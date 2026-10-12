@@ -5,6 +5,7 @@
 // convolution, and the norms around it.  Work-group shapes are the CUDA kernels'; a warp is a sub-group of 32, and
 // lane 0 of its xor butterfly adds in the order of CUDA's shuffle-down tree.
 #include "strata/kernels/gdn.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_gdn
@@ -32,7 +33,7 @@ inline float sigmoid_f(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 
 template <typename D>
 inline D warp_sum(const sycl::sub_group& sg, D v) {
-    for (int off = 16; off > 0; off >>= 1) v += sycl::permute_group_by_xor(sg, v, off);
+    for (int off = 16; off > 0; off >>= 1) v += strata_shfl_xor(sg, v, off);
     return v;
 }
 

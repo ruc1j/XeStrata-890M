@@ -10,6 +10,7 @@
 // that barrier on the CUDA side; here every work-item reaches the barrier first, since a SYCL barrier that some
 // work-items of the group never reach is undefined.
 #include "strata/kernels/s_gemv.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_s_gemv
@@ -242,7 +243,7 @@ sycl::event launch_q8_split(sycl::queue& q, const uint8_t* x, const uint8_t* cod
             }
             float a = (((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))) +
                       (((acc[8] + acc[9]) + (acc[10] + acc[11])) + ((acc[12] + acc[13]) + (acc[14] + acc[15])));
-            for (int step = 16; step > 0; step >>= 1) a += sycl::permute_group_by_xor(sg, a, step);
+            for (int step = 16; step > 0; step >>= 1) a += strata_shfl_xor(sg, a, step);
             if (lane == 0) y[o] = a;
         });
     });

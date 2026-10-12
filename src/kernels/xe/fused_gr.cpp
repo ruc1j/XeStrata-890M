@@ -7,6 +7,7 @@
 // Work-group shapes and reduction orders are the CUDA kernels'; a warp is a sub-group of 32.  CUDA's __expf and
 // rsqrtf become the precise exp and SYCL's rsqrt; explicit fmaf calls stay fused.
 #include "strata/kernels/fused_gr.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/runtime.hpp"
@@ -39,9 +40,15 @@ constexpr int UPM_BLOCKS = N / UPM_COLS;         // 160
 // each staging its chunk of R' * w_norm (unscaled) for the T tokens and writing the chunk's partial dots and sums of
 // squares; `up` adds them per stream in a fixed order, applies rs and runs the epilogue.  The weights are
 // kNativeQ8Rows' (each row's int8 values, then its fp16 scales): every load aligned.
-constexpr int Q8_RPW = 4;                          // down rows per sub-group
+#ifndef STRATA_Q8_RPW
+#define STRATA_Q8_RPW 4
+#endif
+#ifndef STRATA_Q8_KC
+#define STRATA_Q8_KC 640
+#endif
+constexpr int Q8_RPW = STRATA_Q8_RPW;                          // down rows per sub-group
 constexpr int Q8_RG = LR / (WARPS * Q8_RPW);       // 10 row groups (+1: the inject rows)
-constexpr int Q8_KC = 640, Q8_NKC = D / Q8_KC;     // 16 chunks, 4 per stream
+constexpr int Q8_KC = STRATA_Q8_KC, Q8_NKC = D / Q8_KC;     // 16 chunks, 4 per stream
 constexpr int Q8_CPS = N / Q8_KC;                  // chunks per stream
 constexpr int Q8_SPB = Q8_KC / 128;                // 5 steps of 4 Q8_0 blocks (8 lanes x 4 values each)
 constexpr int PR = LR + HC;                        // partial rows: the down rows, then the inject rows
@@ -57,7 +64,7 @@ sycl::queue& queue_for(void* stream) {
 }
 
 inline float warp_sum(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += strata_shfl_xor(sg, v, o);
     return v;
 }
 inline float sigmoidf_(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
@@ -191,7 +198,9 @@ template <int T>
 sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned long long* stamp_buf, int stamp_i0) {
     float* ssg = part + (size_t) T * Q8_NKC * PR;
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float4, 1> xs(sycl::range<1>((size_t) kFusedGrMaxT * Q8_KC / 4), h);
+        // XeStrata-890M: local memory for T tokens, not kFusedGrMaxT: 20 KB a work-group left the 890M's CUs room for
+        // two or three of them at a time
+        sycl::local_accessor<float4, 1> xs(sycl::range<1>((size_t) T * Q8_KC / 4), h);
         sycl::local_accessor<float, 1> red(sycl::range<1>((size_t) WARPS * kFusedGrMaxT), h);
         const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (Q8_RG + 1) * THREADS, Q8_NKC), sycl::range<2>(THREADS, 1)),
@@ -289,9 +298,9 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
         gpu_stamp(stamp_buf, stamp_i0 + 1, &q);
     }
     return q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float4, 1> lo(sycl::range<1>((size_t) kFusedGrMaxT * LR / 4), h);
-        sycl::local_accessor<float, 1> rs_s(sycl::range<1>((size_t) kFusedGrMaxT * HC), h);
-        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) kFusedGrMaxT * HC * UPM_COLS), h);
+        sycl::local_accessor<float4, 1> lo(sycl::range<1>((size_t) T * LR / 4), h);   // T tokens' (XeStrata-890M)
+        sycl::local_accessor<float, 1> rs_s(sycl::range<1>((size_t) T * HC), h);
+        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) T * HC * UPM_COLS), h);
         const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<1>((size_t) UPM_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             tok.stage(m, it);
@@ -443,7 +452,7 @@ sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
                     const float p2 = dot(w[p][2], k, j + 16);
                     const float p3 = dot(w[p][3], k, j + 24);
                     float s = (p0 + p2) + (p1 + p3);
-                    for (int o = 4; o > 0; o >>= 1) s += sycl::permute_group_by_xor(sg, s, o);
+                    for (int o = 4; o > 0; o >>= 1) s += strata_shfl_xor(sg, s, o);
                     if (j == k) mine = s;
                 }
                 if (j < T) {

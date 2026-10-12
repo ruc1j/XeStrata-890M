@@ -10,6 +10,7 @@
 // the same order.  The native kernels follow ggml-cuda at llama.cpp 3cf03257 (MIT License, Copyright (c) 2023-2026
 // The ggml authors, see third_party/main/ggml/LICENSE); CUDA compiled them with --use_fast_math, here the math is precise.
 #include "strata/kernels/gr.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_gr_norm.hpp"
@@ -50,7 +51,7 @@ inline float sigmoid_f(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 
 /// CUDA's shuffle-down tree then __shfl(v, 0): lane 0's butterfly value, broadcast.
 inline float warp_sumf(const sycl::sub_group& sg, float v) {
-    for (int off = 16; off > 0; off >>= 1) v += sycl::permute_group_by_xor(sg, v, off);
+    for (int off = 16; off > 0; off >>= 1) v += strata_shfl_xor(sg, v, off);
     return sycl::group_broadcast(sg, v, 0);
 }
 
@@ -193,13 +194,13 @@ void launch_weighted_rms_norm(sycl::queue& q, const float* input, const float* g
                 partial += value * value;
             }
             // Pinned block_reduce<SUM,BlockSize>: every sub-group repeats the final xor reduction.
-            for (int o = 16; o > 0; o >>= 1) partial += sycl::permute_group_by_xor(sg, partial, o);
+            for (int o = 16; o > 0; o >>= 1) partial += strata_shfl_xor(sg, partial, o);
             const int lane = tid % 32;
             if (lane == 0) sums[tid / 32] = partial;
             sycl::group_barrier(it.get_group());
             partial = 0.0f;
             if (lane < BlockSize / 32) partial = sums[lane];
-            for (int o = 16; o > 0; o >>= 1) partial += sycl::permute_group_by_xor(sg, partial, o);
+            for (int o = 16; o > 0; o >>= 1) partial += strata_shfl_xor(sg, partial, o);
             const float mean = partial / n_cols;
             const float scale = sycl::rsqrt(mean + epsilon);
             for (int col = tid; col < n_cols; col += BlockSize) out[col] = scale * in[col] * ga[col];

@@ -11,6 +11,7 @@
 // every hit where CUDA placed it.  Work-items past the last row keep computing (on row 0) and do not write, because
 // a sub-group permute needs every lane.
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -75,7 +76,7 @@ inline float row_dot_s2_q8(const uint8_t* codes, const uint8_t* scales, const ui
 }
 
 inline float warp_sum(const sycl::sub_group& sg, float v) {
-    for (int off = 16; off > 0; off >>= 1) v += sycl::permute_group_by_xor(sg, v, off);
+    for (int off = 16; off > 0; off >>= 1) v += strata_shfl_xor(sg, v, off);
     return v;
 }
 
@@ -140,7 +141,7 @@ sycl::event swiglu_q8_launch(sycl::queue& q, float* gate_up, long long n_pairs, 
         gate_up[i] = xv;
         uint8_t* out = blocks + b * 34;
         float amax = sycl::fabs(xv);
-        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
+        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(amax, strata_shfl_xor(sg, amax, o));
         const float sc = amax > 0.f ? amax / 127.f : 0.f;
         const float inv = sc > 0.f ? 1.f / sc : 0.f;
         if (lane == 0) {
@@ -201,9 +202,9 @@ inline float row_dot_cpu_order(const sycl::sub_group& sg, const uint8_t* codes, 
         acc = sycl::fma(d * xs[2 * b + 1], (float) hi, acc);
         if (lane == 0) corr = corr + d * (hx[2 * b] + hx[2 * b + 1]);
     }
-    acc = acc + sycl::permute_group_by_xor(sg, acc, 4);
-    acc = acc + sycl::permute_group_by_xor(sg, acc, 1);
-    acc = acc + sycl::permute_group_by_xor(sg, acc, 2);
+    acc = acc + strata_shfl_xor(sg, acc, 4);
+    acc = acc + strata_shfl_xor(sg, acc, 1);
+    acc = acc + strata_shfl_xor(sg, acc, 2);
     return acc - corr;
 }
 

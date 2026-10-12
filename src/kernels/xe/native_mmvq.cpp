@@ -34,6 +34,7 @@
 // the multi-column kernel with NCOLS = 1 and the ncols = 1 layout (4 warps, 1 row, or 4 rows for small K) is the
 // single-column path, so both share one set of dot-product traits.  A warp is a sub-group of 32.
 #include "strata/kernels/native_mmvq.hpp"
+#include "xe_shuffle.hpp"
 #include "q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/runtime.hpp"
@@ -479,11 +480,11 @@ struct SmallTraits {
 
 // ---------------------------------------------------------------- the kernel
 inline float warp_sum(const sycl::sub_group& sg, float x) {
-    for (int offset = WARP / 2; offset > 0; offset >>= 1) x += sycl::permute_group_by_xor(sg, x, offset);
+    for (int offset = WARP / 2; offset > 0; offset >>= 1) x += strata_shfl_xor(sg, x, offset);
     return x;
 }
 inline float warp_max(const sycl::sub_group& sg, float x) {
-    for (int offset = WARP / 2; offset > 0; offset >>= 1) x = sycl::fmax(x, sycl::permute_group_by_xor(sg, x, offset));
+    for (int offset = WARP / 2; offset > 0; offset >>= 1) x = sycl::fmax(x, strata_shfl_xor(sg, x, offset));
     return x;
 }
 

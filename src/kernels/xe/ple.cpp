@@ -8,6 +8,7 @@
 // gate's sqrt and sigmoid are f32.  Work shapes are the CUDA kernels'; the double block sum's shuffle-down tree is an
 // xor butterfly whose lane 0 adds in the same order.  The opt-in native paths are unchanged in structure.
 #include "strata/kernels/ple.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/ngram.hpp"
@@ -51,7 +52,7 @@ inline float silu_f(float x) { return x / (1.0f + sycl::exp(-x)); }
 // (device_caps.hpp)
 template <typename D>
 inline D warp_sum_d(const sycl::sub_group& sg, D v) {
-    for (int off = 16; off > 0; off >>= 1) v += sycl::permute_group_by_xor(sg, v, off);
+    for (int off = 16; off > 0; off >>= 1) v += strata_shfl_xor(sg, v, off);
     return v;
 }
 template <typename D>

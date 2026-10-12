@@ -32,6 +32,7 @@
 // SOFTWARE.
 //
 #include "strata/kernels/iq_kernels.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "cuda_intrinsics.hpp"
@@ -622,11 +623,11 @@ template<> struct GridOf<22> { using T = uint64_t; static constexpr int N = 1024
 
 // CUDA's __shfl_xor butterfly, in the same order, so a row's sum does not depend on the backend's reduction tree.
 inline float warp_sum(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += strata_shfl_xor(sg, v, o);
     return v;
 }
 inline float warp_max(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, o));
+    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(v, strata_shfl_xor(sg, v, o));
     return v;
 }
 
@@ -680,7 +681,7 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
             if (e < n) s[e] += F::S::apply(wd, x[e] + xo, iqs);
     }
     for (int e = 0; e < NE; ++e) {
-        for (int o = LPR / 2; o > 0; o >>= 1) s[e] += sycl::permute_group_by_xor(sg, s[e], o);
+        for (int o = LPR / 2; o > 0; o >>= 1) s[e] += strata_shfl_xor(sg, s[e], o);
         out[e] = s[e];
     }
 }

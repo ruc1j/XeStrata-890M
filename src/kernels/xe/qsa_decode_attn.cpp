@@ -7,6 +7,7 @@
 // A warp is a sub-group of 32.  CUDA used the __expf intrinsic here; this uses the precise exp.  Explicit fmaf calls
 // stay fused (sycl::fma), and the library's -ffp-contract=off leaves every other multiply-add as written.
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/runtime.hpp"
@@ -33,11 +34,11 @@ sycl::queue& queue_for(void* stream) {
 }
 
 inline float warp_sum(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += strata_shfl_xor(sg, v, o);
     return v;
 }
 inline float warp_max(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, o));
+    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(v, strata_shfl_xor(sg, v, o));
     return v;
 }
 inline float h2f(uint16_t bits) { return (float) sycl::bit_cast<sycl::half>(bits); }
@@ -51,23 +52,23 @@ inline float reduce12(const sycl::sub_group& sg, const float (&part)[16], int la
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const bool hi = (lane & 16) != 0;
-        r8[i] = (hi ? part[i + 8] : part[i]) + sycl::permute_group_by_xor(sg, hi ? part[i] : part[i + 8], 16);
+        r8[i] = (hi ? part[i + 8] : part[i]) + strata_shfl_xor(sg, hi ? part[i] : part[i + 8], 16);
     }
     float r4[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const bool hi = (lane & 8) != 0;
-        r4[i] = (hi ? r8[i + 4] : r8[i]) + sycl::permute_group_by_xor(sg, hi ? r8[i] : r8[i + 4], 8);
+        r4[i] = (hi ? r8[i + 4] : r8[i]) + strata_shfl_xor(sg, hi ? r8[i] : r8[i + 4], 8);
     }
     float r2[2];
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
         const bool hi = (lane & 4) != 0;
-        r2[i] = (hi ? r4[i + 2] : r4[i]) + sycl::permute_group_by_xor(sg, hi ? r4[i] : r4[i + 2], 4);
+        r2[i] = (hi ? r4[i + 2] : r4[i]) + strata_shfl_xor(sg, hi ? r4[i] : r4[i + 2], 4);
     }
     const bool hi2 = (lane & 2) != 0;
-    const float r1 = (hi2 ? r2[1] : r2[0]) + sycl::permute_group_by_xor(sg, hi2 ? r2[0] : r2[1], 2);
-    return r1 + sycl::permute_group_by_xor(sg, r1, 1);
+    const float r1 = (hi2 ? r2[1] : r2[0]) + strata_shfl_xor(sg, hi2 ? r2[0] : r2[1], 2);
+    return r1 + strata_shfl_xor(sg, r1, 1);
 }
 inline int head_of_lane(int lane) {
     return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);

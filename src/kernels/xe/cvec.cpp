@@ -8,6 +8,7 @@
 // all made the RTX 4070 read the B70's and time out at its first steered layer).  The gate is fused_gr's, with the
 // precise exp.
 #include "strata/kernels/cvec.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_cvec
@@ -165,12 +166,12 @@ void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* b
                 }
             }
             if (steer && mode == 0) {
-                for (int o = 16; o > 0; o >>= 1) dot += sycl::permute_group_by_xor(sg, dot, o);
+                for (int o = 16; o > 0; o >>= 1) dot += strata_shfl_xor(sg, dot, o);
                 if ((tid & 31) == 0) part[tid >> 5] = dot;
                 sycl::group_barrier(it.get_group());
                 if (tid < 32) {
                     float p = tid < THREADS / 32 ? part[tid] : 0.0f;
-                    for (int o = 16; o > 0; o >>= 1) p += sycl::permute_group_by_xor(sg, p, o);
+                    for (int o = 16; o > 0; o >>= 1) p += strata_shfl_xor(sg, p, o);
                     if (tid == 0) part[0] = p;
                 }
                 sycl::group_barrier(it.get_group());

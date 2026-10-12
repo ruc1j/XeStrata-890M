@@ -9,6 +9,7 @@
 // Warp sums are xor butterflies.  Lane 0 of a butterfly adds the same partial sums in the same order as CUDA's
 // shuffle-down tree, so the row results of the warp-per-row kernel are those of the CUDA kernel.
 #include "strata/kernels/bf16_gemv.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
@@ -43,7 +44,7 @@ void finish(void* stream, const sycl::event& e, const char* what) {
 }
 
 inline float warp_sum(const sycl::sub_group& sg, float v) {
-    for (int off = 16; off > 0; off >>= 1) v += sycl::permute_group_by_xor(sg, v, off);
+    for (int off = 16; off > 0; off >>= 1) v += strata_shfl_xor(sg, v, off);
     return v;
 }
 

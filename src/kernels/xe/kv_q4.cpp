@@ -4,6 +4,7 @@
 // src/kernels/xe/kv_q4.cpp - the Xe port of Strata's src/kernels/cuda/kv_q4.cu: Q4_0 KV storage after a 256-point Walsh-Hadamard
 // rotation.  One sub-group of 32 per Q4_0 block or Hadamard row, as in the CUDA kernels.
 #include "strata/kernels/kv_q4.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/core/runtime.hpp"
@@ -34,15 +35,15 @@ void need_256(const QsaShapes& s, const char* what) {
 inline uint16_t q4_group(const sycl::sub_group& sg, float x, uint8_t& byte) {
     float amax = sycl::fabs(x), mval = x;
     for (int o = 16; o > 0; o >>= 1) {
-        const float a = sycl::permute_group_by_xor(sg, amax, o);
-        const float v = sycl::permute_group_by_xor(sg, mval, o);
+        const float a = strata_shfl_xor(sg, amax, o);
+        const float v = strata_shfl_xor(sg, mval, o);
         if (a > amax || (a == amax && v > mval)) { amax = a; mval = v; }
     }
     const float d = mval / -8.0f;
     const float id = d != 0.0f ? 1.0f / d : 0.0f;
     const int q = (int) (x * id + 8.5f);                   // __float2int_rz: truncation toward zero
     const uint8_t qc = (uint8_t) (q < 0 ? 0 : (q > 15 ? 15 : q));
-    const uint8_t qhi = sycl::permute_group_by_xor(sg, qc, 16);   // lanes 0..15 read lane + 16, as __shfl_down(16)
+    const uint8_t qhi = strata_shfl_xor(sg, qc, 16);   // lanes 0..15 read lane + 16, as __shfl_down(16)
     byte = (uint8_t) (qc | (qhi << 4));
     return f16_from_f32(d);
 }
@@ -75,7 +76,7 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
         for (int h = 1; h < WARP; h *= 2) {
             for (int j = 0; j < el_w; ++j) {
                 const float val = reg[j];
-                const float val2 = sycl::permute_group_by_xor(sg, val, h);
+                const float val2 = strata_shfl_xor(sg, val, h);
                 reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
             }
         }

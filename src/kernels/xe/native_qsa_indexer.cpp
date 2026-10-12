@@ -10,6 +10,7 @@
 // CUDA's fast-math powf, cosf, sinf and rsqrtf are the precise pow, cos, sin and SYCL's rsqrt here.  The explicit
 // round-to-nearest adds are plain adds (the library does not contract); SCALE's zero-bias fma stays an fma.
 #include "strata/kernels/native_qsa_indexer.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/rope_scaling.hpp"
@@ -31,7 +32,7 @@ std::atomic<bool> enabled{false};
 constexpr int D = 128, R = 4, ROT = 64, THREADS = 256, WARP = 32;
 
 inline float warp_sum(const sycl::sub_group& sg, float x) {
-    for (int offset = 16; offset; offset >>= 1) x += sycl::permute_group_by_xor(sg, x, offset);
+    for (int offset = 16; offset; offset >>= 1) x += strata_shfl_xor(sg, x, offset);
     return x;
 }
 // SET_ROWS stores F16; GET_ROWS expands those exact values to F32

@@ -8,6 +8,7 @@
 // The (value, index) argmax reductions are xor butterflies.  Their comparison is a total order (larger value, then
 // smaller index), and lane 0 of a butterfly combines the same lanes in the same order as CUDA's shuffle-down tree.
 #include "strata/kernels/sampler.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "device_caps.hpp"
@@ -88,8 +89,8 @@ inline float apply_penalties(float logit, int count, const SamplerParams& p) {
 
 inline void argmax_step(const sycl::sub_group& sg, float& bv, int& best) {
     for (int off = 16; off > 0; off >>= 1) {
-        const float ov = sycl::permute_group_by_xor(sg, bv, off);
-        const int oi = sycl::permute_group_by_xor(sg, best, off);
+        const float ov = strata_shfl_xor(sg, bv, off);
+        const int oi = strata_shfl_xor(sg, best, off);
         if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
     }
 }

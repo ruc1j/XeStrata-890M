@@ -11,6 +11,7 @@
 // the next chunk after its own sub-group read it, so a sub-group barrier separates the two (CUDA relied on the warp
 // running in step there).
 #include "strata/kernels/native_flash_attn.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_flash_attn
@@ -29,11 +30,11 @@ constexpr int WARP = 32;
 
 template <int Width>
 inline float warp_sum(const sycl::sub_group& sg, float x) {
-    for (int offset = Width / 2; offset; offset >>= 1) x += sycl::permute_group_by_xor(sg, x, offset);
+    for (int offset = Width / 2; offset; offset >>= 1) x += strata_shfl_xor(sg, x, offset);
     return x;
 }
 inline float warp_max(const sycl::sub_group& sg, float x) {
-    for (int offset = 16; offset; offset >>= 1) x = sycl::fmax(x, sycl::permute_group_by_xor(sg, x, offset));
+    for (int offset = 16; offset; offset >>= 1) x = sycl::fmax(x, strata_shfl_xor(sg, x, offset));
     return x;
 }
 
@@ -120,7 +121,7 @@ void native_flash_attn_short_step(const float* q, const uint16_t* k, const uint1
                     if (lane % 8 == row) score = dot;
                 }
                 for (int offset = 8; offset < 32; offset <<= 1)
-                    next_max = sycl::fmax(next_max, sycl::permute_group_by_xor(sg, next_max, offset));
+                    next_max = sycl::fmax(next_max, strata_shfl_xor(sg, next_max, offset));
                 const float rescale = sycl::exp(maximum - next_max);
                 maximum = next_max;
                 score = sycl::exp(score - maximum);

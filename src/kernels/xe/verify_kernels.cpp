@@ -10,6 +10,7 @@
 // the 2026-09-30-xe-doorbell record: a volatile read followed by a system-scope acquire fence.  gpu_stamp writes
 // device-clock ticks, not the nanoseconds of CUDA's %globaltimer.
 #include "strata/kernels/verify_kernels.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 #include "q8_1_finite.hpp"
@@ -48,7 +49,7 @@ void done(void* stream, const sycl::event& e, const char* what) {
 }
 
 inline float warp_sum(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += strata_shfl_xor(sg, v, o);
     return v;
 }
 // The q8_1 block of a sub-group's 32 values, lane l's value xi (native_quantize_q8_1's quantizer, the same bytes):
@@ -57,8 +58,8 @@ inline void q8_1_store(const sycl::sub_group& sg, const float xi, uint8_t* block
 #pragma clang fp contract(off)
     float amax = sycl::fabs(xi), sum = xi;
     for (int o = 16; o > 0; o >>= 1) {
-        amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
-        sum += sycl::permute_group_by_xor(sg, sum, o);
+        amax = sycl::fmax(amax, strata_shfl_xor(sg, amax, o));
+        sum += strata_shfl_xor(sg, sum, o);
     }
     const float d = xe::q8_1_finite(amax / 127.0f);
     block[4 + lane] = (uint8_t) xe::q8_1_quant(xi, d, amax);

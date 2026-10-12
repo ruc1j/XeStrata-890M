@@ -7,6 +7,7 @@
 // The library compiles with -ffp-contract=off, which keeps Q8_K's `iscale * x` the separately rounded multiply that
 // CUDA's __fmul_rn spells.
 #include "strata/kernels/quantize_act.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
@@ -99,7 +100,7 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
         const float xv = x[b * QK8_0 + lane];
         uint8_t* out = blocks + b * 34;
         float amax = sycl::fabs(xv);
-        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
+        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(amax, strata_shfl_xor(sg, amax, o));
         const float s = amax > 0.f ? amax / 127.f : 0.f;
         const float inv = s > 0.f ? 1.f / s : 0.f;
         if (lane == 0) {

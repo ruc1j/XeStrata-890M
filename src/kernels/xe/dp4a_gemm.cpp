@@ -9,6 +9,7 @@
 // loading needs no int8 copies in memory; with them made beforehand the products alone were 15% faster on the
 // largest shapes and no faster on the experts', before counting the quantization (the 2026-10-02-dp4a record).
 #include "dp4a_gemm.hpp"
+#include "xe_shuffle.hpp"
 #include "cuda_intrinsics.hpp"
 #include "device_target.hpp"
 #include "strata/core/per_device.hpp"
@@ -46,7 +47,7 @@ inline void load_block(sycl::sub_group sg, int lid, const uint16_t* A, int64_t r
         v[j] = ok ? value<BF16>(A[(row0 + r) * K + k0 + (int64_t) part * V + j]) : 0.0f;
         m = sycl::fmax(m, sycl::fabs(v[j]));
     }
-    for (int o = 1; o < P; o <<= 1) m = sycl::fmax(m, sycl::permute_group_by_xor(sg, m, o));
+    for (int o = 1; o < P; o <<= 1) m = sycl::fmax(m, strata_shfl_xor(sg, m, o));
     const float inv = m == 0.0f ? 0.0f : 127.0f / m;
     for (int j = 0; j < V; j += 4) {
         uint32_t p = 0;

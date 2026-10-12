@@ -9,6 +9,7 @@
 // Copyright (c) 2023-2026 The ggml authors, see third_party/main/ggml/LICENSE.  CUDA compiled it with --use_fast_math;
 // here pow, cos and sin are the precise SYCL functions.
 #include "strata/kernels/rope.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/on_device.hpp"
@@ -240,12 +241,12 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
             const int half = n_rot / 2;
             const float x_tid = tid < n_cols ? in[tid] : 0.0f;
             const float x_hi = tid < half ? in[tid + half] : 0.0f;
-            for (int offset = 16; offset; offset >>= 1) partial += sycl::permute_group_by_xor(sg, partial, offset);
+            for (int offset = 16; offset; offset >>= 1) partial += strata_shfl_xor(sg, partial, offset);
             const int lane = tid % 32;
             if (lane == 0) sums[tid / 32] = partial;
             sycl::group_barrier(it.get_group());
             partial = lane < BlockSize / 32 ? sums[lane] : 0.0f;
-            for (int offset = 16; offset; offset >>= 1) partial += sycl::permute_group_by_xor(sg, partial, offset);
+            for (int offset = 16; offset; offset >>= 1) partial += strata_shfl_xor(sg, partial, offset);
             const float mean = partial / (float) n_cols;
             const float scale = sycl::rsqrt(mean + epsilon);
             if (tid >= n_rot && tid < n_cols) {

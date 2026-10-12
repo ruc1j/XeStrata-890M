@@ -6,6 +6,7 @@
 // is linearised the way CUDA numbers its threads (x fastest).  __expf, rsqrtf, powf, cosf, sinf and log1pf are the
 // precise SYCL functions.
 #include "strata/prefill/kernels.hpp"
+#include "../kernels/xe/xe_shuffle.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -34,11 +35,11 @@ constexpr int WARP = 32;
 sycl::queue& Q(void* stream) { return core::Runtime::get().stream(stream); }
 
 inline float warp_sum(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += strata_shfl_xor(sg, v, o);
     return v;
 }
 inline float warp_max(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, o));
+    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(v, strata_shfl_xor(sg, v, o));
     return v;
 }
 inline uint16_t bf(float f) {
@@ -124,8 +125,8 @@ void route_launch(sycl::queue& q, const float* logits, int32_t* ids, float* wout
             int ex = lane;
             for (int i = 1; i < REG; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
             for (int m = 16; m; m >>= 1) {
-                const float ob = sycl::permute_group_by_xor(sg, best, m);
-                const int oi = sycl::permute_group_by_xor(sg, ex, m);
+                const float ob = strata_shfl_xor(sg, best, m);
+                const int oi = strata_shfl_xor(sg, ex, m);
                 if (ob > best || (ob == best && oi < ex)) { best = ob; ex = oi; }
             }
             if ((ex & 31) == lane) { v[ex / 32] = -INFINITY; selected_sum += best; }
@@ -198,7 +199,7 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
                 return;
             }
             float a = sycl::fabs(x);
-            for (int o = 16; o > 0; o >>= 1) a = sycl::fmax(a, sycl::permute_group_by_xor(sg, a, o));
+            for (int o = 16; o > 0; o >>= 1) a = sycl::fmax(a, strata_shfl_xor(sg, a, o));
             if ((tid & 31) == 0) wm[tid >> 5] = a;
             sycl::group_barrier(it.get_group());
             const float amax = sycl::fmax(wm[0], wm[1]);
@@ -368,12 +369,12 @@ void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t 
                 if (steer && mode == 0) dot = sycl::fma(xv, dir[d], dot);
             }
             if (steer && mode == 0) {   // cvec_apply's two-level sum
-                for (int o = 16; o > 0; o >>= 1) dot += sycl::permute_group_by_xor(sg, dot, o);
+                for (int o = 16; o > 0; o >>= 1) dot += strata_shfl_xor(sg, dot, o);
                 if ((tid & 31) == 0) part[tid >> 5] = dot;
                 sycl::group_barrier(it.get_group());
                 if (tid < 32) {
                     float p = tid < 256 / 32 ? part[tid] : 0.0f;
-                    for (int o = 16; o > 0; o >>= 1) p += sycl::permute_group_by_xor(sg, p, o);
+                    for (int o = 16; o > 0; o >>= 1) p += strata_shfl_xor(sg, p, o);
                     if (tid == 0) part[0] = p;
                 }
                 sycl::group_barrier(it.get_group());

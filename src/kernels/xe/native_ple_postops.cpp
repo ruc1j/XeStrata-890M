@@ -8,6 +8,7 @@
 // CUDA's explicit round-to-nearest operations are plain operations here, since the library does not contract; the
 // fma with a zero addend (ggml SCALE's zero bias) stays an fma.  expf and sqrtf are the precise ones.
 #include "strata/kernels/native_ple_postops.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/native_gr_norm.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -30,7 +31,7 @@ constexpr int N = 2560, H = 4, D = N * H, HISTORY = 9;
 constexpr int WARP = 32;
 
 inline float warp_sum(const sycl::sub_group& sg, float x) {
-    for (int offset = 16; offset; offset >>= 1) x += sycl::permute_group_by_xor(sg, x, offset);
+    for (int offset = 16; offset; offset >>= 1) x += strata_shfl_xor(sg, x, offset);
     return x;
 }
 

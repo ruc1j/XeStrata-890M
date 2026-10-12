@@ -17,6 +17,7 @@
 //     softmax's correction and the change of V scale, then adds the chunk's p.v.
 // Not bitwise equal to `qsa_decode_attn_batch`; qsa_prompt_attn_parity bounds the difference.
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -295,7 +296,7 @@ struct PromptAttn {
                     x[j] = c < nh && rows[c] >= 0 ? sc * qdown : NEG_INF;
                     mxv = sycl::fmax(mxv, x[j]);
                 }
-                for (int o = 1; o < 8; o <<= 1) mxv = sycl::fmax(mxv, sycl::permute_group_by_xor(sg, mxv, o));
+                for (int o = 1; o < 8; o <<= 1) mxv = sycl::fmax(mxv, strata_shfl_xor(sg, mxv, o));
                 const float m_old = mrow[r];
                 const float m_new = m_old == NEG_INF || mxv > m_old + TAU ? mxv : m_old;
                 float sum = 0.0f;
@@ -304,7 +305,7 @@ struct PromptAttn {
                     part[0][r][sub * PER + j] = e;   // this work-item's own cells: read above, no one else's
                     sum += e;
                 }
-                for (int o = 1; o < 8; o <<= 1) sum += sycl::permute_group_by_xor(sg, sum, o);
+                for (int o = 1; o < 8; o <<= 1) sum += strata_shfl_xor(sg, sum, o);
                 if (sub == 0) {
                     const float a = m_old == m_new ? 1.0f : m_old == NEG_INF ? 0.0f : sycl::exp2(m_old - m_new);
                     alpha[r] = a;
@@ -610,7 +611,7 @@ struct PromptAttnMma {
                     x[j] = c < nh && rows[c] >= 0 ? sc * qdown : NEG_INF;
                     mxv = sycl::fmax(mxv, x[j]);
                 }
-                for (int o = 1; o < 8; o <<= 1) mxv = sycl::fmax(mxv, sycl::permute_group_by_xor(sg, mxv, o));
+                for (int o = 1; o < 8; o <<= 1) mxv = sycl::fmax(mxv, strata_shfl_xor(sg, mxv, o));
                 const float m_old = mrow[r];
                 const float m_new = m_old == NEG_INF || mxv > m_old + TAU ? mxv : m_old;
                 float sum = 0.0f;
@@ -619,7 +620,7 @@ struct PromptAttnMma {
                     part[(size_t) r * CH + (size_t) (sub * PER + j)] = e;   // this work-item's own cells
                     sum += e;
                 }
-                for (int o = 1; o < 8; o <<= 1) sum += sycl::permute_group_by_xor(sg, sum, o);
+                for (int o = 1; o < 8; o <<= 1) sum += strata_shfl_xor(sg, sum, o);
                 if (sub == 0) {
                     const float a = m_old == m_new ? 1.0f : m_old == NEG_INF ? 0.0f : sycl::exp2(m_old - m_new);
                     alpha[r] = a;
@@ -812,7 +813,7 @@ struct PromptAttnPtx {
         float qm = 0.0f;
         for (int i = t; i < G * HD; i += THREADS) qm = sycl::fmax(qm, sycl::fabs(qp[i]));
         #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) qm = sycl::fmax(qm, sycl::permute_group_by_xor(sg, qm, o));
+        for (int o = 16; o > 0; o >>= 1) qm = sycl::fmax(qm, strata_shfl_xor(sg, qm, o));
         if (lane == 0) S.qmax[warp] = qm;
         if (t < 16) { S.mrow[t] = NEG_INF; S.lsum[t] = 0.0f; }
         sycl::group_barrier(grp);
@@ -909,7 +910,7 @@ struct PromptAttnPtx {
                     mxv = sycl::fmax(mxv, x[j]);
                 }
                 #pragma unroll
-                for (int o = 1; o < 8; o <<= 1) mxv = sycl::fmax(mxv, sycl::permute_group_by_xor(sg, mxv, o));
+                for (int o = 1; o < 8; o <<= 1) mxv = sycl::fmax(mxv, strata_shfl_xor(sg, mxv, o));
                 const float m_old = S.mrow[r];
                 const float m_new = sycl::fmax(m_old, mxv);
                 float sum = 0.0f;
@@ -920,7 +921,7 @@ struct PromptAttnPtx {
                     sum += e;
                 }
                 #pragma unroll
-                for (int o = 1; o < 8; o <<= 1) sum += sycl::permute_group_by_xor(sg, sum, o);
+                for (int o = 1; o < 8; o <<= 1) sum += strata_shfl_xor(sg, sum, o);
                 sycl::group_barrier(sg);
                 if (sub == 0) {
                     const float a = m_old == NEG_INF ? 0.0f : sycl::exp2(m_old - m_new);
@@ -934,7 +935,7 @@ struct PromptAttnPtx {
             {
                 float vmax = S.sc[st][warp][1][lane];
                 #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) vmax = sycl::fmax(vmax, sycl::permute_group_by_xor(sg, vmax, o));
+                for (int o = 16; o > 0; o >>= 1) vmax = sycl::fmax(vmax, strata_shfl_xor(sg, vmax, o));
                 const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f, vdown = vmax * (1.0f / 16384.0f);
                 float tmp[8][4];
                 #pragma unroll

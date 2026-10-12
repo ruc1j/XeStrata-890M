@@ -8,6 +8,7 @@
 // separately rounded, which CUDA spelled with __dadd_rn/__dmul_rn.  A warp is a sub-group of 32.  The CUDA entry
 // points exited on a bad argument; these throw core::DeviceError.
 #include "strata/kernels/qsa.hpp"
+#include "xe_shuffle.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -166,7 +167,7 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, 
                 D acc = (D) 0;
                 for (int d = lane; d < idx_dim; d += WARP)
                     acc = acc + (D) pooled[(size_t) b * idx_dim + d] * (D) q_idx[(size_t) wid * idx_dim + d];
-                for (int o = 16; o > 0; o >>= 1) acc = acc + sycl::permute_group_by_xor(sg, acc, o);
+                for (int o = 16; o > 0; o >>= 1) acc = acc + strata_shfl_xor(sg, acc, o);
                 if (lane == 0) s_dot[wid] = acc;
                 sycl::group_barrier(it.get_group());
                 if (it.get_local_id(0) != 0) return;
@@ -365,12 +366,12 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
 
             float mx = -FLT_MAX;
             for (long long j = d; j < n_ids; j += bdim) mx = sycl::fmax(mx, w(j));
-            for (int o = 16; o > 0; o >>= 1) mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, o));
+            for (int o = 16; o > 0; o >>= 1) mx = sycl::fmax(mx, strata_shfl_xor(sg, mx, o));
             if (lane == 0) red(wid) = mx;
             sycl::group_barrier(g);
             if (wid == 0) {
                 mx = (lane < nwarp) ? red(lane) : -FLT_MAX;
-                for (int o = 16; o > 0; o >>= 1) mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, o));
+                for (int o = 16; o > 0; o >>= 1) mx = sycl::fmax(mx, strata_shfl_xor(sg, mx, o));
                 if (lane == 0) red(0) = mx;
             }
             sycl::group_barrier(g);
@@ -383,12 +384,12 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
                 w(j) = ex;
                 sum += ex;
             }
-            for (int o = 16; o > 0; o >>= 1) sum += sycl::permute_group_by_xor(sg, sum, o);
+            for (int o = 16; o > 0; o >>= 1) sum += strata_shfl_xor(sg, sum, o);
             if (lane == 0) red(wid) = sum;
             sycl::group_barrier(g);
             if (wid == 0) {
                 sum = (lane < nwarp) ? red(lane) : 0.0f;
-                for (int o = 16; o > 0; o >>= 1) sum += sycl::permute_group_by_xor(sg, sum, o);
+                for (int o = 16; o > 0; o >>= 1) sum += strata_shfl_xor(sg, sum, o);
                 if (lane == 0) red(0) = 1.0f / sum;
             }
             sycl::group_barrier(g);

@@ -9,6 +9,7 @@
 // precise division and exp.  The scalar gate's warp sums are xor butterflies whose lane 0 adds in the order of
 // CUDA's shuffle-down tree and is then broadcast, as CUDA broadcast lane 0.
 #include "strata/kernels/shared_expert.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -61,7 +62,7 @@ void native_swiglu(sycl::queue& q, const float* gate, const float* up, float* ou
 
 template <typename D>
 inline D warp_sum_d(const sycl::sub_group& sg, D v) {
-    for (int off = 16; off > 0; off >>= 1) v += sycl::permute_group_by_xor(sg, v, off);
+    for (int off = 16; off > 0; off >>= 1) v += strata_shfl_xor(sg, v, off);
     return sycl::group_broadcast(sg, v, 0);
 }
 

@@ -10,6 +10,7 @@
 // The top-k's integer prefix sums use SYCL group scans: integer sums are exact in any order, so the ids are the
 // CUDA kernels' ids.
 #include "strata/kernels/qsa_select.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_select
@@ -263,7 +264,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
             for (int h = 0; h < IDX_HEADS; ++h) {
                 const float* q4 = q + h * IDX_DIM;
                 float d = kp[0] * q4[0] + kp[1] * q4[1] + kp[2] * q4[2] + kp[3] * q4[3];
-                for (int o = 16; o > 0; o >>= 1) d += sycl::permute_group_by_xor(sg, d, o);
+                for (int o = 16; o > 0; o >>= 1) d += strata_shfl_xor(sg, d, o);
                 score += d > 0.0f ? d : 0.0f;
             }
             if (lane == 0) {
@@ -354,7 +355,7 @@ sycl::event block_scores_tail(sycl::queue& q, const float* dead, const float* q_
         for (int hh = 0; hh < IDX_HEADS; ++hh) {
             const float* q4 = qv + (ptrdiff_t) hh * IDX_DIM;
             float d = kp[0] * q4[0] + kp[1] * q4[1] + kp[2] * q4[2] + kp[3] * q4[3];
-            for (int o = 16; o > 0; o >>= 1) d += sycl::permute_group_by_xor(sg, d, o);
+            for (int o = 16; o > 0; o >>= 1) d += strata_shfl_xor(sg, d, o);
             score += d > 0.0f ? d : 0.0f;
         }
         if (lane == 0) {

@@ -9,6 +9,7 @@
 //
 // CUDA compiled this with --use_fast_math to match ggml-cuda; the Xe version uses the precise exp and sqrt.
 #include "strata/kernels/native_gdn.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_gdn
 #include "strata/kernels/device_arch_tag.hpp"
@@ -28,7 +29,7 @@ constexpr int WARP = 32;
 constexpr int COLS = 4;   // columns (sub-groups) per work-group
 
 inline float warp_sum(const sycl::sub_group& sg, float value) {
-    for (int offset = 16; offset > 0; offset >>= 1) value += sycl::permute_group_by_xor(sg, value, offset);
+    for (int offset = 16; offset > 0; offset >>= 1) value += strata_shfl_xor(sg, value, offset);
     return value;
 }
 

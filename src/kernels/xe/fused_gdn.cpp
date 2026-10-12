@@ -7,6 +7,7 @@
 // Work-group shapes, explicit fmaf chains and summation orders are the CUDA kernels'.  CUDA's __expf and rsqrtf
 // become the precise exp and SYCL's rsqrt.
 #include "strata/kernels/fused_gdn.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gdn
 #include "strata/kernels/device_arch_tag.hpp"
@@ -32,7 +33,7 @@ void finish(void* stream, const sycl::event& e, const char* what) {
 }
 
 inline float warp_sum(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += strata_shfl_xor(sg, v, o);
     return v;
 }
 

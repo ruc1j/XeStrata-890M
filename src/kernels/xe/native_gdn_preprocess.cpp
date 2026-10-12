@@ -11,6 +11,7 @@
 // round-to-nearest operations (__fadd_rn, __fmul_rn, __fmaf_rn) stay as written: the library does not contract, and
 // the fma with a zero addend keeps its signed-zero behaviour.
 #include "strata/kernels/native_gdn_preprocess.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_gdn_preprocess
 #include "strata/kernels/device_arch_tag.hpp"
@@ -29,7 +30,7 @@ constexpr int WARP = 32;
 constexpr int NORM_THREADS = 256;
 
 inline float warp_sum(const sycl::sub_group& sg, float value) {
-    for (int offset = 16; offset > 0; offset >>= 1) value += sycl::permute_group_by_xor(sg, value, offset);
+    for (int offset = 16; offset > 0; offset >>= 1) value += strata_shfl_xor(sg, value, offset);
     return value;
 }
 // two-level sum over the work-group's eight sub-groups

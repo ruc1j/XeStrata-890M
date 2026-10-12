@@ -8,6 +8,7 @@
 //
 // CUDA's expf and rsqrtf under fast math are the precise exp and SYCL's rsqrt here.
 #include "strata/kernels/native_qsa.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_qsa
@@ -27,7 +28,7 @@ std::atomic<bool> enabled{false};
 constexpr int WARP = 32;
 
 inline float warp_sum(const sycl::sub_group& sg, float value) {
-    for (int offset = 16; offset; offset >>= 1) value += sycl::permute_group_by_xor(sg, value, offset);
+    for (int offset = 16; offset; offset >>= 1) value += strata_shfl_xor(sg, value, offset);
     return value;
 }
 

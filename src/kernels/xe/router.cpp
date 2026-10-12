@@ -7,6 +7,7 @@
 // native_router follows ggml-cuda's topk-moe at llama.cpp 3cf03257; MIT License, Copyright (c) 2023-2026 The ggml
 // authors, see third_party/main/ggml/LICENSE.  CUDA compiled it with --use_fast_math; here exp is the precise function.
 #include "strata/kernels/router_top10.hpp"
+#include "xe_shuffle.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
@@ -113,14 +114,14 @@ sycl::event router_top10_launch(sycl::queue& q, const float* logits, int n_token
                     if (pe > bv) { bv = pe; bi = x; }
                 }
                 for (int off = 16; off > 0; off >>= 1)
-                    better(bv, bi, sycl::permute_group_by_xor(sg, bv, off), sycl::permute_group_by_xor(sg, bi, off));
+                    better(bv, bi, strata_shfl_xor(sg, bv, off), strata_shfl_xor(sg, bi, off));
                 if (lane == 0) { s_red[warp] = bv; s_rid[warp] = bi; }
                 sycl::group_barrier(g);
                 if (warp == 0) {
                     float v = lane < nw ? s_red[lane] : -INFINITY;
                     int ix = lane < nw ? s_rid[lane] : n_expert;
                     for (int off = 16; off > 0; off >>= 1)
-                        better(v, ix, sycl::permute_group_by_xor(sg, v, off), sycl::permute_group_by_xor(sg, ix, off));
+                        better(v, ix, strata_shfl_xor(sg, v, off), strata_shfl_xor(sg, ix, off));
                     if (lane == 0 && ix < n_expert) {
                         ids[(size_t) t * k + i] = ix;
                         weights[(size_t) t * k + i] = v;
@@ -180,13 +181,13 @@ void launch_native_router(sycl::queue& q, const float* logits_all, int32_t* ids_
         for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
         float maximum = -INFINITY;
         for (int i = 0; i < 16; ++i) maximum = sycl::max(maximum, values[i]);
-        for (int mask = 16; mask; mask >>= 1) maximum = sycl::fmax(maximum, sycl::permute_group_by_xor(sg, maximum, mask));
+        for (int mask = 16; mask; mask >>= 1) maximum = sycl::fmax(maximum, strata_shfl_xor(sg, maximum, mask));
         float sum = 0.0f;
         for (int i = 0; i < 16; ++i) {
             values[i] = sycl::exp(values[i] - maximum);
             sum += values[i];
         }
-        for (int mask = 16; mask; mask >>= 1) sum += sycl::permute_group_by_xor(sg, sum, mask);
+        for (int mask = 16; mask; mask >>= 1) sum += strata_shfl_xor(sg, sum, mask);
         const float reciprocal = 1.0f / sum;
         for (int i = 0; i < 16; ++i) {
             values[i] *= reciprocal;
@@ -200,7 +201,7 @@ void launch_native_router(sycl::queue& q, const float* logits_all, int32_t* ids_
                 if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
             }
             for (int mask = 16; mask; mask >>= 1)
-                better(best, expert, sycl::permute_group_by_xor(sg, best, mask), sycl::permute_group_by_xor(sg, expert, mask));
+                better(best, expert, strata_shfl_xor(sg, best, mask), strata_shfl_xor(sg, expert, mask));
             if ((expert & 31) == lane) {
                 values[expert / 32] = -INFINITY;
                 ids[rank] = expert;
@@ -210,7 +211,7 @@ void launch_native_router(sycl::queue& q, const float* logits_all, int32_t* ids_
             }
             if (rank == lane) selected = best;
         }
-        for (int mask = 16; mask; mask >>= 1) selected_sum += sycl::permute_group_by_xor(sg, selected_sum, mask);
+        for (int mask = 16; mask; mask >>= 1) selected_sum += strata_shfl_xor(sg, selected_sum, mask);
         selected_sum = sycl::max(selected_sum, 6.103515625e-5f);
         const float inverse_selected_sum = 1.0f / selected_sum;
         if (lane < 10) weights[lane] = selected * inverse_selected_sum;
@@ -246,7 +247,7 @@ void route_prior_top10(const float* logits, const int32_t* res_layer, float lamb
         float p[16], s[16];
         float mx = -INFINITY;
         for (int i = 0; i < 16; ++i) { p[i] = lg[lane + 32 * i]; mx = sycl::fmax(mx, p[i]); }
-        for (int m = 16; m; m >>= 1) mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, m));
+        for (int m = 16; m; m >>= 1) mx = sycl::fmax(mx, strata_shfl_xor(sg, mx, m));
         for (int i = 0; i < 16; ++i) {
             const int e = lane + 32 * i;
             s[i] = p[i] + (res_layer[e] >= 0 ? lambda : 0.0f);   // the selection score
@@ -259,9 +260,9 @@ void route_prior_top10(const float* logits, const int32_t* res_layer, float lamb
             for (int i = 0; i < 16; ++i)
                 if (s[i] > best) { best = s[i]; be = lane + 32 * i; bp = p[i]; }
             for (int m = 16; m; m >>= 1) {
-                const float ob = sycl::permute_group_by_xor(sg, best, m);
-                const int oe = sycl::permute_group_by_xor(sg, be, m);
-                const float op = sycl::permute_group_by_xor(sg, bp, m);
+                const float ob = strata_shfl_xor(sg, best, m);
+                const int oe = strata_shfl_xor(sg, be, m);
+                const float op = strata_shfl_xor(sg, bp, m);
                 if (ob > best || (ob == best && oe < be)) { best = ob; be = oe; bp = op; }
             }
             if ((be & 31) == lane) s[be >> 5] = -FLT_MAX;
