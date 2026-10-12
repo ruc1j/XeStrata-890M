@@ -620,6 +620,58 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, &q);
 
+    // XeStrata-890M (STRATA_GR_DOWN_ROWS, on unless 0): step 2 with one sub-group a row for all T tokens, the row's
+    // weights loaded once and applied to every token.  The per-(row, token) form below reads each 6.5 MB matrix T
+    // times, which a 2 MB L2 (the 890M's) cannot hold between the tokens.  A lane sums its chunks in the same order
+    // for each token and the sub-group reduces by xor as below, so every output is bitwise the same.
+    static const bool down_rows = [] {
+        const char* v = std::getenv("STRATA_GR_DOWN_ROWS");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (down_rows) {
+        q.submit([&](sycl::handler& h) {
+            const TokArgs tok(h);
+            h.parallel_for(sycl::nd_range<1>((size_t) (DOWN_BLOCKS + 1) * THREADS, THREADS),
+                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                tok.stage(m, it);
+                const sycl::sub_group sg = it.get_sub_group();
+                const int lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
+                const bool inject_block = (int) it.get_group(0) == DOWN_BLOCKS;
+                const int row = inject_block ? warp : (int) it.get_group(0) * WARPS + warp;
+                if (inject_block && (m.a[0].w_inject == nullptr || warp >= HC)) return;
+                const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) row * D;
+                const int T = m.T;
+                float acc[kFusedGrMaxT];
+#pragma unroll
+                for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
+#pragma unroll 4
+                for (int qq = 0; qq < D / 8 / WARP; ++qq) {
+                    const int j = lane + WARP * qq;
+                    const uint4 w = load_u4(wrow, (size_t) j);
+#pragma unroll
+                    for (int k = 0; k < kFusedGrMaxT; ++k) {
+                        if (k >= T) break;
+                        const float* x = m.xn + (size_t) k * D;
+                        const float4 x0 = load4(x + (size_t) j * 8), x1 = load4(x + (size_t) j * 8 + 4);
+                        const float xv[8] = {x0.x(), x0.y(), x0.z(), x0.w(), x1.x(), x1.y(), x1.z(), x1.w()};
+                        acc[k] += dot8(w, xv);
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < kFusedGrMaxT; ++k) {
+                    if (k >= T) break;
+                    const float sum = warp_sum(sg, acc[k]);
+                    if (lane != 0) continue;
+                    if (inject_block) {
+                        tok(m, k).inject_out[row] = sum;
+                    } else {
+                        const float v = sum / (float) HC;
+                        tok(m, k).lo[row] = v / (1.0f + sycl::exp(-v));
+                    }
+                }
+            });
+        });
+    } else
     // Step 2 for T tokens: one sub-group per (row, token), the token in the second dimension.  A lane sums its 40
     // chunks (lane + 32 q) in order and the sub-group then reduces by xor, as the single-token kernel does, so each
     // output is bitwise the single-token one; rows and tokens are independent, so splitting them gives the GPU
