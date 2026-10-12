@@ -70,7 +70,10 @@ inline Int2 grid_pair(const uint64_t* grid, int index) {
     return {(int) (uint32_t) g, (int) (uint32_t) (g >> 32)};
 }
 // four sign bits as a 0xFF byte mask each
-inline uint32_t sign_mask(uint32_t nib) { return (((nib & 0xF) * 0x00204081u) & 0x01010101u) * 0xFFu; }
+inline uint32_t sign_mask(uint32_t nib) {   // (t << 8) - t is t * 0xFF: two full-rate instructions, not a quarter-rate multiply (gfx11)
+    const uint32_t t = ((nib & 0xF) * 0x00204081u) & 0x01010101u;
+    return (t << 8) - t;
+}
 
 // Q2_0's four 2-bit codes of a byte (the lowest first) as four signed bytes code - 1: the bytes CUDA's __byte_perm
 // table 0x020100FF gives.  The codes are spread to the low bits of the four bytes with two shift-and-mask steps, and

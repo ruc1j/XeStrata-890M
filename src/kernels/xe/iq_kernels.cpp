@@ -640,18 +640,41 @@ inline const void* block_at(const uint8_t* row, int kbx) { return row + (size_t)
 // projection: 180-360 bytes) keeps its lanes busy and reduces in log2(LPR) steps.  Each block is loaded once for all
 // the entries (upstream 8ec94aa); entry e's sum is what one entry alone gives, bit for bit.  `grid`
 // (GridOf<TY>::T): the codebook the blocks are decoded with, when not the global table.
+#ifndef STRATA_SEG_UNROLL
+#define STRATA_SEG_UNROLL 2
+#endif
+constexpr int SEG_UNROLL = STRATA_SEG_UNROLL;
 template<int TY, int LPR, int NE, class G = void>
 inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const block_q8_1* const (&x)[NE], int n,
                           int nb, int seg_lane, float (&out)[NE], const G* grid = nullptr) {
     using F = Fmt<TY>;
     float s[NE];
     for (int e = 0; e < NE; ++e) s[e] = 0.0f;
-    for (int k = seg_lane; k < nb * F::ipb; k += LPR) {
+    // XeStrata-890M: SEG_UNROLL steps' weights loaded before any is applied, so a lane's dependent loads (the codes,
+    // then the grid rows they index) of the steps overlap: a row is only a few steps a lane, and on the 890M one step
+    // at a time left the gate/up kernel waiting on memory.  The sums are added in the same order: bitwise the same.
+    const auto load_at = [&](int k) {
         const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-        const auto wd = [&] {
-            if constexpr (std::is_void_v<G>) return F::S::load(block_at<F>(row, kbx), 0, iqs);
-            else return F::S::load(block_at<F>(row, kbx), 0, iqs, grid);
-        }();
+        if constexpr (std::is_void_v<G>) return F::S::load(block_at<F>(row, kbx), 0, iqs);
+        else return F::S::load(block_at<F>(row, kbx), 0, iqs, grid);
+    };
+    const int K = nb * F::ipb;
+    int k = seg_lane;
+    for (; k + (SEG_UNROLL - 1) * LPR < K; k += SEG_UNROLL * LPR) {
+        decltype(load_at(0)) wd[SEG_UNROLL];
+#pragma unroll
+        for (int u = 0; u < SEG_UNROLL; ++u) wd[u] = load_at(k + u * LPR);
+#pragma unroll
+        for (int u = 0; u < SEG_UNROLL; ++u) {
+            const int ku = k + u * LPR, kbx = ku / F::ipb, iqs = F::step * (ku % F::ipb);
+            const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+            for (int e = 0; e < NE; ++e)
+                if (e < n) s[e] += F::S::apply(wd[u], x[e] + xo, iqs);
+        }
+    }
+    for (; k < K; k += LPR) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        const auto wd = load_at(k);
         const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
         for (int e = 0; e < NE; ++e)
             if (e < n) s[e] += F::S::apply(wd, x[e] + xo, iqs);
@@ -731,9 +754,15 @@ sycl::event launch_mmvq(sycl::queue& q, const uint8_t* w, size_t row_bytes, cons
 // down row of under 12 bytes per 32 values (Q2_0's 180) takes 4: a verify window's grouped experts 3-6% faster on the
 // B70 and on an RTX 4070 (scratch lpr_probe), where IQ4_NL's 360-byte rows were 11% slower with 4 (8 and 16 for gate
 // and up were slower on one or both).
-constexpr int GU_LPR = 16;
+#ifndef STRATA_GU_LPR
+#define STRATA_GU_LPR 8
+#endif
+constexpr int GU_LPR = STRATA_GU_LPR;
 constexpr int DOWN_LPR = 8;
-template<int TG> constexpr int down_lpr() { return Fmt<TG>::bsz * 32 / Fmt<TG>::qk < 12 ? 4 : DOWN_LPR; }
+#ifndef STRATA_DOWN_SMALL_LPR
+#define STRATA_DOWN_SMALL_LPR 4
+#endif
+template<int TG> constexpr int down_lpr() { return Fmt<TG>::bsz * 32 / Fmt<TG>::qk < 12 ? STRATA_DOWN_SMALL_LPR : DOWN_LPR; }
 constexpr int GU_ROWS = 8;     // rows per work-group (one sub-group each)
 // entries (a window's tokens routed to one expert) a pass over the row; the verify window of --spec 4 fits in one
 constexpr int kEntriesPass = 4;

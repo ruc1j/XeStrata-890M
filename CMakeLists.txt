@@ -657,6 +657,8 @@ if(STRATA_ENABLE_XE)
     # the dense decode products' time on this GPU (XeStrata-890M), with an output check against a saved run
     add_executable(mmvq_bench src/kernels/mmvq_bench.cpp)
     target_link_libraries(mmvq_bench PRIVATE strata_kernels)
+    add_executable(expert_bench src/kernels/expert_bench.cpp)
+    target_link_libraries(expert_bench PRIVATE strata_kernels)
     add_executable(native_multi_parity src/kernels/native_multi_parity.cpp)
     target_link_libraries(native_multi_parity PRIVATE strata_kernels)
     add_test(NAME native_multi_parity COMMAND native_multi_parity)
