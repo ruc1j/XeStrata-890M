@@ -15,6 +15,7 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gr
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -70,7 +71,14 @@ bool gr_fast(sycl::queue& q) {
         return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
     }();
     // XeStrata-890M: also on the HIP backend (the 890M, gfx1150: decode 11.55 -> 11.92 tok/s at fixed clocks, bitwise)
-    return env >= 0 ? env != 0 : xe::sm70_table(q) || q.get_device().get_backend() == sycl::backend::ext_oneapi_hip;
+    const bool on = env >= 0 ? env != 0 : xe::sm70_table(q) || q.get_device().get_backend() == sycl::backend::ext_oneapi_hip;
+    static const bool said = [on] {
+        std::fprintf(stderr, "strata: the hyper-connection read takes the %s form (STRATA_GR_FAST)\n",
+                     on ? "latency-hidden" : "default");
+        return true;
+    }();
+    (void) said;
+    return on;
 }
 
 // 8 bf16 packed in a uint4 against 8 floats.
