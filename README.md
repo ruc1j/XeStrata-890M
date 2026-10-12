@@ -3,9 +3,20 @@ SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: LGPL-3.0-or-later
 -->
-# XeStrata
+# XeStrata-890M
 
 English | [日本語](README.ja.md)
+
+**XeStrata-890M is a fork of [XeStrata](https://github.com/MistVVK/XeStrata) tuned for the AMD Radeon 890M (the integrated GPU of the Ryzen AI 9 HX 370 and others: gfx1150, RDNA3.5, unified memory shared with the CPU).**
+Its first priority is Qwen3.8-Flash-Next's decode speed on the 890M.
+It keeps the original code that runs on other GPUs, but its speed and behaviour there are not checked.
+
+The main changes for the 890M:
+
+- `STRATA_CACHE_HOST=1`: the expert cache in host memory (host USM) instead of the GPU's pool (the GTT, about half the
+  RAM by default), so the GPU reads every expert directly (with `--mmap-experts --expert-cache 24576 --no-prefill-borrow`).
+
+What follows is the original XeStrata's description.
 
 Run a 125-billion-parameter AI model on one Intel Arc, AMD Radeon or NVIDIA GPU and an ordinary PC.
 

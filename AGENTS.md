@@ -10,6 +10,15 @@
 - **Keep it current in the same turn:** a fact learned or found changed (a new container, a moved folder, something a machine lacks) goes into `LOCAL.md` before the work moves on. A fact that is missing there is looked up, and asked of the user only when it cannot be found, then written down.
 - It is written in Japanese, by machine, facts only, as it is now.
 
+## This fork: XeStrata-890M
+
+This repository is XeStrata-890M, a fork tuned for the AMD Radeon 890M (gfx1150, RDNA3.5, unified memory; the
+machine is described in `LOCAL.md`).  Its goal is Qwen3.8-Flash-Next's decode speed on the 890M, and that goal comes
+before the hardware-independence rule below: a change may be measured on the 890M alone and may favour it, as long as
+it is opt-in or chosen from what the device reports (an integrated GPU, the HIP backend) rather than from its name.
+Other GPUs are `unverified`.  Measure with the GPU's clocks in mind: the 890M in this machine throttles at 95 °C under
+sustained load, so compare runs interleaved, not one after the other.
+
 ## Hardware independence (the first rule)
 
 XeStrata runs on any Intel Arc GPU and any x86-64 CPU with AVX2, not on the development machine's B70 and i7-14700.

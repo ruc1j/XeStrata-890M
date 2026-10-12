@@ -198,6 +198,13 @@ public:
     /// The elastic K/V (--kv-grow): the arena in a VMM range (vmm.hpp) instead of one allocation, so the K/V can take
     /// single chunks of it and give them back. Applies to the next `open`; ignored where VMM is not available.
     static void set_vmm(bool enabled);
+    /// The slots in host USM instead of device memory (STRATA_CACHE_HOST=1: a GPU that shares the host's RAM, where
+    /// host USM is read at full speed and is not bounded by the driver's GPU pool).  Applies to the next `open`; not
+    /// with set_vmm or a segment size.
+    static void set_host_usm(bool enabled);
+    static bool host_usm_requested();
+    /// Whether this cache's slots are in host USM (set_host_usm).
+    bool host_usm() const { return host_usm_; }
     /// The arena's range (null: one allocation).
     VmmRange* vmm_range() { return vmm_.get(); }
     /// Byte offset of slot `s` in the arena (s == slots(): the end).
@@ -208,6 +215,7 @@ private:
     bool open_segmented(uint64_t want, std::string& err);
     void release_segmented();
     uint8_t* base_ = nullptr;
+    bool host_usm_ = false;               ///< the slots are host USM (set_host_usm)
     int64_t live_slots_ = 0;              ///< #533: slots() - all of them unless shrunk
     int64_t seg_req_ = 0;                 ///< #533: the segment size asked for (0: one allocation)
     int64_t seg_ = 0;                     ///< #533: the segment size used (a multiple of the granularity)

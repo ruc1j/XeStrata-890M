@@ -274,9 +274,12 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
 
 namespace {
 bool g_cache_vmm = false;   // set_vmm
+bool g_cache_host = false;  // set_host_usm
 }  // namespace
 
 void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
+void ExpertCache::set_host_usm(bool enabled) { g_cache_host = enabled; }
+bool ExpertCache::host_usm_requested() { return g_cache_host; }
 
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                        std::string& err) {
@@ -292,6 +295,23 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
 
     const uint64_t want = (uint64_t) n_slots * (uint64_t) blob_bytes;
 
+    // STRATA_CACHE_HOST=1 (set_host_usm): the slots in host USM instead of device memory.  On a GPU that shares the
+    // host's RAM (an APU) host USM is the same DRAM, read by kernels at full speed, and it is not bounded by the
+    // driver's GPU pool (the GTT, about half the RAM by default): the cache can hold every expert.  The 890M
+    // (gfx1150, HIP) read a 34 GiB host USM buffer at 44-54 GB/s against 32-34 GB/s for a device allocation of 4 GiB
+    // or more.  The RAM check is the caller's (the slots come out of the memory the host has).
+    if (g_cache_host) {
+        base_ = static_cast<uint8_t*>(strata::gpu::alloc_host((size_t) want));
+        if (base_ == nullptr) {
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "ExpertCache: host USM allocation of %.2f GiB failed: %s",
+                          (double) want / 1073741824.0, strata::gpu::last_error());
+            err = buf;
+            return false;
+        }
+        host_usm_ = true;
+    }
+
     // ---- **THE ALLOCATION IS CHECKED AGAINST THE CARD, NOT AGAINST THE REQUEST.**
     //
     // `cudaMalloc` failing is the easy case. The one that matters is a machine where the weights already own
@@ -299,7 +319,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // `device_slot()` walks off the end. So the free-VRAM figure is read and compared BEFORE the allocation,
     // and the two numbers are named in the refusal.
     size_t free_b = 0, total_b = 0;
-    if (strata::gpu::mem_info(&free_b, &total_b)) {
+    if (!host_usm_ && strata::gpu::mem_info(&free_b, &total_b)) {
         if ((uint64_t) free_b < want) {
             char buf[320];
             std::snprintf(buf, sizeof buf,
@@ -313,7 +333,9 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
+    if (host_usm_) {
+        // allocated above
+    } else if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
         if (!open_segmented(want, err)) return false;
     } else if (g_cache_vmm && vmm_available()) {
         // the elastic K/V: every chunk mapped now; the K/V may later take some of them (and give them back)
@@ -398,9 +420,10 @@ void ExpertCache::close() {
         vmm_.reset();   // unmaps and frees every chunk it still holds
         base_ = nullptr;
     } else if (base_ != nullptr) {
-        strata::gpu::free(base_);
+        strata::gpu::free(base_);   // device or host USM
         base_ = nullptr;
     }
+    host_usm_ = false;
     residency_.clear();
     slots_ = 0;
     live_slots_ = 0;

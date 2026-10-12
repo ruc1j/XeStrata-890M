@@ -4159,6 +4159,32 @@ int main(int argc, char** argv) {
             stages[i]->le = i + 1 < stages.size() ? split_at[i + 1] : g.n_layers;
         }
     }
+    // STRATA_CACHE_HOST=1: the expert cache in host USM (ExpertCache::set_host_usm), on a GPU that shares the host's
+    // RAM only.  Its slots then come out of the RAM, not the GPU's pool: the sizing below counts what Linux can give
+    // (MemAvailable, less STRATA_UMA_HEADROOM_GIB as for any integrated GPU) instead of the free VRAM.
+    const bool cache_host = [&] {
+        const char* v = std::getenv("STRATA_CACHE_HOST");
+        if (v == nullptr || v[0] != '1' || multi_gpu) return false;
+        if (!strata::core::device_info(strata::core::current_device()).integrated) {
+            std::fprintf(stderr, "strata generate: STRATA_CACHE_HOST=1 is for a GPU that shares the host's RAM: off\n");
+            return false;
+        }
+        return true;
+    }();
+    strata::core::ExpertCache::set_host_usm(cache_host);
+    auto cache_mem_info = [&](size_t* free_b, size_t* total_b) {
+        if (!cache_host) return strata::gpu::mem_info(free_b, total_b);
+        strata::core::detail::HostMemory hm;
+        if (!strata::core::detail::host_available_memory(hm)) return false;
+        uint64_t f = hm.available;
+        strata::core::apply_uma_limit(f);
+        *free_b = (size_t) f;
+        *total_b = (size_t) hm.available;
+        return true;
+    };
+    if (cache_host)
+        std::fprintf(stderr, "strata generate: the expert cache goes into host USM (STRATA_CACHE_HOST=1): sized by the "
+                             "RAM Linux can give, not the GPU's pool\n");
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
@@ -4171,7 +4197,7 @@ int main(int argc, char** argv) {
                      o.pipeline_windows >= 2 ? ", the GDN snapshots" : "");
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
-        strata::gpu::mem_info(&free_b, &total_b);
+        cache_mem_info(&free_b, &total_b);
         free_b += (size_t) blas_bytes;   // the matrix library's VRAM is the reserve's (above)
         // The batched prompt path's chunk buffers are allocated later, so reserve room for them here.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
@@ -4253,7 +4279,7 @@ int main(int argc, char** argv) {
         // a layer split's prompt path with buffers of its own (--no-prefill-borrow): an explicit cache size leaves
         // room for them and the reserve, or the first prompt fails with "device buffers ... do not fit"
         size_t free_b = 0, total_b = 0;
-        strata::gpu::mem_info(&free_b, &total_b);
+        cache_mem_info(&free_b, &total_b);
         const int64_t prefill_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + pipe_first;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
@@ -4274,7 +4300,7 @@ int main(int argc, char** argv) {
     uint64_t per_layer_bytes = 0;
     if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {
         size_t free_b = 0, total_b = 0;
-        strata::gpu::mem_info(&free_b, &total_b);
+        cache_mem_info(&free_b, &total_b);
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int asked = o.expert_cache;
         const uint64_t budget = (uint64_t) asked * lay.max_blob;
@@ -4298,7 +4324,7 @@ int main(int argc, char** argv) {
         }
     } else if (native_pack && o.expert_cache > 0 && !profile.empty()) {
         size_t free_b = 0, total_b = 0;
-        strata::gpu::mem_info(&free_b, &total_b);
+        cache_mem_info(&free_b, &total_b);
         const auto& lay = strata::kernels::cpu::expert_layout();
         const uint64_t budget = (uint64_t) o.expert_cache * lay.max_blob;   // what the uniform sizing granted
         uint64_t used = 0;
