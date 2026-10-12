@@ -63,13 +63,14 @@ inline float sigmoidf_(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 
 // Upstream's latency-hidden norm and up kernels (aaa323fe: gfx906's, which upstream runs on sm_70 too; V100-SXM2: 50.9
 // -> 46.7 us a read at T 1, hc-read0's up 1.08 -> 0.96 ms a window, bitwise): STRATA_GR_FAST=1 or 0 on any GPU, else
-// Volta with STRATA_SM70_TABLE=1 (sm70_table.hpp).
+// Volta with STRATA_SM70_TABLE=1 (sm70_table.hpp) and AMD GPUs (the HIP backend).
 bool gr_fast(sycl::queue& q) {
     static const int env = [] {
         const char* v = std::getenv("STRATA_GR_FAST");
         return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
     }();
-    return env >= 0 ? env != 0 : xe::sm70_table(q);
+    // XeStrata-890M: also on the HIP backend (the 890M, gfx1150: decode 11.55 -> 11.92 tok/s at fixed clocks, bitwise)
+    return env >= 0 ? env != 0 : xe::sm70_table(q) || q.get_device().get_backend() == sycl::backend::ext_oneapi_hip;
 }
 
 // 8 bf16 packed in a uint4 against 8 floats.
