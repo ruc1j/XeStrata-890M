@@ -8,9 +8,14 @@
 #include "strata/platform/memory.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/core/device.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #include <algorithm>
 #include <climits>
+#include <vector>
+#include <cstring>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -30,10 +35,13 @@ bool in_range(const std::string& name) {
 // too) as the GGUF's Q8_0 values for the verify window's read, beside the pack's BF16 rounding of them.  The GGUF's
 // inject rows are F32 holding BF16 values, so the read keeps the pack's BF16 for them.  Another summation order and
 // other weights: output-changing, so opt-in.
+// XeStrata-890M: on by default on a GPU that shares the host's RAM, where the decode is bound by the memory (the 890M:
+// 22.82/23.35 -> 24.21/24.49 tok/s, IQ2_XS, its BF16 matrices quantized below); STRATA_HC_Q8=0 turns it off.
 bool hc_q8_requested() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_HC_Q8");
-        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+        if (v != nullptr) return std::strtol(v, nullptr, 10) != 0;
+        return strata::core::device_info(strata::core::current_device()).integrated;
     }();
     return on;
 }
@@ -248,7 +256,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 pending.push_back(Pending{&ref, type, bytes, std::move(data)});
             }
             for (const auto& tensor : gguf.tensors()) {
-                if (!hc_q8_requested() || tensor.type != 8 || !hc_q8_name(tensor.name) || !in_range(tensor.name))
+                // XeStrata-890M: a GGUF whose hyper-connection matrices are BF16 (the IQ2_XS one) has them quantized
+                // to Q8_0 here, as ggml's quantize_row_q8_0_ref does, so STRATA_HC_Q8 halves their bytes there too
+                if (!hc_q8_requested() || (tensor.type != 8 && tensor.type != 30) || !hc_q8_name(tensor.name) ||
+                    !in_range(tensor.name))
                     continue;
                 auto found = table.table_.find(tensor.name);
                 if (found == table.table_.end()) continue;
@@ -263,7 +274,28 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 void* allocation = nullptr;
                 bool status = strata::gpu::alloc_device(&allocation, bytes);
                 DevicePtr data(allocation);
-                if (status) status = strata::gpu::copy(data.get(), gguf.tensor_data(tensor), bytes);
+                std::vector<uint8_t> q8;
+                const void* src = gguf.tensor_data(tensor);
+                if (tensor.type == 30) {   // BF16 -> Q8_0: per 32 values d = amax / 127 (fp16), q = round(x / d)
+                    const uint64_t n = (uint64_t) ref.ne0 * (uint64_t) ref.ne1;
+                    const auto* bf = static_cast<const uint16_t*>(src);
+                    q8.resize(bytes);
+                    for (uint64_t b = 0; b < n / 32; ++b) {
+                        float v[32], amax = 0.0f;
+                        for (int i = 0; i < 32; ++i) {
+                            const uint32_t u = (uint32_t) bf[b * 32 + i] << 16;
+                            std::memcpy(&v[i], &u, 4);
+                            amax = std::max(amax, std::fabs(v[i]));
+                        }
+                        const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+                        const sycl::half dh(d);
+                        uint8_t* blk = q8.data() + b * 34;
+                        std::memcpy(blk, &dh, 2);
+                        for (int i = 0; i < 32; ++i) blk[2 + i] = (uint8_t) (int8_t) std::lround(v[i] * id);
+                    }
+                    src = q8.data();
+                }
+                if (status) status = strata::gpu::copy(data.get(), src, bytes);
                 if (!status) {
                     err = "native dense (STRATA_HC_Q8) upload " + tensor.name + ": " + strata::gpu::last_error();
                     return false;
