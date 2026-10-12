@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -81,7 +82,8 @@ int main(int argc, char** argv) {
         std::vector<unsigned long long> gptr(G);
         std::vector<int32_t> gstart(G + 1, 0), ent_tok, ent_dst;
         for (int g = 0; g < G; ++g) {
-            gptr[g] = (unsigned long long) (pool + ids[g] * blob);
+            // EXPERT_BENCH_SAME=1: every group reads the same blob (cached): what the kernels cost without the memory
+            gptr[g] = (unsigned long long) (pool + (std::getenv("EXPERT_BENCH_SAME") ? 0 : ids[g]) * blob);
             for (int t : by_expert[g]) { ent_tok.push_back(t); ent_dst.push_back((int32_t) ent_dst.size()); }
             gstart[g + 1] = (int32_t) ent_tok.size();
         }

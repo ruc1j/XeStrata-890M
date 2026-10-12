@@ -41,7 +41,7 @@ constexpr int UPM_BLOCKS = N / UPM_COLS;         // 160
 // squares; `up` adds them per stream in a fixed order, applies rs and runs the epilogue.  The weights are
 // kNativeQ8Rows' (each row's int8 values, then its fp16 scales): every load aligned.
 #ifndef STRATA_Q8_RPW
-#define STRATA_Q8_RPW 4
+#define STRATA_Q8_RPW 2
 #endif
 #ifndef STRATA_Q8_KC
 #define STRATA_Q8_KC 640
