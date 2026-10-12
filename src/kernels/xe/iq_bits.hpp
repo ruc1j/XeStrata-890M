@@ -42,6 +42,18 @@ inline uint16_t half_of(uint32_t v, int i) { return (uint16_t) (v >> (16 * i)); 
 inline uint32_t ksigns_byte(uint8_t v) { return (uint32_t) (v ^ (sycl::popcount((uint32_t) v) & 1) << 7) & 0xFF; }
 struct Int2 { int x, y; };
 inline Int2 get_int_from_table_16(int q4, const int8_t* table) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+    // XeStrata-890M: v_perm_b32 with byte selectors (llama.cpp's HIP form), six perms instead of the CUDA form's
+    // translated nibble selectors (~40 instructions every 8 weights on gfx1150); the same bytes
+    const uint32_t* v = reinterpret_cast<const uint32_t*>(table);
+    const uint32_t qe = (uint32_t) q4, qo = (uint32_t) q4 >> 4;
+    const uint32_t el = __builtin_amdgcn_perm(v[1], v[0], qe & 0x07070707u);
+    const uint32_t ol = __builtin_amdgcn_perm(v[1], v[0], qo & 0x07070707u);
+    const uint32_t eh = __builtin_amdgcn_perm(v[3], v[2], qe & 0x07070707u);
+    const uint32_t oh = __builtin_amdgcn_perm(v[3], v[2], qo & 0x07070707u);
+    return {(int) __builtin_amdgcn_perm(eh, el, 0x03020100u | ((qe & 0x08080808u) >> 1)),
+            (int) __builtin_amdgcn_perm(oh, ol, 0x03020100u | ((qo & 0x08080808u) >> 1))};
+#endif
     const uint32_t* table32 = reinterpret_cast<const uint32_t*>(table);
     uint32_t tmp[2];
     const uint32_t sel = 0x32103210 | (((uint32_t) q4 & 0x88888888) >> 1);

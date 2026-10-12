@@ -45,6 +45,7 @@
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <string>
 
 namespace strata::kernels {
@@ -114,6 +115,20 @@ alignas(4) const int8_t iq4nl_values[16] = {
 };
 struct Int2 { int x, y; };
 inline Int2 iq4_table_lookup(int q4) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+    // XeStrata-890M: AMD's v_perm_b32 takes byte selectors, so the CUDA form above (nibble selectors, through
+    // byte_perm's translation) cost ~40 instructions every 8 weights on gfx1150; this is llama.cpp's HIP form
+    // (get_int_from_table_16): six perms.  The same bytes: x the low nibbles' values, y the high ones'.
+    const uint32_t* v = reinterpret_cast<const uint32_t*>(iq4nl_values);
+    const uint32_t qe = (uint32_t) q4, qo = (uint32_t) q4 >> 4;
+    const uint32_t el = __builtin_amdgcn_perm(v[1], v[0], qe & 0x07070707u);
+    const uint32_t ol = __builtin_amdgcn_perm(v[1], v[0], qo & 0x07070707u);
+    const uint32_t eh = __builtin_amdgcn_perm(v[3], v[2], qe & 0x07070707u);
+    const uint32_t oh = __builtin_amdgcn_perm(v[3], v[2], qo & 0x07070707u);
+    const uint32_t x = __builtin_amdgcn_perm(eh, el, 0x03020100u | ((qe & 0x08080808u) >> 1));
+    const uint32_t y = __builtin_amdgcn_perm(oh, ol, 0x03020100u | ((qo & 0x08080808u) >> 1));
+    return {(int) x, (int) y};
+#endif
     const uint32_t* table32 = reinterpret_cast<const uint32_t*>(iq4nl_values);
     uint32_t tmp[2];
     const uint32_t low_high_selection_indices = 0x32103210 | (((uint32_t) q4 & 0x88888888) >> 1);
@@ -586,6 +601,145 @@ sycl::event launch_row(sycl::queue& q, const void* weights, const void* x_q8_1, 
     });
 }
 
+// launch_row with RPS rows a sub-group (XeStrata-890M): a lane issues the loads of all its rows' blocks before it
+// uses any, so on a GPU where a row's two or three steps cannot hide the memory's latency (the 890M: one sub-group a
+// row read 2560 -> 10240 at 23 GB/s) the rows' loads overlap.  Each row's sums are made in the same order as
+// launch_row's, so every output is bitwise launch_row's.
+template<typename F, int NCOLS, int RPG, int RPS>
+sycl::event launch_rows(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out,
+                        const void* weights2 = nullptr, float* y2 = nullptr) {
+    static_assert(WARP % F::T == 0, "a block's lanes must divide the sub-group");
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int rows_all = weights2 ? 2 * n_out : n_out;
+    const int subs = (rows_all + RPS - 1) / RPS;
+    const std::size_t groups = (std::size_t(subs) + RPG - 1) / RPG;
+    return q.parallel_for(sycl::nd_range<1>(groups * RPG * WARP, std::size_t(RPG) * WARP),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int lane = (int) sg.get_local_linear_id();
+        const int sub = (int) it.get_group(0) * RPG + (int) sg.get_group_linear_id();
+        if (sub >= subs) return;
+        const int blocks_per_row = n_in / F::DIV;
+        const int x_stride = n_in / Q8K;
+        const int kqs = F::kqs(lane);
+        const typename F::Block* wp[RPS];
+        bool live[RPS];
+        #pragma unroll
+        for (int r = 0; r < RPS; ++r) {
+            int row = sub * RPS + r;
+            live[r] = row < rows_all;
+            if (!live[r]) row = sub * RPS;   // a valid row's address; its result is not written
+            const void* wsrc = row >= n_out ? weights2 : weights;
+            if (row >= n_out) row -= n_out;
+            wp[r] = static_cast<const typename F::Block*>(wsrc) + std::size_t(row) * blocks_per_row;
+        }
+        float tmp[RPS][NCOLS] = {};
+        for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += WARP / F::T) {
+            typename F::W wv[RPS];
+            #pragma unroll
+            for (int r = 0; r < RPS; ++r) wv[r] = F::load(wp[r] + kbx, kqs);
+            #pragma unroll
+            for (int r = 0; r < RPS; ++r)
+                for (int j = 0; j < NCOLS; ++j)
+                    tmp[r][j] += F::apply(wv[r], x + std::size_t(j) * x_stride + std::size_t(kbx) * F::KBY, kqs);
+        }
+        #pragma unroll
+        for (int r = 0; r < RPS; ++r) {
+            int row = sub * RPS + r;
+            float* ydst = y;
+            if (row >= n_out) { row -= n_out; ydst = y2; }
+            for (int j = 0; j < NCOLS; ++j) {
+                const float s = warp_sum(sg, tmp[r][j]);
+                if (lane == 0 && live[r]) ydst[std::size_t(j) * n_out + row] = s;
+            }
+        }
+    });
+}
+
+// IQ4_XS with RPS rows a sub-group and the activations loaded once a block for all of them (XeStrata-890M).  In
+// launch_row every row's sub-group loads the block's eight activation words a column again, so a 2560 -> 10240 product
+// of four columns moves ~118 MB through the caches for 14 MB of weights, and the 890M ran it at 23 GB/s.  Here a lane
+// keeps its block's words of every column in registers and applies them to RPS rows.  The per-row arithmetic is
+// IQ4XSTraits::apply's in the same order, so every output is bitwise launch_row's.
+template<int NCOLS, int RPG, int RPS>
+sycl::event launch_iq4xs_rows(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out,
+                              const void* weights2 = nullptr, float* y2 = nullptr) {
+    using F = IQ4XSTraits;
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int rows_all = weights2 ? 2 * n_out : n_out;
+    const int subs = (rows_all + RPS - 1) / RPS;
+    const std::size_t groups = (std::size_t(subs) + RPG - 1) / RPG;
+    return q.parallel_for(sycl::nd_range<1>(groups * RPG * WARP, std::size_t(RPG) * WARP),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int lane = (int) sg.get_local_linear_id();
+        const int sub = (int) it.get_group(0) * RPG + (int) sg.get_group_linear_id();
+        if (sub >= subs) return;
+        const int blocks_per_row = n_in / F::DIV;
+        const int x_stride = n_in / Q8K;
+        const int iqs = F::kqs(lane);
+        const F::Block* wp[RPS];
+        bool live[RPS];
+        #pragma unroll
+        for (int r = 0; r < RPS; ++r) {
+            int row = sub * RPS + r;
+            live[r] = row < rows_all;
+            if (!live[r]) row = sub * RPS;
+            const void* wsrc = row >= n_out ? weights2 : weights;
+            if (row >= n_out) row -= n_out;
+            wp[r] = static_cast<const F::Block*>(wsrc) + std::size_t(row) * blocks_per_row;
+        }
+        float tmp[RPS][NCOLS] = {};
+        for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += WARP / F::T) {
+            int xv[NCOLS][8];
+            float xd[NCOLS];
+            #pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                const Q81Block* xb = x + std::size_t(j) * x_stride + std::size_t(kbx) * F::KBY + iqs / 4;
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) xv[j][k] = load_int(xb->qs, k);
+                xd[j] = low(xb->ds);
+            }
+            F::W wv[RPS];
+            #pragma unroll
+            for (int r = 0; r < RPS; ++r) wv[r] = F::load(wp[r] + kbx, iqs);
+            #pragma unroll
+            for (int r = 0; r < RPS; ++r)
+                #pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    int sumi = 0;
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        sumi = dp4a(wv[r].v[k].x, xv[j][k], sumi);
+                        sumi = dp4a(wv[r].v[k].y, xv[j][k + 4], sumi);
+                    }
+                    sumi *= wv[r].ls - 32;
+                    tmp[r][j] += wv[r].dw * xd[j] * sumi;
+                }
+        }
+        #pragma unroll
+        for (int r = 0; r < RPS; ++r) {
+            int row = sub * RPS + r;
+            float* ydst = y;
+            if (row >= n_out) { row -= n_out; ydst = y2; }
+            #pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                const float s = warp_sum(sg, tmp[r][j]);
+                if (lane == 0 && live[r]) ydst[std::size_t(j) * n_out + row] = s;
+            }
+        }
+    });
+}
+
+// STRATA_MMVQ_RPS=N (1, 2, 4): rows a sub-group in launch_row's place (launch_rows); 0 or unset: launch_row
+int mmvq_rps() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_MMVQ_RPS");
+        return e != nullptr ? (int) std::strtol(e, nullptr, 10) : 0;
+    }();
+    return v;
+}
+
 template<typename F, int NCOLS>
 void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
     if (NCOLS > 1 && !g_multi_exact) {
@@ -598,6 +752,18 @@ void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y,
     // (the 2026-10-02-xe-decode-gpu record).
     const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
     if (steps <= 10) {
+        if constexpr (std::is_same_v<F, IQ4XSTraits>) {
+            const int rps = mmvq_rps();
+            if (rps == 11) { launch_iq4xs_rows<NCOLS, 8, 1>(q, weights, x_q8_1, y, n_in, n_out); return; }
+            if (rps == 12) { launch_iq4xs_rows<NCOLS, 8, 2>(q, weights, x_q8_1, y, n_in, n_out); return; }
+            if (rps == 14) { launch_iq4xs_rows<NCOLS, 8, 4>(q, weights, x_q8_1, y, n_in, n_out); return; }
+            if (rps == 18) { launch_iq4xs_rows<NCOLS, 4, 8>(q, weights, x_q8_1, y, n_in, n_out); return; }
+        }
+        if constexpr (!requires { F::load_row; }) {
+            const int rps = mmvq_rps();
+            if (rps == 2) { launch_rows<F, NCOLS, 8, 2>(q, weights, x_q8_1, y, n_in, n_out); return; }
+            if (rps == 4) { launch_rows<F, NCOLS, 8, 4>(q, weights, x_q8_1, y, n_in, n_out); return; }
+        }
         launch_row<F, NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);
         return;
     }
