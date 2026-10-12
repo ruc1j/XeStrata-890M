@@ -549,6 +549,9 @@ public:
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    /// XeStrata-890M: the expert's mapped file pages (the GGUF's three role slices, or its experts.bin range) taken out
+    /// of this process and dropped from the file cache; a later read faults them in again.  Returns the bytes.
+    uint64_t release(int64_t layer, int64_t expert) override;
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
     double cached_share(int64_t samples) const override;

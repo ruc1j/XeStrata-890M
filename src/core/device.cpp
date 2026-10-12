@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -326,6 +327,19 @@ void Runtime::wait(sycl::event event, const char* what) {
         std::list<Waiter>::iterator it;
         ~Done() { std::lock_guard<std::mutex> lock(r.watch_mutex_); r.waiters_.erase(it); }
     } done{*this, self};
+    // XeStrata-890M: on a GPU that shares the host's RAM and power budget, HIP's event wait spins a CPU core at full
+    // clock for the whole window (hsa BusyWaitSignal), and that core's power is taken from the GPU's.  There the wait
+    // polls the event's status and sleeps STRATA_WAIT_SLEEP_US between polls (default 50 on such a GPU on the HIP
+    // backend, 0 elsewhere: block as before).
+    static const int sleep_us = [this] {
+        const char* v = std::getenv("STRATA_WAIT_SLEEP_US");
+        if (v != nullptr) return (int) std::strtol(v, nullptr, 10);
+        return device_.get_backend() == sycl::backend::ext_oneapi_hip && integrated_gpu(device_) ? 50 : 0;
+    }();
+    if (sleep_us > 0)
+        while (event.get_info<sycl::info::event::command_execution_status>() !=
+               sycl::info::event_command_status::complete)
+            std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
     event.wait_and_throw();
     check_async();
 }

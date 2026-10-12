@@ -867,6 +867,39 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
     return true;
 }
 
+uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
+#if defined(_WIN32)
+    (void) layer; (void) expert;
+    return 0;
+#else
+    if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return 0;
+    // the whole pages inside [p, p + n): madvise drops them from this process, fadvise from the file cache
+    auto drop = [&](const uint8_t* p, uint64_t n) -> uint64_t {
+        for (const Map& m : maps_) {
+            if (m.base == nullptr || p < m.base || p + n > m.base + m.bytes) continue;
+            const uint64_t a = ((uint64_t) (p - m.base) + 4095) & ~(uint64_t) 4095;
+            const uint64_t b = ((uint64_t) (p - m.base) + n) & ~(uint64_t) 4095;
+            if (b <= a) return 0;
+            (void) madvise((void*) (m.base + a), (size_t) (b - a), MADV_DONTNEED);
+            if (m.fd >= 0) (void) posix_fadvise(m.fd, (off_t) a, (off_t) (b - a), POSIX_FADV_DONTNEED);
+            return b - a;
+        }
+        return 0;
+    };
+    if (!role_ptr_.empty()) {
+        uint64_t n = 0;
+        for (int r = 0; r < 3; ++r) {
+            const size_t i = (size_t) (3 * layer + r);
+            if (role_ptr_[i] == nullptr || role_bytes_[i] == 0) continue;
+            n += drop(role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]), role_bytes_[i]);
+        }
+        return n;
+    }
+    const uint8_t* b = mapped_blob(layer, expert);
+    return b == nullptr ? 0 : drop(b, layer_blob_bytes_[(size_t) layer]);
+#endif
+}
+
 const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) const {
     if (!role_ptr_.empty()) return nullptr;   // the GGUF in place: no contiguous blob in any file
     if (base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return nullptr;

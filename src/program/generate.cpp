@@ -4485,6 +4485,11 @@ int main(int argc, char** argv) {
             }
             fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
             ++prefilled;
+            // XeStrata-890M: a host USM cache takes the RAM itself, so the file pages a filled expert was read from
+            // go back to the OS at once; left mapped until the fill ends, they and the cache together outgrew the RAM
+            // (the 890M's 62 GiB: the kernel's OOM killer stopped the engine during the fill).  The first pair is
+            // read again for the check below and handed back with the rest after it.
+            if (xcache.host_usm() && i > 0) (void) srcp->release(profile[(size_t) i].first, profile[(size_t) i].second);
         }
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
