@@ -57,6 +57,17 @@
 namespace strata::kernels {
 namespace {
 
+// XeStrata-890M: an expert blob's address as the kernels read it from the group table (a 64-bit integer) made into a
+// pointer the compiler knows is global memory.  Made straight into a generic pointer, AMD's compiler loaded the
+// weights with flat loads and waited for every one of them (vmcnt and lgkmcnt) before the next step.
+inline const uint8_t* global_blob(unsigned long long a) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+    return (const uint8_t*) (const __attribute__((opencl_global)) uint8_t*) a;
+#else
+    return (const uint8_t*) a;
+#endif
+}
+
 constexpr int kWarp = 32;
 
 sycl::queue& queue_for(void* stream) {
@@ -749,7 +760,7 @@ sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned l
         const int nb = valid ? (int) (L.n_embd / Fmt<TG>::qk) : 0, xb = (int) (L.n_embd / 32);
         // the groups g, g + grid rows, ...: a group's rows are the same code in the same order whatever the grid
         for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {
-            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+            const uint8_t* blob = global_blob(grp_ptr[g]);
             const uint8_t* wr = blob + (is_up && valid ? L.up_off : 0) + (size_t) r * L.gu_row;
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
             for (int e = e0; e < e1; e += kEntriesPass) {   // the row's blocks decoded once for kEntriesPass entries
@@ -781,7 +792,7 @@ sycl::event launch_native_down(sycl::queue& q, size_t cap_groups, const unsigned
         const bool valid = r < L.n_embd;
         const int nb = valid ? (int) (L.n_ff / Fmt<TD>::qk) : 0, hb = (int) (L.n_ff / 32);
         for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {   // as gate/up
-            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+            const uint8_t* blob = global_blob(grp_ptr[g]);
             const uint8_t* wr = blob + L.down_off + (size_t) (valid ? r : 0) * L.d_row;
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
             for (int e = e0; e < e1; e += kEntriesPass) {
@@ -834,7 +845,7 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
                 grid = sgrid.template get_multi_ptr<sycl::access::decorated::no>().get();
             }
             const auto* sxb = reinterpret_cast<const block_q8_1*>(sx.template get_multi_ptr<sycl::access::decorated::no>().get());
-            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+            const uint8_t* blob = global_blob(grp_ptr[g]);
             const int nb = (int) (L.n_embd / Fmt<TG>::qk), hb = (int) (L.n_ff / 32);
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
             const int r0 = (int) it.get_group(1) * 32;
@@ -892,7 +903,7 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
             const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
             const int seg_lane = lane % LPR;
             const auto* shb = reinterpret_cast<const block_q8_1*>(sh.template get_multi_ptr<sycl::access::decorated::no>().get());
-            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+            const uint8_t* blob = global_blob(grp_ptr[g]);
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
             for (int c0 = e0; c0 < e1; c0 += kEntriesPass) {
                 const int cn = sycl::min(kEntriesPass, e1 - c0);
