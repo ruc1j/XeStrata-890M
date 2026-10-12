@@ -117,8 +117,12 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
 
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream) {
     const int C = channels;
-    const auto e = Q(stream).parallel_for(sycl::range<1>((size_t) C), [=](sycl::id<1> id) {
-        const int c = (int) id[0];
+    // XeStrata-890M: an explicit 256-wide work-group (the plain range left the HIP runtime's choice, and the 890M took
+    // 73 us a call for 10,240 channels of three floats)
+    const size_t G = 256;
+    const auto e = Q(stream).parallel_for(sycl::nd_range<1>(((size_t) C + G - 1) / G * G, G), [=](sycl::nd_item<1> it) {
+        const int c = (int) it.get_global_id(0);
+        if (c >= C) return;
         const int n = *n_keep;
         if (n <= 0) return;
         float seq[3];
