@@ -805,11 +805,14 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
         }
         return;
     }
-    if constexpr ((TY == 22 || TY == 16) && std::is_void_v<G>) {
+    if constexpr (TY == 22 || TY == 16) {
         // XeStrata-890M: the same for the IQ2_S and IQ2_XXS gate/up rows: GU_CHUNK steps' raw words (codes, signs,
         // scales, block scale: the words Split<TY>::load reads) loaded before any is decoded
         constexpr int C = STRATA_GU_CHUNK;
         const int K = nb * F::ipb;
+        const uint64_t* gsrc;   // the codebook: the work-group's copy (mode 8) or the global table
+        if constexpr (std::is_void_v<G>) gsrc = TY == 22 ? iq2s_grid : iq2xxs_grid;
+        else gsrc = grid;
         for (int k0 = seg_lane; k0 < K; k0 += C * LPR) {
             uint32_t ra[C], rb[C], rc[C];
             sycl::half dh[C];
@@ -841,14 +844,14 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
                     w.ls0 = (int) ((rc[u] >> 8) & 0x0F);
                     w.ls1 = (int) (rc[u] >> 12);
                     for (int l0 = 0; l0 < 8; l0 += 2) {
-                        const Int2 grid_pos = grid_pair(iq2s_grid, byte_of(ra[u], l0 / 2) | ((qh << (8 - l0)) & 0x300));
+                        const Int2 grid_pos = grid_pair(gsrc, byte_of(ra[u], l0 / 2) | ((qh << (8 - l0)) & 0x300));
                         const uint32_t s8 = byte_of(rb[u], l0 / 2);
                         w.g[l0] = grid_pos.x; w.m[l0] = sign_mask(s8);
                         w.g[l0 + 1] = grid_pos.y; w.m[l0 + 1] = sign_mask(s8 >> 4);
                     }
                 } else {
                     for (int k2 = 0; k2 < 8; k2 += 2) {
-                        const Int2 grid_pos = grid_pair(iq2xxs_grid, byte_of(ra[u], k2 / 2));
+                        const Int2 grid_pos = grid_pair(gsrc, byte_of(ra[u], k2 / 2));
                         const uint32_t s8 = ksigns_byte((uint8_t) (rb[u] >> (7 * k2 / 2)));
                         w.g[k2] = grid_pos.x; w.m[k2] = sign_mask(s8);
                         w.g[k2 + 1] = grid_pos.y; w.m[k2 + 1] = sign_mask(s8 >> 4);
@@ -1182,13 +1185,15 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
 }
 
 // Mode 8 on the queue's device: STRATA_EXP_MODE=8 on any GPU (another value: the default kernels; upstream's modes 1-7
-// are gfx906's and not here), else Volta with STRATA_SM70_TABLE=1 (sm70_table.hpp).
+// are gfx906's and not here), else Volta with STRATA_SM70_TABLE=1 (sm70_table.hpp) and AMD GPUs (the HIP backend).
 bool exp_mode8(sycl::queue& q) {
     static const int env = [] {
         const char* v = std::getenv("STRATA_EXP_MODE");
         return v != nullptr ? std::atoi(v) : -1;
     }();
-    return env >= 0 ? env == 8 : xe::sm70_table(q);
+    // XeStrata-890M: also on the HIP backend (the 890M, gfx1150: with the batched loads, expert_bench T 4 IQ2_S
+    // 740 -> 652 us, IQ2_XXS 677 -> 582 us, bitwise)
+    return env >= 0 ? env == 8 : xe::sm70_table(q) || q.get_device().get_backend() == sycl::backend::ext_oneapi_hip;
 }
 
 size_t local_mem_bytes(sycl::queue& q) {
