@@ -46,6 +46,9 @@ constexpr int UPM_BLOCKS = N / UPM_COLS;         // 160
 #ifndef STRATA_Q8_KC
 #define STRATA_Q8_KC 640
 #endif
+#ifndef STRATA_HC_UP8
+#define STRATA_HC_UP8 1
+#endif
 constexpr int Q8_RPW = STRATA_Q8_RPW;                          // down rows per sub-group
 constexpr int Q8_RG = LR / (WARPS * Q8_RPW);       // 10 row groups (+1: the inject rows)
 constexpr int Q8_KC = STRATA_Q8_KC, Q8_NKC = D / Q8_KC;     // 16 chunks, 4 per stream
@@ -336,6 +339,72 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
                 }
             }
             sycl::group_barrier(it.get_group());
+#if STRATA_HC_UP8
+            // XeStrata-890M: 8 lanes a row (gr_up_fast's form for the Q8_0 rows): lane j of a group holds the
+            // sub-group kernel's lanes j, j + 8, j + 16 and j + 24 (their values 4 L + 128 st), adds them as the xor
+            // tree's stages 16 and 8 do and shuffles stages 4, 2 and 1 inside the 8: each row's sum bitwise the
+            // sub-group kernel's.  A work-group's 64 rows are 2 passes of 32 groups, 4 rows a sub-group at a time,
+            // the pass's weights loaded before its dots (one row at a time waited on memory for each of 8 rows)
+            {
+                const int j = t & 7, g8 = t >> 3;
+                const auto& my8 = tok(m, j < T ? j : 0);   // this lane's token, for its epilogue
+#pragma unroll
+                for (int p = 0; p < 2; ++p) {
+                    const int r = g8 + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+                    const uint8_t* qrow = m.a[0].q8_up + (size_t) i * Q8_ROW_U;
+                    const uint16_t* drow = reinterpret_cast<const uint16_t*>(qrow + LR);
+                    uint32_t wq[4][3];
+                    uint16_t wd[4][3];
+#pragma unroll
+                    for (int qq = 0; qq < 4; ++qq)
+#pragma unroll
+                        for (int st = 0; st < 3; ++st) {
+                            const int v = 4 * (j + 8 * qq) + 128 * st;
+                            wq[qq][st] = v < LR ? *reinterpret_cast<const uint32_t*>(qrow + v) : 0u;
+                            wd[qq][st] = v < LR ? drow[v / 32] : (uint16_t) 0;
+                        }
+                    float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+                    bool apply = false;
+                    if (j < T) {
+                        rv = my8.R[i];
+                        wn = my8.w_norm[i];
+                        apply = my8.apply;
+                        if (apply) { bo = my8.bo_prev[d0 + dd]; ip = my8.inj_prev[c]; }
+                    }
+                    float mine = 0.0f;
+#pragma unroll
+                    for (int k = 0; k < T; ++k) {
+                        float aq[4];
+#pragma unroll
+                        for (int qq = 0; qq < 4; ++qq) {
+                            float acc = 0.0f;
+#pragma unroll
+                            for (int st = 0; st < 3; ++st) {
+                                const int v = 4 * (j + 8 * qq) + 128 * st;
+                                if (v < LR) {
+                                    const float4 w = q8_four(wq[qq][st], wd[qq][st]);
+                                    const float4 x = lo[k * LR / 4 + v / 4];
+                                    acc = sycl::fma(w.x(), x.x(), acc); acc = sycl::fma(w.y(), x.y(), acc);
+                                    acc = sycl::fma(w.z(), x.z(), acc); acc = sycl::fma(w.w(), x.w(), acc);
+                                }
+                            }
+                            aq[qq] = acc;
+                        }
+                        float sum = (aq[0] + aq[2]) + (aq[1] + aq[3]);
+                        for (int o = 4; o > 0; o >>= 1) sum += strata_shfl_xor(sg, sum, o);
+                        if (j == k) mine = sum;
+                    }
+                    if (j < T) {
+                        if (apply) {
+                            rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                            my8.R_out[i] = rv;
+                        }
+                        const float x = rv * wn * rs_s[j * HC + c];
+                        g[(j * HC + c) * UPM_COLS + dd] = x * sigmoidf_(mine);
+                    }
+                }
+            }
+#else
             const auto& my = tok(m, lane < T ? lane : 0);   // this lane's token, for its epilogue
             for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
                 const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
@@ -380,6 +449,7 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
                     g[(lane * HC + c) * UPM_COLS + dd] = x * sigmoidf_(mine);
                 }
             }
+#endif
             sycl::group_barrier(it.get_group());
             for (int i = t; i < T * UPM_COLS; i += THREADS) {
                 const int k = i / UPM_COLS, col = i - k * UPM_COLS;
