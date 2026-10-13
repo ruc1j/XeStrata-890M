@@ -217,10 +217,78 @@ namespace {
 // a head's 128 columns, follows in a second kernel: this one leaves the unnormalized output in y, and the norm sums
 // the squares by the same sub-groups (columns 32w .. 32w+31, the same butterfly) in the same order.
 constexpr int GS_COLS = 32;
+#ifndef STRATA_GDN_STAGE
+#define STRATA_GDN_STAGE 1
+#endif
 template <bool Q8>
 sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
                            const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1) {
+#if STRATA_GDN_STAGE
+    // XeStrata-890M: every token's k, q, v (the group's columns), exp(gate) and beta staged in local memory before the
+    // recurrence, and the two reductions a token in their own slots, so a token costs two barriers and no global load
+    // (four barriers and its loads, one after another, before); the arithmetic and its order are unchanged: bitwise
+    q.submit([&](sycl::handler& hd) {
+        const size_t mt = (size_t) T;
+        sycl::local_accessor<float, 1> sk(sycl::range<1>(mt * S), hd), sq(sycl::range<1>(mt * S), hd),
+            sv(sycl::range<1>(mt * GS_COLS), hd), sg(sycl::range<1>(2 * mt), hd),
+            redk(sycl::range<1>(mt * RG * GS_COLS), hd), redo(sycl::range<1>(mt * RG * GS_COLS), hd);
+        hd.parallel_for(sycl::nd_range<1>((size_t) h_v * (S / GS_COLS) * GS_COLS * RG, (size_t) GS_COLS * RG),
+                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int grp = (int) it.get_group(0), head = grp / (S / GS_COLS), c0 = (grp % (S / GS_COLS)) * GS_COLS;
+            const int tid = (int) it.get_local_id(0), lc = tid % GS_COLS, rg = tid / GS_COLS, col = c0 + lc;
+            const int qh = head % h_k;
+            const int qk = S * h_k;
+            const int value_dim = S * h_v;
+            const int n = n_keep ? *n_keep : T;
+            float s[RPG];
+            float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+            const size_t row_stride = (size_t) h_v * S;
+            #pragma unroll
+            for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+            for (int i = tid; i < n * S; i += GS_COLS * RG) {
+                const float* ht = hbuf + (size_t) (i / S) * C;
+                sk[i] = ht[qk + qh * S + i % S];
+                sq[i] = ht[qh * S + i % S];
+            }
+            for (int i = tid; i < n * GS_COLS; i += GS_COLS * RG)
+                sv[i] = hbuf[(size_t) (i / GS_COLS) * C + 2 * qk + head * S + c0 + i % GS_COLS];
+            if (tid < n) {
+                sg[2 * tid] = sycl::exp(gate[(size_t) tid * h_v + head]);
+                sg[2 * tid + 1] = beta[(size_t) tid * h_v + head];
+            }
+            sycl::group_barrier(it.get_group());
+            for (int t = 0; t < n; ++t) {
+                const float* kt = &sk[(size_t) t * S];
+                const float* qt = &sq[(size_t) t * S];
+                float* rk = &redk[(size_t) t * RG * GS_COLS];
+                float* ro = &redo[(size_t) t * RG * GS_COLS];
+                const float g = sg[2 * t];
+                float kv = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], kt[rg * RPG + r], kv);
+                rk[rg * GS_COLS + lc] = kv;
+                sycl::group_barrier(it.get_group());
+                const float kv_col = rk[lc] + rk[GS_COLS + lc] + rk[2 * GS_COLS + lc] + rk[3 * GS_COLS + lc];
+                const float delta = (sv[t * GS_COLS + lc] - g * kv_col) * sg[2 * t + 1];
+                float o = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) {
+                    s[r] = sycl::fma(g, s[r], kt[rg * RPG + r] * delta);
+                    o = sycl::fma(s[r], qt[rg * RPG + r], o);
+                }
+                ro[rg * GS_COLS + lc] = o;
+                sycl::group_barrier(it.get_group());
+                if (rg == 0 && t >= t_out_begin)
+                    y[(size_t) t * value_dim + (size_t) (head * S + col)] =
+                        (ro[lc] + ro[GS_COLS + lc] + ro[2 * GS_COLS + lc] + ro[3 * GS_COLS + lc]) * sycl::rsqrt((float) S);
+            }
+            if (n_keep != nullptr && n > 0)
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        });
+    });
+#else
     q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
             red(sycl::range<1>((size_t) RG * GS_COLS), hd);
@@ -268,6 +336,7 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
                 for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
         });
     });
+#endif
     const int rows = T - t_out_begin;
     if (rows <= 0) return q.ext_oneapi_submit_barrier();
     // y = oc * rsqrt(mean(oc^2) + eps) * gamma * sigmoid(z) a head and token, with the one-group kernel's sums
@@ -306,6 +375,53 @@ namespace {
 // the same order, so the state is every form's bit for bit.
 sycl::event gdn_state_commit(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                              int h_k, int h_v, const int32_t* n_keep) {
+#if STRATA_GDN_STAGE
+    // XeStrata-890M: as gdn_step_split above, the kept tokens' k, v, exp(gate) and beta staged first and a reduction
+    // slot a token: one barrier a token instead of three, no global load inside the recurrence; bitwise the same
+    return q.submit([&](sycl::handler& hd) {
+        constexpr size_t mt = kVerifyMaxT;
+        sycl::local_accessor<float, 1> sk(sycl::range<1>(mt * S), hd), sv(sycl::range<1>(mt * GS_COLS), hd),
+            sg(sycl::range<1>(2 * mt), hd), red(sycl::range<1>(mt * RG * GS_COLS), hd);
+        hd.parallel_for(sycl::nd_range<1>((size_t) h_v * (S / GS_COLS) * GS_COLS * RG, (size_t) GS_COLS * RG),
+                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int n = *n_keep;
+            if (n <= 0 || n > (int) mt) return;   // the whole launch
+            const int grp = (int) it.get_group(0), head = grp / (S / GS_COLS), c0 = (grp % (S / GS_COLS)) * GS_COLS;
+            const int tid = (int) it.get_local_id(0), lc = tid % GS_COLS, rg = tid / GS_COLS, col = c0 + lc;
+            const int qh = head % h_k;
+            const int qk = S * h_k;
+            float s[RPG];
+            float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+            const size_t row_stride = (size_t) h_v * S;
+            #pragma unroll
+            for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+            for (int i = tid; i < n * S; i += GS_COLS * RG) sk[i] = hbuf[(size_t) (i / S) * C + qk + qh * S + i % S];
+            for (int i = tid; i < n * GS_COLS; i += GS_COLS * RG)
+                sv[i] = hbuf[(size_t) (i / GS_COLS) * C + 2 * qk + head * S + c0 + i % GS_COLS];
+            if (tid < n) {
+                sg[2 * tid] = sycl::exp(gate[(size_t) tid * h_v + head]);
+                sg[2 * tid + 1] = beta[(size_t) tid * h_v + head];
+            }
+            sycl::group_barrier(it.get_group());
+            for (int t = 0; t < n; ++t) {
+                const float* kt = &sk[(size_t) t * S];
+                float* rk = &red[(size_t) t * RG * GS_COLS];
+                const float g = sg[2 * t];
+                float kv = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], kt[rg * RPG + r], kv);
+                rk[rg * GS_COLS + lc] = kv;
+                sycl::group_barrier(it.get_group());
+                const float kv_col = rk[lc] + rk[GS_COLS + lc] + rk[2 * GS_COLS + lc] + rk[3 * GS_COLS + lc];
+                const float delta = (sv[t * GS_COLS + lc] - g * kv_col) * sg[2 * t + 1];
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) s[r] = sycl::fma(g, s[r], kt[rg * RPG + r] * delta);
+            }
+            #pragma unroll
+            for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        });
+    });
+#else
     return q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), red(sycl::range<1>((size_t) RG * GS_COLS), hd);
         hd.parallel_for(sycl::nd_range<1>((size_t) h_v * (S / GS_COLS) * GS_COLS * RG, (size_t) GS_COLS * RG),
@@ -341,6 +457,7 @@ sycl::event gdn_state_commit(sycl::queue& q, float* state, const float* hbuf, in
             for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
         });
     });
+#endif
 }
 }  // namespace
 
