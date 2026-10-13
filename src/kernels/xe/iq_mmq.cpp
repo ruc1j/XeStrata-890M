@@ -490,7 +490,8 @@ struct Kernel {
     static constexpr int A_N = IS != 0 && HALF ? 2 : 1;           // copies of the activations' tile
     // MIN: the activations' block sums as [block][row] and the weights' min terms as [block][output] after the rest
     // The output staging tile (ST) last: the WMMA body writes its accumulators straight out and does without it
-    // (LOCAL_DIRECT, launch), so its work-groups fit a 64 KB local memory two at a time (the 890M, IQ2_XS: 40 -> 32 KB)
+    // (LOCAL_DIRECT, launch), so its work-groups fit a 64 KB local memory two at a time (the 890M, IQ2_XS: 40 -> 32 KB;
+    // a K step of 64, 18 KB and three work-groups, was slower: 16 experts of 64 rows 1.86 -> 2.05 ms)
     static constexpr int A_OFF = 0, B_OFF = up128(A_OFF + A_N * WM * LDA), XS_OFF = up128(B_OFF + WN * LDB),
                          WS_OFF = up128(XS_OFF + NB * WM * 4), XU_OFF = up128(WS_OFF + 2 * NB * WN * 4),
                          WM_OFF = up128(XU_OFF + NB * WM * 4), ST_OFF = MIN ? up128(WM_OFF + NB * WN * 4) : XU_OFF,

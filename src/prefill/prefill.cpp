@@ -644,6 +644,21 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch
 // its products are done (a gather into separate group buffers was three copies an expert, and the RTX 4070's prompt
 // path waited on their launches: 980 ms of 4170).  The streamed walk (STREAM_ALL_MIN on) still gathers.
 constexpr int MMQ_RING = 2 * MMQ_GROUP;
+// XeStrata-890M: the experts a launch takes when the products read the blobs in place (no group buffer or ring slot
+// bounds the group): STRATA_PREFILL_MMQ_GROUP (4-64, default 16), fewer launches a layer with more.
+constexpr int MMQ_GROUP_MIN = 4, MMQ_GROUP_MAX = 64;
+inline int inplace_group() {
+    static const int g = [] {
+        const char* v = std::getenv("STRATA_PREFILL_MMQ_GROUP");
+        return v == nullptr ? MMQ_GROUP : std::clamp((int) std::strtol(v, nullptr, 10), MMQ_GROUP_MIN, MMQ_GROUP_MAX);
+    }();
+    return g;
+}
+// the bounds table: the experts' first rows and the total, then each group's relative bounds (G + 1 a group), for the
+// smallest group
+inline size_t bounds_entries(int64_t n_expert) {
+    return (size_t) n_expert + 1 + ((size_t) n_expert / MMQ_GROUP_MIN + 1) * (MMQ_GROUP_MAX + 1);
+}
 inline size_t MMQ_SLOT() { return ((size_t) MAXBLOB() + 255) & ~(size_t) 255; }
 struct MmqPlan {
     bool any = false, fallback = true;
@@ -884,7 +899,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
-        m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
+        m.bounds_dev = o.take<int32_t>(bounds_entries(m.g->n_expert), ok);
         m.wtab_dev = o.take<const uint8_t*>((size_t) m.g->n_expert, ok);
         m.grp_gu = m.grp_d = m.mring = nullptr;
         if ((int64_t) T >= STREAM_ALL_MIN) {
@@ -1144,7 +1159,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
-        o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
+        o.take<int32_t>(bounds_entries(g.n_expert), ok);
         o.take<const uint8_t*>((size_t) g.n_expert, ok);
         if ((int64_t) T >= STREAM_ALL_MIN) {
             o.take<uint8_t>(MMQ_GROUP * mp.gu_max, ok);
@@ -2111,6 +2126,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     bool in_place = use_mmq && inplace_env && m.wtab_dev != nullptr && m.host_res && m.cache;
                     for (size_t j = 0; in_place && j < order.size(); ++j)
                         if (m.host_res[(size_t) l * m.g->n_expert + order[j]] < 0) in_place = false;
+                    const int GRP = in_place ? inplace_group() : MMQ_GROUP;   // experts a launch
                     if (in_place) {
                         m.wtab_host.resize(2 * order.size());
                         for (size_t j = 0; j < order.size(); ++j) {
@@ -2127,14 +2143,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
                         // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                         // reads the group's own quantized H)
-                        const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
-                        m.bounds_host.resize(n + 1 + ng * (MMQ_GROUP + 1));
+                        const size_t n = order.size(), G = (size_t) GRP, ng = (n + G - 1) / G;
+                        m.bounds_host.resize(n + 1 + ng * (G + 1));
                         for (size_t j = 0; j < n; ++j) m.bounds_host[j] = m.off[(size_t) order[j]];
                         m.bounds_host[n] = (int32_t) rows_gpu;
                         for (size_t g = 0; g < ng; ++g)
-                            for (size_t i = 0; i <= MMQ_GROUP; ++i)
-                                m.bounds_host[n + 1 + g * (MMQ_GROUP + 1) + i] =
-                                    m.bounds_host[std::min(n, g * MMQ_GROUP + i)] - m.bounds_host[g * MMQ_GROUP];
+                            for (size_t i = 0; i <= G; ++i)
+                                m.bounds_host[n + 1 + g * (G + 1) + i] =
+                                    m.bounds_host[std::min(n, g * G + i)] - m.bounds_host[g * G];
                         m.bounds_host.to_device(m.bounds_dev, m.cs);
                     } else {
                         gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
@@ -2283,7 +2299,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
                         pt.mark(kPfDequant, cs);
                         if (use_mmq) {
-                            const size_t q = j % MMQ_GROUP;
+                            const size_t q = j % (size_t) GRP;
                             const auto& f = lay.fmt[(size_t) l];
                             if (in_place) {
                                 // the group's products read the blob where it lies (wtab): nothing to move
@@ -2296,7 +2312,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 gg.blob[q] = blob_dev;
                                 gg.n = (int) q + 1;
                                 if (slot >= 0) gg_slots[gg_nslots++] = slot;
-                                if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                if (q + 1 < (size_t) GRP && j + 1 < order.size()) return true;
                                 flush();
                                 gg = mmq::GatherGroup{};
                             } else {
@@ -2305,9 +2321,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                    mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
                                 if (slot >= 0) { strata::gpu::event_record(m.used[slot], m.cs); m.used_of[slot] = slot; }
                             }
-                            if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                            if (q + 1 < (size_t) GRP && j + 1 < order.size()) return true;
                             // the group's products: gate/up, swiglu, the group's H to int8, down
-                            const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                            const size_t j0 = j - q, g = j0 / (size_t) GRP, n = order.size();
                             const int ngx = (int) (q + 1);
                             const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
                             int64_t maxr = 0;
@@ -2327,7 +2343,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             mmq::Product dn;
                             dn.w = mmq_direct ? ring0 + f.down_off : m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640;
                             dn.expert_bytes = mmq_direct ? MMQ_SLOT() : mmq_db;
-                            dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
+                            dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * ((size_t) GRP + 1);
                             dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                             dn.ld_dst = N;
                             if (in_place) { dn.w = nullptr; dn.expert_bytes = 0; dn.wtab = m.wtab_dev + j0; dn.woff = f.down_off; }

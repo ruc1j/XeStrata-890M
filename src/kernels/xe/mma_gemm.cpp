@@ -292,27 +292,41 @@ struct Kernel {
             stage<E, WM, LDA, false>(x, wm0, rows, K, kb, as, 0, lid, NSG * SG);
             stage<E, WN, LDB, false>(w, wn0, N, K, kb, bs, 0, lid, NSG * SG);
             sycl::group_barrier(it.get_group());
-            V8 va[NVA], vb[NVB];
+            // the next step's rows: read into registers while this step multiplies and stored after (PREFETCH; the
+            // shapes here), or staged into the other local buffer meanwhile (two buffers: on the 890M 3.2 against
+            // 4.8 TFLOP/s, so no shape takes it)
+            int buf = 0;
+            V8 va[PREFETCH ? NVA : 1], vb[PREFETCH ? NVB : 1];
             for (int64_t k0 = kb; k0 < ke; k0 += KC) {
                 const bool more = k0 + KC < ke;
-                if (more) {
-                    fetch<WM, NVA>(x, wm0, rows, K, k0 + KC, lid, va);
-                    fetch<WN, NVB>(w, wn0, N, K, k0 + KC, lid, vb);
+                if constexpr (PREFETCH) {
+                    if (more) {
+                        fetch<WM, NVA>(x, wm0, rows, K, k0 + KC, lid, va);
+                        fetch<WN, NVB>(w, wn0, N, K, k0 + KC, lid, vb);
+                    }
+                } else if (more) {
+                    stage<E, WM, LDA, false>(x, wm0, rows, K, k0 + KC, as, (buf ^ 1) * ASZ, lid, NSG * SG);
+                    stage<E, WN, LDB, false>(w, wn0, N, K, k0 + KC, bs, (buf ^ 1) * BSZ, lid, NSG * SG);
                 }
+                const auto apb = ap + buf * ASZ;
+                const auto bpb = bp + buf * BSZ;
                 for (int kk = 0; kk < KC; kk += TK) {
                     wmma::A<E> a[SGM];
                     wmma::Bc<E> b[SGN];
-                    for (int i = 0; i < SGM; ++i) wmma::load(sg, a[i], ap + (ms + i * TM) * LDA + kk, LDA);
-                    for (int j = 0; j < SGN; ++j) wmma::load(sg, b[j], bp + (ns + j * TN) * LDB + kk, LDB);
+                    for (int i = 0; i < SGM; ++i) wmma::load(sg, a[i], apb + (ms + i * TM) * LDA + kk, LDA);
+                    for (int j = 0; j < SGN; ++j) wmma::load(sg, b[j], bpb + (ns + j * TN) * LDB + kk, LDB);
                     for (int i = 0; i < SGM; ++i)
                         for (int j = 0; j < SGN; ++j) wmma::mad(sg, c[i][j], a[i], b[j], c[i][j]);
                 }
-                if (more) {
-                    sycl::group_barrier(it.get_group());
-                    put<WM, LDA, NVA>(as, 0, lid, va);
-                    put<WN, LDB, NVB>(bs, 0, lid, vb);
+                if constexpr (PREFETCH) {
+                    if (more) {
+                        sycl::group_barrier(it.get_group());
+                        put<WM, LDA, NVA>(as, 0, lid, va);
+                        put<WN, LDB, NVB>(bs, 0, lid, vb);
+                    }
                 }
                 sycl::group_barrier(it.get_group());
+                buf = (buf + 1) % NBUF;
             }
             const int lo = lane & 15, hi = lane >> 4;
             for (int i = 0; i < SGM; ++i)
