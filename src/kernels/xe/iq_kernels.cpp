@@ -701,6 +701,12 @@ inline const void* block_at(const uint8_t* row, int kbx) { return row + (size_t)
 // projection: 180-360 bytes) keeps its lanes busy and reduces in log2(LPR) steps.  Each block is loaded once for all
 // the entries (upstream 8ec94aa); entry e's sum is what one entry alone gives, bit for bit.  `grid`
 // (GridOf<TY>::T): the codebook the blocks are decoded with, when not the global table.
+#ifndef STRATA_Q20_BATCH
+#define STRATA_Q20_BATCH 1
+#endif
+#ifndef STRATA_GU_CHUNK
+#define STRATA_GU_CHUNK 10
+#endif
 #ifndef STRATA_SEG_UNROLL
 #define STRATA_SEG_UNROLL 2
 #endif
@@ -711,6 +717,158 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
     using F = Fmt<TY>;
     float s[NE];
     for (int e = 0; e < NE; ++e) s[e] = 0.0f;
+#if STRATA_Q20_BATCH
+    if constexpr (TY == 42 && std::is_void_v<G>) {
+        // XeStrata-890M: a Q2_0 down row is only a few steps a lane (640 wide: 5 at 4 lanes), so every step's codes
+        // and scale are loaded before any is applied: one wait on memory for the row instead of one a step pair.
+        // The words are the ones Split<42>::load reads and the sums are added in the same order: bitwise the same.
+        constexpr int C = 6;
+        const int K = nb * F::ipb;
+        for (int k0 = seg_lane; k0 < K; k0 += C * LPR) {
+            uint16_t q[C][4];
+            sycl::half dh[C];
+#pragma unroll
+            for (int u = 0; u < C; ++u) {
+                const int k = sycl::min(k0 + u * LPR, K - 1);
+                const block_q2_0* b = (const block_q2_0*) block_at<F>(row, k / F::ipb);
+                const uint16_t* qs = (const uint16_t*) b->qs + (ptrdiff_t) (k % F::ipb) * 4;
+                for (int j = 0; j < 4; ++j) q[u][j] = qs[j];
+                dh[u] = b->d;
+            }
+#pragma unroll
+            for (int u = 0; u < C; ++u) {
+                const int k = k0 + u * LPR;
+                if (k >= K) break;
+                typename F::S::W w;
+                for (int j = 0; j < 4; ++j) {
+                    w.qx[j] = (int) q2_0_bytes(q[u][j] & 0xFFu);
+                    w.qy[j] = (int) q2_0_bytes((uint32_t) q[u][j] >> 8);
+                }
+                w.d = (float) dh[u];
+                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+                for (int e = 0; e < NE; ++e)
+                    if (e < n) s[e] += F::S::apply(w, x[e] + xo, iqs);
+            }
+        }
+        for (int e = 0; e < NE; ++e) {
+            for (int o = LPR / 2; o > 0; o >>= 1) s[e] += strata_shfl_xor(sg, s[e], o);
+            out[e] = s[e];
+        }
+        return;
+    }
+    if constexpr (TY == 29) {
+        // XeStrata-890M: IQ1_M's gate/up rows the same way: GU_CHUNK steps' code word, its two qh bytes and the
+        // block's four scale words loaded first, then decoded as Split<29>::load does
+        constexpr int C = STRATA_GU_CHUNK;
+        const int K = nb * F::ipb;
+        for (int k0 = seg_lane; k0 < K; k0 += C * LPR) {
+            uint32_t rq[C], rh[C], rs0[C], rs1[C];
+#pragma unroll
+            for (int u = 0; u < C; ++u) {
+                const int k = sycl::min(k0 + u * LPR, K - 1);
+                const int iqs = F::step * (k % F::ipb);
+                const block_iq1_m* b = (const block_iq1_m*) block_at<F>(row, k / F::ipb);
+                rq[u] = (uint32_t) get_int_b4(b->qs, iqs);
+                rh[u] = (uint32_t) b->qh[2 * iqs] | ((uint32_t) b->qh[2 * iqs + 1] << 8);
+                rs0[u] = (uint32_t) get_int_b4(b->scales, 0);
+                rs1[u] = (uint32_t) get_int_b4(b->scales, 1);
+            }
+#pragma unroll
+            for (int u = 0; u < C; ++u) {
+                const int k = k0 + u * LPR;
+                if (k >= K) break;
+                const int iqs = F::step * (k % F::ipb);
+                typename F::S::W w{};
+                for (int l0 = 0; l0 < 8; l0 += 2) {
+                    const int qhl = (int) ((rh[u] >> (8 * (l0 / 4))) & 0xFF) >> (4 * ((l0 / 2) % 2));
+                    const int grid = (int) iq1s_grid_gpu[byte_of(rq[u], l0 / 2) | ((qhl & 0x07) << 8)];
+                    w.g[l0] = (grid >> 0) & 0x0F0F0F0F;
+                    w.g[l0 + 1] = (grid >> 4) & 0x0F0F0F0F;
+                    w.delta[l0 / 2] = -1.0f + IQ1M_DELTA - (float) (qhl & 0x08) * (2.0f * IQ1M_DELTA / 0x08);
+                }
+                const uint16_t sc[4] = {(uint16_t) rs0[u], (uint16_t) (rs0[u] >> 16), (uint16_t) rs1[u],
+                                        (uint16_t) (rs1[u] >> 16)};
+                w.d = iq1m_scale(sc);
+                const int tmp = sc[iqs / 2] >> (6 * (iqs % 2));
+                w.sc0 = 2 * ((tmp >> 0) & 0x07) + 1;
+                w.sc1 = 2 * ((tmp >> 3) & 0x07) + 1;
+                const int kbx = k / F::ipb;
+                const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+                for (int e = 0; e < NE; ++e)
+                    if (e < n) s[e] += F::S::apply(w, x[e] + xo, iqs);
+            }
+        }
+        for (int e = 0; e < NE; ++e) {
+            for (int o = LPR / 2; o > 0; o >>= 1) s[e] += strata_shfl_xor(sg, s[e], o);
+            out[e] = s[e];
+        }
+        return;
+    }
+    if constexpr ((TY == 22 || TY == 16) && std::is_void_v<G>) {
+        // XeStrata-890M: the same for the IQ2_S and IQ2_XXS gate/up rows: GU_CHUNK steps' raw words (codes, signs,
+        // scales, block scale: the words Split<TY>::load reads) loaded before any is decoded
+        constexpr int C = STRATA_GU_CHUNK;
+        const int K = nb * F::ipb;
+        for (int k0 = seg_lane; k0 < K; k0 += C * LPR) {
+            uint32_t ra[C], rb[C], rc[C];
+            sycl::half dh[C];
+#pragma unroll
+            for (int u = 0; u < C; ++u) {
+                const int k = sycl::min(k0 + u * LPR, K - 1);
+                const int iqs = F::step * (k % F::ipb);
+                if constexpr (TY == 22) {
+                    const block_iq2_s* b = (const block_iq2_s*) block_at<F>(row, k / F::ipb);
+                    ra[u] = (uint32_t) get_int_b2(b->qs, iqs / 2);
+                    rb[u] = (uint32_t) get_int_b2(b->qs, QK_K / 32 + iqs / 2);
+                    rc[u] = (uint32_t) b->qh[iqs / 2] | ((uint32_t) b->scales[iqs / 2] << 8);
+                    dh[u] = b->d;
+                } else {
+                    const block_iq2_xxs* b = (const block_iq2_xxs*) block_at<F>(row, k / F::ipb);
+                    ra[u] = (uint32_t) get_int_b2(b->qs, iqs);
+                    rb[u] = (uint32_t) get_int_b2(b->qs, iqs + 1);
+                    rc[u] = 0;
+                    dh[u] = b->d;
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < C; ++u) {
+                const int k = k0 + u * LPR;
+                if (k >= K) break;
+                typename F::S::W w{};
+                if constexpr (TY == 22) {
+                    const int qh = (int) (rc[u] & 0xFF);
+                    w.ls0 = (int) ((rc[u] >> 8) & 0x0F);
+                    w.ls1 = (int) (rc[u] >> 12);
+                    for (int l0 = 0; l0 < 8; l0 += 2) {
+                        const Int2 grid_pos = grid_pair(iq2s_grid, byte_of(ra[u], l0 / 2) | ((qh << (8 - l0)) & 0x300));
+                        const uint32_t s8 = byte_of(rb[u], l0 / 2);
+                        w.g[l0] = grid_pos.x; w.m[l0] = sign_mask(s8);
+                        w.g[l0 + 1] = grid_pos.y; w.m[l0 + 1] = sign_mask(s8 >> 4);
+                    }
+                } else {
+                    for (int k2 = 0; k2 < 8; k2 += 2) {
+                        const Int2 grid_pos = grid_pair(iq2xxs_grid, byte_of(ra[u], k2 / 2));
+                        const uint32_t s8 = ksigns_byte((uint8_t) (rb[u] >> (7 * k2 / 2)));
+                        w.g[k2] = grid_pos.x; w.m[k2] = sign_mask(s8);
+                        w.g[k2 + 1] = grid_pos.y; w.m[k2 + 1] = sign_mask(s8 >> 4);
+                    }
+                    w.ls = (int) (rb[u] >> 27 | 1);
+                }
+                w.d = (float) dh[u];
+                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+                for (int e = 0; e < NE; ++e)
+                    if (e < n) s[e] += F::S::apply(w, x[e] + xo, iqs);
+            }
+        }
+        for (int e = 0; e < NE; ++e) {
+            for (int o = LPR / 2; o > 0; o >>= 1) s[e] += strata_shfl_xor(sg, s[e], o);
+            out[e] = s[e];
+        }
+        return;
+    }
+#endif
     // XeStrata-890M: SEG_UNROLL steps' weights loaded before any is applied, so a lane's dependent loads (the codes,
     // then the grid rows they index) of the steps overlap: a row is only a few steps a lane, and on the 890M one step
     // at a time left the gate/up kernel waiting on memory.  The sums are added in the same order: bitwise the same.
