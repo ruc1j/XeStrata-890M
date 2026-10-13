@@ -2038,7 +2038,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const size_t grid_bytes = L.gu_type == 22 ? sizeof(iq2s_grid) : L.gu_type == 16 ? sizeof(iq2xxs_grid)
                               : L.gu_type == 18 ? sizeof(iq3xxs_grid) : L.gu_type == 21 ? sizeof(iq3s_grid) : 0;
     const bool fused_gu = m8 && (L.up_type < 0 || L.up_type == L.gu_type) && (L.gu_type == 16 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
-                                 L.gu_type == 23) &&
+                                 L.gu_type == 23 || L.gu_type == 29) &&
                           grid_bytes + xbytes + (size_t) kEntriesPass * kM8Rows * sizeof(float) <= local_mem_bytes(q);
     const bool lds_down = m8 && (L.d_type == 20 || L.d_type == 42) &&
                           (size_t) kEntriesPass * (size_t) (L.n_ff / 32) * sizeof(block_q8_1) <= local_mem_bytes(q);
@@ -2049,6 +2049,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             case 18: launch_native_gu_fused<18, GU_LPR>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 21: launch_native_gu_fused<21, GU_LPR>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 22: launch_native_gu_fused<22, GU_LPR>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 29: launch_native_gu_fused<29, GU_LPR>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;   // XeStrata-890M
             default: launch_native_gu_fused<23, GU_LPR>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
         }
     } else {
