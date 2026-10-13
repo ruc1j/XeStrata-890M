@@ -15,6 +15,16 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 - `STRATA_CACHE_HOST=1`: エキスパートのキャッシュを GPU のプール（GTT、既定で RAM の約半分）ではなくホストのメモリ（host USM）に置き、
   すべてのエキスパートを GPU から直接読みます（`--mmap-experts --expert-cache 24576 --no-prefill-borrow` と組み合わせます）。
+- prefill の密な行列積は、起動時に oneMath のライブラリ（rocBLAS）と XeStrata 自身の WMMA カーネルの速さを比べて速い方を取ります
+  （HIP の GPU のみ。890M では hipBLASLt が gfx1150 のカーネルを持たず rocBLAS が汎用カーネルに落ちるので、自身のカーネルが 3 倍速い）。
+  `STRATA_BLAS=1` でライブラリ、`STRATA_NO_BLAS=1` で自身のカーネルに固定できます。
+- 自身の WMMA カーネル（mma_gemm）は、同時に走るワークグループが出力の小さな四角を受け持つ順（8 x 8 タイルのブロック、`STRATA_MMA_BLOCK`）で、
+  2 MB の L2 に読む行が残るようにします。
+- エキスパートの int8 の積（MMQ）は、層のエキスパートがすべてキャッシュにあれば、blob をその場で読みます（グループへの gather や
+  MMQ ring へのコピーを省く、`STRATA_PREFILL_MMQ_INPLACE=0` で元に戻せます）。WMMA 版は出力の staging をローカルメモリに取らず、
+  WGP に 2 ワークグループが載るようにします。
+  890M での prefill: 2,669 トークン（同じ文の繰り返し）22.0 -> 12.4 s、変化のある 3,481 トークン 29.1 -> 16.2 s、523 トークン 5.4 -> 3.2 s。
+  自身のカーネルは rocBLAS と足す順が違うので、答えが丸めの差で変わることがあります（`STRATA_BLAS=1` なら元のまま）。
 
 以下は元の XeStrata の説明です。
 

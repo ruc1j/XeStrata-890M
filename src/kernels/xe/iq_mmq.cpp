@@ -489,10 +489,12 @@ struct Kernel {
     static constexpr int ISG = IS == 1 ? 16 : IS == 2 ? 8 : SG;   // the sub-group size, and Intel's tile width
     static constexpr int A_N = IS != 0 && HALF ? 2 : 1;           // copies of the activations' tile
     // MIN: the activations' block sums as [block][row] and the weights' min terms as [block][output] after the rest
+    // The output staging tile (ST) last: the WMMA body writes its accumulators straight out and does without it
+    // (LOCAL_DIRECT, launch), so its work-groups fit a 64 KB local memory two at a time (the 890M, IQ2_XS: 40 -> 32 KB)
     static constexpr int A_OFF = 0, B_OFF = up128(A_OFF + A_N * WM * LDA), XS_OFF = up128(B_OFF + WN * LDB),
-                         WS_OFF = up128(XS_OFF + NB * WM * 4), ST_OFF = up128(WS_OFF + 2 * NB * WN * 4),
-                         XU_OFF = up128(ST_OFF + NSG * TM * TN * 4), WM_OFF = up128(XU_OFF + NB * WM * 4),
-                         LOCAL = MIN ? up128(WM_OFF + NB * WN * 4) : XU_OFF;
+                         WS_OFF = up128(XS_OFF + NB * WM * 4), XU_OFF = up128(WS_OFF + 2 * NB * WN * 4),
+                         WM_OFF = up128(XU_OFF + NB * WM * 4), ST_OFF = MIN ? up128(WM_OFF + NB * WN * 4) : XU_OFF,
+                         LOCAL_DIRECT = ST_OFF, LOCAL = up128(ST_OFF + NSG * TM * TN * 4);
     const uint8_t* w;
     const uint8_t* const* wtab;   // expert e's weights at wtab[e] + woff when set, else at w + e expert_bytes
     size_t woff, expert_bytes, row_bytes;
@@ -818,7 +820,18 @@ struct Kernel {
             const int lane = (int) sg.get_local_linear_id(), lo = lane & 15, hi = lane >> 4;
             constexpr int lanes = NSG * SG;
             const int ms = sgid / NSGN * SGM * TM, ns = sgid % NSGN * SGN * TN;
-            const uint8_t* wx = wtab != nullptr ? wtab[e] + woff : w + (size_t) e * expert_bytes;
+            // The weights' and activations' pointers cast to the global address space (XeStrata-890M): the kernel's
+            // arguments are generic pointers, which AMD's compiler read with flat loads; global loads instead (no
+            // measured change on the 890M: each decode still waits on its own loads, the grid lookups behind the
+            // block's)
+            const auto global_of = [](auto p) {
+                return sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                sycl::access::decorated::no>(p).get();
+            };
+            const uint8_t* wx = global_of(wtab != nullptr ? wtab[e] + woff : w + (size_t) e * expert_bytes);
+            const int8_t* xqg = global_of(xq);
+            const float* xsg = global_of(xs);
+            [[maybe_unused]] const float* xug = MIN ? global_of(xu) : nullptr;
             const auto base = lm.template get_multi_ptr<sycl::access::decorated::no>();
             int8_t* al = local_as<int8_t>(base + A_OFF).get();
             int8_t* bl = local_as<int8_t>(base + B_OFF).get();
@@ -849,14 +862,14 @@ struct Kernel {
                     const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
                     const int64_t row = m0 + rr;
                     u32x4 val = {0u, 0u, 0u, 0u};
-                    if (row < rows && (!last || k0 + c < K)) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
+                    if (row < rows && (!last || k0 + c < K)) val = *reinterpret_cast<const u32x4*>(xqg + (row0 + row) * K + k0 + c);
                     *reinterpret_cast<u32x4*>(al + rr * LDA + c) = val;
                 }
                 for (int v = lid; v < WM * NB; v += lanes) {
                     const int b = v / WM, rr = v % WM;
                     const int64_t row = m0 + rr;
-                    xsl[v] = row < rows && (!last || k0 / 32 + b < kb) ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
-                    if constexpr (MIN) xul[v] = row < rows && (!last || k0 / 32 + b < kb) ? xu[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    xsl[v] = row < rows && (!last || k0 / 32 + b < kb) ? xsg[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                    if constexpr (MIN) xul[v] = row < rows && (!last || k0 / 32 + b < kb) ? xug[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
                 }
                 for (int v = lid; v < WN * NB; v += lanes) {
                     const int nn = v / NB, b = v % NB;
@@ -898,7 +911,8 @@ struct Kernel {
                             const float ws = wsl[(2 * b + h) * WN + ns + j * TN + lo];   // this lane's column's
                             for (int i = 0; i < SGM; ++i)
                                 for (int el = 0; el < 8; ++el)
-                                    acc[i][j][el] += ws * xsr[i][el] * exact_float(ci[i][j][el]);
+                                    // (float) c: one full-rate conversion on RDNA (exact below 2^24, as exact_float)
+                                    acc[i][j][el] += ws * xsr[i][el] * (float) ci[i][j][el];
                         }
                     }
                     if constexpr (MIN)
@@ -943,8 +957,10 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
     const auto* x8 = static_cast<const int8_t*>(xq);
     const auto* xs = reinterpret_cast<const float*>(x8 + total_rows * w_cols);
     const auto* xu = xs + total_rows * (w_cols / 32);
+    // RDNA's WMMA body does without the output staging tile (LOCAL_DIRECT)
+    const size_t local = !DP4A && xe::amd_wmma(q.get_device()) ? (size_t) KT::LOCAL_DIRECT : (size_t) KT::LOCAL;
     return q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>((size_t) KT::LOCAL), h);
+        sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>(local), h);
         const size_t wg = (size_t) KT::NSG * SG;
         h.parallel_for(sycl::nd_range<1>((size_t) n * (size_t) (tiles_m * tiles_n) * wg, wg),
                        KT{static_cast<const uint8_t*>(w), wtab, woff, expert_bytes, row_bytes, x8, xs, xu, w_cols, bounds, ids, dst,

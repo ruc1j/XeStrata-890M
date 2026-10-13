@@ -34,6 +34,7 @@
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 
 namespace strata::kernels::xe {
 namespace {
@@ -63,7 +64,16 @@ struct Shape {
 };
 constexpr Shape kShapes[] = {{8, 16, 16, 16, {2, 2, 2, 2, false}, {2, 2, 2, 2, false}, true},
                              {8, 8, 16, 8, {4, 8, 4, 4, true}, {2, 8, 2, 2, false}, true},
-                             {16, 16, 16, 32, {2, 2, 2, 2, false}, {2, 2, 2, 2, false}, false}};
+                             {16, 16, 16, 32, {2, 2, 2, 2, false}, {2, 2, 2, 2, false}, false},
+                             // RDNA's WMMA (XeStrata-890M), opt-in (STRATA_MMA_SHAPE=3): a product's tile of 128 x 128
+                             // as 16 sub-groups of 2 x 2 tiles.  On the 890M (dpm high, 2048 rows, FP16) it ran
+                             // 2048 x 2560 x 6144 in 12.4 ms against the 64 x 64 tile's 14.1 and 10240 x 2560 in 22.0
+                             // against 22.4, but 512 x 2560 in 1.36 against 1.09, so the 64 x 64 tile stays the
+                             // default.  Layouts of 4 x 2 or 2 x 4 tiles a sub-group spilled there: AMD's compiler
+                             // budgets 128 registers a lane whatever the work-group's size, and their accumulators
+                             // went to scratch memory (141-192 registers spilled; 0.2-0.4 against 4 TFLOP/s).
+                             {16, 16, 16, 32, {4, 4, 2, 2, false}, {2, 2, 2, 2, false}, false}};
+constexpr int kAmdShape = 2;                      // the shapes RDNA's WMMA takes: kAmdShape on
 constexpr int KC = 32;            // K a step (64 was no faster on the A380)
 
 // NVIDIA's shape from sm_80 on: the tiles read from local memory with ldmatrix and multiplied with mma.sync
@@ -106,7 +116,7 @@ constexpr int VEC = 8;            // values a work-item copies at once (16 bytes
 template<int S>
 constexpr bool built() {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
-    return S == 2 && STRATA_AMD_WMMA;
+    return S >= kAmdShape && STRATA_AMD_WMMA;
 #else
     return kShapes[S].sg < 32 ? !STRATA_DEVICE_NOT_INTEL : true;
 #endif
@@ -192,6 +202,7 @@ struct Kernel {
     const int32_t* bounds;
     int64_t T, N, K, tiles_m, tiles_n;
     int64_t kslice;   // a product's K split: the values of K one slice takes (K: none), slice s writing Y + s * T * ldy
+    int64_t blk_m, blk_n;   // the work-groups' order: blocks of blk_m x blk_n tiles (0: M first), see tile_of
     sycl::local_accessor<E, 1> as;       // two buffers of the step's rows of X: WM x KC
     sycl::local_accessor<E, 1> bs;       // two buffers of the step's rows of W, as B: WN x KC
     sycl::local_accessor<float, 1> cs;   // a TM x TN tile of Y a sub-group, on its way out
@@ -201,6 +212,34 @@ struct Kernel {
     // before multiplying (RTX 4070: long-scoreboard stalls, 33% occupancy by local memory).  Intel's packed shapes keep
     // stage(): on the A380 the registers spilled (see the file's note).
     static constexpr bool PREFETCH = !PACKED;
+    // The work-groups of one expert (or K slice): `per` of them.  M first (blk_m 0): the work-groups that read a tile
+    // of W run side by side and find it in L2 (N first, a 52 MB W was read from memory once a tile of 64 rows: RTX
+    // 4070, 512 x 10240 x 2560, 1735 -> 1015 us).  In blocks (blk_m x blk_n tiles, the tiles of a block M first): the
+    // work-groups in flight together cover a compact part of Y, so the rows of X and of W they read stay in a small
+    // L2 while they advance along K; X is then read from memory once a column of blocks, W once a row of them (the
+    // 890M, 2 MB of L2, dpm high, 2048 rows FP16: 10240 x 2560 26.4 -> 23.9 ms, 512 x 2560 1.79 -> 1.29, 10240 x 320
+    // 4.72 -> 2.83; block_order).  The grid is padded to whole blocks; a work-group past the last tile returns at
+    // once.
+    static int64_t per_expert(int64_t tiles_m, int64_t tiles_n, int64_t blk_m, int64_t blk_n) {
+        if (blk_m <= 0) return tiles_m * tiles_n;
+        return (tiles_m + blk_m - 1) / blk_m * blk_m * ((tiles_n + blk_n - 1) / blk_n * blk_n);
+    }
+    bool tile_of(int64_t g, int64_t& ex, int64_t& wm0, int64_t& wn0) const {
+        const int64_t per = per_expert(tiles_m, tiles_n, blk_m, blk_n), r = g % per;
+        ex = g / per;
+        if (blk_m <= 0) {
+            wm0 = r % tiles_m * WM;
+            wn0 = r / tiles_m * WN;
+            return true;
+        }
+        const int64_t bsz = blk_m * blk_n, bm = (tiles_m + blk_m - 1) / blk_m;   // a block's tiles; blocks along M
+        const int64_t b = r / bsz, i = r % bsz;
+        const int64_t mt = b % bm * blk_m + i % blk_m, nt = b / bm * blk_n + i / blk_m;
+        if (mt >= tiles_m || nt >= tiles_n) return false;
+        wm0 = mt * WM;
+        wn0 = nt * WN;
+        return true;
+    }
     static constexpr bool PTX = STRATA_MMA_PTX && !PACKED && TM == 16 && TN == 16 && TK == 16;
     static constexpr int LANES = NSG * SG, NVA = (WM * (KC / VEC) + LANES - 1) / LANES,
                          NVB = (WN * (KC / VEC) + LANES - 1) / LANES;
@@ -233,8 +272,8 @@ struct Kernel {
 #if STRATA_AMD_WMMA
             // RDNA3 and RDNA4: the same steps as below, the tiles through the WMMA instructions (amd_wmma.hpp), the
             // accumulators straight to Y (a lane's elements are column lane % 16 of 8 rows)
-            const int64_t g = (int64_t) it.get_group(0), ex = g / (tiles_m * tiles_n), r = g % (tiles_m * tiles_n);
-            const int64_t wm0 = r % tiles_m * WM, wn0 = r / tiles_m * WN;
+            int64_t ex, wm0, wn0;
+            if (!tile_of((int64_t) it.get_group(0), ex, wm0, wn0)) return;
             const int64_t row0 = bounds ? bounds[ex] : 0, rows = bounds ? bounds[ex + 1] - row0 : T;
             if (wm0 >= rows) return;
             const int64_t kb = bounds ? 0 : ex * kslice, ke = bounds ? K : sycl::min(K, kb + kslice);
@@ -289,10 +328,8 @@ struct Kernel {
                 }
 #endif
         } else {
-            const int64_t g = (int64_t) it.get_group(0), ex = g / (tiles_m * tiles_n), r = g % (tiles_m * tiles_n);
-            // M first: the work-groups that read a tile of W run side by side and find it in L2 (N first, a 52 MB W
-            // was read from memory once a tile of 64 rows: RTX 4070, 512 x 10240 x 2560, 1735 -> 1015 us)
-            const int64_t wm0 = r % tiles_m * WM, wn0 = r / tiles_m * WN;
+            int64_t ex, wm0, wn0;   // M first, or in blocks (tile_of)
+            if (!tile_of((int64_t) it.get_group(0), ex, wm0, wn0)) return;
             const int64_t row0 = bounds ? bounds[ex] : 0, rows = bounds ? bounds[ex + 1] - row0 : T;
             if (wm0 >= rows) return;   // the whole work-group: this group of rows is shorter than the launch
             // without bounds, ex is the slice of K (run: a product split along K)
@@ -430,24 +467,44 @@ struct Kernel {
         }
     }
     auto get(syclex::properties_tag) const {
+        // the work-group's size as a property as well (reqd_work_group_size in the device code: a launch of another
+        // size is refused; AMD's compiler budgets 128 registers a lane either way, see kShapes)
         if constexpr (L.grf)
-            return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>,
+            return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>, syclex::work_group_size<NSG * SG>,
                                       sycl::ext::intel::experimental::grf_size<256>};
-        else return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>};
+        else return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>, syclex::work_group_size<NSG * SG>};
     }
 };
 
+// The block order of a product's work-groups (Kernel::tile_of) on this device: on RDNA's WMMA 8 x 8 tiles (the 890M:
+// 64 work-groups in flight, 8 compute units; measured there), elsewhere M first.  STRATA_MMA_BLOCK=M,N sets it (0,0:
+// M first).
+std::pair<int64_t, int64_t> block_order(const sycl::queue& q) {
+    static const std::pair<int64_t, int64_t> env = [] {
+        const char* v = std::getenv("STRATA_MMA_BLOCK");
+        if (v == nullptr) return std::pair<int64_t, int64_t>{-1, -1};
+        char* e = nullptr;
+        const long m = std::strtol(v, &e, 10);
+        const long n = *e == ',' ? std::strtol(e + 1, nullptr, 10) : m;
+        return std::pair<int64_t, int64_t>{std::max(0L, m), std::max(0L, n)};
+    }();
+    if (env.first >= 0) return env;
+    return amd_wmma(q.get_device()) ? std::pair<int64_t, int64_t>{8, 8} : std::pair<int64_t, int64_t>{0, 0};
+}
+
 template<int S, typename E, bool ACC, bool GROUPED>
 sycl::event launch(sycl::queue& q, const E* X, const E* W, int64_t w_stride, float* Y, int64_t ldy,
-                   const int32_t* bounds, int G, int64_t T, int64_t N, int64_t K, int64_t kslice) {
+                   const int32_t* bounds, int G, int64_t T, int64_t N, int64_t K, int64_t kslice, int64_t blk_m = 0,
+                   int64_t blk_n = 0) {
     using KT = Kernel<S, E, ACC, GROUPED>;
     const int64_t tiles_m = (T + KT::WM - 1) / KT::WM, tiles_n = (N + KT::WN - 1) / KT::WN;
+    const int64_t per = KT::per_expert(tiles_m, tiles_n, blk_m, blk_n);
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<E, 1> as(sycl::range<1>(KT::NBUF * KT::ASZ), h), bs(sycl::range<1>(KT::NBUF * KT::BSZ), h);
         sycl::local_accessor<float, 1> cs(sycl::range<1>(KT::NSG * KT::TM * KT::TN), h);
         const size_t wg = (size_t) KT::NSG * KT::SG;
-        h.parallel_for(sycl::nd_range<1>((size_t) (G * tiles_m * tiles_n) * wg, wg),
-                       KT{X, W, w_stride, Y, ldy, bounds, T, N, K, tiles_m, tiles_n, kslice, as, bs, cs});
+        h.parallel_for(sycl::nd_range<1>((size_t) (G * per) * wg, wg),
+                       KT{X, W, w_stride, Y, ldy, bounds, T, N, K, tiles_m, tiles_n, kslice, blk_m, blk_n, as, bs, cs});
     });
 }
 
@@ -481,9 +538,14 @@ int shape(const sycl::queue& q, bool bf16) {
     static core::PerDevice<Shapes> per_device;
     const Shapes& s = per_device.get(q.get_device(), [&q] {
         const auto pick = [&q](mx::matrix_type in) {
-            // RDNA3 and RDNA4 report no combination (see built): their WMMA takes NVIDIA's shape, FP16 and BF16
-            if (amd_wmma(q.get_device()) && !(in == mx::matrix_type::bf16 && no_bf16_mma()))
-                return groups_layout_fits(2, q) ? 2 : -1;
+            // RDNA3 and RDNA4 report no combination (see built): their WMMA takes NVIDIA's shape, FP16 and BF16;
+            // STRATA_MMA_SHAPE=2..3 picks the tile (gemm_bench's A/B)
+            if (amd_wmma(q.get_device()) && !(in == mx::matrix_type::bf16 && no_bf16_mma())) {
+                int s = kAmdShape;
+                if (const char* v = std::getenv("STRATA_MMA_SHAPE"); v != nullptr)
+                    s = std::clamp((int) std::strtol(v, nullptr, 10), kAmdShape, (int) std::size(kShapes) - 1);
+                return groups_layout_fits(s, q) ? s : -1;
+            }
             for (int i = 0; i < (int) std::size(kShapes); ++i)
                 if (reported(q.get_device(), in, kShapes[i])) return groups_layout_fits(i, q) ? i : -1;
             return -1;
@@ -517,9 +579,12 @@ bool layout_fits(const sycl::queue& q) {
 }
 
 bool groups_layout_fits(int s, const sycl::queue& q) {
-    if (s == 0) return layout_fits<0, true>(q);
-    if (s == 1) return layout_fits<1, true>(q);
-    return layout_fits<2, true>(q);
+    switch (s) {
+        case 0: return layout_fits<0, true>(q);
+        case 1: return layout_fits<1, true>(q);
+        case 2: return layout_fits<2, true>(q);
+        default: return layout_fits<3, true>(q);
+    }
 }
 
 // A product's slices along K: when its tiles fill less than twice the device's compute units (its report) and it has
@@ -561,10 +626,11 @@ sycl::event launch_split(sycl::queue& q, const E* x, const E* w, float* Y, int64
     const int64_t kslice = (K / ns + KC - 1) / KC * KC;
     ns = (K + kslice - 1) / kslice;
     *slices = ns;
-    if (ns <= 1) return launch<S, E, false, GROUPED>(q, x, w, 0, Y, ldy, nullptr, 1, T, N, K, K);
+    const auto [bm, bn] = block_order(q);
+    if (ns <= 1) return launch<S, E, false, GROUPED>(q, x, w, 0, Y, ldy, nullptr, 1, T, N, K, K, bm, bn);
     float* part = k_scratch(q, (size_t) (ns * T * N));
-    if (part == nullptr) { *slices = 1; return launch<S, E, false, GROUPED>(q, x, w, 0, Y, ldy, nullptr, 1, T, N, K, K); }
-    launch<S, E, false, GROUPED>(q, x, w, 0, part, N, nullptr, (int) ns, T, N, K, kslice);
+    if (part == nullptr) { *slices = 1; return launch<S, E, false, GROUPED>(q, x, w, 0, Y, ldy, nullptr, 1, T, N, K, K, bm, bn); }
+    launch<S, E, false, GROUPED>(q, x, w, 0, part, N, nullptr, (int) ns, T, N, K, kslice, bm, bn);
     return q.parallel_for(sycl::range<2>((size_t) T, (size_t) N), [=](sycl::id<2> i) {
         const int64_t t = (int64_t) i[0], n = (int64_t) i[1];
         float v = part[t * N + n];
@@ -600,9 +666,12 @@ sycl::event run(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t w_
 template<typename E>
 sycl::event by_shape(int s, sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y,
                      int64_t ldy, const int32_t* bounds, int G, int64_t T, int64_t N, int64_t K, bool accumulate) {
-    if (s == 0) return run<0, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
-    if (s == 1) return run<1, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
-    return run<2, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+    switch (s) {
+        case 0: return run<0, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+        case 1: return run<1, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+        case 2: return run<2, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+        default: return run<3, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+    }
 }
 
 }  // namespace

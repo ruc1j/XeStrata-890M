@@ -15,6 +15,18 @@ The main changes for the 890M:
 
 - `STRATA_CACHE_HOST=1`: the expert cache in host memory (host USM) instead of the GPU's pool (the GTT, about half the
   RAM by default), so the GPU reads every expert directly (with `--mmap-experts --expert-cache 24576 --no-prefill-borrow`).
+- Prefill's dense matrix products: at start the engine times oneMath's library (rocBLAS) against XeStrata's own WMMA
+  kernel and takes the faster (HIP GPUs only; on the 890M hipBLASLt has no gfx1150 kernels and rocBLAS falls back to
+  generic ones, three times slower than the own kernel).  `STRATA_BLAS=1` keeps the library, `STRATA_NO_BLAS=1` the
+  own kernel.
+- The own WMMA kernel (mma_gemm) orders its work-groups so that those in flight together cover a compact part of the
+  output (blocks of 8 x 8 tiles, `STRATA_MMA_BLOCK`), keeping the rows they read in the 2 MB L2.
+- The experts' int8 products (MMQ) read the blobs in place when every expert a layer routes is in the cache (no gather
+  into group buffers, no copies into the MMQ ring; `STRATA_PREFILL_MMQ_INPLACE=0` restores the old way).  The WMMA
+  body takes no output staging in local memory, so two work-groups fit a WGP.
+  Prefill on the 890M: 2,669 tokens (one sentence repeated) 22.0 -> 12.4 s, varied text of 3,481 tokens 29.1 -> 16.2 s
+  and of 523 tokens 5.4 -> 3.2 s.  The own kernel sums in another order than rocBLAS, so an answer can differ by
+  rounding (`STRATA_BLAS=1` gives the old one).
 
 What follows is the original XeStrata's description.
 

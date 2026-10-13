@@ -470,6 +470,9 @@ struct Prefill::Impl {
     strata::gpu::Event* mgrp_used[2] = {};    // a group of ring slots read by its products, by the group's parity
     bool mgrp_live[2] = {};
     HostVec<int32_t> bounds_host;
+    // XeStrata-890M: the layer's experts' addresses (two int32 each), the int8 products reading them in place (wtab)
+    HostVec<int32_t> wtab_host;
+    const uint8_t** wtab_dev = nullptr;
     std::unique_ptr<mmq::Context> mmq_ctx;
     HostVec<int32_t> ids_host, slot_host, src_host;
     std::vector<int32_t> cnt, off;
@@ -882,6 +885,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
+        m.wtab_dev = o.take<const uint8_t*>((size_t) m.g->n_expert, ok);
         m.grp_gu = m.grp_d = m.mring = nullptr;
         if ((int64_t) T >= STREAM_ALL_MIN) {
             m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max, ok);
@@ -1141,6 +1145,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
+        o.take<const uint8_t*>((size_t) g.n_expert, ok);
         if ((int64_t) T >= STREAM_ALL_MIN) {
             o.take<uint8_t>(MMQ_GROUP * mp.gu_max, ok);
             o.take<uint8_t>(MMQ_GROUP * mp.d_max, ok);
@@ -2091,6 +2096,31 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
                     const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                     const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
+                    // XeStrata-890M: when every expert the layer routes is in the cache (a GPU whose cache holds them
+                    // all, the host-USM cache of the 890M among them), the int8 products read the blobs where they lie,
+                    // through a table of their addresses (wtab), instead of gathering each group into the group buffers
+                    // (a launch and 1.5 MB of copies an expert) or copying each into the MMQ ring (chunks below
+                    // STREAM_ALL_MIN).  The products then read host USM, which the GPU does not cache, a little slower,
+                    // but less than the copies cost: on the 890M a varied 3,481-token prompt 16.8 -> 16.4 s, a
+                    // 523-token one 3.5 -> 3.2 s.  The same products of the same bytes: the same results.
+                    // STRATA_PREFILL_MMQ_INPLACE=0: as before.
+                    static const bool inplace_env = [] {
+                        const char* v = std::getenv("STRATA_PREFILL_MMQ_INPLACE");
+                        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+                    }();
+                    bool in_place = use_mmq && inplace_env && m.wtab_dev != nullptr && m.host_res && m.cache;
+                    for (size_t j = 0; in_place && j < order.size(); ++j)
+                        if (m.host_res[(size_t) l * m.g->n_expert + order[j]] < 0) in_place = false;
+                    if (in_place) {
+                        m.wtab_host.resize(2 * order.size());
+                        for (size_t j = 0; j < order.size(); ++j) {
+                            const uint8_t* b = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + order[j]]);
+                            const uint64_t a = (uint64_t) (uintptr_t) b;
+                            m.wtab_host[2 * j] = (int32_t) (uint32_t) (a & 0xffffffffu);
+                            m.wtab_host[2 * j + 1] = (int32_t) (uint32_t) (a >> 32);
+                        }
+                        m.wtab_host.to_device(reinterpret_cast<int32_t*>(m.wtab_dev), m.cs);
+                    }
                     pt.mark(kPfGather, cs);
                     if (use_mmq) {
                         // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
@@ -2255,7 +2285,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (use_mmq) {
                             const size_t q = j % MMQ_GROUP;
                             const auto& f = lay.fmt[(size_t) l];
-                            if (mmq_direct) {
+                            if (in_place) {
+                                // the group's products read the blob where it lies (wtab): nothing to move
+                            } else if (mmq_direct) {
                                 // a resident expert into its ring slot (the slot's last group is done: same stream)
                                 if (slot < 0)
                                     strata::gpu::copy_async(slot_ptr((int) (j % MMQ_RING)), blob_dev,
@@ -2287,6 +2319,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             gu.expert_bytes = mmq_direct ? MMQ_SLOT() : mmq_gub;
                             gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                             gu.total_rows = T * K; gu.max_rows = maxr; gu.rows = nr; gu.dst = m.GU; gu.ld_dst = 1280;
+                            if (in_place) { gu.w = nullptr; gu.expert_bytes = 0; gu.wtab = m.wtab_dev + j0; gu.woff = 0; }
                             m.mmq_ctx->run(gu, m.cs);
                             mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
                             pt.mark(kPfGemmD, cs);
@@ -2297,6 +2330,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
                             dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                             dn.ld_dst = N;
+                            if (in_place) { dn.w = nullptr; dn.expert_bytes = 0; dn.wtab = m.wtab_dev + j0; dn.woff = f.down_off; }
                             m.mmq_ctx->run(dn, m.cs);
                             if (mmq_direct) {
                                 const int par = (int) (g % 2);

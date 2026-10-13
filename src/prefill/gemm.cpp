@@ -15,6 +15,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include <oneapi/math/blas.hpp>
+#include <chrono>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -42,6 +43,10 @@ bool env_on(const char* name) {
 struct Trial {
     std::string why;   // empty when oneMath took the products
     bool bf16 = true;
+    // XeStrata-890M: the library's and XeStrata's own kernels' time for one product (ms; 0: not measured), and
+    // whether the own kernels are to take the products (own_faster)
+    double ms_lib = 0, ms_own = 0;
+    bool own_faster = false;
 };
 // Per GPU (a layer split drives GPUs of different makers, so oneMKL on one and cuBLAS on the next): whether oneMath
 // takes the products - not once it had no backend for the GPU, nor with STRATA_NO_BLAS=1 (XeStrata's own kernels, to
@@ -54,6 +59,8 @@ struct Backend {
 };
 std::mutex g_mutex;
 std::unordered_map<sycl::device, Backend> g_backends;
+// the timed product of the trial (a short prompt's rows, the model's width)
+constexpr int64_t kTrialT = 512, kTrialN = 2560, kTrialK = 2560;
 
 // The backend of `dev`, its trial's outcome taken in (waited for) the first time
 Backend backend(const sycl::device& dev) {
@@ -72,6 +79,12 @@ Backend backend(const sycl::device& dev) {
         if (!t.why.empty()) {
             std::fprintf(stderr, "strata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
                          t.why.c_str());
+            b.blas = false;
+        } else if (t.own_faster) {
+            std::fprintf(stderr, "strata: oneMath's library took %.2f ms for a %lld x %lld x %lld FP16 product, "
+                                 "XeStrata's own kernels %.2f: the prompt's matrix products take the own kernels "
+                                 "(STRATA_BLAS=1 keeps the library)\n", t.ms_lib, (long long) kTrialT,
+                         (long long) kTrialN, (long long) kTrialK, t.ms_own);
             b.blas = false;
         } else if (!t.bf16 && b.bf16) {
             std::fprintf(stderr, "strata: oneMath has no BF16 product on this GPU: those take XeStrata's own "
@@ -148,6 +161,45 @@ void Gemm::prepare() {
         q.wait();
         sycl::free(x, q);
         sycl::free(y, q);
+        // XeStrata-890M: on a GPU oneMath drives through the HIP backend (rocBLAS, hipBLASLt where it has kernels for
+        // the GPU), the library's product against XeStrata's own kernels' (mma_gemm's WMMA on RDNA3 and RDNA4), a
+        // kTrialT x kTrialN x kTrialK FP16 product three times each, turn about, the fastest of each: the own kernels
+        // take the products when at least a fifth faster.  On the 890M (gfx1150) hipBLASLt has no kernels and rocBLAS
+        // runs generic ones without the matrix instructions: 3.3 against 1.1 ms, and a 2669-token prompt 22.4 -> 14.0 s
+        // on the own kernels.  STRATA_BLAS=1 keeps the library without the trial (the A/B); STRATA_NO_BLAS=1 the own
+        // kernels (Backend).
+        if (t.why.empty() && dev.get_backend() == sycl::backend::ext_oneapi_hip && !env_on("STRATA_BLAS")) {
+            const size_t xe = (size_t) kTrialT * kTrialK, we = (size_t) kTrialN * kTrialK, ye = (size_t) kTrialT * kTrialN;
+            auto* tx = sycl::malloc_device<uint16_t>(xe + we, q);
+            auto* ty = sycl::malloc_device<float>(ye, q);
+            void* own = strata::gpu::stream_create();
+            if (tx != nullptr && ty != nullptr && own != nullptr &&
+                strata::kernels::xmx_gemm_ok(tx, tx + xe, ty, kTrialN, kTrialK, kTrialN)) {
+                q.fill<uint16_t>(tx, 0x3c00, xe + we).wait();   // 1.0 in FP16
+                try {
+                    double best_lib = 1e30, best_own = 1e30;
+                    for (int r = 0; r < 4; ++r) {   // the first round warms both up
+                        auto t0 = std::chrono::steady_clock::now();
+                        product<sycl::half>(q, tx, tx + xe, ty, kTrialT, kTrialN, kTrialK, kTrialN, false);
+                        q.wait_and_throw();
+                        const double ml = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                        t0 = std::chrono::steady_clock::now();
+                        strata::kernels::xmx_gemm(XmxType::f16, tx, tx + xe, ty, kTrialT, kTrialN, kTrialK, kTrialN, own);
+                        strata::gpu::stream_sync(own);
+                        const double mo = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                        if (r > 0) { best_lib = std::min(best_lib, ml); best_own = std::min(best_own, mo); }
+                    }
+                    t.ms_lib = best_lib;
+                    t.ms_own = best_own;
+                    t.own_faster = best_own * 1.2 < best_lib;
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "strata: the prompt products' trial did not run (%s): oneMath keeps them\n", e.what());
+                }
+            }
+            if (own != nullptr) strata::gpu::stream_destroy(own);
+            if (tx != nullptr) sycl::free(tx, q);
+            if (ty != nullptr) sycl::free(ty, q);
+        }
         return t;
     }).share();
 #endif
