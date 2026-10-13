@@ -1,6 +1,6 @@
 ---
 name: release
-description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages published with the notes (Japanese then English), then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
+description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages published with the notes (English then Japanese) and the older releases marked as old, then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
 disable-model-invocation: true
 argument-hint: "[VERSION, e.g. 0.1.39 or 0.1.39.1]"
 ---
@@ -73,7 +73,7 @@ Steps 5 and 6 are done while it builds.
 
 ## 5. The release notes
 
-Write `build/release/xe<VERSION>/NOTES.md`: the Japanese section first, then the same content in English.
+Write `build/release/xe<VERSION>/NOTES.md`: the English section first, then the same content in Japanese (the user's decision, 2026-10-12), under a first line linking the two: `[English](#english) | [日本語](#日本語)`.
 
 - What changed for users since the previous release tag (`git log --no-merges <previous>..xe<VERSION>`; for the first release, since `origin/main`), grouped by what a user notices, not a list of commits.
 - How to install: README's install section, as it is there (the user's decision, 2026-10-11): the four numbered steps (download from the table with `SHA256SUMS`, `sha256sum -c SHA256SUMS --ignore-missing`, `sudo apt install ./…deb` or `sudo dnf install ./…rpm` with the release's file names, `xestrata --setup`, which shows the GPU makers' packages that are missing and the command that installs them: AGENTS.md, "Packages", the notes do not list them), then the `> [!NOTE]` that without an NVIDIA GPU either CUDA version works the same, then the package table (Intel, AMD (RDNA2 or later), NVIDIA (Turing or later): `xestrata-contrib-cuda13.1`, `cuda13.4` on Fedora; Intel, AMD (RDNA2 or later), NVIDIA Pascal and Volta: `xestrata-contrib-cuda12.4`). A change to one goes into the other.
@@ -129,19 +129,30 @@ Retry a push only for a network failure (up to four times, waiting 2, 4, 8, 16 s
 Report the release's URL, then prepare the development machine's engines for step 9.
 A wrong asset or note is fixed with `gh release upload --clobber`, `gh release delete-asset` or `gh release edit --notes-file`.
 
+### The older releases
+
+Once the new release is published (it is then the latest), mark every older one:
+
+```sh
+gh release list --repo MistVVK/XeStrata --limit 1000 --json tagName,isLatest -q '.[] | select(.isLatest | not) | .tagName' |
+  while read -r t; do .claude/skills/release/scripts/mark-old.sh "$t"; done
+```
+
+`mark-old.sh` puts a warning at the top of a release's notes, in English and Japanese, that sends the reader to the latest release (`releases/latest`, so a note put in before stays right); a release that has it already is left as it is, so in practice only the previous release changes.
+
 ## 9. The speed table
 
 The release against upstream's newest release tag, IQ3_XXS, on each maker's GPU: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container (step 6).
-The six tiers and the settings of the 2026-10-04-speed-matrix record (1K to 262K, what setup writes for each context, 256 greedy tokens); its `prompts.py`, now `.claude/skills/release/scripts/prompts.py`, writes the prompts (`python .claude/skills/release/scripts/prompts.py <pack> <ids folder>`).
+The six tiers and the settings of the 2026-10-04-speed-matrix record (1K to 262K, what setup writes for each context, 256 greedy tokens), with one change (the user's decision of 2026-10-12): KV streaming (`--kv-resident`) only where setup writes it on the machine, from 64K when the RAM holds the KV cache beside the model, so a machine short of that RAM (the AMD container: `LOCAL.md`) does not compare at those lengths with the releases up to xe0.1.42; its `prompts.py`, now `.claude/skills/release/scripts/prompts.py`, writes the prompts (`python .claude/skills/release/scripts/prompts.py <pack> <ids folder>`).
 The table's method stays fixed from release to release so the releases compare: the upstream merge's measurements (/upstream-sync) have scripts of their own, and a change to them does not change this table.
 
 The engines, built from the tags (no package installed), each in a worktree of its own under `.claude/worktrees/`:
 
 - XeStrata: the contrib-llvm build of `xe<VERSION>` (docs/BUILD.md, with `LD_LIBRARY_PATH` to intel/llvm's `lib`); one GPU at a time with `ONEAPI_DEVICE_SELECTOR` (`level_zero:*` for the B70, `cuda:*` for the RTX 4070).
-- upstream on the B70: its `sycl/` port, built in its Docker image as its docs/INTEL.md says (`docker build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`), and run through `scripts/up-sycl.sh` (`UP=".claude/skills/release/scripts/up-sycl.sh"` with `UP_TREE`, `DATA` and `IDS` exported).
+- upstream on the B70: its `sycl/` port, built in its Docker image as its docs/INTEL.md says (`docker build -t strata-sycl-dev sycl/tools`, then its `build.sh` with `AOT=bmg-g31`), and run through `scripts/up-sycl.sh` (`UP=".claude/skills/release/scripts/up-sycl.sh"` with `UP_TREE`, `DATA` and `IDS` exported), which runs it as its setup configures an Intel card: the arguments get what its `sycl/setup_intel.py` writes (the xe cards' expert profile, the streamed experts, KV streaming from 64K, the VRAM reserve, the prompt chunks), and the engine the run-time switches of its `sycl/serve/strata-sycl.sh`.
 - upstream on the RTX 4070: its CUDA build, as its documents say.
 
-Each engine's own shipped expert profile (`data/expert-profile.bin` of its tree).
+Each engine's own shipped expert profile (`data/expert-profile.bin` of its tree; upstream's `sycl/` port takes the one its `sycl/setup_intel.py` writes in its place, `data/expert-profile-sycl.bin` from v0.1.43).
 No other work on a machine while it measures (no build, no other engine).
 
 ```sh
@@ -177,7 +188,7 @@ It is not committed; the release notes carry the tables.
 
 ## 10. The final release (確定報)
 
-The final release is reached a GPU at a time (the user's decision, 2026-10-11): as soon as one GPU's tables are complete (its generate table and its serve and everyday table both), add them to the notes (Japanese and English sections) and update the release (`gh release edit`, below), without waiting for the other GPUs.
+The final release is reached a GPU at a time (the user's decision, 2026-10-11): as soon as one GPU's tables are complete (its generate table and its serve and everyday table both), add them to the notes (English and Japanese sections) and update the release (`gh release edit`, below), without waiting for the other GPUs.
 
 - The comparison section comes after the notes' other sections: its opening lines (the engines' versions, the model, the method), then the note on temperatures and what counts as equal (below) right after them, once, then the GPUs in a fixed order, the B70, the RTX 4070, the RX 9060 XT, each as its tables are done.
 - While some are missing, one line under the done ones names them: B70・RTX 4070: 計測中（後で足す） / B70, RTX 4070: being measured (added later).
