@@ -761,7 +761,11 @@ bool doorbell_visible(void* stream) {
 
 void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
                    const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
-                   uint32_t ring, void* stream) {
+                   uint32_t ring, void* stream, int keep, float* w) {
+    // XeStrata-890M (keep < k, STRATA_EXPERT_KEEP): each token's experts past rank `keep` are left out of the plan and
+    // their weights set to 0, the kept ones scaled to the token's old sum (the router ranks them by weight, first the
+    // largest).  An approximation: it changes the output.
+    if (keep <= 0 || keep > k) keep = k;
     // One work-item per entry (at most kVerifyMaxT * 10 of them; one work-item alone grouped them in ~70 us a layer,
     // upstream 882764d).  The plan is the host loop's exactly: groups in order of first occurrence, entries in a group
     // in index order.  Entry i: L = its expert's first index; its group = the first occurrences before L; the group
@@ -774,20 +778,27 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
         h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
             const auto grp = it.get_group();
             const int t = (int) it.get_local_id(0);
+            const bool use = t < n && t % k < keep;
             bool bad = false;
             if (t < n) {
                 const int32_t ex = ids[t];
-                s_ids[t] = ex;
-                bad = ex < 0 || ex >= n_expert || res[ex] < 0;
+                s_ids[t] = use ? ex : -1;   // a left-out entry joins no group
+                bad = use && (ex < 0 || ex >= n_expert || res[ex] < 0);
             }
             if (sycl::any_of_group(grp, bad)) {
                 if (t == 0) *skip = 0;
                 return;
             }
+            if (keep < k && w != nullptr && t < n && t % k == 0) {   // one work-item a token: its weights
+                float all = 0.0f, kept = 0.0f;
+                for (int j = 0; j < k; ++j) { all += w[t + j]; if (j < keep) kept += w[t + j]; }
+                const float scale = kept > 0.0f ? all / kept : 1.0f;
+                for (int j = 0; j < k; ++j) w[t + j] = j < keep ? w[t + j] * scale : 0.0f;
+            }
             // an entry's leader L (its expert's first index) and, for a leader, its entry count; then one scan of
             // (entries << 16 | 1) over the leaders numbers the groups and gives their starts (upstream fe4de5de)
             int L = t, cnt = 0, pos = 0;
-            if (t < n) {
+            if (use) {
                 for (int j = 0; j < t; ++j)
                     if (s_ids[j] == s_ids[t]) { L = j; break; }
                 for (int j = 0; j < n; ++j) {
@@ -796,7 +807,7 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
                     if (j < t) ++pos;
                 }
             }
-            const int pack = L == t && t < n ? (cnt << 16) | 1 : 0;
+            const int pack = L == t && use ? (cnt << 16) | 1 : 0;
             const int excl = sycl::exclusive_scan_over_group(grp, pack, sycl::plus<int>());
             s_excl[t] = excl;
             const int total = sycl::reduce_over_group(grp, pack, sycl::plus<int>());
@@ -808,7 +819,8 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
             unsigned long long* ptr = reinterpret_cast<unsigned long long*>(pl + ptr_off);
             int32_t* start2 = pl + ptr_off + 4 * capx;
-            if (t < n) {
+            const int n_used = (int) (total >> 16);
+            if (use) {
                 const int le = s_excl[L];
                 const int g = le & 0xffff, gstart = le >> 16;
                 dst[gstart + pos] = t;
@@ -822,10 +834,10 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             sycl::group_barrier(grp);
             if (t != 0) return;
             const int groups = total & 0xffff;
-            start[groups] = n;
-            start2[0] = n;
+            start[groups] = n_used;
+            start2[0] = n_used;
             counts[0] = groups;
-            counts[1] = n;
+            counts[1] = n_used;
             counts[2] = 0;
             sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
             *skip = ring;

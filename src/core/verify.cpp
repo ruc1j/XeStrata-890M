@@ -1092,11 +1092,20 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                       rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
+        // XeStrata-890M, STRATA_EXPERT_KEEP=N (opt-in, changes the output): only each token's N heaviest routed experts
+        // (the weights rescaled to the token's sum), on the device-planned path (every expert resident)
+        static const int expert_keep = [] {
+            const char* v = std::getenv("STRATA_EXPERT_KEEP");
+            const int n = v != nullptr ? (int) std::strtol(v, nullptr, 10) : 0;
+            if (n > 0) std::fprintf(stderr, "strata verify: STRATA_EXPERT_KEEP=%d: each token's %d heaviest routed experts "
+                                            "(an approximation)\n", n, n);
+            return n;
+        }();
         if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
-                          (uint32_t) ((l - lb_) * G + grp + 1), cs);
+                          (uint32_t) ((l - lb_) * G + grp + 1), cs, expert_keep, w_ + tb * K);
         if (!recording_res_)   // the resident graph asks the host nothing
             doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                              m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
