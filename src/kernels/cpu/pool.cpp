@@ -15,6 +15,7 @@
 #include <intrin.h>   // __cpuidex (STRATA_POOL_UMWAIT)
 #else
 #include <cpuid.h>    // __cpuid_count (STRATA_POOL_UMWAIT)
+#include <x86intrin.h>   // _mm_monitorx / _mm_mwaitx (clang's immintrin.h leaves the AMD ones out)
 #endif
 
 #include <cstdio>
@@ -54,15 +55,41 @@ bool cpu_waitpkg() {
 #endif
     return ((r[2] >> 5) & 1u) != 0;
 }
+// XeStrata-890M: an AMD CPU has MONITORX/MWAITX (CPUID.80000001H:ECX bit 29) and no WAITPKG (the Ryzen AI 9 HX 370
+// of the 890M's machine): the same wait on the epoch's line, the timer in TSC cycles (EBX, ECX bit 1), and the C0
+// hint (EAX 0xF0, no C-state) for UMWAIT's C0.1, the C1 hint (EAX 0) for C0.2.  STRATA_POOL_UMWAIT picks it there.
+// Measured on the 890M (IQ2_XS, the cache in host memory, 6 chats twice): the spin 31.10 / 30.77 tok/s, MWAITX C0
+// 31.12 / 31.07, C1 31.10 / 31.08, the same answers: the workers sleep on the condition variable through a GPU-bound
+// decode anyway, so the knob stays opt-in.
+bool cpu_mwaitx() {
+    unsigned r[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+    int x[4];
+    __cpuidex(x, (int) 0x80000000u, 0);
+    if ((unsigned) x[0] < 0x80000001u) return false;
+    __cpuidex(x, (int) 0x80000001u, 0);
+    r[2] = (unsigned) x[2];
+#else
+    __cpuid_count(0x80000000u, 0, r[0], r[1], r[2], r[3]);
+    if (r[0] < 0x80000001u) return false;
+    __cpuid_count(0x80000001u, 0, r[0], r[1], r[2], r[3]);
+#endif
+    return ((r[2] >> 29) & 1u) != 0;
+}
+bool wait_is_mwaitx() {
+    static const bool m = !cpu_waitpkg() && cpu_mwaitx();
+    return m;
+}
 uint64_t umwait_cycles() {
     static const uint64_t c = [] {
         const char* e = std::getenv("STRATA_POOL_UMWAIT");
         if (e == nullptr || std::strtoll(e, nullptr, 10) <= 0) return (uint64_t) 0;
-        if (!cpu_waitpkg()) {
-            std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
+        if (!cpu_waitpkg() && !cpu_mwaitx()) {
+            std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG or MWAITX, the workers spin\n");
             return (uint64_t) 0;
         }
-        std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::strtoll(e, nullptr, 10));
+        std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: parked workers wait with %s (%lld cycles)\n",
+                     wait_is_mwaitx() ? "MWAITX" : "UMWAIT", std::strtoll(e, nullptr, 10));
         return (uint64_t) std::strtoll(e, nullptr, 10);
     }();
     return c;
@@ -86,6 +113,16 @@ bool umwait_unless_moved(const std::atomic<uint32_t>& epoch, uint32_t seen, unsi
     _umonitor((void*) &epoch);
     if (epoch.load(std::memory_order_acquire) != seen) return false;
     _umwait(state, until);
+    return true;
+}
+// the MWAITX form: `cycles` from now (EBX is 32 bits), the hint from `state` as above
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((target("mwaitx")))
+#endif
+bool mwaitx_unless_moved(const std::atomic<uint32_t>& epoch, uint32_t seen, unsigned state, uint64_t cycles) {
+    _mm_monitorx((void*) &epoch, 0, 0);
+    if (epoch.load(std::memory_order_acquire) != seen) return false;
+    _mm_mwaitx(0x2u, state != 0 ? 0xF0u : 0x0u, (unsigned) (std::min)(cycles, (uint64_t) 0xFFFFFFFFu));
     return true;
 }
 
@@ -361,10 +398,11 @@ void ExpertPool::worker(int id) {
         const uint64_t um_t0 = um != 0 && um_esc != 0 ? __rdtsc() : 0;
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            if (um != 0) {   // STRATA_POOL_UMWAIT: wake on the publish's write to epoch_, or after `um` cycles
+            if (um != 0) {   // STRATA_POOL_UMWAIT: wake on the publish's write to epoch_, or after `um` cycles (UMWAIT or MWAITX)
                 const uint64_t now = __rdtsc();
                 const unsigned st = um_esc != 0 ? (now - um_t0 < um_esc ? 1u : 0u) : umwait_state();
-                if (!umwait_unless_moved(epoch_, seen, st, now + um)) break;
+                if (!(wait_is_mwaitx() ? mwaitx_unless_moved(epoch_, seen, st, um)
+                                       : umwait_unless_moved(epoch_, seen, st, now + um))) break;
                 if ((++spins & 15u) != 0) continue;   // each wait is ~um cycles: look at the clock more often
             } else {
                 _mm_pause();
