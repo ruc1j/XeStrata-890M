@@ -748,9 +748,9 @@ struct Gdn {
                 const int n = (int) std::min<int64_t>(GDN_TB, T - k * GDN_TB);
                 for (int i = 0; i < n; ++i) {
                     const int64_t t = k * GDN_TB + i;
-                    float kc[RPG];
-    #pragma unroll
-                    for (int r = 0; r < RPG; ++r) kc[r] = sk[((size_t) bb * GDN_TB + i) * S + (size_t) (rg * RPG + r)];
+                    // k's values read from local memory at each use (XeStrata-890M): a copy of the 32 in registers
+                    // spilled 405 of them at the 256-register budget (gfx1150)
+                    const float* kc = &sk[((size_t) bb * GDN_TB + i) * S + (size_t) (rg * RPG)];
                     float g[VPK], kv[VPK], delta[VPK], o[VPK];
     #pragma unroll
                     for (int j = 0; j < VPK; ++j) {
