@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/expert_source.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -312,7 +312,11 @@ void test_page_cache_hint() {
 void test_rotating_source(bool rotate, bool pin) {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
+#if defined(_WIN32)
+    _putenv_s("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0");
+#else
     setenv("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0", 1);
+#endif
     TempDirectory dir;
     std::string err;
     require(expert_layout_load(dir.path.string(), 1, 5, err), err);

@@ -76,7 +76,7 @@ constexpr Shape kShapes[] = {{8, 16, 16, 16, {2, 2, 2, 2, false}, {2, 2, 2, 2, f
                              // RDNA's WMMA with more tiles a sub-group (XeStrata-890M, STRATA_MMA_SHAPE=4..6): 2 x 2
                              // sub-groups of 4 x 2, 2 x 4 and 4 x 4 tiles (128 x 64, 64 x 128 and 128 x 128 on 256
                              // lanes).  They need the register budget of a 256-lane work-group (the patch
-                             // 20-hip-reqd-work-group-size: without it 128 registers a lane, and they spilled)
+                             // 22-hip-reqd-work-group-size: without it 128 registers a lane, and they spilled)
                              {16, 16, 16, 32, {2, 2, 4, 2, false}, {2, 2, 2, 2, false}, false},
                              {16, 16, 16, 32, {2, 2, 2, 4, false}, {2, 2, 2, 2, false}, false},
                              {16, 16, 16, 32, {2, 2, 4, 4, false}, {2, 2, 2, 2, false}, false}};
