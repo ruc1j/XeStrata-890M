@@ -6,6 +6,7 @@
 // is linearised the way CUDA numbers its threads (x fastest).  __expf, rsqrtf, powf, cosf, sinf and log1pf are the
 // precise SYCL functions.
 #include "strata/prefill/kernels.hpp"
+#include "../kernels/xe/device_target.hpp"
 #include "../kernels/xe/xe_shuffle.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -600,6 +601,7 @@ struct Gdn {
         int64_t T;
         static constexpr int NJ = S / SG;   // the q and k values a work-item holds
         static constexpr int QR = S / 4;    // the D-2 kernel's rows per row group
+        STRATA_AMD_REQD_WG(16)
         void operator()(sycl::nd_item<1> it) const {
             const sycl::sub_group sg = it.get_sub_group();
             const int lane = (int) sg.get_local_linear_id();
@@ -678,6 +680,7 @@ struct Gdn {
         int64_t T;
         sycl::local_accessor<float, 1> sq, sk, sv, sgb, rkv, ro;   // [2][TB][S] x2, [2][TB][VPK][CB], [2][2][TB][VPK], ...
 
+        STRATA_AMD_REQD_WG(NT)
         void operator()(sycl::nd_item<1> it) const {
             const int qh = (int) it.get_group(0) / NCB, cb = (int) it.get_group(0) % NCB;
             const int tid = (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
@@ -871,13 +874,13 @@ struct Gdn {
         }();
         const bool pipe = pipe_on;   // the kernel takes a copy
         static_assert(CB * RG == S, "one q and one k value a work-item");
-        // STRATA_GDN_KEYHEAD=0: the D-2 kernel where GdnRecLane does not run (A/B).  Off on the HIP backend
-        // (XeStrata-890M): on the 890M the D-2 kernel took 813-825 ms for the recurrence of a 3,474-token prompt
-        // against 908-909 with the key-head kernel, the same bits.
-        static const bool kh_on = [&] {
+        // STRATA_GDN_KEYHEAD=0: the D-2 kernel where GdnRecLane does not run (A/B).  On the 890M the key-head form
+        // needs the register budget of its work-group's size (STRATA_AMD_REQD_WG): at 128 registers it spilled 314-515
+        // and took 908 ms for the recurrence of a 3,474-token prompt against D-2's 820; with the budget 602 ms, the
+        // same bits.
+        static const bool kh_on = [] {
             const char* v = std::getenv("STRATA_GDN_KEYHEAD");
-            if (v != nullptr) return std::strtol(v, nullptr, 10) != 0;
-            return q.get_device().get_backend() != sycl::backend::ext_oneapi_hip;
+            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
         auto launch_kh = [&](float* st, float* yy) {
             q.submit([&](sycl::handler& hd) {

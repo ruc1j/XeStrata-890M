@@ -173,6 +173,7 @@ struct WmmaKernel {
     float scale;
     sycl::local_accessor<uint16_t, 1> ks, vs, ps;
 
+    STRATA_AMD_REQD_WG(1, W * 32)
     void operator()(sycl::nd_item<2> it) const {
 #if STRATA_PA_WMMA
         using fv8 = float __attribute__((ext_vector_type(8)));

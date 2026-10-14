@@ -78,7 +78,8 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      keeps the grid tables in local memory and applies the scales with one fma.
    - The expert cache's host USM is, on HIP, memory the GPU may cache (`hipHostMalloc` with NonCoherent; `STRATA_HOST_NC=0` for
      plain host USM): the MMQ reading it in place runs about twice as fast (a 523-token prefill 3.16 -> 2.68 s).
-   - The GDN recurrence does without the key-head kernel on HIP (`STRATA_GDN_KEYHEAD=1` brings it back).
+   - The required work-group size is stated for the QSA prompt attention too (PromptAttnMma: 83 spills -> 0, a 3,474-token
+     prompt's attention 1.99 -> 1.22 s), for the GDN key-head recurrence (908 -> 602 ms) and for decode's dense GEMV and HC read.
    - The own kernel sums in another order than rocBLAS, and the MMQ's fma rounds its scales differently, so an answer can differ by rounding (`STRATA_BLAS=1` gives the old dense products).
 
 ## What you need

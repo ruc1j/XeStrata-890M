@@ -486,6 +486,7 @@ struct PromptAttnMma {
     sycl::local_accessor<float, 1> st;      // [NG][R][16]: a sub-group's tile of p.v on its way to the registers
     sycl::local_accessor<float, 1> mrow, lsum, alpha;
 
+    STRATA_AMD_REQD_WG(1, pm::WG)
     void operator()(sycl::nd_item<2> it) const {
         // an empty body where there are no FP16 matrix engines of this shape (AMD before RDNA3, NVIDIA before sm_70):
         // mma_gemm does not take the 16 x 16 x 16 shape there, so this kernel is never launched.  RDNA3 and RDNA4 take

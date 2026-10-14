@@ -77,7 +77,8 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
      MMQ は decoder を load と decode に分けてステップの load を先に出し、格子表をローカルメモリに置き、スケールを 1 つの fma で掛けます。
    - エキスパートのキャッシュの host USM は、HIP では GPU がキャッシュできるメモリ（`hipHostMalloc` の NonCoherent、`STRATA_HOST_NC=0` で元の
      host USM）に取ります: その場で読む MMQ が 2 倍ほど速くなります（523 トークンの prefill 3.16 -> 2.68 s）。
-   - GDN の recurrence は HIP では key-head の kernel を使いません（`STRATA_GDN_KEYHEAD=1` で戻せます）。
+   - 必要なワークグループの大きさは QSA の prompt attention（PromptAttnMma: spill 83 → 0、3,474 トークンの attention 1.99 → 1.22 s）、
+     GDN の key-head の recurrence（908 → 602 ms）、decode の密な GEMV と HC の読みにも付けてあります。
    - 自身のカーネルは rocBLAS と足す順が違い、MMQ のスケールの fma も丸めが変わるので、答えが丸めの差で変わることがあります（`STRATA_BLAS=1` なら密な積は元のまま）。
 
 ## 必要なもの
