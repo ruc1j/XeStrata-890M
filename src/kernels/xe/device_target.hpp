@@ -32,7 +32,7 @@
 // gfx1150), and clang sets that attribute from reqd_work_group_size (third_party/main/intel-llvm/patches/20-...).
 // The other compiles are left as they were (unverified with the attribute).
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
-#define STRATA_AMD_REQD_WG(N) [[sycl::reqd_work_group_size(N)]]
+#define STRATA_AMD_REQD_WG(...) [[sycl::reqd_work_group_size(__VA_ARGS__)]]
 #else
-#define STRATA_AMD_REQD_WG(N)
+#define STRATA_AMD_REQD_WG(...)
 #endif

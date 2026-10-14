@@ -34,6 +34,7 @@
 // the multi-column kernel with NCOLS = 1 and the ncols = 1 layout (4 warps, 1 row, or 4 rows for small K) is the
 // single-column path, so both share one set of dot-product traits.  A warp is a sub-group of 32.
 #include "strata/kernels/native_mmvq.hpp"
+#include "device_target.hpp"
 #include "xe_shuffle.hpp"
 #include "q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -534,7 +535,7 @@ sycl::event launch_kernel(sycl::queue& q, const void* weights, const void* x_q8_
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> partial(sycl::range<1>(PW * NCOLS * ROWS * WARP), h);
         h.parallel_for(sycl::nd_range<1>(groups * NW * WARP, NW * WARP),
-                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                       [=](sycl::nd_item<1> it) STRATA_AMD_REQD_WG(NW * WARP) [[sycl::reqd_sub_group_size(WARP)]] {
             constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
             const sycl::sub_group sg = it.get_sub_group();
             const int ty = (int) sg.get_group_linear_id(), tx = (int) sg.get_local_linear_id();
@@ -601,7 +602,7 @@ sycl::event launch_row(sycl::queue& q, const void* weights, const void* x_q8_1, 
     const int rows_all = weights2 ? 2 * n_out : n_out;
     const std::size_t groups = (std::size_t(rows_all) + RPG - 1) / RPG;
     return q.parallel_for(sycl::nd_range<1>(groups * RPG * WARP, std::size_t(RPG) * WARP),
-                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                          [=](sycl::nd_item<1> it) STRATA_AMD_REQD_WG(RPG * WARP) [[sycl::reqd_sub_group_size(WARP)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int lane = (int) sg.get_local_linear_id();
         int row = (int) it.get_group(0) * RPG + (int) sg.get_group_linear_id();
@@ -647,7 +648,7 @@ sycl::event launch_rows(sycl::queue& q, const void* weights, const void* x_q8_1,
     const int subs = (rows_all + RPS - 1) / RPS;
     const std::size_t groups = (std::size_t(subs) + RPG - 1) / RPG;
     return q.parallel_for(sycl::nd_range<1>(groups * RPG * WARP, std::size_t(RPG) * WARP),
-                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                          [=](sycl::nd_item<1> it) STRATA_AMD_REQD_WG(RPG * WARP) [[sycl::reqd_sub_group_size(WARP)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int lane = (int) sg.get_local_linear_id();
         const int sub = (int) it.get_group(0) * RPG + (int) sg.get_group_linear_id();
@@ -703,7 +704,7 @@ sycl::event launch_iq4xs_rows(sycl::queue& q, const void* weights, const void* x
     const int subs = (rows_all + RPS - 1) / RPS;
     const std::size_t groups = (std::size_t(subs) + RPG - 1) / RPG;
     return q.parallel_for(sycl::nd_range<1>(groups * RPG * WARP, std::size_t(RPG) * WARP),
-                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                          [=](sycl::nd_item<1> it) STRATA_AMD_REQD_WG(RPG * WARP) [[sycl::reqd_sub_group_size(WARP)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int lane = (int) sg.get_local_linear_id();
         const int sub = (int) it.get_group(0) * RPG + (int) sg.get_group_linear_id();

@@ -207,7 +207,7 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
         sycl::local_accessor<float, 1> red(sycl::range<1>((size_t) WARPS * kFusedGrMaxT), h);
         const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (Q8_RG + 1) * THREADS, Q8_NKC), sycl::range<2>(THREADS, 1)),
-                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                       [=](sycl::nd_item<2> it) STRATA_AMD_REQD_WG(THREADS, 1) [[sycl::reqd_sub_group_size(WARP)]] {
             tok.stage(m, it);
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id();
