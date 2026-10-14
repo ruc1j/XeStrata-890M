@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 
 namespace strata::kernels {
 namespace {
@@ -102,23 +103,58 @@ struct Sub {
 // the grid bytes (below 128) negated where m is 0xFF
 inline uint32_t signed_bytes(uint32_t g, uint32_t m) { return (g ^ m) + (m & 0x01010101u); }
 
+// The i-quant decoders the expert products meet most (IQ2_XXS, IQ2_XS, IQ2_S, IQ1_M, Q2_0) in two parts
+// (XeStrata-890M): load gathers a block's bytes (Raw), decode makes the Sub from them, so that a lane's blocks of a
+// step have their loads in flight together before any decode (the WMMA body); get is the two in sequence.  The
+// unaligned words are read as the aligned words around them and joined by a shift, without get_int2_b2's branch (a
+// word that would lie past the block is read from the block instead: no bytes past the row).  Measured on the 890M,
+// IQ2_XS experts of 64 rows: each decode's loads were issued and waited for one after another (flat_load, s_waitcnt
+// vmcnt(0), then the grid's).
+struct Dw3 { uint32_t w0, w1, w2; };
+inline Dw3 load_dw3(const void* p) {   // the aligned words around 8 bytes at a 2-byte aligned address
+    const uintptr_t a = (uintptr_t) p;
+    const uint32_t* w = (const uint32_t*) (a & ~(uintptr_t) 3);
+    return {w[0], w[1], w[(a & 2) ? 2 : 1]};
+}
+inline U2 join8(const Dw3& w, const void* p) {   // those 8 bytes as two words
+    return ((uintptr_t) p & 2) ? U2{(w.w0 >> 16) | (w.w1 << 16), (w.w1 >> 16) | (w.w2 << 16)} : U2{w.w0, w.w1};
+}
+struct Dw2 { uint32_t w0, w1; };
+inline Dw2 load_dw2(const void* p) {   // the aligned words around 4 bytes at a 2-byte aligned address
+    const uintptr_t a = (uintptr_t) p;
+    const uint32_t* w = (const uint32_t*) (a & ~(uintptr_t) 3);
+    return {w[0], w[(a & 2) ? 1 : 0]};
+}
+inline uint32_t join4(const Dw2& w, const void* p) { return ((uintptr_t) p & 2) ? (w.w0 >> 16) | (w.w1 << 16) : w.w0; }
+template<typename T, typename = void> struct split_dec : std::false_type {};
+template<typename T> struct split_dec<T, std::void_t<typename T::Raw>> : std::true_type {};
+
 template<int TY> struct Dec;
 template<> struct Dec<16> {   // IQ2_XXS: d (0.5 + ls) / 4
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq2_xxs);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    using Grid = uint64_t;
+    static constexpr int GRID_BYTES = (int) sizeof(iq2xxs_grid);
+    static const Grid* table() { return iq2xxs_grid; }
+    struct Raw { Dw3 q; uint16_t d; };
+    static Raw load(const uint8_t* row, int sb, size_t) {
         const block_iq2_xxs* b = reinterpret_cast<const block_iq2_xxs*>(row) + sb / 8;
-        const int ib = sb % 8;
-        const uint32_t q2 = (uint32_t) get_int_b2(b->qs, 2 * ib), aux = (uint32_t) get_int_b2(b->qs, 2 * ib + 1);
+        return {load_dw3(b->qs + 4 * (sb % 8)), sycl::bit_cast<uint16_t>(b->d)};
+    }
+    static Sub decode(const Raw& w, const uint8_t* row, int sb, size_t, const Grid* grid) {
+        const block_iq2_xxs* b = reinterpret_cast<const block_iq2_xxs*>(row) + sb / 8;
+        const U2 pk = join8(w.q, b->qs + 4 * (sb % 8));
+        const uint32_t q2 = pk.x, aux = pk.y;
         Sub r;
         for (int k = 0; k < 8; k += 2) {
-            const Int2 gp = grid_pair(iq2xxs_grid, byte_of(q2, k / 2));
+            const Int2 gp = grid_pair(grid, byte_of(q2, k / 2));
             const uint32_t s8 = ksigns_byte((uint8_t) (aux >> (7 * k / 2)));
             r.v[k] = signed_bytes((uint32_t) gp.x, sign_mask(s8));
             r.v[k + 1] = signed_bytes((uint32_t) gp.y, sign_mask(s8 >> 4));
         }
-        r.s0 = r.s1 = (float) b->d * (float) (2 * (aux >> 28) + 1) * 0.125f;
+        r.s0 = r.s1 = (float) sycl::bit_cast<sycl::half>(w.d) * (float) (2 * (aux >> 28) + 1) * 0.125f;
         return r;
     }
+    static Sub get(const uint8_t* row, int sb, size_t rb) { return decode(load(row, sb, rb), row, sb, rb, table()); }
 };
 template<> struct Dec<18> {   // IQ3_XXS: d (0.5 + ls) / 2
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq3_xxs);
@@ -160,45 +196,64 @@ template<> struct Dec<21> {   // IQ3_S: d (1 + 2 ls)
 };
 template<> struct Dec<17> {   // IQ2_XS: d (0.5 + ls) / 4, a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq2_xs);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    using Grid = uint64_t;
+    static constexpr int GRID_BYTES = (int) sizeof(iq2xs_grid);
+    static const Grid* table() { return iq2xs_grid; }
+    struct Raw { Dw3 q; uint16_t d; uint8_t sc; };
+    static Raw load(const uint8_t* row, int sb, size_t) {
         const block_iq2_xs* b = reinterpret_cast<const block_iq2_xs*>(row) + sb / 8;
         const int ib = sb % 8;
-        const U2 pk = get_int2_b2(b->qs, 2 * ib);
+        return {load_dw3(b->qs + 4 * ib), sycl::bit_cast<uint16_t>(b->d), b->scales[ib]};
+    }
+    static Sub decode(const Raw& w, const uint8_t* row, int sb, size_t, const Grid* grid) {
+        const block_iq2_xs* b = reinterpret_cast<const block_iq2_xs*>(row) + sb / 8;
+        const U2 pk = join8(w.q, b->qs + 4 * (sb % 8));
         const uint32_t packed[2] = {pk.x, pk.y};
         Sub r;
         for (int l = 0; l < 8; l += 2) {
             const uint16_t q2 = half_of(packed[l / 4], (l / 2) % 2);
-            const Int2 gp = grid_pair(iq2xs_grid, q2 & 0x1FF);
+            const Int2 gp = grid_pair(grid, q2 & 0x1FF);
             const uint32_t s8 = ksigns_byte((uint8_t) (q2 >> 9));
             r.v[l] = signed_bytes((uint32_t) gp.x, sign_mask(s8));
             r.v[l + 1] = signed_bytes((uint32_t) gp.y, sign_mask(s8 >> 4));
         }
-        const float d = (float) b->d;
-        r.s0 = d * (float) (2 * (b->scales[ib] & 0x0F) + 1) * 0.125f;
-        r.s1 = d * (float) (2 * (b->scales[ib] >> 4) + 1) * 0.125f;
+        const float d = (float) sycl::bit_cast<sycl::half>(w.d);
+        r.s0 = d * (float) (2 * (w.sc & 0x0F) + 1) * 0.125f;
+        r.s1 = d * (float) (2 * (w.sc >> 4) + 1) * 0.125f;
         return r;
     }
+    static Sub get(const uint8_t* row, int sb, size_t rb) { return decode(load(row, sb, rb), row, sb, rb, table()); }
 };
 template<> struct Dec<22> {   // IQ2_S: d (0.5 + ls) / 4, a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq2_s);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    using Grid = uint64_t;
+    static constexpr int GRID_BYTES = (int) sizeof(iq2s_grid);
+    static const Grid* table() { return iq2s_grid; }
+    struct Raw { Dw2 q, sg; uint16_t d; uint8_t qh, sc; };
+    static Raw load(const uint8_t* row, int sb, size_t) {
         const block_iq2_s* b = reinterpret_cast<const block_iq2_s*>(row) + sb / 8;
         const int ib = sb % 8;
-        const uint32_t qs = (uint32_t) get_int_b2(b->qs, ib);
-        const int qh = b->qh[ib];
-        const uint32_t signs = (uint32_t) get_int_b2(b->qs, QK_K / 32 + ib);
+        return {load_dw2(b->qs + 4 * ib), load_dw2(b->qs + QK_K / 8 + 4 * ib), sycl::bit_cast<uint16_t>(b->d), b->qh[ib],
+                b->scales[ib]};
+    }
+    static Sub decode(const Raw& w, const uint8_t* row, int sb, size_t, const Grid* grid) {
+        const block_iq2_s* b = reinterpret_cast<const block_iq2_s*>(row) + sb / 8;
+        const int ib = sb % 8;
+        const uint32_t qs = join4(w.q, b->qs + 4 * ib), signs = join4(w.sg, b->qs + QK_K / 8 + 4 * ib);
+        const int qh = w.qh;
         Sub r;
         for (int l = 0; l < 8; l += 2) {
-            const Int2 gp = grid_pair(iq2s_grid, byte_of(qs, l / 2) | ((qh << (8 - l)) & 0x300));
+            const Int2 gp = grid_pair(grid, byte_of(qs, l / 2) | ((qh << (8 - l)) & 0x300));
             const uint32_t s8 = byte_of(signs, l / 2);
             r.v[l] = signed_bytes((uint32_t) gp.x, sign_mask(s8));
             r.v[l + 1] = signed_bytes((uint32_t) gp.y, sign_mask(s8 >> 4));
         }
-        const float d = (float) b->d;
-        r.s0 = d * (float) (2 * (b->scales[ib] & 0x0F) + 1) * 0.125f;
-        r.s1 = d * (float) (2 * (b->scales[ib] >> 4) + 1) * 0.125f;
+        const float d = (float) sycl::bit_cast<sycl::half>(w.d);
+        r.s0 = d * (float) (2 * (w.sc & 0x0F) + 1) * 0.125f;
+        r.s1 = d * (float) (2 * (w.sc >> 4) + 1) * 0.125f;
         return r;
     }
+    static Sub get(const uint8_t* row, int sb, size_t rb) { return decode(load(row, sb, rb), row, sb, rb, table()); }
 };
 template<> struct Dec<20> {   // IQ4_NL: d
     static constexpr int QK = 32, BSZ = (int) sizeof(block_iq4_nl);
@@ -232,44 +287,67 @@ template<> struct Dec<23> {   // IQ4_XS: d (ls - 32)
 };
 template<> struct Dec<42> {   // Q2_0: d (code - 1), 64 values a block
     static constexpr int QK = 64, BSZ = (int) sizeof(block_q2_0);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    using Grid = uint32_t;
+    static constexpr int GRID_BYTES = 0;
+    static const Grid* table() { return nullptr; }
+    struct Raw { Dw3 q; uint16_t d; };
+    static Raw load(const uint8_t* row, int sb, size_t) {
         const block_q2_0* b = reinterpret_cast<const block_q2_0*>(row) + sb / 2;
-        const uint16_t* qs = reinterpret_cast<const uint16_t*>(b->qs) + (ptrdiff_t) (sb % 2) * 4;
+        return {load_dw3(b->qs + 8 * (sb % 2)), sycl::bit_cast<uint16_t>(b->d)};
+    }
+    static Sub decode(const Raw& w, const uint8_t* row, int sb, size_t, const Grid*) {
+        const block_q2_0* b = reinterpret_cast<const block_q2_0*>(row) + sb / 2;
+        const U2 pk = join8(w.q, b->qs + 8 * (sb % 2));
+        const uint32_t packed[2] = {pk.x, pk.y};
         Sub r;
         for (int j = 0; j < 4; ++j) {
-            const uint32_t q = qs[j];
+            const uint32_t q = half_of(packed[j / 2], j % 2);
             const int k = 2 * j;
             r.v[k] = q2_0_bytes(q & 0xFFu);
             r.v[k + 1] = q2_0_bytes(q >> 8);
         }
-        r.s0 = r.s1 = (float) b->d;
+        r.s0 = r.s1 = (float) sycl::bit_cast<sycl::half>(w.d);
         return r;
     }
+    static Sub get(const uint8_t* row, int sb, size_t rb) { return decode(load(row, sb, rb), row, sb, rb, nullptr); }
 };
 
 template<> struct Dec<29> {   // IQ1_M: d (2 ls + 1) (grid +- 1/8), a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_iq1_m);
-    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+    using Grid = uint32_t;
+    static constexpr int GRID_BYTES = (int) sizeof(iq1s_grid_gpu);
+    static const Grid* table() { return iq1s_grid_gpu; }
+    struct Raw { Dw2 q; Dw3 sc; uint16_t qh; };
+    static Raw load(const uint8_t* row, int sb, size_t) {
         const block_iq1_m* b = reinterpret_cast<const block_iq1_m*>(row) + sb / 8;
         const int ib = sb % 8;
+        return {load_dw2(b->qs + 4 * ib), load_dw3(b->scales),
+                (uint16_t) (b->qh[2 * ib] | (b->qh[2 * ib + 1] << 8))};
+    }
+    static Sub decode(const Raw& w, const uint8_t* row, int sb, size_t, const Grid* grid) {
+        const block_iq1_m* b = reinterpret_cast<const block_iq1_m*>(row) + sb / 8;
+        const int ib = sb % 8;
+        const uint32_t qs = join4(w.q, b->qs + 4 * ib);
+        const U2 scw = join8(w.sc, b->scales);
+        const uint16_t sc[4] = {half_of(scw.x, 0), half_of(scw.x, 1), half_of(scw.y, 0), half_of(scw.y, 1)};
         Sub r;
         for (int k = 0; k < 8; k += 2) {
             const int l = k / 2;
-            const int qh = b->qh[2 * ib + l / 2] >> (4 * (l % 2));
-            const uint32_t g = iq1s_grid_gpu[b->qs[4 * ib + l] | ((qh & 0x07) << 8)];
+            const int qh = w.qh >> (4 * l);
+            const uint32_t g = grid[byte_of(qs, l) | ((qh & 0x07) << 8)];
             // the grid's nibbles (0 .. 2, the value + 1) as 8 (value +- 1/8): 8 nibble + 9 or 7, then 16 off each
             // byte without a borrow crossing bytes (as q2_0_bytes)
             const uint32_t c = qh & 0x08 ? 0x07070707u : 0x09090909u;
             r.v[k] = (((((g & 0x0F0F0F0Fu) << 3) + c) | 0x80808080u) - 0x10101010u) ^ 0x80808080u;
             r.v[k + 1] = ((((((g >> 4) & 0x0F0F0F0Fu) << 3) + c) | 0x80808080u) - 0x10101010u) ^ 0x80808080u;
         }
-        const uint16_t* sc = reinterpret_cast<const uint16_t*>(b->scales);
         const float d = iq1m_scale(sc) * 0.125f;
         const int ls = sc[ib / 2] >> (6 * (ib % 2));
         r.s0 = d * (float) (2 * (ls & 0x07) + 1);
         r.s1 = d * (float) (2 * ((ls >> 3) & 0x07) + 1);
         return r;
     }
+    static Sub get(const uint8_t* row, int sb, size_t rb) { return decode(load(row, sb, rb), row, sb, rb, table()); }
 };
 
 template<> struct Dec<8> {   // Q8_0: d
@@ -457,6 +535,13 @@ template<int TY>
 constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11; }
 template<int TY>
 constexpr bool has_min() { return TY == 12 || TY == 13; }
+template<int TY, bool = split_dec<Dec<TY>>::value> struct GridOf { using type = uint32_t; };
+template<int TY> struct GridOf<TY, true> { using type = typename Dec<TY>::Grid; };
+template<int TY>
+constexpr int grid_bytes() {
+    if constexpr (split_dec<Dec<TY>>::value) return Dec<TY>::GRID_BYTES;
+    else return 0;
+}
 
 // ---------------------------------------------------------------- the products
 template<typename T>
@@ -491,11 +576,16 @@ struct Kernel {
     // MIN: the activations' block sums as [block][row] and the weights' min terms as [block][output] after the rest
     // The output staging tile (ST) last: the WMMA body writes its accumulators straight out and does without it
     // (LOCAL_DIRECT, launch), so its work-groups fit a 64 KB local memory two at a time (the 890M, IQ2_XS: 40 -> 32 KB;
-    // a K step of 64, 18 KB and three work-groups, was slower: 16 experts of 64 rows 1.86 -> 2.05 ms)
+    // a K step of 64, 18 KB and three work-groups, was slower: 16 experts of 64 rows 1.86 -> 2.05 ms; the grid table
+    // after it, 36 KB and one work-group for the 64-row tile, was faster still: 1.65 -> 1.61 ms, 16 rows 0.71 -> 0.65)
     static constexpr int A_OFF = 0, B_OFF = up128(A_OFF + A_N * WM * LDA), XS_OFF = up128(B_OFF + WN * LDB),
                          WS_OFF = up128(XS_OFF + NB * WM * 4), XU_OFF = up128(WS_OFF + 2 * NB * WN * 4),
                          WM_OFF = up128(XU_OFF + NB * WM * 4), ST_OFF = MIN ? up128(WM_OFF + NB * WN * 4) : XU_OFF,
                          LOCAL_DIRECT = ST_OFF, LOCAL = up128(ST_OFF + NSG * TM * TN * 4);
+    // RDNA's body (LOCAL_DIRECT) keeps the type's grid table in local memory after the rest (XeStrata-890M): the
+    // decode's second loads (the grid's pairs, behind the block's bytes) from there instead of global memory
+    static constexpr int GRID_BYTES = grid_bytes<TY>();
+    static constexpr int GRID_OFF = LOCAL_DIRECT, LOCAL_DIRECT_GRID = up128(GRID_OFF + GRID_BYTES);
     const uint8_t* w;
     const uint8_t* const* wtab;   // expert e's weights at wtab[e] + woff when set, else at w + e expert_bytes
     size_t woff, expert_bytes, row_bytes;
@@ -683,6 +773,7 @@ struct Kernel {
 #endif
     }
 
+    STRATA_AMD_REQD_WG(NSG * SG)
     void operator()(sycl::nd_item<1> it) const {
         if constexpr (DP4A) {
             dp4a_body(it);
@@ -855,67 +946,112 @@ struct Kernel {
                 for (int j = 0; j < SGN; ++j)
                     for (int el = 0; el < 8; ++el) acc[i][j][el] = 0.0f;
 
+            [[maybe_unused]] const typename GridOf<TY>::type* gl = nullptr;
+            if constexpr (GRID_BYTES > 0) {
+                u32x4* g = reinterpret_cast<u32x4*>(local_as<uint8_t>(base + GRID_OFF).get());
+                const u32x4* t = reinterpret_cast<const u32x4*>(Dec<TY>::table());
+                for (int v = lid; v < GRID_BYTES / 16; v += lanes) g[v] = t[v];
+                gl = reinterpret_cast<const typename GridOf<TY>::type*>(g);
+            }
             const int64_t kb = K / 32;   // activation scales a row
             for (int64_t k0 = 0; k0 < K; k0 += KC) {
                 sycl::group_barrier(it.get_group());   // the last step's tiles are read
                 const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
-                for (int v = lid; v < WM * (KC / 16); v += lanes) {
+                // the step's loads (XeStrata-890M): the counts a lane are compile-time, the loops unrolled, and the
+                // weights' bytes are all loaded before any block is decoded (Dec::load, Dec::decode)
+                constexpr int AV = WM * (KC / 16), SV = WM * NB, DV = WN * NB;
+                constexpr int APL = (AV + lanes - 1) / lanes, SPL = (SV + lanes - 1) / lanes, DPL = (DV + lanes - 1) / lanes;
+#pragma unroll
+                for (int u = 0; u < APL; ++u) {
+                    const int v = lid + u * lanes;
+                    if (AV % lanes != 0 && v >= AV) break;
                     const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
                     const int64_t row = m0 + rr;
                     u32x4 val = {0u, 0u, 0u, 0u};
                     if (row < rows && (!last || k0 + c < K)) val = *reinterpret_cast<const u32x4*>(xqg + (row0 + row) * K + k0 + c);
                     *reinterpret_cast<u32x4*>(al + rr * LDA + c) = val;
                 }
-                for (int v = lid; v < WM * NB; v += lanes) {
+#pragma unroll
+                for (int u = 0; u < SPL; ++u) {
+                    const int v = lid + u * lanes;
+                    if (SV % lanes != 0 && v >= SV) break;
                     const int b = v / WM, rr = v % WM;
                     const int64_t row = m0 + rr;
                     xsl[v] = row < rows && (!last || k0 / 32 + b < kb) ? xsg[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
                     if constexpr (MIN) xul[v] = row < rows && (!last || k0 / 32 + b < kb) ? xug[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
                 }
-                for (int v = lid; v < WN * NB; v += lanes) {
-                    const int nn = v / NB, b = v % NB;
-                    const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes)
-                                                : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
-                    u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
-                    o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
-                    o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
-                    wsl[(2 * b) * WN + nn] = d.s0;
-                    wsl[(2 * b + 1) * WN + nn] = d.s1;
-                    if constexpr (MIN) wml[b * WN + nn] = d.m;
+                if constexpr (split_dec<Dec<TY>>::value) {
+                    typename Dec<TY>::Raw raw[DPL];
+#pragma unroll
+                    for (int u = 0; u < DPL; ++u) {
+                        const int v = lid + u * lanes;
+                        if (DV % lanes != 0 && v >= DV) break;
+                        const int nn = v / NB, b = v % NB;
+                        if (!last || k0 / 32 + b < kb)
+                            raw[u] = Dec<TY>::load(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes);
+                    }
+#pragma unroll
+                    for (int u = 0; u < DPL; ++u) {
+                        const int v = lid + u * lanes;
+                        if (DV % lanes != 0 && v >= DV) break;
+                        const int nn = v / NB, b = v % NB;
+                        const Sub d = !last || k0 / 32 + b < kb
+                                          ? Dec<TY>::decode(raw[u], wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes, gl)
+                                          : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
+                        u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
+                        o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
+                        o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
+                        wsl[(2 * b) * WN + nn] = d.s0;
+                        wsl[(2 * b + 1) * WN + nn] = d.s1;
+                        if constexpr (MIN) wml[b * WN + nn] = d.m;
+                    }
+                } else {
+#pragma unroll
+                    for (int u = 0; u < DPL; ++u) {
+                        const int v = lid + u * lanes;
+                        if (DV % lanes != 0 && v >= DV) break;
+                        const int nn = v / NB, b = v % NB;
+                        const Sub d = !last || k0 / 32 + b < kb ? Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes)
+                                                    : Sub{{}, 0.0f, 0.0f, 0.0f};   // past K: zeros
+                        u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
+                        o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
+                        o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
+                        wsl[(2 * b) * WN + nn] = d.s0;
+                        wsl[(2 * b + 1) * WN + nn] = d.s1;
+                        if constexpr (MIN) wml[b * WN + nn] = d.m;
+                    }
                 }
                 sycl::group_barrier(it.get_group());
                 for (int b = 0; b < NB; ++b) {
-                    float xsr[SGM][8];   // the rows' scales of the block, in the accumulator's row order
-                    for (int i = 0; i < SGM; ++i)
-                        for (int el = 0; el < 8; ++el) xsr[i][el] = xsl[b * WM + ms + i * TM + row_of(el)];
-                    for (int h = 0; h < (HALF ? 2 : 1); ++h) {
-                        i8v ci[SGM][SGN];
-                        for (int i = 0; i < SGM; ++i)
-                            for (int j = 0; j < SGN; ++j) ci[i][j] = i8v{0, 0, 0, 0, 0, 0, 0, 0};
-                        for (int kk = HALF ? h * TK : 0; kk < (HALF ? h * TK + TK : 32); kk += TK) {
-                            frag a[SGM], bm[SGN];
-                            for (int i = 0; i < SGM; ++i)
-                                a[i] = *reinterpret_cast<const frag*>(al + (ms + i * TM + lo) * LDA + b * 32 + kk + hi * KOFF);
-                            for (int j = 0; j < SGN; ++j)
-                                bm[j] = *reinterpret_cast<const frag*>(bl + (ns + j * TN + lo) * LDB + b * 32 + kk + hi * KOFF);
-                            for (int i = 0; i < SGM; ++i)
-                                for (int j = 0; j < SGN; ++j)
+                    // The sub-group's rows one tile at a time (XeStrata-890M): its int32 tiles, the rows' scales
+                    // and the A fragment of one row tile at a time, B's fragments loaded again for each (the 64 x 128
+                    // tile's kernel spilled 17-26 registers at the backend's 128 with the two row tiles' int32 tiles
+                    // and scales live together), and the scales applied with one fma (ws xsr) c + acc: three
+                    // instructions an element instead of four
+                    for (int h = 0; h < (HALF ? 2 : 1); ++h)
+                        for (int i = 0; i < SGM; ++i) {
+                            float xsr[8];   // the rows' scales of the block, in the accumulator's row order
+                            for (int el = 0; el < 8; ++el) xsr[el] = xsl[b * WM + ms + i * TM + row_of(el)];
+                            i8v ci[SGN];
+                            for (int j = 0; j < SGN; ++j) ci[j] = i8v{0, 0, 0, 0, 0, 0, 0, 0};
+                            for (int kk = HALF ? h * TK : 0; kk < (HALF ? h * TK + TK : 32); kk += TK) {
+                                const frag a = *reinterpret_cast<const frag*>(al + (ms + i * TM + lo) * LDA + b * 32 + kk + hi * KOFF);
+                                for (int j = 0; j < SGN; ++j) {
+                                    const frag bm = *reinterpret_cast<const frag*>(bl + (ns + j * TN + lo) * LDB + b * 32 + kk + hi * KOFF);
 #if defined(__GFX12__)
-                                    ci[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a[i], true, bm[j],
-                                                                                              ci[i][j], false);
+                                    ci[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, bm, ci[j], false);
 #else
-                                    ci[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a[i], true, bm[j],
-                                                                                        ci[i][j], false);
+                                    ci[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bm, ci[j], false);
 #endif
-                        }
-                        for (int j = 0; j < SGN; ++j) {
-                            const float ws = wsl[(2 * b + h) * WN + ns + j * TN + lo];   // this lane's column's
-                            for (int i = 0; i < SGM; ++i)
+                                }
+                            }
+                            for (int j = 0; j < SGN; ++j) {
+                                const float ws = wsl[(2 * b + h) * WN + ns + j * TN + lo];   // this lane's column's
                                 for (int el = 0; el < 8; ++el)
                                     // (float) c: one full-rate conversion on RDNA (exact below 2^24, as exact_float)
-                                    acc[i][j][el] += ws * xsr[i][el] * (float) ci[i][j][el];
+                                    acc[i][j][el] = sycl::fma(ws * xsr[el], (float) ci[j][el], acc[i][j][el]);
+                            }
                         }
-                    }
                     if constexpr (MIN)
                         for (int j = 0; j < SGN; ++j) {
                             const float wm = wml[b * WN + ns + j * TN + lo];
@@ -959,7 +1095,7 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
     const auto* xs = reinterpret_cast<const float*>(x8 + total_rows * w_cols);
     const auto* xu = xs + total_rows * (w_cols / 32);
     // RDNA's WMMA body does without the output staging tile (LOCAL_DIRECT)
-    const size_t local = !DP4A && xe::amd_wmma(q.get_device()) ? (size_t) KT::LOCAL_DIRECT : (size_t) KT::LOCAL;
+    const size_t local = !DP4A && xe::amd_wmma(q.get_device()) ? (size_t) KT::LOCAL_DIRECT_GRID : (size_t) KT::LOCAL;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>(local), h);
         const size_t wg = (size_t) KT::NSG * SG;

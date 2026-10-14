@@ -871,10 +871,13 @@ struct Gdn {
         }();
         const bool pipe = pipe_on;   // the kernel takes a copy
         static_assert(CB * RG == S, "one q and one k value a work-item");
-        // STRATA_GDN_KEYHEAD=0: the D-2 kernel where GdnRecLane does not run (A/B)
-        static const bool kh_on = [] {
+        // STRATA_GDN_KEYHEAD=0: the D-2 kernel where GdnRecLane does not run (A/B).  Off on the HIP backend
+        // (XeStrata-890M): on the 890M the D-2 kernel took 813-825 ms for the recurrence of a 3,474-token prompt
+        // against 908-909 with the key-head kernel, the same bits.
+        static const bool kh_on = [&] {
             const char* v = std::getenv("STRATA_GDN_KEYHEAD");
-            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+            if (v != nullptr) return std::strtol(v, nullptr, 10) != 0;
+            return q.get_device().get_backend() != sycl::backend::ext_oneapi_hip;
         }();
         auto launch_kh = [&](float* st, float* yy) {
             q.submit([&](sycl::handler& hd) {

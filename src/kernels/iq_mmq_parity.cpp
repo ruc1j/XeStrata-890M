@@ -23,6 +23,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <dlfcn.h>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -181,8 +183,28 @@ int bench() {
         const size_t gb = ggml_row_size(c.gate, N) * (size_t) FF, ub = ggml_row_size(c.up, N) * (size_t) FF;
         const size_t db = ggml_row_size(c.down, FF) * (size_t) N;
         P::Device dev;
-        uint8_t* wg = dev.alloc<uint8_t>((gb + ub) * G);   // per expert: gate's rows, then up's
-        uint8_t* wd = dev.alloc<uint8_t>(db * G);
+        // IQ_MMQ_BENCH_HOST=1: the weights in host USM, as the prompt reads an integrated GPU's expert cache in place
+        // (STRATA_PREFILL_MMQ_INPLACE): the GPU does not cache those reads
+        // =2: host memory the GPU may cache (hipHostMalloc with hipHostMallocNonCoherent, through dlopen: HIP only)
+        const char* hw = std::getenv("IQ_MMQ_BENCH_HOST");
+        const int host_w = hw != nullptr ? (int) std::strtol(hw, nullptr, 10) : 0;
+        auto host_alloc = [&](size_t bytes) -> uint8_t* {
+            if (host_w == 2) {
+                static auto* hip_host_malloc = [] {
+                    void* lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
+                    return lib != nullptr ? reinterpret_cast<int (*)(void**, size_t, unsigned)>(dlsym(lib, "hipHostMalloc")) : nullptr;
+                }();
+                void* p = nullptr;
+                if (hip_host_malloc == nullptr || hip_host_malloc(&p, bytes, 0x80000000u) != 0) {
+                    std::fprintf(stderr, "hipHostMalloc(NonCoherent) failed\n");
+                    std::exit(1);
+                }
+                return static_cast<uint8_t*>(p);
+            }
+            return host_w != 0 ? static_cast<uint8_t*>(P::alloc_host_bytes(bytes)) : dev.alloc<uint8_t>(bytes);
+        };
+        uint8_t* wg = host_alloc((gb + ub) * G);   // per expert: gate's rows, then up's
+        uint8_t* wd = host_alloc(db * G);
         q.memset(wg, 0x11, (gb + ub) * G).wait();
         q.memset(wd, 0x11, db * G).wait();
         uint16_t* dq_gu = dev.alloc<uint16_t>((size_t) G * 2 * (size_t) (FF * N));

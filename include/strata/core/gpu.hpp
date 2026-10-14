@@ -50,6 +50,11 @@ bool device_sync();
 
 void* alloc_device(size_t bytes);
 void* alloc_host(size_t bytes);
+// Host memory kernels read as cached memory where the backend offers it (HIP: hipHostMalloc with
+// hipHostMallocNonCoherent, loaded with dlopen; STRATA_HOST_NC=0 turns it off), else alloc_host.  For memory the host
+// writes before the kernels that read it are launched (the expert cache's slots): the GPU's caches are made coherent
+// with the host at kernel boundaries, not during a kernel.  Freed by free.
+void* alloc_host_cached(size_t bytes);
 template <class T> bool alloc_device(T** p, size_t bytes) { *p = static_cast<T*>(alloc_device(bytes)); return *p; }
 template <class T> bool alloc_host(T** p, size_t bytes) { *p = static_cast<T*>(alloc_host(bytes)); return *p; }
 /// Frees device or host USM after draining the runtime's queues (null is a no-op).

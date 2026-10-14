@@ -26,3 +26,13 @@
 // A kernel's required sub-group size SG, as the device compile takes it: the compilers for the other GPUs accept 32
 // only, and a kernel built for 16 is never launched on them (narrow_sub_group in dp4a_gemm.hpp picks 32 there).
 #define STRATA_SUB_GROUP(SG) (STRATA_DEVICE_NOT_INTEL ? 32 : (SG))
+
+// A kernel's required work-group size, in AMD's device compile only (XeStrata-890M): the AMDGPU backend budgets a
+// kernel's registers by the work-group size its attribute states, 1024 work-items without one (128 VGPRs on
+// gfx1150), and clang sets that attribute from reqd_work_group_size (third_party/main/intel-llvm/patches/20-...).
+// The other compiles are left as they were (unverified with the attribute).
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+#define STRATA_AMD_REQD_WG(N) [[sycl::reqd_work_group_size(N)]]
+#else
+#define STRATA_AMD_REQD_WG(N)
+#endif

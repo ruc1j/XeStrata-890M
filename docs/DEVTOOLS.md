@@ -145,6 +145,8 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Fourteenth, the HIP adapter answered a GPU's free memory (SYCL's `ext_intel_free_memory`) with `hipMemGetInfo` without making that GPU current, so every AMD GPU reported the free memory of the thread's current one.
   A layer split over two AMD GPUs saw the first stage's free memory, nearly all of it held by its expert cache, on the second stage, which found no room for its own cache and stopped.
   Fixed, the GPU is made current before the query, as the adapter's other calls do (`hip-mem-free-device`; the CUDA adapter makes the GPU's context current for every query).
+  Fifteenth, the AMDGPU backend budgets a kernel's registers by the "amdgpu-flat-work-group-size" attribute, which clang set only from OpenCL's reqd_work_group_size and HIP's --gpu-max-threads-per-block, so a SYCL kernel was budgeted for 1024 work-items (128 VGPRs on gfx1150) whatever its [[sycl::reqd_work_group_size(N)]] or work_group_size property said, and the larger tiles of the products spilled registers.
+  Fixed, the attribute is set from SYCL's reqd_work_group_size too, the attribute's and the property's (`hip-reqd-work-group-size`; the 890M's int8 expert product went from 12-26 spilled registers to none, and the dense product's 64 x 128 tile became usable).
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
   `offload-bundle-arch` asks every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).

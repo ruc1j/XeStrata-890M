@@ -301,7 +301,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // (gfx1150, HIP) read a 34 GiB host USM buffer at 44-54 GB/s against 32-34 GB/s for a device allocation of 4 GiB
     // or more.  The RAM check is the caller's (the slots come out of the memory the host has).
     if (g_cache_host) {
-        base_ = static_cast<uint8_t*>(strata::gpu::alloc_host((size_t) want));
+        base_ = static_cast<uint8_t*>(strata::gpu::alloc_host_cached((size_t) want));
         if (base_ == nullptr) {
             char buf[256];
             std::snprintf(buf, sizeof buf, "ExpertCache: host USM allocation of %.2f GiB failed: %s",

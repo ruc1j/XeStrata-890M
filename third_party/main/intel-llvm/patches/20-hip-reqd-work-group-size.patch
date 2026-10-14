@@ -1,0 +1,66 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-reqd-work-group-size: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The AMDGPU backend sizes a kernel's register budget by the "amdgpu-flat-work-group-size" attribute, which clang sets
+from reqd_work_group_size for OpenCL kernels and from --gpu-max-threads-per-block for HIP ones, but not for SYCL
+kernels: a SYCL kernel's [[sycl::reqd_work_group_size(N)]] or work_group_size property went only into the reqd_work_group_size metadata, which
+the backend does not read for this, so every SYCL kernel was budgeted for 1024 work-items (on gfx1150: 128 VGPRs;
+the int8 expert product's 64 x 128 tile spilled 12-26 registers, with the attribute 135 and none).  The attribute
+is now set from the SYCL kernel's reqd_work_group_size as it is from OpenCL's.
+---
+diff --git a/clang/lib/CodeGen/Targets/AMDGPU.cpp b/clang/lib/CodeGen/Targets/AMDGPU.cpp
+index 5df374671..48c70656f 100644
+--- a/clang/lib/CodeGen/Targets/AMDGPU.cpp
++++ b/clang/lib/CodeGen/Targets/AMDGPU.cpp
+@@ -353,6 +353,23 @@ void AMDGPUTargetCodeGenInfo::setFunctionDeclAttributes(
+   const auto *FlatWGS = FD->getAttr<AMDGPUFlatWorkGroupSizeAttr>();
+   if (ReqdWGS || FlatWGS) {
+     M.handleAMDGPUFlatWorkGroupSizeAttr(F, FlatWGS, ReqdWGS);
++  } else if (const auto *SYCLReqdWGS =
++                 M.getLangOpts().SYCLIsDevice
++                     ? FD->getAttr<SYCLReqdWorkGroupSizeAttr>()
++                     : nullptr) {
++    // A SYCL kernel's reqd_work_group_size bounds its work-groups as
++    // OpenCL's does: without it the backend budgets the registers for
++    // work-groups of 1024 work-items (128 VGPRs on gfx11, whatever the
++    // kernel's size) and only the metadata records the size.
++    std::optional<llvm::APSInt> X = SYCLReqdWGS->getXDimVal();
++    std::optional<llvm::APSInt> Y = SYCLReqdWGS->getYDimVal();
++    std::optional<llvm::APSInt> Z = SYCLReqdWGS->getZDimVal();
++    if (X) {
++      uint64_t N = X->getZExtValue() * (Y ? Y->getZExtValue() : 1) *
++                   (Z ? Z->getZExtValue() : 1);
++      F->addFnAttr("amdgpu-flat-work-group-size",
++                   llvm::utostr(N) + "," + llvm::utostr(N));
++    }
+   } else if (IsOpenCLKernel || IsHIPKernel) {
+     // By default, restrict the maximum size to a value specified by
+     // --gpu-max-threads-per-block=n or its default value for HIP.
+diff --git a/llvm/lib/SYCLLowerIR/CompileTimePropertiesPass.cpp b/llvm/lib/SYCLLowerIR/CompileTimePropertiesPass.cpp
+index 48900f9db..73582e153 100644
+--- a/llvm/lib/SYCLLowerIR/CompileTimePropertiesPass.cpp
++++ b/llvm/lib/SYCLLowerIR/CompileTimePropertiesPass.cpp
+@@ -393,6 +393,20 @@ attributeToExecModeMetadata(const Attribute &Attr, Function &F) {
+       MDVals.push_back(ConstantAsMetadata::get(
+           Constant::getIntegerValue(SizeTTy, APInt(SizeTBitSize, 1, 10))));
+ 
++    // The AMDGPU backend budgets a kernel's registers by this attribute
++    // (1024 work-items without it), not by the metadata: a required or
++    // largest work-group size bounds it, as clang does for OpenCL's.
++    if (Triple(F.getParent()->getTargetTriple()).isAMDGCN() &&
++        (AttrKindStr == "sycl-work-group-size" ||
++         AttrKindStr == "sycl-max-work-group-size")) {
++      uint64_t Lanes = 1;
++      for (Metadata *MDVal : MDVals)
++        Lanes *= cast<ConstantAsMetadata>(MDVal)->getValue()->getUniqueInteger().getZExtValue();
++      F.addFnAttr("amdgpu-flat-work-group-size",
++                  (AttrKindStr == "sycl-work-group-size" ? std::to_string(Lanes) : std::string("1")) +
++                      "," + std::to_string(Lanes));
++    }
++
+     if (NumDims < 3) {
+       if (!F.hasMetadata("work_group_num_dim"))
+         F.setMetadata("work_group_num_dim",

@@ -71,7 +71,15 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
    - The experts' int8 products (MMQ) read the blobs in place when every expert a layer routes is in the cache (no gather into group
      buffers, no copies into the MMQ ring; `STRATA_PREFILL_MMQ_INPLACE=0` restores the old way; `STRATA_PREFILL_MMQ_GROUP` is the number
      of experts per launch, default 16). The WMMA body takes no output staging in local memory, so two work-groups fit a WGP.
-   - The own kernel sums in another order than rocBLAS, so an answer can differ by rounding (`STRATA_BLAS=1` gives the old one).
+   - AMD's device compile states each kernel's required work-group size (`STRATA_AMD_REQD_WG`), and the intel/llvm fix
+     `hip-reqd-work-group-size` passes it to the backend's register budget (before it every kernel had 128 VGPRs and spilled).
+     With that the dense product takes a 64 x 128 tile for a long prompt's large products (`STRATA_MMA_SHAPE=5`: 2048 rows and
+     2048 columns or more, and the like), and the MMQ splits its decoders into load and decode and issues a step's loads first,
+     keeps the grid tables in local memory and applies the scales with one fma.
+   - The expert cache's host USM is, on HIP, memory the GPU may cache (`hipHostMalloc` with NonCoherent; `STRATA_HOST_NC=0` for
+     plain host USM): the MMQ reading it in place runs about twice as fast (a 523-token prefill 3.16 -> 2.68 s).
+   - The GDN recurrence does without the key-head kernel on HIP (`STRATA_GDN_KEYHEAD=1` brings it back).
+   - The own kernel sums in another order than rocBLAS, and the MMQ's fma rounds its scales differently, so an answer can differ by rounding (`STRATA_BLAS=1` gives the old dense products).
 
 ## What you need
 

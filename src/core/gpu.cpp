@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <dlfcn.h>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -177,7 +179,59 @@ void* alloc_host(size_t bytes) {
     } catch (const std::exception& e) { fail("alloc_host", e); return nullptr; }
 }
 
+// alloc_host_cached (XeStrata-890M): HIP's hipHostMalloc with hipHostMallocNonCoherent, so that the GPU caches the
+// memory (a SYCL host USM allocation is fine-grained, which the GPU reads uncached: the int8 expert products reading
+// the 890M's expert cache in place took 1,504 us for 16 experts of 8 rows against 695 from non-coherent memory and
+// 641 from device memory).  The pointers are kept apart for hipHostFree.
+std::mutex g_nc_mu;
+std::map<const void*, size_t> g_nc;
+struct HipHost {
+    int (*malloc_)(void**, size_t, unsigned) = nullptr;
+    int (*free_)(void*) = nullptr;
+};
+const HipHost& hip_host() {
+    static const HipHost h = [] {
+        HipHost r;
+        const char* v = std::getenv("STRATA_HOST_NC");
+        if (v != nullptr && std::strtol(v, nullptr, 10) == 0) return r;
+        try {
+            if (rt().device().get_backend() != sycl::backend::ext_oneapi_hip) return r;
+        } catch (const std::exception&) { return r; }
+        void* lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
+        if (lib == nullptr) lib = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_GLOBAL);
+        if (lib == nullptr) return r;
+        r.malloc_ = reinterpret_cast<int (*)(void**, size_t, unsigned)>(dlsym(lib, "hipHostMalloc"));
+        r.free_ = reinterpret_cast<int (*)(void*)>(dlsym(lib, "hipHostFree"));
+        if (r.malloc_ == nullptr || r.free_ == nullptr) r = HipHost{};
+        return r;
+    }();
+    return h;
+}
+
+void* alloc_host_cached(size_t bytes) {
+    const HipHost& h = hip_host();
+    if (h.malloc_ != nullptr) {
+        void* p = nullptr;
+        constexpr unsigned kHipHostMallocNonCoherent = 0x80000000u;
+        if (h.malloc_(&p, bytes, kHipHostMallocNonCoherent) == 0 && p != nullptr) {
+            std::lock_guard<std::mutex> lock(g_nc_mu);
+            g_nc[p] = bytes;
+            return p;
+        }
+        std::fprintf(stderr, "strata: hipHostMalloc(NonCoherent) of %zu bytes failed: host USM instead\n", bytes);
+    }
+    return alloc_host(bytes);
+}
+
 void free(const void* p) {
+    {
+        std::lock_guard<std::mutex> lock(g_nc_mu);
+        if (auto it = g_nc.find(p); it != g_nc.end()) {
+            g_nc.erase(it);
+            hip_host().free_(const_cast<void*>(p));
+            return;
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(g_live_mu);
         if (auto it = g_live.find(p); it != g_live.end()) {

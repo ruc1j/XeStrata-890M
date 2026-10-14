@@ -72,7 +72,14 @@ constexpr Shape kShapes[] = {{8, 16, 16, 16, {2, 2, 2, 2, false}, {2, 2, 2, 2, f
                              // default.  Layouts of 4 x 2 or 2 x 4 tiles a sub-group spilled there: AMD's compiler
                              // budgets 128 registers a lane whatever the work-group's size, and their accumulators
                              // went to scratch memory (141-192 registers spilled; 0.2-0.4 against 4 TFLOP/s).
-                             {16, 16, 16, 32, {4, 4, 2, 2, false}, {2, 2, 2, 2, false}, false}};
+                             {16, 16, 16, 32, {4, 4, 2, 2, false}, {2, 2, 2, 2, false}, false},
+                             // RDNA's WMMA with more tiles a sub-group (XeStrata-890M, STRATA_MMA_SHAPE=4..6): 2 x 2
+                             // sub-groups of 4 x 2, 2 x 4 and 4 x 4 tiles (128 x 64, 64 x 128 and 128 x 128 on 256
+                             // lanes).  They need the register budget of a 256-lane work-group (the patch
+                             // 20-hip-reqd-work-group-size: without it 128 registers a lane, and they spilled)
+                             {16, 16, 16, 32, {2, 2, 4, 2, false}, {2, 2, 2, 2, false}, false},
+                             {16, 16, 16, 32, {2, 2, 2, 4, false}, {2, 2, 2, 2, false}, false},
+                             {16, 16, 16, 32, {2, 2, 4, 4, false}, {2, 2, 2, 2, false}, false}};
 constexpr int kAmdShape = 2;                      // the shapes RDNA's WMMA takes: kAmdShape on
 constexpr int KC = 32;            // K a step (64 was no faster on the A380)
 
@@ -263,6 +270,7 @@ struct Kernel {
         }
     }
 
+    STRATA_AMD_REQD_WG(LANES)
     void operator()(sycl::nd_item<1> it) const {
         // BF16 on NVIDIA's tensor cores from sm_80 on, FP16 from sm_70 on (device_target.hpp)
         constexpr bool arch_ok = STRATA_NV_ARCH == 0 || STRATA_NV_ARCH >= (std::is_same_v<E, bf16_t> ? 800 : 700);
@@ -553,7 +561,7 @@ int shape(const sycl::queue& q, bool bf16) {
     const Shapes& s = per_device.get(q.get_device(), [&q] {
         const auto pick = [&q](mx::matrix_type in) {
             // RDNA3 and RDNA4 report no combination (see built): their WMMA takes NVIDIA's shape, FP16 and BF16;
-            // STRATA_MMA_SHAPE=2..3 picks the tile (gemm_bench's A/B)
+            // STRATA_MMA_SHAPE=2..6 picks the tile (gemm_bench's A/B)
             if (amd_wmma(q.get_device()) && !(in == mx::matrix_type::bf16 && no_bf16_mma())) {
                 int s = kAmdShape;
                 if (const char* v = std::getenv("STRATA_MMA_SHAPE"); v != nullptr)
@@ -597,7 +605,10 @@ bool groups_layout_fits(int s, const sycl::queue& q) {
         case 0: return layout_fits<0, true>(q);
         case 1: return layout_fits<1, true>(q);
         case 2: return layout_fits<2, true>(q);
-        default: return layout_fits<3, true>(q);
+        case 3: return layout_fits<3, true>(q);
+        case 4: return layout_fits<4, true>(q);
+        case 5: return layout_fits<5, true>(q);
+        default: return layout_fits<6, true>(q);
     }
 }
 
@@ -684,7 +695,10 @@ sycl::event by_shape(int s, sycl::queue& q, const uint16_t* X, const uint16_t* W
         case 0: return run<0, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
         case 1: return run<1, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
         case 2: return run<2, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
-        default: return run<3, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+        case 3: return run<3, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+        case 4: return run<4, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+        case 5: return run<5, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+        default: return run<6, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
     }
 }
 
@@ -706,9 +720,21 @@ bool mma_shape_is(const sycl::queue& q, int m, int n, int k, int sg) {
     return s.m == m && s.n == n && s.k == k && s.sg == sg;
 }
 
+// A product's shape on RDNA's WMMA (XeStrata-890M): the 64 x 128 tile (shape 5, 2 x 4 tiles a sub-group) for the
+// large products of a long prompt, the 64 x 64 one (shape 2) elsewhere.  Measured on the 890M (gemm_bench, FP16,
+// dpm high): 2048 rows, 10240 x 2560 22.6 -> 19.4 ms, 2560 x 6144 14.0 -> 11.1, 2560 x 2560 5.18 -> 5.12, but
+// 512 x 2560 1.10 -> 1.40; 1024 rows, 6144 x 2560 6.65 -> 5.76 but 2560 x 2560 2.64 -> 2.76; 512 rows, every shape
+// slower or equal.  STRATA_MMA_SHAPE forces one (shape).
+int product_shape(const sycl::queue& q, bool bf16, int64_t T, int64_t N) {
+    const int s = shape(q, bf16);
+    if (s != kAmdShape || !amd_wmma(q.get_device()) || std::getenv("STRATA_MMA_SHAPE") != nullptr) return s;
+    const bool wide = (T >= 2048 && N >= 2048) || (T >= 1024 && N >= 4096);
+    return wide && layout_fits<5, false>(q) ? 5 : s;
+}
+
 sycl::event mma_gemm(sycl::queue& q, bool bf16, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
                      int64_t K, int64_t ldy, bool accumulate) {
-    const int s = shape(q, bf16);
+    const int s = product_shape(q, bf16, T, N);
     if (bf16) return by_shape<bf16_t>(s, q, X, W, 0, Y, ldy, nullptr, 1, T, N, K, accumulate);
     return by_shape<sycl::half>(s, q, X, W, 0, Y, ldy, nullptr, 1, T, N, K, accumulate);
 }

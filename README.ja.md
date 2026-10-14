@@ -71,7 +71,14 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
    - エキスパートの int8 の積（MMQ）は、層のエキスパートがすべてキャッシュにあれば blob をその場で読みます（グループへの gather や
      MMQ ring へのコピーを省く、`STRATA_PREFILL_MMQ_INPLACE=0` で元に戻せます。1 回に積むエキスパートの数は `STRATA_PREFILL_MMQ_GROUP`、既定 16）。
      WMMA 版は出力の staging をローカルメモリに取らず、WGP に 2 ワークグループが載るようにします。
-   - 自身のカーネルは rocBLAS と足す順が違うので、答えが丸めの差で変わることがあります（`STRATA_BLAS=1` なら元のまま）。
+   - AMD のデバイスコンパイルでは、カーネルに必要なワークグループの大きさを付け（`STRATA_AMD_REQD_WG`）、intel/llvm への修正
+     `hip-reqd-work-group-size` がそれをバックエンドのレジスター予算に渡します（それまでは全カーネルが 128 VGPR で spill していました）。
+     それで密な積は長い prompt の大きい積に 64 x 128 のタイル（`STRATA_MMA_SHAPE=5`、2048 行以上かつ 2048 列以上など）を取り、
+     MMQ は decoder を load と decode に分けてステップの load を先に出し、格子表をローカルメモリに置き、スケールを 1 つの fma で掛けます。
+   - エキスパートのキャッシュの host USM は、HIP では GPU がキャッシュできるメモリ（`hipHostMalloc` の NonCoherent、`STRATA_HOST_NC=0` で元の
+     host USM）に取ります: その場で読む MMQ が 2 倍ほど速くなります（523 トークンの prefill 3.16 -> 2.68 s）。
+   - GDN の recurrence は HIP では key-head の kernel を使いません（`STRATA_GDN_KEYHEAD=1` で戻せます）。
+   - 自身のカーネルは rocBLAS と足す順が違い、MMQ のスケールの fma も丸めが変わるので、答えが丸めの差で変わることがあります（`STRATA_BLAS=1` なら密な積は元のまま）。
 
 ## 必要なもの
 

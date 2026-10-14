@@ -145,6 +145,8 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   14 番目: HIP のアダプタが GPU の空きメモリ（SYCL の `ext_intel_free_memory`）を、その GPU を current にせずに `hipMemGetInfo` で答えていて、どの AMD の GPU もスレッドの current の GPU の空きを報告していました。
   AMD の GPU 2 枚で層を分割すると、2 段目は 1 段目のエキスパートのキャッシュでほぼ埋まった空きを見て、自分のキャッシュの場所がないと言って止まっていました。
   修正後は、アダプタのほかの呼び出しと同じく、その GPU を current にしてから問い合わせます（`hip-mem-free-device`。CUDA のアダプタは問い合わせのたびにその GPU のコンテキストを current にしています）。
+  15 番目: AMDGPU のバックエンドはカーネルのレジスター予算を "amdgpu-flat-work-group-size" 属性で決め、clang はその属性を OpenCL の reqd_work_group_size と HIP の --gpu-max-threads-per-block からしか付けないので、SYCL のカーネルは [[sycl::reqd_work_group_size(N)]] や work_group_size プロパティを付けても 1024 ワークアイテムの予算（gfx1150 で 128 VGPR）で組まれ、大きいタイルの積がレジスターを溢れていました。
+  修正後は、SYCL の reqd_work_group_size（属性でもプロパティでも）からも同じ属性を付けます（`hip-reqd-work-group-size`。890M の int8 のエキスパートの積は 12〜26 個の spill が 0 に、64 x 128 のタイルの密な積が使えるように）。
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
   `offload-bundle-arch` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
