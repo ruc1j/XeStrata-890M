@@ -17,14 +17,14 @@ Speed on the 890M (Ryzen AI 9 HX 370, 64 GB RAM, Fedora 44, Qwen3.8-Flash-Next I
 | | Original XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
 | decode (mean of 6 short chats) | 15-22 tok/s | about 31 tok/s |
-| prefill, 523 tokens | 5.4 s | 3.2 s |
-| prefill, 3,481 tokens | 29.1 s | 16.2 s |
-| prefill, 2,669 tokens (one sentence repeated) | 22.0 s | 12.4 s |
+| prefill, 523 tokens | 5.4 s (98 tok/s) | 2.55 s (205 tok/s) |
+| prefill, 3,481 tokens | 29.1 s (119 tok/s) | 13.1 s (265 tok/s) |
+| prefill, 2,669 tokens (one sentence repeated) | 22.0 s (121 tok/s) | 10.0 s (267 tok/s) |
 
-The prefill column "Original XeStrata" is the fork at the point where its decode changes were in (the prefill path was still the original's until then).
+The prefill column "Original XeStrata" is the original XeStrata's prefill path measured on this 890M. The answers are the same but for rounding.
 
 > **Contents:** [About XeStrata-890M](#about-xestrata-890m) · [What you need](#what-you-need) ·
-> [Choosing a model](#choosing-a-model) · [Install](#install) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
+> [The model](#the-model) · [Install](#install) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
 > [How it works](#how-it-works) · [For developers](#for-developers) · [All the details](docs/DETAILS.md)
 
 ## About XeStrata-890M
@@ -80,6 +80,7 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      plain host USM): the MMQ reading it in place runs about twice as fast (a 523-token prefill 3.16 -> 2.68 s).
    - The required work-group size is stated for the QSA prompt attention too (PromptAttnMma: 83 spills -> 0, a 3,474-token
      prompt's attention 1.99 -> 1.22 s), for the GDN key-head recurrence (908 -> 602 ms) and for decode's dense GEMV and HC read.
+     The prompt attention's p.v stays in the WMMA accumulators' layout in registers, without the staging tile and its sub-group barriers (1.22 -> 1.15 s).
    - The own kernel sums in another order than rocBLAS, and the MMQ's fma rounds its scales differently, so an answer can differ by rounding (`STRATA_BLAS=1` gives the old dense products).
 
 ## What you need
@@ -88,7 +89,7 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
 | --- | --- |
 | GPU | AMD Radeon 890M (the integrated GPU of the Ryzen AI 9 HX 370, gfx1150). See [AMD GPUs](#amd-gpus). |
 | CPU | Ryzen AI 9 HX 370 (12 cores, 24 threads, AVX-512). |
-| RAM | 64 GB (IQ2_XS's experts, about 34 GiB, all stay in RAM). See [Choosing a model](#choosing-a-model). |
+| RAM | 64 GB (IQ2_XS's experts, about 34 GiB, all stay in RAM). See [The model](#the-model). |
 | Disk | 68 GB for the model and about 6 GB for the MTP layer. An NVMe SSD. |
 | OS | Fedora 44 (the distribution's ROCm 7.1.1). |
 | BIOS | The memory assigned to the GPU (VRAM) can stay at its default (512 MB): the experts live in host USM, so no larger assignment is needed. The kernel's boot options (`ttm.pages_limit` and the like) stay as they are too. |
@@ -102,33 +103,12 @@ The fork targets the Radeon 890M (gfx1150) only.
 - Ubuntu 26.04's rocBLAS has no code for gfx1150: use Fedora 44.
 - `./setup.sh --check` prints your GPU's gfx after its name.
 
-## Choosing a model
+## The model
 
-The fork is run and measured with Qwen3.8-Flash-Next **IQ2_XS** (64 GB of RAM holds all its experts).
-To add another size later, run `./setup.sh`.
-
-| Version | Size | Download | RAM | Speed | Quality |
-| --- | --- | ---: | ---: | --- | --- |
-| Original, Swift 1.5 | **Q2_0** | 66 GB | 48 GB | fastest | good |
-| Original, Swift 1.5 | **IQ2_XS** | 68 GB | 48 GB | fast | better (**recommended**) |
-| Original, Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | slower | very good |
-| Original, Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | slow | like the original model |
-| Coder | **IQ1_M** | 58 GB | 32 GB | fast | good at code, weak elsewhere |
-
-The RAM figures are the original XeStrata's. The fork's `--expert-cache 24576` (every expert in RAM) takes about 34 GiB with IQ2_XS.
-The other sizes have not been run with the fork; where the experts do not all fit in RAM, lower `--expert-cache` (the start-up log shows the free memory).
-Unsloth's 4-bit versions (UD-IQ4_XS, UD-Q4_K_XL) have 60-77 GB of experts alone and do not suit a 64 GB PC.
-
-**Versions:**
-
-- **Qwen3.8-Flash-Next**: the original model.
-- **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**: UkisAI's tune.
-  It thinks less before answering, so answers start sooner, at about the same quality. The model's own license applies.
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)**: ISTA-DASLab's version for code.
-  It keeps the 256 experts used for code of the 512 in each layer. With half the experts it is weaker outside code and outside English.
-
-The other models the original XeStrata runs (Ornith-1.5, llm-jp-4.1, Unsloth's versions) have not been run with the fork
-([the original description](https://github.com/MistVVK/XeStrata#choosing-a-model)).
+The fork is run and measured with Qwen3.8-Flash-Next **IQ2_XS** ([ISTA-DASLab's GSQ-RCO compression](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF),
+a 68 GB download). `--expert-cache 24576` puts every expert in RAM, about 34 GiB.
+Other sizes and versions have not been run with the fork. Where the experts do not all fit in RAM, lower `--expert-cache`
+(the start-up log shows the free memory).
 
 ## Install
 
@@ -269,7 +249,7 @@ so XeStrata-890M **uses the whole RAM as the GPU's memory**.
 - **Long texts are read in big chunks** (up to 32,768 tokens at once). The dense products of prefill run on the 890M's WMMA,
   the expert products on its int8 WMMA.
 
-Each part is described in [docs/DETAILS.md](docs/DETAILS.md#how-it-works) (the original XeStrata's description, which also covers other GPUs).
+Each part is described in [docs/DETAILS.md](docs/DETAILS.md#how-it-works) (the original XeStrata's description).
 
 ## For developers
 
@@ -279,12 +259,13 @@ Each part is described in [docs/DETAILS.md](docs/DETAILS.md#how-it-works) (the o
   Measure kernels at the high clock (`dpm high`), not a fixed one; A/B runs interleaved under the same conditions, with the GPU cooled down first (heat moves them by a few per cent).
   `STRATA_PREFILL_TIMING=1` logs the GPU time of each prefill stage.
 - **Reading the ISA**: emit bitcode with `-fsycl-device-only`, turn it into assembly with intel/llvm's `llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1150`,
-  and read `.vgpr_count` and `.vgpr_spill_count` in the metadata. This intel/llvm's AMD backend caps every kernel at 128 VGPRs, so large tiles spill.
+  and read `.vgpr_count` and `.vgpr_spill_count` in the metadata. The AMD backend sets a kernel's register budget from its required work-group size
+  (the intel/llvm fix `hip-reqd-work-group-size`), so kernels carry `STRATA_AMD_REQD_WG`; a kernel without it is held to the 128 VGPRs of 1024 work-items and spills.
 - **Rules**: [AGENTS.md](AGENTS.md). A branch for the 890M is chosen from what the device reports (an integrated GPU, the HIP backend, WMMA) or an opt-in environment variable, not from the GPU's name.
   The lints (`tools/lint/run.sh`), the tests (CTest, `python -m unittest`) and the license notices are there too.
   Measurement records do not go into git.
 - **README and docs**: the Japanese files (README.ja.md, docs/*.ja.md) are written first; the English ones (README.md, docs/*.md) are their translations.
-  `docs/` is the original XeStrata's and covers other GPUs as well.
+  `docs/` is the original XeStrata's.
 
 ## Credits
 
@@ -292,9 +273,7 @@ Each part is described in [docs/DETAILS.md](docs/DETAILS.md#how-it-works) (the o
   and its original, [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.
 - **Models**:
    - [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team.
-   - The compressed versions by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), and their
-     [Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF).
-   - [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI.
+   - The compressed version (IQ2_XS) by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF).
 
   The model files are under their own licenses.
 - **Components**:

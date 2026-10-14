@@ -17,13 +17,13 @@ Radeon 890M と 64 GB の RAM を積んだノート PC 1 台で動かします�
 | | 元の XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
 | decode（短い会話 6 つの平均） | 15〜22 tok/s | 約 31 tok/s |
-| prefill 523 トークン | 5.4 s | 3.2 s |
-| prefill 3,481 トークン | 29.1 s | 16.2 s |
-| prefill 2,669 トークン（同じ文の繰り返し） | 22.0 s | 12.4 s |
+| prefill 523 トークン | 5.4 s（98 tok/s） | 2.55 s（205 tok/s） |
+| prefill 3,481 トークン | 29.1 s（119 tok/s） | 13.1 s（265 tok/s） |
+| prefill 2,669 トークン（同じ文の繰り返し） | 22.0 s（121 tok/s） | 10.0 s（267 tok/s） |
 
-prefill の「元の XeStrata」の列は、このフォークの decode の改修を入れた時点の値です（prefill の経路はそこまで元のままでした）。
+prefill の「元の XeStrata」の列は、この 890M で元の XeStrata の prefill の経路を測った値です。答えは丸めの差を除いて同じです。
 
-> **目次:** [XeStrata-890M とは](#xestrata-890m-とは) · [必要なもの](#必要なもの) · [モデルの選び方](#モデルの選び方) ·
+> **目次:** [XeStrata-890M とは](#xestrata-890m-とは) · [必要なもの](#必要なもの) · [モデル](#モデル) ·
 > [インストール](#インストール) · [使い方](#使い方) · [困ったとき](#困ったとき) · [しくみ](#しくみ) ·
 > [開発する人へ](#開発する人へ) · [詳しい説明](docs/DETAILS.ja.md)
 
@@ -79,6 +79,7 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
      host USM）に取ります: その場で読む MMQ が 2 倍ほど速くなります（523 トークンの prefill 3.16 -> 2.68 s）。
    - 必要なワークグループの大きさは QSA の prompt attention（PromptAttnMma: spill 83 → 0、3,474 トークンの attention 1.99 → 1.22 s）、
      GDN の key-head の recurrence（908 → 602 ms）、decode の密な GEMV と HC の読みにも付けてあります。
+     prompt attention の p.v の累積は WMMA の累積器の配置のままレジスターに置き、staging のタイルとサブグループのバリアを外しています（1.22 → 1.15 s）。
    - 自身のカーネルは rocBLAS と足す順が違い、MMQ のスケールの fma も丸めが変わるので、答えが丸めの差で変わることがあります（`STRATA_BLAS=1` なら密な積は元のまま）。
 
 ## 必要なもの
@@ -87,7 +88,7 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
 | --- | --- |
 | GPU | AMD Radeon 890M（Ryzen AI 9 HX 370 の内蔵 GPU、gfx1150）。[AMD の GPU](#amd-の-gpu) も見てください。 |
 | CPU | Ryzen AI 9 HX 370（12 コア 24 スレッド、AVX-512）。 |
-| RAM | 64 GB（IQ2_XS のエキスパート約 34 GiB をすべて RAM に置きます）。[モデルの選び方](#モデルの選び方)。 |
+| RAM | 64 GB（IQ2_XS のエキスパート約 34 GiB をすべて RAM に置きます）。[モデル](#モデル)。 |
 | ディスク | モデルに 68 GB、MTP 層に約 6 GB。NVMe の SSD。 |
 | OS | Fedora 44（ディストリビューションの ROCm 7.1.1）。 |
 | BIOS | GPU へのメモリの割り当て（VRAM）は既定（512 MB）のままで構いません。エキスパートは host USM に置くので、割り当てを増やす必要はありません。カーネルの起動オプション（`ttm.pages_limit` など）も変えません。 |
@@ -101,33 +102,12 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
 - Ubuntu 26.04 の rocBLAS は gfx1150 のコードを持ちません。Fedora 44 を使ってください。
 - 自分の GPU の gfx は、`./setup.sh --check` が GPU の名前の後ろに出します。
 
-## モデルの選び方
+## モデル
 
-このフォークで動かして測っているのは、Qwen3.8-Flash-Next の **IQ2_XS** です（64 GB の RAM に、エキスパートをすべて置けます）。
-あとから別の大きさを足すときは `./setup.sh` を実行します。
-
-| 版 | 大きさ | ダウンロード | RAM の目安 | 速さ | 品質 |
-| --- | --- | ---: | ---: | --- | --- |
-| 元のモデル、Swift 1.5 | **Q2_0** | 66 GB | 48 GB | いちばん速い | 良い |
-| 元のモデル、Swift 1.5 | **IQ2_XS** | 68 GB | 48 GB | 速い | より良い（**おすすめ**） |
-| 元のモデル、Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | 遅め | とても良い |
-| 元のモデル、Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | 遅い | 元のモデルと同等 |
-| Coder | **IQ1_M** | 58 GB | 32 GB | 速い | コードでは良い、ほかは弱い |
-
-RAM の目安は元の XeStrata のものです。このフォークの `--expert-cache 24576`（エキスパートをすべて RAM に置く）は、IQ2_XS で約 34 GiB を使います。
-ほかの大きさはこのフォークでは動かしていません。エキスパートの全部を RAM に置けなければ、`--expert-cache` を小さくします（起動時のログの空きのメモリを見て決めます）。
-Unsloth の 4 ビットの版（UD-IQ4_XS、UD-Q4_K_XL）は、エキスパートだけで 60〜77 GB あり、64 GB の PC には向きません。
-
-**版:**
-
-- **Qwen3.8-Flash-Next**: 元のモデル。
-- **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**: UkisAI による調整版です。
-  答える前の思考が短く、答えが早く出ます。品質はほぼ同じです。このモデル自身のライセンスに従います。
-- **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)**: ISTA-DASLab によるコード向けの版です。
-  各層 512 個のエキスパートのうち、コードで使う 256 個だけを残しています。エキスパートが半分なので、コード以外や、英語以外の言語では弱くなります。
-
-元の XeStrata が扱うほかのモデル（Ornith-1.5、llm-jp-4.1、Unsloth の版）は、このフォークでは動かしていません
-（[元の説明](https://github.com/MistVVK/XeStrata#choosing-a-model)）。
+このフォークで動かして測っているのは、Qwen3.8-Flash-Next の **IQ2_XS**（[ISTA-DASLab の GSQ-RCO の圧縮版](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)、
+ダウンロード 68 GB）です。`--expert-cache 24576` でエキスパートをすべて RAM に置き、約 34 GiB を使います。
+ほかの大きさや版はこのフォークでは動かしていません。エキスパートの全部を RAM に置けなければ、`--expert-cache` を小さくします
+（起動時のログの空きのメモリを見て決めます）。
 
 ## インストール
 
@@ -269,7 +249,7 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
 - **長い文章は大きな塊で読みます**（一度に最大 32,768 トークン）。prefill の密な行列積は 890M の WMMA で、
   エキスパートの積は int8 の WMMA で計算します。
 
-各部分の詳しい説明は [docs/DETAILS.ja.md](docs/DETAILS.ja.md#しくみ) にあります（元の XeStrata の説明で、ほかの GPU の記述も含みます）。
+各部分の詳しい説明は [docs/DETAILS.ja.md](docs/DETAILS.ja.md#しくみ) にあります（元の XeStrata の説明です）。
 
 ## 開発する人へ
 
@@ -279,13 +259,14 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
   単体はクロックを固定せず高い側（`dpm high`）で測り、A/B は同じ条件で交互に、GPU を冷ましてから測ります（熱で数 % 動きます）。
   `STRATA_PREFILL_TIMING=1` で prefill の段階ごとの GPU 時間がログに出ます。
 - **ISA の確認**: `-fsycl-device-only` で bitcode を出し、intel/llvm の `llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1150` でアセンブリにして、
-  メタデータの `.vgpr_count` と `.vgpr_spill_count` を見ます。この intel/llvm の AMD の backend はすべてのカーネルを 128 VGPR に抑えるので、
-  大きなタイルは溢れます。
+  メタデータの `.vgpr_count` と `.vgpr_spill_count` を見ます。AMD の backend はカーネルのレジスター予算を必要なワークグループの大きさから決めるので
+  （intel/llvm への修正 `hip-reqd-work-group-size`）、カーネルには `STRATA_AMD_REQD_WG` を付けます。付けないカーネルは 1024 ワークアイテム分の
+  128 VGPR に抑えられ、溢れます。
 - **守ること**: [AGENTS.md](AGENTS.md)。890M 向けの分岐は、GPU の名前ではなく、報告される性質（統合 GPU、HIP の backend、WMMA の有無）か環境変数の opt-in で選びます。
   リント（`tools/lint/run.sh`）、テスト（CTest、`python -m unittest`）、ライセンスの表示もそこにあります。
   計測の記録は git に入れません。
 - **README と docs**: 日本語版（README.ja.md、docs/*.ja.md）を先に書き、英語版（README.md、docs/*.md）はその訳です。
-  `docs/` は元の XeStrata のもので、ほかの GPU の記述を含みます。
+  `docs/` は元の XeStrata のものです。
 
 ## クレジット
 
@@ -293,9 +274,7 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
   その元の、Niko1221 と Strata の貢献者による [Strata](https://github.com/Niko1221/Strata)。
 - **モデル**:
    - Qwen チームの [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)。
-   - [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) による圧縮版と、
-     [Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)。
-   - UkisAI による [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
+   - [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) による圧縮版（IQ2_XS）。
 
   モデルのファイルには、それぞれのライセンスが適用されます。
 - **使っている部品**:
