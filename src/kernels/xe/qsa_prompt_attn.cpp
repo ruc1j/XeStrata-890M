@@ -547,8 +547,17 @@ struct PromptAttnMma {
         // output values a lane: element lane + SG * i (i < TPL) of each of the sub-group's four 16 x 16 tiles, in
         // o[nt * TPL + i]
         constexpr int TPL = R * T16 / pm::SG, OPL = 4 * TPL;
+#if STRATA_AMD_WMMA
+        // RDNA (XeStrata-890M): the output stays in the WMMA accumulator's layout (lane l column l % 16, element e row
+        // row_of(l / 16, e)), so p.v's tiles are scaled and added in registers: no staging tile, no sub-group barriers
+        J::fv8 ow[4];
+        for (int nt = 0; nt < 4; ++nt) J::fill(sg, *reinterpret_cast<MC*>(&ow[nt]), 0.0f);
+        const int wlo = J::lane16(sg), whi = J::half_of(sg);
+        float walpha[8];
+#else
         float o[OPL];
         for (int i = 0; i < OPL; ++i) o[i] = 0.0f;
+#endif
 
         for (int c0 = 0; c0 < n; c0 += CH) {
             const int nh = sycl::min(CH, n - c0);
@@ -692,6 +701,11 @@ struct PromptAttnMma {
                     J::load(sg, b, at(kvq, VH + (size_t) g * 64 + (size_t) nt * T16), KR);
                     J::mad(sg, acc, ph, b, acc);
                     J::mad(sg, acc, pl, b, acc);
+#if STRATA_AMD_WMMA
+                    if (nt == 0)
+                        for (int e = 0; e < 8; ++e) walpha[e] = alpha[J::row_of(whi, e)];
+                    for (int e = 0; e < 8; ++e) ow[nt][e] = sycl::fma(ow[nt][e], walpha[e], acc.v[e] * unit);
+#else
                     // through local memory a tile at a time (a quarter of the 16 x 64 staging: the work-group's local
                     // memory, and so how many fit on a compute unit, set this kernel's speed on the RTX 4070)
                     sycl::group_barrier(sg);   // the previous tile's values are read
@@ -701,9 +715,20 @@ struct PromptAttnMma {
                         const int e = lane + pm::SG * i;
                         o[nt * TPL + i] = sycl::fma(o[nt * TPL + i], alpha[e / T16], st[SG0 + e] * unit);
                     }
+#endif
                 }
             }
         }
+#if STRATA_AMD_WMMA
+        for (int nt = 0; nt < 4; ++nt)
+            for (int e = 0; e < 8; ++e) {
+                const int r = J::row_of(whi, e), col = nt * T16 + wlo;
+                if (r < G) {
+                    const float l = lsum[r];
+                    out[r * HD + g * 64 + col] = l > 0.0f ? ow[nt][e] / l : 0.0f;
+                }
+            }
+#else
         for (int i = 0; i < OPL; ++i) {
             const int e = lane + pm::SG * (i % TPL), r = e / T16, col = (i / TPL) * T16 + e % T16;
             if (r < G) {
@@ -711,6 +736,7 @@ struct PromptAttnMma {
                 out[r * HD + g * 64 + col] = l > 0.0f ? o[i] / l : 0.0f;
             }
         }
+#endif
 #endif
     }
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(pm::SG)>}; }
@@ -737,7 +763,8 @@ sycl::event launch_mma(sycl::queue& q, const float* qv, QsaAttnPools p, const in
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) pm::CH * K::VS), h),
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) NG * R * pm::CH), h),
             sycl::local_accessor<half, 1>(sycl::range<1>((size_t) 2 * K::VS * R * pm::CH), h),
-            sycl::local_accessor<float, 1>(sycl::range<1>((size_t) NG * R * pm::T16), h),
+            // the output staging tile: RDNA's body keeps the output in the accumulators' layout and does without it
+            sycl::local_accessor<float, 1>(sycl::range<1>(xe::amd_wmma(q.get_device()) ? 1 : (size_t) NG * R * pm::T16), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h)};
