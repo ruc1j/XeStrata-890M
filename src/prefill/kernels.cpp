@@ -264,19 +264,32 @@ void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo
 }
 
 // ---------------------------------------------------------------- hyper-connection
-void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo) {
-    Q(stream).parallel_for(sycl::range<1>((size_t) (T * LR)), [=](sycl::id<1> i) {
-        const float x = lo[i] / (float) HC;
-        const float v = x / (1.0f + sycl::exp(-x));
-        const uint16_t h = bf(v);
-        lo16[i] = h;
-        if (lo16_lo) lo16_lo[i] = bf_lo(v, h);
+void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo, int8_t* xq8, float* xs8) {
+    const int64_t n = T * LR;   // a multiple of 32: a sub-group's lanes are one block
+    Q(stream).parallel_for(sycl::nd_range<1>((size_t) ((n + 255) / 256 * 256), 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const int64_t i = (int64_t) it.get_global_id(0);
+        const bool in = i < n;
+        float v = 0.0f;
+        if (in) {
+            const float x = lo[i] / (float) HC;
+            v = x / (1.0f + sycl::exp(-x));
+            const uint16_t h = bf(v);
+            lo16[i] = h;
+            if (lo16_lo) lo16_lo[i] = bf_lo(v, h);
+        }
+        if (xq8 != nullptr) {   // XeStrata-890M: the block's int8 form for the hc up product (hc_mmq)
+            const sycl::sub_group sg = it.get_sub_group();
+            const float amax = sycl::reduce_over_group(sg, sycl::fabs(v), sycl::maximum<float>());
+            const float dq = amax / 127.0f, id = amax > 0.0f ? 1.0f / dq : 0.0f;
+            if (in) xq8[i] = (int8_t) sycl::round(v * id);
+            if (in && sg.get_local_id()[0] == 0) xs8[i / 32] = dq;
+        }
     });
 }
 // F-1: the row scale only (and the BF16 image); gr_mix_r recomputes r * rs * w itself, in the same order, so the FP32
 // copy of the normalized rows (T x 10240 floats) is neither written nor read
 void gr_norm_rs(const float* R, const float* w, float eps, float* rs_out, uint16_t* xn16, int64_t T, void* stream,
-                uint16_t* xn16_lo) {
+                uint16_t* xn16_lo, int8_t* xq8, float* xs8) {
     Q(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sh(sycl::range<1>(32), h);
         h.parallel_for(sycl::nd_range<1>((size_t) (T * HC) * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
@@ -293,6 +306,13 @@ void gr_norm_rs(const float* R, const float* w, float eps, float* rs_out, uint16
                 const uint16_t hi = bf(v);
                 xn16[row * N + d] = hi;
                 if (xn16_lo) xn16_lo[row * N + d] = bf_lo(v, hi);
+                if (xq8 != nullptr) {   // XeStrata-890M: the block's int8 form for the hc down product (hc_mmq)
+                    const sycl::sub_group sg = it.get_sub_group();   // 32 lanes: 32 consecutive d, one block
+                    const float amax = sycl::reduce_over_group(sg, sycl::fabs(v), sycl::maximum<float>());
+                    const float dq = amax / 127.0f, id = amax > 0.0f ? 1.0f / dq : 0.0f;
+                    xq8[(row / HC) * (HC * N) + c * N + d] = (int8_t) sycl::round(v * id);
+                    if (sg.get_local_id()[0] == 0) xs8[(row / HC) * (HC * N / 32) + (c * N + d) / 32] = dq;
+                }
             }
         });
     });
@@ -321,7 +341,7 @@ void gr_mix_r(const float* R, const float* rs, const float* w, const float* g, f
 // work-item to element mapping (256 work-items, stride 256) and block_sum, so rs and the BF16 image are the same bits,
 // and R is not read back
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w, float eps,
-                      float* rs_out, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo) {
+                      float* rs_out, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int8_t* xq8, float* xs8) {
     constexpr int PER = (N + 255) / 256;
     Q(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sh(sycl::range<1>(32), h);
@@ -349,6 +369,13 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
                 const uint16_t hi = bf(x);
                 xn16[row * N + d] = hi;
                 if (xn16_lo) xn16_lo[row * N + d] = bf_lo(x, hi);
+                if (xq8 != nullptr) {   // XeStrata-890M: the block's int8 form for the hc down product (hc_mmq)
+                    const sycl::sub_group sg = it.get_sub_group();   // 32 lanes: 32 consecutive d, one block
+                    const float amax = sycl::reduce_over_group(sg, sycl::fabs(x), sycl::maximum<float>());
+                    const float dq = amax / 127.0f, id = amax > 0.0f ? 1.0f / dq : 0.0f;
+                    xq8[(row / HC) * (HC * N) + c * N + d] = (int8_t) sycl::round(x * id);
+                    if (sg.get_local_id()[0] == 0) xs8[(row / HC) * (HC * N / 32) + (c * N + d) / 32] = dq;
+                }
             }
         });
     });

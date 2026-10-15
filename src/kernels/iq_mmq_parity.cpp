@@ -14,6 +14,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "parity_device.hpp"
 
 #include "ggml.h"
@@ -171,15 +172,18 @@ int bench_dense() {
     namespace k = strata::kernels;
     sycl::queue& q = strata::core::Runtime::get().compute();
     void* s = P::stream();
-    struct Shape { const char* name; ggml_type t; int64_t N, K; };
+    struct Shape { const char* name; int t; int64_t N, K; };
+    // the hc shapes: the Q8_0 copies (kNativeQ8Rows, STRATA_HC_Q8) against the BF16 WMMA they take now (no dequant)
     const Shape shapes[] = {{"attn_qkv", GGML_TYPE_IQ4_XS, 10240, 2560}, {"attn_gate", GGML_TYPE_IQ4_XS, 6144, 2560},
                             {"attn_q", GGML_TYPE_IQ4_XS, 12288, 2560},   {"ssm_out", GGML_TYPE_IQ4_XS, 2560, 6144},
                             {"shexp", GGML_TYPE_IQ4_XS, 640, 2560},      {"attn_k", GGML_TYPE_IQ4_XS, 512, 2560},
-                            {"qkv iq3_s", GGML_TYPE_IQ3_S, 10240, 2560}, {"gate q6_k", GGML_TYPE_Q6_K, 6144, 2560}};
+                            {"qkv iq3_s", GGML_TYPE_IQ3_S, 10240, 2560}, {"gate q6_k", GGML_TYPE_Q6_K, 6144, 2560},
+                            {"hc_down", k::kNativeQ8Rows, 384, 10240},   {"hc_up", k::kNativeQ8Rows, 10240, 320}};
     std::printf("iq_mmq_parity --dense: int8 %s, FP16 products %s\n", k::iq_mmq_usable(q) ? "on the matrix engines" : "by dp4a",
                 k::gemm_path(k::XmxType::f16));
     for (const Shape& c : shapes) {
-        const size_t wb = ggml_row_size(c.t, c.K) * (size_t) c.N;
+        const size_t wb = k::iq_mmq_row_bytes(c.t, c.K) * (size_t) c.N;
+        const bool bf = c.t == k::kNativeQ8Rows;
         P::Device dev;
         uint8_t* w = dev.alloc<uint8_t>(wb);
         q.memset(w, 0x11, wb).wait();
@@ -202,8 +206,12 @@ int bench_dense() {
                 k::iq_mmq_grouped(q, (int) c.t, w, wb, c.N, c.K, 1, xq, T, db_, T, di, y, c.N);
             });
             const double us16 = time_us(q, [&] {
-                k::dequant_f16((int) c.t, w, 0, c.N, c.K, w16, s);
-                k::xmx_gemm(k::XmxType::f16, x16, w16, y, T, c.N, c.K, c.N, s);
+                if (bf) {
+                    k::xmx_gemm(k::XmxType::bf16, x16, w16, y, T, bf ? c.N - 64 : c.N, c.K, c.N, s);   // 320 rows
+                } else {
+                    k::dequant_f16((int) c.t, w, 0, c.N, c.K, w16, s);
+                    k::xmx_gemm(k::XmxType::f16, x16, w16, y, T, c.N, c.K, c.N, s);
+                }
             });
             std::printf("  %-10s N %5lld K %4lld T %4lld: int8 %8.1f us (+ quantize %6.1f)  FP16 dequant+gemm %8.1f us  %s\n",
                         c.name, (long long) c.N, (long long) c.K, (long long) T, us8, usq, us16,

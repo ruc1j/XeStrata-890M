@@ -20,8 +20,10 @@ namespace strata::prefill {
 /// FP32 normalized rows are not written, gr_mix_r recomputes them (F-1, upstream 882bb6d).
 /// `xn16_lo` (null: none) takes bf16(x - xn16): W.xn16 + W.xn16_lo is the product with ~16 mantissa bits of x
 /// (STRATA_PREFILL_BF16X2); the other `*_lo` arguments below the same for their BF16 images.
+/// `xq8` / `xs8` (null: none): the normalized rows in the int8 products' form as well (row t's 4 x 2560 values as one
+/// row of int8 blocks of 32, their scales after: iq_mmq_quantize's layout), for the hc down product (XeStrata-890M).
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream,
-                uint16_t* xn16_lo = nullptr);
+                uint16_t* xn16_lo = nullptr, int8_t* xq8 = nullptr, float* xs8 = nullptr);
 /// mixed[t, d] = mean_c xn[t,c,d] * sigmoid(gated[t,c,d]), xn = R * rs * w_norm as gr_norm_rs computes it (the same
 /// bits); FP32, BF16 and FP16 (either image may be null).
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
@@ -29,9 +31,12 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
 /// F-2 (upstream b046845): gr_write, then gr_norm_rs of the next half (its norm weights) over the rows just written -
 /// the same bits as the two calls, without reading R back.
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
-                      float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr);
+                      float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr, int8_t* xq8 = nullptr,
+                      float* xs8 = nullptr);
 /// lo16[t, k] = bf16(silu(lo[t, k] / hc))
-void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo = nullptr);
+/// `xq8` / `xs8`: the rows' int8 form too (T rows of 320), for the hc up product.
+void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo = nullptr, int8_t* xq8 = nullptr,
+             float* xs8 = nullptr);
 /// R[t, c, d] += bo[t, d] * 2 sigmoid(inj[t, c] / hc)   (inj has row stride inj_ld)
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream);
 /// gr_write, cvec_apply(R, layer, ...) of the loaded control vector and gr_norm_rs of the next half in one pass over R

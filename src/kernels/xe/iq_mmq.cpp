@@ -1391,7 +1391,8 @@ size_t iq_mmq_act_bytes(int64_t rows, int64_t cols) { return (size_t) (rows * co
 
 bool iq_mmq_type_dup(int t) { return t == 10; }
 
-template <class X>   // float rows, or FP16 rows as uint16_t (XeStrata-890M: the dense projections' FP16-only inputs)
+// float rows, or FP16 / BF16 rows as uint16_t (XeStrata-890M: the dense projections' 16-bit-only inputs)
+template <class X, bool BF16 = false>
 sycl::event quantize_rows(sycl::queue& q, const X* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
                           int64_t rows, bool sums, bool dup) {
     // dup (Q2_K, Dec<10>): each block written twice, as a row of 2 cols values
@@ -1404,8 +1405,10 @@ sycl::event quantize_rows(sycl::queue& q, const X* x, const int32_t* ids, void* 
         const int64_t r = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
         const X* xr = x + (int64_t) (ids ? ids[r] : r) * ld + b * 32;
         float v[32], amax = 0.0f;
+        // (16-byte vector loads here were no faster on the 890M: the kernel runs at the memory's rate)
         for (int j = 0; j < 32; ++j) {
             if constexpr (std::is_same_v<X, float>) v[j] = xr[j];
+            else if constexpr (BF16) v[j] = sycl::bit_cast<float>((uint32_t) xr[j] << 16);
             else v[j] = (float) sycl::bit_cast<sycl::half>(xr[j]);
             amax = sycl::fmax(amax, sycl::fabs(v[j]));
         }
@@ -1439,6 +1442,10 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
 sycl::event iq_mmq_quantize_f16(sycl::queue& q, const uint16_t* x, void* xq, int64_t cols, int64_t ld, int64_t rows,
                                 bool sums, bool dup) {
     return quantize_rows<uint16_t>(q, x, nullptr, xq, cols, ld, rows, sums, dup);
+}
+sycl::event iq_mmq_quantize_bf16(sycl::queue& q, const uint16_t* x, void* xq, int64_t cols, int64_t ld, int64_t rows,
+                                 bool sums, bool dup) {
+    return quantize_rows<uint16_t, true>(q, x, nullptr, xq, cols, ld, rows, sums, dup);
 }
 
 sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_bytes, int64_t w_rows, int64_t w_cols,

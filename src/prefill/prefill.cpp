@@ -20,6 +20,7 @@
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -500,11 +501,17 @@ struct Prefill::Impl {
     // one-expert bounds {0, T} and what the rows hold now (their source, form and width; the chunk's T)
     void* Xqd = nullptr;
     int32_t* bounds_dense = nullptr;
+    float* lo_pad = nullptr;   // hc down's outputs over its copy's padded rows (hc_q8_rows), before the copy into lo
     HostVec<int32_t> bounds_dense_host;
     const void* xqd_src = nullptr;
     bool xqd_sums = false, xqd_dup = false;
     int64_t xqd_K = 0, bounds_T = -1;
     bool dense_ok(const core::WeightRef* w) const;
+    void dense_run(const void* w, int type, int64_t w_rows, int64_t K, float* Y, int64_t ld_dst, int64_t T);
+    bool hc_ok(const core::WeightRef* wd, const core::WeightRef* wu) const;
+    bool hc_mmq(const core::WeightRef* wd, const core::WeightRef* wu, int64_t T);
+    int8_t* xq8() const { return static_cast<int8_t*>(Xqd); }                  // Xqd's int8 rows
+    float* xs8(int64_t T, int64_t K) const { return reinterpret_cast<float*>(static_cast<uint8_t*>(Xqd) + T * K); }   // and scales
     bool dense_proj(const core::WeightRef* w, const float* x32, const uint16_t* x16, bool fresh, float* Y, int64_t T,
                     const std::string& name, std::string& err, int64_t ldy = 0);
     std::unique_ptr<mmq::Context> mmq_ctx;
@@ -696,6 +703,8 @@ inline int inplace_group() {
 // the bounds table: the experts' first rows and the total, then each group's relative bounds (G + 1 a group), for the
 // smallest group
 bool dense_mmq_on();
+bool hc_mmq_on();
+constexpr int64_t LR_PAD = (LR + 127) / 128 * 128;   // hc down's 320 outputs as the int8 products' 128-wide tiles
 inline size_t bounds_entries(int64_t n_expert) {
     return (size_t) n_expert + 1 + ((size_t) n_expert / MMQ_GROUP_MIN + 1) * (MMQ_GROUP_MAX + 1);
 }
@@ -1008,8 +1017,9 @@ bool Prefill::carve(size_t T, void* alloc) {
     if (mmq_plan().any) {
         m.ids_identity = o.take<int32_t>(T * K, ok);
         if (dense_mmq_on()) {
-            m.Xqd = o.take<uint8_t>(mmq::q8_bytes(T, ZV), ok);
+            m.Xqd = o.take<uint8_t>(mmq::q8_bytes(T, D), ok);
             m.bounds_dense = o.take<int32_t>(2, ok);
+            if (hc_mmq_on()) m.lo_pad = o.take<float>(T * LR_PAD, ok);
         }
         m.bounds_dev = o.take<int32_t>(bounds_entries(m.g->n_expert), ok);
         m.wtab_dev = o.take<const uint8_t*>((size_t) m.g->n_expert, ok);
@@ -1263,7 +1273,11 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     o.take<int32_t>((size_t) g.n_expert + 1, ok);
     if (mmq_plan().any) {
         o.take<int32_t>(T * K, ok);
-        if (dense_mmq_on()) { o.take<uint8_t>(mmq::q8_bytes(T, ZV), ok); o.take<int32_t>(2, ok); }
+        if (dense_mmq_on()) {
+            o.take<uint8_t>(mmq::q8_bytes(T, D), ok);
+            o.take<int32_t>(2, ok);
+            if (hc_mmq_on()) o.take<float>(T * LR_PAD, ok);
+        }
         o.take<int32_t>(bounds_entries(g.n_expert), ok);
         o.take<const uint8_t*>((size_t) g.n_expert, ok);
         if ((int64_t) T < STREAM_ALL_MIN) o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
@@ -1291,6 +1305,19 @@ bool dense_mmq_on() {
     }();
     return v > 0 || (v < 0 && mmq_plan().any);
 }
+// STRATA_PREFILL_HC_MMQ=1 (opt-in): the hyper-connection's down and up from their Q8_0 copies in int8 too (hc_mmq;
+// the loader pads the copies' rows for it).  Measured on the 890M (IQ2_XS, 28 W) and not taken: hc read 190 -> 197 ms
+// on the 523-token prompt, 1,313 -> 1,397 ms on the 3,481-token one, with the int8 rows written by the norm and SiLU
+// kernels themselves.  The down product alone wins (iq_mmq_parity --dense, 2048 rows: 2.50 against the BF16 WMMA's
+// 2.87 ms), the up product (K = 320, the kernel's K-tail form) does not (2.65 against 2.69), and the int8 rows of
+// 10,240 values a token cost a write pass the BF16 image already pays.
+bool hc_mmq_on() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_HC_MMQ");
+        return e != nullptr && std::strtol(e, nullptr, 10) > 0;
+    }();
+    return v && dense_mmq_on();
+}
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                  std::string& err, int64_t ldy = 0);
 
@@ -1317,7 +1344,43 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
 
 bool Prefill::Impl::dense_ok(const core::WeightRef* w) const {
     return Xqd != nullptr && mmq_ctx != nullptr && w->native_data != nullptr && mmq::supported(w->native_type) &&
-           w->ne1 % 128 == 0 && w->ne0 % 32 == 0 && w->ne0 <= ZV;
+           w->ne1 % 128 == 0 && w->ne0 % 32 == 0 && w->ne0 <= D;
+}
+// one expert of T rows: the quantized rows in Xqd (K values each) times the [w_rows, K] matrix of `type` into Y
+void Prefill::Impl::dense_run(const void* w, int type, int64_t w_rows, int64_t K, float* Y, int64_t ld_dst, int64_t T) {
+    if (bounds_T != T) {
+        bounds_dense_host.resize(2);
+        bounds_dense_host[0] = 0;
+        bounds_dense_host[1] = (int32_t) T;
+        bounds_dense_host.to_device(bounds_dense, cs);
+        bounds_T = T;
+    }
+    mmq::Product p;
+    p.w = w; p.type = type; p.w_rows = w_rows; p.w_cols = K; p.expert_bytes = 0; p.n = 1;
+    p.xq = Xqd; p.bounds = bounds_dense; p.ids = ids_identity; p.total_rows = T; p.max_rows = T; p.rows = T;
+    p.dst = Y; p.ld_dst = ld_dst;
+    mmq_ctx->run(p, cs);
+}
+// XeStrata-890M: the hyper-connection's down and up projections from their Q8_0 copies (STRATA_HC_Q8's, the rows
+// padded to 128: hc_q8_rows) in int8: the normalized rows xn16 (BF16, D values) quantized, down over the padded rows
+// into lo_pad and its LR columns copied into lo, the SiLU, lo16 quantized, up (K = LR, the kernel's K-tail form) into
+// gated.  False (nothing done) where a copy or the buffers are missing, or the BF16 low parts are in use.
+bool Prefill::Impl::hc_ok(const core::WeightRef* wd, const core::WeightRef* wu) const {
+    return lo_pad != nullptr && Xqd != nullptr && mmq_ctx != nullptr && xn16_lo == nullptr && wd->hc_q8 != nullptr &&
+           wu->hc_q8 != nullptr && wd->hc_q8_rows == LR_PAD && wu->hc_q8_rows == D && wd->ne0 == D && wu->ne0 == LR;
+}
+// The norm kernels write the int8 rows themselves (gr_norm_rs / gr_write_norm_rs with xq8: xqd_src is then xn16);
+// a norm that did not (the control vector's) is quantized here from the BF16 image.
+bool Prefill::Impl::hc_mmq(const core::WeightRef* wd, const core::WeightRef* wu, int64_t T) {
+    if (!hc_ok(wd, wu)) return false;
+    constexpr int t = strata::kernels::kNativeQ8Rows;
+    if (xqd_src != xn16 || xqd_K != D) mmq::quantize_bf16(xn16, Xqd, t, D, D, T, cs);
+    dense_run(wd->hc_q8, t, LR_PAD, D, lo_pad, LR_PAD, T);
+    strata::gpu::copy2d_async(lo, (size_t) LR * 4, lo_pad, (size_t) LR_PAD * 4, (size_t) LR * 4, (size_t) T, cs);
+    gr_silu(lo, lo16, T, cs, nullptr, xq8(), xs8(T, LR));
+    dense_run(wu->hc_q8, t, D, LR, gated, D, T);
+    xqd_src = nullptr;
+    return true;
 }
 // The rows are quantized once for the projections that share them (`fresh`: x holds new values); from the FP32
 // rows x32 (K floats a row) where they exist, else from the FP16 rows x16 (the recurrence's y, the attention, the
@@ -1334,18 +1397,7 @@ bool Prefill::Impl::dense_proj(const core::WeightRef* w, const float* x32, const
         else mmq::quantize_f16(x16, Xqd, t, K, K, T, cs);
         xqd_src = src; xqd_sums = sums; xqd_dup = dup; xqd_K = K;
     }
-    if (bounds_T != T) {
-        bounds_dense_host.resize(2);
-        bounds_dense_host[0] = 0;
-        bounds_dense_host[1] = (int32_t) T;
-        bounds_dense_host.to_device(bounds_dense, cs);
-        bounds_T = T;
-    }
-    mmq::Product p;
-    p.w = w->native_data; p.type = t; p.w_rows = w->ne1; p.w_cols = K; p.expert_bytes = 0; p.n = 1;
-    p.xq = Xqd; p.bounds = bounds_dense; p.ids = ids_identity; p.total_rows = T; p.max_rows = T; p.rows = T;
-    p.dst = Y; p.ld_dst = ldy > 0 ? ldy : w->ne1;
-    mmq_ctx->run(p, cs);
+    dense_run(w->native_data, t, w->ne1, K, Y, ldy > 0 ? ldy : w->ne1, T);
     return true;
 }
 
@@ -1782,11 +1834,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 pt.mark(kPfHc, cs);
                 // F-1: the row scales into the start of xn (the FP32 normalized rows are not written; gr_mix_r
                 // recomputes them from R)
-                if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
+                const bool hc8 = hc_mmq_on() && m.hc_ok(wd, wu);
+                if (!normed) {
+                    gr_norm_rs(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo,
+                               hc8 ? m.xq8() : nullptr, hc8 ? m.xs8(T, D) : nullptr);
+                    if (hc8) { m.xqd_src = m.xn16; m.xqd_K = D; }
+                }
                 normed = false;
-                if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
-                gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
-                if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                if (!(hc8 && m.hc_mmq(wd, wu, T))) {
+                    if (!bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
+                    gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                    if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                }
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
                 gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                          m.mixed_bf_lo);
@@ -2708,8 +2767,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                           m.xn16_lo);
                     normed = true;
                 } else if (wnn) {
+                    const bool hc8n = hc_mmq_on() && m.lo_pad != nullptr && m.xn16_lo == nullptr;   // the next half's hc_mmq
                     gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.xn, m.xn16, T, m.cs,
-                                     m.xn16_lo);
+                                     m.xn16_lo, hc8n ? m.xq8() : nullptr, hc8n ? m.xs8(T, D) : nullptr);
+                    if (hc8n) { m.xqd_src = m.xn16; m.xqd_K = D; }
                     normed = true;
                 } else {
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);

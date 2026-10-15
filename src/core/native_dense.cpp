@@ -46,6 +46,15 @@ bool hc_q8_requested() {
     }();
     return on;
 }
+// XeStrata-890M: with STRATA_PREFILL_HC_MMQ=1 (prefill.cpp's hc_mmq, opt-in) the copies hold ne1 rounded up to 128
+// rows (zero rows after), so the prefill's int8 products (128 outputs a tile) take hc down's 320 rows as 384
+int64_t hc_q8_rows_of(int64_t ne1) {
+    static const bool pad = [] {
+        const char* e = std::getenv("STRATA_PREFILL_HC_MMQ");
+        return e != nullptr && std::strtol(e, nullptr, 10) > 0;
+    }();
+    return pad ? (ne1 + 127) / 128 * 128 : ne1;
+}
 bool hc_q8_name(const std::string& name) {
     if (name == "output_hc_down.weight" || name == "output_hc_up.weight") return true;
     if (name.rfind("blk.", 0) != 0) return false;
@@ -272,9 +281,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense (STRATA_HC_Q8): incompatible matrix " + tensor.name; return false;
                 }
                 const uint64_t bytes = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1;
+                const uint64_t bytes_pad = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) hc_q8_rows_of(ref.ne1);
                 void* allocation = nullptr;
-                bool status = strata::gpu::alloc_device(&allocation, bytes);
+                bool status = strata::gpu::alloc_device(&allocation, bytes_pad);
                 DevicePtr data(allocation);
+                if (status && bytes_pad > bytes)
+                    status = strata::gpu::memset(static_cast<uint8_t*>(data.get()) + bytes, 0, bytes_pad - bytes);
                 std::vector<uint8_t> q8;
                 const void* src = gguf.tensor_data(tensor);
                 if (tensor.type == 30) {   // BF16 -> Q8_0: per 32 values d = amax / 127 (fp16), q = round(x / d)
@@ -301,8 +313,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense (STRATA_HC_Q8) upload " + tensor.name + ": " + strata::gpu::last_error();
                     return false;
                 }
-                strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
-                hc_q8_bytes += bytes;
+                strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) hc_q8_rows_of(ref.ne1), &compute);
+                hc_q8_bytes += bytes_pad;
                 hc_q8.emplace_back(&ref, std::move(data));
             }
         }
@@ -321,16 +333,21 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     return false;
                 }
                 const uint64_t nb = (uint64_t) ref.elements / 32, bytes = nb * 34;
+                const uint64_t bytes_pad = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) hc_q8_rows_of(ref.ne1);
                 void* allocation = nullptr;
-                if (!strata::gpu::alloc_device(&allocation, bytes)) {
+                if (!strata::gpu::alloc_device(&allocation, bytes_pad)) {
                     err = "native dense (STRATA_HC_Q8) alloc " + name + ": " + strata::gpu::last_error();
                     return false;
                 }
                 DevicePtr data(allocation);
+                if (bytes_pad > bytes && !strata::gpu::memset(static_cast<uint8_t*>(data.get()) + bytes, 0, bytes_pad - bytes)) {
+                    err = "native dense (STRATA_HC_Q8) clear " + name + ": " + strata::gpu::last_error();
+                    return false;
+                }
                 strata::kernels::fused_gr_quantize_q8_0(static_cast<const uint16_t*>(ref.data),
                                                         static_cast<uint8_t*>(data.get()), (int64_t) nb, &compute);
-                strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
-                hc_q8_bytes += bytes;
+                strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) hc_q8_rows_of(ref.ne1), &compute);
+                hc_q8_bytes += bytes_pad;
                 hc_q8.emplace_back(&ref, std::move(data));
             }
         compute.wait();   // the Q6_K rewrites, before any other queue reads the weights
@@ -350,6 +367,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         scratch_ = scratch.release();
         for (auto& [ref, data] : hc_q8) {
             ref->hc_q8 = data.get();
+            ref->hc_q8_rows = hc_q8_rows_of(ref->ne1);
             hc_q8_.push_back(data.release());
         }
         bytes_ = total + hc_q8_bytes;
