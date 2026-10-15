@@ -1237,6 +1237,14 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
         STRATA_MMQ_ROWS_INTEL(false, 2);
     }
 #undef STRATA_MMQ_ROWS_INTEL
+    // XeStrata-890M: a dense projection (one expert of many rows: prefill.cpp's dense_proj) takes a 128-row tile of
+    // 8 sub-groups (4 row tiles by 2 column tiles each): a step's decoded weights serve twice the rows.  iq_mmq_parity
+    // --dense, IQ4_XS, 2048 rows: 10240 x 2560 17.5 -> 14.0 ms (the FP16 WMMA 19.1), 6144 x 2560 10.9 -> 8.4
+    // (11.7), 2560 x 6144 13.8 -> 9.3 (10.6); 512 rows of 10240 x 2560 3.7 -> 2.9 (5.4).  256-row tiles and 512-lane
+    // work-groups lost (2 x 4: 16.9 ms, 4 x 4: 18.8, 8 x 1: 33.6).  STRATA_MMQ_BIG=0 keeps the 64-row tile, =1 gives
+    // the 128-row one to the experts' groups too.
+    static const int big = [] { const char* v = std::getenv("STRATA_MMQ_BIG"); return v ? (int) std::strtol(v, nullptr, 10) : -1; }();
+    if ((big == 1 || (big < 0 && n == 1)) && max_rows > 64 && !tail) return STRATA_MMQ_LAUNCH(4, 2, false, false, 0);
     if (tail) STRATA_MMQ_ROWS(false, true, 0);
     STRATA_MMQ_ROWS(false, false, 0);
 #undef STRATA_MMQ_ROWS
@@ -1383,8 +1391,9 @@ size_t iq_mmq_act_bytes(int64_t rows, int64_t cols) { return (size_t) (rows * co
 
 bool iq_mmq_type_dup(int t) { return t == 10; }
 
-sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
-                            int64_t rows, bool sums, bool dup) {
+template <class X>   // float rows, or FP16 rows as uint16_t (XeStrata-890M: the dense projections' FP16-only inputs)
+sycl::event quantize_rows(sycl::queue& q, const X* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
+                          int64_t rows, bool sums, bool dup) {
     // dup (Q2_K, Dec<10>): each block written twice, as a row of 2 cols values
     const int64_t oc = dup ? 2 * cols : cols, rep = dup ? 2 : 1;
     auto* x8 = static_cast<int8_t*>(xq);
@@ -1393,9 +1402,13 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
     float* xu = xs + rows * onb;
     return q.parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> i) {
         const int64_t r = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
-        const float* xr = x + (int64_t) (ids ? ids[r] : r) * ld + b * 32;
+        const X* xr = x + (int64_t) (ids ? ids[r] : r) * ld + b * 32;
         float v[32], amax = 0.0f;
-        for (int j = 0; j < 32; ++j) { v[j] = xr[j]; amax = sycl::fmax(amax, sycl::fabs(v[j])); }
+        for (int j = 0; j < 32; ++j) {
+            if constexpr (std::is_same_v<X, float>) v[j] = xr[j];
+            else v[j] = (float) sycl::bit_cast<sycl::half>(xr[j]);
+            amax = sycl::fmax(amax, sycl::fabs(v[j]));
+        }
         const float d = amax / 127.0f, id = amax > 0.0f ? 1.0f / d : 0.0f;
         uint32_t p[8];
         int sum = 0;
@@ -1417,6 +1430,15 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
             if (sums) xu[r * onb + ob] = d * (float) sum;
         }
     });
+}
+
+sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
+                            int64_t rows, bool sums, bool dup) {
+    return quantize_rows<float>(q, x, ids, xq, cols, ld, rows, sums, dup);
+}
+sycl::event iq_mmq_quantize_f16(sycl::queue& q, const uint16_t* x, void* xq, int64_t cols, int64_t ld, int64_t rows,
+                                bool sums, bool dup) {
+    return quantize_rows<uint16_t>(q, x, nullptr, xq, cols, ld, rows, sums, dup);
 }
 
 sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_bytes, int64_t w_rows, int64_t w_cols,

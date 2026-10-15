@@ -71,6 +71,10 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
    - The experts' int8 products (MMQ) read the blobs in place when every expert a layer routes is in the cache (no gather into group
      buffers, no copies into the MMQ ring; `STRATA_PREFILL_MMQ_INPLACE=0` restores the old way; `STRATA_PREFILL_MMQ_GROUP` is the number
      of experts per launch, default 16). The WMMA body takes no output staging in local memory, so two work-groups fit a WGP.
+   - The dense projections (attn_qkv, attn_gate, ssm_out, attn_q/k/v, attn_output, the shared expert) whose type and shape fit
+     (outputs a multiple of 128) go through the same int8 products instead of the FP16 copy (one expert of T rows, 128-row
+     tiles): the 523-token prefill 2.68 -> 2.44 s, 3,481 tokens 13.4 -> 12.8 s. The answers can change by the int8 rounding
+     (the 523-token one is the same, the 3,481-token one differs in two words). `STRATA_PREFILL_DENSE_MMQ=0` restores FP16.
    - AMD's device compile states each kernel's required work-group size (`STRATA_AMD_REQD_WG`), and the intel/llvm fix
      `hip-reqd-work-group-size` passes it to the backend's register budget (before it every kernel had 128 VGPRs and spilled).
      With that the dense product takes a 64 x 128 tile for a long prompt's large products (`STRATA_MMA_SHAPE=5`: 2048 rows and

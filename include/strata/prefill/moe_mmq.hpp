@@ -37,6 +37,8 @@ size_t q8_bytes(int64_t rows, int64_t cols);
 /// ids is null); `x` has `ld` floats per row.
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream);
+/// The same from FP16 rows (`ld` halves a row), row i from row i.
+void quantize_f16(const uint16_t* x, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows, void* stream);
 
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into

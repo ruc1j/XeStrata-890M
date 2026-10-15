@@ -19,6 +19,7 @@
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -495,6 +496,17 @@ struct Prefill::Impl {
     // XeStrata-890M: the layer's experts' addresses (two int32 each), the int8 products reading them in place (wtab)
     HostVec<int32_t> wtab_host;
     const uint8_t** wtab_dev = nullptr;
+    // XeStrata-890M: the dense projections in int8 (dense_proj below): their quantized rows (K up to ZV), the
+    // one-expert bounds {0, T} and what the rows hold now (their source, form and width; the chunk's T)
+    void* Xqd = nullptr;
+    int32_t* bounds_dense = nullptr;
+    HostVec<int32_t> bounds_dense_host;
+    const void* xqd_src = nullptr;
+    bool xqd_sums = false, xqd_dup = false;
+    int64_t xqd_K = 0, bounds_T = -1;
+    bool dense_ok(const core::WeightRef* w) const;
+    bool dense_proj(const core::WeightRef* w, const float* x32, const uint16_t* x16, bool fresh, float* Y, int64_t T,
+                    const std::string& name, std::string& err, int64_t ldy = 0);
     std::unique_ptr<mmq::Context> mmq_ctx;
     HostVec<int32_t> ids_host, slot_host, src_host;
     std::vector<int32_t> cnt, off;
@@ -683,6 +695,7 @@ inline int inplace_group() {
 }
 // the bounds table: the experts' first rows and the total, then each group's relative bounds (G + 1 a group), for the
 // smallest group
+bool dense_mmq_on();
 inline size_t bounds_entries(int64_t n_expert) {
     return (size_t) n_expert + 1 + ((size_t) n_expert / MMQ_GROUP_MIN + 1) * (MMQ_GROUP_MAX + 1);
 }
@@ -994,6 +1007,10 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.xb_dev = o.take<int32_t>((size_t) m.g->n_expert + 1, ok);
     if (mmq_plan().any) {
         m.ids_identity = o.take<int32_t>(T * K, ok);
+        if (dense_mmq_on()) {
+            m.Xqd = o.take<uint8_t>(mmq::q8_bytes(T, ZV), ok);
+            m.bounds_dense = o.take<int32_t>(2, ok);
+        }
         m.bounds_dev = o.take<int32_t>(bounds_entries(m.g->n_expert), ok);
         m.wtab_dev = o.take<const uint8_t*>((size_t) m.g->n_expert, ok);
         if ((int64_t) T < STREAM_ALL_MIN) m.mring = o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
@@ -1246,6 +1263,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     o.take<int32_t>((size_t) g.n_expert + 1, ok);
     if (mmq_plan().any) {
         o.take<int32_t>(T * K, ok);
+        if (dense_mmq_on()) { o.take<uint8_t>(mmq::q8_bytes(T, ZV), ok); o.take<int32_t>(2, ok); }
         o.take<int32_t>(bounds_entries(g.n_expert), ok);
         o.take<const uint8_t*>((size_t) g.n_expert, ok);
         if ((int64_t) T < STREAM_ALL_MIN) o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
@@ -1260,13 +1278,29 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
 
 namespace {
 
+// XeStrata-890M: a dense projection through the experts' int8 products (iq_mmq) as one expert of T rows, where
+// the weight's type and shape are the products' (N a multiple of 128, K of 32 and at most ZV); the others keep
+// Gemm::native (dequantized to FP16, the FP16 WMMA).  On the 890M (IQ2_XS, 28 W): the 523-token prompt 2,678 -> 2,439
+// ms (gdn's projections in 371 -> 227, qsa proj 180 -> 120, gdn out proj 155 -> 118, router+shared 91 -> 73), the
+// 3,481-token one 13,386 -> 12,810 ms; the short answer the same, the long one two words apart (the int8 rounding,
+// as the experts').  STRATA_PREFILL_DENSE_MMQ=0 turns it off, =1 forces it where the experts keep the FP16 form.
+bool dense_mmq_on() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_DENSE_MMQ");
+        return e != nullptr ? (int) std::strtol(e, nullptr, 10) : -1;
+    }();
+    return v > 0 || (v < 0 && mmq_plan().any);
+}
+bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
+                 std::string& err, int64_t ldy = 0);
+
 const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::string& err) {
     const core::WeightRef* r = v.get(suffix);
     if (!r) err = v.name(suffix) + " is missing";
     return r;
 }
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
-                 std::string& err, int64_t ldy = 0) {
+                 std::string& err, int64_t ldy) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
     gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy);
     return true;
@@ -1280,6 +1314,40 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
 }
 
 }  // namespace
+
+bool Prefill::Impl::dense_ok(const core::WeightRef* w) const {
+    return Xqd != nullptr && mmq_ctx != nullptr && w->native_data != nullptr && mmq::supported(w->native_type) &&
+           w->ne1 % 128 == 0 && w->ne0 % 32 == 0 && w->ne0 <= ZV;
+}
+// The rows are quantized once for the projections that share them (`fresh`: x holds new values); from the FP32
+// rows x32 (K floats a row) where they exist, else from the FP16 rows x16 (the recurrence's y, the attention, the
+// shared expert's SwiGLU).
+bool Prefill::Impl::dense_proj(const core::WeightRef* w, const float* x32, const uint16_t* x16, bool fresh, float* Y,
+                               int64_t T, const std::string& name, std::string& err, int64_t ldy) {
+    if (!dense_ok(w)) return native_proj(gemm, w, x16, Y, T, name, err, ldy);
+    const int t = w->native_type;
+    const int64_t K = w->ne0;
+    const bool sums = strata::kernels::iq_mmq_type_sums(t), dup = strata::kernels::iq_mmq_type_dup(t);
+    const void* src = x32 != nullptr ? static_cast<const void*>(x32) : static_cast<const void*>(x16);
+    if (fresh || xqd_src != src || xqd_sums != sums || xqd_dup != dup || xqd_K != K) {
+        if (x32 != nullptr) mmq::quantize(x32, nullptr, Xqd, t, K, K, T, cs);
+        else mmq::quantize_f16(x16, Xqd, t, K, K, T, cs);
+        xqd_src = src; xqd_sums = sums; xqd_dup = dup; xqd_K = K;
+    }
+    if (bounds_T != T) {
+        bounds_dense_host.resize(2);
+        bounds_dense_host[0] = 0;
+        bounds_dense_host[1] = (int32_t) T;
+        bounds_dense_host.to_device(bounds_dense, cs);
+        bounds_T = T;
+    }
+    mmq::Product p;
+    p.w = w->native_data; p.type = t; p.w_rows = w->ne1; p.w_cols = K; p.expert_bytes = 0; p.n = 1;
+    p.xq = Xqd; p.bounds = bounds_dense; p.ids = ids_identity; p.total_rows = T; p.max_rows = T; p.rows = T;
+    p.dst = Y; p.ld_dst = ldy > 0 ? ldy : w->ne1;
+    mmq_ctx->run(p, cs);
+    return true;
+}
 
 std::string experts_path() {
     const MmqPlan& p = mmq_plan();
@@ -1364,6 +1432,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
     if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
+    m.bounds_T = -1;   // the dense products' bounds and rows (dense_proj) as well
+    m.xqd_src = nullptr;
     // The PLE rows of a chunk are read from the model file on the host (an SSD read per missed row): the chunk
     // after this one is read on a thread while the GPU runs this one, into the other of two buffers.  The rows
     // depend only on the tokens (the two before a position name its n-grams), so this is the same data.
@@ -1732,8 +1802,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    if (!m.dense_proj(wqkv, m.mixed, m.mixed_h, true, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    if (!m.dense_proj(wg, m.mixed, m.mixed_h, false, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
@@ -1742,7 +1812,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfGdnRec, cs);
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
                     pt.mark(kPfGdnOut, cs);
-                    if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                    if (!m.dense_proj(wo, nullptr, m.y_h, true, m.bo, T, v.name("ssm_out.weight"), err)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
@@ -1756,9 +1826,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                     pt.mark(kPfQsa, cs);
-                    if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    if (!m.dense_proj(wk, m.mixed, m.mixed_h, true, m.Kc, T, v.name("attn_k.weight"), err)) return false;
+                    if (!m.dense_proj(wv, m.mixed, m.mixed_h, false, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                    if (!m.dense_proj(wq, m.mixed, m.mixed_h, false, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
@@ -1945,7 +2015,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
-                    if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
+                    if (!m.dense_proj(wo, nullptr, m.attn_h, true, m.bo, T, v.name("attn_output.weight"), err)) return false;
                     ++qsa_index;
                 } else {
                     // ======================= MoE =======================
@@ -1959,10 +2029,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     // the shared expert and its scalar gate
-                    if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                    if (!m.dense_proj(wsg, m.mixed, m.mixed_h, true, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                    if (!m.dense_proj(wsu, m.mixed, m.mixed_h, false, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
                     swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
-                    if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                    if (!m.dense_proj(wsd, nullptr, m.sh_h, true, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                     if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                     if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, true);

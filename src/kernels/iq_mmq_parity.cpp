@@ -165,6 +165,54 @@ double time_us(sycl::queue& q, const std::function<void()>& f) {
     return best;
 }
 
+// --dense: a dense projection of the IQ2_XS pack as one "expert" of T rows (XeStrata-890M: the prefill's dense products
+// through the int8 kernel), against the FP16 form the prefill takes now (dequant_f16 into a scratch, then xmx_gemm).
+int bench_dense() {
+    namespace k = strata::kernels;
+    sycl::queue& q = strata::core::Runtime::get().compute();
+    void* s = P::stream();
+    struct Shape { const char* name; ggml_type t; int64_t N, K; };
+    const Shape shapes[] = {{"attn_qkv", GGML_TYPE_IQ4_XS, 10240, 2560}, {"attn_gate", GGML_TYPE_IQ4_XS, 6144, 2560},
+                            {"attn_q", GGML_TYPE_IQ4_XS, 12288, 2560},   {"ssm_out", GGML_TYPE_IQ4_XS, 2560, 6144},
+                            {"shexp", GGML_TYPE_IQ4_XS, 640, 2560},      {"attn_k", GGML_TYPE_IQ4_XS, 512, 2560},
+                            {"qkv iq3_s", GGML_TYPE_IQ3_S, 10240, 2560}, {"gate q6_k", GGML_TYPE_Q6_K, 6144, 2560}};
+    std::printf("iq_mmq_parity --dense: int8 %s, FP16 products %s\n", k::iq_mmq_usable(q) ? "on the matrix engines" : "by dp4a",
+                k::gemm_path(k::XmxType::f16));
+    for (const Shape& c : shapes) {
+        const size_t wb = ggml_row_size(c.t, c.K) * (size_t) c.N;
+        P::Device dev;
+        uint8_t* w = dev.alloc<uint8_t>(wb);
+        q.memset(w, 0x11, wb).wait();
+        uint16_t* w16 = dev.alloc<uint16_t>((size_t) (c.N * c.K));
+        for (int64_t T : {512, 1024, 2048}) {
+            std::vector<int32_t> bounds = {0, (int32_t) T}, ids((size_t) T);
+            for (int64_t i = 0; i < T; ++i) ids[(size_t) i] = (int32_t) i;
+            P::Device io;
+            int32_t* db_ = io.upload(bounds);
+            int32_t* di = io.upload(ids);
+            float* x = io.alloc<float>((size_t) (T * c.K));
+            q.memset(x, 0, (size_t) (T * c.K) * 4).wait();
+            uint8_t* xq = io.alloc<uint8_t>(k::iq_mmq_act_bytes(T, c.K));
+            uint16_t* x16 = io.alloc<uint16_t>((size_t) (T * c.K));
+            q.memset(x16, 0, (size_t) (T * c.K) * 2).wait();
+            float* y = io.alloc<float>((size_t) (T * c.N));
+            const bool sums = k::iq_mmq_type_sums((int) c.t);
+            const double usq = time_us(q, [&] { k::iq_mmq_quantize(q, x, nullptr, xq, c.K, c.K, T, sums, false); });
+            const double us8 = time_us(q, [&] {
+                k::iq_mmq_grouped(q, (int) c.t, w, wb, c.N, c.K, 1, xq, T, db_, T, di, y, c.N);
+            });
+            const double us16 = time_us(q, [&] {
+                k::dequant_f16((int) c.t, w, 0, c.N, c.K, w16, s);
+                k::xmx_gemm(k::XmxType::f16, x16, w16, y, T, c.N, c.K, c.N, s);
+            });
+            std::printf("  %-10s N %5lld K %4lld T %4lld: int8 %8.1f us (+ quantize %6.1f)  FP16 dequant+gemm %8.1f us  %s\n",
+                        c.name, (long long) c.N, (long long) c.K, (long long) T, us8, usq, us16,
+                        us8 + usq < us16 ? "int8" : "FP16");
+        }
+    }
+    return 0;
+}
+
 int bench() {
     namespace k = strata::kernels;
     sycl::queue& q = strata::core::Runtime::get().compute();
@@ -266,6 +314,7 @@ int bench() {
 
 int main(int argc, char** argv) try {
     if (argc > 1 && std::string(argv[1]) == "--bench") return bench();
+    if (argc > 1 && std::string(argv[1]) == "--dense") return bench_dense();
     sycl::queue& q = strata::core::Runtime::get().compute();
     const bool matrix = strata::kernels::iq_mmq_usable(q), dp4a = strata::kernels::iq_mmq_dp4a_usable(q);
     std::printf("iq_mmq_parity: the int8 expert products %s\n",

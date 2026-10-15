@@ -33,6 +33,12 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
                                  kernels::iq_mmq_type_dup(t));
 }
 
+void quantize_f16(const uint16_t* x, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+    if (rows > 0)
+        kernels::iq_mmq_quantize_f16(Q(stream), x, xq, cols, ld, rows, kernels::iq_mmq_type_sums(t),
+                                     kernels::iq_mmq_type_dup(t));
+}
+
 Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product& p, void* stream) {

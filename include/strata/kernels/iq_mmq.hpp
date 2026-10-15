@@ -40,6 +40,9 @@ bool iq_mmq_type_dup(int ggml_type);
 /// block sums too (iq_mmq_type_sums), else that part is left unwritten; `dup`: each block twice (rows of 2 cols).
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
                             int64_t rows, bool sums, bool dup = false);
+/// The same from FP16 rows (`ld` halves a row), without a row map.
+sycl::event iq_mmq_quantize_f16(sycl::queue& q, const uint16_t* x, void* xq, int64_t cols, int64_t ld, int64_t rows,
+                                bool sums, bool dup = false);
 
 /// n experts, one launch: expert e's weights ([w_rows, w_cols] in ggml_type's blocks) at w + e * expert_bytes, its
 /// activation rows bounds[e] .. bounds[e + 1] of xq (bounds on the device; xq holds total_rows rows), into dst rows
