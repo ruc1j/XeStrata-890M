@@ -75,6 +75,8 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      (outputs a multiple of 128) go through the same int8 products instead of the FP16 copy (one expert of T rows, 128-row
      tiles): the 523-token prefill 2.68 -> 2.44 s, 3,481 tokens 13.4 -> 12.8 s. The answers can change by the int8 rounding
      (the 523-token one is the same, the 3,481-token one differs in two words). `STRATA_PREFILL_DENSE_MMQ=0` restores FP16.
+     `STRATA_PREFILL_HC_MMQ=1` multiplies the hyper-connection's down/up (BF16, 320 outputs) from their Q8_0 copies the same
+     way, but on the 890M hc read grows 1,313 -> 1,397 ms, so it is off by default.
    - AMD's device compile states each kernel's required work-group size (`STRATA_AMD_REQD_WG`), and the intel/llvm fix
      `hip-reqd-work-group-size` passes it to the backend's register budget (before it every kernel had 128 VGPRs and spilled).
      With that the dense product takes a 64 x 128 tile for a long prompt's large products (`STRATA_MMA_SHAPE=5`: 2048 rows and

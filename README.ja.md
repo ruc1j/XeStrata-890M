@@ -74,7 +74,8 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
    - 密な射影（attn_qkv・attn_gate・ssm_out・attn_q/k/v・attn_output・shared expert）も、型と形が合うもの（出力が 128 の倍数）は
      FP16 に戻さず同じ int8 の積で掛けます（1 つのエキスパートに T 行、128 行のタイル）。523 トークンの prefill 2.68 → 2.44 s、
      3,481 トークン 13.4 → 12.8 s。答えは int8 の丸めの分だけ変わることがあります（523 トークンは同一、3,481 トークンは 2 語）。
-     `STRATA_PREFILL_DENSE_MMQ=0` で FP16 に戻せます。
+     `STRATA_PREFILL_DENSE_MMQ=0` で FP16 に戻せます。hyper-connection の down/up（BF16、出力 320）を Q8_0 の写しから同じ形で掛ける
+     `STRATA_PREFILL_HC_MMQ=1` もありますが、890M では hc read が 1,313 → 1,397 ms と遅くなるので既定はオフです。
    - AMD のデバイスコンパイルでは、カーネルに必要なワークグループの大きさを付け（`STRATA_AMD_REQD_WG`）、intel/llvm への修正
      `hip-reqd-work-group-size` がそれをバックエンドのレジスター予算に渡します（それまでは全カーネルが 128 VGPR で spill していました）。
      それで密な積は長い prompt の大きい積に 64 x 128 のタイル（`STRATA_MMA_SHAPE=5`、2048 行以上かつ 2048 列以上など）を取り、
