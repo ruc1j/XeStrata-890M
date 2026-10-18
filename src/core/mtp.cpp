@@ -144,6 +144,7 @@ MtpDrafter::~MtpDrafter() {
     if (state_arena_) strata::gpu::free(state_arena_);
     if (arena_) strata::gpu::free(arena_);
     if (head_logits_) strata::gpu::free(head_logits_);
+    for (auto& w : hc_q8_) for (uint8_t* p : w) if (p) strata::gpu::free(p);
     if (owns_draft_head_ && dhead_) strata::gpu::free(dhead_);
     if (owns_draft_head_ && dvocab_) strata::gpu::free(dvocab_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
@@ -560,7 +561,49 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         }
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
+    if (!make_hc_q8(err)) return false;
     return true;
+}
+
+namespace {
+const char* const kHcName[3] = {"attn_hyper_connection", "mlp_hyper_connection", "hyper_connection_mixer"};
+}
+
+bool MtpDrafter::make_hc_q8(std::string& err) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_HC_Q8");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (!on || hc_q8_[0][0] != nullptr) return true;
+    const int64_t D = g_->hc * g_->n_embd, LR = g_->hc_lr;
+    if (!strata::kernels::fused_gr_supported(g_->n_embd, g_->hc, LR) || !strata::kernels::native_q8_0_rows_ok((int) D) ||
+        !strata::kernels::native_q8_0_rows_ok((int) LR))
+        return true;
+    uint64_t bytes_all = 0;
+    for (int w = 0; w < 3; ++w)
+        for (int up = 0; up < 2; ++up) {
+            const std::string name = std::string(kHcName[w]) + (up ? ".input_mix_weight_up.weight" : ".input_mix_weight_down.weight");
+            const uint16_t* src = bf16(name.c_str());
+            const int64_t ne0 = up ? LR : D, ne1 = up ? D : LR;   // a row's values, the rows
+            const uint64_t bytes = (uint64_t) (ne0 / 32 * 34) * (uint64_t) ne1;
+            if (!strata::gpu::alloc_device((void**) &hc_q8_[w][up], bytes)) {
+                err = "mtp: the hyper-connections' Q8_0 copies do not fit (STRATA_MTP_HC_Q8=0 keeps the BF16 read)";
+                return false;
+            }
+            strata::kernels::fused_gr_quantize_q8_0(src, hc_q8_[w][up], ne0 * ne1 / 32, cs_);
+            strata::kernels::native_q8_0_to_rows(hc_q8_[w][up], (int) ne0, (int) ne1, cs_);
+            bytes_all += bytes;
+        }
+    if (!strata::gpu::stream_sync(cs_)) { err = std::string("mtp: hyper-connection Q8_0: ") + strata::gpu::last_error(); return false; }
+    vram_ += bytes_all;
+    std::fprintf(stderr, "strata mtp: the hyper-connections read from Q8_0 copies (%.1f MiB; STRATA_MTP_HC_Q8=0: BF16)\n",
+                 (double) bytes_all / 1048576.0);
+    return true;
+}
+
+void MtpDrafter::hc_q8_args(int which, strata::kernels::FusedGrArgs& a) const {
+    a.q8_down = hc_q8_[which][0];
+    a.q8_up = hc_q8_[which][1];
 }
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
@@ -625,6 +668,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
                 fa[t].w_down = bf16("attn_hyper_connection.input_mix_weight_down.weight");
                 fa[t].w_up = bf16("attn_hyper_connection.input_mix_weight_up.weight");
                 fa[t].w_inject = bf16("attn_hyper_connection.block_inject_weight.weight");
+                hc_q8_args(0, fa[t]);
                 fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
                 fa[t].inject_out = inj_ + t * HC; fa[t].mixed = mixed_ + t * N;
             }
@@ -702,6 +746,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
                 fa[t].w_down = bf16("mlp_hyper_connection.input_mix_weight_down.weight");
                 fa[t].w_up = bf16("mlp_hyper_connection.input_mix_weight_up.weight");
                 fa[t].w_inject = bf16("mlp_hyper_connection.block_inject_weight.weight");
+                hc_q8_args(1, fa[t]);
                 fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
                 fa[t].inject_out = inj2_ + t * HC; fa[t].mixed = mixed_ + t * N;
             }
@@ -778,6 +823,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
                 fa[t].w_norm = f32("hyper_connection_mixer.hc_norm.weight");
                 fa[t].w_down = bf16("hyper_connection_mixer.input_mix_weight_down.weight");
                 fa[t].w_up = bf16("hyper_connection_mixer.input_mix_weight_up.weight");
+                hc_q8_args(2, fa[t]);
                 fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = sample_ + t * N;
             }
             fused_gr_read_multi(fa, T, xn_, cs);

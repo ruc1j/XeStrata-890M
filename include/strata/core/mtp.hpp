@@ -24,6 +24,7 @@
 
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -161,6 +162,11 @@ private:
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
+    // XeStrata-890M: the three hyper-connections' down / up projections as Q8_0 rows (kNativeQ8Rows), made from the
+    // BF16 ones at bind (STRATA_MTP_HC_Q8, default on): the read takes the Q8_0 path (fused_gr_read_multi's v2)
+    bool make_hc_q8(std::string& err);
+    void hc_q8_args(int which, strata::kernels::FusedGrArgs& a) const;
+    uint8_t* hc_q8_[3][2] = {};
 
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
