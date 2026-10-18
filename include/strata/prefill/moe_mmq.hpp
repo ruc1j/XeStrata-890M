@@ -41,6 +41,11 @@ void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64
 void quantize_f16(const uint16_t* x, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows, void* stream);
 /// The same from BF16 rows.
 void quantize_bf16(const uint16_t* x, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows, void* stream);
+/// The rows quantize(x, src, ...) writes for tokens x k_used rows in expert order, written token by token: token t's
+/// row of x is quantized once and stored at rows slot[t * k_used + k] (`slot` the inverse of `src`) - the same bytes,
+/// a k_used-th of the quantizations (upstream c675f5b7).  STRATA_QUANT_GATHER=1: quantize() over `src`, as before.
+void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int ggml_type, int64_t cols,
+                      int64_t ld, int64_t tokens, int k_used, void* stream);
 
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
@@ -80,6 +85,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
 /// Experts [first, n) of a group, each a GGUF-native blob (gate rows at its start, up at `up_off`, down at
 /// `down_off`), into their slots of the group buffers (slot q at gu_dst + q * gu_stride and d_dst + q * d_stride), in
 /// one launch.  False, and nothing done, when an address or a size is not a multiple of 16 bytes (gather_native then).
+/// A null blob is skipped (an expert the products read in place).
 constexpr int kGatherGroupMax = 16;
 struct GatherGroup {
     const uint8_t* blob[kGatherGroupMax] = {};
