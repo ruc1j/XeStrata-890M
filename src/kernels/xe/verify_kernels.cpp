@@ -1198,10 +1198,15 @@ void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64
 }
 
 void add_streams_broadcast(const float* h, const float* ex, float* R, int64_t n_embd, int hc, int n_tok, void* stream) {
-    const auto e = Q(stream).parallel_for(sycl::range<2>((size_t) n_tok, (size_t) (n_embd * hc)), [=](sycl::id<2> id) {
-        const int t = (int) id[0];
-        const int64_t i = (int64_t) id[1];
-        R[(size_t) t * n_embd * hc + i] = h[(size_t) t * n_embd * hc + i] + ex[(size_t) t * n_embd + i % n_embd];
+    // XeStrata-890M: a 1-D range of 256-item groups and 32-bit indices (the 2-D range of single rows took 150 us for
+    // 10,240 floats on the 890M, the MTP draft's every step)
+    const uint32_t row = (uint32_t) (n_embd * hc), total = (uint32_t) n_tok * row, ne = (uint32_t) n_embd;
+    const size_t groups = ((size_t) total + 255) / 256;
+    const auto e = Q(stream).parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) {
+        const uint32_t g = (uint32_t) it.get_global_linear_id();
+        if (g >= total) return;
+        const uint32_t t = g / row, i = g - t * row;
+        R[g] = h[g] + ex[(size_t) t * ne + i % ne];
     });
     done(stream, e, "add_streams_broadcast");
 }
