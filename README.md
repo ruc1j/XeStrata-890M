@@ -58,7 +58,9 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      On AMD the default is one kernel for gate/up and SwiGLU with the activations and the grid tables in local memory (LDS), "mode 8".
      The weights' addresses are built as global-address-space pointers, and the IQ4 table lookup uses `v_perm_b32` with byte selectors.
    - The hyper-connection read-out: the fast version (gr_fast) by default, its BF16 matrices as Q8_0 (`STRATA_HC_Q8`, default on an integrated GPU),
-     the up product with 8 lanes per row and 4 rows at once, the down product with 2 rows per sub-group.
+     the up product with 8 lanes per row and 4 rows at once.  The read runs as three kernels (`STRATA_HC_V2`, the
+     default): the norm once, the down product with 16-byte loads and 4 rows per sub-group, the last work-group to finish
+     adding the 20 column chunks' partials into lo, and the up product reading it (`STRATA_HC_V2=0`: the former two kernels).
    - Sub-group xor exchanges through DPP and `v_permlanex16`.
    - The GDN step and commit stage the tokens' inputs in LDS first and take fewer barriers per token.
    - A Japanese-and-English draft vocabulary (`data/draft_vocab_ja.bin`, 56,554 tokens): the speculative layer reads about half the bytes of the default vocabulary.

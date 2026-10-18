@@ -7,6 +7,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/kernels/fused_gr.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -140,8 +141,14 @@ int main(int argc, char** argv) {
         if (f) std::fclose(f);
         if (n != all.size()) { std::printf("check: %zu outputs in the file, want %zu\n", n, all.size()); return 1; }
         size_t diff = 0;
-        for (size_t i = 0; i < n; ++i) diff += std::memcmp(&ref[i], &all[i], 4) != 0;
-        std::printf("check: %zu of %zu outputs differ\n", diff, n);
+        double max_abs = 0, ref_sq = 0;
+        for (size_t i = 0; i < n; ++i) {
+            diff += std::memcmp(&ref[i], &all[i], 4) != 0;
+            max_abs = std::max(max_abs, (double) std::fabs(ref[i] - all[i]));
+            ref_sq += (double) ref[i] * ref[i];
+        }
+        std::printf("check: %zu of %zu outputs differ, largest difference %.3g (the outputs' rms %.3g)\n", diff, n,
+                    max_abs, std::sqrt(ref_sq / (double) n));
         return diff == 0 ? 0 : 2;
     }
     return 0;
