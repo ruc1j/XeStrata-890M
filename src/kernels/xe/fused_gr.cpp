@@ -169,10 +169,11 @@ class TokArgs {
 public:
     explicit TokArgs(sycl::handler& h) : tab_(sycl::range<1>(kFusedGrMaxT), h) {}
     // every work-item of the group, before the first read
-    template <int D>
+    // NT: the tokens the kernel reads (XeStrata-890M: the v2 read copies its T, not all eight)
+    template <int D, int NT = kFusedGrMaxT>
     void stage(const GrMulti& m, const sycl::nd_item<D>& it) const {
 #if STRATA_DEVICE_NOT_INTEL
-        if (it.get_local_linear_id() == 0) copy(m, std::make_integer_sequence<int, kFusedGrMaxT>{});
+        if (it.get_local_linear_id() == 0) copy(m, std::make_integer_sequence<int, NT>{});
         sycl::group_barrier(it.get_group());
 #else
         (void) m; (void) it;
@@ -728,7 +729,7 @@ sycl::event gr_read_v2(sycl::queue& q, const GrMulti& m, float* scratch) {
         sycl::local_accessor<float, 1> red(sycl::range<1>(WARPS + 1), h);
         const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<1>((size_t) T * HC * THREADS, THREADS), [=](sycl::nd_item<1> it) STRATA_AMD_REQD_WG(THREADS) [[sycl::reqd_sub_group_size(WARP)]] {
-            tok.stage(m, it);
+            tok.template stage<1, T>(m, it);
             const sycl::sub_group sg = it.get_sub_group();
             const int k = (int) it.get_group(0) / HC, c = (int) it.get_group(0) % HC;
             const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id();
@@ -914,7 +915,7 @@ sycl::event gr_read_v2(sycl::queue& q, const GrMulti& m, float* scratch) {
         sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) T * HC * UPM_COLS), h);
         const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<1>((size_t) UPM_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            tok.stage(m, it);
+            tok.template stage<1, T>(m, it);
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_local_id(0);
             const int grp = (int) it.get_group(0), d0 = grp * UPM_COLS;
