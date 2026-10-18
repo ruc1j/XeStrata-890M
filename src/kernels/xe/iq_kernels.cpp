@@ -825,10 +825,11 @@ inline const void* block_at(const uint8_t* row, int kbx) { return row + (size_t)
 // projection: 180-360 bytes) keeps its lanes busy and reduces in log2(LPR) steps.  Each block is loaded once for all
 // the entries (upstream 8ec94aa); entry e's sum is what one entry alone gives, bit for bit.  `grid`
 // (GridOf<TY>::T): the codebook the blocks are decoded with, when not the global table.
-// XeStrata-890M: STRATA_GPU_CANON=0 keeps the fork's batched-load expert rows (its own float order) instead of
-// upstream's CPU-identical canon rows for the formats with parts
+// XeStrata-890M: the fork's batched-load expert rows (its own float order), not upstream's CPU-identical canon rows
+// (#152) for the formats with parts: 890M decode 27.37 -> 27.67 tok/s (2026-10-18, with the per-window adaptive tier).
+// The GPU's experts then round unlike the CPU's.  -DSTRATA_GPU_CANON=1: upstream's rows
 #ifndef STRATA_GPU_CANON
-#define STRATA_GPU_CANON 1
+#define STRATA_GPU_CANON 0
 #endif
 #ifndef STRATA_Q20_BATCH
 #define STRATA_Q20_BATCH 1

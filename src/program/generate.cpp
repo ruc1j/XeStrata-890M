@@ -1202,6 +1202,14 @@ bool adapt_nowait() {
     return v;
 }
 
+/// XeStrata-890M: serve keeps the per-window adaptive tier (a round every --adapt-every windows), not upstream fc62b635's
+/// fixed text positions: their cut windows drafted 1.80 tokens a window instead of 2.04 and decode fell 27.61 -> 26.52
+/// tok/s on the 890M (2026-10-18).  STRATA_ADAPT_FIXED=1: upstream's positions (window-invariant output, #152)
+bool adapt_fixed() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_ADAPT_FIXED"); return e && e[0] == '1'; }();
+    return v;
+}
+
 /// --adapt-async: one background job at a time (the asynchronous adaptive tier's copies and memcpys).  `post` hands
 /// it over, `idle` says whether it has finished; the owner never posts while a job runs.
 class JobThread {
@@ -8023,7 +8031,9 @@ int main(int argc, char** argv) {
         // the serial loop of one request; the batch slots, the pipelined windows and --adapt-async keep the per-window
         // rule (each window's rows counted, a round every --adapt-every windows)
         const int64_t adapt_period =
-            !drive.d.usage.empty() && !ajob && o.batch <= 0 && o.pipeline_windows < 2 ? 4 * (int64_t) o.adapt_every : 0;
+            !drive.d.usage.empty() && !ajob && o.batch <= 0 && o.pipeline_windows < 2 && adapt_fixed()
+                ? 4 * (int64_t) o.adapt_every
+                : 0;
         drive.d.usage_by_window = adapt_period > 0;
         for (int st = 0; st < n_stages; ++st) stage_ver(st).set_route_record(adapt_period > 0);
         // the pipelined loop's side (see above): whether stage `st` has no window in flight; per home, the copies back
