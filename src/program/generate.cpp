@@ -11438,6 +11438,12 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
+            // XeStrata-890M: each commit leaves the GDN state to the next window, which writes it once (the same bits;
+            // Verifier::set_gdn_defer); the wait after the loop runs what is left
+            if (!pl_ran && !ver.set_gdn_defer(true, err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
@@ -11687,7 +11693,7 @@ int main(int argc, char** argv) {
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
-            if (!ver.wait_commit(err)) {
+            if (!ver.set_gdn_defer(false, err) || !ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }

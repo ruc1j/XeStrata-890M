@@ -48,6 +48,38 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
                        const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
                        int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream);
+/// XeStrata-890M: the GDN commit folded into the next window.  A deferred commit stashes the kept rows' k|v columns,
+/// gate and beta of every GDN layer (`h`, `gate`, `beta` in the window's layout: layer z at z * max_t rows of C /
+/// h_v) and their count; the next window's step (gdn_step_norm_pending) runs them on the state it reads anyway, as
+/// gdn_state_commit would, writes the state once and goes on with its own rows - one read of the state a window
+/// instead of three.  The arithmetic and its order are the commit's and the step's: bitwise.  `n` == 0: nothing
+/// pending (the step neither runs nor writes anything extra).
+struct GdnPending {
+    const float* h = nullptr;
+    const float* gate = nullptr;
+    const float* beta = nullptr;
+    const int32_t* n = nullptr;
+};
+/// gdn_step_norm_multi's verify form (n_keep == nullptr) or one-token commit, with the pending rows run first (the
+/// split form always).
+void gdn_step_norm_pending(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                           const int32_t* n_keep, void* stream, int t_out_begin, void* y_q8_1, const GdnPending& pend);
+/// The first *n_keep rows of `n_layers` layers into the pending buffers (same layout), then *pn = *n_keep.
+void gdn_pending_stash(const float* h, const float* gate, const float* beta, int conv_channels, int h_k, int h_v,
+                       int max_t, int n_layers, const int32_t* n_keep, float* ph, float* pg, float* pb, int32_t* pn,
+                       void* stream);
+/// gdn_commit_layers with the recurrence state left to the next window: the conv histories as there, the rows stashed
+/// (gdn_pending_stash; `h`, `gate`, `beta` at layer stride max_t rows).
+void gdn_commit_layers_deferred(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
+                                const float* h, const float* gate, const float* beta, int conv_channels, int h_k, int h_v,
+                                int max_t, int n_layers, const int32_t* n_keep, float* ph, float* pg, float* pb, int32_t* pn,
+                                void* stream);
+/// The pending rows into the states (layer z at state + z * state_stride; gdn_state_commit), then *pend.n = 0.
+void gdn_pending_flush(float* state, int64_t state_stride, int conv_channels, int h_k, int h_v, int max_t, int n_layers,
+                       const GdnPending& pend, void* stream);
+/// *pn = 0 (a window has run the pending rows).
+void gdn_pending_clear(int32_t* pn, void* stream);
 /// (`y_q8_1`: the outputs from t_out_begin on also as native_quantize_q8_1 writes them, value_dim per token - the same
 /// bytes, a launch fewer; upstream 22abb92d's QFUSE.)
 /// Times gdn_step_norm_multi's forms (the same bits) on the stream's device for every window size and keeps the

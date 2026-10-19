@@ -221,8 +221,14 @@ public:
     /// run) calls wait_commit() first (upstream 42b4299, a454dbb).  STRATA_COMMIT_SYNC=1 keeps the wait.
     static void set_commit_async(bool on);
     /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
-    /// false with `err` when it failed.  Free when nothing is pending.
+    /// false with `err` when it failed.  Free when nothing is pending.  Runs the deferred GDN rows first (set_gdn_defer).
     bool wait_commit(std::string& err);
+    /// XeStrata-890M (STRATA_GDN_DEFER, default on): while on, commit() leaves the GDN recurrence state to the next
+    /// window, which runs the kept rows on the state it reads anyway and writes it once (gdn_pending_stash, the same
+    /// bits).  For a loop of windows and commits only (the serve decode loop): anything else that reads the state
+    /// calls wait_commit() first, which runs the deferred rows; off runs them too.  No-op where the window graphs do
+    /// not carry the pending rows (a layer split, the split window, segments).
+    bool set_gdn_defer(bool on, std::string& err);
 
     // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs; upstream bfa532e9).  One conversation's
     // windows with the stages overlapped: stage 0 runs window K+1 while stage 1 still runs window K.  The same window
@@ -429,7 +435,7 @@ private:
     StageLink* next_ = nullptr;          ///< set_next: the next stage, through this link only
     InProcessStage local_next_;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
-    bool capture_commit(std::string& err);
+    bool capture_commit(std::string& err, bool defer = false);   ///< defer: commit_def_exec_
     bool record_window(int T, strata::gpu::Stream cs, std::string& err);
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second half's up-stamp
                                                      // at slot 32 = the next layer's slot 0: upstream e5b47dd)
@@ -468,6 +474,16 @@ private:
     bool fetch_branch_ = false;
     strata::gpu::Graph* exec_[9] = {};
     strata::gpu::Graph* commit_exec_ = nullptr;
+    // set_gdn_defer: the commit graph that stashes the GDN rows instead of writing the state, the pending rows
+    // (layout of h_L_ / gate_L_ / beta_L_) and their count, which every window graph reads and clears
+    strata::gpu::Graph* commit_def_exec_ = nullptr;
+    float *pend_h_ = nullptr, *pend_g_ = nullptr, *pend_b_ = nullptr;
+    int32_t* pend_n_ = nullptr;
+    int defer_graphs_ = -1;      ///< -1 undecided (the first capture decides), 0 / 1: the window graphs carry the rows
+    bool gdn_defer_ = false;     ///< set_gdn_defer
+    bool gdn_pend_ = false;      ///< rows stashed that no window has run yet
+    bool defer_ok();             ///< decides defer_graphs_ once
+    bool flush_gdn(std::string& err);
     // A device whose running kernels do not see the host's writes (doorbell_visible: the UHD 770) runs a window as
     // segments the host launches one after another, cut before each layer group's experts; no kernel waits on a
     // flag.  STRATA_VERIFY_SEGMENTED=1 / 0 forces it either way.

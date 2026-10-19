@@ -136,6 +136,15 @@ bool one_token_self_commit() {
     }();
     return on;
 }
+// XeStrata-890M: the GDN commit folded into the next window (Verifier::set_gdn_defer).  STRATA_GDN_DEFER=0: the commit
+// graph writes the state after every window as before.
+bool gdn_defer_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GDN_DEFER");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
 // the head's hyper-connection read for the window's tokens in one fused_gr_read_multi (upstream edc592b1: its sums
 // are gr_read's); STRATA_HEAD_MIX_MULTI=0: gr_read per token
 bool head_mix_multi_enabled() {
@@ -227,6 +236,7 @@ Verifier::~Verifier() {
     for (auto& v : segs_)
         for (auto* e : v) strata::gpu::graph_destroy(e);
     if (commit_exec_) strata::gpu::graph_destroy(commit_exec_);
+    if (commit_def_exec_) strata::gpu::graph_destroy(commit_def_exec_);
     for (auto& kv : exec_bm_)
         if (kv.second) strata::gpu::graph_destroy(kv.second);
     for (auto& kv : commit_bm_)
@@ -419,6 +429,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
+        if (gdn_defer_env() && nG > 0) {
+            pend_h_ = b.take<float>(nG * T * C); pend_g_ = b.take<float>(nG * T * HV); pend_b_ = b.take<float>(nG * T * HV);
+            pend_n_ = b.take<int32_t>(4);
+        }
     };
     Bump count;
     carve(count);
@@ -821,6 +835,12 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                             t - first, nullptr, cs, 0,
                                             qfuse ? (void*) (xq_ + (size_t) (first - tb) * (ZV / 32) * 36) : nullptr);
                     }
+                } else if (defer_ok()) {   // the previous window's kept rows first (set_gdn_defer)
+                    const GdnPending pd{pend_h_ + (size_t) gi * MT * C, pend_g_ + (size_t) gi * MT * HV,
+                                        pend_b_ + (size_t) gi * MT * HV, pend_n_};
+                    gdn_step_norm_pending(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
+                                          (int) HV, te, self_commit ? one_ : nullptr, cs, tb, qfuse ? (void*) xq_ : nullptr,
+                                          pd);
                 } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, self_commit ? one_ : nullptr, cs, tb, qfuse ? (void*) xq_ : nullptr);
@@ -1394,7 +1414,43 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
+    if (!batch_rec_ && defer_ok()) gdn_pending_clear(pend_n_, cs);   // every GDN layer has run the pending rows
     stamp(g.n_layers, 1, 0);
+    return true;
+}
+
+bool Verifier::defer_ok() {
+    if (defer_graphs_ < 0)
+        defer_graphs_ = pend_n_ != nullptr && g_ != nullptr && lb_ == 0 && le_ == g_->n_layers && next_ == nullptr &&
+                        !split_ && !segmented_ ? 1 : 0;
+    return defer_graphs_ == 1;
+}
+
+bool Verifier::flush_gdn(std::string& err) {
+    if (!gdn_pend_) return true;
+    gdn_pend_ = false;
+    const OnDevice on_device(device_);
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, MT = max_t_;
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    try {   // every layer's (defer_ok: one stage holds them all)
+        const GdnPending pd{pend_h_, pend_g_, pend_b_, pend_n_};
+        gdn_pending_flush(ss.gdn_state - (size_t) ss.gdn_ord0 * gdn_floats, (int64_t) gdn_floats, (int) C,
+                          (int) g.ssm_k_heads, (int) HV, (int) MT, (int) g.n_gdn_layers(), pd, cs_);
+    } catch (const std::exception& e) {
+        err = std::string("verify: GDN flush: ") + e.what();
+        return false;
+    }
+    if (!strata::gpu::stream_sync(cs_)) { err = std::string("verify: GDN flush: ") + strata::gpu::last_error(); return false; }
+    return true;
+}
+
+bool Verifier::set_gdn_defer(bool on, std::string& err) {
+    if (!on && !flush_gdn(err)) return false;
+    gdn_defer_ = on && pend_n_ != nullptr;
     return true;
 }
 
@@ -1504,8 +1560,9 @@ bool Verifier::capture_res(int T, std::string& err) {
     return true;
 }
 
-bool Verifier::capture_commit(std::string& err) {
-    if (commit_exec_ != nullptr) return true;
+bool Verifier::capture_commit(std::string& err, bool defer) {
+    strata::gpu::Graph*& exec = defer ? commit_def_exec_ : commit_exec_;
+    if (exec != nullptr) return true;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -1533,14 +1590,23 @@ bool Verifier::capture_commit(std::string& err) {
             return e == nullptr || std::strtol(e, nullptr, 10) != 0;
         }();
         bool gdn_batched = false, qsa_batched = false;
-        if (commit_batch) {
+        if (commit_batch || defer) {
             int64_t n_gdn = 0;
             for (int64_t l = lb_; l < le_ && ok; ++l)   // the per-layer loop's check of each layer's ssm_norm.weight
                 if (!is_qsa_layer(g, l)) {
                     ++n_gdn;
                     ok = need(LayerView(*wt_, l), "ssm_norm.weight", err) != nullptr;
                 }
-            if (ok && n_gdn > 0)
+            if (ok && n_gdn > 0 && defer) {   // the state is the next window's (set_gdn_defer)
+                gdn_commit_layers_deferred(
+                    ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
+                    (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
+                    MT * C, h_L_ + (size_t) gdn_index * MT * C, gate_L_ + (size_t) gdn_index * MT * HV,
+                    beta_L_ + (size_t) gdn_index * MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT, (int) n_gdn,
+                    commit_, pend_h_ + (size_t) gdn_index * MT * C, pend_g_ + (size_t) gdn_index * MT * HV,
+                    pend_b_ + (size_t) gdn_index * MT * HV, pend_n_, cs_);
+                gdn_batched = true;
+            } else if (ok && n_gdn > 0)
                 gdn_batched = gdn_commit_layers(
                     ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
                     (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
@@ -1618,7 +1684,7 @@ bool Verifier::capture_commit(std::string& err) {
         strata::gpu::abandon_capture(cs_);
         return false;
     }
-    if (!strata::gpu::end_capture(cs_, &commit_exec_)) {
+    if (!strata::gpu::end_capture(cs_, &exec)) {
         err = std::string("verify: commit capture: ") + strata::gpu::last_error();
         return false;
     }
@@ -1638,7 +1704,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return false;
     }
     const bool res = res_graph_ && all_resident();
-    if (!(res ? capture_res(T, err) : capture(T, err)) || !capture_commit(err)) return false;
+    if (!(res ? capture_res(T, err) : capture(T, err)) || !capture_commit(err) ||
+        (defer_ok() && !capture_commit(err, true)))
+        return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
@@ -1676,6 +1744,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     VDBG("staged; launching\n");
     const bool le = strata::gpu::graph_launch(res ? exec_res_[T] : segmented_ ? segs_[T][0] : exec_[T], cs_);
     if (!le) { err = std::string("verify: launch: ") + strata::gpu::last_error(); return false; }
+    gdn_pend_ = false;   // the window runs the stashed GDN rows (set_gdn_defer)
     (void) strata::gpu::stream_idle(cs_);
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
@@ -1923,6 +1992,7 @@ bool Verifier::read_logits(int rows, float* host, std::string& err) const {
 }
 
 bool Verifier::wait_commit(std::string& err) {
+    if (!flush_gdn(err)) return false;   // (a stream sync: the commit before it has run too)
     if (commit_pending_) {
         const OnDevice on_device(device_);
         commit_pending_ = false;
@@ -2084,6 +2154,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
 
 bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                          std::string& err) {
+    if (!flush_gdn(err)) return false;   // set_gdn_defer: their graphs carry no stashed rows
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = t;
     return run_slot_rows(rows, S, tokens, pos, pool, user, out, err);
@@ -2196,6 +2267,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
 
 bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
                              void* user, int32_t* out, std::string& err) {
+    if (!flush_gdn(err)) return false;   // set_gdn_defer: their graphs carry no stashed rows
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
@@ -2316,6 +2388,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
 }
 
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
+    if (!flush_gdn(err)) return false;   // set_gdn_defer: their graphs carry no stashed rows
     const OnDevice on_device(device_);
     if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
@@ -2565,9 +2638,14 @@ bool Verifier::commit(int n_keep, std::string& err) {
         ms_commit += ms_since(t0);
         return next_ == nullptr || next_->commit(n_keep, err);
     }
+    // set_gdn_defer: the GDN state is left to the next window (its graph runs the stashed rows); not after a batch
+    // window, whose graph carries none
+    const bool defer = gdn_defer_ && !last_batch_ && defer_ok();
+    if (defer && commit_def_exec_ == nullptr && !capture_commit(err, true)) return false;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const bool le = strata::gpu::graph_launch(commit_exec_, cs_);
+    const bool le = strata::gpu::graph_launch(defer ? commit_def_exec_ : commit_exec_, cs_);
     if (!le) { err = std::string("verify: commit launch: ") + strata::gpu::last_error(); return false; }
+    gdn_pend_ = defer;
     // set_commit_async: no wait here - the next window runs on the same queue after it, and the drafter (its own
     // queue) reads only this window's final rows and its own K/V.  h_commit_ is next written after the next window's
     // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit, which
@@ -2610,6 +2688,7 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
 }
 
 bool Verifier::capture_all(std::string& err) {
+    if (!flush_gdn(err)) return false;   // set_gdn_defer: their graphs carry no stashed rows
     const OnDevice on_device(device_);
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
     if (segmented_) { err = "verify: pipelined windows need a GPU whose running kernels see the host's writes"; return false; }
@@ -2662,6 +2741,7 @@ bool Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_
 }
 
 bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err) {
+    if (!flush_gdn(err)) return false;   // set_gdn_defer: their graphs carry no stashed rows
     if (fl_active_) { err = "verify: a window is in flight on this verifier"; return false; }
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
@@ -2672,6 +2752,7 @@ bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_
 }
 
 bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
+    if (!flush_gdn(err)) return false;   // set_gdn_defer: their graphs carry no stashed rows
     const OnDevice on_device(device_);
     if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
