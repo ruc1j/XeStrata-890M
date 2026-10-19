@@ -42,7 +42,11 @@
 #include <fstream>
 #include <immintrin.h>
 #include <sstream>
+#include <thread>
 #include <vector>
+#if STRATA_NATIVE_EXPERTS
+#include "ggml.h"
+#endif
 
 namespace strata::core {
 namespace {
@@ -146,6 +150,8 @@ MtpDrafter::~MtpDrafter() {
     if (head_logits_) strata::gpu::free(head_logits_);
     for (auto& w : hc_q8_) for (uint8_t* p : w) if (p) strata::gpu::free(p);
     if (owns_draft_head_ && dhead_) strata::gpu::free(dhead_);
+    for (void* p : {(void*) sk_bits_, (void*) sk_scale_, (void*) sk_cand_, (void*) sk_logits_, (void*) sk_rows_})
+        if (p) strata::gpu::free(p);
     if (owns_draft_head_ && dvocab_) strata::gpu::free(dvocab_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts) if (h) strata::gpu::free(h);
@@ -163,7 +169,6 @@ const void* MtpDrafter::q8(const char* name) const {
     for (const auto& t : tensors_) if (t.name == name && t.kind == "q8_0") return dense_ + t.off;
     return nullptr;
 }
-
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window, const MtpDrafter* shared) {
     device_ = current_device();   // with a layer split, the last stage's GPU (OnDevice)
@@ -562,6 +567,74 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     }
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
     if (!make_hc_q8(err)) return false;
+    if (shared == nullptr && !make_sketch(err)) return false;
+    return true;
+}
+
+bool MtpDrafter::make_sketch(std::string& err) {
+#if STRATA_NATIVE_EXPERTS
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_SKETCH");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (!on || sk_bits_ != nullptr || head_ == nullptr) return true;
+    const ggml_type_traits* tr = ggml_get_type_traits((ggml_type) head_->type());
+    const int64_t n_in = g_->n_embd, rows = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
+    const size_t row_bytes = head_->row_bytes();
+    if (tr == nullptr || tr->to_float == nullptr || n_in % 32 != 0 || rows <= 0) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    // the head's rows to the host, each row's signs and mean |w| in the kernel's layout
+    std::vector<uint8_t> w((size_t) rows * row_bytes);
+    if (!strata::gpu::copy(w.data(), dhead_ != nullptr ? (const void*) dhead_ : head_->weights(), w.size())) {
+        err = std::string("mtp: the head sketch: ") + strata::gpu::last_error();
+        return false;
+    }
+    const int64_t W = n_in / 32, n_pad = (rows + 127) / 128 * 128;
+    std::vector<uint32_t> bits((size_t) n_pad * W, 0u);
+    std::vector<float> scale((size_t) n_pad, 0.0f);
+    const unsigned nth = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    for (unsigned k = 0; k < nth; ++k)
+        th.emplace_back([&, k] {
+            std::vector<float> f((size_t) n_in);
+            for (int64_t r = rows * k / nth; r < rows * (k + 1) / nth; ++r) {
+                tr->to_float(w.data() + (size_t) r * row_bytes, f.data(), n_in);
+                double a = 0.0;
+                for (int64_t c = 0; c < n_in; ++c) a += std::fabs(f[(size_t) c]);
+                scale[(size_t) r] = (float) (a / (double) n_in);
+                const int64_t g = r / 32, l = r % 32;
+                for (int64_t wd = 0; wd < W; ++wd) {
+                    uint32_t m = 0;
+                    for (int j = 0; j < 32; ++j) m |= (f[(size_t) (wd * 32 + j)] > 0.0f ? 1u : 0u) << j;
+                    bits[((size_t) g * W + wd) * 32 + l] = m;
+                }
+            }
+        });
+    for (auto& x : th) x.join();
+    n_cand_ = (int) (n_pad / 32);
+    if (!strata::gpu::alloc_device((void**) &sk_bits_, bits.size() * 4) ||
+        !strata::gpu::alloc_device((void**) &sk_scale_, scale.size() * 4) ||
+        !strata::gpu::alloc_device((void**) &sk_cand_, (size_t) n_cand_ * 4) ||
+        !strata::gpu::alloc_device((void**) &sk_logits_, (size_t) n_cand_ * 4) ||
+        !strata::gpu::alloc_device((void**) &sk_rows_, (size_t) n_cand_ * row_bytes)) {
+        err = "mtp: the head sketch does not fit (STRATA_MTP_SKETCH=0 drafts from the whole head)";
+        return false;
+    }
+    strata::gpu::copy(sk_bits_, bits.data(), bits.size() * 4);
+    strata::gpu::copy(sk_scale_, scale.data(), scale.size() * 4);
+    sk_.bits = sk_bits_;
+    sk_.scale = sk_scale_;
+    sk_.n_rows = rows;
+    sk_.n_pad = n_pad;
+    sk_.n_in = (int) n_in;
+    const uint64_t bytes = bits.size() * 4 + scale.size() * 4 + (uint64_t) n_cand_ * (8 + row_bytes);
+    vram_ += bytes;
+    std::fprintf(stderr, "strata mtp: the draft head's one-bit sketch (%.1f MiB, %d candidates, %.0f ms; "
+                         "STRATA_MTP_SKETCH=0: the whole head)\n", bytes / 1048576.0, n_cand_,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+#else
+    (void) err;
+#endif
     return true;
 }
 
@@ -836,12 +909,22 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+        const bool sketch = sk_bits_ != nullptr && T == 1 && !coupled_rec_;
+        if (!sketch) native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
             coupled_draft_sample(head_logits_, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
                                  cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, cs);
+            return true;
+        }
+        if (sketch) {   // the sketch's candidates, computed exactly (make_sketch)
+            head_sketch_candidates(sk_, xq_, sk_cand_, cs);
+            gather_rows((const uint8_t*) (sub ? dhead_ : head_->weights()), (int64_t) head_->row_bytes(), sk_cand_, n_cand_,
+                        sk_rows_, cs);
+            native_mmvq(head_->type(), sk_rows_, xq_, sk_logits_, (int) N, n_cand_, 1, cs);
+            head_sketch_pick(sk_logits_, sk_cand_, n_cand_, out_ids_, probs_, cs);
+            if (sub) map_ids(out_ids_, dvocab_, 1, cs);
             return true;
         }
         SamplerParams sp;
@@ -1110,6 +1193,18 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     return true;
 }
 
+// STRATA_MTP_DUMP_HEAD=<path> (a diagnostic): each draft's head input (n_embd floats) and its token appended to <path>
+void MtpDrafter::dump_head(int32_t tok) {
+    static std::FILE* f = [] { const char* p = std::getenv("STRATA_MTP_DUMP_HEAD"); return p ? std::fopen(p, "ab") : nullptr; }();
+    if (f == nullptr) return;
+    strata::gpu::stream_sync(cs_);
+    std::vector<float> x((size_t) g_->n_embd);
+    strata::gpu::copy(x.data(), sample_, x.size() * sizeof(float));
+    std::fwrite(&tok, 4, 1, f);
+    std::fwrite(x.data(), 4, x.size(), f);
+    std::fflush(f);
+}
+
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
@@ -1184,6 +1279,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!wait_step(0)) return false;
     drafts[0] = ((volatile int32_t*) h_out_)[0];
     if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(0); }
+    dump_head(drafts[0]);
     float pj = ((volatile float*) h_prob_)[0];
     if (probs) probs[0] = pj;
     int n = 1;
@@ -1198,6 +1294,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (!wait_step(j)) return false;
         drafts[j] = ((volatile int32_t*) h_out_)[j];
         if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(j); }
+        dump_head(drafts[j]);
         pj = ((volatile float*) h_prob_)[j];
         if (probs) probs[j] = pj;
         ++n;

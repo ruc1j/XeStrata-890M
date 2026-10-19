@@ -25,6 +25,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -162,6 +163,16 @@ private:
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
+    void dump_head(int32_t tok);
+    bool make_sketch(std::string& err);
+    // XeStrata-890M (STRATA_MTP_SKETCH): the draft head's one-bit sketch picks 4 of every 128 rows, which are then
+    // computed exactly (verify_kernels.hpp: head_sketch_*); a draft only proposes, so the output does not change
+    strata::kernels::HeadSketch sk_{};
+    uint32_t* sk_bits_ = nullptr;
+    float *sk_scale_ = nullptr, *sk_logits_ = nullptr;
+    int32_t* sk_cand_ = nullptr;
+    uint8_t* sk_rows_ = nullptr;
+    int n_cand_ = 0;
     // XeStrata-890M: the three hyper-connections' down / up projections as Q8_0 rows (kNativeQ8Rows), made from the
     // BF16 ones at bind (STRATA_MTP_HC_Q8, default on): the read takes the Q8_0 path (fused_gr_read_multi's v2)
     bool make_hc_q8(std::string& err);

@@ -12,6 +12,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "xe_shuffle.hpp"
+#include "cuda_intrinsics.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 #include "q8_1_finite.hpp"
@@ -28,6 +29,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -1391,6 +1393,134 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
     else if (row_bytes % 4 == 0) e = launch(uint32_t{});
     else e = launch(uint8_t{});
     done(stream, e, "gather_rows");
+}
+
+void head_sketch_candidates(const HeadSketch& sk, const void* x_q8_1, int32_t* cand, void* stream) {
+    if (!sk.bits || !sk.scale || !x_q8_1 || !cand || sk.n_in % 32 != 0 || sk.n_rows <= 0 || sk.n_pad % 128 != 0)
+        fail("head_sketch_candidates: invalid arguments");
+    // a work-group of 128 work-items = 128 rows, a row a work-item: lane l of a sub-group holds row 32g + l, whose word
+    // w (input columns 32w .. 32w+31, the q8_1 block w) is bits[(g * W + w) * 32 + l] - the sub-group's 32 rows of a
+    // word in 128 contiguous bytes.  Sum over the set bits of the block's int8 inputs: the word's nibbles spread to
+    // bytes (n * 0x00204081 & 0x01010101) and dot4 with four inputs; the row's sign sum is 2 * set - all, scaled by
+    // the block's d (and the row's scale).  Then the group's 4 best rows to cand[4 * group ..].
+    const int W = sk.n_in / 32;
+    const int64_t n_rows = sk.n_rows;
+    const uint32_t* bits = sk.bits;
+    const float* scale = sk.scale;
+    const uint8_t* xq = static_cast<const uint8_t*>(x_q8_1);
+    const auto e = Q(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<int32_t, 1> lq(sycl::range<1>((size_t) W * 8), h);
+        sycl::local_accessor<float, 1> ld(sycl::range<1>((size_t) W), h), lsc(sycl::range<1>(128), h);
+        sycl::local_accessor<float, 1> lall(sycl::range<1>(1), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) sk.n_pad, 128), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int tid = (int) it.get_local_id(0);
+            for (int i = tid; i < W * 8; i += 128) {   // the input's int8 values, four to a word
+                const uint8_t* b = xq + (size_t) (i / 8) * 36 + 4 + (i % 8) * 4;
+                lq[i] = (int32_t) ((uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24));
+            }
+            if (tid < 32) {
+                float all = 0.0f;
+                for (int w = tid; w < W; w += 32) {
+                    const sycl::half2 ds = *reinterpret_cast<const sycl::half2*>(xq + (size_t) w * 36);
+                    ld[w] = (float) ds[0];
+                    all += (float) ds[1];
+                }
+                all = warp_sum(sg, all);
+                if (tid == 0) lall[0] = all;
+            }
+            sycl::group_barrier(it.get_group());
+            const int64_t row = (int64_t) it.get_global_id(0);
+            const int64_t g = row / 32;
+            const int lane = (int) (row % 32);
+            float acc = 0.0f;
+            for (int w = 0; w < W; ++w) {
+                const uint32_t m = bits[((size_t) g * W + w) * 32 + lane];
+                int set = 0;
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const uint32_t nib = (m >> (4 * k)) & 0xFu;
+                    set = xe::dp4a((int) ((nib * 0x00204081u) & 0x01010101u), lq[w * 8 + k], set);
+                }
+                acc = sycl::fma(ld[w], (float) set, acc);
+            }
+            const float sc = row < n_rows ? scale[row] * (2.0f * acc - lall[0]) : -INFINITY;
+            lsc[tid] = sc;
+            sycl::group_barrier(it.get_group());
+            if (tid < 32) {   // the 4 best of the group's 128 (lowest row on a tie)
+                float v[4];
+                for (int k = 0; k < 4; ++k) v[k] = lsc[tid + 32 * k];
+                const int64_t base = (int64_t) it.get_group(0) * 128;
+                for (int r = 0; r < 4; ++r) {
+                    float bv = v[0];
+                    int bi = tid;
+                    for (int k = 1; k < 4; ++k)
+                        if (v[k] > bv) { bv = v[k]; bi = tid + 32 * k; }
+                    for (int o = 16; o > 0; o >>= 1) {
+                        const float ov = strata_shfl_xor(sg, bv, o);
+                        const int oi = strata_shfl_xor(sg, bi, o);
+                        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+                    }
+                    if (tid == (bi & 31)) v[bi >> 5] = -INFINITY;
+                    if (tid == 0) cand[it.get_group(0) * 4 + r] = (int32_t) sycl::min<int64_t>(base + bi, n_rows - 1);
+                }
+            }
+        });
+    });
+    done(stream, e, "head_sketch_candidates");
+}
+
+void head_sketch_pick(const float* logits, const int32_t* cand, int n_cand, int32_t* out_id, float* out_prob, void* stream) {
+    if (!logits || !cand || n_cand <= 0 || !out_id) fail("head_sketch_pick: invalid arguments");
+    // the candidates' best (lowest index on a tie) and its probability over the candidates (a row counted twice where
+    // a short last group repeated it)
+    const auto e = Q(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> lv(sycl::range<1>(32), h);
+        sycl::local_accessor<int32_t, 1> li(sycl::range<1>(32), h);
+        h.parallel_for(sycl::nd_range<1>(1024, 1024), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int tid = (int) it.get_local_id(0);
+            float bv = -INFINITY;
+            int bi = 0x7fffffff;
+            for (int i = tid; i < n_cand; i += 1024) {
+                const float v = logits[i];
+                const int id = cand[i];
+                if (v > bv || (v == bv && id < bi)) { bv = v; bi = id; }
+            }
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = strata_shfl_xor(sg, bv, o);
+                const int oi = strata_shfl_xor(sg, bi, o);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            if ((tid & 31) == 0) { lv[tid >> 5] = bv; li[tid >> 5] = bi; }
+            sycl::group_barrier(it.get_group());
+            if (tid < 32) {
+                bv = lv[tid];
+                bi = li[tid];
+                for (int o = 16; o > 0; o >>= 1) {
+                    const float ov = strata_shfl_xor(sg, bv, o);
+                    const int oi = strata_shfl_xor(sg, bi, o);
+                    if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+                }
+                if (tid == 0) { lv[0] = bv; li[0] = bi; }
+            }
+            sycl::group_barrier(it.get_group());
+            const float m = lv[0];
+            float z = 0.0f;
+            for (int i = tid; i < n_cand; i += 1024) z += sycl::exp(logits[i] - m);
+            z = warp_sum(sg, z);
+            sycl::group_barrier(it.get_group());
+            if ((tid & 31) == 0) lv[tid >> 5] = z;
+            sycl::group_barrier(it.get_group());
+            if (tid == 0) {
+                float tot = 0.0f;
+                for (int k = 0; k < 32; ++k) tot += lv[k];
+                *out_id = li[0];
+                if (out_prob) *out_prob = 1.0f / tot;
+            }
+        });
+    });
+    done(stream, e, "head_sketch_pick");
 }
 
 void map_ids(int32_t* ids, const int32_t* table, int n, void* stream) {

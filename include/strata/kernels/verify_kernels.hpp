@@ -160,6 +160,19 @@ void copy_row_to_first(const int32_t* row_dev, float* a, int64_t a_n, float* b, 
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream);
 /// ids[t] = table[ids[t]] for n entries (a subset index back to a token id).
 void map_ids(int32_t* ids, const int32_t* table, int n, void* stream);
+/// XeStrata-890M (STRATA_MTP_SKETCH): a one-bit sketch of a head - each row's signs and its mean |w| - to pick the
+/// rows worth computing exactly.  bits: (n_pad / 32) groups of n_in / 32 words of 32 rows (row 32g + l's word w at
+/// [(g * n_in / 32 + w) * 32 + l], bit j = input column 32w + j positive); n_pad a multiple of 128.
+struct HeadSketch {
+    const uint32_t* bits = nullptr;
+    const float* scale = nullptr;
+    int64_t n_rows = 0, n_pad = 0;
+    int n_in = 0;
+};
+/// One input row (q8_1, as native_mmvq reads it): the sketch's 4 best rows of every 128 into cand (n_pad / 32 ids).
+void head_sketch_candidates(const HeadSketch& sk, const void* x_q8_1, int32_t* cand, void* stream);
+/// The best of n_cand candidates' exact logits (its row id from cand) and its probability among them.
+void head_sketch_pick(const float* logits, const int32_t* cand, int n_cand, int32_t* out_id, float* out_prob, void* stream);
 /// probs[t] = softmax(logits[t])[ids[t]] for n_rows rows of n_vocab (the probability of each row's argmax).
 void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream);
 /// #879 guard (upstream f332a855): flags[t * kNonfiniteBlocks + b] = 1 when slice b of row t (n floats a row) holds a
