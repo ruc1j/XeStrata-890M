@@ -6,6 +6,7 @@
 // is linearised the way CUDA numbers its threads (x fastest).  __expf, rsqrtf, powf, cosf, sinf and log1pf are the
 // precise SYCL functions.
 #include "strata/prefill/kernels.hpp"
+#include "../kernels/xe/amd_wmma.hpp"
 #include "../kernels/xe/device_target.hpp"
 #include "../kernels/xe/xe_shuffle.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -458,6 +459,75 @@ void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
 }
 
 // ---------------------------------------------------------------- GDN
+// STRATA_GDN_CHUNKED (upstream 0.2.0's gfx11 path in src/prefill/kernels.cu): the recurrence in chunks of 16 tokens on
+// RDNA3's matrix cores, FP16 operands and FP32 accumulation, the output norm fused.  Per value head, gamma_t the gate's
+// sum from the chunk's start to t (inclusive) and S0 the state before the chunk:
+//   A[t][i] = beta_t exp(gamma_t - gamma_i) k_t.k_i (i < t),  T = (I + A)^-1,  P[t][i] = exp(gamma_t - gamma_i) q_t.k_i (i <= t),
+//   Y = beta (V - exp(gamma) K S0),  D = T Y,  o = exp(gamma) Q S0 + P D,
+//   S = exp(gamma_last) S0 + K^T (exp(gamma_last - gamma) D).
+// The prep kernel computes T and P of every chunk at once (they do not depend on the state); the scan walks the chunks,
+// a work-group per value head and a wave per 16 value columns, the state in the waves' accumulators (FP32).  k, q, T,
+// P, D and the state as an operand are rounded to FP16, so the output differs from the FP32 kernels by more than their
+// rounding.  The layouts are GFX11's (amd_wmma.hpp): lane l holds row l % 16 of A and column l % 16 of B with all 16 K
+// values, the accumulator's rows 2 e + l / 16.
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__) && defined(__GFX11__)
+#define STRATA_GDN_WMMA 1
+#else
+#define STRATA_GDN_WMMA 0
+#endif
+namespace gw {
+constexpr int CK = 16;          // tokens per chunk (a WMMA tile)
+constexpr int NW = S / 16;      // the scan's waves: one per 16 value columns
+constexpr int KP = S + 8;       // the scan's padded FP16 k / q rows
+[[maybe_unused]] constexpr int AHEAD = 3;   // the scan warms the cache this many chunks ahead
+constexpr int64_t kMin = 64;    // prompt chunks of this many tokens and more
+using h16 = _Float16 __attribute__((ext_vector_type(16)));
+using h8 = _Float16 __attribute__((ext_vector_type(8)));
+using h2 = _Float16 __attribute__((ext_vector_type(2)));
+using f8 = float __attribute__((ext_vector_type(8)));
+using f4 = float __attribute__((ext_vector_type(4)));
+using u4 = unsigned __attribute__((ext_vector_type(4)));
+// Whether the device takes these kernels: GFX11 (the accumulator-to-operand shuffle below is GFX11's layout).
+inline bool device_ok(const sycl::device& d) {
+    namespace syclex = sycl::ext::oneapi::experimental;
+    return kernels::xe::amd_wmma(d) &&
+           static_cast<uint64_t>(d.get_info<syclex::info::device::architecture>()) <
+               static_cast<uint64_t>(syclex::architecture::amd_gpu_gfx1200);
+}
+#if STRATA_GDN_WMMA
+inline f8 mma(h16 a, h16 b, f8 c) { return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c); }
+// An accumulator tile (lane l: rows 2v + (l >> 4), column l & 15) as a B operand (lane l: column l & 15, rows 0..15):
+// pairs of rows rounded to FP16 and packed, the other half's pairs fetched across (permlanex16), then interleaved by a
+// byte permute whose selector depends on the lane's half.
+struct Sel { unsigned even, odd; };
+inline Sel sel(int hi) { return hi ? Sel{0x01000504u, 0x03020706u} : Sel{0x05040100u, 0x07060302u}; }
+inline h16 acc_to_b(f8 x, Sel ps) {
+    unsigned wd[8];
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        const h2 p = {(_Float16) x[2 * m], (_Float16) x[2 * m + 1]};
+        const unsigned own = __builtin_bit_cast(unsigned, p);
+        const unsigned other = __builtin_amdgcn_permlanex16(own, own, 0x76543210u, 0xfedcba98u, false, false);
+        wd[2 * m] = __builtin_amdgcn_perm(other, own, ps.even);
+        wd[2 * m + 1] = __builtin_amdgcn_perm(other, own, ps.odd);
+    }
+    return __builtin_bit_cast(h16, wd);
+}
+inline h16 ld(const _Float16* p) {   // 32 bytes of local memory, 16-byte aligned
+    const u4 ab[2] = {*reinterpret_cast<const u4*>(p), *reinterpret_cast<const u4*>(p + 8)};
+    return __builtin_bit_cast(h16, ab);
+}
+// The wave's own local writes complete (read back across its lanes).
+inline void lds_wait() { __asm__ volatile("s_waitcnt lgkmcnt(0)" ::: "memory"); }
+// A barrier over local memory only: group_barrier also waits for every global load in flight, so the scan's loads of
+// the next chunk would have to land before each barrier.
+inline void lds_barrier() {
+    __asm__ volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    __builtin_amdgcn_s_barrier();
+}
+#endif
+}  // namespace gw
+
 // The kernels of one GDN shape: HK key heads and HV value heads of S, conv channels C = 2 HK S + HV S.  Qwen3.8 is
 // <16, 48>, Ornith-1.5 (qwen35moe) <16, 32>; the public functions below dispatch on the shape.
 template <int HK, int HV>
@@ -830,6 +900,304 @@ struct Gdn {
     };
     static_assert(HV % HK == 0 && VPK <= RG && GdnRecKh::GB <= GdnRecKh::NT, "the key-head form's layout");
 
+    // STRATA_GDN_CHUNKED (gw above): T then P of every (chunk, value head), FP16 row-major (1 KB), at
+    // tp[(chunk * HV + vh) * 512].  A work-group per (key head, chunk) - the key head the fastest index, so the groups
+    // in flight read the same token rows - and a wave per value head of the key head.
+    struct GdnWmmaPrep {
+        const float* h;
+        const float* gate;
+        const float* beta;
+        _Float16* tp;
+        int64_t T;
+        sycl::local_accessor<float, 1> lsa, lsg, lsb;   // [VPK][CK * CK], [VPK][CK], [VPK][CK]
+
+        STRATA_AMD_REQD_WG(1, 32 * VPK)
+        void operator()(sycl::nd_item<2> it) const {
+#if STRATA_GDN_WMMA
+            using namespace gw;
+            const sycl::sub_group sgp = it.get_sub_group();
+            const int qh = (int) it.get_group(1), ch = (int) it.get_group(0), tid = (int) it.get_local_id(1);
+            const int w = tid >> 5, l = tid & 31, c = l & 15, hi = l >> 4, vh = qh + w * HK;
+            float* sa = lsa.get_multi_ptr<sycl::access::decorated::no>().get() + w * CK * CK;
+            float* sg = lsg.get_multi_ptr<sycl::access::decorated::no>().get() + w * CK;
+            float* sb = lsb.get_multi_ptr<sycl::access::decorated::no>().get() + w * CK;
+            const int64_t t0 = (int64_t) ch * CK;
+            f8 kk = {}, qk = {};   // k_t.k_i and q_t.k_i (lane: column i = c, rows t = 2v + hi)
+            {
+                const bool ok = t0 + c < T;   // past the end: zero rows
+                const float* ht = h + (ok ? t0 + c : 0) * C;
+    #pragma unroll
+                for (int j = 0; j < S / 16; ++j) {
+                    h16 ka, qa;
+    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const f4 k4 = *reinterpret_cast<const f4*>(ht + HK * S + qh * S + 16 * j + 4 * i);
+                        const f4 q4 = *reinterpret_cast<const f4*>(ht + qh * S + 16 * j + 4 * i);
+    #pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            ka[4 * i + e] = (_Float16) (ok ? k4[e] : 0.0f);
+                            qa[4 * i + e] = (_Float16) (ok ? q4[e] : 0.0f);
+                        }
+                    }
+                    kk = mma(ka, ka, kk);   // B = K^T: lane i holds column i of K^T, row i of K - the A operand itself
+                    qk = mma(qa, ka, qk);
+                }
+            }
+            {   // the gate's running sum over the chunk in lanes 0..15 (the upper half's sums are not kept)
+                const bool ok = l < CK && t0 + l < T;   // past the end: gate 0, beta 0
+                float g = ok ? gate[(t0 + l) * HV + vh] : 0.0f;
+    #pragma unroll
+                for (int o = 1; o < CK; o <<= 1) {
+                    const float u = sycl::shift_group_right(sgp, g, o);
+                    if (c >= o) g += u;
+                }
+                if (l < CK) {
+                    sg[l] = g;
+                    sb[l] = ok ? beta[(t0 + l) * HV + vh] : 0.0f;
+                }
+            }
+            lds_wait();   // the wave's own local writes, read across its lanes
+            _Float16* out = tp + ((int64_t) ch * HV + vh) * (2 * CK * CK);
+    #pragma unroll
+            for (int v = 0; v < 8; ++v) {
+                const int t = 2 * v + hi;
+                sa[t * CK + c] = c < t ? sb[t] * sycl::exp(sg[t] - sg[c]) * kk[v] : 0.0f;
+                out[CK * CK + t * CK + c] = (_Float16) (c <= t ? sycl::exp(sg[t] - sg[c]) * qk[v] : 0.0f);
+            }
+            lds_wait();
+            if (l < CK) {   // lane c: column c of T = (I + A)^-1 by forward substitution
+                float tc[CK];
+    #pragma unroll
+                for (int t = 0; t < CK; ++t) {
+                    float v = t == c ? 1.0f : 0.0f;
+    #pragma unroll
+                    for (int k = 0; k < t; ++k) v = sycl::fma(-sa[t * CK + k], tc[k], v);
+                    tc[t] = v;
+                    out[t * CK + c] = (_Float16) v;
+                }
+            }
+#else
+            (void) it;
+#endif
+        }
+    };
+    // The scan, a work-group per value head.  Per chunk: stage it (k / q FP16, k also transposed, v, the gate's running
+    // sum, beta, T and P); barrier (1); store the previous chunk's output rows (the z gate on its normed output, 16 bytes
+    // a work-item); X = K S0, QS = Q S0; Y, D, o and the wave's sums of o^2; the state update; barrier (2); the norm.
+    // The next chunk's k, q, v, T and P load during this one, and a load whose result is not used brings the lines of
+    // the chunk AHEAD on into the cache.  Local memory is single-buffered: an array written in the staging of chunk
+    // c + 1 or after its barrier (2) was last read before that wave reached barrier (1) of c + 1.
+    struct GdnWmmaScan {
+        // the local arrays in 16-byte words: k, q (FP16, rows of KP), k transposed, T and P (FP16), v, the normed
+        // output, the waves' sums of o^2, the gate's running sum, beta, gamma (FP32)
+        static constexpr int SK = 0, SQ = SK + gw::CK * gw::KP / 8, SKT = SQ + gw::CK * gw::KP / 8,
+                             STP = SKT + S * gw::CK / 8, SV = STP + 2 * gw::CK * gw::CK / 8, SO = SV + gw::CK * S / 4,
+                             SN = SO + gw::CK * S / 4, SG = SN + gw::CK * gw::NW / 4, SB = SG + gw::CK / 4,
+                             SGAM = SB + gw::CK / 4, WORDS = SGAM + S / 4;
+        float* state;
+        const float* h;
+        const float* gate;
+        const float* beta;
+        const float* z;
+        const float* gamma;
+        const unsigned* tp;
+        float eps;
+        uint16_t* y16;
+        int64_t T;
+        bool silu;
+        sycl::local_accessor<gw::u4, 1> lds;   // WORDS
+
+        STRATA_AMD_REQD_WG(gw::NW * 32)
+        void operator()(sycl::nd_item<1> it) const {
+#if STRATA_GDN_WMMA
+            using namespace gw;
+            const sycl::sub_group sgp = it.get_sub_group();
+            u4* base = lds.get_multi_ptr<sycl::access::decorated::no>().get();
+            _Float16 *sk = reinterpret_cast<_Float16*>(base + SK), *sq = reinterpret_cast<_Float16*>(base + SQ),
+                     *skt = reinterpret_cast<_Float16*>(base + SKT), *stp = reinterpret_cast<_Float16*>(base + STP);
+            float *sv = reinterpret_cast<float*>(base + SV), *so = reinterpret_cast<float*>(base + SO),
+                  *sn = reinterpret_cast<float*>(base + SN), *sg = reinterpret_cast<float*>(base + SG),
+                  *sb = reinterpret_cast<float*>(base + SB), *sgam = reinterpret_cast<float*>(base + SGAM);
+            const _Float16 *st_ = stp, *sp_ = stp + CK * CK;   // T, P
+            const int tid = (int) it.get_local_id(0);
+            const int vh = (int) it.get_group(0), qh = vh % HK, w = tid >> 5, l = tid & 31, c = l & 15, hi = l >> 4;
+            const int col = 16 * w + c;                       // this lane's column in the products
+            const int st = tid >> 4, sr = (tid & 15) * 8;    // this work-item's staging slice: token st, columns sr..+7
+            const size_t rs = (size_t) HV * S;
+            const int64_t ld16 = (int64_t) HV * S;
+            const Sel ps = sel(hi);
+            f8 s[S / 16];   // the state: rows 16j + 2v + hi, column col
+    #pragma unroll
+            for (int j = 0; j < S / 16; ++j)
+    #pragma unroll
+                for (int v = 0; v < 8; ++v) s[j][v] = state[(size_t) (16 * j + 2 * v + hi) * rs + (size_t) vh * S + col];
+            if (tid < S) sgam[tid] = gamma[tid];
+            const float out_scale = sycl::rsqrt((float) S);
+            // A work-item's slice of a chunk, loaded a chunk ahead, and one word of the chunk's T and P; lanes 0..15 of
+            // wave 0 also gate and beta of token l.  Rows past the end read the last row (finite: their gate and beta
+            // become 0 at staging) - no select on the loaded values, which would wait for them.
+            f4 k0, k1, q0, q1, v0, v1;
+            float cg = 0.0f, cb = 0.0f;
+            unsigned ctp;
+            auto load = [&](int64_t t0) {
+                const float* ht = h + sycl::min<int64_t>(t0 + st, T - 1) * C;
+                ctp = tp[((t0 / CK) * HV + vh) * (CK * CK) + tid];
+                k0 = *reinterpret_cast<const f4*>(ht + HK * S + qh * S + sr);
+                k1 = *reinterpret_cast<const f4*>(ht + HK * S + qh * S + sr + 4);
+                q0 = *reinterpret_cast<const f4*>(ht + qh * S + sr);
+                q1 = *reinterpret_cast<const f4*>(ht + qh * S + sr + 4);
+                v0 = *reinterpret_cast<const f4*>(ht + 2 * HK * S + vh * S + sr);
+                v1 = *reinterpret_cast<const f4*>(ht + 2 * HK * S + vh * S + sr + 4);
+                if (tid < CK) {
+                    const int64_t tl = sycl::min<int64_t>(t0 + tid, T - 1);
+                    cg = gate[tl * HV + vh];
+                    cb = beta[tl * HV + vh];
+                }
+            };
+            // a later chunk's lines (this group's k, q, v and z rows: 256 lines of 128 bytes, one a work-item), its
+            // result consumed by an empty asm one chunk later, where the wait for the loads before it also covers it
+            auto touch = [&](int64_t t0) -> unsigned {
+                const int part = tid & 15, kind = part >> 2;
+                if (t0 + st >= T) return 0u;
+                const float* p = kind == 0 ? h + (t0 + st) * C + HK * S + qh * S
+                               : kind == 1 ? h + (t0 + st) * C + qh * S
+                               : kind == 2 ? h + (t0 + st) * C + 2 * HK * S + vh * S
+                                           : z + (t0 + st) * HV * S + vh * S;
+                return __builtin_bit_cast(unsigned, p[32 * (part & 3)]);
+            };
+            load(0);
+            unsigned touched = 0;
+            f4 z0 = {}, z1 = {};   // the z slice of the chunk whose output rows are stored next
+            const bool sl = silu;
+            auto store_rows = [&](int64_t c0) {   // the output rows of the chunk at c0 (its norm in so): z gate, FP16
+                if (c0 + st >= T) return;
+                const float* o = &so[st * S + sr];
+                h8 r;
+    #pragma unroll
+                for (int i = 0; i < 8; ++i) r[i] = (_Float16) (o[i] * zgate(i < 4 ? z0[i] : z1[i - 4], sl));
+                *reinterpret_cast<u4*>(y16 + (c0 + st) * ld16 + vh * S + sr) = __builtin_bit_cast(u4, r);
+            };
+            for (int64_t t0 = 0; t0 < T; t0 += CK) {
+                {   // stage this chunk
+                    h8 kh, qq;
+    #pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        kh[i] = (_Float16) (i < 4 ? k0[i] : k1[i - 4]);
+                        qq[i] = (_Float16) (i < 4 ? q0[i] : q1[i - 4]);
+                        skt[(sr + i) * CK + st] = kh[i];
+                    }
+                    *reinterpret_cast<u4*>(&sk[st * KP + sr]) = __builtin_bit_cast(u4, kh);
+                    *reinterpret_cast<u4*>(&sq[st * KP + sr]) = __builtin_bit_cast(u4, qq);
+                    *reinterpret_cast<f4*>(&sv[st * S + sr]) = v0;
+                    *reinterpret_cast<f4*>(&sv[st * S + sr + 4]) = v1;
+                    reinterpret_cast<unsigned*>(stp)[tid] = ctp;
+                    if (w == 0) {   // the running sum in lanes 0..15 (past the end: gate 0, beta 0)
+                        const bool ok = l < CK && t0 + l < T;
+                        float g = ok ? cg : 0.0f;
+    #pragma unroll
+                        for (int o = 1; o < CK; o <<= 1) {
+                            const float u = sycl::shift_group_right(sgp, g, o);
+                            if (c >= o) g += u;
+                        }
+                        if (l < CK) {
+                            sg[l] = g;
+                            sb[l] = ok ? cb : 0.0f;
+                        }
+                    }
+                }
+                if (t0 + CK < T) load(t0 + CK);   // lands during this chunk
+                const unsigned touch_now = touch(t0 + AHEAD * CK);
+                lds_barrier();   // (1) this chunk staged; the previous chunk's norm in so
+                if (t0 > 0) store_rows(t0 - CK);
+                __asm__ volatile("" ::"v"(touched));   // the previous touch, consumed here
+                touched = touch_now;
+                {   // this chunk's z slice, for its output rows after barrier (1) of the next chunk
+                    const int64_t tz = sycl::min<int64_t>(t0 + st, T - 1);
+                    z0 = *reinterpret_cast<const f4*>(z + tz * HV * S + vh * S + sr);
+                    z1 = *reinterpret_cast<const f4*>(z + tz * HV * S + vh * S + sr + 4);
+                }
+                f8 x = {}, qs = {};   // K S0 and Q S0, this wave's columns
+    #pragma unroll
+                for (int j = 0; j < S / 16; ++j) {
+                    const h16 b = acc_to_b(s[j], ps);
+                    x = mma(ld(sk + c * KP + 16 * j), b, x);
+                    qs = mma(ld(sq + c * KP + 16 * j), b, qs);
+                }
+                f8 y;
+    #pragma unroll
+                for (int v = 0; v < 8; ++v) {
+                    const int t = 2 * v + hi;
+                    y[v] = sb[t] * (sv[t * S + col] - sycl::exp(sg[t]) * x[v]);
+                }
+                const f8 d = mma(ld(st_ + c * CK), acc_to_b(y, ps), f8{});
+                f8 o;
+    #pragma unroll
+                for (int v = 0; v < 8; ++v) o[v] = sycl::exp(sg[2 * v + hi]) * qs[v];
+                o = mma(ld(sp_ + c * CK), acc_to_b(d, ps), o);
+    #pragma unroll
+                for (int v = 0; v < 8; ++v) {   // the wave's 16 columns of o^2 per token, then the 8 waves' through LDS
+                    o[v] *= out_scale;
+                    float p = o[v] * o[v];
+    #pragma unroll
+                    for (int m = 1; m < 16; m <<= 1) p += strata_shfl_xor(sgp, p, m);
+                    if (c == 0) sn[(2 * v + hi) * NW + w] = p;
+                }
+                const float gl = sg[CK - 1];
+                f8 dd;
+    #pragma unroll
+                for (int v = 0; v < 8; ++v) dd[v] = sycl::exp(gl - sg[2 * v + hi]) * d[v];
+                const h16 db = acc_to_b(dd, ps);
+                const float eg = sycl::exp(gl);
+    #pragma unroll
+                for (int j = 0; j < S / 16; ++j) s[j] = mma(ld(skt + (16 * j + c) * CK), db, s[j] * eg);
+                lds_barrier();   // (2) the sums of o^2
+                const float g_col = sgam[col];
+    #pragma unroll
+                for (int v = 0; v < 8; ++v) {
+                    const int t = 2 * v + hi;
+                    const f4 n0 = *reinterpret_cast<const f4*>(&sn[t * NW]), n1 = *reinterpret_cast<const f4*>(&sn[t * NW + 4]);
+                    const float ss = n0[0] + n0[1] + n0[2] + n0[3] + n1[0] + n1[1] + n1[2] + n1[3];
+                    so[t * S + col] = o[v] * sycl::rsqrt(ss * (1.0f / S) + eps) * g_col;
+                }
+            }
+            __asm__ volatile("" ::"v"(touched));
+            lds_barrier();
+            store_rows((T - 1) / CK * CK);
+            float* sto = state;
+            __asm__ volatile("" : "+s"(sto));   // the state's addresses recomputed here, not kept (spilled) since the start
+    #pragma unroll
+            for (int j = 0; j < S / 16; ++j)
+    #pragma unroll
+                for (int v = 0; v < 8; ++v) sto[(size_t) (16 * j + 2 * v + hi) * rs + (size_t) vh * S + col] = s[j][v];
+#else
+            (void) it;
+#endif
+        }
+    };
+    static_assert(gw::NW == 8 && gw::CK * gw::NW * 2 == 256, "the scan's staging: 16 tokens x 16 slices of 8 columns");
+    // The chunked recurrence where the device takes it (gw::device_ok) and the chunk has kMin tokens: false (nothing
+    // launched) otherwise.  y, the FP32 scratch of the other kernels (T x HV x S floats), holds T and P (1 KB per chunk
+    // and value head).
+    static bool rec_wmma(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                         const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, bool silu, sycl::queue& q) {
+        static core::PerDevice<bool> per_device;
+        if (T < gw::kMin || !per_device.get(q.get_device(), [&] { return gw::device_ok(q.get_device()); })) return false;
+        const int64_t nch = (T + gw::CK - 1) / gw::CK;
+        _Float16* tp = reinterpret_cast<_Float16*>(y);
+        q.submit([&](sycl::handler& hd) {
+            using L = sycl::local_accessor<float, 1>;
+            hd.parallel_for(sycl::nd_range<2>({(size_t) nch, (size_t) HK * 32 * VPK}, {1, (size_t) 32 * VPK}),
+                            GdnWmmaPrep{h, gate, beta, tp, T, L(sycl::range<1>((size_t) VPK * gw::CK * gw::CK), hd),
+                                        L(sycl::range<1>((size_t) VPK * gw::CK), hd), L(sycl::range<1>((size_t) VPK * gw::CK), hd)});
+        });
+        q.submit([&](sycl::handler& hd) {
+            hd.parallel_for(sycl::nd_range<1>((size_t) HV * gw::NW * 32, gw::NW * 32),
+                            GdnWmmaScan{state, h, gate, beta, z, gamma, reinterpret_cast<const unsigned*>(tp), eps, y16, T,
+                                        silu, sycl::local_accessor<gw::u4, 1>(sycl::range<1>(GdnWmmaScan::WORDS), hd)});
+        });
+        return true;
+    }
+
     // Whether GdnRecLane<16> runs on this device: a GRF holds 16 floats only where the EU is 16 wide (Xe2; the 8-wide
     // EUs of Xe-LP and Xe-HPG would spill the 128 state rows), and the device must build the large register file.
     // STRATA_GDN_REC_LANE=0: the D-2 kernel (A/B).
@@ -858,6 +1226,15 @@ struct Gdn {
                            const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, bool silu, void* stream) {
         static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-group-per-head kernel (A/B)
         auto& q = Q(stream);
+        // STRATA_GDN_CHUNKED=1 (opt-in): the chunked recurrence on GFX11's matrix cores (gw above), other bits.  On the
+        // 890M (Qwen3.8 IQ2_XS) one layer's recurrence and norm take 8.0 ms for 3,481 tokens against 14.4 ms, the prompt
+        // 2-3% less time; the next token's KL after 20 prompts 0.020 (top-1 equal; run to run 0.0002).  Splitting the
+        // state into two FP16 operands left the error as it was (the rounding of k, q, T, P and D is most of it).
+        static const bool chunked = [] {
+            const char* v = std::getenv("STRATA_GDN_CHUNKED");
+            return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+        }();
+        if (chunked && !serial && rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, silu, q)) return;
         if (serial || T <= 0) {
             q.submit([&](sycl::handler& hd) {
                 sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
