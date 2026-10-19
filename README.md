@@ -64,6 +64,15 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      adds the 20 column chunks' partials into lo, and the up product reads it (`STRATA_HC_V2=0`: the former two kernels).
    - Sub-group xor exchanges through DPP and `v_permlanex16`.
    - The GDN step and commit stage the tokens' inputs in LDS first and take fewer barriers per token.
+   - The GDN commit folded into the next window (`STRATA_GDN_DEFER`, the default): the commit only stashes the kept rows'
+     k, v, gate and beta, and the next window's step runs them on the state it reads anyway and writes it back once.  The
+     state (about 113 MB over the 36 layers) is read or written twice a window instead of three times, in the same order of
+     arithmetic, so the output is bit for bit the same (`STRATA_GDN_DEFER=0`: the former commit).
+   - The speculative layer's head narrowed by a one-bit sketch (`STRATA_MTP_SKETCH`, the default): at start-up each head
+     row's signs and mean magnitude are taken, every draft step picks 4 candidates of each 128 rows with them, and only the
+     candidates' rows go through the real head.  The head reads about a quarter of the bytes and the drafts hit as often
+     (about 0.7% fall outside the candidates).  A draft only proposes, so the output does not change (`STRATA_MTP_SKETCH=0`:
+     the whole head).
    - A Japanese-and-English draft vocabulary (`data/draft_vocab_ja.bin`, 56,554 tokens): the speculative layer reads about half the bytes of the default vocabulary.
    - `STRATA_EXPERT_KEEP=N` (opt-in, changes the answers): only the N heaviest experts of each token are computed.
 - **Prefill:**
