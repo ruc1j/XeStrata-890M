@@ -680,12 +680,13 @@ sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
 // and each of its 160 up groups added all T x 16 x 324 partials again for lo).
 //  1. norm: a group per token and stream folds the previous write into R (in place), writes rs, and writes
 //     x = R' w_norm rs into the queue's work buffer, the tokens' rows one after another;
-//  2. down: groups of 32 rows (16 for 5 or more tokens; and one group of the inject rows) times 20 chunks of 512
-//     columns; a lane reads 16 bytes of a row (half a Q8_0 block) and its scale and the chunk's x from local memory;
-//     the last group of a row group to finish (a ticket) adds its rows' 20 partials in chunk order: lo and the
-//     inject sums, into the work buffer.  It reads no token's arguments;
+//  2. down: blocks of two row groups of 32 rows (16 for 5 or more tokens; and one block of the inject rows) times 20
+//     chunks of 512 columns; a lane reads 16 bytes of a row (half a Q8_0 block) and its scale and the chunk's x from
+//     local memory, staged once a block; the last group of a block to finish (a ticket) adds its rows' 20 partials in
+//     chunk order: lo and the inject sums, into the work buffer.  It reads no token's arguments;
 //  3. up: gr_read_q8's 8-lane up with lo from the work buffer and x for its epilogue.
-// The scratch holds the partials (T x 20 x 324 floats), then the row groups' tickets.  Another summation order than
+// The three in one launch by default (STRATA_HC_FUSE=0: three launches; gr_read_v2).
+// The scratch holds the partials (T x 20 x 324 floats), then the blocks' tickets.  Another summation order than
 // gr_read_q8 (rs inside the dot): not its bits.  STRATA_HC_V2=0: gr_read_q8.
 constexpr int V2_KC = 512, V2_NKC = D / V2_KC, V2_CPS = N / V2_KC;   // 20 chunks, 5 a stream
 static_assert(V2_KC == 32 * 16 && N % V2_KC == 0, "the v2 down's geometry");
@@ -693,6 +694,11 @@ static_assert(V2_KC == 32 * 16 && N % V2_KC == 0, "the v2 down's geometry");
 template <int T> constexpr int v2_rpw() { return T <= 4 ? 4 : 2; }
 template <int T> constexpr int v2_rg() { return LR / (WARPS * v2_rpw<T>()); }   // row groups (+1: the inject rows)
 constexpr int V2_RG_MAX = LR / (WARPS * 2);
+// row groups a down block (XeStrata-890M: x staged once a block, the next group's bytes loaded during a group; 5 and
+// 10 groups were slower, as were 2 rows a sub-group up to 4 tokens)
+template <int T> constexpr int v2_gps() { return 2; }
+template <int T> constexpr int v2_nb() { return v2_rg<T>() / v2_gps<T>(); }   // blocks (+1: the inject rows)
+static_assert(v2_rg<1>() % v2_gps<1>() == 0 && v2_rg<8>() % v2_gps<8>() == 0, "whole blocks");
 static_assert((size_t) kFusedGrMaxT * V2_NKC * PR + V2_RG_MAX + 1 <= (size_t) kFusedGrMaxT * D, "v2's scratch");
 constexpr size_t V2_WS_LO = (size_t) kFusedGrMaxT * D;              // the work buffer: x, then lo | inject
 constexpr size_t V2_WS = V2_WS_LO + (size_t) kFusedGrMaxT * PR;
@@ -705,276 +711,401 @@ bool hc_v2_on() {
     return on;
 }
 
-// the queue's work buffer (each stream its own: a draft and a verify window may read at once), never freed
+// the queue's work buffer (each stream its own: a draft and a verify window may read at once), never freed; after it
+// the fused read's three counters, zeroed once here and by the read's last group after every read
+constexpr size_t V2_SYNC = 16;
 float* v2_work(sycl::queue& q) {
     static std::mutex mu;
     static std::map<const void*, float*> bufs;
     std::lock_guard<std::mutex> lock(mu);
     float*& b = bufs[&q];
-    if (b == nullptr) b = sycl::malloc_device<float>(V2_WS, q);
-    if (b == nullptr) throw core::DeviceError("fused_gr_read_multi: the v2 work buffer does not fit");
+    if (b == nullptr) {
+        b = sycl::malloc_device<float>(V2_WS + V2_SYNC, q);
+        if (b == nullptr) throw core::DeviceError("fused_gr_read_multi: the v2 work buffer does not fit");
+        // another queue: q may be recording a graph
+        sycl::queue z(q.get_context(), q.get_device());
+        z.memset(b + V2_WS, 0, V2_SYNC * sizeof(float)).wait();
+    }
     return b;
+}
+
+// v2's three steps as a group's work, for its three launches (STRATA_HC_FUSE=0) or the fused one.
+// 1. the norm, group grp = token x stream: R' in place, rs, x; the tickets zeroed
+template <int T, int DIM>
+inline void v2_norm(const sycl::nd_item<DIM>& it, int grp, const TokArgs& tok, const GrMulti& m,
+                    const sycl::local_accessor<float, 1>& red, uint32_t* tickets, float* xw) {
+    constexpr int RG = v2_rg<T>();
+    const sycl::sub_group sg = it.get_sub_group();
+    const int k = grp / HC, c = grp % HC;
+    const int t = (int) it.get_local_linear_id(), lane = (int) sg.get_local_linear_id();
+    const int warp = (int) sg.get_group_linear_id();
+    if (grp == 0 && t <= RG) tickets[t] = 0u;
+    const auto& a = tok(m, k);
+    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    constexpr int NQ = N / (4 * THREADS);   // a work-item's float4 of the stream (2.5: the last one partly)
+    float4 rr[NQ + 1];
+    float ss = 0.0f;
+#pragma unroll
+    for (int u = 0; u <= NQ; ++u) {
+        const int d = 4 * (t + u * THREADS);
+        if (d >= N) break;
+        const int i = c * N + d;
+        float4 r = load4(a.R + i);
+        if (a.apply) {
+            const float4 b = load4(a.bo_prev + d);
+            r.x() = sycl::fma(b.x(), gw, r.x()); r.y() = sycl::fma(b.y(), gw, r.y());
+            r.z() = sycl::fma(b.z(), gw, r.z()); r.w() = sycl::fma(b.w(), gw, r.w());
+            *reinterpret_cast<float4*>(a.R_out + i) = r;
+        }
+        rr[u] = r;
+        ss += r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+    }
+    const float v = warp_sum(sg, ss);
+    if (lane == 0) red[warp] = v;
+    sycl::group_barrier(it.get_group());
+    if (t == 0) {
+        float sum = 0.0f;
+        for (int w = 0; w < WARPS; ++w) sum += red[w];
+        const float rsv = sycl::rsqrt(sum / (float) N + a.eps);
+        red[WARPS] = rsv;
+        a.rs[c] = rsv;
+    }
+    sycl::group_barrier(it.get_group());
+    const float rsv = red[WARPS];
+#pragma unroll
+    for (int u = 0; u <= NQ; ++u) {
+        const int d = 4 * (t + u * THREADS);
+        if (d >= N) break;
+        const int i = c * N + d;
+        *reinterpret_cast<float4*>(xw + (size_t) k * D + i) = rr[u] * load4(a.w_norm + i) * rsv;
+    }
+}
+
+// 2. the down rows of row block blk in chunk kc: a block is GPS row groups (or, the last block, the inject rows), x
+// staged once and each group's bytes loaded while the group before is computed; partials, then the last group of
+// the block adds them.  wait(): after the first rows' bytes are loaded, before x is read; done(): the adding group,
+// after its sums are written.
+template <int T, int DIM, class Wait, class Done>
+inline void v2_down(const sycl::nd_item<DIM>& it, int blk, int kc, const sycl::local_accessor<float4, 1>& xs,
+                    const sycl::local_accessor<int, 1>& last, const uint8_t* qd, const uint16_t* wi, const float* xw,
+                    float* part, uint32_t* tickets, float* low, Wait wait, Done done) {
+    constexpr int RPW = v2_rpw<T>(), GPS = v2_gps<T>(), NB = v2_nb<T>();
+    const sycl::sub_group sg = it.get_sub_group();
+    const int t = (int) it.get_local_linear_id(), lane = (int) sg.get_local_linear_id();
+    const int warp = (int) sg.get_group_linear_id();
+    const bool inj = blk == NB;
+    const int ng = inj ? 1 : GPS;
+    const int nrows = inj ? ((wi != nullptr && warp < HC) ? 1 : 0) : RPW;
+    const int col0 = kc * V2_KC + 16 * lane;   // this lane's 16 columns
+    // a group's bytes: 16 int8 and their block's scale a row, or (the inject rows) 16 BF16
+    sycl::uint4 wq[2][RPW], wb[2];
+    uint16_t wd[2][RPW];
+    const auto load = [&](int gi, sycl::uint4* q, uint16_t* d) {
+        const int row0 = ((blk * GPS + gi) * WARPS + warp) * RPW;
+#pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const uint8_t* qrow = qd + (size_t) (row0 + r) * Q8_ROW_D;
+            q[r] = *reinterpret_cast<const sycl::uint4*>(qrow + col0);
+            d[r] = reinterpret_cast<const uint16_t*>(qrow + D)[col0 / 32];
+        }
+    };
+    if (inj) {
+        if (nrows > 0) {
+            const sycl::uint4* p = reinterpret_cast<const sycl::uint4*>(wi + (size_t) warp * D + col0);
+            wb[0] = p[0];
+            wb[1] = p[1];
+        }
+    } else {
+        load(0, wq[0], wd[0]);
+    }
+    wait();
+    // the chunk's x for the T tokens; float4 j of the chunk at (j % 4) * 32 + j / 4: lane l's four float4
+    // (4 l .. 4 l + 3) in four rows of the local memory, its neighbours' beside them (no bank conflicts below)
+    for (int i = t; i < T * V2_KC / 4; i += THREADS) {
+        const int k = i / (V2_KC / 4), j = i - k * (V2_KC / 4);
+        xs[k * V2_KC / 4 + (j % 4) * 32 + j / 4] = load4(xw + (size_t) k * D + kc * V2_KC + 4 * j);
+    }
+    sycl::group_barrier(it.get_group());
+#pragma unroll
+    for (int gi = 0; gi < GPS; ++gi) {
+        if (gi >= ng) break;
+        const int cur = gi & 1;
+        if (!inj && gi + 1 < GPS) load(gi + 1, wq[cur ^ 1], wd[cur ^ 1]);
+        if (nrows > 0) {
+            const int row0 = inj ? warp : ((blk * GPS + gi) * WARPS + warp) * RPW;
+            float w[RPW][16];
+#pragma unroll
+            for (int r = 0; r < RPW; ++r) {
+                if (inj) {
+#pragma unroll
+                    for (int h2 = 0; h2 < 2; ++h2) {
+                        const uint32_t u[4] = {wb[h2].x(), wb[h2].y(), wb[h2].z(), wb[h2].w()};
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            w[r][8 * h2 + 2 * j] = sycl::bit_cast<float>(u[j] << 16);
+                            w[r][8 * h2 + 2 * j + 1] = sycl::bit_cast<float>(u[j] & 0xffff0000u);
+                        }
+                    }
+                } else {
+                    const float sc = (float) sycl::bit_cast<sycl::half>(wd[cur][r]);
+                    const uint32_t u[4] = {wq[cur][r].x(), wq[cur][r].y(), wq[cur][r].z(), wq[cur][r].w()};
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) w[r][j] = sc * (float) (int8_t) ((u[j / 4] >> (8 * (j % 4))) & 255u);
+                }
+            }
+            float acc[RPW][T];
+#pragma unroll
+            for (int k = 0; k < T; ++k) {
+                float x[16];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float4 v = xs[k * V2_KC / 4 + j * 32 + lane];
+                    x[4 * j] = v.x(); x[4 * j + 1] = v.y(); x[4 * j + 2] = v.z(); x[4 * j + 3] = v.w();
+                }
+#pragma unroll
+                for (int r = 0; r < RPW; ++r) {
+                    float sum = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) sum = sycl::fma(w[r][j], x[j], sum);
+                    acc[r][k] = sum;
+                }
+            }
+            // the sub-group's sums of the RPW x T values as a reduce-scatter: at each step a lane keeps half of its
+            // values, adds its partner's other half, and passes on (the butterfly's pairs, so each sum is
+            // warp_sum's); P values (RPW T rounded up to a power of two) take P - 1 + (5 - log2 P) exchanges
+            // instead of 5 P.  Lane l ends with value l >> (5 - log2 P).
+            constexpr int P = RPW * T <= 4 ? 4 : RPW * T <= 8 ? 8 : 16;
+            constexpr int LP = P == 4 ? 2 : P == 8 ? 3 : 4;
+            static_assert(RPW * T <= 16, "16 values a sub-group at most");
+            float v[P];
+#pragma unroll
+            for (int i = 0; i < P; ++i) v[i] = i < RPW * T ? acc[i / T][i % T] : 0.0f;
+#pragma unroll
+            for (int o = 16, cnt = P; o > 0; o >>= 1) {
+                if (cnt > 1) {
+                    const bool upper = (lane & o) != 0;
+#pragma unroll
+                    for (int i = 0; i < cnt / 2; ++i) {
+                        const float keep = upper ? v[cnt / 2 + i] : v[i];
+                        const float send = upper ? v[i] : v[cnt / 2 + i];
+                        v[i] = keep + strata_shfl_xor(sg, send, o);
+                    }
+                    cnt /= 2;
+                } else {
+                    v[0] += strata_shfl_xor(sg, v[0], o);
+                }
+            }
+            const int idx = lane >> (5 - LP), r = idx / T, k = idx - r * T;
+            if ((lane & ((1 << (5 - LP)) - 1)) == 0 && idx < RPW * T && r < nrows) {
+                const int prow = inj ? LR + warp : row0 + r;
+                part[((size_t) k * V2_NKC + kc) * PR + prow] = v[0];
+            }
+        }
+    }
+    // the ticket: the block's last chunk to finish adds the partials
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+    sycl::group_barrier(it.get_group());
+    if (t == 0) {
+        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space> tk(tickets[blk]);
+        last[0] = tk.fetch_add(1u) == (uint32_t) (V2_NKC - 1) ? 1 : 0;
+    }
+    sycl::group_barrier(it.get_group());
+    if (!last[0]) return;
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+    const int rows = inj ? (wi != nullptr ? HC : 0) : GPS * WARPS * RPW;
+    const int r0 = inj ? LR : blk * GPS * WARPS * RPW;
+    for (int i = t; i < T * rows; i += THREADS) {
+        const int k = i / rows, r = r0 + (i - k * rows);
+        float sum = 0.0f;
+        for (int j = 0; j < V2_NKC; ++j) sum += part[((size_t) k * V2_NKC + j) * PR + r];
+        if (r < LR) {
+            const float x = sum / (float) HC;
+            sum = x / (1.0f + sycl::exp(-x));
+        }
+        low[(size_t) k * PR + r] = sum;
+    }
+    if (t == 0) tickets[blk] = 0u;
+    done();
+}
+
+// 3. the up rows of group grp (gr_read_q8's 8-lane form): lo and x from the work buffer.  wait(): after the rows'
+// bytes are loaded, before lo is read.
+template <int T, class Wait>
+inline void v2_up(const sycl::nd_item<1>& it, int grp, const TokArgs& tok, const GrMulti& m,
+                  const sycl::local_accessor<float4, 1>& lo, const sycl::local_accessor<float, 1>& g, const float* low,
+                  const float* xw, Wait wait) {
+    const sycl::sub_group sg = it.get_sub_group();
+    const int t = (int) it.get_local_id(0);
+    const int d0 = grp * UPM_COLS;
+    const int j = t & 7, g8 = t >> 3;
+    uint32_t wq[2][4][3];
+    uint16_t wd[2][4][3];
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int r = g8 + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const uint8_t* qrow = m.a[0].q8_up + (size_t) i * Q8_ROW_U;
+        const uint16_t* drow = reinterpret_cast<const uint16_t*>(qrow + LR);
+#pragma unroll
+        for (int qq = 0; qq < 4; ++qq)
+#pragma unroll
+            for (int st = 0; st < 3; ++st) {
+                const int v = 4 * (j + 8 * qq) + 128 * st;
+                wq[p][qq][st] = v < LR ? *reinterpret_cast<const uint32_t*>(qrow + v) : 0u;
+                wd[p][qq][st] = v < LR ? drow[v / 32] : (uint16_t) 0;
+            }
+    }
+    wait();
+    for (int i = t; i < T * LR / 4; i += THREADS) {
+        const int k = i / (LR / 4);
+        lo[i] = load4(low + (size_t) k * PR + 4 * (i - k * (LR / 4)));
+    }
+    if (grp == 0 && t < T * HC && m.a[0].w_inject != nullptr)
+        tok(m, t / HC).inject_out[t % HC] = low[(size_t) (t / HC) * PR + LR + t % HC];
+    sycl::group_barrier(it.get_group());
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const int r = g8 + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const float xv = j < T ? xw[(size_t) j * D + i] : 0.0f;
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < T; ++k) {
+            float aq[4];
+#pragma unroll
+            for (int qq = 0; qq < 4; ++qq) {
+                float acc = 0.0f;
+#pragma unroll
+                for (int st = 0; st < 3; ++st) {
+                    const int v = 4 * (j + 8 * qq) + 128 * st;
+                    if (v < LR) {
+                        const float4 w = q8_four(wq[p][qq][st], wd[p][qq][st]);
+                        const float4 x = lo[k * LR / 4 + v / 4];
+                        acc = sycl::fma(w.x(), x.x(), acc); acc = sycl::fma(w.y(), x.y(), acc);
+                        acc = sycl::fma(w.z(), x.z(), acc); acc = sycl::fma(w.w(), x.w(), acc);
+                    }
+                }
+                aq[qq] = acc;
+            }
+            float sum = (aq[0] + aq[2]) + (aq[1] + aq[3]);
+            for (int o = 4; o > 0; o >>= 1) sum += strata_shfl_xor(sg, sum, o);
+            if (j == k) mine = sum;
+        }
+        if (j < T) g[(j * HC + c) * UPM_COLS + dd] = xv * sigmoidf_(mine);
+    }
+    sycl::group_barrier(it.get_group());
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float sum = 0.0f;
+        for (int c = 0; c < HC; ++c) sum += g[(k * HC + c) * UPM_COLS + col];
+        tok(m, k).mixed[d0 + col] = sum / (float) HC;
+    }
+}
+
+bool hc_fuse_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HC_FUSE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
+inline void v2_pause() {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+    __builtin_amdgcn_s_sleep(1);
+#endif
 }
 
 template <int T>
 sycl::event gr_read_v2(sycl::queue& q, const GrMulti& m, float* scratch) {
-    constexpr int RPW = v2_rpw<T>(), RG = v2_rg<T>();
     float* part = scratch;
     uint32_t* tickets = reinterpret_cast<uint32_t*>(scratch + (size_t) T * V2_NKC * PR);
     float* ws = v2_work(q);
     float* xw = ws;               // [T][D]
     float* low = ws + V2_WS_LO;   // [T][PR]: lo, then the inject sums
-    // 1. the norm: R' in place, rs, x; the tickets zeroed
+    const uint8_t* qd = m.a[0].q8_down;
+    const uint16_t* wi = m.a[0].w_inject;
+    if (hc_fuse_on()) {
+        // XeStrata-890M: the three steps in one launch, the groups in order (norm, down, up): a down group loads its
+        // rows, then waits for the norm groups to finish, an up group for the down row groups' sums; the earlier
+        // groups are dispatched first, so the waits end.  The rows' loads overlap the step before (the three
+        // launches drained and refilled the GPU twice).  The same arithmetic: the same bits.
+        constexpr int NNORM = T * HC, NDOWN = (v2_nb<T>() + 1) * V2_NKC, NUP = UPM_BLOCKS;
+        uint32_t* sync = reinterpret_cast<uint32_t*>(ws + V2_WS);   // norm groups done, down row groups done, up groups past their wait
+        return q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> red(sycl::range<1>(WARPS + 1), h);
+            sycl::local_accessor<float4, 1> xs(sycl::range<1>((size_t) T * V2_KC / 4), h);
+            sycl::local_accessor<int, 1> last(sycl::range<1>(1), h);
+            sycl::local_accessor<float4, 1> lo(sycl::range<1>((size_t) T * LR / 4), h);
+            sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) T * HC * UPM_COLS), h);
+            const TokArgs tok(h);
+            h.parallel_for(sycl::nd_range<1>((size_t) (NNORM + NDOWN + NUP) * THREADS, THREADS),
+                           [=](sycl::nd_item<1> it) STRATA_AMD_REQD_WG(THREADS) [[sycl::reqd_sub_group_size(WARP)]] {
+                using Counter = sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                                 sycl::access::address_space::global_space>;
+                const int grp = (int) it.get_group(0), t = (int) it.get_local_id(0);
+                const auto wait = [&](uint32_t* c, uint32_t n) {
+                    if (t == 0) {
+                        Counter cn(*c);
+                        while (cn.load() < n) v2_pause();
+                    }
+                    sycl::group_barrier(it.get_group());
+                    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+                };
+                const auto signal = [&](uint32_t* c) {
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                    sycl::group_barrier(it.get_group());
+                    if (t == 0) Counter(*c).fetch_add(1u);
+                };
+                if (grp < NNORM) {
+                    tok.template stage<1, T>(m, it);
+                    v2_norm<T>(it, grp, tok, m, red, tickets, xw);
+                    signal(sync);
+                } else if (grp < NNORM + NDOWN) {
+                    const int dg = grp - NNORM;
+                    v2_down<T>(it, dg / V2_NKC, dg % V2_NKC, xs, last, qd, wi, xw, part, tickets, low,
+                               [&] { wait(sync, (uint32_t) NNORM); }, [&] { signal(sync + 1); });
+                } else {
+                    tok.template stage<1, T>(m, it);
+                    v2_up<T>(it, grp - NNORM - NDOWN, tok, m, lo, g, low, xw, [&] {
+                        wait(sync + 1, (uint32_t) (v2_nb<T>() + 1));
+                        // the last up group past its wait: every group's waits are over, the counters back to 0
+                        if (t == 0 && Counter(sync[2]).fetch_add(1u) == (uint32_t) (NUP - 1)) {
+                            Counter(sync[0]).store(0u);
+                            Counter(sync[1]).store(0u);
+                            Counter(sync[2]).store(0u);
+                        }
+                    });
+                }
+            });
+        });
+    }
+    // 1. the norm
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> red(sycl::range<1>(WARPS + 1), h);
         const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<1>((size_t) T * HC * THREADS, THREADS), [=](sycl::nd_item<1> it) STRATA_AMD_REQD_WG(THREADS) [[sycl::reqd_sub_group_size(WARP)]] {
             tok.template stage<1, T>(m, it);
-            const sycl::sub_group sg = it.get_sub_group();
-            const int k = (int) it.get_group(0) / HC, c = (int) it.get_group(0) % HC;
-            const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id();
-            const int warp = (int) sg.get_group_linear_id();
-            if (it.get_group(0) == 0 && t <= RG) tickets[t] = 0u;
-            const auto& a = tok(m, k);
-            const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
-            constexpr int NQ = N / (4 * THREADS);   // a work-item's float4 of the stream (2.5: the last one partly)
-            float4 rr[NQ + 1];
-            float ss = 0.0f;
-#pragma unroll
-            for (int u = 0; u <= NQ; ++u) {
-                const int d = 4 * (t + u * THREADS);
-                if (d >= N) break;
-                const int i = c * N + d;
-                float4 r = load4(a.R + i);
-                if (a.apply) {
-                    const float4 b = load4(a.bo_prev + d);
-                    r.x() = sycl::fma(b.x(), gw, r.x()); r.y() = sycl::fma(b.y(), gw, r.y());
-                    r.z() = sycl::fma(b.z(), gw, r.z()); r.w() = sycl::fma(b.w(), gw, r.w());
-                    *reinterpret_cast<float4*>(a.R_out + i) = r;
-                }
-                rr[u] = r;
-                ss += r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
-            }
-            const float v = warp_sum(sg, ss);
-            if (lane == 0) red[warp] = v;
-            sycl::group_barrier(it.get_group());
-            if (t == 0) {
-                float sum = 0.0f;
-                for (int w = 0; w < WARPS; ++w) sum += red[w];
-                const float rsv = sycl::rsqrt(sum / (float) N + a.eps);
-                red[WARPS] = rsv;
-                a.rs[c] = rsv;
-            }
-            sycl::group_barrier(it.get_group());
-            const float rsv = red[WARPS];
-#pragma unroll
-            for (int u = 0; u <= NQ; ++u) {
-                const int d = 4 * (t + u * THREADS);
-                if (d >= N) break;
-                const int i = c * N + d;
-                *reinterpret_cast<float4*>(xw + (size_t) k * D + i) = rr[u] * load4(a.w_norm + i) * rsv;
-            }
+            v2_norm<T>(it, (int) it.get_group(0), tok, m, red, tickets, xw);
         });
     });
-    // 2. the down rows: partials, then the last group of each row group adds them
+    // 2. the down rows
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float4, 1> xs(sycl::range<1>((size_t) T * V2_KC / 4), h);
         sycl::local_accessor<int, 1> last(sycl::range<1>(1), h);
-        const uint8_t* qd = m.a[0].q8_down;
-        const uint16_t* wi = m.a[0].w_inject;
-        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (RG + 1) * THREADS, V2_NKC), sycl::range<2>(THREADS, 1)),
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (v2_nb<T>() + 1) * THREADS, V2_NKC), sycl::range<2>(THREADS, 1)),
                        [=](sycl::nd_item<2> it) STRATA_AMD_REQD_WG(THREADS, 1) [[sycl::reqd_sub_group_size(WARP)]] {
-            const sycl::sub_group sg = it.get_sub_group();
-            const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id();
-            const int warp = (int) sg.get_group_linear_id();
-            const int rg = (int) it.get_group(0), kc = (int) it.get_group(1);
-            const bool inj = rg == RG;
-            const int nrows = inj ? ((wi != nullptr && warp < HC) ? 1 : 0) : RPW;
-            const int row0 = inj ? warp : (rg * WARPS + warp) * RPW;
-            const int col0 = kc * V2_KC + 16 * lane;   // this lane's 16 columns
-            // the rows' bytes first: 16 int8 and their block's scale, or (the inject rows) 16 BF16
-            sycl::uint4 wq[RPW], wb[2];
-            uint16_t wd[RPW];
-#pragma unroll
-            for (int r = 0; r < RPW; ++r) {
-                if (inj || r >= nrows) continue;
-                const uint8_t* qrow = qd + (size_t) (row0 + r) * Q8_ROW_D;
-                wq[r] = *reinterpret_cast<const sycl::uint4*>(qrow + col0);
-                wd[r] = reinterpret_cast<const uint16_t*>(qrow + D)[col0 / 32];
-            }
-            if (inj && nrows > 0) {
-                const sycl::uint4* p = reinterpret_cast<const sycl::uint4*>(wi + (size_t) row0 * D + col0);
-                wb[0] = p[0];
-                wb[1] = p[1];
-            }
-            // the chunk's x for the T tokens; float4 j of the chunk at (j % 4) * 32 + j / 4: lane l's four float4
-            // (4 l .. 4 l + 3) in four rows of the local memory, its neighbours' beside them (no bank conflicts below)
-            for (int i = t; i < T * V2_KC / 4; i += THREADS) {
-                const int k = i / (V2_KC / 4), j = i - k * (V2_KC / 4);
-                xs[k * V2_KC / 4 + (j % 4) * 32 + j / 4] = load4(xw + (size_t) k * D + kc * V2_KC + 4 * j);
-            }
-            sycl::group_barrier(it.get_group());
-            if (nrows > 0) {
-                float w[RPW][16];
-#pragma unroll
-                for (int r = 0; r < RPW; ++r) {
-                    if (inj) {
-#pragma unroll
-                        for (int h2 = 0; h2 < 2; ++h2) {
-                            const uint32_t u[4] = {wb[h2].x(), wb[h2].y(), wb[h2].z(), wb[h2].w()};
-#pragma unroll
-                            for (int j = 0; j < 4; ++j) {
-                                w[r][8 * h2 + 2 * j] = sycl::bit_cast<float>(u[j] << 16);
-                                w[r][8 * h2 + 2 * j + 1] = sycl::bit_cast<float>(u[j] & 0xffff0000u);
-                            }
-                        }
-                    } else {
-                        const float sc = (float) sycl::bit_cast<sycl::half>(wd[r]);
-                        const uint32_t u[4] = {wq[r].x(), wq[r].y(), wq[r].z(), wq[r].w()};
-#pragma unroll
-                        for (int j = 0; j < 16; ++j) w[r][j] = sc * (float) (int8_t) ((u[j / 4] >> (8 * (j % 4))) & 255u);
-                    }
-                }
-                float acc[RPW][T];
-#pragma unroll
-                for (int k = 0; k < T; ++k) {
-                    float x[16];
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const float4 v = xs[k * V2_KC / 4 + j * 32 + lane];
-                        x[4 * j] = v.x(); x[4 * j + 1] = v.y(); x[4 * j + 2] = v.z(); x[4 * j + 3] = v.w();
-                    }
-#pragma unroll
-                    for (int r = 0; r < RPW; ++r) {
-                        float sum = 0.0f;
-#pragma unroll
-                        for (int j = 0; j < 16; ++j) sum = sycl::fma(w[r][j], x[j], sum);
-                        acc[r][k] = sum;
-                    }
-                }
-                // the sub-group's sums of the RPW x T values as a reduce-scatter: at each step a lane keeps half of its
-                // values, adds its partner's other half, and passes on (the butterfly's pairs, so each sum is
-                // warp_sum's); P values (RPW T rounded up to a power of two) take P - 1 + (5 - log2 P) exchanges
-                // instead of 5 P.  Lane l ends with value l >> (5 - log2 P).
-                constexpr int P = RPW * T <= 4 ? 4 : RPW * T <= 8 ? 8 : 16;
-                constexpr int LP = P == 4 ? 2 : P == 8 ? 3 : 4;
-                static_assert(RPW * T <= 16, "16 values a sub-group at most");
-                float v[P];
-#pragma unroll
-                for (int i = 0; i < P; ++i) v[i] = i < RPW * T ? acc[i / T][i % T] : 0.0f;
-#pragma unroll
-                for (int o = 16, cnt = P; o > 0; o >>= 1) {
-                    if (cnt > 1) {
-                        const bool upper = (lane & o) != 0;
-#pragma unroll
-                        for (int i = 0; i < cnt / 2; ++i) {
-                            const float keep = upper ? v[cnt / 2 + i] : v[i];
-                            const float send = upper ? v[i] : v[cnt / 2 + i];
-                            v[i] = keep + strata_shfl_xor(sg, send, o);
-                        }
-                        cnt /= 2;
-                    } else {
-                        v[0] += strata_shfl_xor(sg, v[0], o);
-                    }
-                }
-                const int idx = lane >> (5 - LP), r = idx / T, k = idx - r * T;
-                if ((lane & ((1 << (5 - LP)) - 1)) == 0 && idx < RPW * T && r < nrows) {
-                    const int prow = inj ? LR + warp : row0 + r;
-                    part[((size_t) k * V2_NKC + kc) * PR + prow] = v[0];
-                }
-            }
-            // the ticket: the row group's last chunk to finish adds the partials
-            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-            sycl::group_barrier(it.get_group());
-            if (t == 0) {
-                sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
-                                 sycl::access::address_space::global_space> tk(tickets[rg]);
-                last[0] = tk.fetch_add(1u) == (uint32_t) (V2_NKC - 1) ? 1 : 0;
-            }
-            sycl::group_barrier(it.get_group());
-            if (!last[0]) return;
-            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
-            const int rows = inj ? (wi != nullptr ? HC : 0) : WARPS * RPW;
-            const int r0 = inj ? LR : rg * WARPS * RPW;
-            for (int i = t; i < T * rows; i += THREADS) {
-                const int k = i / rows, r = r0 + (i - k * rows);
-                float sum = 0.0f;
-                for (int j = 0; j < V2_NKC; ++j) sum += part[((size_t) k * V2_NKC + j) * PR + r];
-                if (r < LR) {
-                    const float x = sum / (float) HC;
-                    sum = x / (1.0f + sycl::exp(-x));
-                }
-                low[(size_t) k * PR + r] = sum;
-            }
-            if (t == 0) tickets[rg] = 0u;
+            v2_down<T>(it, (int) it.get_group(0), (int) it.get_group(1), xs, last, qd, wi, xw, part, tickets, low,
+                       [] {}, [] {});
         });
     });
-    // 3. the up rows (gr_read_q8's 8-lane form): lo and x from the work buffer
+    // 3. the up rows
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float4, 1> lo(sycl::range<1>((size_t) T * LR / 4), h);
         sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) T * HC * UPM_COLS), h);
         const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<1>((size_t) UPM_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             tok.template stage<1, T>(m, it);
-            const sycl::sub_group sg = it.get_sub_group();
-            const int t = (int) it.get_local_id(0);
-            const int grp = (int) it.get_group(0), d0 = grp * UPM_COLS;
-            for (int i = t; i < T * LR / 4; i += THREADS) {
-                const int k = i / (LR / 4);
-                lo[i] = load4(low + (size_t) k * PR + 4 * (i - k * (LR / 4)));
-            }
-            if (grp == 0 && t < T * HC && m.a[0].w_inject != nullptr)
-                tok(m, t / HC).inject_out[t % HC] = low[(size_t) (t / HC) * PR + LR + t % HC];
-            sycl::group_barrier(it.get_group());
-            const int j = t & 7, g8 = t >> 3;
-#pragma unroll
-            for (int p = 0; p < 2; ++p) {
-                const int r = g8 + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
-                const uint8_t* qrow = m.a[0].q8_up + (size_t) i * Q8_ROW_U;
-                const uint16_t* drow = reinterpret_cast<const uint16_t*>(qrow + LR);
-                uint32_t wq[4][3];
-                uint16_t wd[4][3];
-#pragma unroll
-                for (int qq = 0; qq < 4; ++qq)
-#pragma unroll
-                    for (int st = 0; st < 3; ++st) {
-                        const int v = 4 * (j + 8 * qq) + 128 * st;
-                        wq[qq][st] = v < LR ? *reinterpret_cast<const uint32_t*>(qrow + v) : 0u;
-                        wd[qq][st] = v < LR ? drow[v / 32] : (uint16_t) 0;
-                    }
-                const float xv = j < T ? xw[(size_t) j * D + i] : 0.0f;
-                float mine = 0.0f;
-#pragma unroll
-                for (int k = 0; k < T; ++k) {
-                    float aq[4];
-#pragma unroll
-                    for (int qq = 0; qq < 4; ++qq) {
-                        float acc = 0.0f;
-#pragma unroll
-                        for (int st = 0; st < 3; ++st) {
-                            const int v = 4 * (j + 8 * qq) + 128 * st;
-                            if (v < LR) {
-                                const float4 w = q8_four(wq[qq][st], wd[qq][st]);
-                                const float4 x = lo[k * LR / 4 + v / 4];
-                                acc = sycl::fma(w.x(), x.x(), acc); acc = sycl::fma(w.y(), x.y(), acc);
-                                acc = sycl::fma(w.z(), x.z(), acc); acc = sycl::fma(w.w(), x.w(), acc);
-                            }
-                        }
-                        aq[qq] = acc;
-                    }
-                    float sum = (aq[0] + aq[2]) + (aq[1] + aq[3]);
-                    for (int o = 4; o > 0; o >>= 1) sum += strata_shfl_xor(sg, sum, o);
-                    if (j == k) mine = sum;
-                }
-                if (j < T) g[(j * HC + c) * UPM_COLS + dd] = xv * sigmoidf_(mine);
-            }
-            sycl::group_barrier(it.get_group());
-            for (int i = t; i < T * UPM_COLS; i += THREADS) {
-                const int k = i / UPM_COLS, col = i - k * UPM_COLS;
-                float sum = 0.0f;
-                for (int c = 0; c < HC; ++c) sum += g[(k * HC + c) * UPM_COLS + col];
-                tok(m, k).mixed[d0 + col] = sum / (float) HC;
-            }
+            v2_up<T>(it, (int) it.get_group(0), tok, m, lo, g, low, xw, [] {});
         });
     });
 }

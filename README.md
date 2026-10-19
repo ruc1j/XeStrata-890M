@@ -62,6 +62,10 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      default): the norm writes x = R' w_norm rs once into the stream's work buffer, the down product reads it with no
      token arguments, with 16-byte loads and 4 rows per sub-group (2 from 5 tokens on), the last work-group to finish
      adds the 20 column chunks' partials into lo, and the up product reads it (`STRATA_HC_V2=0`: the former two kernels).
+     The three run as one launch (`STRATA_HC_FUSE`, the default): a down work-group loads its rows and then waits for the
+     norm to finish, an up work-group loads its rows and then waits for the down sums, so the row loads overlap the step
+     before.  The down product stages x once per two row groups and loads the next row group while computing the
+     current one.  The same arithmetic, bit for bit (`STRATA_HC_FUSE=0`: three launches).
    - Sub-group xor exchanges through DPP and `v_permlanex16`.
    - The GDN step and commit stage the tokens' inputs in LDS first and take fewer barriers per token.
    - The GDN commit folded into the next window (`STRATA_GDN_DEFER`, the default): the commit only stashes the kept rows'
