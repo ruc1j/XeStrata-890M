@@ -66,6 +66,8 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      norm to finish, an up work-group loads its rows and then waits for the down sums, so the row loads overlap the step
      before.  The down product stages x once per two row groups and loads the next row group while computing the
      current one.  The same arithmetic, bit for bit (`STRATA_HC_FUSE=0`: three launches).
+   - The multi-token IQ4_XS GEMV (3 or more columns) stages the activations once per work-group of 8 rows in LDS
+     (`STRATA_MMVQ_LDS`, the default; each row's arithmetic unchanged, bit for bit; `STRATA_MMVQ_LDS=0`: the former form).
    - Sub-group xor exchanges through DPP and `v_permlanex16`.
    - The GDN step and commit stage the tokens' inputs in LDS first and take fewer barriers per token.
    - The GDN commit folded into the next window (`STRATA_GDN_DEFER`, the default): the commit only stashes the kept rows'

@@ -765,6 +765,72 @@ sycl::event launch_iq4xs_rows(sycl::queue& q, const void* weights, const void* x
     });
 }
 
+// IQ4_XS as launch_row with the work-group's activations in local memory (XeStrata-890M): launch_row's RPG row
+// sub-groups each read the columns' Q8_1 words from the caches again (2560 -> 10240 at four columns: ~118 MB through
+// the caches for 14 MB of weights); here the group stages them once, the quants 16-byte aligned and the scales apart.
+// Each row's sums as launch_row's, so every output is bitwise launch_row's.
+template<int NCOLS, int RPG>
+sycl::event launch_iq4xs_lds(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out,
+                             const void* weights2 = nullptr, float* y2 = nullptr) {
+    using F = IQ4XSTraits;
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int rows_all = weights2 ? 2 * n_out : n_out;
+    const std::size_t groups = (std::size_t(rows_all) + RPG - 1) / RPG;
+    const int nb = n_in / Q8K;   // Q8_1 blocks a column
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::int4, 1> xq(sycl::range<1>(std::size_t(NCOLS) * nb * 2), h);
+        sycl::local_accessor<float, 1> xd(sycl::range<1>(std::size_t(NCOLS) * nb), h);
+        h.parallel_for(sycl::nd_range<1>(groups * RPG * WARP, std::size_t(RPG) * WARP),
+                       [=](sycl::nd_item<1> it) STRATA_AMD_REQD_WG(RPG * WARP) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int t = (int) it.get_local_id(0);
+            for (int i = t; i < NCOLS * nb; i += RPG * WARP) {
+                const Q81Block* xb = x + i;   // column i / nb, block i % nb: the columns are contiguous
+                const int* qi = reinterpret_cast<const int*>(xb->qs);
+                xq[2 * i] = sycl::int4(qi[0], qi[1], qi[2], qi[3]);
+                xq[2 * i + 1] = sycl::int4(qi[4], qi[5], qi[6], qi[7]);
+                xd[i] = low(xb->ds);
+            }
+            sycl::group_barrier(it.get_group());
+            const sycl::sub_group sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id();
+            int row = (int) it.get_group(0) * RPG + (int) sg.get_group_linear_id();
+            if (row >= rows_all) return;
+            const void* wsrc = weights;
+            float* ydst = y;
+            if (row >= n_out) {
+                row -= n_out;
+                wsrc = weights2;
+                ydst = y2;
+            }
+            const auto* w = static_cast<const F::Block*>(wsrc);
+            const int blocks_per_row = n_in / F::DIV;
+            const int kqs = F::kqs(lane);
+            float tmp[NCOLS] = {};
+            for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += WARP / F::T) {
+                const F::W wv = F::load(w + std::size_t(row) * blocks_per_row + kbx, kqs);
+                #pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    const int b = j * nb + kbx * F::KBY + kqs / 4;
+                    const sycl::int4 a = xq[2 * b], c = xq[2 * b + 1];
+                    const int xv[8] = {a.x(), a.y(), a.z(), a.w(), c.x(), c.y(), c.z(), c.w()};
+                    int sumi = 0;
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        sumi = dp4a(wv.v[k].x, xv[k], sumi);
+                        sumi = dp4a(wv.v[k].y, xv[k + 4], sumi);
+                    }
+                    sumi *= wv.ls - 32;
+                    tmp[j] += wv.dw * xd[b] * sumi;
+                }
+            }
+            for (int j = 0; j < NCOLS; ++j) {
+                const float s = warp_sum(sg, tmp[j]);
+                if (lane == 0) ydst[std::size_t(j) * n_out + row] = s;
+            }
+        });
+    });
+}
+
 // STRATA_MMVQ_RPS=N (1, 2, 4): rows a sub-group in launch_row's place (launch_rows); 0 or unset: launch_row
 int mmvq_rps() {
     static const int v = [] {
@@ -772,6 +838,16 @@ int mmvq_rps() {
         return e != nullptr ? (int) std::strtol(e, nullptr, 10) : 0;
     }();
     return v;
+}
+
+// launch_iq4xs_lds in launch_row's place: 3 or more columns (at 1 and 2 it was slower or the same; 2560 -> 10240 at
+// 4 columns 79 -> 85 GB/s, 2560 -> 6144 73 -> 81) whose activations fit 32 KiB of local memory.  STRATA_MMVQ_LDS=0: off
+bool iq4xs_lds_fits(int ncols, int n_in) {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_MMVQ_LDS");
+        return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+    }();
+    return on && ncols >= 3 && (std::size_t) ncols * (n_in / Q8K) * 36 <= 32768;
 }
 
 template<typename F, int NCOLS>
@@ -792,6 +868,7 @@ void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y,
             if (rps == 12) { launch_iq4xs_rows<NCOLS, 8, 2>(q, weights, x_q8_1, y, n_in, n_out); return; }
             if (rps == 14) { launch_iq4xs_rows<NCOLS, 8, 4>(q, weights, x_q8_1, y, n_in, n_out); return; }
             if (rps == 18) { launch_iq4xs_rows<NCOLS, 4, 8>(q, weights, x_q8_1, y, n_in, n_out); return; }
+            if (iq4xs_lds_fits(NCOLS, n_in)) { launch_iq4xs_lds<NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out); return; }
         }
         if constexpr (!requires { F::load_row; }) {
             const int rps = mmvq_rps();
@@ -860,6 +937,19 @@ bool mmvq_pair(const void* w1, const void* w2, const void* x_q8_1, float* y1, fl
     auto& q = validate_stream(stream);
     const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
     if ((ncols > 1 && !g_multi_exact) || steps > 10) return false;
+    if constexpr (std::is_same_v<F, IQ4XSTraits>) {
+        if (iq4xs_lds_fits(ncols, n_in)) {
+            switch (ncols) {
+                case 3: launch_iq4xs_lds<3, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); return true;
+                case 4: launch_iq4xs_lds<4, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); return true;
+                case 5: launch_iq4xs_lds<5, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); return true;
+                case 6: launch_iq4xs_lds<6, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); return true;
+                case 7: launch_iq4xs_lds<7, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); return true;
+                case 8: launch_iq4xs_lds<8, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); return true;
+                default: break;
+            }
+        }
+    }
     switch (ncols) {
         case 1: launch_row<F, 1, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
         case 2: launch_row<F, 2, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;

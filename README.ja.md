@@ -66,6 +66,8 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
      up のワークグループは自分の行を読んでから down の和の終わりを待つので、行の読み込みが前の段と重なります。down は
      2 行グループで x を 1 回だけ載せ、次の行グループを読みながら今の行グループを計算します。計算は同じでビット単位で
      同じです（`STRATA_HC_FUSE=0` で 3 つの起動）。
+   - 複数トークンの IQ4_XS の GEMV（3 列以上）は、ワークグループの 8 行で活性を 1 回だけ LDS に載せて共有します
+     （`STRATA_MMVQ_LDS`、既定。各行の計算は同じでビット単位で同じ。`STRATA_MMVQ_LDS=0` で元の形）。
    - サブグループの xor の交換を DPP と `v_permlanex16` で行います。
    - GDN の step と commit は、トークンの入力を先に LDS へ載せ、トークンごとのバリアを減らします。
    - GDN の commit を次の窓に畳みます（`STRATA_GDN_DEFER`、既定）: commit は採用した行の k・v・gate・beta だけを退避し、
