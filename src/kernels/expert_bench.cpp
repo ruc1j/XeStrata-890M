@@ -42,7 +42,9 @@ int main(int argc, char** argv) {
     const auto L = strata::kernels::native_expert_layout(gu, d, n_embd, n_ff);
     const size_t blob = (L.bytes + 255) / 256 * 256;
     const size_t pool_n = (size_t) (4ull << 30) / blob;
-    uint8_t* pool = static_cast<uint8_t*>(strata::gpu::alloc_host(pool_n * blob));
+    // EXPERT_BENCH_NC=1: the pool in cached (non-coherent) host memory, as the engine's expert cache (STRATA_CACHE_HOST)
+    uint8_t* pool = static_cast<uint8_t*>(std::getenv("EXPERT_BENCH_NC") ? strata::gpu::alloc_host_cached(pool_n * blob)
+                                                                         : strata::gpu::alloc_host(pool_n * blob));
     if (!pool) { std::printf("host USM pool failed\n"); return 1; }
     std::mt19937_64 rng(77);
     for (size_t i = 0; i < pool_n * blob / 8; ++i) reinterpret_cast<uint64_t*>(pool)[i] = rng();

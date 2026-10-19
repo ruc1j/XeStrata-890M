@@ -1347,16 +1347,20 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
     });
 }
 
+// XeStrata-890M: 256 down rows a work-group (four passes of 64 with the entries' h staged once; 64 rows a group made
+// 40 groups an expert of 11.5 KB of weights each): a verify window's down 147 -> 133 us a layer on the 890M (512 the
+// same, 1,280 and 2,560 slower).  The same rows' code: the same bits.
+constexpr int kDownRows = 256;
 template<int TD, int LPR>
 sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                    const block_q8_1* hq, NativeExpertLayout L, float* out) {
     constexpr int RPW = kWarp / LPR, WG = 8 * kWarp;
-    static_assert(kM8Rows % (8 * RPW) == 0, "whole passes");
+    static_assert(kDownRows % (8 * RPW) == 0, "whole passes");
     const int hb = (int) (L.n_ff / 32);
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int, 1> sh(sycl::range<1>((size_t) kEntriesPass * hb * 9), h);
-        h.parallel_for(sycl::nd_range<2>({cap_groups, (size_t) ((L.n_embd + kM8Rows - 1) / kM8Rows) * WG}, {1, WG}),
+        h.parallel_for(sycl::nd_range<2>({cap_groups, (size_t) ((L.n_embd + kDownRows - 1) / kDownRows) * WG}, {1, WG}),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
             const int g = (int) it.get_group(0);
             if (g >= *n_groups) return;
@@ -1375,8 +1379,8 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
                 sycl::group_barrier(it.get_group());
                 const block_q8_1* xs[kEntriesPass];
                 for (int j = 0; j < kEntriesPass; ++j) xs[j] = shb + (size_t) (j < cn ? j : 0) * hb;
-                for (int p = 0; p < kM8Rows / (8 * RPW); ++p) {
-                    const int r0 = (int) it.get_group(1) * kM8Rows + (p * 8 + warp) * RPW;
+                for (int p = 0; p < kDownRows / (8 * RPW); ++p) {
+                    const int r0 = (int) it.get_group(1) * kDownRows + (p * 8 + warp) * RPW;
                     if (r0 >= L.n_embd) break;                                       // the whole sub-group
                     const int r = r0 + lane / LPR;
                     const bool valid = r < L.n_embd;
