@@ -100,6 +100,10 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
    - 必要なワークグループの大きさは QSA の prompt attention（PromptAttnMma: spill 83 → 0、3,474 トークンの attention 1.99 → 1.22 s）、
      GDN の key-head の recurrence（908 → 602 ms）、decode の密な GEMV と HC の読みにも付けてあります。
      prompt attention の p.v の累積は WMMA の累積器の配置のままレジスターに置き、staging のタイルとサブグループのバリアを外しています（1.22 → 1.15 s）。
+   - prompt の DeltaNet の再帰は 16 トークンのチャンクで RDNA3 の WMMA に載せます（`STRATA_GDN_CHUNKED`、既定、64 トークン以上）: 準備のカーネルが
+     各チャンクの T = (I + A)^-1 と P を先に作り、スキャンは value head ごとに状態を WMMA の累積器に持ちます。1 層の再帰と norm が
+     3,481 トークンで 14.4 → 8.0 ms、prefill は 2〜3% 短くなります。k・q・T・P と状態を FP16 に丸めるので、答えが変わることがあります
+     （20 の prompt の次のトークンの KL 平均 0.020、最も確率の高いトークンは同じ）。`STRATA_GDN_CHUNKED=0` で FP32 のカーネル。
    - 自身のカーネルは rocBLAS と足す順が違い、MMQ のスケールの fma も丸めが変わるので、答えが丸めの差で変わることがあります（`STRATA_BLAS=1` なら密な積は元のまま）。
 
 ## 必要なもの

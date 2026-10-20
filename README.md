@@ -105,6 +105,11 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
    - The required work-group size is stated for the QSA prompt attention too (PromptAttnMma: 83 spills -> 0, a 3,474-token
      prompt's attention 1.99 -> 1.22 s), for the GDN key-head recurrence (908 -> 602 ms) and for decode's dense GEMV and HC read.
      The prompt attention's p.v stays in the WMMA accumulators' layout in registers, without the staging tile and its sub-group barriers (1.22 -> 1.15 s).
+   - The prompt's DeltaNet recurrence runs in chunks of 16 tokens on RDNA3's WMMA (`STRATA_GDN_CHUNKED`, the default, 64 tokens
+     and more): a prep kernel computes each chunk's T = (I + A)^-1 and P first, and the scan keeps the state in the WMMA
+     accumulators per value head. One layer's recurrence and norm 14.4 -> 8.0 ms for 3,481 tokens, the prefill 2-3% shorter.
+     k, q, T, P and the state are rounded to FP16, so an answer can change (the next token's KL over 20 prompts 0.020 on
+     average, the most likely token the same). `STRATA_GDN_CHUNKED=0` gives the FP32 kernels.
    - The own kernel sums in another order than rocBLAS, and the MMQ's fma rounds its scales differently, so an answer can differ by rounding (`STRATA_BLAS=1` gives the old dense products).
 
 ## What you need

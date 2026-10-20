@@ -1226,13 +1226,14 @@ struct Gdn {
                            const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, bool silu, void* stream) {
         static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-group-per-head kernel (A/B)
         auto& q = Q(stream);
-        // STRATA_GDN_CHUNKED=1 (opt-in): the chunked recurrence on GFX11's matrix cores (gw above), other bits.  On the
-        // 890M (Qwen3.8 IQ2_XS) one layer's recurrence and norm take 8.0 ms for 3,481 tokens against 14.4 ms, the prompt
-        // 2-3% less time; the next token's KL after 20 prompts 0.020 (top-1 equal; run to run 0.0002).  Splitting the
-        // state into two FP16 operands left the error as it was (the rounding of k, q, T, P and D is most of it).
+        // STRATA_GDN_CHUNKED (the default; =0 the FP32 kernels below): the chunked recurrence on GFX11's matrix cores
+        // (gw above), other bits.  On the 890M (Qwen3.8 IQ2_XS) one layer's recurrence and norm take 8.0 ms for 3,481
+        // tokens against 14.4 ms, the prompt 2-3% less time; the next token's KL after 20 prompts 0.020 (top-1 equal;
+        // run to run 0.0002).  Splitting the state into two FP16 operands left the error as it was (the rounding of k,
+        // q, T, P and D is most of it).
         static const bool chunked = [] {
             const char* v = std::getenv("STRATA_GDN_CHUNKED");
-            return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
         if (chunked && !serial && rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, silu, q)) return;
         if (serial || T <= 0) {
