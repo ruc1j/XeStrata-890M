@@ -697,6 +697,10 @@ if(STRATA_ENABLE_XE)
     add_executable(resident_plan_parity src/kernels/resident_plan_parity.cpp)
     target_link_libraries(resident_plan_parity PRIVATE strata_kernels)
     add_test(NAME resident_plan_parity COMMAND resident_plan_parity)
+    # XeStrata-890M: the verify window's expert cap (STRATA_VERIFY_ECAP, upstream PR 3545) against its contract
+    add_executable(ecap_parity src/kernels/ecap_parity.cpp)
+    target_link_libraries(ecap_parity PRIVATE strata_kernels)
+    add_test(NAME ecap_parity COMMAND ecap_parity)
     # KV streaming: streamed vs resident attention, bitwise (synthetic, no model).
     add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
     target_link_libraries(kv_stream_parity PRIVATE strata_kernels)

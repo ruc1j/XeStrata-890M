@@ -1143,11 +1143,40 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                             "(an approximation)\n", n, n);
             return n;
         }();
+        // XeStrata-890M, STRATA_EXPERT_SER=Kmin,t (opt-in, changes the output): ik_llama.cpp's smart expert reduction
+        // (PR 239) on the same path: a token's Kmin heaviest experts, then only those at least t times its heaviest
+        static const std::pair<int, float> expert_ser = [] {
+            const char* v = std::getenv("STRATA_EXPERT_SER");
+            if (v == nullptr) return std::make_pair(0, 0.0f);
+            char* end = nullptr;
+            const int kmin = (int) std::strtol(v, &end, 10);
+            const float t = end != nullptr && *end == ',' ? std::strtof(end + 1, nullptr) : 0.0f;
+            if (kmin <= 0 || !(t > 0.0f) || t > 1.0f) {
+                std::fprintf(stderr, "strata verify: STRATA_EXPERT_SER=%s ignored (want Kmin,t with Kmin > 0 and 0 < t <= 1)\n", v);
+                return std::make_pair(0, 0.0f);
+            }
+            std::fprintf(stderr, "strata verify: STRATA_EXPERT_SER=%d,%.3g: each token's %d heaviest routed experts and those "
+                                 "weighing at least %.3g of its heaviest (an approximation)\n", kmin, t, kmin, t);
+            return std::make_pair(kmin, t);
+        }();
+        // XeStrata-890M, STRATA_VERIFY_ECAP=N (upstream PR 3545, opt-in, changes the output): the window's expert set
+        // capped before the plan - token 0 keeps its K picks, the speculative tail the top (N - K) entries by weight,
+        // the rest redirected onto kept experts at weight 0.  Inside the window graph.  Device-planned path only.
+        static const int verify_ecap_n = [] {
+            const char* v = std::getenv("STRATA_VERIFY_ECAP");
+            const int n = v != nullptr ? (int) std::strtol(v, nullptr, 10) : 0;
+            if (n > 0) std::fprintf(stderr, "strata verify: STRATA_VERIFY_ECAP=%d: a window reads token 0's experts and at "
+                                            "most %d more picks of its draft rows (an approximation)\n", n, n - 10);
+            return n;
+        }();
+        if (verify_ecap_n > (int) K && n > 1 && (device_plan_ || recording_res_))
+            verify_ecap(ids_ + tb * K, w_ + tb * K, n * (int) K, (int) K, verify_ecap_n, cs);
         if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
-                          (uint32_t) ((l - lb_) * G + grp + 1), cs, expert_keep, w_ + tb * K);
+                          (uint32_t) ((l - lb_) * G + grp + 1), cs, expert_keep, w_ + tb * K, expert_ser.first,
+                          expert_ser.second);
         if (!recording_res_)   // the resident graph asks the host nothing
             doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                              m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);

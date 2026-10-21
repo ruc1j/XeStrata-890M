@@ -110,7 +110,13 @@ bool gpu_stamp_available();
 /// routing order, their entries ascending), no PCIe groups.  *skip = ring when it did, else 0.
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream, int keep = 0, float* w = nullptr);
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, int keep = 0, float* w = nullptr,
+                   int ser_kmin = 0, float ser_t = 0.0f);
+/// STRATA_VERIFY_ECAP=N (upstream PR 3545, opt-in, changes the output): the verify window's expert set capped in
+/// place - token 0 keeps all k picks, the speculative tail (tokens 1..n-1) keeps the top (cap - k) entries by
+/// routing weight; a dropped entry is redirected round-robin onto a kept expert with weight 0 (no extra expert read,
+/// zero contribution).  No-op when n <= k or cap <= k.
+void verify_ecap(int32_t* ids, float* w, int n, int k, int cap, void* stream);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.

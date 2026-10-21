@@ -1046,13 +1046,63 @@ bool doorbell_visible(void* stream) {
     return ok;
 }
 
+// STRATA_VERIFY_ECAP (XeStrata-890M, upstream PR 3545's ecap_redirect_kernel in SYCL): token 0 keeps its k picks,
+// the speculative tail keeps the top (cap - k) entries by (weight desc, index asc), every other tail entry is
+// redirected round-robin onto a KEPT expert with weight 0 (its group reads no expert the kept set does not, and
+// every combine multiplies by w, so it adds exactly 0; spreading the drops over the kept groups keeps the grouped
+// GEMV balanced - one big group was slower upstream).  Work-item 0 decides serially in local memory (n <= 128
+// entries, no atomics), the barrier hands every work-item its verdict.
+void verify_ecap(int32_t* ids, float* w, int n, int k, int cap, void* stream) {
+    if (n <= k || cap <= k) return;
+    constexpr int WG = 128;
+    if (n > WG) throw std::invalid_argument("verify_ecap: more entries than a work-group");
+    const auto e = Q(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<int32_t, 1> s_keep(sycl::range<1>(WG), h);
+        sycl::local_accessor<int32_t, 1> s_verdict(sycl::range<1>(WG), h);   // >= 0: fold into kept group, < 0: as routed
+        sycl::local_accessor<int32_t, 1> s_nkeep(sycl::range<1>(1), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            const int t = (int) it.get_local_id(0);
+            if (t == 0) {
+                const int keep = cap - k;
+                int nkeep = 0;
+                for (int i = 0; i < n; ++i) s_verdict[i] = -1;
+                for (int i = 0; i < k; ++i) s_keep[nkeep++] = ids[i];   // token 0's picks, in index order
+                for (int sel = 0; sel < keep; ++sel) {   // the top-`keep` tail entries by (w desc, index asc)
+                    int best = -1;
+                    for (int j = k; j < n; ++j) {
+                        if (s_verdict[j] != -1) continue;
+                        if (best < 0 || w[j] > w[best]) best = j;
+                    }
+                    if (best < 0) break;
+                    s_verdict[best] = -2;   // kept by rank
+                    s_keep[nkeep++] = ids[best];
+                }
+                int fold = 0;
+                for (int j = k; j < n; ++j)
+                    if (s_verdict[j] == -1) s_verdict[j] = fold++ % nkeep;
+                s_nkeep[0] = nkeep;
+            }
+            sycl::group_barrier(it.get_group());
+            if (t >= n || s_nkeep[0] <= 0) return;
+            const int v = s_verdict[t];
+            if (v >= 0) { ids[t] = s_keep[v]; w[t] = 0.0f; }
+        });
+    });
+    done(stream, e, "verify_ecap");
+}
+
 void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
                    const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
-                   uint32_t ring, void* stream, int keep, float* w) {
+                   uint32_t ring, void* stream, int keep, float* w, int ser_kmin, float ser_t) {
     // XeStrata-890M (keep < k, STRATA_EXPERT_KEEP): each token's experts past rank `keep` are left out of the plan and
     // their weights set to 0, the kept ones scaled to the token's old sum (the router ranks them by weight, first the
     // largest).  An approximation: it changes the output.
+    // STRATA_EXPERT_SER=Kmin,t (ser_kmin > 0, ser_t > 0; ik_llama.cpp's smart expert reduction, PR 239): a token keeps
+    // its Kmin heaviest experts, and past them only those whose weight is at least t times its heaviest one; the
+    // weights are rescaled as with keep.  Also an approximation.
     if (keep <= 0 || keep > k) keep = k;
+    const bool ser = ser_kmin > 0 && ser_t > 0.0f && w != nullptr;
+    if (ser && ser_kmin > k) ser_kmin = k;
     // One work-item per entry (at most kVerifyMaxT * 10 of them; one work-item alone grouped them in ~70 us a layer,
     // upstream 882764d).  The plan is the host loop's exactly: groups in order of first occurrence, entries in a group
     // in index order.  Entry i: L = its expert's first index; its group = the first occurrences before L; the group
@@ -1065,7 +1115,8 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
         h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
             const auto grp = it.get_group();
             const int t = (int) it.get_local_id(0);
-            const bool use = t < n && t % k < keep;
+            bool use = t < n && t % k < keep;
+            if (ser && use && t % k >= ser_kmin) use = w[t] >= ser_t * w[t - t % k];   // read before any rescale
             bool bad = false;
             if (t < n) {
                 const int32_t ex = ids[t];
@@ -1076,11 +1127,14 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
                 if (t == 0) *skip = 0;
                 return;
             }
-            if (keep < k && w != nullptr && t < n && t % k == 0) {   // one work-item a token: its weights
-                float all = 0.0f, kept = 0.0f;
-                for (int j = 0; j < k; ++j) { all += w[t + j]; if (j < keep) kept += w[t + j]; }
-                const float scale = kept > 0.0f ? all / kept : 1.0f;
-                for (int j = 0; j < k; ++j) w[t + j] = j < keep ? w[t + j] * scale : 0.0f;
+            if ((keep < k || ser) && w != nullptr) {
+                sycl::group_barrier(grp);   // every entry's `use` (s_ids) is written, and no weight is read any more
+                if (t < n && t % k == 0) {   // one work-item a token: its weights
+                    float all = 0.0f, kept = 0.0f;
+                    for (int j = 0; j < k; ++j) { all += w[t + j]; if (s_ids[t + j] >= 0) kept += w[t + j]; }
+                    const float scale = kept > 0.0f ? all / kept : 1.0f;
+                    for (int j = 0; j < k; ++j) w[t + j] = s_ids[t + j] >= 0 ? w[t + j] * scale : 0.0f;
+                }
             }
             // an entry's leader L (its expert's first index) and, for a leader, its entry count; then one scan of
             // (entries << 16 | 1) over the leaders numbers the groups and gives their starts (upstream fe4de5de)

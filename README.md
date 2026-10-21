@@ -81,6 +81,15 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      the whole head).
    - A Japanese-and-English draft vocabulary (`data/draft_vocab_ja.bin`, 56,554 tokens): the speculative layer reads about half the bytes of the default vocabulary.
    - `STRATA_EXPERT_KEEP=N` (opt-in, changes the answers): only the N heaviest experts of each token are computed.
+   - `STRATA_EXPERT_SER=Kmin,t` (opt-in, changes the answers): each token computes only its Kmin heaviest experts and
+     those weighing at least t times its heaviest (ik_llama.cpp's SER). At 28 W, rt, --spec 4 over 6 chats, 6,0.2 gives
+     decode +1.4% (35.8 -> 36.3 tok/s; teacher-forced next-token KL 0.056, top-1 92.8%) and 4,0.4 +5.1% (KL 0.218,
+     top-1 83.6%). Against `STRATA_EXPERT_KEEP` at the same speed it is better at the mild end (keep 8: +0.8%, KL 0.074)
+     and worse at the strong end (keep 6: +9%, KL 0.18).
+   - `STRATA_VERIFY_ECAP=N` (opt-in, changes the answers): a speculation window's expert picks are capped to token 0's
+     and the N-10 heaviest picks of its draft rows (upstream PR #3545 ported). It does not pay on the 890M, whose windows
+     are short (3 rows on average): 16 / 20 / 26 decode at 36.0 / 36.4 / 36.0 tok/s (35.8 without), teacher-forced KL
+     0.456 / 0.275 / 0.136, draft acceptance 75% -> 69% (16).
 - **Prefill:**
    - At start the engine times oneMath's library (rocBLAS) against its own WMMA kernel for the dense products and takes the faster
      (HIP GPUs only). `STRATA_BLAS=1` keeps the library, `STRATA_NO_BLAS=1` the own kernel.
