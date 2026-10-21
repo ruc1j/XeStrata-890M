@@ -288,7 +288,9 @@ sde64 -version
   decode の `verify window` の行（ホストが GPU を待つ時間、CPU のプール）は、いつも出ます。
 - `STRATA_VERIFY_NODES=1` は、decode の窓のグラフに入るカーネルの数を出します。
 - SYCL のイベントのプロファイリングで単独のカーネルを測る使い捨てのプローブ。
-- `STRATA_VERIFY_PROFILE=1` はデバイス全体で共通の時計を必要とし、B70 にはそれがありません。
+- `STRATA_VERIFY_PROFILE=1` は decode の窓の段ごとの GPU 時間（`STRATA_DECODE_TIMING=1` と一緒に、要求ごとの
+  `strata decode GPU stages` の行）。デバイス全体で共通の時計を必要とし、B70 にはそれがありません。890M（HIP）では
+  GPU の REALTIME カウンター（100 MHz、1 M ticks = 10 ms）を読みます。計測中の decode は 1 割ほど遅くなります。
 
 ### xe ドライバーのカーネルのログ
 

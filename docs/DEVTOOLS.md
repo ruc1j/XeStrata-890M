@@ -288,7 +288,9 @@ sde64 -version
   The decode's `verify window` line (the host's wait for the GPU, the CPU pool) is always printed.
 - `STRATA_VERIFY_NODES=1` prints how many kernels a decode window's graph holds.
 - Scratch probes that time single kernels with SYCL event profiling.
-- `STRATA_VERIFY_PROFILE=1` needs a device-scope clock, which the B70 does not have.
+- `STRATA_VERIFY_PROFILE=1` gives the GPU time of each stage of a decode window (with `STRATA_DECODE_TIMING=1`, the
+  `strata decode GPU stages` line per request). It needs a device-scope clock, which the B70 does not have; on the 890M
+  (HIP) it reads the GPU's REALTIME counter (100 MHz, 1 M ticks = 10 ms). Decode is about a tenth slower while it runs.
 
 ### The xe driver's kernel log
 

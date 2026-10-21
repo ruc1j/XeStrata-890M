@@ -1692,6 +1692,10 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
         unsigned long long t;
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
         buf[i] = t;
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+        // XeStrata-890M: the HIP adapter reports no device-scope clock aspect; the GPU's constant-rate REALTIME
+        // counter (100 MHz on RDNA, HIP's wall_clock64) read by the kernel, so the stage profile works on AMD
+        buf[i] = (unsigned long long) __builtin_readsteadycounter();
 #elif defined(SYCL_EXT_ONEAPI_CLOCK)
         buf[i] = (unsigned long long) sycl::ext::oneapi::experimental::clock<
             sycl::ext::oneapi::experimental::clock_scope::device>();
@@ -1704,6 +1708,7 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream) {
 bool gpu_stamp_available() {
     const sycl::device d = core::Runtime::get().compute().get_device();
     if (d.get_backend() == sycl::backend::ext_oneapi_cuda) return true;   // %globaltimer
+    if (d.get_backend() == sycl::backend::ext_oneapi_hip) return true;    // XeStrata-890M: the REALTIME counter
 #ifdef SYCL_EXT_ONEAPI_CLOCK
     return d.has(sycl::aspect::ext_oneapi_clock_device);
 #else
