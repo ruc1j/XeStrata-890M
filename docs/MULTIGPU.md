@@ -28,7 +28,7 @@ List the GPUs in setup's `--gpus` (numbered as `--check` lists them; the first r
 
 setup writes the first GPU's PCI address in `"gpu_pci"` and the others' in `"split_pci"`, and the server passes
 `--layer-split` and `--split-device` to the engine.
-The engine's own options:
+The engine's own options are as follows.
 
 | Option | Meaning |
 | --- | --- |
@@ -67,7 +67,6 @@ The start-up log names the GPUs by these numbers, as `CUDA0`, `CUDA1` (upstream'
 - how fast each GPU reads its VRAM, and how much VRAM is free;
 - how fast the CPU reads the RAM (which sets the speed of the experts the CPU computes);
 - what each GPU holds: weights and sessions (both of its own layers only), the output head (the last GPU), and the room the prefill path keeps.
-
 - each GPU's link (how fast the host copies to it).
 
 From these it works out how many experts each GPU holds and, filling the caches in the order of `--expert-profile`,
@@ -93,7 +92,7 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
   The log shows which one wins (`as a helper expert cache instead: ... -> the helper`).
   With `--pipeline-windows`, `--no-pool` or `--batch` the split stays.
 
-Environment variables change the model's assumptions:
+Environment variables change the model's assumptions.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -175,8 +174,8 @@ Only the last stage waits for the verdict.
 It works with a split of two or more stages, each on its own GPU, and `--serve`.
 With three or more stages `--pipeline-windows 2` turns `--adapt-async` off, and the adaptive tier runs at a verdict.
 
-- **Cost**: a second verify window on each GPU, 160 MiB more kept out of each GPU's expert cache, and with `2` two copies of the recurrent state on every GPU before the last stage (about 3 MiB per GDN layer of that GPU).
-- **The text**: the last GPU only runs windows that are verified, and picks the tokens by the serial loop's rules.
+- Cost: a second verify window on each GPU, 160 MiB more kept out of each GPU's expert cache, and with `2` two copies of the recurrent state on every GPU before the last stage (about 3 MiB per GDN layer of that GPU).
+- The text: the last GPU only runs windows that are verified, and picks the tokens by the serial loop's rules.
   The windows are cut differently from the serial loop's, though, and a verify window's rounding can depend on how many rows it holds, so even greedy output can flip a near-tie.
   The serial loop's output changes the same way with another `--spec` or `--spec-min-p` (B70 + RTX 4070, IQ2_XS, `STRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 0`, the expert caches matched: 2 of 3 answers; the same on the B70 alone).
   The pipeline keeps its VRAM out of the caches, so against a run without the flag a few experts move from a GPU to the CPU, which rounds them differently, and a near-tie can flip.
@@ -190,7 +189,7 @@ With three or more stages `--pipeline-windows 2` turns `--adapt-async` off, and 
 
 ## Measurements
 
-Arc Pro B70 (32 GB) and RTX 4070 (12 GB, PCIe x4), Core i7-14700, 128 tokens of decode:
+Arc Pro B70 (32 GB) and RTX 4070 (12 GB, PCIe x4), Core i7-14700, 128 tokens of decode
 
 | Model | B70 alone | B70 + 4070 (`--layer-split auto`) |
 | --- | --- | --- |
@@ -200,14 +199,14 @@ Arc Pro B70 (32 GB) and RTX 4070 (12 GB, PCIe x4), Core i7-14700, 128 tokens of 
 
 For IQ2_XS, K=38 by hand was about 3% faster than auto's choice.
 
-A prompt of about 5,000 tokens (the second prompt of the process):
+A prompt of about 5,000 tokens (the second prompt of the process)
 
 | Model | B70 alone | B70 + 4070 |
 | --- | --- | --- |
 | IQ3_S | 4,884 ms | 5,110 ms (K=36) |
 | IQ2_XS | 4,439 ms | 4,208 ms (K=45), 3,661 ms (K=42) |
 
-Eight conversations decoded together (IQ3_S, `--batch 8`, `--layer-split auto`, speed from the first batch token):
+Eight conversations decoded together (IQ3_S, `--batch 8`, `--layer-split auto`, speed from the first batch token)
 
 | Configuration | Speed |
 | --- | --- |
@@ -217,7 +216,7 @@ Eight conversations decoded together (IQ3_S, `--batch 8`, `--layer-split auto`, 
 | split, `--batch-groups 4` | 64.9 tok/s |
 | split, `--batch-groups 2 --batch-cpu-split 10,9` | 71.8 tok/s |
 
-`--pipeline-windows 2` (IQ2_XS, 32K context, 256 tokens after a prompt of about 4,900 tokens and three short chats, greedy, two interleaved runs each):
+`--pipeline-windows 2` (IQ2_XS, 32K context, 256 tokens after a prompt of about 4,900 tokens and three short chats, greedy, two interleaved runs each)
 
 | Split | Serial | `--pipeline-windows 2` |
 | --- | --- | --- |

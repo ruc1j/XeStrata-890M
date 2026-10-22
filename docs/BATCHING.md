@@ -119,7 +119,7 @@ Four scripts drive a built engine or a running server; each exits non-zero on a 
 | `tools/parking_test.py` | a follow-up to a conversation decodes the same tokens whether its state stayed live or came back from the parking cache. |
 | `tools/early_close_test.py` | a client that stops reading a streamed answer early (alone, and with a second request running) does not leave its tokens to the next request (server). |
 
-For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000`:
+For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000`.
 
 ```sh
 python3 tools/batch_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json --batch 3 --n 3 \
@@ -135,7 +135,7 @@ All four passed on the B70 (IQ2_XS, contrib-llvm build) on 2026-10-06.
 
 ## Engine protocol (`--serve`)
 
-On top of `GEN` / `GENI`:
+On top of `GEN` / `GENI`, the engine uses these lines.
 
 | Line | Direction | Meaning |
 | --- | --- | --- |
