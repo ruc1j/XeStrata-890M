@@ -59,27 +59,34 @@ struct GdnPending {
     const float* gate = nullptr;
     const float* beta = nullptr;
     const int32_t* n = nullptr;
+    /// XeStrata-890M (STRATA_GDN_ACC): the step writes the state back, and the window clears the rows, only once the
+    /// pending rows reach this count; below it the state stays as read and the next commit appends its rows
+    /// (gdn_pending_stash).  1: after every window that has rows.
+    int write_at = 1;
 };
 /// gdn_step_norm_multi's verify form (n_keep == nullptr) or one-token commit, with the pending rows run first (the
 /// split form always).
 void gdn_step_norm_pending(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                            const int32_t* n_keep, void* stream, int t_out_begin, void* y_q8_1, const GdnPending& pend);
-/// The first *n_keep rows of `n_layers` layers into the pending buffers (same layout), then *pn = *n_keep.
+/// The first *n_keep rows of `n_layers` layers appended to the pending buffers (layer z at z * rows rows, after the
+/// *pn rows there), then *pn += *n_keep.  The caller keeps *pn + *n_keep <= rows (STRATA_GDN_ACC: rows = write_at - 1
+/// + max_t).
 void gdn_pending_stash(const float* h, const float* gate, const float* beta, int conv_channels, int h_k, int h_v,
-                       int max_t, int n_layers, const int32_t* n_keep, float* ph, float* pg, float* pb, int32_t* pn,
-                       void* stream);
+                       int max_t, int rows, int n_layers, const int32_t* n_keep, float* ph, float* pg, float* pb,
+                       int32_t* pn, void* stream);
 /// gdn_commit_layers with the recurrence state left to the next window: the conv histories as there, the rows stashed
 /// (gdn_pending_stash; `h`, `gate`, `beta` at layer stride max_t rows).
 void gdn_commit_layers_deferred(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
                                 const float* h, const float* gate, const float* beta, int conv_channels, int h_k, int h_v,
-                                int max_t, int n_layers, const int32_t* n_keep, float* ph, float* pg, float* pb, int32_t* pn,
-                                void* stream);
-/// The pending rows into the states (layer z at state + z * state_stride; gdn_state_commit), then *pend.n = 0.
-void gdn_pending_flush(float* state, int64_t state_stride, int conv_channels, int h_k, int h_v, int max_t, int n_layers,
+                                int max_t, int rows, int n_layers, const int32_t* n_keep, float* ph, float* pg, float* pb,
+                                int32_t* pn, void* stream);
+/// The pending rows (layer z at z * rows rows) into the states (layer z at state + z * state_stride;
+/// gdn_state_commit), then *pend.n = 0.
+void gdn_pending_flush(float* state, int64_t state_stride, int conv_channels, int h_k, int h_v, int rows, int n_layers,
                        const GdnPending& pend, void* stream);
-/// *pn = 0 (a window has run the pending rows).
-void gdn_pending_clear(int32_t* pn, void* stream);
+/// *pn = 0 where *pn >= write_at (a window has run the pending rows and written the state; GdnPending::write_at).
+void gdn_pending_clear(int32_t* pn, int write_at, void* stream);
 /// (`y_q8_1`: the outputs from t_out_begin on also as native_quantize_q8_1 writes them, value_dim per token - the same
 /// bytes, a launch fewer; upstream 22abb92d's QFUSE.)
 /// Times gdn_step_norm_multi's forms (the same bits) on the stream's device for every window size and keeps the

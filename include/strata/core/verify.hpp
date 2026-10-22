@@ -487,6 +487,8 @@ private:
     strata::gpu::Graph* commit_def_exec_ = nullptr;
     float *pend_h_ = nullptr, *pend_g_ = nullptr, *pend_b_ = nullptr;
     int32_t* pend_n_ = nullptr;
+    int pend_rows_ = 0;          ///< a layer's rows in pend_h_ / pend_g_ / pend_b_: max_t_ + gdn_acc_ - 1
+    int gdn_acc_ = 1;            ///< STRATA_GDN_ACC: the steps write the state back at this many pending rows
     int defer_graphs_ = -1;      ///< -1 undecided (the first capture decides), 0 / 1: the window graphs carry the rows
     bool gdn_defer_ = false;     ///< set_gdn_defer
     bool gdn_pend_ = false;      ///< rows stashed that no window has run yet

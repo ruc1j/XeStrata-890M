@@ -6,6 +6,7 @@
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/runtime.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -144,6 +145,29 @@ bool gdn_defer_env() {
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     return on;
+}
+// XeStrata-890M: STRATA_GDN_ACC=K (with the deferred commit): the stashed rows accumulate over windows, and a window's
+// step writes the GDN state back only once K rows are pending (the rows run on the state in registers either way, in
+// the same order, so the state and the outputs are bitwise those of a write after every window).  0 or 1: the write
+// after every window that kept rows.  Unset: 6 on an integrated GPU on the HIP backend, 1 elsewhere.  Measured on
+// the 890M (28 W, windows of about 3 kept rows): a layer's write costs about 40 us and every row run again about 5 us,
+// so the write every second window pays (+0.7% decode at 6), every fourth does not (12: -0.3%, 24: -1.0%); the balance
+// depends on the device's write bandwidth against its per-row latency, so other GPUs keep the write every window.
+int gdn_acc_env() {
+    static const int k = [] {
+        const char* v = std::getenv("STRATA_GDN_ACC");
+        long n = 1;
+        if (v != nullptr) n = std::strtol(v, nullptr, 10);
+        else {
+            const sycl::device& d = Runtime::get().device();
+            if (d.get_backend() == sycl::backend::ext_oneapi_hip && integrated_gpu(d)) n = 6;
+        }
+        const int k = n < 1 ? 1 : n > 4096 ? 4096 : (int) n;
+        if (k > 1 && gdn_defer_env())
+            std::fprintf(stderr, "strata verify: the GDN state is written back once %d kept rows are pending (STRATA_GDN_ACC)\n", k);
+        return k;
+    }();
+    return k;
 }
 // the head's hyper-connection read for the window's tokens in one fused_gr_read_multi (upstream edc592b1: its sums
 // are gr_read's); STRATA_HEAD_MIX_MULTI=0: gr_read per token
@@ -463,8 +487,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
-        if (gdn_defer_env() && nG > 0) {
-            pend_h_ = b.take<float>(nG * T * C); pend_g_ = b.take<float>(nG * T * HV); pend_b_ = b.take<float>(nG * T * HV);
+        if (gdn_defer_env() && nG > 0) {   // a layer's rows: up to K - 1 pending and a window's T more (gdn_acc_env)
+            gdn_acc_ = gdn_acc_env();
+            pend_rows_ = (int) T + gdn_acc_ - 1;
+            const uint64_t PR = (uint64_t) pend_rows_;
+            pend_h_ = b.take<float>(nG * PR * C); pend_g_ = b.take<float>(nG * PR * HV); pend_b_ = b.take<float>(nG * PR * HV);
             pend_n_ = b.take<int32_t>(4);
         }
     };
@@ -869,9 +896,10 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                             t - first, nullptr, cs, 0,
                                             qfuse ? (void*) (xq_ + (size_t) (first - tb) * (ZV / 32) * 36) : nullptr);
                     }
-                } else if (defer_ok()) {   // the previous window's kept rows first (set_gdn_defer)
-                    const GdnPending pd{pend_h_ + (size_t) gi * MT * C, pend_g_ + (size_t) gi * MT * HV,
-                                        pend_b_ + (size_t) gi * MT * HV, pend_n_};
+                } else if (defer_ok()) {   // the previous windows' kept rows first (set_gdn_defer, STRATA_GDN_ACC)
+                    const size_t PR = (size_t) pend_rows_;
+                    const GdnPending pd{pend_h_ + (size_t) gi * PR * C, pend_g_ + (size_t) gi * PR * HV,
+                                        pend_b_ + (size_t) gi * PR * HV, pend_n_, self_commit ? 1 : gdn_acc_};
                     gdn_step_norm_pending(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                           (int) HV, te, self_commit ? one_ : nullptr, cs, tb, qfuse ? (void*) xq_ : nullptr,
                                           pd);
@@ -1475,7 +1503,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
-    if (!batch_rec_ && defer_ok()) gdn_pending_clear(pend_n_, cs);   // every GDN layer has run the pending rows
+    // every GDN layer has run the pending rows; they are cleared where the steps wrote the state (STRATA_GDN_ACC: at
+    // gdn_acc_ rows; a one-token window that commits itself always)
+    if (!batch_rec_ && defer_ok()) gdn_pending_clear(pend_n_, self_commit ? 1 : gdn_acc_, cs);
     stamp(g.n_layers, 1, 0);
     return true;
 }
@@ -1494,13 +1524,13 @@ bool Verifier::flush_gdn(std::string& err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
-    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, MT = max_t_;
+    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads;
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     try {   // every layer's (defer_ok: one stage holds them all)
         const GdnPending pd{pend_h_, pend_g_, pend_b_, pend_n_};
         gdn_pending_flush(ss.gdn_state - (size_t) ss.gdn_ord0 * gdn_floats, (int64_t) gdn_floats, (int) C,
-                          (int) g.ssm_k_heads, (int) HV, (int) MT, (int) g.n_gdn_layers(), pd, cs_);
+                          (int) g.ssm_k_heads, (int) HV, pend_rows_, (int) g.n_gdn_layers(), pd, cs_);
     } catch (const std::exception& e) {
         err = std::string("verify: GDN flush: ") + e.what();
         return false;
@@ -1663,9 +1693,10 @@ bool Verifier::capture_commit(std::string& err, bool defer) {
                     ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
                     (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
                     MT * C, h_L_ + (size_t) gdn_index * MT * C, gate_L_ + (size_t) gdn_index * MT * HV,
-                    beta_L_ + (size_t) gdn_index * MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT, (int) n_gdn,
-                    commit_, pend_h_ + (size_t) gdn_index * MT * C, pend_g_ + (size_t) gdn_index * MT * HV,
-                    pend_b_ + (size_t) gdn_index * MT * HV, pend_n_, cs_);
+                    beta_L_ + (size_t) gdn_index * MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT, pend_rows_,
+                    (int) n_gdn, commit_, pend_h_ + (size_t) gdn_index * pend_rows_ * C,
+                    pend_g_ + (size_t) gdn_index * pend_rows_ * HV, pend_b_ + (size_t) gdn_index * pend_rows_ * HV, pend_n_,
+                    cs_);
                 gdn_batched = true;
             } else if (ok && n_gdn > 0)
                 gdn_batched = gdn_commit_layers(

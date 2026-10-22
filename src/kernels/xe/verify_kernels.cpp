@@ -256,6 +256,7 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
     // (four barriers and its loads, one after another, before); the arithmetic and its order are unchanged: bitwise
     const float *ph = pend ? pend->h : nullptr, *pg = pend ? pend->gate : nullptr, *pb = pend ? pend->beta : nullptr;
     const int32_t* pn = pend ? pend->n : nullptr;
+    const int write_at = pend ? sycl::max(pend->write_at, 1) : 1;   // STRATA_GDN_ACC: the state written at this many rows
     q.submit([&](sycl::handler& hd) {
         const size_t mt = (size_t) T;   // the pending rows go through in chunks of T
         sycl::local_accessor<float, 1> sk(sycl::range<1>(mt * S), hd), sq(sycl::range<1>(mt * S), hd),
@@ -305,7 +306,9 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
                 }
                 sycl::group_barrier(it.get_group());   // the next chunk's or the window's staging reuses sk, sv, sg
             }
-            if (np > 0 && (n_keep == nullptr || n <= 0))   // (a window that keeps its rows writes the state at its end)
+            // (a window that keeps its rows writes the state at its end; STRATA_GDN_ACC: below write_at rows the state
+            // stays as read, and the next window runs these rows again, after the ones its commit appends)
+            if (np >= write_at && (n_keep == nullptr || n <= 0))
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
             for (int i = tid; i < n * S; i += GS_COLS * RG) {
@@ -452,7 +455,7 @@ sycl::event gdn_state_commit(sycl::queue& q, float* state0, const float* hbuf0, 
         hd.parallel_for(sycl::nd_range<1>((size_t) n_layers * per_layer * GS_COLS * RG, (size_t) GS_COLS * RG),
                         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const int n = *n_keep;
-            if (n <= 0 || n > (int) mt) return;   // the whole launch
+            if (n <= 0) return;   // the whole launch
             const int z = (int) it.get_group(0) / per_layer;   // the layer (upstream 6f3e3810's batched commit)
             float* state = state0 + (size_t) z * (size_t) state_stride;
             const float* hbuf = hbuf0 + (size_t) z * (size_t) h_stride;
@@ -467,27 +470,34 @@ sycl::event gdn_state_commit(sycl::queue& q, float* state0, const float* hbuf0, 
             const size_t row_stride = (size_t) h_v * S;
             #pragma unroll
             for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
-            for (int i = tid; i < n * S; i += GS_COLS * RG) sk[i] = hbuf[(size_t) (i / S) * C + qk + qh * S + i % S];
-            for (int i = tid; i < n * GS_COLS; i += GS_COLS * RG)
-                sv[i] = hbuf[(size_t) (i / GS_COLS) * C + 2 * qk + head * S + c0 + i % GS_COLS];
-            if (tid < n) {
-                sg[2 * tid] = sycl::exp(gate[(size_t) tid * h_v + head]);
-                sg[2 * tid + 1] = beta[(size_t) tid * h_v + head];
-            }
-            sycl::group_barrier(it.get_group());
-            for (int t = 0; t < n; ++t) {
-                const float* kt = &sk[(size_t) t * S];
-                float* rk = &red[(size_t) t * RG * GS_COLS];
-                const float g = sg[2 * t];
-                float kv = 0.0f;
-                #pragma unroll
-                for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], kt[rg * RPG + r], kv);
-                rk[rg * GS_COLS + lc] = kv;
+            // the rows in chunks of mt (more than mt only in a flush of accumulated rows, STRATA_GDN_ACC): each row's
+            // arithmetic as in one pass
+            for (int p0 = 0; p0 < n; p0 += (int) mt) {
+                const int pc = sycl::min(n - p0, (int) mt);
+                const float* hp = hbuf + (size_t) p0 * C;
+                for (int i = tid; i < pc * S; i += GS_COLS * RG) sk[i] = hp[(size_t) (i / S) * C + qk + qh * S + i % S];
+                for (int i = tid; i < pc * GS_COLS; i += GS_COLS * RG)
+                    sv[i] = hp[(size_t) (i / GS_COLS) * C + 2 * qk + head * S + c0 + i % GS_COLS];
+                if (tid < pc) {
+                    sg[2 * tid] = sycl::exp(gate[(size_t) (p0 + tid) * h_v + head]);
+                    sg[2 * tid + 1] = beta[(size_t) (p0 + tid) * h_v + head];
+                }
                 sycl::group_barrier(it.get_group());
-                const float kv_col = rk[lc] + rk[GS_COLS + lc] + rk[2 * GS_COLS + lc] + rk[3 * GS_COLS + lc];
-                const float delta = (sv[t * GS_COLS + lc] - g * kv_col) * sg[2 * t + 1];
-                #pragma unroll
-                for (int r = 0; r < RPG; ++r) s[r] = sycl::fma(g, s[r], kt[rg * RPG + r] * delta);
+                for (int t = 0; t < pc; ++t) {
+                    const float* kt = &sk[(size_t) t * S];
+                    float* rk = &red[(size_t) t * RG * GS_COLS];
+                    const float g = sg[2 * t];
+                    float kv = 0.0f;
+                    #pragma unroll
+                    for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], kt[rg * RPG + r], kv);
+                    rk[rg * GS_COLS + lc] = kv;
+                    sycl::group_barrier(it.get_group());
+                    const float kv_col = rk[lc] + rk[GS_COLS + lc] + rk[2 * GS_COLS + lc] + rk[3 * GS_COLS + lc];
+                    const float delta = (sv[t * GS_COLS + lc] - g * kv_col) * sg[2 * t + 1];
+                    #pragma unroll
+                    for (int r = 0; r < RPG; ++r) s[r] = sycl::fma(g, s[r], kt[rg * RPG + r] * delta);
+                }
+                sycl::group_barrier(it.get_group());   // the next chunk's staging reuses sk, sv, sg
             }
             #pragma unroll
             for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
@@ -893,12 +903,15 @@ void gdn_step_norm_pending(float* state, const float* hbuf, int C, const float* 
 }
 
 void gdn_pending_stash(const float* h, const float* gate, const float* beta, int C, int h_k, int h_v, int max_t,
-                       int n_layers, const int32_t* n_keep, float* ph, float* pg, float* pb, int32_t* pn, void* stream) {
-    if (!h || !gate || !beta || !ph || !pg || !pb || !pn || !n_keep || n_layers <= 0 || max_t < 1 || max_t > kVerifyMaxT)
+                       int rows, int n_layers, const int32_t* n_keep, float* ph, float* pg, float* pb, int32_t* pn,
+                       void* stream) {
+    if (!h || !gate || !beta || !ph || !pg || !pb || !pn || !n_keep || n_layers <= 0 || max_t < 1 || max_t > kVerifyMaxT ||
+        rows < max_t)
         fail("gdn_pending_stash: invalid arguments");
     auto& q = Q(stream);
     // the kept rows' k and v (columns [S*h_k, C) of each row; q is not read by the recurrence) in float4s, and their
-    // gate and beta; then the count, which the next window's steps read
+    // gate and beta, after the rows already pending (STRATA_GDN_ACC; none without it); then the count, which the
+    // next window's steps read - added by a launch of its own, after every work-item has read the old count
     const int qk = S * h_k, row4 = (C - qk) / 4, per_layer = max_t * (row4 + 2 * h_v);
     if ((C - qk) % 4 != 0 || qk % 4 != 0) fail("gdn_pending_stash: the k|v columns are not float4-aligned");
     const size_t total = (size_t) n_layers * per_layer;
@@ -906,45 +919,46 @@ void gdn_pending_stash(const float* h, const float* gate, const float* beta, int
         const size_t i = it.get_global_id(0);
         if (i >= total) return;
         const int n = *n_keep;
-        if (i == 0) *pn = n;
+        const int off = *pn;
         const int z = (int) (i / per_layer), r = (int) (i % per_layer);
         if (r < max_t * row4) {
             const int t = r / row4, c = r % row4;
-            if (t >= n) return;
-            const size_t at = ((size_t) z * max_t + t) * C + qk;
-            reinterpret_cast<sycl::float4*>(ph + at)[c] = reinterpret_cast<const sycl::float4*>(h + at)[c];
+            if (t >= n || off + t >= rows) return;
+            reinterpret_cast<sycl::float4*>(ph + ((size_t) z * rows + off + t) * C + qk)[c] =
+                reinterpret_cast<const sycl::float4*>(h + ((size_t) z * max_t + t) * C + qk)[c];
         } else {
             const int e = r - max_t * row4, which = e / (max_t * h_v), k = e % (max_t * h_v);
-            if (k / h_v >= n) return;
-            const size_t at = (size_t) z * max_t * h_v + k;
-            (which == 0 ? pg : pb)[at] = (which == 0 ? gate : beta)[at];
+            if (k / h_v >= n || off + k / h_v >= rows) return;
+            (which == 0 ? pg : pb)[((size_t) z * rows + off) * h_v + k] =
+                (which == 0 ? gate : beta)[(size_t) z * max_t * h_v + k];
         }
     });
+    q.single_task([=] { *pn = sycl::min(*pn + *n_keep, rows); });
     done(stream, q.ext_oneapi_submit_barrier(), "gdn_pending_stash");
 }
 
 void gdn_commit_layers_deferred(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
                                 const float* h, const float* gate, const float* beta, int conv_channels, int h_k, int h_v,
-                                int max_t, int n_layers, const int32_t* n_keep, float* ph, float* pg, float* pb, int32_t* pn,
-                                void* stream) {
+                                int max_t, int rows, int n_layers, const int32_t* n_keep, float* ph, float* pg, float* pb,
+                                int32_t* pn, void* stream) {
     if (!state || n_layers <= 0) fail("gdn_commit_layers_deferred: invalid arguments");
     gdn_conv_commit_layers(state + conv_off, state_stride, qkv, qkv_stride, conv_channels, n_layers, n_keep, stream);
-    gdn_pending_stash(h, gate, beta, conv_channels, h_k, h_v, max_t, n_layers, n_keep, ph, pg, pb, pn, stream);
+    gdn_pending_stash(h, gate, beta, conv_channels, h_k, h_v, max_t, rows, n_layers, n_keep, ph, pg, pb, pn, stream);
 }
 
-void gdn_pending_flush(float* state, int64_t state_stride, int C, int h_k, int h_v, int max_t, int n_layers,
+void gdn_pending_flush(float* state, int64_t state_stride, int C, int h_k, int h_v, int rows, int n_layers,
                        const GdnPending& pend, void* stream) {
-    if (!state || !pend.h || !pend.gate || !pend.beta || !pend.n || n_layers <= 0 || max_t < 1 || max_t > kVerifyMaxT)
+    if (!state || !pend.h || !pend.gate || !pend.beta || !pend.n || n_layers <= 0 || rows < 1)
         fail("gdn_pending_flush: invalid arguments");
     auto& q = Q(stream);
     gdn_state_commit(q, state, pend.h, C, pend.gate, pend.beta, h_k, h_v, pend.n, n_layers, state_stride,
-                     (int64_t) max_t * C, (int64_t) max_t * h_v);
-    gdn_pending_clear(const_cast<int32_t*>(pend.n), stream);
+                     (int64_t) rows * C, (int64_t) rows * h_v);
+    gdn_pending_clear(const_cast<int32_t*>(pend.n), 1, stream);
 }
 
-void gdn_pending_clear(int32_t* pn, void* stream) {
-    if (!pn) fail("gdn_pending_clear: invalid arguments");
-    done(stream, Q(stream).single_task([=] { *pn = 0; }), "gdn_pending_clear");
+void gdn_pending_clear(int32_t* pn, int write_at, void* stream) {
+    if (!pn || write_at < 1) fail("gdn_pending_clear: invalid arguments");
+    done(stream, Q(stream).single_task([=] { if (*pn >= write_at) *pn = 0; }), "gdn_pending_clear");
 }
 
 bool graph_branch_pays(void* stream, void* side0, void* side1) {

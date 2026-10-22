@@ -75,16 +75,16 @@ int main(int argc, char** argv) {
     }
     {   // the commit folded into the next window (gdn_step_norm_pending) against step + commit + step: the second
         // window's outputs and the state after it, bit for bit, and the time a layer of each
-        const int TA = 4, NA = 3, TB = 3;
+        const int TA = 4, NA = 3, TB = 3, ROWS = 4 * MT;   // the pending buffers hold ROWS rows (STRATA_GDN_ACC)
         float *d_s1, *d_s2, *d_y1, *d_y2, *d_ph, *d_pg, *d_pb;
         int32_t *d_na, *d_pn;
         strata::gpu::alloc_device(&d_s1, n_state * 4);
         strata::gpu::alloc_device(&d_s2, n_state * 4);
         strata::gpu::alloc_device(&d_y1, z.size() * 4);
         strata::gpu::alloc_device(&d_y2, z.size() * 4);
-        strata::gpu::alloc_device(&d_ph, h.size() * 4);
-        strata::gpu::alloc_device(&d_pg, gate.size() * 4);
-        strata::gpu::alloc_device(&d_pb, beta.size() * 4);
+        strata::gpu::alloc_device(&d_ph, (size_t) ROWS * C * 4);
+        strata::gpu::alloc_device(&d_pg, (size_t) ROWS * HV * 4);
+        strata::gpu::alloc_device(&d_pb, (size_t) ROWS * HV * 4);
         strata::gpu::alloc_device(&d_na, 4);
         strata::gpu::alloc_device(&d_pn, 4);
         const int32_t na = NA, zero = 0;
@@ -100,9 +100,10 @@ int main(int argc, char** argv) {
         // A then stash, B with the pending rows
         strata::kernels::gdn_step_norm_pending(d_s2, d_h, C, d_g, d_b, d_z, d_gm, 1e-6f, d_y2, HK, HV, TA, nullptr, s, 0,
                                                nullptr, pd);
-        strata::kernels::gdn_pending_stash(d_h, d_g, d_b, C, HK, HV, MT, 1, d_na, d_ph, d_pg, d_pb, d_pn, s);
+        strata::kernels::gdn_pending_stash(d_h, d_g, d_b, C, HK, HV, MT, ROWS, 1, d_na, d_ph, d_pg, d_pb, d_pn, s);
         strata::kernels::gdn_step_norm_pending(d_s2, d_h + C, C, d_g + HV, d_b + HV, d_z, d_gm, 1e-6f, d_y2, HK, HV, TB,
                                                nullptr, s, 0, nullptr, pd);
+        strata::kernels::gdn_pending_clear(d_pn, 1, s);
         strata::gpu::stream_sync(s);
         std::vector<float> a(n_state), b(n_state), ya((size_t) TB * S * HV), yb(ya.size());
         strata::gpu::copy(a.data(), d_s1, n_state * 4);
@@ -113,8 +114,8 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < n_state; ++i) ds += std::memcmp(&a[i], &b[i], 4) != 0;
         for (size_t i = 0; i < ya.size(); ++i) dy += std::memcmp(&ya[i], &yb[i], 4) != 0;
         // and a flush of a stash: the commit's state
-        strata::kernels::gdn_pending_stash(d_h + C, d_g + HV, d_b + HV, C, HK, HV, MT, 1, d_na, d_ph, d_pg, d_pb, d_pn, s);
-        strata::kernels::gdn_pending_flush(d_s2, 0, C, HK, HV, MT, 1, pd, s);
+        strata::kernels::gdn_pending_stash(d_h + C, d_g + HV, d_b + HV, C, HK, HV, MT, ROWS, 1, d_na, d_ph, d_pg, d_pb, d_pn, s);
+        strata::kernels::gdn_pending_flush(d_s2, 0, C, HK, HV, ROWS, 1, pd, s);
         strata::kernels::gdn_step_norm_multi(d_s1, d_h + C, C, d_g + HV, d_b + HV, d_z, d_gm, 1e-6f, d_y1, HK, HV, MT, d_na, s, MT);
         strata::gpu::stream_sync(s);
         strata::gpu::copy(a.data(), d_s1, n_state * 4);
@@ -122,12 +123,72 @@ int main(int argc, char** argv) {
         size_t df = 0;
         for (size_t i = 0; i < n_state; ++i) df += std::memcmp(&a[i], &b[i], 4) != 0;
         std::printf("pending: B's outputs %zu, state %zu, flushed state %zu values differ\n", dy, ds, df);
-        // time a layer: step + commit against the step with 3 pending rows (the stash of 36 layers / 36 included)
-        strata::gpu::copy(d_pn, &na, 4);   // 3 rows pending in every step below
+        // STRATA_GDN_ACC: the rows of several windows accumulated and written at write_at rows, against a commit after
+        // every window: four windows of 4 / 3 / 2 / 1 kept rows (the stashes append), the steps between them with
+        // write_at 7 (the third window runs 7 rows and writes, the fifth runs 3 unwritten ones); the fifth window's
+        // outputs and the state, and the state after a flush of 16 more rows (two stashes of 8: past kVerifyMaxT)
+        {
+            const int32_t keeps[4] = {4, 3, 2, 1};   // each window's count on the device before any launch (no copy
+            int32_t* d_keeps;                         // into a buffer a queued kernel still reads)
+            strata::gpu::alloc_device(&d_keeps, 4 * 4);
+            strata::gpu::copy(d_keeps, keeps, 4 * 4);
+            const strata::kernels::GdnPending pa{d_ph, d_pg, d_pb, d_pn, 7};
+            strata::gpu::copy(d_s1, st.data(), n_state * 4);
+            strata::gpu::copy(d_s2, st.data(), n_state * 4);
+            strata::gpu::copy(d_pn, &zero, 4);
+            for (int w = 0; w < 4; ++w) {
+                const float *hw = d_h + (size_t) w * C, *gw = d_g + (size_t) w * HV, *bw = d_b + (size_t) w * HV;
+                const int32_t* kw = d_keeps + w;
+                strata::kernels::gdn_step_norm_multi(d_s1, hw, C, gw, bw, d_z, d_gm, 1e-6f, d_y1, HK, HV, 4, nullptr, s);
+                strata::kernels::gdn_step_norm_multi(d_s1, hw, C, gw, bw, d_z, d_gm, 1e-6f, d_y1, HK, HV, 4, kw, s, 4);
+                strata::kernels::gdn_step_norm_pending(d_s2, hw, C, gw, bw, d_z, d_gm, 1e-6f, d_y2, HK, HV, 4, nullptr, s, 0,
+                                                       nullptr, pa);
+                strata::kernels::gdn_pending_clear(d_pn, 7, s);
+                strata::kernels::gdn_pending_stash(hw, gw, bw, C, HK, HV, MT, ROWS, 1, kw, d_ph, d_pg, d_pb, d_pn, s);
+            }
+            strata::kernels::gdn_step_norm_multi(d_s1, d_h, C, d_g, d_b, d_z, d_gm, 1e-6f, d_y1, HK, HV, 3, nullptr, s);
+            strata::kernels::gdn_step_norm_pending(d_s2, d_h, C, d_g, d_b, d_z, d_gm, 1e-6f, d_y2, HK, HV, 3, nullptr, s, 0,
+                                                   nullptr, pa);
+            strata::kernels::gdn_pending_clear(d_pn, 7, s);
+            strata::gpu::stream_sync(s);
+            int32_t left = -1;
+            strata::gpu::copy(&left, d_pn, 4);
+            strata::gpu::copy(a.data(), d_s1, n_state * 4);
+            strata::gpu::copy(b.data(), d_s2, n_state * 4);
+            strata::gpu::copy(ya.data(), d_y1, ya.size() * 4);
+            strata::gpu::copy(yb.data(), d_y2, yb.size() * 4);
+            size_t day = 0;   // (the states differ here by design: three rows are still pending on the new side)
+            for (size_t i = 0; i < ya.size(); ++i) day += std::memcmp(&ya[i], &yb[i], 4) != 0;
+            const int32_t eight = MT;
+            strata::gpu::copy(d_keep, &eight, 4);
+            for (int w = 0; w < 2; ++w) {
+                strata::kernels::gdn_step_norm_multi(d_s1, d_h, C, d_g, d_b, d_z, d_gm, 1e-6f, d_y1, HK, HV, MT, d_keep, s, MT);
+                strata::kernels::gdn_pending_stash(d_h, d_g, d_b, C, HK, HV, MT, ROWS, 1, d_keep, d_ph, d_pg, d_pb, d_pn, s);
+            }
+            strata::kernels::gdn_pending_flush(d_s2, 0, C, HK, HV, ROWS, 1, pa, s);
+            strata::gpu::stream_sync(s);
+            strata::gpu::copy(a.data(), d_s1, n_state * 4);
+            strata::gpu::copy(b.data(), d_s2, n_state * 4);
+            size_t daf = 0;
+            for (size_t i = 0; i < n_state; ++i) daf += std::memcmp(&a[i], &b[i], 4) != 0;
+            std::printf("accumulated: the fifth window's outputs %zu, flushed state %zu values differ; %d rows pending "
+                        "after it (3 expected)\n", day, daf, left);
+            if (dy || ds || df || day || daf || left != 3) {
+                std::printf("FAIL\n");
+                return 1;
+            }
+        }
+        // time a layer: step + commit against the step with pending rows written back (today's deferred commit, 3
+        // rows) and the step with 3 / 6 / 12 / 24 pending rows left unwritten (STRATA_GDN_ACC); the stash of 36 layers
+        // / 36 is not included
         for (int T = 1; T <= 4; ++T) {
             const int reps = 64;
-            double us[2] = {};
-            for (int pass = 0; pass < 2; ++pass) {
+            const int rows_at[6] = {0, 3, 3, 6, 12, 24};
+            double us[6] = {};
+            for (int pass = 0; pass < 6; ++pass) {
+                const int32_t np = rows_at[pass];
+                strata::gpu::copy(d_pn, &np, 4);
+                const strata::kernels::GdnPending pp{d_ph, d_pg, d_pb, d_pn, pass == 1 ? 1 : 1000};
                 const auto t0 = std::chrono::steady_clock::now();
                 for (int r = 0; r < reps; ++r) {
                     float* stl = d_st + (size_t) (r % LAYERS) * n_state;
@@ -136,13 +197,14 @@ int main(int argc, char** argv) {
                         strata::kernels::gdn_step_norm_multi(stl, d_h, C, d_g, d_b, d_z, d_gm, 1e-6f, d_y, HK, HV, T, d_na, s, T);
                     } else {
                         strata::kernels::gdn_step_norm_pending(stl, d_h, C, d_g, d_b, d_z, d_gm, 1e-6f, d_y, HK, HV, T,
-                                                               nullptr, s, 0, nullptr, pd);
+                                                               nullptr, s, 0, nullptr, pp);
                     }
                 }
                 strata::gpu::stream_sync(s);
                 us[pass] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
             }
-            std::printf("T %d  step + commit %7.1f us  step with 3 pending rows %7.1f us\n", T, us[0], us[1]);
+            std::printf("T %d  step + commit %7.1f us  step + 3 pending, written %7.1f us  unwritten: 3 rows %7.1f  6 %7.1f  "
+                        "12 %7.1f  24 %7.1f us\n", T, us[0], us[1], us[2], us[3], us[4], us[5]);
         }
     }
     std::vector<float> out(st.size());

@@ -74,6 +74,12 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      k, v, gate and beta, and the next window's step runs them on the state it reads anyway and writes it back once.  The
      state (about 113 MB over the 36 layers) is read or written twice a window instead of three times, in the same order of
      arithmetic, so the output is bit for bit the same (`STRATA_GDN_DEFER=0`: the former commit).
+   - The stashed rows accumulate over windows, and the state is written back less often (`STRATA_GDN_ACC=K`, the default 6 on an
+     integrated GPU on the HIP backend, 1 elsewhere): the commit appends its rows, and a window's step runs all of them and writes
+     the state back only once K rows are pending.  The write costs about 1.4 ms over the 36 layers, but every pending row is run
+     again in the next window (about 0.18 ms a row), so a write every second window is the balance.  The 890M's decode is +0.7%
+     at K=6 (35.7 to 36.0 tok/s), -0.3% at 12 and -1.0% at 24.  The arithmetic and its order are unchanged, so the output is bit
+     for bit the same (`STRATA_GDN_ACC=1`: the write after every window).
    - The speculative layer's head narrowed by a one-bit sketch (`STRATA_MTP_SKETCH`, the default): at start-up each head
      row's signs and mean magnitude are taken, every draft step picks 4 candidates of each 128 rows with them, and only the
      candidates' rows go through the real head.  The head reads about a quarter of the bytes and the drafts hit as often
