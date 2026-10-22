@@ -72,12 +72,12 @@ weights (no renormalisation), so the answers differ slightly. Upstream zeroes it
 needs the expert, so a token's output depended on the window's other rows; here it is decided for each token.
 It does nothing when every expert is in VRAM (nothing is skipped), with `--batch` and with a helper cache
 (`--expert-cache-device1..3`); on a layer split each stage skips its own.
-It is not on by default either when 90% or more of the experts are in VRAM (upstream's #1884: the misses are few and the
+By default it is also off when 90% or more of the experts are in VRAM (upstream's #1884: the misses are few and the
 skip costs more draft acceptance than it saves; a V100 32 GB with Coder IQ1_M at 94.8% decoded 1-2% slower);
 `STRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves that line (101: always on).
 `STRATA_ROUTE_TAIL_SKIP=0` turns it off and 1-9 sets the rank; the start prints one line.
 
-Measured (IQ3_XXS):
+Measured (IQ3_XXS)
 
 | | B70 | RTX 4070 | RX 9060 XT |
 | --- | --- | --- | --- |
@@ -131,7 +131,7 @@ The expert cache holds the rest, giving slots to the K/V as the context grows an
 Both live in virtual memory (`sycl_ext_oneapi_virtual_mem`) and neither address moves, so the captured graphs stay valid.
 It needs one GPU with virtual memory, an expert profile, no KV streaming and every expert in RAM; otherwise (and with `--batch` or `--vram-elastic`) the engine says so and stays off.
 `STRATA_KV_GROW_HOLD=1` keeps the longest parked conversation's cells in the K/V until it comes back.
-At a 128K context, int8, IQ2_XS and a 4,945-token prompt (one run each) the result differs by card:
+At a 128K context, int8, IQ2_XS and a 4,945-token prompt (one run each) the result differs by card.
 
 | | prefill (tokens/s) | decode after it | short chat decode | slots |
 | --- | ---: | ---: | ---: | ---: |
@@ -243,7 +243,7 @@ Images can be chosen, with a warning that this file has not been run with them (
 ```
 
 Measured on an Arc Pro B70 (32 GB) and an i7-14700 with 96 GB of RAM, with setup's configuration, 64 generated tokens of a short chat,
-every run from a cold OS cache:
+every run from a cold OS cache.
 
 | | Decode tokens/s |
 | --- | ---: |
@@ -301,7 +301,7 @@ first), and the options made for Qwen3.8-Flash-Next such as the KV cache's preci
 When RAM is short for the experts, the engine does not load them and reads them from the model file through the OS
 file cache instead (slower; setup warns of it).
 
-The engine's options (added to the settings' `args`):
+The engine's options (added to the settings' `args`).
 
 | Option | Meaning |
 | --- | --- |
@@ -384,17 +384,17 @@ setup's estimate of how much of a model the GPU holds is upstream's (its VRAM le
 The GPU, CPU, RAM and disk are in the [README](../README.md#what-you-need).
 This adds only what the README leaves out.
 
-- **Packages**: with the deb and rpm packages ([README](../README.md#install)), apt or dnf installs what is needed.
+- Packages: with the deb and rpm packages ([README](../README.md#install)), apt or dnf installs what is needed.
   From the source, an Intel GPU needs its runtime (Level Zero), an AMD GPU ROCm (HIP, rocBLAS, hipBLASLt and others),
   an NVIDIA GPU its driver and the CUDA toolkit, and an Intel GPU in the default contrib-llvm build oneMKL.
   setup can build the SYCL compiler (intel/llvm).
   setup installs no system packages, so install them first.
   What Ubuntu 26.04 and Fedora 44 need is in [BUILD.md](BUILD.md#packages), and `./setup.sh --packages` prints the one-line command for this PC.
-- **The GPU device**: your user must be able to open `/dev/dri/renderD*` (and `/dev/kfd` for an AMD GPU; the `render` group).
-- **Disk**: about 60–110 GB for the model and about 6 GB for the MTP layer (1 GB more with images).
+- The GPU device: your user must be able to open `/dev/dri/renderD*` (and `/dev/kfd` for an AMD GPU; the `render` group).
+- Disk: about 60–110 GB for the model and about 6 GB for the MTP layer (1 GB more with images).
   **The original model's Q2_0 on an AVX-512 CPU** also writes a one-time copy of its experts (about 40 GB) for the fast CPU kernel.
   An NVMe SSD is strongly recommended.
-- **Time**: the first run takes a while to download and to build the engine.
+- Time: the first run takes a while to download and to build the engine.
   With `--intel-llvm-build`, building intel/llvm takes another 13–20 minutes.
 
 With the packages, the first start writes these, and nothing in the program's folders (`/usr`):
@@ -442,15 +442,15 @@ The model is 60–110 GB, so the first start takes a while; an interrupted downl
 Your browser opens `http://127.0.0.1:8095`.
 The app has three tabs:
 
-- **Chat**: streaming answers; the model's thinking (folded away once it answers); code with a copy button;
+- Chat: streaming answers; the model's thinking (folded away once it answers); code with a copy button;
   pictures when images are on; sampling and thinking-level settings.
   Chats stay in your browser.
-- **Monitor**: what the model is doing (prefill, with progress, or decode, at how many tokens/s);
+- Monitor: what the model is doing (prefill, with progress, or decode, at how many tokens/s);
   GPU load, VRAM, temperature, power and PCIe traffic; CPU, RAM and disk; the context in use; the last requests.
   Its conversation cache card shows how many prefill tokens the cache gave back (in the last request and since the
   start) and, with `--conversation-cache-mib`, the parked conversations and their memory, and how many were parked,
   restored and evicted (upstream #596; the same is under `"conversation_cache"` in `/metrics`).
-- **About**: the model and engine settings, and the addresses to connect other apps.
+- About: the model and engine settings, and the addresses to connect other apps.
 
 `http://127.0.0.1:8095/?q=your question` opens it with a new chat already asking.
 The API for your apps is at `http://127.0.0.1:8095/v1`.
@@ -591,11 +591,11 @@ All are off by default, and each is also a key in `xestrata-<model>.json`.
 | `--before-load "cmd"` | `"before_load": "cmd"` or `["cmd", "arg"]` | a command run before the model is loaded again, e.g. one that unloads another server's model |
 | | `"before_load_timeout_s": 120` | how long that command may run (default 120 s). When it exits non-zero or times out (a peer that is not running makes `curl` exit 7), the free VRAM decides: with `min_free_vram_mib` set and not enough free, the model is **not** loaded and the request gets **503** with `Retry-After`; with room (or no limit set) it loads, with a warning in the log. `"before_load_strict": true` always refuses on a failure; `"before_load_ignore_failure": true` always loads |
 
-- **Unloading and loading**: `POST /unload` unloads it now (`409` while a request is running; `POST /unload?wait=1` waits for the running turn first, up to 300 s, or `?wait=<seconds>`, so a second server can really free the card) and `POST /load` loads it ahead of a request.
+- Unloading and loading: `POST /unload` unloads it now (`409` while a request is running; `POST /unload?wait=1` waits for the running turn first, up to 300 s, or `?wait=<seconds>`, so a second server can really free the card) and `POST /load` loads it ahead of a request.
   Both take `Content-Type: application/json` (e.g. `curl -X POST -H "Content-Type: application/json" localhost:8095/unload`).
-- **State**: `/health` says `"loaded"`, `/v1/models` lists an unloaded model as `unloaded` (like llama.cpp's router),
+- State: `/health` says `"loaded"`, `/v1/models` lists an unloaded model as `unloaded` (like llama.cpp's router),
   `/props` sets `is_sleeping`, and the Monitor shows the state.
-- **What unloading does**: it ends the engine process, and the image encoder when images are on (that is started again first, as at a start).
+- What unloading does: it ends the engine process, and the image encoder when images are on (that is started again first, as at a start).
   So their VRAM and RAM go straight back.
   The model files stay in the OS file cache, so loading again takes seconds while that RAM is not needed elsewhere.
 
@@ -742,7 +742,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Closing the connection or pressing stop in your app really stops the model, so the next request starts at once.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8095/v1`, any API key.
 - **OpenCode** (upstream #543). A starting point for `opencode.jsonc` (in your project, or `~/.config/opencode/`).
-  The field names are OpenCode's, so check its config docs if your version differs:
+  The field names are OpenCode's, so check its config docs if your version differs.
 
   ```jsonc
   {
@@ -779,10 +779,10 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   The prefix cache only reuses a prompt's start, so every new folder and every new day reads ~14K tokens again.
   `"env_to_user": true` in `xestrata-<model>.json` moves that block to the front of the first user message, so the system turn is the same for every session (opt-in, upstream d8a49433).
   Measured by upstream (RTX 5070 Ti Laptop, a new session in a second folder): the first request took 1.1 s instead of 11.9 s, and the model still answered the folder and date correctly.
-- **Claude Code**: set `ANTHROPIC_BASE_URL=http://127.0.0.1:8095` and `ANTHROPIC_MODEL` to a Claude model name it knows.
+- Claude Code: set `ANTHROPIC_BASE_URL=http://127.0.0.1:8095` and `ANTHROPIC_MODEL` to a Claude model name it knows.
   Claude Code refuses names it doesn't know; XeStrata ignores the name.
   Add any `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
-- **Codex CLI**: see [the Responses API](#the-responses-api-and-codex-cli) below.
+- Codex CLI: see [the Responses API](#the-responses-api-and-codex-cli) below.
 - **Context.** Chosen in setup (8K–262K).
   Requests longer than that are refused, never silently cut.
   A request whose `max_tokens` would run past the context is refused too (400).
@@ -1022,7 +1022,7 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
   The draft layer guesses without penalties, so more of its guesses are rejected and requests with penalties run slower.
 - `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
 - A sampling field sent as a numeric string (`"0.7"`) is read and used; a value that cannot be read as a number, or of another type (`true`), is a 400 that names the field (upstream #1663).
-- **logit_bias**: `"logit_bias"` in `/v1/chat/completions` (`{"<token id>": -100 to 100}`, or a list of `[id, bias]` pairs) is added before the penalties and filters (upstream dcc6f756).
+- logit_bias: `"logit_bias"` in `/v1/chat/completions` (`{"<token id>": -100 to 100}`, or a list of `[id, bias]` pairs) is added before the penalties and filters (upstream dcc6f756).
   -100 (`false` in a pair list) keeps the token out. Not with parallel requests (`"parallel"`).
 - `STRATA_SPEC_GUMBEL=1` (opt-in, upstream 6381df34) picks a sampled request's token by Gumbel-max.
   The noise is drawn per token id instead of along the probability-sorted list, so the tokens follow the same distribution while `--coupled-draft` drafts agree more often with the target's pick.
@@ -1111,7 +1111,7 @@ While a long prompt is read, a `response.in_progress` event goes out every 15 s,
 Errors before the answer starts have the Responses form (`{"error": {"message", "type", "param", "code"}}`); after
 it started they arrive as `response.failed`.
 
-**Codex CLI.** In `~/.codex/config.toml`:
+**Codex CLI.** In `~/.codex/config.toml`.
 
 ```toml
 model = "xestrata"                      # any name; XeStrata answers with its model
@@ -1136,7 +1136,7 @@ name; that is expected.
 The chat page can give the model tools from [MCP](https://modelcontextprotocol.io) servers, as LM Studio and Claude Desktop do:
 reading your files, fetching web pages, searching, anything an MCP server offers.
 List the servers in `xestrata-<model>.json` under `"mcp_servers"`.
-It has the same shape as Claude Desktop's `mcpServers` block, which you can also paste as it is (key `"mcpServers"`):
+It has the same shape as Claude Desktop's `mcpServers` block, which you can also paste as it is (key `"mcpServers"`).
 
 ```json
 "mcp_servers": {
@@ -1180,7 +1180,7 @@ If XeStrata is reachable from other devices, set an API key.
 
 `tools/strata_mcp.py` is an MCP server for Claude Code, Claude Desktop, Cursor, VS Code, Codex and other assistants.
 Once it is added, you can ask your assistant "install XeStrata for this PC", "start XeStrata" or "is XeStrata running?".
-In Claude Code, add it with:
+In Claude Code, add it with.
 
 ```bash
 claude mcp add xestrata -- python3 /path/to/XeStrata/tools/strata_mcp.py
@@ -1268,7 +1268,7 @@ you> /image /home/me/Pictures/receipt.jpg
 you> What is the total on this receipt?
 ```
 
-**OpenAI API** (an `image_url` part: a `data:` URL, an `http(s)://` URL or a local file path):
+**OpenAI API** (an `image_url` part: a `data:` URL, an `http(s)://` URL or a local file path).
 
 ```python
 import base64
@@ -1335,7 +1335,7 @@ so measure it on your own prompts; the Monitor marks every request ESP or stock.
 or pass `--experimental-speed-projection on` (`off`, or a path to another vector GGUF).
 The deb and rpm packages do not carry the vector: with it turned on, setup downloads the vector and its license from the installed version's tag on GitHub into `experimental-speed-projection/` in the data folder.
 Only for the original Qwen3.8-Flash-Next, not Swift 1.5.
-It writes these engine flags (llama.cpp's) into `xestrata-<model>.json`:
+It writes these engine flags (llama.cpp's) into `xestrata-<model>.json`.
 
 ```text
 --control-vector-scaled <XeStrata>/third_party/nonfree/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf:1.0
@@ -1437,8 +1437,8 @@ The code from Strata and from ggml / llama.cpp (both MIT) is part of it under th
 The exceptions stay under their own licenses: the patches to intel/llvm, the changes to oneMath, `ggml-common.h`, Outfit and `third_party/nonfree/` (below).
 The model files are not part of it; their licenses apply to them (below).
 
-- **The original software**: [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.
-- **Models**: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team;
+- The original software: [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.
+- Models: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team;
   quantizations: [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF).
   The Coder: [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
   (Apache-2.0 per its card); its support in Strata came from @pjgmobile's PR #54.
@@ -1465,7 +1465,7 @@ The model files are not part of it; their licenses apply to them (below).
      [XE](XE.md#splitting-the-missed-experts-between-the-cpu-and-pcie));
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
      models merges; the code is written anew).
-- **The web app's font**: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;
+- The web app's font: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;
   without it the app uses the system font). Its Monitor tab started from @code-martin's dashboard idea (PR #22).
-- **`third_party/nonfree/`**: Qwen Community License 1.0, not free; XeStrata runs without it.
+- `third_party/nonfree/`: Qwen Community License 1.0, not free; XeStrata runs without it.
   It holds the experimental speed projection's vector, made from the model's activations, and the original model's chat template (see its README).
