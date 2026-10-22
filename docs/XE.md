@@ -110,7 +110,7 @@ The following were fixed on XeStrata's side during this integration.
 Compared with upstream v0.1.44.1 on the three makers' GPUs (generate on five model files, serve, everyday use):
 on the RTX 4070 generate's decode is 8-21% faster on all five files and the prefill as fast or faster (IQ3_XXS at 1K
 16%, IQ2_XS 15%). On the RX 9060 XT the prefill is 2.1-3.2x, but IQ3_XXS's decode is 2.5-4.7% slower: upstream reads
-the hyper-connection down/up projections in Q8_0 by default on gfx12 (+4.4% when turned off and on in upstream).
+the hyper-connection down/up projections in Q8_0 by default on gfx12 (+4.4% in upstream, comparing it off and on).
 XeStrata times it at load and takes Q8_0 too, but gains only 0.6% on the RX 9060 XT. The B70 is not compared
 with upstream; on the same text it is as fast as XeStrata before this integration.
 
@@ -220,7 +220,7 @@ The following were found during the final comparison and fixed on XeStrata's sid
 - serve's short reads keep each path's readings with where the read started and choose from the readings near it; a batched read is tried only up to 16K. On the RTX 4070 at 64K the fourth turn's follow-up went from 505 to 304 ms.
 
 Of the paths meant to be faster, those faster on the B70, the RTX 4070 or the RX 9060 XT and slower on none are carried.
-The CPU share's auto gate (upstream f2a3b946) slowed 1K prompts on the B70 and the RTX 4070, so it is opt-in (`STRATA_PREFILL_CPU_GATE=1`); the Q8_0 dequantization four threads a block (upstream e910e410) was faster on neither, so it is left out.
+The CPU share's auto gate (upstream f2a3b946) slowed 1K prompts on the B70 and the RTX 4070, so it is opt-in (`STRATA_PREFILL_CPU_GATE=1`); the four-way split of the Q8_0 dequantization (upstream e910e410) was faster on neither, so it is left out.
 Not carried: the Windows implementation, upstream's `sycl/` (measured against on the same B70), the HIP and CUDA kernels' tuning tables, some paths for GPUs there is no machine for (those for RDNA2 only), and the multi-GPU changes (carried together in work of their own).
 
 ## Integration through Strata 0.1.40

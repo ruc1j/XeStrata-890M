@@ -230,7 +230,7 @@ The engine goes to `engine/` with `BUILD.json` (`"backend": "xe"` and the compil
 An engine without that record is taken for upstream's CUDA build and compiled over.
 An engine whose compiler changed is compiled again.
 The config setup writes lists the runtime's library folders under `lib_dirs`:
-the intel/llvm built here for that one.
+For the intel/llvm built here, that is the folder it installs into.
 So the server starts the engine without any toolkit environment.
 
 Ready-made engines are in the deb and rpm packages ([below](#the-deb-and-rpm-packages)).
