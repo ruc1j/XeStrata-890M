@@ -12,7 +12,7 @@ It runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**
 on a single laptop with a Radeon 890M and 64 GB of RAM.
 This GPU is the only target: the other GPUs the original XeStrata runs on are not covered here.
 
-Speed on the 890M (Ryzen AI 9 HX 370, 64 GB RAM, Fedora 44, Qwen3.8-Flash-Next IQ2_XS, APU power 28 W):
+Speed on the 890M (Ryzen AI 9 HX 370, 64 GB RAM, Fedora 44, Qwen3.8-Flash-Next IQ2_XS, APU power 28 W)
 
 | | Original XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
@@ -42,8 +42,8 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
 - **The CPU and the GPU share one memory (LPDDR5X).** The pool the GPU can take for itself (the GTT) is about half the RAM by the kernel's default.
   The fork puts all 24,576 experts of the model (about 34 GiB) in host memory (host USM) and the GPU reads them there directly.
   No expert is ever computed by the CPU for lack of room on the GPU: decode runs on the GPU alone.
-- **Its matrix engine is WMMA (16 x 16 x 16, f16 and int8).** The distribution's hipBLASLt has no kernels for gfx1150 and rocBLAS falls
-  back to generic kernels without matrix instructions, so the fork computes the dense matrix products with XeStrata's own WMMA kernel (three times rocBLAS's speed).
+- **Its matrix engine is WMMA (16 x 16 x 16, f16 and int8).** The distribution's hipBLASLt has no kernels for gfx1150, and rocBLAS falls
+  back to generic kernels without matrix instructions. So the fork computes the dense matrix products with XeStrata's own WMMA kernel (three times rocBLAS's speed).
 - **Power and heat set the speed.** Decode is bounded by the APU's power limit (the PPT, 28 W by default), not by heat.
   33 W makes short chats 3.5% faster, but long generations then reach 92 °C and get slower, so the fork keeps the default 28 W.
   The clock is throttled at 95 °C: compare speeds interleaved, with the GPU cooled down before each run.
@@ -61,9 +61,9 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      the up product with 8 lanes per row and 4 rows at once.  The read runs as three kernels (`STRATA_HC_V2`, the
      default): the norm writes x = R' w_norm rs once into the stream's work buffer, the down product reads it with no
      token arguments, with 16-byte loads and 4 rows per sub-group (2 from 5 tokens on), the last work-group to finish
-     adds the 20 column chunks' partials into lo, and the up product reads it (`STRATA_HC_V2=0`: the former two kernels).
+     adds the 20 column chunks' partials into lo. The up product then reads it (`STRATA_HC_V2=0`: the former two kernels).
      The three run as one launch (`STRATA_HC_FUSE`, the default): a down work-group loads its rows and then waits for the
-     norm to finish, an up work-group loads its rows and then waits for the down sums, so the row loads overlap the step
+     norm to finish, an up work-group loads its rows and then waits for the down sums. The row loads thus overlap the step
      before.  The down product stages x once per two row groups and loads the next row group while computing the
      current one.  The same arithmetic, bit for bit (`STRATA_HC_FUSE=0`: three launches).
    - The multi-token IQ4_XS GEMV (3 or more columns) stages the activations once per work-group of 8 rows in LDS
@@ -154,7 +154,7 @@ Other sizes and versions have not been run with the fork. Where the experts do n
 
 The fork has no packages: install it from source.
 
-1. On Fedora 44, install the build packages and ROCm (`./setup.sh --packages fedora44/amd --license free` prints the same line):
+1. On Fedora 44, install the build packages and ROCm (`./setup.sh --packages fedora44/amd --license free` prints the same line).
 
    ```bash
    sudo dnf install python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static \
@@ -163,7 +163,7 @@ The fork has no packages: install it from source.
    ```
 
    Let your user open `/dev/kfd` and `/dev/dri/renderD*` (`sudo usermod -aG render,video $USER`, then log in again).
-1. Get the repository and run setup:
+1. Get the repository and run setup.
 
    ```bash
    git clone https://github.com/ruc1j/XeStrata-890M.git
@@ -173,14 +173,14 @@ The fork has no packages: install it from source.
 
    setup checks the GPU, the RAM and the CPU, asks whether to build intel/llvm here (v7.1.1, with ROCm's HIP target),
    builds the engine, downloads the model and starts it. Enter takes the recommended answer to each question.
-   - **Model and size**: Qwen3.8-Flash-Next IQ2_XS.
-   - **Context length**: how much text it keeps at once. 32,768 is what the fork is run with.
-   - **Images**: whether it should read pictures too.
-   - **Experimental speed projection**: an experimental feature that changes how it answers, off by default. Read
+   - Model and size: Qwen3.8-Flash-Next IQ2_XS.
+   - Context length: how much text it keeps at once. 32,768 is what the fork is run with.
+   - Images: whether it should read pictures too.
+   - Experimental speed projection: an experimental feature that changes how it answers, off by default. Read
      [its description](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) before turning it on.
 1. After the first start, stop it (close the window) and set the config up for the 890M.
    Open `xestrata-iq2_xs.json`, which setup wrote in the XeStrata folder, set the value after `--expert-cache` in `"args"` to `24576`,
-   add `--mmap-experts` and `--no-prefill-borrow`, and add `STRATA_CACHE_HOST` to `"env"`:
+   add `--mmap-experts` and `--no-prefill-borrow`, and add `STRATA_CACHE_HOST` to `"env"`.
 
    ```json
    "args": [ ..., "--expert-cache", "24576", ..., "--mmap-experts", "--no-prefill-borrow" ],
@@ -191,12 +191,12 @@ The fork has no packages: install it from source.
    setup writes the original file back on its next run, so copy the folder under another name, replace the file there and point `--mtp` at it).
 1. `./setup.sh` starts it and opens `http://127.0.0.1:8095` in the browser.
 
-- **Time**: the first run downloads 68 GB and builds intel/llvm and the engine, which takes a while. Stopping half-way is fine: the next run continues.
+- Time: the first run downloads 68 GB and builds intel/llvm and the engine, which takes a while. Stopping half-way is fine: the next run continues.
   The driver compiles the GPU code the first time it is used, so the model is run once at the end to get that over with.
-- **The PC gets sluggish while the model starts**: it reads about 34 GiB of experts into RAM. The first time takes longest, and
+- The PC gets sluggish while the model starts: it reads about 34 GiB of experts into RAM. The first time takes longest, and
   the PC may respond slowly for 1-3 minutes. Keep the window open and wait.
-- **Where things go**: the model files in `XeStrata-data` next to the XeStrata folder; the model's config (`xestrata-<model>.json`) and the logs in the XeStrata folder.
-- **RAM headroom**: the engine counts the GPU's free memory as what Linux can give back less 6 GiB (`STRATA_UMA_HEADROOM_GIB`).
+- Where things go: the model files in `XeStrata-data` next to the XeStrata folder; the model's config (`xestrata-<model>.json`) and the logs in the XeStrata folder.
+- RAM headroom: the engine counts the GPU's free memory as what Linux can give back less 6 GiB (`STRATA_UMA_HEADROOM_GIB`).
   On a 64 GB PC that runs little else, `"STRATA_UMA_HEADROOM_GIB": "3"` in `"env"` leaves more memory for the context.
 
 **From then on** `./setup.sh` starts it right away. Close its window to stop it.
@@ -210,8 +210,8 @@ After an update, or after choosing again in `./setup.sh`, check that the `"args"
 
 **Tuning to your PC**: `./setup.sh --calibrate` measures a few engine settings on this PC and keeps the faster ones (5-10 minutes).
 
-**Measuring the speed**: `./setup.sh --bench` measures the installed model's speed on this PC (`--model IQ2_XS` picks the size) and where the time goes,
-and writes a record to `records/bench-<time>/` in the data folder (about 40 minutes; stop a running XeStrata first).
+**Measuring the speed**: `./setup.sh --bench` measures the installed model's speed on this PC (`--model IQ2_XS` picks the size) and where the time goes.
+It writes a record to `records/bench-<time>/` in the data folder (about 40 minutes; stop a running XeStrata first).
 What it measures and what the record holds are in [docs/BENCH.md](docs/BENCH.md).
 
 **Removing it**: `./setup.sh --remove-data` deletes the model files, the config and the logs (it shows the sizes and asks); then delete the folder.
@@ -220,15 +220,15 @@ The build in detail (the free mode, building intel/llvm, what setup does) is in 
 
 ## Using it
 
-- **Browser**: `http://127.0.0.1:8095` (opens by itself when the model starts). **Chat**, **Monitor** for the model and the GPU, CPU and RAM,
+- Browser: `http://127.0.0.1:8095` (opens by itself when the model starts). **Chat**, **Monitor** for the model and the GPU, CPU and RAM,
   **About** for the settings and the addresses.
-- **In the terminal**: `.venv/bin/python chat.py`
-- **Apps and coding agents**: point an "OpenAI-compatible" client at the base URL **`http://127.0.0.1:8095/v1`**.
+- In the terminal: `.venv/bin/python chat.py`
+- Apps and coding agents: point an "OpenAI-compatible" client at the base URL **`http://127.0.0.1:8095/v1`**.
   Any API key and model name will do. Apps that speak Anthropic's API use `http://127.0.0.1:8095/v1/messages`.
-- **Thinking depth**: the model thinks before it answers. The depth is **Off, Low, Medium or High**, set in the chat page's menu,
+- Thinking depth: the model thinks before it answers. The depth is **Off, Low, Medium or High**, set in the chat page's menu,
   with `/think low` in `chat.py`, or through an app's "reasoning effort" setting. Off is fastest; High suits hard questions.
-- **Pictures**: press **Picture** in the chat page; type `/image <path>` in `chat.py`; attach them in an app.
-- **From a phone or another PC**: run `./setup.sh --host 0.0.0.0 --api-key <a secret>` and open the address the server window
+- Pictures: press **Picture** in the chat page; type `/image <path>` in `chat.py`; attach them in an app.
+- From a phone or another PC: run `./setup.sh --host 0.0.0.0 --api-key <a secret>` and open the address the server window
   shows ([details](docs/DETAILS.md#streaming-and-connecting)).
 
 **Good to know**: requests are handled one at a time (`"parallel": 2` handles several at once, [BATCHING](docs/BATCHING.md)). The first message of a
@@ -284,7 +284,7 @@ so XeStrata-890M **uses the whole RAM as the GPU's memory**.
   The GPU's pool (the GTT) holds the layers every word needs, the KV cache and the working memory.
 - **The GPU** does all the work: the computation every word needs and the experts'. In decode the CPU does little.
 - **The SSD** holds a large table, of which a few rows are read per word.
-- **Guess, then check**: a small helper built into the model (the MTP layer) guesses the next few words, and the big model checks them in one go.
+- Guess, then check: a small helper built into the model (the MTP layer) guesses the next few words, and the big model checks them in one go.
   The right ones are kept, and it writes the next word itself. The big model always decides, so the answers' quality is unchanged.
 - **Long texts are read in big chunks** (up to 32,768 tokens at once). The dense products of prefill run on the 890M's WMMA,
   the expert products on its int8 WMMA.
@@ -293,37 +293,37 @@ Each part is described in [docs/DETAILS.md](docs/DETAILS.md#how-it-works) (the o
 
 ## For developers
 
-- **Build**: the free mode only (`build/free`, `-DSTRATA_LICENSE=free`, intel/llvm v7.1.1 built with HIP by `tools/intel_llvm_build.py`).
+- Build: the free mode only (`build/free`, `-DSTRATA_LICENSE=free`, intel/llvm v7.1.1 built with HIP by `tools/intel_llvm_build.py`).
   The steps are in [docs/BUILD.md](docs/BUILD.md). This machine's facts (paths, settings, tools) go into `LOCAL.md`, which git ignores.
-- **Kernel benchmarks**: `build/free/gemm_bench` (the dense products), `iq_mmq_parity --bench` (the experts' int8 products), `expert_bench`, `gdn_bench`, `gr_bench`, `mmvq_bench`.
+- Kernel benchmarks: `build/free/gemm_bench` (the dense products), `iq_mmq_parity --bench` (the experts' int8 products), `expert_bench`, `gdn_bench`, `gr_bench`, `mmvq_bench`.
   Measure kernels at the high clock (`dpm high`), not a fixed one; A/B runs interleaved under the same conditions, with the GPU cooled down first (heat moves them by a few per cent).
   `STRATA_PREFILL_TIMING=1` logs the GPU time of each prefill stage.
-- **Reading the ISA**: emit bitcode with `-fsycl-device-only`, turn it into assembly with intel/llvm's `llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1150`,
+- Reading the ISA: emit bitcode with `-fsycl-device-only`, turn it into assembly with intel/llvm's `llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1150`,
   and read `.vgpr_count` and `.vgpr_spill_count` in the metadata. The AMD backend sets a kernel's register budget from its required work-group size
   (the intel/llvm fix `hip-reqd-work-group-size`), so kernels carry `STRATA_AMD_REQD_WG`; a kernel without it is held to the 128 VGPRs of 1024 work-items and spills.
-- **Rules**: [AGENTS.md](AGENTS.md). A branch for the 890M is chosen from what the device reports (an integrated GPU, the HIP backend, WMMA) or an opt-in environment variable, not from the GPU's name.
+- Rules: [AGENTS.md](AGENTS.md). A branch for the 890M is chosen from what the device reports (an integrated GPU, the HIP backend, WMMA) or an opt-in environment variable, not from the GPU's name.
   The lints (`tools/lint/run.sh`), the tests (CTest, `python -m unittest`) and the license notices are there too.
   Measurement records do not go into git.
-- **README and docs**: the Japanese files (README.ja.md, docs/*.ja.md) are written first; the English ones (README.md, docs/*.md) are their translations.
+- README and docs: the Japanese files (README.ja.md, docs/*.ja.md) are written first; the English ones (README.md, docs/*.md) are their translations.
   `docs/` is the original XeStrata's.
 
 ## Credits
 
-- **The original software**: [XeStrata](https://github.com/MistVVK/XeStrata) by MistVVK and the XeStrata contributors,
+- The original software: [XeStrata](https://github.com/MistVVK/XeStrata) by MistVVK and the XeStrata contributors,
   and its original, [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.
-- **Models**:
+- Models:
    - [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team.
    - The compressed version (IQ2_XS) by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF).
 
   The model files are under their own licenses.
-- **Components**:
+- Components:
    - Parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT).
    - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the rocBLAS backend (the start-up comparison and `STRATA_BLAS=1`).
      CMake fetches the fork with XeStrata's changes ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), same license).
    - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the compiler and the SYCL runtime,
      built with XeStrata's patches (`third_party/main/intel-llvm/patches/`, same license).
    - The pages' font [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1).
-- **Ideas**: those in the original XeStrata's [credits](https://github.com/MistVVK/XeStrata#credits).
+- Ideas: those in the original XeStrata's [credits](https://github.com/MistVVK/XeStrata#credits).
   The IQ4 table lookup follows llama.cpp's HIP version.
 - More in [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
 
@@ -332,11 +332,11 @@ Each part is described in [docs/DETAILS.md](docs/DETAILS.md#how-it-works) (the o
 XeStrata (copyright MistVVK and the XeStrata contributors) is free software, distributed as a whole under the
 [GNU Lesser General Public License, version 3 or later](COPYING.LESSER) (`COPYING.LESSER` and `COPYING`). So is this fork.
 
-- **Linking with a maker's compute library**: XeStrata linked with a GPU or CPU maker's compute library for its own products and its runtime libraries may be conveyed too.
+- Linking with a maker's compute library: XeStrata linked with a GPU or CPU maker's compute library for its own products and its runtime libraries may be conveyed too.
   This is an additional permission under section 7 of GPL version 3; the text is in [NOTICE](NOTICE). The fork's ROCm is free software, so it does not need this permission.
-- **Code from Strata and ggml**: the code that came from the MIT-licensed Strata and ggml / llama.cpp (including the kernels transcribed into `src/`)
+- Code from Strata and ggml: the code that came from the MIT-licensed Strata and ggml / llama.cpp (including the kernels transcribed into `src/`)
   is part of XeStrata under the LGPL. As the MIT terms require, their copyright and permission notices are kept in [NOTICE](NOTICE).
-- **Exceptions**: these under `third_party/` keep their own licenses, each in its project's folder with the license text.
+- Exceptions: these under `third_party/` keep their own licenses, each in its project's folder with the license text.
    - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
    - XeStrata's changes to oneMath (the fork, `third_party/main/oneMath/`): Apache-2.0.
    - ggml's `ggml-common.h` (`third_party/main/ggml/`, an unchanged copy): MIT.
@@ -344,4 +344,4 @@ XeStrata (copyright MistVVK and the XeStrata contributors) is free software, dis
    - `third_party/nonfree/`: what is not free software. The original model's chat template and the experimental speed projection's vectors,
      both under the Qwen Community License 1.0.
 - **Without `third_party/nonfree/`** XeStrata still builds and runs.
-- **The model**: not in this repository. The model files are under their own licenses.
+- The model: not in this repository. The model files are under their own licenses.
