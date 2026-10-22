@@ -108,6 +108,13 @@ setup はホストの設定を変えません。
 キャッシュと予算は同じ RAM を使うので、起動時の空きから決める `auto` は予算がまだ取っていない分まで数え、OS の分が残らなくなります。
 数は RAM から 24 GB と予算（と RAM に置く KV）を引いた分のスロットで、設定の `args` の `--expert-cache N` で変えられます。
 
+Radeon 890M（Ryzen AI 9 HX 370、LPDDR5X-7500、理論値 120 GB/s）で GPU が読める帯域を 1 GiB の連続読み（16 バイトのロード）で測ると、
+hipMalloc 102 GB/s、hipHostMalloc 95 GB/s、NonCoherent の hipHostMalloc 101 GB/s、2 MB ページの hipHostRegister 100 GB/s、Managed 100 GB/s です。
+エキスパートを置く NonCoherent の host メモリは VRAM と同じ速さで読め、理論値の 84% です（2 MB ページにしても伸びません）。
+decode 中（28 W、6 つの短い会話）の DRAM の読みは平均 57 GB/s（42〜64）で、この帯域の 56% です。カーネル単体では HC の読み 57、
+密な GEMV 72、エキスパート 65〜81 GB/s です。このとき uclk は上限の 937 MHz ですが、fclk は 1.29〜1.44 GHz で上限の 1.96 GHz に届きません。
+`dpm high` で fclk を 1.96 GHz に固定しても decode は変わらない（27.1 対 27.3 tok/s）ので、足りないのはクロックではなく 28 W の電力です。
+
 ### KV キャッシュの置き場所と精度
 
 **KV のストリーミング**: 文脈が 64K 以上のとき、setup は文脈の KV キャッシュを RAM に置きます。

@@ -119,6 +119,14 @@ For the models that keep a RAM budget of their experts (UD-Q4_K_XL, UD-IQ4_XS), 
 The cache and the budget draw on the same RAM, so `auto`, sized from the memory free at start, would count what the budget has not taken yet and leave the OS nothing.
 The number is the RAM less 24 GB and the budget (and a KV cache streamed to RAM), in slots; `--expert-cache N` in the config's `args` sets another.
 
+On a Radeon 890M (Ryzen AI 9 HX 370, LPDDR5X-7500, 120 GB/s in theory) the GPU reads a 1 GiB buffer sequentially (16-byte loads) at
+102 GB/s from hipMalloc, 95 GB/s from hipHostMalloc, 101 GB/s from NonCoherent hipHostMalloc, 100 GB/s from hipHostRegister on 2 MB pages
+and 100 GB/s from Managed memory.  The NonCoherent host memory that holds the experts reads as fast as VRAM, 84% of the theoretical figure
+(2 MB pages add nothing).  During decode (28 W, six short chats) the DRAM reads average 57 GB/s (42 to 64), 56% of that bandwidth; the
+kernels on their own read at 57 GB/s (the HC reads), 72 GB/s (the dense GEMVs) and 65 to 81 GB/s (the experts).  uclk sits at its
+maximum of 937 MHz, but fclk at 1.29 to 1.44 GHz stays below its 1.96 GHz; pinning it there with `dpm high` leaves decode unchanged
+(27.1 against 27.3 tok/s), so what is short is the 28 W of power, not a clock.
+
 ### Where the KV cache lives, and its precision
 
 **KV streaming**: at a context of 64K or more, setup keeps the context's KV cache in RAM.
