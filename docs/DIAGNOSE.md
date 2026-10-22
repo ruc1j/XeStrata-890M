@@ -22,7 +22,7 @@ If it involves images or multiple GPUs, verify that operation too.
 1. Within the user's instructions and your granted permissions, proceed with necessary configuration fixes, dependency installation, resumed downloads, builds or local code fixes.
    Record why each change was made and its before/after values without secrets.
 1. Check one possible cause at a time.
-   If you apply several changes together, report that you have not identified which one helped.
+   If you apply several changes together, report that you have not identified which change improved the situation.
 1. If you need more permissions, a reboot, an existing service stopped or data deleted, explain the specific operation and its effects and ask for approval.
    Leave unrelated processes and user files alone, and continue whatever investigation can proceed meanwhile.
 1. Bound execution waits and retries.
@@ -90,13 +90,13 @@ Include only secret-free diffs of relevant local changes in the report.
 ### deb/rpm installation
 
 First locate the launch command with `command -v xestrata`.
-For deb, query the packages actually installed, for example:
+For deb, check the packages actually installed like this.
 
 ```bash
 dpkg-query -W -f '${binary:Package} ${Version} ${Architecture}\n' 'xestrata*'
 ```
 
-For rpm:
+For rpm, use this.
 
 ```bash
 rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' | rg '^xestrata'
@@ -145,7 +145,7 @@ For a systemd user service, examine `journalctl --user -u xestrata`, restricted 
 If launched through MCP, also examine that launch's records.
 MCP's `strata_logs` setup/server logs belong to processes MCP itself started; they do not replace logs from other launch methods.
 
-`xestrata --check` and a source installation's `setup.py --check` check GPUs, RAM and CPU, but setup first organizes the data folder and saves settings.
+`xestrata --check` and a source installation's `setup.py --check` check GPUs, RAM and CPU. Setup, however, first organizes the data folder and saves settings.
 `./setup.sh --check` may also install Python or create a virtual environment.
 Use these as part of recovery after preserving the original information.
 If a source installation already has its virtual environment, you can use `.venv/bin/python -B setup.py --check`.
