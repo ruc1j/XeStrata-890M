@@ -22,7 +22,7 @@ The commands are for Ubuntu and Debian; the versions are those last used on the 
 
 [AGENTS.md](../AGENTS.md#lints) says which lints to run and how (`tools/lint/run.sh`).
 
-From the distribution:
+From the distribution.
 
 ```sh
 sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyflakes codespell \
@@ -30,13 +30,13 @@ sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyf
 ```
 
 `tools/lint/run.sh` runs oneAPI's clang-tidy, which knows SYCL (found under `/opt/intel/oneapi/compiler`), not the distribution's.
-clang-tidy reads `compile_commands.json` from the build folder (by default `build/free`; `STRATA_LINT_BUILD` changes it):
+clang-tidy reads `compile_commands.json` from the build folder (by default `build/free`; `STRATA_LINT_BUILD` changes it).
 
 ```sh
 cmake -S . -B build/free -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 ```
 
-The ones the distribution does not package, or packages too old, go into `.lint/`:
+The ones the distribution does not package, or packages too old, go into `.lint/`.
 
 ```sh
 python3 -m venv .lint/venv && .lint/venv/bin/pip install ruff reuse        # ruff 0.16, reuse 6.2
@@ -56,7 +56,7 @@ An example of the latter is Ubuntu 26.04's 6.2 with the Arc Pro B70 (intel/llvm 
 setup runs it for `--intel-llvm-build`;
 [BUILD.md](BUILD.md#the-sycl-compiler) describes how it reuses a finished build.
 intel/llvm is free software (Apache-2.0 with LLVM exceptions) and builds with free software only.
-It needs these packages (on Fedora 44: `git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static python3`; on Arch: `git cmake ninja base-devel lld hwloc zstd opencl-headers python`):
+It needs these packages (on Fedora 44: `git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static python3`; on Arch: `git cmake ninja base-devel lld hwloc zstd opencl-headers python`).
 
 ```sh
 sudo apt install git cmake ninja-build g++ lld python3 libhwloc-dev libzstd-dev
@@ -159,7 +159,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Sixteenth, the device libraries (libdevice) depended on the compiler being built and all its tools (`sycl-compiler`) even when `LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR` gives the tools that compile them.
   The cross build for Windows (`--windows`) built a Windows `clang.exe` and tools nobody runs, most of its time.
   Fixed, with the tools given they depend on the SYCL headers alone (`build-libdevice-custom-tools`; a build without them is unchanged). A fix to the build only, it asks no finished toolchain to be built again.
-  Seventeenth, the AMDGPU backend budgets a kernel's registers by the "amdgpu-flat-work-group-size" attribute, which clang set only from OpenCL's reqd_work_group_size and HIP's --gpu-max-threads-per-block, so a SYCL kernel was budgeted for 1024 work-items (128 VGPRs on gfx1150) whatever its [[sycl::reqd_work_group_size(N)]] or work_group_size property said, and the larger tiles of the products spilled registers.
+  Seventeenth, the AMDGPU backend budgets a kernel's registers by the "amdgpu-flat-work-group-size" attribute, which clang set only from OpenCL's reqd_work_group_size and HIP's --gpu-max-threads-per-block. As a result, a SYCL kernel was budgeted for 1024 work-items (128 VGPRs on gfx1150) whatever its [[sycl::reqd_work_group_size(N)]] or work_group_size property said, and the larger tiles of the products spilled registers.
   Fixed, the attribute is set from SYCL's reqd_work_group_size too, the attribute's and the property's (`hip-reqd-work-group-size`; the 890M's int8 expert product went from 12-26 spilled registers to none, and the dense product's 64 x 128 tile became usable).
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
   `offload-bundle-arch` and `l0-static-graph` ask every toolchain.
@@ -270,7 +270,7 @@ The development machine has no AVX-512.
 [AGENTS.md](../AGENTS.md#avx-512-code) says when and how to run the tests under SDE.
 SDE is not free software.
 Download it by hand from [Intel](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html) (its license is accepted there),
-unpack it outside the repository and put a small wrapper on the `PATH`:
+unpack it outside the repository and put a small wrapper on the `PATH`.
 
 ```sh
 mkdir -p ~/.local/opt ~/.local/bin
@@ -295,7 +295,7 @@ sde64 -version
 ### The xe driver's kernel log
 
 The xe driver reports its errors in the kernel log.
-`journalctl -k` reads it without root (`dmesg` needs root):
+`journalctl -k` reads it without root (`dmesg` needs root).
 
 ```sh
 journalctl -k --since "-1h" --no-pager | grep "xe 0000"
@@ -310,7 +310,7 @@ Reading the GPU's hardware counters (memory bandwidth per kernel) needs three th
 
 1. Membership in the `render` group, and both drivers' observation setting open.
    The B70 runs on xe; VTune checks i915's setting as well.
-   They last until the next boot:
+   They last until the next boot.
 
    ```sh
    sudo sysctl dev.xe.observation_paranoid=0 dev.i915.perf_stream_paranoid=0
@@ -324,7 +324,7 @@ Reading the GPU's hardware counters (memory bandwidth per kernel) needs three th
    echo 'ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card*", RUN+="/usr/lib/systemd/systemd-sysctl --prefix=/dev/xe --prefix=/dev/i915"' | sudo tee /etc/udev/rules.d/60-gpu-observation.rules
    ```
 
-1. Intel's Metrics Discovery library (MIT; Ubuntu does not package it), built into `.tools/`:
+1. Intel's Metrics Discovery library (MIT; Ubuntu does not package it), built into `.tools/`.
 
    ```sh
    sudo apt install libdrm-dev
@@ -333,7 +333,7 @@ Reading the GPU's hardware counters (memory bandwidth per kernel) needs three th
    cmake --build .tools/src/metrics-discovery/build -j
    ```
 
-   It builds `libigdmd.so` into `.tools/src/metrics-discovery/dump/linux64/release/metrics_discovery/`, which goes on the library path when VTune runs:
+   It builds `libigdmd.so` into `.tools/src/metrics-discovery/dump/linux64/release/metrics_discovery/`, which goes on the library path when VTune runs.
 
    ```sh
    export LD_LIBRARY_PATH=$PWD/.tools/src/metrics-discovery/dump/linux64/release/metrics_discovery:$LD_LIBRARY_PATH
