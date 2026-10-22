@@ -244,6 +244,7 @@ Verifier::~Verifier() {
     if (arena_b_) strata::gpu::free(arena_b_);
     if (h_commitb_) strata::gpu::free(h_commitb_);
     if (logit_bias_device_) strata::gpu::free(logit_bias_device_);
+    if (stop_ids_device_) strata::gpu::free(stop_ids_device_);
     if (cs_ && cs_ != ext_stream_) strata::gpu::stream_destroy(cs_);   // set_stream: the stage's stream, shared
     if (ev_done_) strata::gpu::event_destroy(ev_done_);
     if (ev_commit_) strata::gpu::event_destroy(ev_commit_);
@@ -289,6 +290,39 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     }
     logit_bias_host_ = bias;
     sampling_.logit_bias = bias.empty() ? nullptr : logit_bias_device_;
+    return true;
+}
+
+// XeStrata-890M, STRATA_VERIFY_ECAP=N (upstream PR 3545, opt-in, changes the output): the cap on a window's expert set,
+// 0 when off.  Read once; both the plan (the cap) and the head (the stop guard) ask.
+static int verify_ecap_cap() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_VERIFY_ECAP");
+        const int c = v != nullptr ? (int) std::strtol(v, nullptr, 10) : 0;
+        if (c > 0) std::fprintf(stderr, "strata verify: STRATA_VERIFY_ECAP=%d: a window reads token 0's experts and at "
+                                        "most %d more picks of its draft rows (an approximation); its rows past 0 never "
+                                        "pick a stop token\n", c, c - 10);
+        return c;
+    }();
+    return n;
+}
+
+bool Verifier::set_stop_ids(const std::vector<int32_t>& ids, std::string& err) {
+    if (next_ && !next_->set_stop_ids(ids, err)) return false;
+    if (le_ < g_->n_layers) return true;
+    const OnDevice on_device(device_);
+    if (ids != stop_ids_host_ && !ids.empty()) {
+        const size_t bytes = ids.size() * sizeof(int32_t);
+        if (stop_ids_device_ && ids.size() != stop_ids_host_.size()) {
+            strata::gpu::free(stop_ids_device_);
+            stop_ids_device_ = nullptr;
+        }
+        if ((!stop_ids_device_ && !strata::gpu::alloc_device(&stop_ids_device_, bytes)) ||
+            !strata::gpu::copy(stop_ids_device_, ids.data(), bytes)) {
+            err = "cannot upload the stop ids"; return false;
+        }
+    }
+    stop_ids_host_ = ids;
     return true;
 }
 
@@ -1162,13 +1196,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // XeStrata-890M, STRATA_VERIFY_ECAP=N (upstream PR 3545, opt-in, changes the output): the window's expert set
         // capped before the plan - token 0 keeps its K picks, the speculative tail the top (N - K) entries by weight,
         // the rest redirected onto kept experts at weight 0.  Inside the window graph.  Device-planned path only.
-        static const int verify_ecap_n = [] {
-            const char* v = std::getenv("STRATA_VERIFY_ECAP");
-            const int n = v != nullptr ? (int) std::strtol(v, nullptr, 10) : 0;
-            if (n > 0) std::fprintf(stderr, "strata verify: STRATA_VERIFY_ECAP=%d: a window reads token 0's experts and at "
-                                            "most %d more picks of its draft rows (an approximation)\n", n, n - 10);
-            return n;
-        }();
+        const int verify_ecap_n = verify_ecap_cap();
         if (verify_ecap_n > (int) K && n > 1 && (device_plan_ || recording_res_))
             verify_ecap(ids_ + tb * K, w_ + tb * K, n * (int) K, (int) K, verify_ecap_n, cs);
         if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
@@ -1436,6 +1464,10 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
+        // XeStrata-890M: a capped window's rows past 0 never pick a stop token (verify_stop_guard; in the graph, before
+        // every pick of these logits: the request's own sampling after run() reads them masked too)
+        if (verify_ecap_cap() > (int) ss.k && T > 1 && stop_ids_device_ != nullptr && (device_plan_ || recording_res_))
+            verify_stop_guard(head_logits_, T, (int) n_vocab_, stop_ids_device_, (int) stop_ids_host_.size(), cs);
         SamplerParams sp;
         sp.greedy = true;
         sp.temperature = 0.0f;
@@ -3023,6 +3055,9 @@ void InProcessStage::set_slot_sampling(int slot, const strata::kernels::SamplerP
 void InProcessStage::set_head_sampling(bool on) { next_->set_head_sampling(on); }
 bool InProcessStage::set_logit_bias(const std::vector<float>& bias, std::string& err) {
     return next_->set_logit_bias(bias, err);
+}
+bool InProcessStage::set_stop_ids(const std::vector<int32_t>& ids, std::string& err) {
+    return next_->set_stop_ids(ids, err);
 }
 void InProcessStage::set_history(const int32_t* history, int history_len) { next_->set_history(history, history_len); }
 bool InProcessStage::read_logits(int rows, float* host, std::string& err) const {

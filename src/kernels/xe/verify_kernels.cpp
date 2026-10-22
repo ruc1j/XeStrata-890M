@@ -1091,6 +1091,19 @@ void verify_ecap(int32_t* ids, float* w, int n, int k, int cap, void* stream) {
     done(stream, e, "verify_ecap");
 }
 
+void verify_stop_guard(float* logits, int T, int n_vocab, const int32_t* stop, int n_stop, void* stream) {
+    if (T <= 1 || n_stop <= 0) return;
+    const int rows = T - 1;
+    const auto e = Q(stream).submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::range<2>((size_t) rows, (size_t) n_stop), [=](sycl::id<2> id) {
+            const int t = 1 + (int) id[0];
+            const int32_t s = stop[id[1]];
+            if (s >= 0 && s < n_vocab) logits[(size_t) t * (size_t) n_vocab + (size_t) s] = -1e30f;
+        });
+    });
+    done(stream, e, "verify_stop_guard");
+}
+
 void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
                    const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
                    uint32_t ring, void* stream, int keep, float* w, int ser_kmin, float ser_t) {

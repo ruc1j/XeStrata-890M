@@ -83,6 +83,7 @@ public:
     virtual void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) = 0;
     virtual void set_head_sampling(bool on) = 0;
     virtual bool set_logit_bias(const std::vector<float>& bias, std::string& err) = 0;
+    virtual bool set_stop_ids(const std::vector<int32_t>& ids, std::string& err) = 0;
     /// Same process: the penalty rows the last stage's head reads, a buffer the engine fills before every window.
     virtual void set_history(const int32_t* history, int history_len) = 0;
     virtual bool read_logits(int rows, float* host, std::string& err) const = 0;
@@ -115,6 +116,7 @@ public:
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) override;
     void set_head_sampling(bool on) override;
     bool set_logit_bias(const std::vector<float>& bias, std::string& err) override;
+    bool set_stop_ids(const std::vector<int32_t>& ids, std::string& err) override;
     void set_history(const int32_t* history, int history_len) override;
     bool read_logits(int rows, float* host, std::string& err) const override;
     bool copy_logits(int t, float* host) const override;
@@ -165,6 +167,10 @@ public:
     }
     // One request's fixed vocabulary bias. Empty clears it; copied only when changed, on the final stage's device.
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
+    /// XeStrata-890M: the request's stop (end-of-turn) token ids, for the capped window's stop guard
+    /// (STRATA_VERIFY_ECAP, `verify_stop_guard`): a window's rows past 0 never pick one.  Without ECAP the guard is
+    /// not recorded and this changes nothing.  Set once after init, on the final stage's device.
+    bool set_stop_ids(const std::vector<int32_t>& ids, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
     /// int32 slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused
@@ -381,6 +387,8 @@ private:
     bool head_sampling_ = true;          ///< set_head_sampling
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
+    std::vector<int32_t> stop_ids_host_;      ///< set_stop_ids
+    int32_t* stop_ids_device_ = nullptr;
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT: this GPU's counters (nullptr: none)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)

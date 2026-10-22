@@ -7078,6 +7078,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
+        {   // XeStrata-890M: the stop ids for STRATA_VERIFY_ECAP's stop guard (verify_stop_guard; reaches the later stages)
+            std::vector<int32_t> stop32;
+            for (const int64_t id : o.eos_ids) if (id >= 0 && id <= 0x7fffffffLL) stop32.push_back((int32_t) id);
+            if (!ver.set_stop_ids(stop32, err) || (pipe && !ver_b.set_stop_ids(stop32, err))) {
+                std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                return 1;
+            }
+        }
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
         // --batch-mtp: each slot's drafter reads its two window rows' final residuals from a buffer of its own
         std::vector<float*> slot_mtp_rows;
@@ -12423,6 +12431,14 @@ int main(int argc, char** argv) {
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        {   // XeStrata-890M: the stop ids for STRATA_VERIFY_ECAP's stop guard (verify_stop_guard)
+            std::vector<int32_t> stop32;
+            for (const int64_t id : o.eos_ids) if (id >= 0 && id <= 0x7fffffffLL) stop32.push_back((int32_t) id);
+            if (!ver.set_stop_ids(stop32, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
         }
         const bool use_mtp = !o.mtp.empty();
         if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {

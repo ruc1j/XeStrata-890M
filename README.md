@@ -87,9 +87,11 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      top-1 83.6%). Against `STRATA_EXPERT_KEEP` at the same speed it is better at the mild end (keep 8: +0.8%, KL 0.074)
      and worse at the strong end (keep 6: +9%, KL 0.18).
    - `STRATA_VERIFY_ECAP=N` (opt-in, changes the answers): a speculation window's expert picks are capped to token 0's
-     and the N-10 heaviest picks of its draft rows (upstream PR #3545 ported). It does not pay on the 890M, whose windows
-     are short (3 rows on average): 16 / 20 / 26 decode at 36.0 / 36.4 / 36.0 tok/s (35.8 without), teacher-forced KL
-     0.456 / 0.275 / 0.136, draft acceptance 75% -> 69% (16).
+     and the N-10 heaviest picks of its draft rows (upstream PR #3545 ported). A capped row (token 1 on) never picks a
+     stop token: logits computed without the dropped experts can land on one and end the answer mid-text (the flaw
+     noted under the PR); a true stop re-emerges at the next window's token 0. It does not pay on the 890M, whose
+     windows are short (3 rows on average): 16 / 20 / 26 decode at 35.7 / 36.1 / 35.9 tok/s (35.8 without),
+     teacher-forced KL 0.456 / 0.275 / 0.136 (measured before the guard), draft acceptance 75% -> 69% (16).
 - **Prefill:**
    - At start the engine times oneMath's library (rocBLAS) against its own WMMA kernel for the dense products and takes the faster
      (HIP GPUs only). `STRATA_BLAS=1` keeps the library, `STRATA_NO_BLAS=1` the own kernel.

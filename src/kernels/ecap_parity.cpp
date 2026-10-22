@@ -11,6 +11,8 @@
 //   * every kept entry keeps its id and weight; every dropped entry's weight is exactly 0 and its id is one of the
 //     kept set's (so the plan never meets an expert the uncapped window would not have named)
 //   * the same input gives the same output (the fold is deterministic)
+// and the capped window's stop guard (`verify_stop_guard`): rows past 0 of a logits block get their stop ids set to
+// -1e30 and nothing else changes; row 0, T = 1 and n_stop = 0 are untouched.
 // GPU, synthetic, no model.
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -85,6 +87,39 @@ int main() {
             std::printf("  cap %2d       T %d  kept %2d dropped %2d  %s\n", cap, T, (int) kept_ids.size(), dropped,
                         ok ? "ok" : "*** MISMATCH ***");
             if (!ok) ++bad;
+        }
+    }
+    // the stop guard (verify_stop_guard): rows 1..T-1 of a T x V logits block have their stop ids set to -1e30 and
+    // nothing else changes; row 0 is untouched; T = 1 and n_stop = 0 are no-ops; ids outside the vocabulary are ignored
+    {
+        const int V = 4096;
+        const std::vector<int32_t> stops = {7, 4000, -1, V + 5};
+        auto* d_lg = static_cast<float*>(P::alloc_bytes((size_t) 8 * V * 4));
+        auto* d_st = static_cast<int32_t*>(P::alloc_bytes(stops.size() * 4));
+        P::copy_bytes_in(d_st, stops.data(), stops.size() * 4);
+        std::normal_distribution<float> lg_dist(0.0f, 3.0f);
+        for (int T : {1, 2, 4, 8}) {
+            std::vector<float> lg((size_t) T * V), lg0;
+            for (auto& v : lg) v = lg_dist(rng);
+            lg0 = lg;
+            for (int n_stop : {0, (int) stops.size()}) {
+                P::copy_bytes_in(d_lg, lg0.data(), lg0.size() * 4);
+                k::verify_stop_guard(d_lg, T, V, d_st, n_stop, st);
+                P::sync();
+                P::copy_bytes_out(lg.data(), d_lg, lg.size() * 4);
+                bool ok = true;
+                int masked = 0;
+                for (int t = 0; t < T && ok; ++t)
+                    for (int j = 0; j < V && ok; ++j) {
+                        const bool stop_here = t >= 1 && n_stop > 0 && (j == 7 || j == 4000);
+                        const float want = stop_here ? -1e30f : lg0[(size_t) t * V + j];
+                        ok = lg[(size_t) t * V + j] == want;
+                        if (stop_here) ++masked;
+                    }
+                std::printf("  stop guard   T %d  n_stop %d  masked %2d  %s\n", T, n_stop, masked,
+                            ok ? "ok" : "*** MISMATCH ***");
+                if (!ok) ++bad;
+            }
         }
     }
     std::printf("ecap_parity: %s\n", bad == 0 ? "PASS" : "FAIL");

@@ -117,6 +117,12 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
 /// routing weight; a dropped entry is redirected round-robin onto a kept expert with weight 0 (no extra expert read,
 /// zero contribution).  No-op when n <= k or cap <= k.
 void verify_ecap(int32_t* ids, float* w, int n, int k, int cap, void* stream);
+/// The stop guard of a capped window (STRATA_VERIFY_ECAP, upstream PR 3545's follow-up): rows 1..T-1 of `logits`
+/// (T x n_vocab) ran without the dropped experts, and their pick may land on a stop token by that approximation alone,
+/// which ends the answer mid-text.  Sets those rows' `stop[0..n_stop)` logits to -1e30 (finite: the NaN guard reads the
+/// rows), so a capped row picks its best non-stop token; row 0 is exact and keeps its logits, and a true stop
+/// re-emerges there in the next window.  No-op when T <= 1 or n_stop <= 0.
+void verify_stop_guard(float* logits, int T, int n_vocab, const int32_t* stop, int n_stop, void* stream);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
