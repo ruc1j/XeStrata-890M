@@ -7,12 +7,12 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 [English](README.md) | 日本語
 
-**XeStrata-890M は、[XeStrata](https://github.com/MistVVK/XeStrata) を AMD Radeon 890M（Ryzen AI 9 HX 370 の内蔵 GPU、gfx1150、RDNA3.5）だけに特化させたフォークです。**
+**XeStrata-890M は [XeStrata](https://github.com/MistVVK/XeStrata) を AMD Radeon 890M（Ryzen AI 9 HX 370 の内蔵 GPU、gfx1150、RDNA3.5）だけに特化させたフォークです。**
 1,250 億パラメーターの AI モデル **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** を、
 Radeon 890M と 64 GB の RAM を積んだノート PC 1 台で動かします。
 対象はこの GPU だけです。元の XeStrata が扱うほかの GPU のことは、このフォークでは扱いません。
 
-890M での速さ（Ryzen AI 9 HX 370、RAM 64 GB、Fedora 44、Qwen3.8-Flash-Next IQ2_XS、APU の電力 28 W）:
+890M での速さ（Ryzen AI 9 HX 370、RAM 64 GB、Fedora 44、Qwen3.8-Flash-Next IQ2_XS、APU の電力 28 W）
 
 | | 元の XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
@@ -29,18 +29,18 @@ prefill の「元の XeStrata」の列は、この 890M で元の XeStrata の p
 
 ## XeStrata-890M とは
 
-XeStrata は、[Strata](https://github.com/Niko1221/Strata)（NVIDIA の GPU 向け）の GPU の計算を、オープンな標準の SYCL に書き直したものです。
-AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SYCL のコードをコンパイルし、ROCm の上で動かします。
-このフォークは、その AMD の経路を Radeon 890M に合わせて作り直したものです。
+XeStrata は [Strata](https://github.com/Niko1221/Strata)（NVIDIA の GPU 向け）の GPU の計算を、オープンな標準の SYCL に書き直したものです。
+AMD の GPU では intel/llvm の DPC++ の HIP のターゲットでその SYCL のコードをコンパイルし、ROCm の上で動かします。
+このフォークはその AMD の経路を Radeon 890M に合わせて作り直したものです。
 モデル、インストールの流れ、画面、API は Strata と XeStrata のままです。
 
 ビルドは自由ソフトウェアだけの free 方式だけです（ROCm は自由ソフトウェアです）。oneMKL や CUDA は使いません。
 元の XeStrata の xe0.1.43.1（Strata 0.1.43）までの変更を取り込んでいます。
 
-**890M の性質と、このフォークの使い方:**
+**890M の性質と、このフォークの使い方**
 
 - **CPU と GPU が同じメモリ（LPDDR5X）を使います。** GPU が自分で確保できる共有のプール（GTT）は、カーネルの既定では RAM の約半分です。
-  このフォークは、モデルの 24,576 個のエキスパート（約 34 GiB）をすべてホストのメモリ（host USM）に置き、GPU がそこを直接読みます。
+  このフォークはモデルの 24,576 個のエキスパート（約 34 GiB）をすべてホストのメモリ（host USM）に置き、GPU がそこを直接読みます。
   GPU にないエキスパートを CPU が計算することはなくなり、decode は GPU だけで回ります。
 - **行列エンジンは WMMA（16 x 16 x 16 の f16 と int8）です。** ディストリビューションの hipBLASLt は gfx1150 のカーネルを持たず、
   rocBLAS は行列命令を使わない汎用カーネルに落ちます。このフォークは密な行列積を XeStrata 自身の WMMA のカーネルで計算します（rocBLAS の 3 倍の速さ）。
@@ -49,10 +49,10 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
   95 度でクロックが絞られるので、速さの比較は交互に、GPU を冷ましてから測ります。
 - **CPU の Ryzen AI 9 HX 370 は AVX-512 を持ち**、CPU 側の計算は AVX-512 の経路を使います。
 
-**890M 向けの主な変更**（コミットの順ではなく、部分ごと）:
+**890M 向けの主な変更**（コミットの順ではなく、部分ごと）
 
 - エキスパートのキャッシュを host USM に（`STRATA_CACHE_HOST=1`、`--mmap-experts --expert-cache 24576 --no-prefill-borrow` と組み合わせます）。
-  統合 GPU では、GPU を待つ間に CPU を空回りさせず、host USM のキャッシュを詰めるときにファイルのページを OS に返します。
+  統合 GPU では GPU を待つ間に CPU を空回りさせず、host USM のキャッシュを詰めるときにファイルのページを OS に返します。
 - **decode:**
    - エキスパートの積: 1 レーンが受け持つ行のロードを先にまとめて出します（Q2_0 の down、IQ2_S・IQ2_XXS・IQ1_M の gate/up）。
      AMD では gate/up と SwiGLU を 1 つのカーネルで計算し、活性と格子表をローカルメモリ（LDS）に置く形（mode 8）を既定にしています。
@@ -61,7 +61,7 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
      up は 1 行 8 レーンで 4 行を同時に計算します。読み出しは 3 つのカーネルに分け（`STRATA_HC_V2`、既定）、
      正規化で x = R' w_norm rs をストリームごとの作業バッファに 1 回だけ書き、down は 1 レーン 16 バイトのロードで
      4 行ずつ（5 トークン以上は 2 行）、トークンの引数を読まずに x を読み、20 の列の塊の部分和を最後に終わった
-     ワークグループが足して lo にし、up はそれを読むだけにしています（`STRATA_HC_V2=0` で前の 2 カーネルの形）。
+     ワークグループが足して lo にします。up はそれを読むだけにしています（`STRATA_HC_V2=0` で前の 2 カーネルの形）。
      3 つは 1 回の起動にまとめます（`STRATA_HC_FUSE`、既定）: down のワークグループは自分の行を読んでから正規化の終わりを、
      up のワークグループは自分の行を読んでから down の和の終わりを待つので、行の読み込みが前の段と重なります。down は
      2 行グループで x を 1 回だけ載せ、次の行グループを読みながら今の行グループを計算します。計算は同じでビット単位で
@@ -69,7 +69,7 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
    - 複数トークンの IQ4_XS の GEMV（3 列以上）は、ワークグループの 8 行で活性を 1 回だけ LDS に載せて共有します
      （`STRATA_MMVQ_LDS`、既定。各行の計算は同じでビット単位で同じ。`STRATA_MMVQ_LDS=0` で元の形）。
    - サブグループの xor の交換を DPP と `v_permlanex16` で行います。
-   - GDN の step と commit は、トークンの入力を先に LDS へ載せ、トークンごとのバリアを減らします。
+   - GDN の step と commit はトークンの入力を先に LDS へ載せ、トークンごとのバリアを減らします。
    - GDN の commit を次の窓に畳みます（`STRATA_GDN_DEFER`、既定）: commit は採用した行の k・v・gate・beta だけを退避し、
      次の窓の step が状態を読むついでにそれを当てて 1 回だけ書き戻します。状態（36 層で約 113 MB）の読み書きが窓あたり 3 回から 2 回になり、
      計算の順は同じなので答えはビット単位で同じです（`STRATA_GDN_DEFER=0` で元の commit）。
@@ -85,10 +85,10 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
    - `STRATA_VERIFY_ECAP=N`（opt-in、答えが変わります）: 推測の窓が読むエキスパートの選択を、トークン 0 の全部と、下書きの行の重い順 N−10 個
      までに抑えます（上流 PR #3545 の移植）。上限つきの行（トークン 1 以降）は停止トークンを選びません: 落としたエキスパートなしの
      logits が停止トークンに当たると答えが途中で終わるためで（PR の追記にある不具合）、本当の停止は次の窓のトークン 0 で出ます。
-     890M では窓が短く（平均 3 行）効きません: 16 / 20 / 26 で decode 35.7 / 36.1 / 35.9 tok/s（何もなし 35.8）、教師強制の
+     890M では窓が短いので（平均 3 行）効きません: 16 / 20 / 26 で decode 35.7 / 36.1 / 35.9 tok/s（何もなし 35.8）、教師強制の
      KL 0.456 / 0.275 / 0.136（ガードを入れる前の値）、下書きの採択率 75% → 69%（16）。
 - **prefill:**
-   - 密な行列積は、起動時に oneMath のライブラリ（rocBLAS）と自身の WMMA のカーネルの速さを比べて速い方を取ります
+   - 密な行列積は起動時に oneMath のライブラリ（rocBLAS）と自身の WMMA のカーネルの速さを比べて速い方を取ります
      （HIP の GPU のみ）。`STRATA_BLAS=1` でライブラリ、`STRATA_NO_BLAS=1` で自身のカーネルに固定できます。
    - 自身の WMMA のカーネル（mma_gemm）は、同時に走るワークグループが出力の小さな四角を受け持つ順（8 x 8 タイルのブロック、`STRATA_MMA_BLOCK`）で、
      2 MB の L2 に読む行が残るようにします。
@@ -100,9 +100,9 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
      3,481 トークン 13.4 → 12.8 s。答えは int8 の丸めの分だけ変わることがあります（523 トークンは同一、3,481 トークンは 2 語）。
      `STRATA_PREFILL_DENSE_MMQ=0` で FP16 に戻せます。hyper-connection の down/up（BF16、出力 320）を Q8_0 の写しから同じ形で掛ける
      `STRATA_PREFILL_HC_MMQ=1` もありますが、890M では hc read が 1,313 → 1,397 ms と遅くなるので既定はオフです。
-   - AMD のデバイスコンパイルでは、カーネルに必要なワークグループの大きさを付け（`STRATA_AMD_REQD_WG`）、intel/llvm への修正
+   - AMD のデバイスコンパイルではカーネルに必要なワークグループの大きさを付け（`STRATA_AMD_REQD_WG`）、intel/llvm への修正
      `hip-reqd-work-group-size` がそれをバックエンドのレジスター予算に渡します（それまでは全カーネルが 128 VGPR で spill していました）。
-     それで密な積は長い prompt の大きい積に 64 x 128 のタイル（`STRATA_MMA_SHAPE=5`、2048 行以上かつ 2048 列以上など）を取り、
+     そのため密な積は長い prompt の大きい積に 64 x 128 のタイル（`STRATA_MMA_SHAPE=5`、2048 行以上かつ 2048 列以上など）を取り、
      MMQ は decoder を load と decode に分けてステップの load を先に出し、格子表をローカルメモリに置き、スケールを 1 つの fma で掛けます。
    - エキスパートのキャッシュの host USM は、HIP では GPU がキャッシュできるメモリ（`hipHostMalloc` の NonCoherent、`STRATA_HOST_NC=0` で元の
      host USM）に取ります: その場で読む MMQ が 2 倍ほど速くなります（523 トークンの prefill 3.16 -> 2.68 s）。
@@ -146,7 +146,7 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
 
 このフォークにはパッケージがありません。ソースから入れます。
 
-1. Fedora 44 で、ビルドに要るパッケージと ROCm を入れます（`./setup.sh --packages fedora44/amd --license free` も同じ 1 行を出します）:
+1. Fedora 44 で、ビルドに要るパッケージと ROCm を入れます（`./setup.sh --packages fedora44/amd --license free` も同じ 1 行を出します）。
 
    ```bash
    sudo dnf install python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static \
@@ -155,7 +155,7 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
    ```
 
    自分のユーザーが `/dev/kfd` と `/dev/dri/renderD*` を開けるようにします（`sudo usermod -aG render,video $USER` のあと、ログインし直します）。
-1. リポジトリを取ってきて、setup を実行します:
+1. リポジトリを取ってきて、setup を実行します。
 
    ```bash
    git clone https://github.com/ruc1j/XeStrata-890M.git
@@ -165,14 +165,14 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
 
    setup は GPU と RAM と CPU を確かめ、intel/llvm（v7.1.1、ROCm の HIP のターゲット付き）をここでビルドするかを尋ね、
    エンジンをビルドし、モデルをダウンロードして起動します。質問は Enter を押せばおすすめの選択になります。
-   - **モデルと大きさ**: Qwen3.8-Flash-Next の IQ2_XS。
-   - **文脈の長さ**: 一度に覚えておける文章の量です。32,768 を使っています。
-   - **画像**: 画像も読ませるかどうか。
-   - **実験的な速度向上用の射影**: 答え方が変わる実験的な機能で、既定ではオフです。使う前に
+   - モデルと大きさ: Qwen3.8-Flash-Next の IQ2_XS。
+   - 文脈の長さ: 一度に覚えておける文章の量です。32,768 を使っています。
+   - 画像: 画像も読ませるかどうか。
+   - 実験的な速度向上用の射影: 答え方が変わる実験的な機能で、既定ではオフです。使う前に
      [説明](docs/DETAILS.ja.md#実験的な速度向上用の射影実験的既定はオフ)を読んでください。
 1. 一度起動したら止め（ウィンドウを閉じます）、設定を 890M 向けにします。
    setup が XeStrata のフォルダーに書いた `xestrata-iq2_xs.json` を開き、`"args"` の `--expert-cache` の値を `24576` にして
-   `--mmap-experts` と `--no-prefill-borrow` を足し、`"env"` に `STRATA_CACHE_HOST` を足します:
+   `--mmap-experts` と `--no-prefill-borrow` を足し、`"env"` に `STRATA_CACHE_HOST` を足します。
 
    ```json
    "args": [ ..., "--expert-cache", "24576", ..., "--mmap-experts", "--no-prefill-borrow" ],
@@ -183,12 +183,12 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
    元のファイルは setup が次に書き戻すので、別の名前のフォルダーに写してから置き換え、`--mtp` をそこに向けます）。
 1. `./setup.sh` を実行すると起動し、ブラウザで `http://127.0.0.1:8095` が開きます。
 
-- **時間**: 初回はダウンロード（68 GB）と intel/llvm とエンジンのビルドに時間がかかります。途中で止めても、次は続きから始まります。
+- 時間: 初回はダウンロード（68 GB）と intel/llvm とエンジンのビルドに時間がかかります。途中で止めても、次は続きから始まります。
   GPU のコードは初めて使うときにドライバーがコンパイルするので、最後にモデルを一度動かしてそれを済ませます。
-- **起動中は PC が重くなります**: モデルを起動すると、エキスパート約 34 GiB を RAM に読み込みます。初回はとくに時間がかかり、
+- 起動中は PC が重くなります: モデルを起動すると、エキスパート約 34 GiB を RAM に読み込みます。初回はとくに時間がかかり、
   1〜3 分ほど PC の反応が遅くなることがあります。ウィンドウを閉じずに待ってください。
-- **置き場所**: モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data`、モデルの設定（`xestrata-<モデル>.json`）とログは XeStrata のフォルダーに置きます。
-- **RAM の余裕**: エンジンは、Linux が返せるメモリから 6 GiB（`STRATA_UMA_HEADROOM_GIB`）を引いた分を GPU の空きとして数えます。
+- 置き場所: モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data`、モデルの設定（`xestrata-<モデル>.json`）とログは XeStrata のフォルダーに置きます。
+- RAM の余裕: エンジンは Linux が返せるメモリから 6 GiB（`STRATA_UMA_HEADROOM_GIB`）を引いた分を GPU の空きとして数えます。
   64 GB の PC でほかのプログラムをあまり動かさないなら、`"env"` に `"STRATA_UMA_HEADROOM_GIB": "3"` を足すと文脈に使えるメモリが増えます。
 
 **次からは** `./setup.sh` を実行すると、すぐに起動します。止めるときはそのウィンドウを閉じます。
@@ -212,15 +212,15 @@ AMD の GPU では、intel/llvm の DPC++ の HIP のターゲットでその SY
 
 ## 使い方
 
-- **ブラウザ**: `http://127.0.0.1:8095`（モデルが起動すると自動で開きます）。**Chat**、モデルと GPU・CPU・RAM の様子を
+- ブラウザ: `http://127.0.0.1:8095`（モデルが起動すると自動で開きます）。**Chat**、モデルと GPU・CPU・RAM の様子を
   見る **Monitor**、設定とアドレスを見る **About** があります。
-- **端末で会話**: `.venv/bin/python chat.py`
-- **アプリやコーディングエージェント**: 「OpenAI 互換」の接続先として、ベース URL **`http://127.0.0.1:8095/v1`** を指定します。
+- 端末で会話: `.venv/bin/python chat.py`
+- アプリやコーディングエージェント: 「OpenAI 互換」の接続先として、ベース URL **`http://127.0.0.1:8095/v1`** を指定します。
   API キーとモデル名は何でも構いません。Anthropic の API を使うアプリは `http://127.0.0.1:8095/v1/messages` です。
-- **思考の深さ**: モデルは答える前に考えます。深さは **Off、Low、Medium、High** から選べます。チャットの画面のメニュー、
+- 思考の深さ: モデルは答える前に考えます。深さは **Off、Low、Medium、High** から選べます。チャットの画面のメニュー、
   `chat.py` の `/think low`、アプリの「reasoning effort」の設定で変えられます。Off がいちばん速く、難しい質問には High が向きます。
-- **画像**: チャットの画面では **Picture** を押します。`chat.py` では `/image <パス>` と入力します。アプリでは添付します。
-- **スマートフォンや別の PC から**: `./setup.sh --host 0.0.0.0 --api-key <秘密の文字列>` を実行し、
+- 画像: チャットの画面では **Picture** を押します。`chat.py` では `/image <パス>` と入力します。アプリでは添付します。
+- スマートフォンや別の PC から: `./setup.sh --host 0.0.0.0 --api-key <秘密の文字列>` を実行し、
   サーバーのウィンドウに出るアドレスを開きます（[詳細](docs/DETAILS.ja.md#ストリーミングと接続)）。
 
 **知っておくと良いこと**: 要求は 1 つずつ処理します（複数を同時に処理するには `"parallel": 2`、[BATCHING](docs/BATCHING.ja.md)）。会話の最初のメッセージはすべて読み込みますが、
@@ -269,15 +269,15 @@ APU の電力の上限（PPT）を上げても、長い生成では熱で遅く�
 
 ## しくみ
 
-このようなモデルは、ふつう数百 GB の GPU のメモリを持つサーバーで動かします。890M では CPU と GPU が 1 つの RAM を分け合うので、
+このようなモデルはふつう数百 GB の GPU のメモリを持つサーバーで動かします。890M では CPU と GPU が 1 つの RAM を分け合うので、
 XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
 
 - **モデルは 24,576 個の小さな専門家（エキスパート）の集まり**で、1 語を書くのに使うのはそのうち 10 個だけです。
-  このフォークは、すべてのエキスパート（IQ2_XS で約 34 GiB）をホストのメモリに置き、GPU が直接読みます。
-  GPU のプール（GTT）には、どの語にも必要な層、KV キャッシュ、作業用のメモリを置きます。
-- **GPU** が、どの語にも必要な計算とエキスパートの計算をすべて受け持ちます。decode では CPU はほとんど働きません。
+  このフォークはすべてのエキスパート（IQ2_XS で約 34 GiB）をホストのメモリに置き、GPU が直接読みます。
+  GPU のプール（GTT）にはどの語にも必要な層、KV キャッシュ、作業用のメモリを置きます。
+- **GPU** がどの語にも必要な計算とエキスパートの計算をすべて受け持ちます。decode では CPU はほとんど働きません。
 - **SSD** には大きな表を置き、1 語ごとにその数行だけを読みます。
-- **推測してから確かめる**: モデルに組み込まれた小さな助手（MTP 層）が次の数語を推測し、大きなモデルがそれをまとめて確かめます。
+- 推測してから確かめる: モデルに組み込まれた小さな助手（MTP 層）が次の数語を推測し、大きなモデルがそれをまとめて確かめます。
   合っているものは残し、次の 1 語は自分で書きます。決めるのはいつも大きなモデルなので、答えの品質は変わりません。
 - **長い文章は大きな塊で読みます**（一度に最大 32,768 トークン）。prefill の密な行列積は 890M の WMMA で、
   エキスパートの積は int8 の WMMA で計算します。
@@ -286,38 +286,38 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
 
 ## 開発する人へ
 
-- **ビルド**: free 方式だけです（`build/free`、`-DSTRATA_LICENSE=free`、intel/llvm v7.1.1 を `tools/intel_llvm_build.py` で HIP 付きにビルドしたもの）。
+- ビルド: free 方式だけです（`build/free`、`-DSTRATA_LICENSE=free`、intel/llvm v7.1.1 を `tools/intel_llvm_build.py` で HIP 付きにビルドしたもの）。
   手順は [docs/BUILD.ja.md](docs/BUILD.ja.md) にあります。この機械の事実（パス、設定、道具）は `LOCAL.md`（git には入れません）に書きます。
-- **カーネル単体の計測**: `build/free/gemm_bench`（密な積）、`iq_mmq_parity --bench`（エキスパートの int8 の積）、`expert_bench`、`gdn_bench`、`gr_bench`、`mmvq_bench`。
+- カーネル単体の計測: `build/free/gemm_bench`（密な積）、`iq_mmq_parity --bench`（エキスパートの int8 の積）、`expert_bench`、`gdn_bench`、`gr_bench`、`mmvq_bench`。
   単体はクロックを固定せず高い側（`dpm high`）で測り、A/B は同じ条件で交互に、GPU を冷ましてから測ります（熱で数 % 動きます）。
   `STRATA_PREFILL_TIMING=1` で prefill の段階ごとの GPU 時間がログに出ます。
-- **ISA の確認**: `-fsycl-device-only` で bitcode を出し、intel/llvm の `llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1150` でアセンブリにして、
+- ISA の確認: `-fsycl-device-only` で bitcode を出し、intel/llvm の `llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1150` でアセンブリにして、
   メタデータの `.vgpr_count` と `.vgpr_spill_count` を見ます。AMD の backend はカーネルのレジスター予算を必要なワークグループの大きさから決めるので
   （intel/llvm への修正 `hip-reqd-work-group-size`）、カーネルには `STRATA_AMD_REQD_WG` を付けます。付けないカーネルは 1024 ワークアイテム分の
   128 VGPR に抑えられ、溢れます。
-- **守ること**: [AGENTS.md](AGENTS.md)。890M 向けの分岐は、GPU の名前ではなく、報告される性質（統合 GPU、HIP の backend、WMMA の有無）か環境変数の opt-in で選びます。
+- 守ること: [AGENTS.md](AGENTS.md)。890M 向けの分岐は GPU の名前ではなく報告される性質（統合 GPU、HIP の backend、WMMA の有無）か環境変数の opt-in で選びます。
   リント（`tools/lint/run.sh`）、テスト（CTest、`python -m unittest`）、ライセンスの表示もそこにあります。
   計測の記録は git に入れません。
-- **README と docs**: 日本語版（README.ja.md、docs/*.ja.md）を先に書き、英語版（README.md、docs/*.md）はその訳です。
+- README と docs: 日本語版（README.ja.md、docs/*.ja.md）を先に書き、英語版（README.md、docs/*.md）はその訳です。
   `docs/` は元の XeStrata のものです。
 
 ## クレジット
 
-- **元のソフトウェア**: MistVVK と XeStrata の貢献者による [XeStrata](https://github.com/MistVVK/XeStrata)、
+- 元のソフトウェア: MistVVK と XeStrata の貢献者による [XeStrata](https://github.com/MistVVK/XeStrata)、
   その元の、Niko1221 と Strata の貢献者による [Strata](https://github.com/Niko1221/Strata)。
-- **モデル**:
+- モデル:
    - Qwen チームの [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)。
    - [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) による圧縮版（IQ2_XS）。
 
   モデルのファイルには、それぞれのライセンスが適用されます。
-- **使っている部品**:
+- 使っている部品:
    - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。
    - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: rocBLAS の後端（起動時の比較と `STRATA_BLAS=1`）。
      CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: コンパイラと SYCL の実行時。
      XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当ててビルドします。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
-- **参考にした考え方**: 元の XeStrata の[クレジット](https://github.com/MistVVK/XeStrata#credits)にあるもの。
+- 参考にした考え方: 元の XeStrata の[クレジット](https://github.com/MistVVK/XeStrata#credits)にあるもの。
   IQ4 の表引きの形は llama.cpp の HIP 版を参考にしています。
 - 詳しくは [docs/DETAILS.ja.md](docs/DETAILS.ja.md#クレジットとライセンス) にあります。
 
@@ -326,11 +326,11 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
 XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフトウェアで、全体を
 [GNU Lesser General Public License の第 3 版以降](COPYING.LESSER)（`COPYING.LESSER` と `COPYING`）で配布します。このフォークも同じです。
 
-- **メーカーの計算ライブラリとのリンク**: GPU や CPU のメーカーが自社の製品向けに出している計算ライブラリとその実行時ライブラリとリンクしたものも配布できます。
+- メーカーの計算ライブラリとのリンク: GPU や CPU のメーカーが自社の製品向けに出している計算ライブラリとその実行時ライブラリとリンクしたものも配布できます。
   GPL 第 3 版の第 7 条による追加の許可で、文面は [NOTICE](NOTICE) にあります。このフォークが使う ROCm は自由ソフトウェアなので、この許可は要りません。
-- **Strata と ggml から来たコード**: MIT ライセンスの Strata と ggml / llama.cpp から来たコード（`src/` に書き写したカーネルを含む）も、
+- Strata と ggml から来たコード: MIT ライセンスの Strata と ggml / llama.cpp から来たコード（`src/` に書き写したカーネルを含む）も、
   XeStrata の一部として LGPL です。MIT の条件どおり、著作権表示と許諾表示を [NOTICE](NOTICE) に残しています。
-- **例外**: `third_party/` の次のものは、元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
+- 例外: `third_party/` の次のものは元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
    - intel/llvm への XeStrata の修正のパッチ（`third_party/main/intel-llvm/`）: Apache-2.0 WITH LLVM-exception。
    - oneMath への XeStrata の変更（フォーク、`third_party/main/oneMath/`）: Apache-2.0。
    - ggml の `ggml-common.h`（`third_party/main/ggml/`、変えていない写し）: MIT。
@@ -338,4 +338,4 @@ XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフト�
    - `third_party/nonfree/`: 自由ソフトウェアでないもの。元のモデルのチャットテンプレートと、実験的な速度向上用の射影のベクトルで、
      どちらも Qwen Community License 1.0 です。
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。
-- **モデル**: このリポジトリには含みません。モデルのファイルには、それぞれのライセンスが適用されます。
+- モデル: このリポジトリには含みません。モデルのファイルには、それぞれのライセンスが適用されます。
