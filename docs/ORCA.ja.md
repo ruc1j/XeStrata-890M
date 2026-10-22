@@ -7,7 +7,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 [English](ORCA.md) | 日本語
 
-この文書は、setup のメニューにないモデル `orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF` の **IQ3_XXS** を、手で pack にして動かす手順です。
+この文書は setup のメニューにないモデル `orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF` の **IQ3_XXS** を、手で pack にして動かす手順です。
 
 このリポジトリは gated で、ダウンロードには、モデルのページで条件を受け入れた Hugging Face のアカウントでのログインが要ります。
 下の手順と確認の結果は、upstream の Strata が 2026-09-27 に、Linux、RTX 5090（32 GB）、Ryzen 9 9950X3D、RAM 128 GB で確かめたものです。
@@ -15,15 +15,15 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 ## このモデルの違い
 
 IQ3_XXS は 2 つのシャードで、合わせて 85.20 GB です。
-層の構成は Strata の Qwen4Exp と同じですが、普通の量子化で、ハイパーコネクション、小さなアテンション、PLE の射影まで圧縮しています。
-Strata のカーネルは、これらを BF16 として読みます。
+層の構成は Strata の Qwen4Exp と同じですが、このモデルは普通の量子化で、ハイパーコネクション、小さなアテンション、PLE の射影まで圧縮しています。
+Strata のカーネルはこれらを BF16 として読みます。
 
-`tools/iq_pack.py --compat-bf16` は、これらの射影だけを展開し、偶数への丸めで BF16 にします。
+`tools/iq_pack.py --compat-bf16` はこれらの射影だけを展開し、偶数への丸めで BF16 にします。
 GGUF の展開した重みに丸めが 1 回足されるだけで、元の BF16 のチェックポイントやその品質が戻るわけではありません。
 エキスパートの重み、ネイティブのアテンションの重み、埋め込み、28.8 GB の PLE の照合表はそのままで、照合表はディスクに置いたままです。
 pack は、変換したものを `compat-bf16.json` に記録します。
 
-ネイティブのローダーは、この pack が変換した PLE のキーを使います。
+ネイティブのローダーはこの pack が変換した PLE のキーを使います。
 元のモデルのネイティブの Q2_0 のキーの経路も残っています。
 Hugging Face のスナップショットのシンボリックリンクも使えます。
 pack にする前に、分割したシャードのダウンロードをすべて終えておきます。
@@ -31,7 +31,7 @@ pack にする前に、分割したシャードのダウンロードをすべて
 
 ## 準備
 
-エンジンは、固定した llama.cpp と一緒に普通にビルドします（`./setup.sh` が `engine/strata` に作ります）。
+エンジンは固定した llama.cpp と一緒に普通にビルドします（`./setup.sh` が `engine/strata` に作ります）。
 Python には numpy、regex と、その llama.cpp の gguf-py が要ります（`STRATA_GGUF_PY` で gguf-py のフォルダーを指定できます）。
 
 ```sh
@@ -40,7 +40,7 @@ Python には numpy、regex と、その llama.cpp の gguf-py が要ります�
   --out packs/orca-iq3_xxs --compat-bf16
 ```
 
-トークナイザーは、このモデルのものを pack に書き出して使います。
+トークナイザーはこのモデルのものを pack に書き出して使います。
 ほかのモデルの `dense.bin` を共有したり、Orca のファイルの名前を setup の GSQ-RCO のモデルに変えて成りすましたりはしません。
 
 常駐する server は MTP のランタイムも使います（なくても動き、推測は照合だけになります）。
@@ -64,7 +64,7 @@ setup が Swift 1.5 でするのと同じく、元のモデルの推測のヘッ
 Orca の PLE の表は、シャード 1 にあるためです。
 名前を `xestrata-` で始めないのは、setup がそれを自分の入れたモデルの設定として扱うためです。
 
-最初は、文脈 32K、prefill の塊 512 トークンで始めます。
+最初は文脈 32K、prefill の塊 512 トークンで始めます。
 エキスパートのキャッシュは、空いている VRAM に合わせて大きさが決まります。
 エキスパートの置き場だけで、空いた RAM が約 49.8 GiB 要ります。
 これに推測とランタイムのバッファー、ほかのアプリケーションの分が加わります。
@@ -89,7 +89,7 @@ Orca の PLE の表は、シャード 1 にあるためです。
 }
 ```
 
-エンジンを、ここで作った intel/llvm でビルドしたときは、そのランタイムのフォルダーが要ります。
+エンジンをここで作った intel/llvm でビルドしたときは、そのランタイムのフォルダーが要ります。
 setup が書いた `xestrata-<model>.json` の `lib_dirs` を、この設定にも写します。
 
 リポジトリの最上位で起動します。

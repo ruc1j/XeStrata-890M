@@ -6,7 +6,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 English | [日本語](BENCH.ja.md)
 
-XeStrata's speed is measured in three ways, and on a PC with image generation set up, that too.
+XeStrata's speed is measured in three ways, and, on a PC with image generation set up, image generation as well.
 A user's `xestrata --bench` and a developer's measurements for an upstream merge share one implementation (`tools/bench_core.py`) and the same prompts, conversations and settings,
 so a user's record and the development machines' records go into the same tables.
 
@@ -52,7 +52,7 @@ xestrata --bench --original-strata v0.1.41        # upstream Strata's tag on the
 ### --original-strata
 
 Fetches upstream Strata's tag with git into the data folder's `upstream/` and measures it in turns with XeStrata.
-Its engine is made as upstream's setup makes it:
+Its engine is made as upstream's setup makes it.
 
 | GPU | upstream's engine |
 | --- | --- |

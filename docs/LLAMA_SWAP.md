@@ -12,7 +12,7 @@ This page is the procedure upstream checked (Strata 0.1.39 on a Tesla V100), wit
 ## The entry
 
 Set the model up as usual first (`./setup.sh --no-start ...`).
-The start script setup writes (`run-<model>.sh`) fixes the port, so call `serve/server.py` with llama-swap's port instead:
+The start script setup writes (`run-<model>.sh`) fixes the port, so call `serve/server.py` with llama-swap's port instead.
 
 ```yaml
 healthCheckTimeout: 300            # loading takes 1-2 minutes
@@ -50,7 +50,7 @@ Any one of these fixes it:
 
 ## XeStrata's own pages through llama-swap
 
-llama-swap forwards `/upstream/<model>/...` unchanged, so the status and health pages stay reachable, and calling one also loads the model without sending a chat request:
+llama-swap forwards `/upstream/<model>/...` unchanged, so the status and health pages stay reachable. Calling one also loads the model without sending a chat request.
 
 ```bash
 curl http://my-server:8040/upstream/xestrata/health

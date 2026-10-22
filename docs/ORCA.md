@@ -7,7 +7,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 English | [日本語](ORCA.ja.md)
 
-This is the procedure to pack and run `orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF` **IQ3_XXS** by hand, a model setup's menu does not offer.
+This is the procedure to pack and run `orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF` **IQ3_XXS** by hand. setup's menu does not offer this model.
 
 The repository is gated: downloading needs a login with a Hugging Face account that has accepted the terms on the model page.
 The procedure and the results below are upstream Strata's, checked on 2026-09-27 on Linux with an RTX 5090 (32 GB), a Ryzen 9 9950X3D and 128 GB of RAM.
@@ -43,8 +43,8 @@ Python needs numpy, regex and that llama.cpp's gguf-py (`STRATA_GGUF_PY` can poi
 Use this model's own tokenizer, exported into the pack.
 Do not share another model's `dense.bin`, and do not rename the Orca files to pass them off as one of setup's GSQ-RCO models.
 
-The persistent server also uses the MTP runtime (optional: without it the drafts come from lookup only), prepared
-with the existing tools:
+The persistent server also uses the MTP runtime (optional: without it the drafts come from lookup only).
+Prepare it with the existing tools.
 
 ```sh
 .venv/bin/python tools/mtp_fetch.py fetch --out mtp
@@ -90,7 +90,7 @@ The expert arena alone needs about 49.8 GiB of free RAM, plus the draft and runt
 An engine built with the intel/llvm built here needs its runtime's folders.
 Copy `lib_dirs` from an `xestrata-<model>.json` setup wrote into this config.
 
-Run from the repository root:
+Run from the repository root.
 
 ```sh
 .venv/bin/python -m serve.server --engine strata --config strata-orca-iq3_xxs.json --port 8095

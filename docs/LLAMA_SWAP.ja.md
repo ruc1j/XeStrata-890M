@@ -39,7 +39,7 @@ llama-swap を通した最初の要求が、すぐに次のように断られる
 403 Host 'my-server:8040' is not allowed (DNS rebinding protection)
 ```
 
-XeStrata は知っているホスト名にだけ答えます。ウェブのページが DNS の名前を 127.0.0.1 に向けて届くのを防ぐためです。
+XeStrata は知っているホスト名にだけ答えます。ウェブのページが DNS の名前を 127.0.0.1 に向けて XeStrata に届くのを防ぐためです。
 llama-swap はクライアントの Host ヘッダーをそのまま渡すので、名前でプロキシに来たクライアント（`http://my-server:8040`）は断られます。
 IP アドレスと `localhost` への要求はいつも通るので、手元の試しでは動き、ほかの機械からだけ失敗することがあります。
 次のどれかで直ります。
@@ -50,7 +50,7 @@ IP アドレスと `localhost` への要求はいつも通るので、手元の�
 
 ## llama-swap を通した XeStrata のページ
 
-llama-swap は `/upstream/<model>/...` をそのまま渡すので、状態と health のページにも届き、呼ぶとチャットの要求なしにモデルを読み込みます。
+llama-swap は `/upstream/<model>/...` をそのまま渡すので、状態と health のページにも届きます。呼ぶとチャットの要求なしにモデルを読み込みます。
 
 ```bash
 curl http://my-server:8040/upstream/xestrata/health
