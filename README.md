@@ -80,6 +80,10 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      again in the next window (about 0.18 ms a row), so a write every second window is the balance.  The 890M's decode is +0.7%
      at K=6 (35.7 to 36.0 tok/s), -0.3% at 12 and -1.0% at 24.  The arithmetic and its order are unchanged, so the output is bit
      for bit the same (`STRATA_GDN_ACC=1`: the write after every window).
+   - The shared expert (three small GEMVs: gate, up, down) on a graph side branch beside the experts' stage (`STRATA_SH_BRANCH`,
+     the default where side branches pay on the GPU; upstream's SH_STREAM).  The same kernels in the same order, joined before the
+     combine, so the output is bit for bit the same.  The 890M's decode is +2.5 to 3.0% (35.5 to 36.5 tok/s).  `STRATA_SH_BRANCH=0`:
+     the former order.
    - The speculative layer's head narrowed by a one-bit sketch (`STRATA_MTP_SKETCH`, the default): at start-up each head
      row's signs and mean magnitude are taken, every draft step picks 4 candidates of each 128 rows with them, and only the
      candidates' rows go through the real head.  The head reads about a quarter of the bytes and the drafts hit as often

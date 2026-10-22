@@ -646,6 +646,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     bool gate_later_[2] = {false, false};   // the group's shared rows still to be scaled by the combine (pre -> post)
+    // XeStrata-890M (STRATA_SH_BRANCH, default on with the side branches): the shared expert's three GEMVs on side
+    // branch 0 beside the experts' VRAM hits (upstream's SH_STREAM), joined before the combine reads its rows; the
+    // same kernels and bits.  STRATA_SH_BRANCH=0: on cs before the experts, as before.
+    static const bool sh_branch = [] {
+        const char* v = std::getenv("STRATA_SH_BRANCH");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    bool sh_side_[2] = {false, false};      // the group's shared expert runs on side branch 0 (pre -> post)
     if (!batch_rec_) groups_[T] = G;
     const int64_t nQall = g.n_qsa_layers();
     // a batch window: row t is slot t, whose state lives in its own session (upstream PR #559)
@@ -1265,11 +1273,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
                 else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
             }
+            sh_side_[grp] = br && sh_branch;
+            if (sh_side_[grp] && !fork(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
             try {
                 // the window's combine scales the shared rows itself (upstream b08cf3e1; the same bits, a launch fewer)
                 gate_later_[grp] = shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data,
                                                        sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff,
-                                                       sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs,
+                                                       sh_g_ + tb, shared_ + tb * N, N, g.n_ff,
+                                                       sh_side_[grp] ? df_side_[0] : cs,
                                                        lfuse_gate && dec_batch && n > 1 && native_moe_combine_enabled(),
                                                        g_ready, qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36)
                                                                        : nullptr);
@@ -1379,6 +1390,10 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 else
                     copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
+        }
+        if (sh_side_[grp]) {   // the shared expert's rows (STRATA_SH_BRANCH) before the combine reads them
+            sh_side_[grp] = false;
+            if (!join(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
         }
         const bool multi_combine = dec_batch && n > 1 && native_moe_combine_enabled();
         const bool fold_hits = multi_combine && native_moe_fuse_hits();   // the hit rows added inside the combine
