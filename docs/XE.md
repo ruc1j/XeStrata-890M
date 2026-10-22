@@ -20,7 +20,8 @@ Upstream Strata (`3ce2523`) keeps them, and each Xe source names the CUDA file i
 It is developed and measured on an Intel Arc Pro B70 (Xe2, 32 GB); the speeds in the records are that card's unless they say otherwise.
 On NVIDIA it is checked on an RTX 4070 and an RTX 3070.
 The engine chooses its paths from what the GPU reports (AGENTS.md, the first rule).
-The prefill path's matrix products use a kernel of their own on Xe2's XMX (xmx_gemm), a joint_matrix product that takes the reported tile shape on the Arc A series' XMX and NVIDIA's tensor cores (mma_gemm), the same product through the WMMA instructions on RDNA3 and RDNA4, and the DP4a paths on a GPU without matrix engines.
+The prefill path's matrix products use a kernel of their own on Xe2's XMX (xmx_gemm), a joint_matrix product that takes the reported tile shape on the Arc A series' XMX and NVIDIA's tensor cores (mma_gemm), the same product through the WMMA instructions on RDNA3 and RDNA4.
+A GPU without matrix engines uses the DP4a paths instead.
 The experts' products in int8 (their quantized blocks as they are, iq_mmq) run on Intel's XMX (Xe2, Xe-HPG), NVIDIA's tensor cores (Turing on) and the WMMA of RDNA3 and RDNA4, and take DP4a only on a GPU without matrix engines.
 Volta, whose matrix engines have no int8, takes the FP16 path.
 Qwen3.8's prompt keeps the FP16 path on a GPU that runs xmx_gemm (faster there on the B70).
@@ -47,7 +48,7 @@ The main ones:
 - serve: the thinking limit (`max_tokens` and Anthropic's `budget_tokens`), the model card's sampling for a request without one, the prompt tokenized from the last shared prefix (#1852), the next turn sent to the slot that holds the conversation's checkpoint (#2518), short prompts admitted first (`STRATA_ADMIT_SHORT_FIRST`, opt-in), parser fixes.
 - Carried as opt-in: `STRATA_EXCHANGE_ROTATE`, `STRATA_RAM_ADAPT`, `STRATA_SPLIT_UNIFORM`.
 
-Fixed on XeStrata's side during the integration:
+The following were fixed on XeStrata's side during the integration.
 
 - The boundary between the experts' int8 and FP16 products is timed up to 1024 rows an expert. Timed to 256 only, it read IQ3_S's and UD-Q4_K_XL's 32K chunks with the int8 products (B70, IQ3_S, 32K prefill 1,896 -> 2,425 tok/s).
 - The choice of the big prompt chunks no longer counts the RAM copy it has already made a second time (B70, UD-Q4_K_XL, 32K prefill 1,760 -> 2,412 tok/s).
@@ -98,7 +99,7 @@ The main ones:
 - Ported and kept opt-in: `STRATA_MTP_PRIO` and `STRATA_COPY_PRIO`, `STRATA_POOL_UMWAIT`, `STRATA_PCIE_MIN1`, `--adapt-async 1` in the arena
   mode, `STRATA_DENSE_F32`.
 
-Fixed on XeStrata's side during this integration:
+The following were fixed on XeStrata's side during this integration.
 
 - A failed GPU query is told from an unfinished one, and a wait ends with an error (issue #12). The "RAM is tight"
   warning counts the experts actually placed in RAM (issue #11).
@@ -138,7 +139,7 @@ The main ones:
 - setup's `--calibrate` tunes the model of `--model` and `--family` (#2036). The benchmark reports only the GPUs the engine uses (#1985, #2062),
   and the server it starts runs without `--expert-profile-save` (#2088).
 
-Fixed on XeStrata's side meanwhile:
+The following were fixed on XeStrata's side meanwhile.
 
 - Prompt path: the FP16 and int8 experts' rows and groups share one place, so a model with both paths keeps its chunk.
   RTX 4070, UD-Q4_K_XL at 32K: 460 → 617 tok/s (upstream: 620).
@@ -176,7 +177,7 @@ The main ones:
   `STRATA_DROP_CACHE_ON_EXIT`, the file-cache hint when RAM is short, `STRATA_TRACE`'s VRAM marks.
 - `xestrata --setup --bench-original-compat`, which runs upstream's benchmark mode (`strata_bench.py`) as it measures ([BENCH](BENCH.md)).
 
-Fixed on XeStrata's side during this integration:
+The following were fixed on XeStrata's side during this integration.
 
 - The split of the missed experts between the CPU and PCIe refines the CPU's times from the decode ([Splitting the missed experts between the CPU and PCIe](#splitting-the-missed-experts-between-the-cpu-and-pcie)).
 - When the RAM cannot hold the whole expert arena, the engine starts as with `--resident-experts` instead of loading it, and moves layers into host USM only while the RAM has room for them (issue #10, [DETAILS](DETAILS.md)).
@@ -212,7 +213,7 @@ the B70 and the RTX 4070 match or beat upstream in every cell; the RX 9060 XT do
 times as fast at every length. Its decode moves by about a third from run to run in the same setting (upstream's too),
 for reasons not yet known.
 
-Found during the final comparison and fixed on XeStrata's side:
+The following were found during the final comparison and fixed on XeStrata's side.
 
 - When page-locking the RAM copy of the experts is refused as one allocation (the B70's Level Zero takes 30 GiB at most), it is taken in parts cut between experts (`STRATA_PIN_PARTS=0`: as before). UD-Q4_K_XL at 32K on the B70: prefill +17%, decode +14%.
 - The measurement behind the CPU/PCIe split of the missed experts holds still from start to start ([Splitting the missed experts between the CPU and PCIe](#splitting-the-missed-experts-between-the-cpu-and-pcie)).
@@ -305,9 +306,9 @@ The nonfree build's four-token window stopped inside the Intel runtime.
 
 What the engine requires of the GPU and the host, and the rules it keeps.
 
-- **BIOS**: a discrete card needs Above 4G Decoding and Re-Size BAR enabled and CSM disabled.
+- BIOS: a discrete card needs Above 4G Decoding and Re-Size BAR enabled and CSM disabled.
   Otherwise the B70's BARs stayed unassigned and the xe driver did not bind.
-- **Choosing the GPU**: the runtime drives one GPU (several with a layer split, [MULTIGPU](MULTIGPU.md#gpu-numbers)): an Intel GPU through Level Zero, an NVIDIA GPU through the CUDA backend (not OpenCL, which lists the same Intel GPUs again).
+- Choosing the GPU: the runtime drives one GPU (several with a layer split, [MULTIGPU](MULTIGPU.md#gpu-numbers)): an Intel GPU through Level Zero, an NVIDIA GPU through the CUDA backend (not OpenCL, which lists the same Intel GPUs again).
   It is chosen by what it reports, never by its maker or device ID.
   It needs 32-wide sub-groups, FP16, and device and host USM, and the executable must carry code for it (an NVIDIA GPU with a build without `STRATA_CUDA_ARCHS` is refused).
   `STRATA_GPU_PCI` (setup writes it) names the card by PCI address.
@@ -315,7 +316,7 @@ What the engine requires of the GPU and the host, and the rules it keeps.
   then the one with the most memory, then the most compute units (whose size differs between makers).
   There is no CPU fallback.
   A GPU without what it needs is refused with the reason.
-- **Queues**: one context owns an in-order compute queue and an in-order transfer queue.
+- Queues: one context owns an in-order compute queue and an in-order transfer queue.
   `copy_async` returns an event; `compute_after` inserts the cross-queue dependency.
   For readback, pass the compute completion event to `copy_async` and wait before reading the host buffer.
   The existing parity harness takes this path with separate host USM staging allocations.
@@ -324,8 +325,8 @@ What the engine requires of the GPU and the host, and the rules it keeps.
   A kernel's `void* stream` is resolved by `Runtime::stream`:
   an engine stream, the compute queue, or null (the compute queue, with synchronous completion where CUDA synchronized); any other pointer is refused.
   Work on different streams is ordered only through events, as with CUDA's non-blocking streams.
-- **Allocations**: device allocations are 4096-byte aligned; bump allocations validate capacity without wrapping.
-- **The expert arena**: `PinnedArena` is one 2 MB-aligned anonymous mapping with `MADV_HUGEPAGE`.
+- Allocations: device allocations are 4096-byte aligned; bump allocations validate capacity without wrapping.
+- The expert arena: `PinnedArena` is one 2 MB-aligned anonymous mapping with `MADV_HUGEPAGE`.
   It is registered with `prepare_for_device_copy` before the loader fills it; a failed mapping or registration throws.
   Host USM is not used for it:
   Level Zero refuses a single USM allocation above `max_mem_alloc_size` (32.5 GB on the B70), and every model's arena but the Coder's is larger.
@@ -334,10 +335,10 @@ What the engine requires of the GPU and the host, and the rules it keeps.
   `registered_bytes` is the whole capacity, and `locked_bytes` counts explicit `mlock` bytes (zero).
   Neither `mlock` nor a hugetlbfs pool is used; transparent huge pages back the arena.
   The B70 measurements registered a 47.46 GiB arena under an 8 MiB memlock limit, with `VmLck` 0.
-- **Following the device**: kernels take what the device reports.
+- Following the device: kernels take what the device reports.
   A work-group of 1024 work-items only where the device takes one (the UHD 770 takes 512).
   FP64 only where the device has it; on the UHD 770 and the Arc A series those kernels sum in FP32.
-- **The verify window's wait**: the verify window's GPU waits for the CPU's experts by spinning on a flag in host memory.
+- The verify window's wait: the verify window's GPU waits for the CPU's experts by spinning on a flag in host memory.
   That needs a running kernel to see the host's writes.
   The verifier checks that at start (`doorbell_visible`).
   Where it fails (the UHD 770), each window runs as segments the host launches one after another, with no waiting kernel: the same results, slower.
@@ -345,12 +346,12 @@ What the engine requires of the GPU and the host, and the rules it keeps.
   A window whose verifier layers have every expert in VRAM runs as another graph that plans the experts on the GPU and never waits for the host (upstream cfd3b72; no segments either).
   On the B70 the Coder IQ1_M went from 28.0 to 28.5 tok/s with the same logits.
   `STRATA_VERIFY_RESIDENT_GRAPH=0` turns it off.
-- **Lifetimes**: every source, destination and reader stays alive until its final consumer completes.
+- Lifetimes: every source, destination and reader stays alive until its final consumer completes.
   A copy-complete event alone does not allow reuse while a kernel still reads the destination.
   Arena destruction drains every owned queue before freeing USM or releasing the registration.
   USM pointers are used in their allocation context, and their dependencies are the application's responsibility
   (see the [Khronos USM reference](https://github.com/KhronosGroup/SYCL_Reference/blob/main/source/iface/usm_basic_concept.rst)).
-- **Errors and waits**: synchronous SYCL failures propagate to the CLI; asynchronous errors are kept and checked at waits.
+- Errors and waits: synchronous SYCL failures propagate to the CLI; asynchronous errors are kept and checked at waits.
   Waits block in the driver; a watchdog thread reports the named wait and ends the process when one lasts 120 s.
   The xe driver resets a job after `job_timeout_ms` (5 s here), so a healthy wait returns well inside that limit.
   A hang or an unsafe teardown failure ends the process without unwinding through live GPU allocations.
@@ -459,7 +460,7 @@ Where the draft modes differ, there are two causes:
   K-quant and BF16 experts (Unsloth's files, Ornith, llm-jp) are not covered.
   `STRATA_CANON=0` takes the CPU's former kernels (for comparisons; the GPU's stay, so the CPU's and the GPU's results then differ).
 - On Qwen IQ3_XXS, the suffix run differed from the no-draft run even with the same cache.
-  The CPU took its multi-token expert kernels (i-quant gate/up and IQ4_NL down) from two tokens on and ggml's single-token dot for one, so a token's rows were summed in another order alone than in a window.
+  The CPU took its multi-token expert kernels (i-quant gate/up and IQ4_NL down) from two tokens on and ggml's single-token dot for one, so a token's rows were summed in a different order when it ran alone than when it ran in a window.
   From 2026-10-16 the CPU computes these and Q4_K, Q5_K and Q6_K with the multi-token kernels from one token on, and Q2_K, Q3_K and Q8_0 with ggml's dot at every token count. A token's rows are the same alone and in a window, and with the same cache the draft modes give bit-identical logits (the GPU side of a multi-token window added no difference before either).
   `STRATA_IQ_MT_MIN=N` takes the multi-token kernels from N tokens as before (for comparisons).
 
@@ -494,21 +495,21 @@ In a verify window the experts missing from VRAM are computed by the CPU or read
 How many go each way is chosen from times measured at start (after [Project Maya](https://github.com/mw00/project-maya)'s CPU lane; the code is written anew).
 Before, it was a share from the link's speed alone (0.55 from 20 GB/s, below that in proportion).
 
-- **Measured**: the CPU pool's time for an expert (64 taken in turn, past the CPU's cache), the window's copy kernel (`fetch_blobs`) reading one over PCIe,
+- Measured: the CPU pool's time for an expert (64 taken in turn, past the CPU's cache), the window's copy kernel (`fetch_blobs`) reading one over PCIe,
   the window's expert kernel computing one from VRAM, and the memory's rate as the CPU reads experts.
-- **Sharing the memory**: the CPU and PCIe read the same memory; when their rates together pass the memory's, both are taken as slowed by that factor.
+- Sharing the memory: the CPU and PCIe read the same memory; when their rates together pass the memory's, both are taken as slowed by that factor.
   On the B70 that gives 0.13 ms an expert over PCIe (0.066 alone), as the decode's waits work out.
   The memory's rate is the fastest of five readings 100 ms apart, taken once the kernels' preload thread is done, and in generate before the prompt is read.
   A single reading beside other work came out up to 3x low, and on the RX 9060 XT some starts then gave the CPU every miss, the 64K decode at 21 tok/s (38-41 once steady).
-- **The split**: for each group of a window, the GPU computes its VRAM hits, then (beside them where the window's fetch branch runs) reads and computes the PCIe experts,
+- The split: for each group of a window, the GPU computes its VRAM hits, then (beside them where the window's fetch branch runs) reads and computes the PCIe experts,
   and the CPU computes the rest; the number read over PCIe makes the later side earliest.
   Experts go over PCIe only when that is at least 10% earlier than the CPU taking them all.
-- **Refined from the decode**: the CPU's time at start is measured a token at a time, and the window's pool calls can run slower (1.27-1.29x on the RX 9060 XT, 3.5x beside a busy host).
+- Refined from the decode: the CPU's time at start is measured a token at a time, and the window's pool calls can run slower (1.27-1.29x on the RX 9060 XT, 3.5x beside a busy host).
   The decode's calls are set against the time the split expected for them, and when they are more than 15% off, the CPU's times are scaled by the ratio (after 512 calls with experts on the CPU, then 1,024 and 2,048 more, three updates at most; as upstream's PcieAuto refines its share).
   On the RX 9060 XT, IQ3_XXS decodes at 52.2 instead of 50.3 tok/s at 1K, 51.3 instead of 48.5 at 64K and 44.7 instead of 42.5 at 262K; on the B70 and the RTX 4070, whose times at start match the decode's, nothing changes. `STRATA_PCIE_SPLIT_REFINE=0` keeps the times taken at start.
-- **The arena**: on Level Zero, GPU kernels cannot read the arena registered for device copies.
+- The arena: on Level Zero, GPU kernels cannot read the arena registered for device copies.
   Only when the split reads experts over PCIe, the arena moves into host USM a layer at a time (about 7.5 s for IQ3_XXS's 40 GB). `STRATA_ARENA_HOST_USM=1` puts it in host USM from the start.
-- **The share stays**: with `--pcie-frac` (also as `--calibrate` saved it), over a layer split, with `--pcie-mode dma` or `direct`, and when the times cannot be measured.
+- The share stays: with `--pcie-frac` (also as `--calibrate` saved it), over a layer split, with `--pcie-mode dma` or `direct`, and when the times cannot be measured.
 
 The RTX 4070 (PCIe 4.0 x4) now computes every miss on the CPU: IQ3_XXS 32K 49.9 -> 57-58.6 tok/s, UD-Q4_K_XL 32K 22.0 -> 25.7.
 The B70 keeps every miss on the CPU, as before; the RX 9060 XT reads 1.0 instead of 4.7 experts a layer over PCIe; neither changes speed.
