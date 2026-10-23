@@ -125,6 +125,15 @@ and 100 GB/s from Managed memory.  The NonCoherent host memory that holds the ex
 (2 MB pages add nothing).  During decode (28 W, six short chats) the DRAM reads average 57 GB/s (42 to 64), 56% of that bandwidth; the
 kernels on their own read at 57 GB/s (the HC reads), 72 GB/s (the dense GEMVs) and 65 to 81 GB/s (the experts).  uclk sits at its
 maximum of 937 MHz, but fclk at 1.29 to 1.44 GHz stays below its 1.96 GHz; pinning it there with `dpm high` leaves decode unchanged
+
+The row strides of the matrices decode reads were audited against RDNA's memory channel interleave (256 B, a 4 KiB period over 16 channels; 2026-10-24).
+The quantized dense matrices (attn_qkv 1,360 B, attn_gate 1,100 B, ssm_out 6,528 B, attn_q 1,360 B, attn_k 2,100 B, attn_output 6,528 B, the shared expert's 680 to 1,360 B, the head 1,760 B) have block sizes that are not powers of two, so their row strides are never a multiple of 4 KiB.
+The only multiple of 4 KiB is the HC down (BF16, 10240 columns, 20,480 B = 5 x 4 KiB); the router and ssm_alpha / ssm_beta (BF16, 2560 columns, 5,120 B) cycle through four 1 KiB phases.
+The HC down read the way decode reads it (one row a sub-group, 8 rows a work-group, 320 rows) runs at 82 GB/s with the stride as stored and 85 GB/s (+4%) with 256 to 512 B added to each row; with 4 tokens there is no difference.
+The HC stages are under a tenth of a window, so for decode as a whole this is under 0.5%.
+The dense GEMV alone (2560 -> 10240, 1 to 4 columns) runs at 94 / 90 / 87 / 86 GB/s, 85 to 90% of the ceiling of a 1 GiB sequential read (99 to 101 GB/s).
+Two rows a sub-group (`STRATA_MMVQ_RPS`) was measured on 2026-10-13 with no difference, and staggering the rows' starts does not apply to the quantized matrices.
+The stage table's "HC reads at 36 to 43 GB/s" becomes 70 to 75 GB/s once down and up are each counted as 6.5 MB a layer, the same level as the dense GEMVs.
 (27.1 against 27.3 tok/s), so what is short is the 28 W of power, not a clock.
 
 ### Where the KV cache lives, and its precision
