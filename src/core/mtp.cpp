@@ -1373,7 +1373,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     // so far are)
     const float cum_min = min_p > 0.0f ? spec_cum_threshold() : 0.0f;
     float cum = pj;
-    for (int j = 1; j < max_steps && (cum_min > 0.0f ? cum >= cum_min : pj >= min_p); ++j) {
+    for (int j = 1; j < max_steps && (chain_rule_ ? chain_rule_(j - 1, pj) : cum_min > 0.0f ? cum >= cum_min : pj >= min_p); ++j) {
         if (!strata::gpu::graph_launch(cp ? step_exec_c_[j] : step_exec_[j], cs_)) {
             err = std::string("mtp draft step: ") + strata::gpu::last_error();
             return false;
@@ -1389,6 +1389,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (probs) probs[j] = pj;
         ++n;
     }
+    if (chain_rule_ && n >= max_steps) (void) chain_rule_(n - 1, pj);   // the last step of a full chain
     prefetch_ple(drafts[n - 1]);
     if (!strata::gpu::stream_sync(cs_)) {
         err = std::string("mtp draft: ") + strata::gpu::last_error();
