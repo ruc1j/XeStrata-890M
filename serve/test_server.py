@@ -4502,6 +4502,30 @@ class SilentEngine(unittest.TestCase):
         self.assertIn("#481", engine.death_note())
         self.assertNotIn("STOP", engine.proc.stdin.getvalue())    # nothing is listening: no STOP, no drain
 
+    def test_death_note_names_a_finite_rttime_limit_on_signal_9(self):
+        # #3238: a hard RLIMIT_RTTIME of 0 (PipeWire without rtkit) kills with -9 and no OOM; say so, not "out of RAM"
+        import sys
+        import tempfile
+        from unittest import mock
+        engine = self.bare(0.3)
+        fake = mock.MagicMock()
+        fake.RLIMIT_RTTIME = 15
+        fake.RLIM_INFINITY = -1
+        fake.getrlimit.return_value = (0, 0)
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(sys.modules, {"resource": fake}):
+            engine.log_path = os.path.join(d, "e.log")
+            open(engine.log_path, "w").close()
+            engine.proc.poll.return_value = -9
+            note = engine.death_note()
+            self.assertIn("RLIMIT_RTTIME", note)
+            self.assertIn("rtkit", note)
+            fake.getrlimit.return_value = (-1, -1)               # unlimited: the old RAM hint stays
+            self.assertIn("running out of RAM", engine.death_note())
+            fake.getrlimit.return_value = (0, 0)
+            engine.proc.poll.return_value = -11                  # another signal: a crash (issue #12), not this cause
+            self.assertNotIn("RLIMIT_RTTIME", engine.death_note())
+            self.assertIn("crashed", engine.death_note())
+
     def test_death_note_finds_the_watchdog_line_under_a_long_trace(self):
         # #1705: STRATA_VERIFY_TRACE dumps (~30 KB) after the watchdog's line must not hide it
         import tempfile
