@@ -468,6 +468,10 @@ struct Options {
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
     /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
     int adapt_every = 4;
+    bool adapt_every_given = false;   ///< --adapt-every was on the command line (the warm-up interval below does not override it)
+    int adapt_warm_every = 0;         ///< upstream 2ccf57ec: > 0: the interval for the first adapt_warm_rounds verify rounds of a speculative run
+    int64_t adapt_warm_rounds = 0;
+    int adapt_iv(int64_t rounds) const { return adapt_warm_every > 0 && rounds < adapt_warm_rounds ? adapt_warm_every : adapt_every; }   ///< the interval in force at verify round `rounds`
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     /// an expert is swapped into the VRAM tier only when its decayed routing count beats the one it replaces by more
     /// than this (--adapt-min-gain, upstream 495dc436; both tiers)
@@ -2488,7 +2492,7 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::strtoll(next("--mtp-window"), nullptr, 10);
         else if (a == "--pcie-frac") o.pcie_frac = std::strtod(next("--pcie-frac"), nullptr);
-        else if (a == "--adapt-every") o.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10);
+        else if (a == "--adapt-every") { o.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10); o.adapt_every_given = true; }
         else if (a == "--adapt-decay") o.adapt_decay = std::strtof(next("--adapt-decay"), nullptr);
         else if (a == "--adapt-min-gain") o.adapt_min_gain = std::strtof(next("--adapt-min-gain"), nullptr);
         else if (a == "--adapt-async") o.adapt_async = std::strtol(next("--adapt-async"), nullptr, 10) != 0 ? 1 : 0;
@@ -2884,6 +2888,18 @@ int main(int argc, char** argv) {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
         const int chain_base = o.spec;
         o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));   // kVerifyMaxT
+    }
+    // upstream 2ccf57ec (opt-in; upstream's own A/B on sm_86 did not reproduce the gain, a4c503d7): right after the start
+    // the resident experts are the profile's, not this text's; a speculative round carries 2-5 tokens, so the adaptive
+    // tier (one swap round per adapt_every VERIFY rounds) learned the text 2-5 times slower per token.  For the first
+    // STRATA_SPEC_ADAPT_WARM rounds it swaps every STRATA_SPEC_ADAPT_EVERY rounds; later the normal interval.  An
+    // explicit --adapt-every is kept as it is.  (The CLI's loop swaps at fixed positions of the text and keeps them.)
+    if (!o.adapt_every_given && o.spec >= 2 && o.adapt_every > 0) {
+        const char* e = std::getenv("STRATA_SPEC_ADAPT_EVERY");
+        const char* w = std::getenv("STRATA_SPEC_ADAPT_WARM");
+        const int n = e ? std::atoi(e) : 0;
+        const long long wr = w ? std::atoll(w) : 0;
+        if (n > 0 && n < o.adapt_every && wr > 0) { o.adapt_warm_every = n; o.adapt_warm_rounds = wr; }
     }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
@@ -11053,7 +11069,7 @@ int main(int argc, char** argv) {
                 bool pl_adapt_due = false;
                 auto pl_adapt = [&]() -> bool {   // the blocking tier (--adapt-async 0)
                     apply_pending(true);
-                    pl_adapt_due = pl_adapt_due || (rounds % std::max(1, o.adapt_every)) == 0;
+                    pl_adapt_due = pl_adapt_due || (rounds % std::max(1, o.adapt_iv(rounds))) == 0;
                     if (!pl_adapt_due || drive.d.usage.empty() || o.adapt_every <= 0) return true;
                     pl_adapt_due = false;
                     return adapt();
@@ -11637,7 +11653,8 @@ int main(int argc, char** argv) {
                 if (adapt_period > 0)
                     for (int st = 0; st < n_stages; ++st) stage_ver(st).add_routing(drive.d.usage.data(), g.n_expert, a + 1);
                 if (!drive.d.usage.empty() && !ajob &&
-                    (adapt_period > 0 ? (p + a + 1) / adapt_period > p / adapt_period : ((rounds + 1) % o.adapt_every) == 0))
+                    (adapt_period > 0 ? (p + a + 1) / adapt_period > p / adapt_period : ((rounds + 1) % o.adapt_iv(rounds)) == 0))
+
                     adapt_thr = std::thread([&] {
                         strata::aux_cpus::pin_current_thread();
                         const Clock::time_point ta = Clock::now();
