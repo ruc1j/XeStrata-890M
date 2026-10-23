@@ -32,6 +32,7 @@
 
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/pool_plan.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -73,6 +74,13 @@ struct ExpertJobMulti {
 ///
 /// `skip_first` drops the first core, which P2.S3 reserves for the host loop.
 std::vector<int> physical_cores(bool skip_first);
+
+/// The description plan_pool_workers() takes (pool_plan.hpp, upstream 5ece068f): the logical processors this process
+/// may run on, the physical cores per CPU package (the host's package first; `host_core` is the host thread's logical
+/// processor, physical_cores(false).front(), and counts in its package; -1: none), the container's CPU quota.
+PoolPlanInput pool_plan_input(const std::vector<int>& worker_cores, int host_core);
+/// The CPUs a container quota allows (cgroup v2 cpu.max / v1 cfs quota), 0 when none or not Linux.
+double container_cpu_quota();
 
 /// **THE RESERVATION IS A FICTION UNLESS THE HOST IS ACTUALLY PUT THERE.**
 ///
@@ -127,6 +135,11 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    /// What bounded the default worker count (pool_plan.hpp; "" when a count was configured), the physical cores
+    /// and logical processors counted - for the start-up line.
+    const char* plan_limit() const { return plan_limit_; }
+    int plan_cores() const { return plan_cores_; }
+    int plan_logical() const { return plan_logical_; }
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
@@ -200,6 +213,9 @@ private:
     void publish();
 
     int n_ = 0;
+    const char* plan_limit_ = "";
+    int plan_cores_ = 0;
+    int plan_logical_ = 0;
     bool host_works_ = true;
     ExpertJob* jobs_ = nullptr;
     int njobs_ = 0;

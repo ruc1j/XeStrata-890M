@@ -5710,6 +5710,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "strata generate: %d expert-pool workers%s%s\n", pool.workers(),
                  pool.host_works() ? " + the host thread" : "",
                  o.no_pool ? " (UNUSED: --no-pool)" : "");
+    if (pool.plan_limit()[0] != '\0')   // the default count: what it was bounded by (a configured count is never changed)
+        std::fprintf(stderr, "strata generate: CPU pool: %d workers by default (%d physical cores, %d logical processors; bounded by %s)\n",
+                     pool.workers(), pool.plan_cores(), pool.plan_logical(), pool.plan_limit());
     {   // --aux-cpus: the plan, now the workers' CPUs are known (the host takes the first physical core, as
         // SessionLoopScratch pins it); the threads that exist already (the GPU runtime's) move now when it is on, the
         // ones created later pin themselves (strata/platform/aux_cpus.hpp)

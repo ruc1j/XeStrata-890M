@@ -21,7 +21,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
+#include <string>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -199,6 +201,75 @@ std::vector<int> physical_cores(bool skip_first) {
     return cores;
 }
 
+double container_cpu_quota() {
+#if defined(__linux__)
+    // cgroup v2: "max 100000" (no limit) or "<quota> <period>"; v1: cpu.cfs_quota_us (-1: none) / cpu.cfs_period_us
+    if (std::FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {
+        char a[32] = {0};
+        long period = 0;
+        double q = 0;
+        if (std::fscanf(f, "%31s %ld", a, &period) == 2 && std::strcmp(a, "max") != 0 && period > 0)
+            q = std::atof(a) / (double) period;
+        std::fclose(f);
+        return q > 0 ? q : 0.0;
+    }
+    long quota = -1, period = 0;
+    if (std::FILE* f = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r")) {
+        if (std::fscanf(f, "%ld", &quota) != 1) quota = -1;
+        std::fclose(f);
+    }
+    if (std::FILE* f = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r")) {
+        if (std::fscanf(f, "%ld", &period) != 1) period = 0;
+        std::fclose(f);
+    }
+    return quota > 0 && period > 0 ? (double) quota / (double) period : 0.0;
+#else
+    return 0.0;
+#endif
+}
+
+PoolPlanInput pool_plan_input(const std::vector<int>& worker_cores, int host_core) {
+    PoolPlanInput in;
+    in.cpu_quota = container_cpu_quota();
+#if defined(_WIN32)
+    in.logical = (int) GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    // (the sockets of a Windows box are not told apart: one package, the host's core counted in it)
+    in.cores_per_package.push_back((int) worker_cores.size() + (host_core >= 0 ? 1 : 0));
+    return in;
+#else
+    {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        in.logical = sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : (int) std::thread::hardware_concurrency();
+    }
+    auto pkg_of = [](int cpu) -> long {
+        char path[96];
+        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+        long v = -1;
+        if (std::FILE* f = std::fopen(path, "r")) {
+            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
+            std::fclose(f);
+        }
+        return v;
+    };
+    // the cores per package, the host package first; the host core counts in its package.  A package the OS does not
+    // name leaves the layout unknown (cores_per_package empty: the plan then takes half the logical processors).
+    std::vector<std::pair<long, int>> counts;   // (package, cores)
+    bool known = host_core >= 0 || !worker_cores.empty();
+    auto add = [&](long pkg) {
+        if (pkg < 0) { known = false; return; }
+        for (auto& c : counts)
+            if (c.first == pkg) { ++c.second; return; }
+        counts.emplace_back(pkg, 1);
+    };
+    if (host_core >= 0) add(pkg_of(host_core));
+    for (int c : worker_cores) add(pkg_of(c));
+    if (!known) return in;
+    for (const auto& c : counts) in.cores_per_package.push_back(c.second);
+    return in;
+#endif
+}
+
 namespace {
 
 #if defined(_WIN32)
@@ -328,8 +399,25 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core,
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
+    const std::vector<int> all = physical_cores(false);
+    const int host_core = all.empty() ? -1 : all.front();   // the host thread's (SessionLoopScratch pins it there)
     const std::vector<int> cores = physical_cores(true);
-    n_ = n_workers > 0 ? n_workers : (int) cores.size();
+    // upstream 5ece068f: the default count from the physical cores of the host's package, the container's quota and
+    // the measured cap (pool_plan.hpp); a configured count runs as given, with a plain warning above what this CPU
+    // can use well (recommend, never force)
+    const PoolPlanInput plan_in = pool_plan_input(cores, host_core);
+    const PoolPlan plan = plan_pool_workers(plan_in);
+    if (n_workers > 0) {
+        n_ = n_workers;
+        static std::atomic<bool> warned{false};
+        const std::string why = pool_workers_warning(n_workers, plan_in, plan);
+        if (!why.empty() && !warned.exchange(true)) std::fprintf(stderr, "strata cpu pool: warning: %s\n", why.c_str());
+    } else {
+        n_ = (std::min)(plan.workers, (std::max)(1, (int) cores.size()));
+        plan_limit_ = plan.limit;
+    }
+    plan_cores_ = plan.cores;
+    plan_logical_ = plan_in.logical;
     if (n_ < 1) n_ = 1;
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
