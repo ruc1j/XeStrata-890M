@@ -3380,6 +3380,25 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 }
             }
         }
+        // STRATA_DUMP_RFINAL=<path> (XeStrata-890M, a diagnostic): every chunk's final residual (after the last layer,
+        // the MTP layer's input), the T rows of HC * N floats as bf16, after [int32 T, HC, N] (issue #10)
+        if (static const char* dump = std::getenv("STRATA_DUMP_RFINAL"); dump != nullptr && LE == m.g->n_layers) {
+            static std::FILE* df = std::fopen(dump, "wb");
+            if (df != nullptr) {
+                std::vector<float> hr((size_t) T * D);
+                strata::gpu::copy_async(hr.data(), m.R, hr.size() * sizeof(float), m.cs);
+                strata::gpu::stream_sync(m.cs);
+                std::vector<uint16_t> hb(hr.size());
+                for (size_t k = 0; k < hr.size(); ++k) {   // round to nearest even, as f32_to_bf16_bulk
+                    uint32_t u; std::memcpy(&u, &hr[k], 4);
+                    hb[k] = (uint16_t) ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+                }
+                const int32_t head[3] = {(int32_t) T, (int32_t) HC, (int32_t) N};
+                std::fwrite(head, sizeof(int32_t), 3, df);
+                std::fwrite(hb.data(), sizeof(uint16_t), hb.size(), df);
+                std::fflush(df);
+            }
+        }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
         if (issuer.joinable()) {
             issuer.join();
