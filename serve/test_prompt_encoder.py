@@ -123,6 +123,7 @@ class Served(unittest.TestCase):
         full = self.service(max_context=4096)
         full.prompts = None
         refused_ids = full.encode_prompt(refused, None, {})
+        svc.fit_max_tokens = False                     # the strict 400 (the default shortens max_tokens to the room left)
         with self.assertRaisesRegex(ValueError, "exceeds the context"):
             svc.prepare(refused, None, {}, 1 << 20)
         self.assertNotIn(refused_ids, [e[2] for e in svc.prompts.entries])
