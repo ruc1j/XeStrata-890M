@@ -1279,6 +1279,27 @@ void broadcast_streams(const float* x, float* R, int64_t n_embd, int hc, int n_t
     done(stream, e, "broadcast_streams");
 }
 
+void route_marginal_stats(const int32_t* ids, int n, int k, unsigned long long* acc, void* stream) {
+    // one work-group of 32 items: item r counts row r's ids that no earlier row (nor an earlier slot of its own row) holds
+    const auto e = Q(stream).parallel_for(sycl::nd_range<1>(32, 32), [=](sycl::nd_item<1> it) {
+        const int r = (int) it.get_local_id(0);
+        if (r >= n) return;
+        int fresh = 0;
+        for (int j = 0; j < k; ++j) {
+            const int32_t v = ids[r * k + j];
+            bool seen = false;
+            for (int j2 = 0; j2 < j && !seen; ++j2) seen = ids[r * k + j2] == v;
+            for (int r2 = 0; r2 < r && !seen; ++r2)
+                for (int j2 = 0; j2 < k && !seen; ++j2) seen = ids[r2 * k + j2] == v;
+            if (!seen) ++fresh;
+        }
+        sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space> a(acc[r]);
+        a.fetch_add((unsigned long long) fresh);
+    });
+    done(stream, e, "route_marginal_stats");
+}
+
 void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* index, int64_t n, void* stream) {
     const auto e = Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
         const int idx = *index;

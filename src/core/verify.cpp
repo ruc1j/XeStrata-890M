@@ -506,6 +506,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     strata::gpu::memset(arena_, 0, count.used);
     prof_on_ = std::getenv("STRATA_VERIFY_PROFILE") != nullptr;
+    if (const char* rs = std::getenv("STRATA_ROUTE_STATS"); rs != nullptr && rs[0] == '1') {   // upstream d276adf2 (bench only)
+        const size_t nrs = (size_t) 9 * (size_t) g.n_layers * 8;
+        if (strata::gpu::alloc_device((void**) &rs_dev_, nrs * 8)) {
+            strata::gpu::memset(rs_dev_, 0, nrs * 8);
+            rs_on_ = true;
+        } else {
+            rs_dev_ = nullptr;
+        }
+    }
     // The stamps are recorded in the window graph, so they need a clock a kernel reads: without one the profile is off
     // rather than the capture failing.  Level Zero native commands and profiling tags cannot be recorded in a graph.
     if (prof_on_ && !strata::kernels::gpu_stamp_available()) {
@@ -1238,6 +1247,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         const int verify_ecap_n = verify_ecap_cap();
         if (verify_ecap_n > (int) K && n > 1 && (device_plan_ || recording_res_))
             verify_ecap(ids_ + tb * K, w_ + tb * K, n * (int) K, (int) K, verify_ecap_n, cs);
+        if (rs_on_ && G == 1 && n <= 8 && T <= 8)
+            strata::kernels::route_marginal_stats(ids_ + tb * K, n, (int) K, rs_dev_ + ((size_t) T * (size_t) g.n_layers + (size_t) l) * 8, cs);
         if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -1563,6 +1574,67 @@ bool Verifier::set_gdn_defer(bool on, std::string& err) {
     return true;
 }
 
+std::string Verifier::profile_by_t_report() {
+    if (!prof_on_) return std::string();
+    static const char* names[kProfPer] = {"-", "hc-read0", "qkv gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
+                                          "k/v+norm-rope", "kv+idx append", "q+q-idx", "scores+topk", "kv-resolve",
+                                          "attention", "gate", "", "out-proj", "router+plan", "shared+quant",
+                                          "waitA", "VRAM hits", "waitB", "PCIe grp", "waitCPU", "copy+combine",
+                                          "(gap)", "head", "hc0 norm", "hc0 down", "hc0 up", "hc1 norm", "hc1 down", "hc1 up"};
+    std::string out;
+    char b[96];
+    for (int T = 1; T <= 8; ++T) {
+        if (prof_t_win_[T] == 0) continue;
+        double total = 0;
+        std::snprintf(b, sizeof b, "T%d (n=%lld):", T, (long long) prof_t_win_[T]);
+        out += b;
+        for (int k = 0; k < 2; ++k) {
+            out += k == 0 ? " GDN[" : " | QSA[";
+            for (int i = 0; i < kProfPer; ++i) {
+                if (prof_t_sum_[T][k][i] <= 0) continue;
+                total += prof_t_sum_[T][k][i];
+                std::snprintf(b, sizeof b, " %s %.3f", names[i], prof_t_sum_[T][k][i] / 1e6 / (double) prof_t_win_[T]);
+                out += b;
+            }
+            out += " ]";
+        }
+        std::snprintf(b, sizeof b, " | total %.2f ms\n", total / 1e6 / (double) prof_t_win_[T]);
+        out += b;
+    }
+    std::memset(prof_t_sum_, 0, sizeof prof_t_sum_);
+    std::memset(prof_t_win_, 0, sizeof prof_t_win_);
+    return out;
+}
+
+std::string Verifier::route_stats_report() {
+    if (!rs_on_ || rs_dev_ == nullptr || g_ == nullptr) return std::string();
+    const OnDevice on_device(device_);
+    const int64_t L = g_->n_layers;
+    std::vector<unsigned long long> h((size_t) 9 * (size_t) L * 8);
+    strata::gpu::copy(h.data(), rs_dev_, h.size() * 8);
+    std::string out;
+    char b[160];
+    for (int T = 1; T <= 8; ++T) {
+        if (rs_win_[T] == 0) continue;
+        double row[8] = {};
+        for (int64_t l = 0; l < L; ++l)
+            for (int r = 0; r < 8; ++r) row[r] += (double) h[((size_t) T * (size_t) L + (size_t) l) * 8 + (size_t) r];
+        const double denom = (double) rs_win_[T] * (double) L;
+        double sum = 0;
+        for (int r = 0; r < T; ++r) sum += row[r] / denom;
+        std::snprintf(b, sizeof b, "T%d (n=%lld): distinct experts per layer %.2f; new per row:", T, (long long) rs_win_[T], sum);
+        out += b;
+        for (int r = 0; r < T; ++r) {
+            std::snprintf(b, sizeof b, " %.2f", row[r] / denom);
+            out += b;
+        }
+        out += "\n";
+    }
+    strata::gpu::memset(rs_dev_, 0, h.size() * 8);
+    std::memset(rs_win_, 0, sizeof rs_win_);
+    return out;
+}
+
 std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
@@ -1848,6 +1920,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     *(volatile uint32_t*) h_flagB_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = T;
+    if (rs_on_ && T >= 1 && T <= 8) ++rs_win_[T];
     last_pos0_ = pos0;
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
@@ -2068,6 +2141,17 @@ void Verifier::add_routing(float* usage, int64_t n_expert, int rows) const {
 }
 
 void Verifier::accumulate_profile(const unsigned long long* stamps) {
+    double before[2][kProfPer];
+    std::memcpy(before, prof_sum_, sizeof before);
+    accumulate_profile_inner(stamps);
+    if (last_t_ >= 1 && last_t_ <= 8) {
+        for (int k = 0; k < 2; ++k)
+            for (int i = 0; i < kProfPer; ++i) prof_t_sum_[last_t_][k][i] += prof_sum_[k][i] - before[k][i];
+        ++prof_t_win_[last_t_];
+    }
+}
+
+void Verifier::accumulate_profile_inner(const unsigned long long* stamps) {
     const ModelGeometry& g = *g_;
     const int64_t L = g.n_layers;
     auto at = [&](int64_t l, int i) { return stamps[(size_t) (l * kProfPer + i)]; };

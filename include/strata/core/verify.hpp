@@ -414,6 +414,10 @@ public:
     /// STRATA_VERIFY_PROFILE=1 - GPU stage counts since the last call (millions of device-clock ticks per
     /// window), as one line; empty when off, unsupported, or no windows have been profiled.
     std::string profile_report();
+    /// STRATA_VERIFY_PROFILE: the same stage split, one line per window size T (bench: with STRATA_SPEC_T_CYCLE). Resets.
+    std::string profile_by_t_report();
+    /// STRATA_ROUTE_STATS=1: per window size, the routed experts per layer: distinct, and new per row (not in the rows before it). Resets.
+    std::string route_stats_report();
 
 private:
     bool capture(int T, std::string& err);
@@ -493,7 +497,8 @@ private:
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second half's up-stamp
                                                      // at slot 32 = the next layer's slot 0: upstream e5b47dd)
     bool prof_on_ = false;
-    void accumulate_profile(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
+    void accumulate_profile(const unsigned long long* stamps);
+    void accumulate_profile_inner(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
     // pipelined windows (pl_launch ...)
     strata::gpu::Stream ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
     bool always_publish_ = false;
@@ -509,6 +514,11 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
+    double prof_t_sum_[9][2][kProfPer] = {};   // the same per window size T (1..8), for profile_by_t_report
+    int64_t prof_t_win_[9] = {};
+    bool rs_on_ = false;                      // STRATA_ROUTE_STATS (upstream d276adf2)
+    unsigned long long* rs_dev_ = nullptr;    // [9 T][n_layers][8 rows]: experts of row r that no earlier row of the window routed to
+    int64_t rs_win_[9] = {};
 
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
