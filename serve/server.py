@@ -2384,6 +2384,69 @@ def vision_attempts(cfg: dict) -> list[dict]:
     return out
 
 
+def vision_log_tail(log=None, limit: int = 16384) -> str:
+    """The last `limit` bytes of the encoder's stderr file (`log` is the file object it was started with; "" when there
+    is none or it cannot be read)."""
+    try:
+        name = getattr(log, "name", None)
+        if name:
+            with open(name, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - limit))
+                return f.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+# What the CUDA / HIP runtimes print when the reader has no code for the card it runs on (a binary built without that
+# architecture: #3669, the Windows cuda12 package's reader on a Pascal card).
+_VISION_ARCH_SIGNS = ("device kernel image is invalid", "no kernel image is available", "im2col failed",
+                      "unsupported gpu architecture", "invalid device function", "unknown gpu architecture")
+
+
+def vision_start_error(line: str, log=None, code: int | None = None, waited: float | None = None) -> str:
+    """The message when the image encoder answered something other than READY.  #1445: a card in the Exclusive_Process
+    compute mode (or one another process holds) refuses the encoder's CUDA context with "busy or unavailable"; that
+    cause is named instead of leaving the user the first line of a traceback.  `log` is the encoder's stderr file, whose
+    tail is searched too (the CUDA error is printed there).  An encoder that dies before it prints anything (#3645, #3444,
+    #3669, #3697) used to give a blank sentence: now the last lines of its stderr, its exit status (`code`) and, for a
+    kernel-image error, the card/architecture hint come with it.  `waited`: it said nothing for that many seconds."""
+    text = line.strip()
+    tail = vision_log_tail(log)
+    both = (text + chr(10) + tail).lower()
+    if "busy or unavailable" in both:
+        return ("the vision encoder did not start: the GPU refused a second CUDA context (\"CUDA-capable device(s) "
+                "is/are busy or unavailable\"). This is usually the compute mode Exclusive_Process: only one process "
+                "may use the card, and the engine already holds it. Check with: nvidia-smi --query-gpu=compute_mode "
+                "--format=csv; set it back with: sudo nvidia-smi -c DEFAULT (or run the encoder on another card). "
+                "First line from the encoder: " + (text or "(none)"))
+    lines = [x.strip() for x in tail.splitlines() if x.strip()]
+    if any(sign in both for sign in _VISION_ARCH_SIGNS):
+        evidence = next((x for x in reversed(lines) if any(sign in x.lower() for sign in _VISION_ARCH_SIGNS)), text)
+        return ("the vision encoder did not start: it has no code for this graphics card (a kernel-image error: the "
+                "picture reader in this engine package was built for other card generations than yours). Update the "
+                "engine, or read pictures on the CPU (Models, Read pictures, Image encoder device: CPU; or run setup "
+                "again with --vision cpu). From the encoder: " + evidence[:300])
+    if text:
+        msg = "the vision encoder did not start: " + text
+    elif waited is not None:
+        msg = f"the vision encoder did not start: it said nothing for {waited:g} s (it never reported READY)"
+    else:
+        msg = "the vision encoder did not start: it ended without saying anything"
+    extra = []
+    if code is not None:
+        words = engine_exit_words(code)
+        if words:
+            extra.append(words)
+    shown = [x for x in lines[-3:] if x != text]
+    if shown:
+        extra.append("last lines of its log: " + " | ".join(x[:200] for x in shown))
+    if extra:
+        msg += " (" + "; ".join(extra) + ")"
+    return msg
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -2491,8 +2554,13 @@ class Vision:
         if line is None or not line.startswith("READY"):
             why = ("no answer within %d s" % VISION_READY_S if line == "" else
                    "it exited" if line is None else line.strip())
+            # upstream c40a03e6: the last lines of its stderr, its exit status and the kernel-image hint come with the message
+            code = self.proc.poll() if line is None else None   # an encoder that died by itself has its status already
             self._stop(why)
-            raise RuntimeError("the vision encoder did not start: " + why)
+            if line is None and code is None:
+                code = getattr(self.proc, "returncode", None)
+            raise RuntimeError(vision_start_error("" if line in (None, "") else line, log, code,
+                                                  waited=VISION_READY_S if line == "" else None))
         self.stopped = False
 
     def alive(self) -> bool:
@@ -2658,6 +2726,8 @@ class Vision:
                 return self.cache[key]
             if self.dead:
                 raise ValueError("images are unavailable: " + self.dead)
+            if self.proc is None or self.proc.stdin is None:           # an elastic encoder not started yet, or one that was unloaded
+                raise ValueError("the picture reader is not running")
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
@@ -4039,8 +4109,9 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
+                            self._vision_up()         # an elastic encoder is not running until a picture needs it
                             self.vision.encode(src)
-                    except (ValueError, OSError) as e:
+                    except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
                         why = str(e)
                 if why is not None:
                     print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
