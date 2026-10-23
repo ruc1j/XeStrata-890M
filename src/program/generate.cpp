@@ -78,6 +78,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/batch_telemetry.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/model_spec.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -8929,6 +8930,21 @@ int main(int argc, char** argv) {
         };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds (#465)
+        // upstream 79d8ea06: STRATA_BATCH_TELEMETRY=1 (opt-in) prints one BSTAT line a second: windows, rows run, live
+        // slots, elapsed ms (core/batch_telemetry.hpp); off, nothing is printed and no state is kept
+        const char* batch_telemetry_env = std::getenv("STRATA_BATCH_TELEMETRY");
+        const bool batch_telemetry_enabled = batch_telemetry_env != nullptr &&
+                                             batch_telemetry_env[0] == '1' && batch_telemetry_env[1] == '\0';
+        strata::core::BatchWindowSampler batch_telemetry(batch_telemetry_enabled);
+        auto report_batch_window = [&](int processed_rows, int active_rows, bool idle, Clock::time_point started) {
+            if (!batch_telemetry_enabled) return;
+            const auto sample = batch_telemetry.complete(processed_rows, active_rows, idle, started, Clock::now());
+            if (!sample) return;
+            std::printf("BSTAT %lld %lld %lld %lld\n", (long long) sample->windows,
+                        (long long) sample->processed_rows, (long long) sample->active_rows,
+                        (long long) sample->elapsed_ms);
+            std::fflush(stdout);
+        };
         auto batch_step = [&]() -> bool {
             int S = 0;
             int rows[strata::kernels::kVerifyMaxT] = {};
@@ -9090,6 +9106,7 @@ int main(int argc, char** argv) {
                 bt_adapt_wait += msd(wa, Clock::now());
             }
             strata::core::progress().busy.store(was_busy);
+            report_batch_window(S, A, !batch_on(), w0);
             if (!batch_on() && bt_windows > 0) {
                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
                 char adapt_txt[112] = "";
