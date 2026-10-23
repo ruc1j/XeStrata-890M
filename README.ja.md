@@ -35,7 +35,7 @@ AMD の GPU では intel/llvm の DPC++ の HIP のターゲットでその SYCL
 モデル、インストールの流れ、画面、API は Strata と XeStrata のままです。
 
 ビルドは自由ソフトウェアだけの free 方式だけです（ROCm は自由ソフトウェアです）。oneMKL や CUDA は使いません。
-元の XeStrata の xe0.1.43.1（Strata 0.1.43）までの変更を取り込んでいます。
+元の XeStrata の xe0.1.45-1（Strata 0.1.45）までの変更と、upstream の Strata 0.2.3.1（エンジン 0.1.48.1）のエンジン・serve・setup の変更を取り込んでいます（[docs/XE.ja.md](docs/XE.ja.md)）。
 
 **890M の性質と、このフォークの使い方**
 

@@ -35,7 +35,7 @@ This fork reworks that AMD path for the Radeon 890M.
 The model, the install flow, the pages and the API are Strata's and XeStrata's.
 
 It builds in the free mode only, with free software (ROCm is free software): no oneMKL, no CUDA.
-It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
+It carries the original XeStrata's changes up to xe0.1.45-1 (Strata 0.1.45) and the engine, serve and setup changes of upstream Strata 0.2.3.1 (engine 0.1.48.1; [docs/XE.md](docs/XE.md)).
 
 **What the 890M is, and how the fork uses it:**
 

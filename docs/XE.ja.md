@@ -32,6 +32,43 @@ Qwen3.8 の prompt は xmx_gemm が動く GPU では FP16 の経路のままに�
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は確認用の 2 つ目の実機として使います。
 
+## Strata 0.1.48.1 の取り込み
+
+upstream の Strata 0.1.45 から 0.2.3.1（`7ddc17a3`、エンジンの版は 0.1.48.1）までの 1,116 コミットのうち、エンジン・serve・setup・tools の変更を XeStrata-890M に移しています。
+upstream の 0.2 は app と Terminal と Control の層を加えた版で、エンジンはその中の 1 つの部分です。
+
+移したものの主なものは次のとおりです。
+
+- 推測デコード: 費用を見て MTP の窓を決める `STRATA_SPEC_COST=1`（opt-in）。下書きごとの確率から幅ごとの期待トークン数を求め、測った採択率と 1 周の時間で割って比べます。
+  890M の 6 チャット（abliterated 版、28 W、`--spec 6`、greedy、3 回の交互の計測）の結果: 3 周の中央値は既定（`STRATA_SPEC_CUM`）30.9 tok/s、`STRATA_SPEC_COST=1` 31.5 tok/s で、差は揺れの幅の中でした（2 周目の既定は温度の揺れで 27.4 tok/s）。費用の規則は下書きを 2〜7% 多く出し、採択数は同じで、答えは一致しました。890M では速くならないので既定は変えていません。
+  推測の輪の始まりの規則を `spec_loop_runs()` に名づけ、実行の始めだけ適応の段の入れ替えを頻繁にする `STRATA_SPEC_ADAPT_EVERY` と `STRATA_SPEC_ADAPT_WARM`（opt-in）を足しました。
+  計測用の `STRATA_SPEC_TRACE`、`STRATA_SPEC_T_CYCLE`、`STRATA_ROUTE_STATS`、`STRATA_SPEC_WATCH`、`STRATA_BATCH_TELEMETRY` は既定で無効です。
+- serve: prompt の末尾を読む窓で logits が有限でなくなったら、次の要求は prompt を全部バッチの経路で読みます（#3465）。
+  prompt は入るのに prompt + max_tokens が文脈に入らない要求は、400 を返さず max_tokens を残りに縮めます（既定。`--no-fit-max-tokens` で元の 400）。
+  会話キャッシュの大きさを空き RAM から決めます（#3493）。API key なしでの公開は警告だけにし、`/v1/v1/messages` を本物の経路として読みます。
+  tok/s の定義を 1 つにし、Anthropic の usage に cache_creation_input_tokens を返し、llama-server の thinking_budget_tokens も読みます。
+  tool call の開きの揺れと別名、wrapper の区切りを直し（#3441、#3075、PR #3556）、画像のトークン数の上限に既定を持たせ、
+  読み取りの起動に失敗したときの文に stderr の末尾と終了の状態を添えます。エンジンを起動できないときは 503 を返し、RLIMIT_RTTIME が有限なら警告します（#3238）。web ページの 4 つの修正も入っています。
+- CPU のプール: 既定の worker 数を物理コア、host のソケット、cgroup の CPU の割り当て、測った上限（32）から決めます（pool_plan.hpp）。
+  `--pool-cores`（`STRATA_POOL_CORES`、設定の "pool_cores"）で worker を置く論理プロセッサを指定でき、起動時に置き場所を 1 行で言います。エンジンの常駐スレッドに名前が付きます。
+- setup と tools: モデルのファイルを 16 本の接続で分けて取り、setup が取る全部のファイルの SHA-256 と大きさを固定し、固定した版が Hugging Face から消えていたら止まります（`STRATA_ALLOW_UNPINNED=1` が逃げ道）。
+  SHA-256 の合わないファイルは片ごとに直し、`--gguf-dir` の利用者自身のファイルは消しません。iq_pack は途中で止まっても次の層から続け、SSD でも RAM に余りがあれば `--ple-io ram` にし、MTP の取得は進み具合を出して再試行します。
+
+移していないのは次のとおりです。
+
+- upstream の新しい製品層: app（apps/）、Terminal と Control（strata_cli/、strata_control/）、packaging、Docker、integrations と、その試験と文書。XeStrata は自分の setup と serve と deb/rpm を持ちます。
+  それらに依存する serve と setup の変更（TLS の証明書の確認、user_args、エンジンのパッケージ、lifeline、cloudflared）も移していません。
+- 複数 GPU の選び方（gpu_roles、内蔵 GPU を最後の段にしない、hip_auto_devices）: XeStrata の serve はカードを自分の番号で選び、この機械は GPU が 1 つです。
+- Gyro（APR の trellis 形式 TQ2_T・TQK6・TQK7 と Hadamard の回転）: CPU と GPU のカーネルと pack の移植が大きく、この fork の目的（IQ2_XS の decode）には効きません。
+- DFlash2 の drafter（CUDA のカーネルと重み。upstream も auto では MTP のままです）。
+- Linux の file tier（zero-copy、io prefetch、drive probe、prefill の planner）と NUMA のプールの分割: この機械ではエキスパートが全部 RAM にあり、ソケットも 1 つなので測れません。
+- NVIDIA の世代ごとのカーネル（Volta、Pascal、sm_120、sm_86 の既定）、NVFP4、Metal、upstream の sycl/、Windows の packaging。
+- HIP 固有で XeStrata にない形のもの: hipBLASLt の表、HIP の仮想メモリ、hipBLAS の warm-up、gfx12 と内蔵 GPU の WMMA の既定（fork では自前のカーネルが既定）、8 ビットのハイパーコネクション（fork の `STRATA_HC_Q8` で済んでいます）。
+  queue を決まった順で開く変更は未計測です。
+
+確かめたのは、free のビルドと、変えた C++ の試験（spec_start、draft_policy、suffix_drafter、pool_plan、pool_cores、conversation_memory、batch_telemetry）、serve と tools の Python の試験、画像の読み取り（strata-vision）の CPU のビルドです。
+contrib-llvm のビルド、Windows のクロスビルド、ほかの GPU は unverified です。
+
 ## Strata 0.1.45 の取り込み
 
 upstream の Strata 0.1.44.1 から 0.1.45（`477ac13c`）までの変更を Xe に移しています。

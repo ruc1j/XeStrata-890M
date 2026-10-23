@@ -31,6 +31,43 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
 
+## Integration through Strata 0.1.48.1
+
+Of the 1,116 commits from upstream Strata 0.1.45 to 0.2.3.1 (`7ddc17a3`; the engine's version is 0.1.48.1), the changes to the engine, serve, setup and tools are carried into XeStrata-890M.
+Upstream's 0.2 added the app, the Terminal and the Control layer around the engine; the engine is one part of it.
+
+The main ones:
+
+- Speculative decoding: the cost-aware MTP window, `STRATA_SPEC_COST=1` (opt-in). From each draft's probability it computes the expected tokens of every window width and divides by the measured acceptance and round time.
+  On the 890M (6 chats, the abliterated file, 28 W, `--spec 6`, greedy, 3 interleaved rounds): the medians of 3 rounds were 30.9 tok/s with the default (`STRATA_SPEC_CUM`) and 31.5 tok/s with `STRATA_SPEC_COST=1`, within the noise (the default's second round was 27.4 tok/s from thermal throttling). The cost rule offers 2–7% more drafts for the same number accepted, and the answers are identical. It does not speed up the 890M, so the default stays.
+  The speculative loop's start rule is named `spec_loop_runs()`, and `STRATA_SPEC_ADAPT_EVERY` / `STRATA_SPEC_ADAPT_WARM` (opt-in) swap the adaptive tier more often at the start of a run.
+  The measurement switches `STRATA_SPEC_TRACE`, `STRATA_SPEC_T_CYCLE`, `STRATA_ROUTE_STATS`, `STRATA_SPEC_WATCH` and `STRATA_BATCH_TELEMETRY` are off by default.
+- serve: after non-finite logits in a window that reads the prompt's tail, the next request reads its whole prompt through the batched path (#3465).
+  A request whose prompt fits but prompt + max_tokens does not gets max_tokens shortened to the room left instead of a 400 (the default; `--no-fit-max-tokens` keeps the 400).
+  The conversation cache is sized from the free RAM (#3493). Serving without an API key is a warning, not a refusal; `/v1/v1/messages` is read as the real path.
+  One definition of tok/s; Anthropic usage reports cache_creation_input_tokens; llama-server's thinking_budget_tokens is honoured.
+  Drifted tool-call openers, aliases and wrapper boundaries (#3441, #3075, PR #3556); the image-token limit has a default; a failed picture-reader start carries its stderr tail and exit status.
+  An engine program that cannot start is a 503, and a finite RLIMIT_RTTIME is warned about (#3238). Four web-page fixes.
+- The CPU pool: the default worker count comes from the physical cores, the host's socket, the cgroup CPU quota and the measured cap of 32 (pool_plan.hpp).
+  `--pool-cores` (`STRATA_POOL_CORES`, the config's "pool_cores") names the logical processors the workers take, and the start-up line says where they run. The engine's long-lived threads carry names.
+- setup and tools: model files come over 16 connections in pieces, every file setup downloads has a fixed SHA-256 and size, and a pinned version that is gone from Hugging Face stops the download (`STRATA_ALLOW_UNPINNED=1` is the opt-out).
+  A file with a wrong SHA-256 is repaired piece by piece, and a file of the user's own (`--gguf-dir`) is never deleted. iq_pack continues an interrupted write at the next layer, `--ple-io ram` is chosen on an SSD too when the RAM has room, and the MTP fetch shows progress and retries.
+
+Not taken:
+
+- Upstream's new product layer: the app (apps/), the Terminal and Control (strata_cli/, strata_control/), packaging, Docker, integrations, with their tests and documents. XeStrata has its own setup, serve and deb/rpm packages.
+  The serve and setup changes that depend on them (the TLS certificate check, user_args, engine packages, lifeline, cloudflared) are not taken either.
+- The choice among several GPUs (gpu_roles, an integrated GPU never the last stage, hip_auto_devices): XeStrata's serve numbers the cards its own way, and this machine has one GPU.
+- Gyro (the APR trellis formats TQ2_T, TQK6 and TQK7 and the Hadamard rotation): a large port of CPU and GPU kernels and the pack, with no gain for this fork's goal (IQ2_XS decode).
+- The DFlash2 drafter (CUDA kernels and weights; upstream's auto keeps MTP too).
+- The Linux file tier (zero-copy, io prefetch, the drive probe, the prefill planner) and the NUMA split of the pool: on this machine every expert is in RAM and there is one socket, so neither can be measured.
+- NVIDIA's per-generation kernels (Volta, Pascal, the sm_120 and sm_86 defaults), NVFP4, Metal, upstream's sycl/, Windows packaging.
+- HIP-specific work XeStrata has no counterpart for: hipBLASLt tables, HIP virtual memory, the hipBLAS warm-up, the gfx12 and integrated-GPU WMMA defaults (this fork's own kernels are the default), the 8-bit hyper-connection (this fork's `STRATA_HC_Q8` already does it).
+  Opening the queues in a fixed order is unmeasured.
+
+Checked: the free build, the C++ tests that changed (spec_start, draft_policy, suffix_drafter, pool_plan, pool_cores, conversation_memory, batch_telemetry), the Python tests of serve and tools, and the CPU build of the picture reader (strata-vision).
+The contrib-llvm build, the Windows cross build and other GPUs are unverified.
+
 ## Integration through Strata 0.1.45
 
 The changes of upstream Strata 0.1.44.1 to 0.1.45 (`477ac13c`) are carried into Xe.
