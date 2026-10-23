@@ -2212,6 +2212,26 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!bf16_proj(m.gemm, &wuv, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
                 }
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
+                // STRATA_DUMP_HC=<path> (XeStrata-890M, a diagnostic): the completed output of layers 5, 15, 25, 35 and 45
+                // averaged over the HC streams (what DFlash2 reads, issue #23), appended as [int32 l, T, N][T * N f32]
+                if (static const char* dump = std::getenv("STRATA_DUMP_HC"); dump != nullptr && (l % 10) == 6) {
+                    static std::FILE* df = std::fopen(dump, "wb");
+                    if (df != nullptr) {
+                        std::vector<float> hr((size_t) T * D), mean((size_t) T * N);
+                        strata::gpu::copy_async(hr.data(), m.R, hr.size() * sizeof(float), m.cs);
+                        strata::gpu::stream_sync(m.cs);
+                        for (int64_t t = 0; t < T; ++t)
+                            for (int64_t d = 0; d < N; ++d) {
+                                float a = 0.0f;
+                                for (int64_t c = 0; c < HC; ++c) a += hr[(size_t) (t * D + c * N + d)];
+                                mean[(size_t) (t * N + d)] = a / (float) HC;
+                            }
+                        const int32_t head[3] = {(int32_t) (l - 1), (int32_t) T, (int32_t) N};
+                        std::fwrite(head, sizeof(int32_t), 3, df);
+                        std::fwrite(mean.data(), sizeof(float), mean.size(), df);
+                        std::fflush(df);
+                    }
+                }
                 gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                          m.mixed_bf_lo);
 
