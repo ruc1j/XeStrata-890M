@@ -195,9 +195,11 @@ Work with the repository through `git`, not the GitHub CLI (`gh`), with these ex
 - `gh release`, to create and edit releases;
 - fetching issues and pull requests: `gh issue list`, `gh issue view`, `gh pr list`, `gh pr view`, `gh pr diff` and `gh pr checks`;
 - merging, rejecting and reopening pull requests: `gh pr merge`, `gh pr close` and `gh pr reopen`;
+- commenting on issues: `gh issue comment`, to report the work an issue asked for (what was done, measured or rejected, with
+  the numbers) before it is closed, in Japanese;
 - closing and reopening issues: `gh issue close` and `gh issue reopen`.
 
-Do not create, comment on or edit issues and pull requests with `gh`.
+Do not create or edit issues, and do not create, comment on or edit pull requests, with `gh`.
 
 A pull request says which modes it was built in (free, contrib-llvm) and on which GPUs and CPUs it ran, and marks what was not checked `unverified`; one that does not is asked for it ([What goes in](#what-goes-in)).
 
