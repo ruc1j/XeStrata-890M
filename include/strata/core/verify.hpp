@@ -33,7 +33,9 @@
 
 #include "strata/core/gpu.hpp"
 
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <chrono>
 #include <map>
 #include <string>
@@ -86,6 +88,8 @@ public:
     virtual bool set_stop_ids(const std::vector<int32_t>& ids, std::string& err) = 0;
     /// Same process: the penalty rows the last stage's head reads, a buffer the engine fills before every window.
     virtual void set_history(const int32_t* history, int history_len) = 0;
+    /// Same process: the drafter's q rows for the next window (Verifier::set_spec_q).
+    virtual void set_spec_q(const int32_t* q, int n_q) = 0;
     virtual bool read_logits(int rows, float* host, std::string& err) const = 0;
     virtual bool copy_logits(int t, float* host) const = 0;
     /// The last stage's check of its head logits (#879): the first row that held a NaN or an infinity, its position,
@@ -118,6 +122,7 @@ public:
     bool set_logit_bias(const std::vector<float>& bias, std::string& err) override;
     bool set_stop_ids(const std::vector<int32_t>& ids, std::string& err) override;
     void set_history(const int32_t* history, int history_len) override;
+    void set_spec_q(const int32_t* q, int n_q) override;
     bool read_logits(int rows, float* host, std::string& err) const override;
     bool copy_logits(int t, float* host) const override;
     int nonfinite_row() const override;
@@ -183,6 +188,42 @@ public:
         hist_len_ = history_len;
         if (next_) next_->set_history(history, history_len);
     }
+    /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): for the NEXT run() only, judge the
+    /// window's first `n_q` drafts against the drafter's distributions `q` (host memory, n_q rows of kSpecQStride
+    /// int32: ids, -1 terminated, then probabilities as float bits) with rejection sampling instead of exact match; the
+    /// drafts past `n_q` are point masses.  No effect on a greedy request, a window of one token, or where the split
+    /// sampler cannot run - those take the exact-match path.  Cleared by run().
+    void set_spec_q(const int32_t* q, int n_q) {
+        spec_q_ = q;
+        spec_nq_ = n_q;
+        if (next_) next_->set_spec_q(q, n_q);
+    }
+    int64_t spec_windows = 0;   ///< windows judged by rejection sampling
+    /// XeStrata-890M, STRATA_VERIFY_MARGIN=a,pmin (opt-in): greedy windows keep a draft that is not the row's argmax
+    /// when p(draft) >= a * p(argmax) and p(draft) >= pmin (the raw softmax), and go on past it.  The output changes:
+    /// margin_logloss sums log(p(argmax) / p(draft)) over the kept ones (the log-probability the request gave up).
+    struct VerifyMargin {
+        bool on = false;
+        float log_a = 0.0f, log_pmin = 0.0f;
+    };
+    static const VerifyMargin& verify_margin() {
+        static const VerifyMargin vm = [] {
+            VerifyMargin m;
+            const char* e = std::getenv("STRATA_VERIFY_MARGIN");
+            if (e == nullptr || *e == 0) return m;
+            char* end = nullptr;
+            const double a = std::strtod(e, &end);
+            const double pm = end != nullptr && *end == ',' ? std::strtod(end + 1, nullptr) : 0.0;
+            if (!(a > 0.0 && a <= 1.0)) return m;
+            m.on = true;
+            m.log_a = (float) std::log(a);
+            m.log_pmin = pm > 0.0 ? (float) std::log(pm) : -1e30f;
+            return m;
+        }();
+        return vm;
+    }
+    int64_t margin_judged = 0, margin_kept = 0;
+    double margin_logloss = 0.0;
     /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
@@ -384,6 +425,10 @@ private:
     }();   ///< greedy by default; per-request via set_sampling
     const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
+    const int32_t* spec_q_ = nullptr;   ///< set_spec_q: the drafter's q rows for the next window (host)
+    int spec_nq_ = 0;
+    int32_t* d_spec_ = nullptr;         ///< device: kVerifyMaxT draft ids, then kVerifyMaxT q rows
+    float *h_margin_ = nullptr, *m_margin_ = nullptr;   ///< STRATA_VERIFY_MARGIN: draft_margins' rows (mapped)
     bool head_sampling_ = true;          ///< set_head_sampling
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;

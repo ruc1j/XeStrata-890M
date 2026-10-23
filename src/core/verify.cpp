@@ -7,6 +7,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/spec_prob.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -253,6 +254,8 @@ Verifier::~Verifier() {
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     if (cs_) strata::gpu::stream_sync(cs_);
+    if (d_spec_) strata::gpu::free(d_spec_);
+    if (h_margin_) strata::gpu::free(h_margin_);
     for (auto& e : exec_)
         if (e) strata::gpu::graph_destroy(e);
     for (auto& e : exec_res_)
@@ -1965,13 +1968,67 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
-        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
+        bool judged = false;
+        if (sampled && spec_q_ != nullptr && spec_nq_ > 0 && T > 1 && T <= strata::kernels::kVerifyMaxT) {
+            if (d_spec_ == nullptr &&
+                !strata::gpu::alloc_device((void**) &d_spec_, (size_t) strata::kernels::kVerifyMaxT *
+                                                                  (1 + strata::core::kSpecQStride) * sizeof(int32_t)))
+                d_spec_ = nullptr;
+            if (d_spec_ != nullptr) {
+                const int nq = std::min(spec_nq_, T - 1);
+                int32_t* d_q = d_spec_ + strata::kernels::kVerifyMaxT;
+                if (strata::gpu::copy_async(d_spec_, tokens + 1, (size_t) (T - 1) * sizeof(int32_t), cs_) &&
+                    strata::gpu::copy_async(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t), cs_))
+                    judged = strata::kernels::sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp,
+                                                                 d_spec_, d_q, nq, m_out_, cs_);
+            }
+        }
+        spec_q_ = nullptr;
+        spec_nq_ = 0;
+        if (judged) ++spec_windows;
+        else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
         if (!strata::gpu::stream_sync(cs_)) {   // m_out_ is the mapped h_out_: synced, it is readable
             err = "verify: the head sampling failed";
             return false;
         }
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    // XeStrata-890M, STRATA_VERIFY_MARGIN=a,pmin (opt-in, greedy requests; the output changes): a draft that is not
+    // the row's argmax is kept when p(draft) >= a * p(argmax) and p(draft) >= pmin, so the window goes on past it
+    if (const auto& vm = verify_margin(); vm.on && !sampled && T > 1 && head_sampling_ && hist_d_ == nullptr &&
+                                          sampling_.logit_bias == nullptr) {
+        bool any = false;
+        for (int t = 0; t + 1 < T && !any; ++t) any = out[t] != tokens[t + 1];
+        if (any && d_spec_ == nullptr &&
+            !strata::gpu::alloc_device((void**) &d_spec_, (size_t) strata::kernels::kVerifyMaxT *
+                                                              (1 + strata::core::kSpecQStride) * sizeof(int32_t)))
+            d_spec_ = nullptr;
+        if (any && h_margin_ == nullptr) {
+            if (!strata::gpu::alloc_host((void**) &h_margin_, 2 * strata::kernels::kVerifyMaxT * sizeof(float)) ||
+                !strata::gpu::device_pointer((void**) &m_margin_, h_margin_)) {
+                if (h_margin_) strata::gpu::free(h_margin_);
+                h_margin_ = nullptr;
+            }
+        }
+        if (any && d_spec_ != nullptr && h_margin_ != nullptr &&
+            strata::gpu::copy_async(d_spec_, tokens + 1, (size_t) (T - 1) * sizeof(int32_t), cs_)) {
+            strata::kernels::draft_margins(head_logits_, T - 1, (int) n_vocab_, d_spec_, m_margin_, cs_);
+            if (!strata::gpu::stream_sync(cs_)) {
+                err = "verify: the draft margins failed";
+                return false;
+            }
+            for (int t = 0; t + 1 < T; ++t) {
+                if (out[t] == tokens[t + 1]) continue;
+                const float r = ((volatile float*) h_margin_)[2 * t], lp = ((volatile float*) h_margin_)[2 * t + 1];
+                ++margin_judged;
+                if (!(r >= vm.log_a && lp >= vm.log_pmin)) break;   // the window ends here, as before
+                out[t] = tokens[t + 1];
+                ++margin_kept;
+                margin_logloss -= r;
+            }
+        }
+    }
     note_nonfinite(T, nullptr);
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
@@ -3106,6 +3163,7 @@ bool InProcessStage::set_stop_ids(const std::vector<int32_t>& ids, std::string& 
     return next_->set_stop_ids(ids, err);
 }
 void InProcessStage::set_history(const int32_t* history, int history_len) { next_->set_history(history, history_len); }
+void InProcessStage::set_spec_q(const int32_t* q, int n_q) { next_->set_spec_q(q, n_q); }
 bool InProcessStage::read_logits(int rows, float* host, std::string& err) const {
     return next_->read_logits(rows, host, err);
 }

@@ -4,6 +4,7 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
+#include "strata/core/spec_prob.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/runtime.hpp"
@@ -138,6 +139,7 @@ MtpDrafter::~MtpDrafter() {
     if (dinv_) strata::gpu::free(dinv_);
     if (cscratch_) strata::gpu::free(cscratch_);
     if (h_cparams_) strata::gpu::free(h_cparams_);
+    if (h_q_) strata::gpu::free(h_q_);
     if (h_chist_) strata::gpu::free(h_chist_);
     if (ev_chain_) strata::gpu::event_destroy(ev_chain_);
     for (strata::gpu::Event* e : ev_step_) if (e) strata::gpu::event_destroy(e);
@@ -421,7 +423,7 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
     }
     // coupled draft sampling (STRATA_SPEC_COUPLED=1 only): an upper bound - the id -> subset map, the penalty ring,
     // the split scratch (64 lists of 64 entries at most) and the parameters
-    if (coupled_draft_env() && cparams_ == nullptr)
+    if ((coupled_draft_env() || spec_prob_on()) && cparams_ == nullptr)
         bytes += (uint64_t) n_vocab * 4 + (uint64_t) (kCoupledHistCap + max_t_) * 4 + strata::kernels::coupled_draft_scratch_bytes((int) n_vocab) + 4096;
     return bytes;
 }
@@ -440,6 +442,11 @@ bool MtpDrafter::setup_coupled(std::string& err) {
         !mapped(sizeof(strata::kernels::SamplerParams), (void**) &h_cparams_, (void**) &m_cparams_) ||
         !mapped((size_t) kCoupledHistCap * sizeof(int32_t), (void**) &h_chist_, (void**) &m_chist_)) {
         err = "mtp: the coupled draft sampler's buffers do not fit";
+        return false;
+    }
+    if (spec_prob_on() &&
+        !mapped((size_t) max_t_ * (size_t) kSpecQStride * sizeof(int32_t), (void**) &h_q_, (void**) &m_q_)) {
+        err = "mtp: the draft distributions' buffer does not fit";
         return false;
     }
     strata::gpu::memset(cring_, 0xff, ring);   // -1: no token
@@ -462,13 +469,19 @@ bool MtpDrafter::setup_coupled(std::string& err) {
         return false;
     }
     coupled_ok_ = true;
-    std::fprintf(stderr, "strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the "
-                         "target's chain and Philox draw over %lld tokens\n", (long long) nv);
+    if (spec_prob_on())
+        std::fprintf(stderr, "strata mtp: probabilistic draft acceptance on (STRATA_SPEC_PROB): sampled requests at "
+                             "temperature %.2f or more draft by sampling the draft head's distribution over %lld tokens; "
+                             "the verifier accepts with min(1, p/q) and resamples the residual\n",
+                     (double) spec_prob_min_temp(), (long long) nv);
+    else
+        std::fprintf(stderr, "strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the "
+                             "target's chain and Philox draw over %lld tokens\n", (long long) nv);
     return true;
 }
 
 void MtpDrafter::set_draft_sampling(const strata::kernels::SamplerParams& sp) {
-    coupled_active_ = coupled_ok_ && !sp.greedy && sp.temperature > 0.0f;
+    coupled_active_ = coupled_ok_ && !sp.greedy && sp.temperature > 0.0f && sp.temperature >= spec_prob_min_temp();
     if (!coupled_active_) return;
     *h_cparams_ = sp;   // read by the next round graph (after the previous one has synced)
     std::fill(h_chist_, h_chist_ + kCoupledHistCap, -1);
@@ -566,7 +579,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
         }
     }
-    if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
+    if ((coupled_draft_env() || spec_prob_on()) && cparams_ == nullptr && !setup_coupled(err)) return false;
     if (!make_hc_q8(err)) return false;
     if (shared == nullptr && !make_sketch(err)) return false;
     return true;
@@ -910,13 +923,30 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        const bool sketch = sk_bits_ != nullptr && T == 1 && !coupled_rec_;
+        // STRATA_SPEC_PROB's q may come from the sketch's candidates alone (any q keeps the target's distribution): the
+        // head's read is the sketch's, not the whole head's (STRATA_SPEC_PROB_SKETCH=0: the whole head)
+        const bool prob_sketch = coupled_rec_ && m_q_ != nullptr && spec_prob_sketch();
+        const bool sketch = sk_bits_ != nullptr && T == 1 && (!coupled_rec_ || prob_sketch);
         if (!sketch) native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+        if (coupled_rec_ && sketch) {
+            head_sketch_candidates(sk_, xq_, sk_cand_, cs);
+            gather_rows((const uint8_t*) (sub ? dhead_ : head_->weights()), (int64_t) head_->row_bytes(), sk_cand_, n_cand_,
+                        sk_rows_, cs);
+            native_mmvq(head_->type(), sk_rows_, xq_, sk_logits_, (int) N, n_cand_, 1, cs);
+            spec_draft_sample(sk_logits_, n_cand_, sub ? dvocab_ : nullptr, nullptr, (int) n_vocab_, cparams_, cring_,
+                              kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, m_q_, cs, sk_cand_);
+            return true;
+        }
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
-            coupled_draft_sample(head_logits_, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
-                                 cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, cs);
+            if (m_q_ != nullptr)   // STRATA_SPEC_PROB: a draw from q with its own stream, and q's list for the verifier
+                spec_draft_sample(head_logits_, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
+                                  cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, out_ids_, probs_, m_q_, cs);
+            else
+                coupled_draft_sample(head_logits_, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr,
+                                     (int) n_vocab_, cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_,
+                                     out_ids_, probs_, cs);
             return true;
         }
         if (sketch) {   // the sketch's candidates, computed exactly (make_sketch)
@@ -1211,6 +1241,36 @@ void MtpDrafter::dump_head(int32_t tok) {
 // drafts offered when the head is sure, fewer when it is not), 0.3 and 0.4 lost (rows that miss cost a window row each,
 // about 9.5 ms there), --spec 8 lost; with --spec 4, 0.45 gave +1.3%.  The best product depends on a row's cost
 // against the window's, so other GPUs keep --spec-min-p unless the variable is set.
+// STRATA_SPEC_PROB (spec_prob.hpp): set, as it says; unset, on for an integrated GPU on the HIP backend.  Measured on
+// the 890M (28 W, the abliterated IQ2_XS model, six chats, two rounds each): at temperature 1.0 (Flash-Next's
+// recommended sampling) decode 28.56 / 28.56 -> 30.45 / 30.47 tok/s (+6.7%; drafts kept 59% -> 68%), at 0.7 the
+// same (31.00 / 30.99 against 30.94 / 30.88), so the default takes requests from 0.7 up (STRATA_SPEC_MIN_TEMP).
+// Elsewhere the exact-match rule stays: upstream measured sampled drafting losing below 0.7 on NVIDIA GPUs.
+static bool spec_prob_auto() {
+    static const bool on = [] {
+        if (std::getenv("STRATA_SPEC_PROB") != nullptr) return false;
+        const sycl::device& d = Runtime::get().device();
+        return d.get_backend() == sycl::backend::ext_oneapi_hip && integrated_gpu(d);
+    }();
+    return on;
+}
+bool spec_prob_on() { return spec_prob_env() || spec_prob_auto(); }
+bool spec_prob_sketch() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_SPEC_PROB_SKETCH"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }();
+    return on;
+}
+int spec_prob_max_t() {
+    static const int t = [] {
+        const char* v = std::getenv("STRATA_SPEC_PROB_MAX_T");
+        if (v != nullptr) return std::max(0, (int) std::strtol(v, nullptr, 10));
+        return spec_prob_auto() ? 4 : 0;
+    }();
+    return t;
+}
+float spec_prob_min_temp() {
+    return std::getenv("STRATA_SPEC_MIN_TEMP") != nullptr || !spec_prob_auto() ? spec_min_temp() : 0.7f;
+}
+
 float spec_cum_threshold() {
     static const float c = [] {
         const char* v = std::getenv("STRATA_SPEC_CUM");
@@ -1241,7 +1301,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!capture_round(T, cp, err)) return false;
     // Draft j writes its K/V at cell p + a + j, and the K/V ends at max_cells (its page table has no page past it):
     // near the context's end the round drafts only the cells that exist
-    const int max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), st_.max_cells - (p + a));
+    int cap = max_drafts_;
+    if (cp && h_q_ != nullptr && spec_prob_max_t() > 0) cap = std::min(cap, spec_prob_max_t() - 1);   // spec_prob.hpp
+    const int max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, cap), st_.max_cells - (p + a));
     for (int j = 1; j < max_steps; ++j)
         if (!capture_step(j, cp, err)) return false;
     const Clock::time_point t0 = Clock::now();

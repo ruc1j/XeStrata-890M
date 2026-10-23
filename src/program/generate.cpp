@@ -11583,6 +11583,9 @@ int main(int argc, char** argv) {
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
                 dt_pre += std::chrono::duration<double, std::milli>(tw0 - round0).count();
+                // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
+                // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
+                if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -11934,6 +11937,11 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * (double) read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * (double) produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            if (strata::core::Verifier::verify_margin().on || ver.spec_windows > 0)   // the totals of the opt-in rules
+                std::fprintf(stderr, "strata serve: STRATA_VERIFY_MARGIN kept %lld of %lld mismatched drafts, log-prob "
+                                     "given up %.3f; STRATA_SPEC_PROB judged %lld windows (totals since start)\n",
+                             (long long) ver.margin_kept, (long long) ver.margin_judged, ver.margin_logloss,
+                             (long long) ver.spec_windows);
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
             // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
             // raises the hit rate while the PCIe reads may make the decode slower)

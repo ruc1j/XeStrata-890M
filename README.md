@@ -92,6 +92,21 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      0.4 and below and `--spec 8` are slower (a row that misses costs 9.5 ms).  With `--spec 4`, 0.45 gives +1.3%.  Drafts are only proposals: the output is the same.
    - A window ends at a draft that ends the turn (`<|im_end|>` and the like): the reply stops there, so a row after it would be
      verified for nothing.
+   - Sampled requests (temperature > 0) take or reject the drafts by rejection sampling (`STRATA_SPEC_PROB`, upstream 33356f72;
+     on by default on an integrated GPU on the HIP backend, `STRATA_SPEC_PROB=0`: the former rule, a draft kept when it equals the
+     target's sample).  The draft layer draws its draft from its own distribution q, and the verifier keeps it with probability
+     min(1, p/q) against the target's p, else draws again from max(0, p - q): the output follows the target's distribution
+     (`spec_prob_parity` checks it).  q is built over the candidates the head's one-bit sketch picks, without the penalties (any q
+     leaves the output's distribution as it is; `STRATA_SPEC_PROB_SKETCH=0`: over the whole head, as upstream).  On by default, it
+     takes requests at temperature 0.7 or more (`STRATA_SPEC_MIN_TEMP`), and their windows end at 4 tokens
+     (`STRATA_SPEC_PROB_MAX_T`: sampled drafts pay up to 4, greedy ones up to 6).  On the abliterated model's six chats (28 W,
+     temperature 1.0, the mean of four seeds) decode went from 28.61 to 30.54 tok/s (+6.7%), and the spread between seeds (the
+     answers' different texts) from 26.2-30.3 to 29.9-31.3.  At temperature 0.7 it is the same.
+   - `STRATA_VERIFY_MARGIN=a,pmin` (opt-in, changes the output): a greedy request keeps a draft that is not the target's argmax
+     when its probability is at least a times the argmax's and at least pmin, and goes on past it.  On the abliterated model's six
+     chats (28 W, `--spec 4`), 0.5,0.3 gave +3.3% decode (37 drafts kept this way, 0.005 of log-probability given up a token),
+     0.3,0.2 +6.2% (76, 0.020).  The answers take other wordings from the first draft kept this way.  The log-probability
+     given up is in the serve log.
    - The speculative layer's head narrowed by a one-bit sketch (`STRATA_MTP_SKETCH`, the default): at start-up each head
      row's signs and mean magnitude are taken, every draft step picks 4 candidates of each 128 rows with them, and only the
      candidates' rows go through the real head.  The head reads about a quarter of the bytes and the drafts hit as often

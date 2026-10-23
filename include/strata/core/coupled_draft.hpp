@@ -41,6 +41,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "strata/core/spec_prob.hpp"
+
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define STRATA_COUPLED_HD __host__ __device__
 #else
@@ -60,9 +62,10 @@ inline bool& coupled_draft_state() {
     return on;
 }
 
-/// Whether coupled draft sampling is enabled (via STRATA_SPEC_COUPLED=1 or --coupled-draft CLI flag).
+/// Whether coupled draft sampling is enabled (via STRATA_SPEC_COUPLED=1 or --coupled-draft CLI flag), or the
+/// probabilistic acceptance (spec_prob.hpp, STRATA_SPEC_PROB=1) that runs on the same buffers and graphs.
 inline bool coupled_draft_env() {
-    return coupled_draft_state();
+    return coupled_draft_state() || spec_prob_env();
 }
 
 inline void set_coupled_draft(bool on) {
