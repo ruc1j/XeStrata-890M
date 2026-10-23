@@ -42,7 +42,11 @@ explicit flag (--model, --context) is the consent to a risk setup would otherwis
 from __future__ import annotations
 
 import argparse
+import calendar
+import ctypes
+import glob
 import hashlib
+import http.client
 import importlib
 import json
 import math
@@ -55,8 +59,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -80,10 +86,11 @@ STATE = places.user_dir("state") if PACKAGED else ROOT    # the logs, and the en
 SETUP_CMD = ("xestrata-cli" if WIN else "xestrata") if PACKAGED else "./setup.sh"
 # Every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when it was pinned, upstream #214), so a checkout installs the same files
-# on any day.  A revision the repository no longer has falls back to its current files, with a message (download()).
+# on any day.  Every file has a fixed size and SHA-256 too (REPO_PINS, upstream e193161d); a revision the repository
+# no longer has stops the download (download()), unless a tester sets STRATA_ALLOW_UNPINNED=1.
 HF_REVISIONS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
-    "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "b22d729eae29b5796f76fb70f91aef549b9fc52c",   # 2026-09-24
+    "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",   # 2026-10-07 (adds IQ3_S)
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
     "ornith-ai/Ornith-1.5-35B-A3B-GGUF": "12393612fd4f730ff5aadc23e9b8f9648aa49ceb",                 # 2026-10-11
@@ -110,6 +117,33 @@ def hf(repo: str) -> str:
 def hf_unpinned(url: str) -> str:
     """The same file at the repository's current revision (main)."""
     return re.sub(r"^(https?://[^/]+/.+?/resolve/)[0-9a-f]{40}/", r"\1main/", url, count=1)
+
+
+_unpinned_said: list[int] = []
+
+
+def _urlopen(req, timeout=None):
+    """Every download request of this file goes through here (upstream's name, kept so its download code reads the same)."""
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def allow_unpinned() -> bool:
+    """STRATA_ALLOW_UNPINNED=1: a tester's opt-out.  A file whose pinned version is gone from Hugging Face is then taken
+    from the repository's current files, without the SHA-256 check (nothing pins them).  Off by default, announced when set."""
+    on = (os.environ.get("STRATA_ALLOW_UNPINNED") or "").strip() == "1"
+    if on and not _unpinned_said:
+        _unpinned_said.append(1)
+        warn("STRATA_ALLOW_UNPINNED=1: a model file whose pinned version is gone from Hugging Face is taken from its "
+             "current files instead, and is NOT checked against a SHA-256. Unset it to get the checked files only")
+    return on
+
+
+def file_pin(url: str):
+    """(bytes, sha256) pinned for the Hugging Face file `url` names (REPO_PINS), else None."""
+    m = HF_FILE.match(url)
+    if m is None:
+        return None
+    return REPO_PINS.get(m.group("repo"), {}).get(m.group("path").rsplit("/", 1)[-1])
 
 
 # ModelScope (www.modelscope.cn) hosts every repository above under the same name, with the same file paths and
@@ -298,6 +332,58 @@ UNSLOTH_BIG_SHARDS = {
     "Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf":
         (34015618784, "538a93bca918064983409a41187ad4c68640f9aced6f29564da8f551bf86d7a5"),
 }
+
+# ISTA-DASLab's Qwen3.8-Flash-Next shards (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S) and the picture reader at the revision pinned in
+# HF_REVISIONS: name -> (bytes, sha256), the Hub's LFS pointers (tools/hf_pin_fetch.py; upstream e193161d).  The n-gram
+# table (shard 2) is the same file for all four sizes.
+ISTA_FILES = {
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf":
+        (39225954592, "92cee27ae5bbadcd732416a0f7a7f0acc092399dbbe8f5a5efa707c2ec0a49d7"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf":
+        (54817524224, "4c1eb2ceb4915e1192f4f386021897bde56a97f40a0bb78bb86465e0f7d2aca3"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf":
+        (47039860096, "219ea929900dfa9ef091f3aa473fdba6874b65fcb36526d7d851ac9e95856d15"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf":
+        (37623740192, "69820c02ec7d0b45ef2ebb19d6620299db749fe2aded7f39f93c6b88b199b720"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "mmproj-Qwen3.8-Flash-Next-BF16.gguf":
+        (907543008, "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0"),
+}
+SWIFT_FILES = {
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf":
+        (39788473344, "ca3b302d3d1eb6eddce3ea4acc79854e6cc5fdc0583e374a6a8b6bb67327743b"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf":
+        (28363693824, "e4996a6de18fd49c58d9a0040fcfd73787db6407c51973f29884bee7b14c9dbb"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf":
+        (44900816736, "46cb3996cd1a17fe8bc5ae1f9bb16869480de5a03f17f868d6047a20a46edd3b"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf":
+        (38842920384, "70ce6fb48a94fe34bd7e9a53a526be68066c64b5a5077cdc82fb31350b66b608"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf":
+        (39785790560, "3bddaa667c750f63baca766df9433e1afd35a139f401c5ca5e7ff560ceff3d23"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf":
+        (36180282560, "b0b15f782af71eb471909d2f3313b2927c324962f86c084325c247cd411a0160"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf":
+        (39799117984, "79e2a3873f1b05df835a1a191b20f2e74b9e12df949cd89861d17d98b6ef9678"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf":
+        (26750834816, "ef3bb04fb4e14f04624abd8acf25faf1603594a034050b048df85ec152ad5ae0"),
+    "mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf":
+        (907543520, "cd1140f4abba943ce8d9fa92fed8407e389954d26907efde7b72153c75bd8a60"),
+}
+CODER_FILES = {
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf":
+        (29608446496, "e11083ba855e7666b48ea3f2db6a9c3a20c18751a012cc24f948de91b7087fad"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "mmproj-Qwen3.8-Flash-Next-BF16.gguf":
+        (907543008, "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0"),
+}
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
 # serve the setup takes yarn (or asks, when interactive) and the factor final / 262144 (at least 1), keeps an explicit
@@ -414,6 +500,20 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                }},
 }
 FAMILIES.update(PLAIN_FAMILIES)
+
+# Every model file setup downloads has a fixed size and SHA-256: (repository, file name) -> (bytes, sha256).  download()
+# checks the file against it as soon as it is whole (a wrong file is deleted and setup stops), and stops before the
+# download when the server's size is not the pinned one.  The files are fetched from the commits in HF_REVISIONS.
+REPO_PINS: dict[str, dict[str, tuple[int, str]]] = {
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": ISTA_FILES,
+    "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": SWIFT_FILES,
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": CODER_FILES,
+    "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
+}
+for _fam in PLAIN_FAMILIES.values():            # the plain families' files carry their pins in their own entries
+    for _m in _fam.get("models", {}).values():
+        if all(k in _m for k in ("repo", "file", "size", "sha256")):
+            REPO_PINS.setdefault(_m["repo"], {})[_m["file"]] = (_m["size"], _m["sha256"])
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
 # under the Qwen Community License, so in third_party/nonfree (XeStrata runs without that folder)
@@ -1415,6 +1515,396 @@ def free_gb(path):
 
 
 # ------------------------------------------------------------------------------------------------ downloads
+def drop_archive(z: Path) -> None:
+    """An unpacked or refused engine archive and its .done mark go: a refused one kept them, and every later run
+    reused it ("already downloaded") instead of the published one (PR #324)."""
+    z.unlink(missing_ok=True)
+    z.with_name(z.name + ".done").unlink(missing_ok=True)
+
+
+# Parallel ranged downloads (0.2.0).  One TCP stream often cannot fill a fast line (a long or lossy route, a CDN that limits
+# each connection): download() takes the file in DL_CHUNK pieces over several connections, writes each piece at its own offset,
+# and keeps the finished pieces in <name>.part.chunks so a stopped download continues where it was.  Anything that is not a
+# ranged file of known length (no Range support, no length, a small file) is one stream, as before.
+DL_CONNECTIONS = 8              # STRATA_DL_CONNECTIONS=1 restores one stream (for testers)
+DL_CHUNK = 32 << 20             # bytes per ranged request; a failed request loses at most this much
+DL_MIN_PARALLEL = 256 << 20     # smaller files are one stream
+DL_CHUNK_TRIES = 5              # tries per piece (1, 2, 4, 8 s apart) before the round is given up and run again
+DL_ROUNDS = 30                  # rounds (10 s apart) before the download is given up, like the 30 tries of one stream
+DL_BACKOFF = 1.0                # seconds before the second try of a piece, doubled each time (tests set 0)
+DL_SAVE_EVERY = 5.0             # seconds between writes of the progress file
+
+
+def dl_connections() -> int:
+    """How many connections a big download uses: STRATA_DL_CONNECTIONS, else DL_CONNECTIONS (1 = one stream)."""
+    raw = (os.environ.get("STRATA_DL_CONNECTIONS") or "").strip()
+    try:
+        n = int(raw) if raw else DL_CONNECTIONS
+    except ValueError:
+        n = DL_CONNECTIONS
+    return max(1, min(n, 32))
+
+
+class _NoRange(Exception):
+    """The server does not answer a byte range with that range (no 206, or another range): one stream instead."""
+
+
+class _DiskError(Exception):
+    """The .part file cannot be written (disk full, no permission): retrying would not help."""
+
+
+class _PieceFailed(Exception):
+    """A piece failed DL_CHUNK_TRIES times."""
+
+
+def _url_ttl(url: str):
+    """Seconds a signed URL (the CDN's, after the redirect) is still valid by its own query, else None."""
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    try:
+        if "Expires" in q:
+            ttl = float(q["Expires"][0]) - time.time()
+        elif "X-Amz-Expires" in q and "X-Amz-Date" in q:
+            t0 = calendar.timegm(time.strptime(q["X-Amz-Date"][0], "%Y%m%dT%H%M%SZ"))
+            ttl = t0 + float(q["X-Amz-Expires"][0]) - time.time()
+        else:
+            return None
+    except (ValueError, OverflowError):
+        return None
+    return ttl if 0 < ttl < 30 * 86400 else None       # a PC clock that is far off says nothing: a 403 re-resolves
+
+
+class _Source:
+    """The URL the pieces are read from: the redirect (Hugging Face answers with a signed, time-limited CDN address) is
+    resolved once and reused; it is resolved again a little before it expires and after a 401/403/410."""
+
+    def __init__(self, url: str, total: int):
+        self.url, self.total = url, total
+        self.final, self.deadline = None, None
+        self.lock = threading.Lock()
+
+    def resolve(self, stale=None) -> str:
+        with self.lock:
+            if stale is not None and self.final is not None and self.final != stale:
+                return self.final                        # another connection already got a fresh address
+            req = urllib.request.Request(self.url, headers={"User-Agent": "strata-setup", "Range": "bytes=0-0"})
+            with _urlopen(req, timeout=60) as r:
+                cr = (r.headers.get("Content-Range") or "").strip()
+                if r.status != 206 or cr not in (f"bytes 0-0/{self.total}", "bytes 0-0/*"):
+                    raise _NoRange(f"HTTP {r.status}, Content-Range {cr!r}")
+                r.read(1)
+                final = r.geturl() or self.url
+            ttl = _url_ttl(final)
+            self.final = final
+            self.deadline = time.monotonic() + max(ttl - 120, 0) if ttl else None
+            return final
+
+    def get(self) -> str:
+        with self.lock:
+            cur, expired = self.final, self.deadline is not None and time.monotonic() >= self.deadline
+        return self.resolve(stale=cur) if cur is None or expired else cur
+
+
+class _Pieces:
+    """The shared state of one parallel download: finished pieces, bytes of the pieces in flight, the stop flags."""
+
+    def __init__(self, total: int, done: set):
+        self.total, self.n = total, -(-total // DL_CHUNK)
+        self.done, self.flight = set(done), {}
+        self.lock = threading.Lock()
+        self.stop = threading.Event()                    # the whole download stops (Ctrl-C, a fatal error)
+        self.abort_round = threading.Event()             # a piece failed for good: end this round, run the next
+        self.fatal, self.errors = None, []
+
+    def size(self, i: int) -> int:
+        return min((i + 1) * DL_CHUNK, self.total) - i * DL_CHUNK
+
+    def add(self, i: int, n: int):
+        with self.lock:
+            self.flight[i] = self.flight.get(i, 0) + n
+
+    def finish(self, i: int):
+        with self.lock:
+            self.flight.pop(i, None)
+            self.done.add(i)
+
+    def have(self) -> int:
+        with self.lock:
+            return sum(self.size(i) for i in self.done) + sum(self.flight.values())
+
+    def snapshot(self) -> set:
+        with self.lock:
+            return set(self.done)
+
+
+def _ranges(done) -> list:
+    out = []
+    for i in sorted(done):
+        if out and out[-1][1] == i:
+            out[-1][1] = i + 1
+        else:
+            out.append([i, i + 1])
+    return out
+
+
+def _prefix_bytes(done: set, total: int) -> int:
+    """Bytes of the unbroken run of finished pieces from the start of the file."""
+    i = 0
+    while i in done:
+        i += 1
+    return min(i * DL_CHUNK, total)
+
+
+def _load_pieces(part: Path, total: int) -> set:
+    """The finished pieces of an earlier run.  <name>.part.chunks lists them; a .part without it comes from one stream
+    (an older setup, or STRATA_DL_CONNECTIONS=1): its bytes are a run from the start, so those pieces are finished."""
+    side = part.with_name(part.name + ".chunks")
+    n = -(-total // DL_CHUNK)
+    try:
+        size = part.stat().st_size if part.is_file() else None
+    except OSError:
+        size = None
+    if side.is_file():
+        try:
+            data = json.loads(side.read_text(encoding="utf-8"))
+            if data.get("v") == 1 and data.get("total") == total and data.get("chunk") == DL_CHUNK and size is not None:
+                done = {i for a, b in data["done"] for i in range(int(a), min(int(b), n))}
+                return {i for i in done if min((i + 1) * DL_CHUNK, total) <= size}
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        side.unlink(missing_ok=True)                    # not this file's list: start the file over
+        part.unlink(missing_ok=True)
+        return set()
+    if size is None:
+        return set()
+    if size > total:
+        part.unlink(missing_ok=True)
+        return set()
+    return set(range(n)) if size >= total else set(range(size // DL_CHUNK))
+
+
+def _save_pieces(part: Path, total: int, done: set):
+    """Flush the data first, then record the pieces: a list never names bytes the disk does not have."""
+    try:
+        with open(part, "r+b") as g:
+            os.fsync(g.fileno())
+        side = part.with_name(part.name + ".chunks")
+        tmp = side.with_name(side.name + ".tmp")
+        tmp.write_text(json.dumps({"v": 1, "total": total, "chunk": DL_CHUNK, "done": _ranges(done)}), encoding="utf-8")
+        os.replace(tmp, side)
+    except OSError:
+        pass                                            # only costs re-downloading a few pieces after a stop
+
+
+def _single_ready(part: Path):
+    """Before one stream continues a .part: keep only the unbroken run from the start of the file (what a parallel
+    download left may have gaps behind it) and drop the list."""
+    side = part.with_name(part.name + ".chunks")
+    if not side.is_file():
+        return
+    try:
+        data = json.loads(side.read_text(encoding="utf-8"))
+        keep = _prefix_bytes({i for a, b in data["done"] for i in range(int(a), int(b))}, int(data["total"]))
+        if data.get("chunk") != DL_CHUNK:
+            keep = 0
+    except (OSError, ValueError, TypeError, KeyError):
+        keep = 0
+    try:
+        if part.is_file():
+            with open(part, "r+b") as g:
+                g.truncate(min(keep, part.stat().st_size))
+    except OSError:
+        part.unlink(missing_ok=True)
+    side.unlink(missing_ok=True)
+
+
+def _fetch_piece(src: _Source, st: _Pieces, f, i: int):
+    start = i * DL_CHUNK
+    end = start + st.size(i) - 1
+    pos, tries = start, 0
+    with st.lock:
+        st.flight[i] = 0
+    while True:
+        if st.stop.is_set():
+            return
+        url, err, wait = None, None, DL_BACKOFF * 2 ** tries
+        try:
+            url = src.get()
+            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={pos}-{end}"})
+            with _urlopen(req, timeout=60) as r:
+                if r.status != 206 or not (r.headers.get("Content-Range") or "").strip().startswith(f"bytes {pos}-{end}/"):
+                    raise _NoRange(f"HTTP {r.status}")
+                while pos <= end:
+                    if st.stop.is_set():
+                        return
+                    b = r.read(min(1 << 20, end + 1 - pos))
+                    if not b:
+                        raise IOError("the connection closed early")
+                    try:
+                        f.seek(pos)
+                        f.write(b)
+                    except OSError as e:
+                        raise _DiskError(str(e)) from e
+                    pos += len(b)
+                    st.add(i, len(b))
+            st.finish(i)
+            return
+        except (_NoRange, _DiskError):
+            raise
+        except urllib.error.HTTPError as e:
+            err = e
+            if e.code in (401, 403, 410) and url is not None:       # the signed address ran out: ask for a new one
+                try:
+                    src.resolve(stale=url)
+                    wait = 0
+                except _NoRange:
+                    raise
+                except (OSError, http.client.HTTPException):
+                    pass
+            elif e.code in (429, 503):
+                try:
+                    wait = max(wait, min(float(e.headers.get("Retry-After") or 0), 60))
+                except (TypeError, ValueError):
+                    pass
+        except (OSError, http.client.HTTPException) as e:
+            err = e
+        tries += 1
+        if tries >= DL_CHUNK_TRIES:
+            raise _PieceFailed(str(err))
+        st.stop.wait(wait)
+
+
+def _piece_worker(src: _Source, st: _Pieces, todo: list, part: Path):
+    try:
+        with open(part, "r+b", buffering=0) as f:
+            while not (st.stop.is_set() or st.abort_round.is_set()):
+                with st.lock:
+                    if not todo:
+                        return
+                    i = todo.pop(0)
+                _fetch_piece(src, st, f, i)
+    except _PieceFailed as e:
+        st.errors.append(e)
+        st.abort_round.set()
+    except (_NoRange, _DiskError) as e:
+        st.fatal = st.fatal or e
+        st.stop.set()
+    except OSError as e:                                # the .part itself could not be opened
+        st.fatal = st.fatal or _DiskError(str(e))
+        st.stop.set()
+
+
+def parallel_download(url: str, part: Path, total: int, label: str, conns: int, name: str) -> bool:
+    """Fill `part` (total bytes) over `conns` ranged connections.  True when every byte is there; False when the server
+    does not do ranges (the caller reads the file in one stream)."""
+    src = _Source(url, total)
+    try:
+        src.resolve()
+    except _NoRange:
+        return False
+    except (OSError, http.client.HTTPException):
+        return False                                    # the one-stream path has its own retries and messages
+    done = _load_pieces(part, total)
+    st = _Pieces(total, done)
+    part.parent.mkdir(parents=True, exist_ok=True)
+    if not part.exists():
+        part.touch()
+    last_print = last_save = 0.0
+
+    def report(force=False):
+        nonlocal last_print, last_save
+        now = time.time()
+        if now - last_print > 2 or force:
+            last_print = now
+            have = st.have()
+            print(f"\r  {label}: {have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)   ", end="", flush=True)
+        if now - last_save > DL_SAVE_EVERY:
+            last_save = now
+            _save_pieces(part, total, st.snapshot())
+
+    try:
+        for rnd in range(DL_ROUNDS):
+            todo = [i for i in range(st.n) if i not in st.done]
+            if not todo:
+                break
+            st.abort_round.clear()
+            st.errors.clear()
+            threads = [threading.Thread(target=_piece_worker, args=(src, st, todo, part), daemon=True)
+                       for _ in range(min(conns, len(todo)))]
+            for t in threads:
+                t.start()
+            while any(t.is_alive() for t in threads):
+                for t in threads:
+                    t.join(0.25)
+                report()
+            if st.fatal is not None:
+                break
+            if st.errors:
+                print()
+                warn(f"download interrupted ({st.errors[0]}); retrying in 10 s ...")
+                _save_pieces(part, total, st.snapshot())
+                time.sleep(10)
+    except BaseException:
+        st.stop.set()                                   # Ctrl-C: let the connections stop, keep what is finished
+        _save_pieces(part, total, st.snapshot())
+        raise
+    report(force=True)
+    print()
+    if isinstance(st.fatal, _DiskError):
+        _save_pieces(part, total, st.snapshot())
+        fail(f"cannot write {part.name}: {st.fatal}", "free some disk space (or pick another --models-dir) and run it again")
+    if isinstance(st.fatal, _NoRange):
+        _save_pieces(part, total, st.snapshot())
+        return False                                    # the server stopped doing ranges: one stream from the unbroken start
+    if len(st.done) < st.n:
+        _save_pieces(part, total, st.snapshot())
+        have = st.have()
+        fail(f"could not finish downloading {name}: {have:,} of {total:,} bytes",
+             "check your internet connection and run it again (the download resumes where it stopped)")
+    try:
+        with open(part, "r+b") as g:
+            g.truncate(total)
+            os.fsync(g.fileno())
+    except OSError:
+        pass
+    part.with_name(part.name + ".chunks").unlink(missing_ok=True)
+    return True
+
+
+def download_single(url: str, part: Path, total: int, label: str):
+    """One stream with a Range resume from the size of `part` (the way every download worked before parallel pieces)."""
+    _single_ready(part)
+    have = part.stat().st_size if part.exists() else 0
+    for attempt in range(30):
+        if total and have >= total:                    # stopped after the last byte, before the rename: nothing to
+            break                                      # ask for (a range past the end is a 416, retried 30 times)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={have}-"})
+            with _urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
+                if have and r.status != 206:                     # the server ignored the range: start over
+                    f.seek(0)
+                    f.truncate()
+                    have = 0
+                last = 0.0
+                while True:
+                    b = r.read(8 << 20)
+                    if not b:
+                        break
+                    f.write(b)
+                    have += len(b)
+                    if time.time() - last > 2:
+                        last = time.time()
+                        size = f"{have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)" if total \
+                            else f"{have / 1e6:7.1f} MB"
+                        print(f"\r  {label}: {size}   ", end="", flush=True)
+            print()
+            if not total or have >= total:
+                break
+        except (OSError, http.client.HTTPException) as e:
+            print()
+            warn(f"download interrupted ({e}); retrying in 10 s ...")
+            time.sleep(10)
+
+
 def download(url, dst: Path, what=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
     A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
@@ -1439,6 +1929,8 @@ def download(url, dst: Path, what=None):
             ms = None
     part = dst.with_name(dst.name + ".part")
     total = 0
+    # the file's pinned size and SHA-256, when it has them (ModelScope's copy is checked against the same pin)
+    pin = REPO_PINS.get(ms[0], {}).get(ms[1].rsplit("/", 1)[-1]) if ms is not None else file_pin(url)
     for attempt in range(5):
         try:
             req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
@@ -1446,9 +1938,13 @@ def download(url, dst: Path, what=None):
             break
         except urllib.error.HTTPError as e:
             if e.code == 404 and hf_unpinned(url) != url:  # the pinned revision is gone from the repository
+                if not allow_unpinned():
+                    fail(f"the pinned version of {what or dst.name} is no longer on Hugging Face",
+                         "update XeStrata: a newer version pins the files that are there now")
                 warn(f"{what or dst.name}: not at the pinned revision any more; downloading the repository's "
-                     "current file")
+                     "current file (not checked against a SHA-256)")
                 url = hf_unpinned(url)
+                pin = None
                 continue
             if attempt == 4:
                 fail(f"cannot reach {url.split('/')[2]} ({e})",
@@ -1459,45 +1955,26 @@ def download(url, dst: Path, what=None):
                 fail(f"cannot reach {url.split('/')[2]} ({e})",
                      "check your internet connection and run it again" + source_hint(url))
             time.sleep(5)
+    if pin and total and total != pin[0]:              # not the pinned file: stop before the download, not after
+        fail(f"{what or dst.name} is {total:,} bytes on {url.split('/')[2]}, not the pinned {pin[0]:,}",
+             "update XeStrata (the file there has changed since this version pinned it)")
     if dst.exists() and total and dst.stat().st_size == total:    # finished by an older setup (no mark yet)
         mark(dst)
         ok(f"{what or dst.name} already downloaded")
         return
-    have = part.stat().st_size if part.exists() else 0
-    for attempt in range(30):
-        if total and have >= total:                    # stopped after the last byte, before the rename: nothing to
-            break                                      # ask for (a range past the end is a 416, retried 30 times)
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={have}-"})
-            with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
-                if have and r.status != 206:                     # the server ignored the range: start over
-                    f.seek(0)
-                    f.truncate()
-                    have = 0
-                last = 0.0
-                while True:
-                    b = r.read(8 << 20)
-                    if not b:
-                        break
-                    f.write(b)
-                    have += len(b)
-                    if time.time() - last > 2:
-                        last = time.time()
-                        progress(what or dst.name, have, total)
-            progress_end()
-            if not total or have >= total:
-                break
-        except OSError as e:
-            progress_end()
-            warn(f"download interrupted ({e}); retrying in 10 s ...")
-            time.sleep(10)
+    label = what or dst.name
+    conns = dl_connections()
+    if not (total >= DL_MIN_PARALLEL and conns > 1 and parallel_download(url, part, total, label, conns, dst.name)):
+        download_single(url, part, total, label)
     if total and part.stat().st_size != total:
         fail(f"could not finish downloading {dst.name}: {part.stat().st_size:,} bytes on disk, "
              f"the server says {total:,}",
              "check your internet connection and run it again (the download resumes where it stopped)")
     part.replace(dst)
     meta = ms_meta(*ms) if ms is not None else None
-    if meta is not None and meta[1]:
+    if pin:
+        verify_sha256(dst, *pin)                       # the fixed hash: a wrong file is deleted and setup stops
+    elif meta is not None and meta[1]:
         verify_sha256(dst, meta[0], meta[1])           # ModelScope's published hash; kept in the finish mark
     else:
         if ms is not None:
