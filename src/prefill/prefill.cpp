@@ -2464,6 +2464,23 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfHostGroup, cs);
                     m.ids_host.resize((size_t) T * K);
                     m.ids_host.from_device(m.ids, m.cs);
+                    // STRATA_DUMP_MOE=<path> (XeStrata-890M, a diagnostic): every layer's MoE input rows, routed ids
+                    // and weights, appended as [int32 l, T, N, K][ids T*K][w T*K f32][x T*N f32] (issue #14's estimate)
+                    if (static const char* dump = std::getenv("STRATA_DUMP_MOE"); dump != nullptr) {
+                        static std::FILE* df = std::fopen(dump, "wb");
+                        if (df != nullptr) {
+                            std::vector<float> hw((size_t) T * K), hx((size_t) T * N);
+                            strata::gpu::copy_async(hw.data(), m.w, hw.size() * sizeof(float), m.cs);
+                            strata::gpu::copy_async(hx.data(), m.mixed, hx.size() * sizeof(float), m.cs);
+                            strata::gpu::stream_sync(m.cs);
+                            const int32_t head[4] = {(int32_t) l, (int32_t) T, (int32_t) N, (int32_t) K};
+                            std::fwrite(head, sizeof(int32_t), 4, df);
+                            std::fwrite(m.ids_host.data(), sizeof(int32_t), (size_t) T * K, df);
+                            std::fwrite(hw.data(), sizeof(float), hw.size(), df);
+                            std::fwrite(hx.data(), sizeof(float), hx.size(), df);
+                            std::fflush(df);
+                        }
+                    }
                     const strata::kernels::cpu::ExpertLayout& lay_c = strata::kernels::cpu::expert_layout();
                     bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr && !m.cpu_dead &&
                                      lay_c.native && !lay_c.fmt.empty();

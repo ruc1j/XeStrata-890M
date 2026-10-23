@@ -130,6 +130,14 @@ int check(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts)
                     s += (double) x8[r * K + k] * xs[r * (K / 32) + k / 32] * wf[(size_t) (o * K + k)];
                 worst = std::max(worst, std::fabs(s - y[(size_t) (r * N + o)]));
                 scale = std::max(scale, std::fabs(s));
+                // IQ_MMQ_PARITY_SHOW=1: the first mismatches (expert, row, column, reference, device)
+                static const bool show = std::getenv("IQ_MMQ_PARITY_SHOW") != nullptr;
+                static int shown = 0;
+                if (show && shown < 24 && std::fabs(s - y[(size_t) (r * N + o)]) > 1e-3 * std::max(1.0, std::fabs(s))) {
+                    ++shown;
+                    std::printf("    mismatch %s e %d r %lld o %lld: ref %.5g got %.5g\n", ggml_type_name(t), e, (long long) r,
+                                (long long) o, s, (double) y[(size_t) (r * N + o)]);
+                }
             }
     }
     const double rel = worst / std::max(scale, 1e-30);
@@ -328,9 +336,9 @@ int main(int argc, char** argv) try {
     std::printf("iq_mmq_parity: the int8 expert products %s\n",
                 matrix ? "on the matrix engines" : dp4a ? "by dp4a" : "(neither form runs here: skipped)");
     if (!matrix && !dp4a) return 77;
-    const std::vector<int32_t> three = {5, 40, 17}, one = {70};
+    const std::vector<int32_t> three = {5, 40, 17}, one = {70}, small = {3, 16, 9};   // small: the 16-row tile
     int bad = 0;
-    for (const auto& c : {three, one}) {
+    for (const auto& c : {three, one, small}) {
         bad += check(GGML_TYPE_Q8_0, 128, 160, c);
         bad += check(GGML_TYPE_IQ3_XXS, 128, 512, c);
         bad += check(GGML_TYPE_IQ2_XS, 128, 512, c);
