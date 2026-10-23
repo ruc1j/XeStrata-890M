@@ -4808,7 +4808,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         say(f"  The model file goes in {models_dir} (a copy you already have: put it there with its name, "
             f"{d['file']}, or use --gguf-dir <its folder>)")
         download(hf(d["repo"]) + d["file"], gguf)
-    verify_sha256(gguf, d["size"], d["sha256"])
+    verify_sha256(gguf, d["size"], d["sha256"], own=bool(a.gguf_dir))
     ok(f"model file present: {gguf}")
 
     # ---- 6. the tokenizer and the chat template, for the server
@@ -5688,7 +5688,7 @@ def main() -> int:
     check_shards(shards)
     for s in shards:                                   # the experimental Unsloth file: pinned sizes and SHA-256
         if s.name in fam.get("sha256", {}):
-            verify_sha256(s, *fam["sha256"][s.name])
+            verify_sha256(s, *fam["sha256"][s.name], own=bool(a.gguf_dir))
     ok("model files present")
     mmproj = Path(a.models_dir) / fam["mmproj"]
     if not mmproj.exists():
