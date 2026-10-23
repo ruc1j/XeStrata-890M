@@ -84,6 +84,14 @@ It carries the original XeStrata's changes up to xe0.1.43.1 (Strata 0.1.43).
      the default where side branches pay on the GPU; upstream's SH_STREAM).  The same kernels in the same order, joined before the
      combine, so the output is bit for bit the same.  The 890M's decode is +2.5 to 3.0% (35.5 to 36.5 tok/s).  `STRATA_SH_BRANCH=0`:
      the former order.
+   - The draft chain and the window end where the product of the drafts' probabilities so far falls below a threshold, instead
+     of at the first draft below `--spec-min-p` (`STRATA_SPEC_CUM=c`, the default 0.5 on an integrated GPU on the HIP backend, 0
+     elsewhere: the former rule; not used with `--spec-min-p 0`).  The head drafts further while it is sure and stops sooner once it
+     is not.  It goes with `--spec 6`: on the abliterated model's six chats (28 W), `--spec 6` with 0.5 gave 32.76 / 32.67 tok/s
+     against 32.18 / 31.99 for `--spec 4` and `--spec-min-p 0.5` (+2.0%), 0.45 +2.3% (in another run's comparison), 0.55 +1.1%;
+     0.4 and below and `--spec 8` are slower (a row that misses costs 9.5 ms).  With `--spec 4`, 0.45 gives +1.3%.  Drafts are only proposals: the output is the same.
+   - A window ends at a draft that ends the turn (`<|im_end|>` and the like): the reply stops there, so a row after it would be
+     verified for nothing.
    - The speculative layer's head narrowed by a one-bit sketch (`STRATA_MTP_SKETCH`, the default): at start-up each head
      row's signs and mean magnitude are taken, every draft step picks 4 candidates of each 128 rows with them, and only the
      candidates' rows go through the real head.  The head reads about a quarter of the bytes and the drafts hit as often

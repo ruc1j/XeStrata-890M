@@ -11454,10 +11454,22 @@ int main(int argc, char** argv) {
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
-                if (use_mtp && req_spec_min_p > 0.0) {
+                if (use_mtp && req_spec_min_p > 0.0 && strata::core::spec_cum_threshold() > 0.0f) {   // mtp.hpp
+                    T = 1;
+                    float cum = 1.0f;
+                    while (T < S_mtp && (cum *= dprob[(size_t) T - 1]) >= strata::core::spec_cum_threshold()) ++T;
+                } else if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
+                // XeStrata-890M: no row after a draft that ends the turn - the reply stops there if it is accepted, and
+                // a row after it could only be verified for nothing (halogen-flash-server 0.18 does the same)
+                if (use_mtp)
+                    for (int i = 0; i + 1 < T; ++i)
+                        if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) drafts[(size_t) i]) != o.eos_ids.end()) {
+                            T = i + 2;
+                            break;
+                        }
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's

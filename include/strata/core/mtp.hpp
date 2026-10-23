@@ -39,6 +39,12 @@ namespace strata::core {
 
 class NativeHead;
 
+/// XeStrata-890M: the chain and the window end at the first draft where the product of the drafts' probabilities so
+/// far falls below this (STRATA_SPEC_CUM=<c>, 0 < c < 1), in place of --spec-min-p's test of each draft alone; 0: the
+/// --spec-min-p rule.  Only where --spec-min-p gates the drafts at all (> 0).  Unset: 0.5 on an integrated GPU on the
+/// HIP backend, 0 elsewhere (mtp.cpp has the measurement).
+float spec_cum_threshold();
+
 class MtpDrafter {
 public:
     MtpDrafter() = default;

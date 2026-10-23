@@ -6,6 +6,7 @@
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/runtime.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/platform/memory.hpp"
@@ -1205,6 +1206,29 @@ void MtpDrafter::dump_head(int32_t tok) {
     std::fflush(f);
 }
 
+// Measured on the 890M (28 W, the abliterated IQ2_XS model, six chats at temperature 0, two rounds each): with
+// --spec 6 a product of 0.45 / 0.5 / 0.55 gave +2.3 / +2.0 / +1.1% decode over --spec 4 and --spec-min-p 0.5 (more
+// drafts offered when the head is sure, fewer when it is not), 0.3 and 0.4 lost (rows that miss cost a window row each,
+// about 9.5 ms there), --spec 8 lost; with --spec 4, 0.45 gave +1.3%.  The best product depends on a row's cost
+// against the window's, so other GPUs keep --spec-min-p unless the variable is set.
+float spec_cum_threshold() {
+    static const float c = [] {
+        const char* v = std::getenv("STRATA_SPEC_CUM");
+        float x = 0.0f;
+        if (v != nullptr) x = std::strtof(v, nullptr);
+        else {
+            const sycl::device& d = Runtime::get().device();
+            if (d.get_backend() == sycl::backend::ext_oneapi_hip && integrated_gpu(d)) x = 0.5f;
+        }
+        x = x > 0.0f && x < 1.0f ? x : 0.0f;
+        if (x > 0.0f)
+            std::fprintf(stderr, "strata mtp: a window's drafts end where their probabilities' product falls below %.2f "
+                                 "(STRATA_SPEC_CUM; with --spec-min-p)\n", (double) x);
+        return x;
+    }();
+    return c;
+}
+
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
@@ -1283,8 +1307,11 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     float pj = ((volatile float*) h_prob_)[0];
     if (probs) probs[0] = pj;
     int n = 1;
-    // the chain continues while the last draft is likely enough to be verified
-    for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+    // the chain continues while the last draft is likely enough to be verified (STRATA_SPEC_CUM: while all the drafts
+    // so far are)
+    const float cum_min = min_p > 0.0f ? spec_cum_threshold() : 0.0f;
+    float cum = pj;
+    for (int j = 1; j < max_steps && (cum_min > 0.0f ? cum >= cum_min : pj >= min_p); ++j) {
         if (!strata::gpu::graph_launch(cp ? step_exec_c_[j] : step_exec_[j], cs_)) {
             err = std::string("mtp draft step: ") + strata::gpu::last_error();
             return false;
@@ -1296,6 +1323,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(j); }
         dump_head(drafts[j]);
         pj = ((volatile float*) h_prob_)[j];
+        cum *= pj;
         if (probs) probs[j] = pj;
         ++n;
     }
