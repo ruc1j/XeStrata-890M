@@ -82,6 +82,19 @@ PoolPlanInput pool_plan_input(const std::vector<int>& worker_cores, int host_cor
 /// The CPUs a container quota allows (cgroup v2 cpu.max / v1 cfs quota), 0 when none or not Linux.
 double container_cpu_quota();
 
+/// `--pool-cores LIST` / STRATA_POOL_CORES / the config's "pool_cores" (experimental, off by default; upstream 7a559958):
+/// pin the pool's workers to exactly these logical processors, in this order, instead of one per physical core.  An
+/// empty list (the default) leaves the placement as it has always been.  Set before the pool is built.  Processors the
+/// process may not run on are left out with a warning; SMT siblings of one core and the host's processor are kept with
+/// a warning (a person who asks for them gets them).  The worker count is the list's length unless --pool-workers says
+/// otherwise.
+void set_pool_cores(const std::vector<int>& cpus);
+const std::vector<int>& pool_cores_setting();
+
+/// Every logical processor this process may run on and the physical core it belongs to (see LogicalCpuInfo).  Empty when
+/// the system does not say (macOS, a sandbox without the topology).
+std::vector<LogicalCpuInfo> logical_cpu_layout();
+
 /// **THE RESERVATION IS A FICTION UNLESS THE HOST IS ACTUALLY PUT THERE.**
 ///
 /// `physical_cores(true)` keeps the workers off the first physical core so that the host loop can spin on
@@ -140,6 +153,11 @@ public:
     const char* plan_limit() const { return plan_limit_; }
     int plan_cores() const { return plan_cores_; }
     int plan_logical() const { return plan_logical_; }
+    /// True when the workers sit where `--pool-cores` said (the list, minus what could not be used).
+    bool explicit_cores() const { return explicit_cores_; }
+    /// The start-up line about where the workers and the host run ("CPU workers on logical processors 2,4,...,30 (15
+    /// workers, one per physical core; host on 0)"); "" without workers.
+    std::string placement_line() const;
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
@@ -213,6 +231,10 @@ private:
     void publish();
 
     int n_ = 0;
+    bool explicit_cores_ = false;
+    bool pinned_ = true;
+    int host_core_ = -1;                   // the host thread's logical processor (physical_cores(false).front())
+    std::vector<LogicalCpuInfo> layout_;   // the logical processors and their cores, read when the pool was built (the caller may be pinned later)
     const char* plan_limit_ = "";
     int plan_cores_ = 0;
     int plan_logical_ = 0;

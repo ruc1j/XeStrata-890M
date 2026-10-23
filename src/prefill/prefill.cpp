@@ -9,6 +9,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/platform/aux_cpus.hpp"
+#include "strata/platform/thread_name.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -310,6 +311,7 @@ struct Stager {
         device = strata::core::current_device();
         for (int t = 0; t < nthreads; ++t)
             threads.emplace_back([this] {
+                strata::platform::name_this_thread("strata-stage");
                 // --aux-cpus: the copy threads go to the spare CPUs with the other helpers; STRATA_AUX_STAGER=0 leaves them where
                 // they were created (a small spare set would then hold all of them: it limits the copy rate of a long read)
                 static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::strtol(v, nullptr, 10) == 0; }();
@@ -2081,6 +2083,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         const bool threaded_issue = stream_all && issuer_on;
         if (threaded_issue) {
             issuer = std::thread([&] {
+                strata::platform::name_this_thread("strata-issue");
                 const core::OnDevice od(m.device);
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
@@ -3524,6 +3527,7 @@ struct InProcessPrefill::Worker {
     std::thread th;
     Worker() {
         th = std::thread([this] {
+            strata::platform::name_this_thread("strata-hand");
             strata::aux_cpus::pin_current_thread();
             for (;;) {
                 std::packaged_task<bool()> job;

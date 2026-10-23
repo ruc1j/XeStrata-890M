@@ -11,6 +11,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
+#include "strata/platform/thread_name.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/mrope.hpp"
 
@@ -546,6 +547,7 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
         pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
         pinned = true;
     }
+    strata::platform::name_this_thread("strata-host");
     strata::aux_cpus::note_owned_thread();   // the host: --aux-cpus leaves it where it is
     return true;
 }
