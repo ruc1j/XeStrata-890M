@@ -126,12 +126,14 @@ class SpawnFailure(unittest.TestCase):
               '/v1/responses': {'input': 'hi', 'max_output_tokens': 8}}
 
     def test_missing_engine_answers_503_and_leaves_nothing_running(self):
-        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         eng = StrataEngine(str(root / 'no-such-engine'), [], log=str(root / 'engine.log'), lazy=True)
         svc = Service(eng, ByteTokenizer(), ChatTemplate(Path(__file__).parent / 'test_chat_template.jinja'))
         httpd = serve(svc, port=0)
-        self.addCleanup(httpd.shutdown); self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.addCleanup(httpd.server_close)
         base = f'http://127.0.0.1:{httpd.server_address[1]}'
         before = set(threading.enumerate())
         cases = list(self.BODIES.items()) + [('/v1/chat/completions',

@@ -1041,10 +1041,10 @@ class OutputParser:
         # the client has no tool to run).  The Responses route leaves it off: a Codex compaction request keeps its
         # conversation's tools in the prompt only, and its calls come back as before.
         self.declared_only = declared_only
-        # PR #3556: the native namespace__member spelling of a declared namespace.member tool is accepted without advertising a
-        # duplicate tool.  Only an unambiguous alias counts (two namespaces can end in the same member), and an exactly declared
-        # name always wins over an alias.
-        aliases = {}
+        # PR #3556: the native namespace__member spelling of a declared namespace.member tool is accepted
+        # without advertising a duplicate tool.  Only an unambiguous alias counts (two namespaces can end
+        # in the same member), and an exactly declared name always wins over an alias.
+        aliases: dict[str, set[str]] = {}
         for name in self.schemas:
             if isinstance(name, str) and "." in name:
                 namespace, member = name.rsplit(".", 1)
@@ -1052,7 +1052,8 @@ class OutputParser:
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
-        self.unread_names: list[str] = []   # the names (first few) of those that named a tool the request did not declare
+        # the names (first few) of those that named a tool the request did not declare
+        self.unread_names: list[str] = []
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
@@ -1589,7 +1590,8 @@ class OutputParser:
                             self.buf = self.buf[j:]
                         return out
                     if gt >= 0 and (nl < 0 or gt < nl) and not self._callable(after[len(FUNC_START):gt].strip()):
-                        self.unread += 1                 # logged by the server: otherwise "the model ignored my tool" is the only clue
+                        # logged by the server: otherwise "the model ignored my tool" is the only clue
+                        self.unread += 1
                         if len(self.unread_names) < 5:
                             self.unread_names.append(after[len(FUNC_START):gt].strip()[:80])
                         out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """#3441 (a call whose envelope drifted by a token) and #3075 (a call for a tool the request never declared)."""
 from __future__ import annotations
 
@@ -92,7 +95,8 @@ class OnlyDeclaredTools(unittest.TestCase):
                 self.assertEqual(text(evs), "I will check.\n" + raw)
 
     def test_an_unparsed_call_is_counted_and_named_for_the_log(self):
-        """T1 rail: a call that went back as text is no longer silent; the server prints its count and the names the model wrote."""
+        """T1 rail: a call that went back as text is no longer silent;
+        the server prints its count and the names the model wrote."""
         raw = body("<function=get_indicators>", "symbol", "600076")
         evs, p = run("I will check."+chr(10) + raw, 4, tools=TOOLS)
         self.assertEqual((p.unread, p.unread_names), (1, ["get_indicators"]))
@@ -107,7 +111,8 @@ class OnlyDeclaredTools(unittest.TestCase):
 
     def test_the_responses_spelling_of_a_namespace_tool_counts(self):
         evs, p = run(body("<function=ns__web_search>", "q", "x"), 4, tools=TOOLS)
-        # PR #3556: the call carries the declared spelling (ns.web_search), the one the client offered, not the model's flat one
+        # PR #3556: the call carries the declared spelling (ns.web_search),
+        # the one the client offered, not the model's flat one
         self.assertEqual(calls(evs), [("ns.web_search", {"q": "x"})])
 
     def test_no_tools_declared(self):

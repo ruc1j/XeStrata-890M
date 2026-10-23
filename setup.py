@@ -43,8 +43,6 @@ from __future__ import annotations
 
 import argparse
 import calendar
-import ctypes
-import glob
 import hashlib
 import http.client
 import importlib
@@ -90,7 +88,8 @@ SETUP_CMD = ("xestrata-cli" if WIN else "xestrata") if PACKAGED else "./setup.sh
 # no longer has stops the download (download()), unless a tester sets STRATA_ALLOW_UNPINNED=1.
 HF_REVISIONS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
-    "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",   # 2026-10-07 (adds IQ3_S)
+    # 2026-10-07 (adds IQ3_S)
+    "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
     "ornith-ai/Ornith-1.5-35B-A3B-GGUF": "12393612fd4f730ff5aadc23e9b8f9648aa49ceb",                 # 2026-10-11
@@ -124,7 +123,8 @@ _unpinned_said: list[int] = []
 
 def atomic_replace(src, dst, *, patience: float = 5.0, sleep=time.sleep, clock=time.monotonic) -> None:
     """os.replace onto a file another program may hold open (a virus scanner, an indexer): on Windows that fails with
-    PermissionError for a split second, so it is tried again for `patience` seconds (upstream's strata_control/atomic.py)."""
+    PermissionError for a split second, so it is tried again for `patience` seconds (upstream's
+    strata_control/atomic.py)."""
     deadline = clock() + patience
     step = 0.02
     while True:
@@ -139,13 +139,15 @@ def atomic_replace(src, dst, *, patience: float = 5.0, sleep=time.sleep, clock=t
 
 
 def _urlopen(req, timeout=None):
-    """Every download request of this file goes through here (upstream's name, kept so its download code reads the same)."""
+    """Every download request of this file goes through here
+    (upstream's name, kept so its download code reads the same)."""
     return urllib.request.urlopen(req, timeout=timeout)
 
 
 def allow_unpinned() -> bool:
-    """STRATA_ALLOW_UNPINNED=1: a tester's opt-out.  A file whose pinned version is gone from Hugging Face is then taken
-    from the repository's current files, without the SHA-256 check (nothing pins them).  Off by default, announced when set."""
+    """STRATA_ALLOW_UNPINNED=1: a tester's opt-out.  A file whose pinned version is gone
+    from Hugging Face is then taken from the repository's current files, without the
+    SHA-256 check (nothing pins them).  Off by default, announced when set."""
     on = (os.environ.get("STRATA_ALLOW_UNPINNED") or "").strip() == "1"
     if on and not _unpinned_said:
         _unpinned_said.append(1)
@@ -171,8 +173,8 @@ def file_pin(url: str):
 MS_DEFAULT = "https://www.modelscope.cn"
 SOURCES = ("auto", "modelscope", "huggingface")
 HF_FILE = re.compile(r"^https?://[^/]+/(?P<repo>[^/]+/[^/]+)/resolve/[^/]+/(?P<path>.+)$")
-_sources = {}                                      # model_source()'s answer per (STRATA_SOURCE, HF_ENDPOINT, host)
-_ms_files = {}
+_sources: dict = {}                                # model_source()'s answer per (STRATA_SOURCE, HF_ENDPOINT, host)
+_ms_files: dict = {}
 
 
 def ms_endpoint() -> str:
@@ -349,9 +351,9 @@ UNSLOTH_BIG_SHARDS = {
         (34015618784, "538a93bca918064983409a41187ad4c68640f9aced6f29564da8f551bf86d7a5"),
 }
 
-# ISTA-DASLab's Qwen3.8-Flash-Next shards (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S) and the picture reader at the revision pinned in
-# HF_REVISIONS: name -> (bytes, sha256), the Hub's LFS pointers (tools/hf_pin_fetch.py; upstream e193161d).  The n-gram
-# table (shard 2) is the same file for all four sizes.
+# ISTA-DASLab's Qwen3.8-Flash-Next shards (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S) and the picture reader at the
+# revision pinned in HF_REVISIONS: name -> (bytes, sha256), the Hub's LFS pointers (tools/hf_pin_fetch.py;
+# upstream e193161d).  The n-gram table (shard 2) is the same file for all four sizes.
 ISTA_FILES = {
     "Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf":
         (39225954592, "92cee27ae5bbadcd732416a0f7a7f0acc092399dbbe8f5a5efa707c2ec0a49d7"),
@@ -679,7 +681,8 @@ def ask(question, choices, default, yes):
 def run(cmd, cwd=None, env=None, check=True, quiet=False):
     say("  > " + " ".join(str(c) for c in cmd))
     env = dict(os.environ if env is None else env)
-    env.setdefault("STRATA_EXIT_WITH_PARENT", "1")     # tools/mtp_fetch.py ends when setup ends (#3257: a cancel left it writing)
+    # tools/mtp_fetch.py ends when setup ends (#3257: a cancel left it writing)
+    env.setdefault("STRATA_EXIT_WITH_PARENT", "1")
     if JSON_OUT and not quiet:                         # the program's lines as log objects, not loose on stdout
         with subprocess.Popen([str(c) for c in cmd], cwd=cwd, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True, errors="replace") as p:
@@ -700,8 +703,9 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
 
 
 def fetch_mtp(mtp: Path, env: dict, tries: int = 3):
-    """The ~5 GB of MTP tensors (tools/mtp_fetch.py).  A timeout or a dropped connection stops one run, not the install (#3214 #3193):
-    it is run again, and each run continues where the last one stopped.  The progress lines it prints are what the app shows."""
+    """The ~5 GB of MTP tensors (tools/mtp_fetch.py).  A timeout or a dropped connection
+    stops one run, not the install (#3214 #3193): it is run again, and each run continues
+    where the last one stopped.  The progress lines it prints are what the app shows."""
     cmd = [sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)]
     env = {**env, "STRATA_SOURCE": model_source()}
     for n in range(1, tries + 1):
@@ -714,7 +718,8 @@ def fetch_mtp(mtp: Path, env: dict, tries: int = 3):
                  f"({n + 1} of {tries})")
             time.sleep(5)
     fail(f"the draft layer's download keeps stopping (exit {rc}): the connection to Hugging Face is slow or drops",
-         "run setup again - what is downloaded is kept. If it still stops, set STRATA_SOURCE=modelscope (setup --source modelscope) "
+         "run setup again - what is downloaded is kept. If it still stops, set STRATA_SOURCE=modelscope (setup "
+         "--source modelscope) "
          "to read the same files from ModelScope")
 
 
@@ -1559,14 +1564,16 @@ def drop_archive(z: Path) -> None:
     z.with_name(z.name + ".done").unlink(missing_ok=True)
 
 
-# Parallel ranged downloads (0.2.0).  One TCP stream often cannot fill a fast line (a long or lossy route, a CDN that limits
-# each connection): download() takes the file in DL_CHUNK pieces over several connections, writes each piece at its own offset,
-# and keeps the finished pieces in <name>.part.chunks so a stopped download continues where it was.  Anything that is not a
-# ranged file of known length (no Range support, no length, a small file) is one stream, as before.
+# Parallel ranged downloads (0.2.0).  One TCP stream often cannot fill a fast line (a long or
+# lossy route, a CDN that limits each connection): download() takes the file in DL_CHUNK pieces
+# over several connections, writes each piece at its own offset, and keeps the finished pieces in
+# <name>.part.chunks so a stopped download continues where it was.  Anything that is not a ranged
+# file of known length (no Range support, no length, a small file) is one stream, as before.
 DL_CONNECTIONS = 16             # STRATA_DL_CONNECTIONS=1 restores one stream (for testers)
 DL_CHUNK = 32 << 20             # bytes per piece: what the piece list records and what a failed request loses at most
-DL_RUN = 4                      # pieces one request asks for (4 x 32 MiB): a new connection per piece spends its first seconds
-                                # in TCP slow start (measured: 8 connections 66 MB/s with a request per piece, 73 with 128 MiB)
+# pieces one request asks for (4 x 32 MiB): a new connection per piece spends its first seconds
+# in TCP slow start (measured: 8 connections 66 MB/s with a request per piece, 73 with 128 MiB)
+DL_RUN = 4
 DL_MIN_PARALLEL = 256 << 20     # smaller files are one stream
 DL_CHUNK_TRIES = 5              # tries per request (1, 2, 4, 8 s apart) before the round is given up and run again
 DL_ROUNDS = 30                  # rounds (10 s apart) before the download is given up, like the 30 tries of one stream
@@ -1597,7 +1604,8 @@ class _PieceFailed(Exception):
 
 
 class _Changed(Exception):
-    """The server's file is not the one the first pieces came from (another ETag): what was written cannot be trusted."""
+    """The server's file is not the one the first pieces came from (another ETag): what was written cannot be trusted.
+    """
 
 
 _CONTENT_RANGE = re.compile(r"\s*bytes (\d+)-(\d+)/(\d+)\s*$")
@@ -1612,10 +1620,10 @@ def _etag(headers) -> str | None:
 
 
 def _check_ranged(r, pos: int, end: int, total: int, etag: str | None):
-    """A ranged answer is trusted only when it is exactly the bytes asked for: status 206, Content-Range `pos-end/total`
-    (a 200 with the whole file, another range or another total is the server not honouring the request), a Content-Length
-    that fits, and the same object (ETag) as the first answer.  _NoRange: this server cannot be used with ranges;
-    OSError: a bad answer worth asking again (another edge)."""
+    """A ranged answer is trusted only when it is exactly the bytes asked for: status 206, Content-Range
+    `pos-end/total` (a 200 with the whole file, another range or another total is the server not honouring
+    the request), a Content-Length that fits, and the same object (ETag) as the first answer.  _NoRange:
+    this server cannot be used with ranges; OSError: a bad answer worth asking again (another edge)."""
     if r.status != 206:
         raise _NoRange(f"HTTP {r.status}")
     m = _CONTENT_RANGE.match(r.headers.get("Content-Range") or "")
@@ -1630,7 +1638,8 @@ def _check_ranged(r, pos: int, end: int, total: int, etag: str | None):
 
 
 def _write_all(f, pos: int, data):
-    """Write `data` at `pos`; a raw unbuffered file may take fewer bytes than it was given, so go on until all are down."""
+    """Write `data` at `pos`; a raw unbuffered file may take fewer bytes than it was given, so go on until all are down.
+    """
     view = memoryview(data)
     f.seek(pos)
     done_n = 0
@@ -1675,8 +1684,10 @@ class _Source:
 
     def __init__(self, url: str, total: int):
         self.url, self.total = url, total
-        self.final, self.deadline = None, None
-        self.etag = None                                 # the object the first answer named; every later answer must match
+        self.final: str | None = None
+        self.deadline: float | None = None
+        # the object the first answer named; every later answer must match
+        self.etag: str | None = None
         self.lock = threading.Lock()
 
     def resolve(self, stale=None) -> str:
@@ -1690,7 +1701,8 @@ class _Source:
                     raise _NoRange(f"HTTP {r.status}, Content-Range {cr!r}")
                 tag = _etag(r.headers)
                 if self.etag and tag and tag != self.etag:
-                    raise _Changed(f"the file on the server changed while it was downloaded ({self.etag[:12]} -> {tag[:12]})")
+                    raise _Changed("the file on the server changed while it was downloaded "
+                                   f"({self.etag[:12]} -> {tag[:12]})")
                 self.etag = self.etag or tag
                 r.read(1)
                 final = r.geturl() or self.url
@@ -1710,11 +1722,13 @@ class _Pieces:
 
     def __init__(self, total: int, done: set, conns: int = 1):
         self.total, self.n, self.conns = total, -(-total // DL_CHUNK), conns
-        self.done, self.flight = set(done), {}
+        self.done = set(done)
+        self.flight: dict[int, int] = {}
         self.lock = threading.Lock()
         self.stop = threading.Event()                    # the whole download stops (Ctrl-C, a fatal error)
         self.abort_round = threading.Event()             # a piece failed for good: end this round, run the next
-        self.fatal, self.errors = None, []
+        self.fatal: Exception | None = None
+        self.errors: list[Exception] = []
 
     def size(self, i: int) -> int:
         return min((i + 1) * DL_CHUNK, self.total) - i * DL_CHUNK
@@ -1738,7 +1752,7 @@ class _Pieces:
 
 
 def _ranges(done) -> list:
-    out = []
+    out: list[list[int]] = []
     for i in sorted(done):
         if out and out[-1][1] == i:
             out[-1][1] = i + 1
@@ -1811,7 +1825,8 @@ def _claim_part(part: Path, url: str, etag: str | None = None):
     except (OSError, ValueError):
         old = {}
     if old is not None:
-        same = isinstance(old, dict) and old.get("url") == url and not (old.get("etag") and etag and old.get("etag") != etag)
+        same = isinstance(old, dict) and old.get("url") == url and \
+            not (old.get("etag") and etag and old.get("etag") != etag)
         if not same:
             part.unlink(missing_ok=True)
             part.with_name(part.name + ".chunks").unlink(missing_ok=True)
@@ -1847,8 +1862,8 @@ def _single_ready(part: Path):
 
 
 def _take_run(st: _Pieces, todo: list) -> list:
-    """The next request's pieces: up to DL_RUN neighbours from the front of `todo`; fewer near the end, so the last pieces
-    are spread over every connection and no single slow one holds the finish."""
+    """The next request's pieces: up to DL_RUN neighbours from the front of `todo`; fewer near the end,
+    so the last pieces are spread over every connection and no single slow one holds the finish."""
     with st.lock:
         if not todo:
             return []
@@ -1860,9 +1875,9 @@ def _take_run(st: _Pieces, todo: list) -> list:
 
 
 def _fetch_run(src: _Source, st: _Pieces, f, run: list):
-    """One ranged request for the neighbouring pieces in `run`, written at their offsets; each piece counts as finished
-    when its last byte is down.  Every answer is checked to be exactly the range asked for (status, Content-Range, length,
-    ETag); a connection that breaks continues from the byte it reached."""
+    """One ranged request for the neighbouring pieces in `run`, written at their offsets; each piece counts
+    as finished when its last byte is down.  Every answer is checked to be exactly the range asked for
+    (status, Content-Range, length, ETag); a connection that breaks continues from the byte it reached."""
     start = run[0] * DL_CHUNK
     end = min((run[-1] + 1) * DL_CHUNK, st.total) - 1
     pos, tries = start, 0
@@ -1872,7 +1887,8 @@ def _fetch_run(src: _Source, st: _Pieces, f, run: list):
     while True:
         if st.stop.is_set():
             return
-        url, err, wait, ra = None, None, None, 0.0
+        url, wait, ra = None, None, 0.0
+        err: Exception | None = None
         attempt_pos = pos
         try:
             url = src.get()
@@ -1895,7 +1911,8 @@ def _fetch_run(src: _Source, st: _Pieces, f, run: list):
                     st.add(cur, len(b))
                     if pos == cur_end:
                         st.finish(cur)
-                        if pos <= end and st.abort_round.is_set():            # a piece failed for good: stop at a piece edge
+                        # a piece failed for good: stop at a piece edge
+                        if pos <= end and st.abort_round.is_set():
                             with st.lock:
                                 for i in run:
                                     if i not in st.done and st.flight.get(i) == 0:
@@ -1921,10 +1938,11 @@ def _fetch_run(src: _Source, st: _Pieces, f, run: list):
                     pass
         except (OSError, http.client.HTTPException) as e:
             err = e
-        # A try that moved forward is not a failed one.  The request goes on from the byte it reached: what came before the
-        # break is exactly the range that was asked for (the answer's status, Content-Range, length and ETag were checked and
-        # every byte was written in full), and writing a piece again from its start would make a route that resets more often
-        # than every DL_CHUNK bytes unable to finish any piece.  The whole-file SHA-256 and the repair are the net behind it.
+        # A try that moved forward is not a failed one.  The request goes on from the byte it reached:
+        # what came before the break is exactly the range that was asked for (the answer's status,
+        # Content-Range, length and ETag were checked and every byte was written in full), and writing a
+        # piece again from its start would make a route that resets more often than every DL_CHUNK bytes
+        # unable to finish any piece.  The whole-file SHA-256 and the repair are the net behind it.
         tries = 1 if pos > attempt_pos else tries + 1
         if tries >= DL_CHUNK_TRIES:
             raise _PieceFailed(str(err))
@@ -1967,7 +1985,8 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
     if not part.exists():
         part.touch()
     if not part.with_name(part.name + ".chunks").is_file() and not _save_pieces(part, total, done):
-        return False                                    # no piece list can be kept here: the pieces would not be told from holes
+        # no piece list can be kept here: the pieces would not be told from holes
+        return False
     last_print = last_save = 0.0
 
     def report(force=False):
@@ -1976,7 +1995,8 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
         if now - last_print > 2 or force:
             last_print = now
             have = st.have()
-            print(f"\r  {label}: {have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)   ", end="", flush=True)
+            print(f"\r  {label}: {have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)   ", end="",
+                  flush=True)
         if now - last_save > DL_SAVE_EVERY:
             last_save = now
             _save_pieces(part, total, st.snapshot())
@@ -2017,10 +2037,12 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
              "run it again (the download starts over with the file that is there now)")
     if isinstance(st.fatal, _DiskError):
         _save_pieces(part, total, st.snapshot())
-        fail(f"cannot write {part.name}: {st.fatal}", "free some disk space (or pick another --models-dir) and run it again")
+        fail(f"cannot write {part.name}: {st.fatal}",
+             "free some disk space (or pick another --models-dir) and run it again")
     if isinstance(st.fatal, _NoRange):
         _save_pieces(part, total, st.snapshot())
-        return False                                    # the server stopped doing ranges: one stream from the unbroken start
+        # the server stopped doing ranges: one stream from the unbroken start
+        return False
     if len(st.done) < st.n:
         _save_pieces(part, total, st.snapshot())
         have = st.have()
@@ -2045,6 +2067,7 @@ def _repair_piece(src: _Source, st: _Pieces, f, i: int, stats: dict):
         if st.stop.is_set():
             return
         url, wait, ra = None, None, 0.0
+        err: Exception | None = None
         before = pos
         try:
             url = src.get()
@@ -2105,7 +2128,7 @@ def repair_download(url: str, path: Path, total: int, label: str, conns: int):
     except (_NoRange, _Changed, OSError, http.client.HTTPException):
         return None
     st = _Pieces(total, set(), conns)
-    stats = {"bytes": 0, "pieces": set()}
+    stats: dict[str, Any] = {"bytes": 0, "pieces": set()}
     todo = list(range(st.n))
     errors = []
 
@@ -2134,7 +2157,8 @@ def repair_download(url: str, path: Path, total: int, label: str, conns: int):
             if time.time() - last > 2:
                 last = time.time()
                 have = st.have()
-                print(f"\r  {label}: {have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)   ", end="", flush=True)
+                print(f"\r  {label}: {have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)   ", end="",
+                      flush=True)
     except BaseException:
         st.stop.set()
         raise
@@ -2151,8 +2175,9 @@ def repair_download(url: str, path: Path, total: int, label: str, conns: int):
 
 
 def download_single(url: str, part: Path, total: int, label: str):
-    """One stream with a Range resume from the size of `part` (the way every download worked before parallel pieces).
-    A resumed answer is used only when it is a 206 that starts at the byte asked for; anything else starts the file over."""
+    """One stream with a Range resume from the size of `part` (the way every download
+    worked before parallel pieces). A resumed answer is used only when it is a 206
+    that starts at the byte asked for; anything else starts the file over."""
     _single_ready(part)
     for attempt in range(30):
         have = part.stat().st_size if part.exists() else 0
@@ -2164,10 +2189,12 @@ def download_single(url: str, part: Path, total: int, label: str):
                 if have:
                     m = _CONTENT_RANGE.match(r.headers.get("Content-Range") or "")
                     if r.status != 206 or not m or int(m.group(1)) != have or (total and int(m.group(3)) != total):
-                        if r.status != 200:              # another range: its bytes are not the file's; ask again from the start
+                        # another range: its bytes are not the file's; ask again from the start
+                        if r.status != 200:
                             part.unlink(missing_ok=True)
                             raise OSError(f"the server answered another range than bytes {have}- (HTTP {r.status})")
-                        have = 0                         # the server ignored the range and sent the whole file: start over
+                        # the server ignored the range and sent the whole file: start over
+                        have = 0
                 elif r.status not in (200, 206):
                     raise OSError(f"HTTP {r.status}")
                 with open(part, "ab" if have else "wb") as f:
@@ -2182,7 +2209,8 @@ def download_single(url: str, part: Path, total: int, label: str):
                         have += len(b)
                         if time.time() - last > 2:
                             last = time.time()
-                            size = f"{have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)" if total                                 else f"{have / 1e6:7.1f} MB"
+                            size = f"{have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)" if total \
+                                else f"{have / 1e6:7.1f} MB"
                             print(f"\r  {label}: {size}   ", end="", flush=True)
                     f.flush()
                     os.fsync(f.fileno())
@@ -2273,9 +2301,10 @@ def download(url, dst: Path, what=None):
     meta = ms_meta(*ms) if ms is not None else None
     fixed = pin if pin else (meta if meta is not None and meta[1] else None)
     again = (lambda: repair_download(url, dst, total, label, conns)) if total >= DL_MIN_PARALLEL and conns > 1 else None
-    if dst.exists() and total and dst.stat().st_size == total:    # finished by an older setup (no mark yet), or stopped before the check
+    # finished by an older setup (no mark yet), or stopped before the check
+    if dst.exists() and total and dst.stat().st_size == total:
         if fixed:                                      # a file that has a fixed hash is checked, not just marked
-            verify_sha256(dst, *fixed, repair=again)
+            verify_sha256(dst, fixed[0], fixed[1], repair=again)
         else:
             mark(dst)
         ok(f"{what or dst.name} already downloaded")
@@ -2288,13 +2317,15 @@ def download(url, dst: Path, what=None):
              f"the server says {total:,}",
              "check your internet connection and run it again (the download resumes where it stopped)")
     try:
-        atomic_replace(part, dst)                      # waits a moment for a virus scanner or indexer that holds the file
+        # waits a moment for a virus scanner or indexer that holds the file
+        atomic_replace(part, dst)
     except OSError as e:
         fail(f"cannot finish {dst.name}: {e}", "close any program that has the file open and run setup again")
     for side in (".chunks", ".src"):
         part.with_name(part.name + side).unlink(missing_ok=True)
     if pin:
-        verify_sha256(dst, *pin, repair=again)         # the fixed hash: a wrong file is repaired, else deleted and setup stops
+        # the fixed hash: a wrong file is repaired, else deleted and setup stops
+        verify_sha256(dst, pin[0], pin[1], repair=again)
     elif meta is not None and meta[1]:
         verify_sha256(dst, meta[0], meta[1], repair=again)   # ModelScope's published hash; kept in the finish mark
     else:
@@ -2402,9 +2433,11 @@ def _hash_file(s: Path, size: int) -> str:
                 break
             h.update(b)
             seen += len(b)
-            if time.time() - last > 2 and size >= (1 << 30):    # a figure for the app and the Terminal: hashing 60 GB takes minutes
+            # a figure for the app and the Terminal: hashing 60 GB takes minutes
+            if time.time() - last > 2 and size >= (1 << 30):
                 last = time.time()
-                print(f"\r  checking {s.name}: {seen / 1e9:6.2f} / {size / 1e9:.2f} GB ({100 * seen // size}%)   ", end="", flush=True)
+                print(f"\r  checking {s.name}: {seen / 1e9:6.2f} / {size / 1e9:.2f} GB ({100 * seen // size}%)   ",
+                      end="", flush=True)
     if seen >= (1 << 30):
         print()
     return h.hexdigest()
@@ -2422,7 +2455,8 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None) 
     if have != size:
         if own:                                        # --gguf-dir: the person's own file is never deleted by setup
             fail(f"{s.name} is {have:,} bytes; the published file is {size:,}",
-                 "it may be cut short or another version; your file was left as it is. Copy the whole published file into the folder")
+                 "it may be cut short or another version; your file was left as it is. Copy the whole published file "
+                 "into the folder")
         fail(f"{s.name} is {have:,} bytes, not {size:,}", "delete it and run setup again (the download restarts)")
     say(f"  checking {s.name} (SHA-256, {size / 1e9:.1f} GB) ...")
     digest = _hash_file(s, size)
@@ -2430,14 +2464,16 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None) 
         say(f"  Some parts of {s.name} were damaged; downloading only those parts again.")
         res = repair()
         if res is not None:
-            say(f"  {res[0]} of {res[1]} parts were different and have been written again; checking the whole file again ...")
+            say(f"  {res[0]} of {res[1]} parts were different and have been written again; checking the whole file "
+                "again ...")
             digest = _hash_file(s, size)
         else:
             say("  The damaged parts could not be found this way.")
     if digest != sha:
         if own:
             fail(f"{s.name} does not match the published file (SHA-256 {digest}, expected {sha})",
-                 "it may be damaged or another version; your file was left as it is. Copy the whole published file into the folder")
+                 "it may be damaged or another version; your file was left as it is. Copy the whole published file "
+                 "into the folder")
         s.unlink(missing_ok=True)
         m.unlink(missing_ok=True)
         fail(f"{s.name} has the wrong SHA-256 ({digest}, expected {sha}): deleted",
@@ -5723,7 +5759,8 @@ def main() -> int:
     check_shards(shards)
     for s in shards:                                   # the experimental Unsloth file: pinned sizes and SHA-256
         if s.name in fam.get("sha256", {}):
-            verify_sha256(s, *fam["sha256"][s.name], own=bool(a.gguf_dir))
+            size, sha = fam["sha256"][s.name]
+            verify_sha256(s, size, sha, own=bool(a.gguf_dir))
     ok("model files present")
     mmproj = Path(a.models_dir) / fam["mmproj"]
     if not mmproj.exists():
@@ -5823,8 +5860,10 @@ def main() -> int:
         table_gb = size / 1e9 if size else 28.8
         if ram >= MODELS[model]["ram_gb"] + table_gb + 16:
             args += ["--ple-io", "ram"]
-            ok(f"{ram:.0f} GB of RAM: the {table_gb:.0f} GB n-gram table is kept in RAM (--ple-io ram), so a new prompt does "
-               "not wait for its rows from the SSD (a 4K prompt about 18% sooner on a fast card upstream); remove --ple-io "
+            ok(f"{ram:.0f} GB of RAM: the {table_gb:.0f} GB n-gram table is kept in RAM (--ple-io ram), so a new "
+               "prompt does "
+               "not wait for its rows from the SSD (a 4K prompt about 18% sooner on a fast card upstream); remove "
+               "--ple-io "
                "ram from the config's args to read it from the SSD instead")
     # KV streaming: from 64K up the whole KV cache lives in RAM and only the part the attention reads (32K positions
     # per layer) stays in VRAM; the VRAM it frees holds more experts (+6% at 128K, +23% at 262K with Q2_0). It

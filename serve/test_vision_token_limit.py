@@ -1,6 +1,10 @@
-"""I7 (tools and images review, 2026-10-22): a picture reader without vision.max_tokens in its config was unclamped, and #3690 saw one
-picture become 93,700 image tokens.  The server gives every reader a limit (GPU 1024, CPU 300) unless the config names one, and logs a
-picture that came back over 4 times the limit.
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+"""I7 (tools and images review, 2026-10-22): a picture reader without vision.max_tokens in its config was unclamped, and
+# 3690 saw one
+picture become 93,700 image tokens.  The server gives every reader a limit (GPU 1024, CPU
+300) unless the config names one, and logs a picture that came back over 4 times the limit.
 
     python -m unittest serve.test_vision_token_limit
 """

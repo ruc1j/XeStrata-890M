@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """I3 (tools and images review, 2026-10-22): a picture reader that dies before it prints used to say only "the vision
 encoder did not start: " (#3645, #3444, #3697, #3669).  The message now carries the tail of its stderr, its exit status
 and, for a kernel-image error, the card/architecture hint.
@@ -40,7 +43,8 @@ class StartError(unittest.TestCase):
         self.assertIn("0xC0000135", m)
 
     def test_kernel_image_error_names_the_card_and_the_way_out(self):
-        for sign in ("CUDA error: device kernel image is invalid", "IM2COL failed", "no kernel image is available for execution"):
+        for sign in ("CUDA error: device kernel image is invalid", "IM2COL failed",
+                     "no kernel image is available for execution"):
             with self.subTest(sign=sign):
                 f = log_with("warm-up\n" + sign + "\n")
                 try:
@@ -60,7 +64,8 @@ class StartError(unittest.TestCase):
         self.assertIn("still loading the projector", m)
 
     def test_the_reader_that_ends_before_READY_raises_with_its_exit_code(self):
-        proc = SimpleNamespace(stdin=io.StringIO(), stdout=io.StringIO(""), kill=lambda: None, wait=lambda timeout=None: 0,
+        proc = SimpleNamespace(stdin=io.StringIO(), stdout=io.StringIO(""), kill=lambda: None,
+                               wait=lambda timeout=None: 0,
                                poll=lambda: 7, returncode=7)
         v = server.Vision.__new__(server.Vision)
         v.spawn = (["strata-vision"], None, None)
@@ -71,7 +76,8 @@ class StartError(unittest.TestCase):
         self.assertIn("exit code 7", str(cm.exception))
 
     def test_a_normal_message_is_unchanged(self):
-        self.assertEqual(server.vision_start_error("ERR no mmproj\n"), "the vision encoder did not start: ERR no mmproj")
+        self.assertEqual(server.vision_start_error("ERR no mmproj\n"),
+                         "the vision encoder did not start: ERR no mmproj")
 
 
 if __name__ == "__main__":

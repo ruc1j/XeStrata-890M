@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
-"""The run config's experimental "pool_cores" (the CPU expert workers' logical processors; --pool-cores in the engine)."""
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+"""The run config's experimental "pool_cores" (the CPU expert workers' logical processors; --pool-cores in the engine).
+"""
 import contextlib
 import io
 import unittest
@@ -15,7 +17,8 @@ class PoolCoresConfig(unittest.TestCase):
         self.assertEqual(pool_cores_args({"pool_cores": ""}, []), [])
         self.assertEqual(pool_cores_args({"pool_cores": []}, []), [])
         self.assertEqual(pool_cores_args({"pool_cores": False}, []), [])
-        self.assertEqual(engine_args({"args": ["--pack", "p"]}), ["--pack", "p"])      # nothing is added to an ordinary config
+        # nothing is added to an ordinary config
+        self.assertEqual(engine_args({"args": ["--pack", "p"]}), ["--pack", "p"])
 
     def test_text_and_list_forms(self):
         self.assertEqual(pool_cores_args({"pool_cores": "2,4,6,8"}, []), ["--pool-cores", "2,4,6,8"])

@@ -1,6 +1,10 @@
-"""Tests for setup.py's parallel ranged downloads (0.2.0): a local threaded HTTP server that supports Range stands in
-for Hugging Face's CDN.  Covers the parallel path, a resume after a kill and after a failed round, a server without Range,
-a piece that fails once, a signed address that runs out, the SHA-256 pin, STRATA_DL_CONNECTIONS=1 and the progress line.
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+"""Tests for setup.py's parallel ranged downloads (0.2.0): a local threaded HTTP server that
+supports Range stands in for Hugging Face's CDN.  Covers the parallel path, a resume after
+a kill and after a failed round, a server without Range, a piece that fails once, a signed
+address that runs out, the SHA-256 pin, STRATA_DL_CONNECTIONS=1 and the progress line.
 
     python -m unittest tools.test_setup_download
 """
@@ -84,7 +88,8 @@ class Server:
             with self.lock:
                 self.redirects += 1
             h.send_response(302)
-            h.send_header("Location", f"http://127.0.0.1:{self.port}/cdn/{NAME}?Expires={int(time.time()) + 3600}&Signature=x")
+            h.send_header("Location",
+                          f"http://127.0.0.1:{self.port}/cdn/{NAME}?Expires={int(time.time()) + 3600}&Signature=x")
             h.send_header("Content-Length", "0")
             h.end_headers()
             return
@@ -194,7 +199,8 @@ class ParallelDownload(unittest.TestCase):
             self.assertGreater(srv.max_active, 1)
             self.assertLessEqual(srv.max_active, 4)
             self.assertEqual(sorted(asked(srv)), list(range(41)))           # every piece once, none twice
-            self.assertEqual(srv.redirects, 2)                              # HEAD and the one probe: the pieces use the CDN address
+            # HEAD and the one probe: the pieces use the CDN address
+            self.assertEqual(srv.redirects, 2)
 
     def test_the_redirect_is_resolved_once(self):
         with small_pieces(), Server(redirect=True) as srv, tempfile.TemporaryDirectory() as d:
@@ -238,13 +244,15 @@ class NoRangeSupport(unittest.TestCase):
 
     def test_a_server_without_any_length_is_read_in_one_stream(self):
         with small_pieces(), Server(length=False, ranges=False) as srv, tempfile.TemporaryDirectory() as d:
-            code, out = run(srv, d, pin=None)                                # no length, so nothing to check a pin against first
+            # no length, so nothing to check a pin against first
+            code, out = run(srv, d, pin=None)
             self.assertIsNone(code, out)
             self.assertEqual((Path(d) / NAME).read_bytes(), DATA)
             self.assertEqual(srv.max_active, 1)
 
     def test_a_head_without_a_length_still_gets_the_connections(self):
-        """ModelScope's HEAD has no Content-Length (#1915): the length comes from a one-byte ranged GET, not 'unknown'."""
+        """ModelScope's HEAD has no Content-Length (#1915): the length comes from a one-byte ranged GET, not 'unknown'.
+        """
         with small_pieces(), Server(length=False) as srv, tempfile.TemporaryDirectory() as d:
             code, out = run(srv, d)
             self.assertIsNone(code, out)
@@ -283,9 +291,11 @@ class Resume(unittest.TestCase):
                 return ("status", 500)
             return None
 
-        with small_pieces(DL_ROUNDS=1, DL_CHUNK_TRIES=1), Server(faults=faults) as srv, tempfile.TemporaryDirectory() as d:
+        with small_pieces(DL_ROUNDS=1, DL_CHUNK_TRIES=1), Server(faults=faults) as srv, \
+                tempfile.TemporaryDirectory() as d:
             code, out = run(srv, d)
-            self.assertEqual(code, 1)                                       # could not finish: setup stops with a message
+            # could not finish: setup stops with a message
+            self.assertEqual(code, 1)
             self.assertIn("could not finish downloading", out)
             part = Path(d) / (NAME + ".part")
             side = Path(d) / (NAME + ".part.chunks")
@@ -341,7 +351,8 @@ class Resume(unittest.TestCase):
 
     def test_a_part_from_one_stream_continues_after_its_last_whole_piece(self):
         with small_pieces(), Server() as srv, tempfile.TemporaryDirectory() as d:
-            have = CHUNK * 10 + 777                                         # an older setup's .part: bytes from the start
+            # an older setup's .part: bytes from the start
+            have = CHUNK * 10 + 777
             (Path(d) / (NAME + ".part")).write_bytes(DATA[:have])
             code, out = run(srv, d)
             self.assertIsNone(code, out)
@@ -379,7 +390,8 @@ class Failures(unittest.TestCase):
             if start == 5 * CHUNK and nth == 1:
                 return ("status", 500)
             if start == 9 * CHUNK and nth == 1:
-                return ("cut", CHUNK // 2)                                  # drops half way: continues from where it was
+                # drops half way: continues from where it was
+                return ("cut", CHUNK // 2)
             return None
 
         with small_pieces(), Server(faults=faults) as srv, tempfile.TemporaryDirectory() as d:
@@ -402,7 +414,8 @@ class Failures(unittest.TestCase):
             code, out = run(srv, d)
             self.assertIsNone(code, out)
             self.assertEqual((Path(d) / NAME).read_bytes(), DATA)
-            self.assertGreater(srv.redirects, 2)                            # HEAD + first probe + a new address after the 403
+            # HEAD + first probe + a new address after the 403
+            self.assertGreater(srv.redirects, 2)
 
     def test_a_pinned_hash_mismatch_deletes_the_file_and_stops(self):
         wrong = bytes(reversed(DATA))
@@ -421,8 +434,6 @@ class Failures(unittest.TestCase):
 
     def test_a_full_disk_stops_with_a_message(self):
         with small_pieces(), Server() as srv, tempfile.TemporaryDirectory() as d:
-            real = setup._piece_worker
-
             def worker(src, st, todo, part):
                 st.fatal = setup._DiskError("No space left on device")
                 st.stop.set()
@@ -442,7 +453,8 @@ class Failures(unittest.TestCase):
                 seen.append(p.stat().st_size if p.exists() else None)
             return None
 
-        with small_pieces(DL_CONNECTIONS=2), Server(faults=faults, delay=0.01) as srv, tempfile.TemporaryDirectory() as d:
+        with small_pieces(DL_CONNECTIONS=2), Server(faults=faults, delay=0.01) as srv, \
+                tempfile.TemporaryDirectory() as d:
             self.d = d
             code, out = run(srv, d)
             self.assertIsNone(code, out)
@@ -469,6 +481,7 @@ class Progress(unittest.TestCase):
             _, par = run(srv, d1)
             with mock.patch.dict(os.environ, {"STRATA_DL_CONNECTIONS": "1"}):
                 _, one = run(srv, d2)
+
             def shape(out):
                 return {re.sub(r"[\d.]+", "N", x) for x in out.replace("\r", "\n").split("\n") if "GB (" in x}
             self.assertEqual(shape(par), shape(one))
@@ -477,12 +490,15 @@ class Progress(unittest.TestCase):
 class SignedAddress(unittest.TestCase):
     def test_expiry_of_a_cdn_address(self):
         now = time.time()
-        self.assertAlmostEqual(setup._url_ttl(f"https://cdn.example/f?Expires={int(now) + 600}&Signature=x"), 600, delta=3)
+        self.assertAlmostEqual(setup._url_ttl(f"https://cdn.example/f?Expires={int(now) + 600}&Signature=x"), 600,
+                               delta=3)
         self.assertIsNone(setup._url_ttl("https://cdn.example/f"))
-        self.assertIsNone(setup._url_ttl(f"https://cdn.example/f?Expires={int(now) - 5}"))      # already out, or a wrong clock
+        # already out, or a wrong clock
+        self.assertIsNone(setup._url_ttl(f"https://cdn.example/f?Expires={int(now) - 5}"))
         self.assertIsNone(setup._url_ttl("https://cdn.example/f?Expires=soon"))
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
-        self.assertAlmostEqual(setup._url_ttl(f"https://cdn.example/f?X-Amz-Date={stamp}&X-Amz-Expires=900"), 900, delta=3)
+        self.assertAlmostEqual(setup._url_ttl(f"https://cdn.example/f?X-Amz-Date={stamp}&X-Amz-Expires=900"), 900,
+                               delta=3)
 
 
 if __name__ == "__main__":
@@ -531,7 +547,8 @@ class Runs(unittest.TestCase):
             first = cuts[0]
             again = [s for s, e in srv.gets if first < s < first + 4 * CHUNK]
             self.assertEqual(len(again), 1)                                  # one more request: for the rest
-            self.assertGreaterEqual(again[0], first + 2 * CHUNK)              # the two whole pieces are not fetched again
+            # the two whole pieces are not fetched again
+            self.assertGreaterEqual(again[0], first + 2 * CHUNK)
 
     def test_a_connection_that_keeps_moving_is_not_given_up_on(self):
         """Seven breaks in a row (more than DL_CHUNK_TRIES) that each carried bytes forward do not end the request."""
@@ -543,7 +560,8 @@ class Runs(unittest.TestCase):
                 return ("cut", CHUNK // 3)
             return None
 
-        with small_pieces(DL_RUN=4, DL_CONNECTIONS=2, DL_ROUNDS=1), Server(faults=faults) as srv,                 tempfile.TemporaryDirectory() as d:
+        with small_pieces(DL_RUN=4, DL_CONNECTIONS=2, DL_ROUNDS=1), Server(faults=faults) as srv, \
+                tempfile.TemporaryDirectory() as d:
             code, out = run(srv, d)
             self.assertIsNone(code, out)
             self.assertEqual((Path(d) / NAME).read_bytes(), DATA)
@@ -555,7 +573,8 @@ class Runs(unittest.TestCase):
                 return ("status", 500)
             return None
 
-        with small_pieces(DL_RUN=4, DL_ROUNDS=1, DL_CHUNK_TRIES=2), Server(faults=faults) as srv,                 tempfile.TemporaryDirectory() as d:
+        with small_pieces(DL_RUN=4, DL_ROUNDS=1, DL_CHUNK_TRIES=2), Server(faults=faults) as srv, \
+                tempfile.TemporaryDirectory() as d:
             code, out = run(srv, d)
             self.assertEqual(code, 1)
             self.assertIn("could not finish downloading", out)
@@ -563,4 +582,5 @@ class Runs(unittest.TestCase):
     def test_the_default_is_many_connections_and_runs(self):
         self.assertGreaterEqual(setup.DL_CONNECTIONS, 8)
         self.assertGreaterEqual(setup.DL_RUN, 2)
-        self.assertEqual(setup.DL_CHUNK, 32 << 20)                           # the piece list on disk names this size: resumes need it
+        # the piece list on disk names this size: resumes need it
+        self.assertEqual(setup.DL_CHUNK, 32 << 20)

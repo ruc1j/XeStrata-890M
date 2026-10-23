@@ -532,7 +532,8 @@ class Assembler:
         if item is None:
             return []
         at, out = self.response["output"].index(item), []
-        item["status"] = status or ("incomplete" if item["type"] in ("function_call", "custom_tool_call") else "completed")
+        item["status"] = status or ("incomplete" if item["type"] in ("function_call", "custom_tool_call")
+                                    else "completed")
         if item["type"] == "message":
             part = item["content"][0]
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,

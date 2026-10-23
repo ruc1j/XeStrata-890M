@@ -536,7 +536,8 @@ class SplitArtifactTests(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     run_pack(paths[0], pack, "--experts-bin")
             want = expected_experts(iq_pack.Model(paths[0]))
-            lines = [ln.split() for ln in (pack / "native_experts.txt").read_text().splitlines() if ln and not ln.startswith("#")]
+            lines = [ln.split() for ln in (pack / "native_experts.txt").read_text().splitlines()
+                     if ln and not ln.startswith("#")]
             one_layer = int(lines[1][3])                                                  # where layer 1 starts
             self.assertFalse((pack / "experts.bin").exists())
             self.assertEqual((pack / "experts.bin.tmp").stat().st_size, one_layer)       # layer 0 is on disk
@@ -555,7 +556,8 @@ class SplitArtifactTests(unittest.TestCase):
             self.assertEqual(rc, 0, log)
             self.assertIn("keeping its first 1 of 2 layers and continuing with layer 1", log)
             self.assertEqual((pack / "experts.bin").read_bytes(), want)
-            self.assertEqual(len(written), 2)                  # one layer re-read to check the kept one, one layer written
+            # one layer re-read to check the kept one, one layer written
+            self.assertEqual(len(written), 2)
             self.assertFalse((pack / "experts.bin.tmp").exists())
             self.assertFalse((pack / "experts.bin.tmp.json").exists())
             self.assertEqual(json.loads((pack / "experts.bin.src.json").read_text())["bytes"], len(want))

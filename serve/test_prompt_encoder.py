@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_prompt_encoder.py - #567's incremental prompt encoding with #537's plain spans: every prompt's ids
 are those of a full encode, and a turn reuses the previous one's.
 
@@ -123,7 +126,8 @@ class Served(unittest.TestCase):
         full = self.service(max_context=4096)
         full.prompts = None
         refused_ids = full.encode_prompt(refused, None, {})
-        svc.fit_max_tokens = False                     # the strict 400 (the default shortens max_tokens to the room left)
+        # the strict 400 (the default shortens max_tokens to the room left)
+        svc.fit_max_tokens = False
         with self.assertRaisesRegex(ValueError, "exceeds the context"):
             svc.prepare(refused, None, {}, 1 << 20)
         self.assertNotIn(refused_ids, [e[2] for e in svc.prompts.entries])

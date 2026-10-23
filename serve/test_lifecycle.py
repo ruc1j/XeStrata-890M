@@ -14,7 +14,8 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, EngineStuck, MockEngine, Service, StrataEngine, serve, ENGINE_TERM_WAIT_S
+from serve.server import (ByteTokenizer, EngineDied, EngineStuck, MockEngine, Service, StrataEngine, serve,
+                          ENGINE_TERM_WAIT_S)
 
 
 class ResidentEngine(StrataEngine):
@@ -77,7 +78,8 @@ class Lifecycle(unittest.TestCase):
                 self.assertEqual(engine.last, {})
                 if running:
                     proc.terminate.assert_called_once()
-                    proc.wait.assert_called_once_with(timeout=ENGINE_TERM_WAIT_S)   # the broken pipe: terminate, then kill
+                    # the broken pipe: terminate, then kill
+                    proc.wait.assert_called_once_with(timeout=ENGINE_TERM_WAIT_S)
                 else:
                     proc.terminate.assert_not_called()
                     proc.wait.assert_not_called()

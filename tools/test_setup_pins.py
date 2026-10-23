@@ -130,7 +130,8 @@ class HuggingFacePins(unittest.TestCase):
             with mock.patch.object(mtp_fetch.urllib.request, "urlopen", urlopen), \
                     mock.patch.dict(mtp_fetch.os.environ, {"STRATA_ALLOW_UNPINNED": "1"}), \
                     contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(mtp_fetch.resolve_repo(), "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/")
+                self.assertEqual(mtp_fetch.resolve_repo(),
+                                 "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/")
             self.assertIn("STRATA_ALLOW_UNPINNED=1", err.getvalue())
         finally:
             mtp_fetch.REPO = pinned

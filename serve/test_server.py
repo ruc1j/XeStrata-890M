@@ -26,7 +26,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
-from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, MockEngine,  # noqa: E402
+from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite,  # noqa: E402
+                          MockEngine,
                           PP_DONE_TAIL, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
                           prompt_tokens_seen, request_timings, serve, start_failure_hint)
@@ -330,6 +331,7 @@ class VisionTempFiles(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no room to answer"):
                 svc.prepare(self.MSGS, None, {})
             engine.max_context = CTX
+            svc.fit_max_tokens = False                               # the 400 path (the default shortens max_tokens)
             with self.assertRaisesRegex(ValueError, "exceeds the context"):
                 svc.prepare(self.MSGS, None, {}, CTX)
             self.assertEqual(self.leftovers(d), [])
@@ -1191,7 +1193,8 @@ class ToolCallRecovery(unittest.TestCase):
     def test_bare_function_without_the_wrapper(self):
         # corpus 395efd4c / 6e71eed4 (x5 each): <function=...> with no <tool_call> around it
         for name in ("write", " write ", "\twrite\t"):
-            self.check(f"Writing it now.\n\n<function={name}>\n{self.PARAMS}", [("write", self.CALL)], "Writing it now.")
+            self.check(f"Writing it now.\n\n<function={name}>\n{self.PARAMS}", [("write", self.CALL)],
+                       "Writing it now.")
             self.check(f"<function={name}>\n{self.PARAMS}\n</tool_call>", [("write", self.CALL)], "")   # stray closer
             self.check(f"<function={name}>\n{self.PARAMS}\nDone.", [("write", self.CALL)], "Done.")
 
@@ -1213,7 +1216,8 @@ class ToolCallRecovery(unittest.TestCase):
         unknown = "<function=format_disk>\n<parameter=x>\n1\n</parameter>\n</function>"
         self.check(unknown, [], unknown)
         for text in (fenced, inline, unknown):
-            padded = text.replace("<function=write>", "<function= write >").replace("<function=format_disk>", "<function= format_disk >")
+            padded = text.replace("<function=write>", "<function= write >") \
+                         .replace("<function=format_disk>", "<function= format_disk >")
             self.check(padded, [], padded)
 
 
@@ -3840,7 +3844,8 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(b["usage"]["prompt_tokens"], len(first))
 
     def test_llama_cpp_thinking_budget_tokens_is_the_same_budget(self):
-        """llama.cpp's name (pi-llama-cpp sends it): the same wrap-up; reasoning_budget_tokens wins when both are set."""
+        """llama.cpp's name (pi-llama-cpp sends it): the same wrap-up; reasoning_budget_tokens wins when both are set.
+        """
         from serve.server import REASONING_WRAP_UP
         wrap = REASONING_WRAP_UP.split("</think>")[0]
         code, b = self.openai(thinking_budget_tokens=20)

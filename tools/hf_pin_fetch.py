@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Print the size and SHA-256 Hugging Face's API metadata gives for the files of a repository at a pinned commit.
 Nothing is downloaded: https://huggingface.co/api/models/<repo>/tree/<revision>?recursive=1 lists each LFS file with
 `lfs.oid` (the SHA-256) and `size`.
@@ -16,9 +19,10 @@ from pathlib import Path
 
 
 def tree(repo: str, revision: str) -> dict:
-    """{path: (size, sha256)} of the repository's LFS files at `revision` (the API pages its answer with Link headers)."""
+    """{path: (size, sha256)} of the repository's LFS files at `revision` (the API pages its answer with Link headers).
+    """
     out = {}
-    url = f"https://huggingface.co/api/models/{repo}/tree/{revision}?recursive=1&expand=0"
+    url: str | None = f"https://huggingface.co/api/models/{repo}/tree/{revision}?recursive=1&expand=0"
     while url:
         with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "strata-pin"}), timeout=60) as r:
             for e in json.load(r):
@@ -33,7 +37,8 @@ def main(argv: list) -> int:
     if argv and argv[0] == "--setup":
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         import setup
-        print(json.dumps({r: {p: list(v) for p, v in tree(r, rev).items()} for r, rev in setup.HF_REVISIONS.items()}, indent=1))
+        print(json.dumps({r: {p: list(v) for p, v in tree(r, rev).items()} for r, rev in setup.HF_REVISIONS.items()},
+                         indent=1))
         return 0
     as_json = bool(argv) and argv[0] == "--json"
     repo, revision = argv[1:3] if as_json else argv[:2]

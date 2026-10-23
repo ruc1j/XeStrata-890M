@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """The web app uses an edited API key immediately, even when site storage is blocked.
 
 Runs the page's storage and server-access code with Node, without a GPU or server:
@@ -16,8 +19,9 @@ APP = Path(__file__).with_name("web") / "app.js"
 class WebApiKey(unittest.TestCase):
     def run_js(self, actions, *, stored=None, blocked=False, quota=False):
         src = APP.read_text(encoding="utf-8")
-        store = src[src.index("const store ="):src.index("// ------------------------------------------------------------------ toasts")]
-        access = src[src.index("// ------------------------------------------------------------------ server access"):src.index("let health =")]
+        rule = "// ------------------------------------------------------------------ "
+        store = src[src.index("const store ="):src.index(rule + "toasts")]
+        access = src[src.index(rule + "server access"):src.index("let health =")]
         js = f"""
 const data = new Map(Object.entries({json.dumps(stored or {})}));
 const field = {{value: ""}};

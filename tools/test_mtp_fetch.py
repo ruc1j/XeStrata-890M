@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Tests for tools/mtp_fetch.py (#327): a range read needs a 206 with the asked Content-Range, the pinned revision's
 tensors are checked against their sha256 (a wrong one is fetched again; a corrupt install is found by `verify` and
 setup fetches it again), and an inventory from another revision is read again.  A fake checkpoint behind a mocked
@@ -174,9 +175,11 @@ class Ranges(FetchCase):
                     raise IOError("expired")
                 return opener(req, timeout)
 
-            with mock.patch.object(M.urllib.request, "urlopen", flaky), mock.patch.object(M.time, "sleep", lambda s: None),                     contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch.object(M.urllib.request, "urlopen", flaky), \
+                    mock.patch.object(M.time, "sleep", lambda s: None), contextlib.redirect_stderr(io.StringIO()):
                 M.get("https://hf.example/f", 300, 399)
-            self.assertEqual(asked, ["https://hf.example/f"])               # the cached address failed: the original is asked again
+            # the cached address failed: the original is asked again
+            self.assertEqual(asked, ["https://hf.example/f"])
         M._cdn.clear()
 
     def test_a_slow_first_range_does_not_stop_the_ones_behind_it(self):
@@ -200,7 +203,8 @@ class Ranges(FetchCase):
         threading.Thread(target=release, daemon=True).start()
         with mock.patch.object(M, "get", get):
             list(M.ranged("u", 0, 40 * 1000 - 1, 1000, 4))
-        self.assertGreaterEqual(len(started), 9)                           # four connections, nine ranges started before range 0 ended
+        # four connections, nine ranges started before range 0 ended
+        self.assertGreaterEqual(len(started), 9)
 
     def test_a_failing_range_stops_the_parallel_read(self):
         def get(url, a, b):
@@ -280,8 +284,6 @@ class Setup(unittest.TestCase):
                     self.assertIn("verify", run.call_args[0][0])
 
 
-
-
 class Progress(FetchCase):
     """#3257: the fetch says how far it is in the form of setup's own download line, so the app can show it."""
 
@@ -310,7 +312,8 @@ class Progress(FetchCase):
 
 class Flaky(FetchCase):
     def test_a_connection_that_drops_mid_tensor_does_not_end_the_run(self):
-        """#3214: every range of the tensor fails past get()'s own retries once: the tensor is tried again (fewer connections)."""
+        """#3214: every range of the tensor fails past get()'s own
+        retries once: the tensor is tried again (fewer connections)."""
         honest, fails = Mirror(), [0]
 
         def mirror(req, timeout=None):
@@ -356,7 +359,8 @@ class OneAtATime(unittest.TestCase):
                       "print('up', flush=True); time.sleep(60)" % str(ROOT / "tools"))
         parent_code = ("import subprocess,sys,os; env=dict(os.environ, STRATA_EXIT_WITH_PARENT='1'); "
                        "p=subprocess.Popen([sys.executable,'-c',%r], env=env, stdout=subprocess.PIPE, text=True); "
-                       "print(p.pid, flush=True); p.stdout.readline(); print('ready', flush=True); sys.stdout.flush(); os._exit(0)" % child_code)
+                       "print(p.pid, flush=True); p.stdout.readline(); print('ready', flush=True); "
+                       "sys.stdout.flush(); os._exit(0)" % child_code)
         r = subprocess.Popen([sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True)
         pid = int(r.stdout.readline())
         r.stdout.readline()

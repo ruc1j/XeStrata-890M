@@ -119,11 +119,11 @@ SHA256 = {
 }
 
 
-# Hugging Face answers a /resolve/ address with a redirect to a signed CDN address (valid for about an hour).  Every range of a
-# tensor used to go through that redirect and a fresh connection to it; the CDN address of the first answer is reused now
-# (and forgotten after any error, so the next try asks again).
+# Hugging Face answers a /resolve/ address with a redirect to a signed CDN address (valid for about an
+# hour).  Every range of a tensor used to go through that redirect and a fresh connection to it; the CDN
+# address of the first answer is reused now (and forgotten after any error, so the next try asks again).
 CDN_TTL = 600
-_cdn = {}
+_cdn: dict = {}
 _cdn_lock = threading.Lock()
 
 
@@ -161,8 +161,9 @@ def get(url, start=None, end=None, retries=6):
 
 
 class Progress:
-    """One line a couple of seconds, `MTP draft layer: 1.23 / 5.04 GB (24%)`: the form of setup's own download line, so the app's
-    progress parser (tools/strata_mcp.py install_progress) shows it.  `done` counts what an earlier run already has."""
+    """One line a couple of seconds, `MTP draft layer: 1.23 / 5.04 GB (24%)`: the form
+    of setup's own download line, so the app's progress parser (tools/strata_mcp.py
+    install_progress) shows it.  `done` counts what an earlier run already has."""
     LABEL = "MTP draft layer"
 
     def __init__(self, total, done=0, every=2.0, out=None):
@@ -187,8 +188,9 @@ class Progress:
 
 
 def lock_folder(out, wait=900.0):
-    """Only one fetch writes a folder: a second one (a retry while the first still runs, #3257) waits for the first and then finds
-    its tensors done.  Returns the open lock file (keep it open), or exits when the first does not end in `wait` seconds."""
+    """Only one fetch writes a folder: a second one (a retry while the first still runs,
+    #3257) waits for the first and then finds its tensors done.  Returns the open
+    lock file (keep it open), or exits when the first does not end in `wait` seconds."""
     os.makedirs(out, exist_ok=True)
     f = open(os.path.join(out, ".mtp_fetch.lock"), "a+b")
     end = time.monotonic() + wait
@@ -205,7 +207,8 @@ def lock_folder(out, wait=900.0):
             return f
         except OSError:
             if time.monotonic() > end:
-                sys.exit("another MTP download is still writing %s: wait for it or end it (Task Manager: python.exe), then try again" % out)
+                sys.exit("another MTP download is still writing %s: wait for it or end it (Task Manager: python.exe), "
+                         "then try again" % out)
             if not told:
                 print("another MTP download is writing %s: waiting for it to end" % out, file=sys.stderr, flush=True)
                 told = True
@@ -213,8 +216,10 @@ def lock_folder(out, wait=900.0):
 
 
 def exit_with_parent():
-    """STRATA_EXIT_WITH_PARENT=1 (set by setup.py for the tools it runs): end when the process that started this one ends, so a cancelled
-    or killed setup does not leave a download running on its own (#3257: taskkill /T does not reach a grandchild whose parent is gone)."""
+    """STRATA_EXIT_WITH_PARENT=1 (set by setup.py for the tools it runs): end when the process that started this one
+    ends, so a cancelled
+    or killed setup does not leave a download running on its own (#3257: taskkill /T does not reach a grandchild
+    whose parent is gone)."""
     if (os.environ.get("STRATA_EXIT_WITH_PARENT") or "").strip() != "1":
         return
     parent = os.getppid()
@@ -225,12 +230,16 @@ def exit_with_parent():
         k32 = ctypes.windll.kernel32
         k32.OpenProcess.restype = ctypes.c_void_p
         k32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
-        h = k32.OpenProcess(0x00100000, False, parent)       # SYNCHRONIZE: a handle keeps the answer true if the id is reused
+        # SYNCHRONIZE: a handle keeps the answer true if the id is reused
+        h = k32.OpenProcess(0x00100000, False, parent)
         if not h:
             return                                           # no access (or already gone): nothing to watch
-        gone = lambda: k32.WaitForSingleObject(h, 0) == 0
+
+        def gone():
+            return k32.WaitForSingleObject(h, 0) == 0
     else:
-        gone = lambda: os.getppid() != parent
+        def gone():
+            return os.getppid() != parent
 
     def watch():
         while not gone():
@@ -241,7 +250,8 @@ def exit_with_parent():
 
 
 def connections():
-    """Ranges read at once: STRATA_DL_CONNECTIONS (the setting of setup's downloads), else 16; 1 reads them one by one."""
+    """Ranges read at once: STRATA_DL_CONNECTIONS (the setting of setup's downloads), else 16; 1 reads them one by one.
+    """
     try:
         n = int((os.environ.get("STRATA_DL_CONNECTIONS") or "").strip() or 16)
     except ValueError:
@@ -250,8 +260,8 @@ def connections():
 
 
 def ranged(url, start, last, chunk, workers):
-    """The bytes start..last of `url` in order, read in `chunk`-sized ranges with `workers` of them in flight.  Each range is
-    checked by get() (a 206 with the range asked for), so a server that ignores Range still fails here."""
+    """The bytes start..last of `url` in order, read in `chunk`-sized ranges with `workers` of them in flight.  Each
+    range is checked by get() (a 206 with the range asked for), so a server that ignores Range still fails here."""
     spans = []
     pos = start
     while pos <= last:
@@ -263,8 +273,8 @@ def ranged(url, start, last, chunk, workers):
         return
     todo = iter(spans)
     window = collections.deque()
-    # the ranges are handed on in order, so one slow range holds the oldest slot; the connections that are done go on with
-    # the next ranges meanwhile (up to `depth` ahead, at most ~512 MiB in memory) instead of waiting for it
+    # the ranges are handed on in order, so one slow range holds the oldest slot; the connections that are done go
+    # on with the next ranges meanwhile (up to `depth` ahead, at most ~512 MiB in memory) instead of waiting for it
     depth = max(workers, min(3 * workers, (512 << 20) // max(chunk, 1)))
     with concurrent.futures.ThreadPoolExecutor(min(workers, len(spans))) as ex:
         for a, b in todo:
@@ -303,8 +313,9 @@ def sha256_of(path):
 
 
 def resolve_repo():
-    """REPO.  When the pinned revision is gone from the repository (a 404 on its index) it stops, unless
-    STRATA_ALLOW_UNPINNED=1: then the current files are read (their tensors are still checked against the pinned SHA256)."""
+    """REPO.  When the pinned revision is gone from the repository (a 404 on its
+    index) it stops, unless STRATA_ALLOW_UNPINNED=1: then the current files
+    are read (their tensors are still checked against the pinned SHA256)."""
     global REPO
     try:
         req = urllib.request.Request(REPO + "model.safetensors.index.json", method="HEAD",
@@ -313,7 +324,8 @@ def resolve_repo():
     except urllib.error.HTTPError as e:
         if e.code == 404 and "/resolve/%s/" % REVISION in REPO:
             if (os.environ.get("STRATA_ALLOW_UNPINNED") or "").strip() != "1":
-                sys.exit("the pinned version of the checkpoint (%s) is no longer on Hugging Face: update XeStrata" % REVISION)
+                sys.exit("the pinned version of the checkpoint (%s) is no longer on Hugging Face: update XeStrata"
+                         % REVISION)
             print("STRATA_ALLOW_UNPINNED=1: the checkpoint's pinned revision %s is gone: reading its current files "
                   "(main); every tensor is still checked against the pinned SHA256" % REVISION, file=sys.stderr)
             REPO = REPO.replace("/resolve/%s/" % REVISION, "/resolve/main/")
@@ -410,14 +422,16 @@ def fetch(out, only):
                         pos += len(data)
                         progress.add(len(data))
             except (OSError, urllib.error.URLError) as e:
-                # #3214: a timeout or a dropped connection mid-tensor ends only this try: what was written stays, the next try
-                # continues after it with fewer connections (a link that drops 16 at once often holds 4)
+                # #3214: a timeout or a dropped connection mid-tensor ends only this try: what was written stays, the
+                # next try continues after it with fewer connections (a link that drops 16 at once often holds 4)
                 net_fails += 1
                 if net_fails > 3:
-                    sys.exit("%s: the download keeps failing (%s). Check the connection and try again - what is downloaded is kept; "
-                             "if Hugging Face is slow to reach, `--source modelscope` reads the same files elsewhere" % (r["name"], e))
+                    sys.exit("%s: the download keeps failing (%s). Check the connection and try again - what is "
+                             "downloaded is kept; if Hugging Face is slow to reach, `--source modelscope` reads the "
+                             "same files elsewhere" % (r["name"], e))
                 workers = max(4, workers // 2)
-                print("%s: %s - continuing with %d connections (try %d)" % (r["name"], e, workers, net_fails + 1), file=sys.stderr, flush=True)
+                print("%s: %s - continuing with %d connections (try %d)" % (r["name"], e, workers, net_fails + 1),
+                      file=sys.stderr, flush=True)
                 time.sleep(min(5 * net_fails, 20))
                 continue
             if os.path.getsize(path) != r["bytes"]:

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """#3370: the encoder's work folder is made again when a temp cleaner removed it while the encoder was unloaded.
 
     python -m serve.test_vision_workdir

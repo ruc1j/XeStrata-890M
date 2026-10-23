@@ -1,10 +1,16 @@
-"""serve/test_anthropic_base_url.py - an Anthropic client reaches the server by the root address, and by the "/v1" one too.
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+"""serve/test_anthropic_base_url.py - an Anthropic client reaches
+the server by the root address, and by the "/v1" one too.
 
-The Anthropic SDKs (and Claude Code) add /v1/messages to the base URL themselves. The app used to show the OpenAI-style base
-(.../v1) in its Anthropic tab, so those clients posted /v1/v1/messages and got a 404. The address is now shown without /v1, and
-the server accepts /v1/v1/messages (and /v1/v1/messages/count_tokens) as the same request, for people who already pasted the old one.
+The Anthropic SDKs (and Claude Code) add /v1/messages to the base URL themselves. The app used to
+show the OpenAI-style base (.../v1) in its Anthropic tab, so those clients posted /v1/v1/messages
+and got a 404. The address is now shown without /v1, and the server accepts /v1/v1/messages (and
+/v1/v1/messages/count_tokens) as the same request, for people who already pasted the old one.
 
-Uses the real `anthropic` Python client against the mock-engine server (no network, no key). Skipped when the package is missing.
+Uses the real `anthropic` Python client against the mock-engine
+server (no network, no key). Skipped when the package is missing.
 
     python -m unittest serve.test_anthropic_base_url -v
 """
@@ -72,7 +78,8 @@ class AnthropicBase(unittest.TestCase):
     @unittest.skipIf(anthropic is None, "the anthropic package is not installed")
     def test_sdk_streaming_through_the_alias(self):
         client = anthropic.Anthropic(base_url=self.root + "/v1", api_key="not-needed", max_retries=0)
-        with client.messages.stream(model="strata", max_tokens=32, messages=[{"role": "user", "content": "hi"}]) as stream:
+        with client.messages.stream(model="strata", max_tokens=32,
+                                    messages=[{"role": "user", "content": "hi"}]) as stream:
             text = "".join(stream.text_stream)
         self.assertIn("hello", text)
 

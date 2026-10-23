@@ -1,7 +1,10 @@
-"""Tests for the fixed SHA-256 and size of every model file setup downloads (REPO_PINS, upstream e193161d): every file a choice can
-download has one, a wrong file is deleted and setup stops, a pinned commit that answers 404 stops the download
-(STRATA_ALLOW_UNPINNED=1 is the tester's opt-out), and an installed model needs no network.  Mocked network - nothing
-is downloaded.
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+"""Tests for the fixed SHA-256 and size of every model file setup downloads (REPO_PINS, upstream
+e193161d): every file a choice can download has one, a wrong file is deleted and setup stops,
+a pinned commit that answers 404 stops the download (STRATA_ALLOW_UNPINNED=1 is the tester's
+opt-out), and an installed model needs no network.  Mocked network - nothing is downloaded.
 
     python -m unittest tools.test_setup_model_pins
 """
@@ -69,7 +72,8 @@ class EveryFileIsPinned(unittest.TestCase):
             if fam.get("ready"):                       # ready-made packs: pinned file by file (ready_files)
                 continue
             for model in (setup.MODELS if fam_name in setup.FAMILIES else fam["models"]):
-                if fam_name in setup.FAMILIES and fam_name not in setup.MODELS[model].get("families", ("qwen", "swift")):
+                if fam_name in setup.FAMILIES and \
+                        fam_name not in setup.MODELS[model].get("families", ("qwen", "swift")):
                     continue
                 with self.subTest(family=fam_name, model=model):
                     if fam_name in setup.FAMILIES:
@@ -133,10 +137,11 @@ class DownloadChecksThePin(unittest.TestCase):
                 _, out = quiet(setup.download, pinned_url(name), dst)
                 code = None
             except SystemExit as e:
-                code, out = e.code, ""
+                code = e.code
             result = (code, dst.exists(), dst.with_name(dst.name + ".done").exists(),
                       dst.with_name(dst.name + ".part").exists(),
-                      dst.with_name(dst.name + ".done").read_text() if dst.with_name(dst.name + ".done").exists() else "")
+                      dst.with_name(dst.name + ".done").read_text() if dst.with_name(dst.name + ".done").exists()
+                      else "")
         return seen, result
 
     def test_the_right_file_is_kept_with_its_hash_in_the_mark(self):
@@ -173,7 +178,8 @@ class NotFoundOnThePinnedCommit(unittest.TestCase):
     def test_it_stops_with_a_plain_message(self):
         seen = []
         out = io.StringIO()
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", self.urlopen(seen)), \
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(setup.urllib.request, "urlopen", self.urlopen(seen)), \
                 mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface"}), contextlib.redirect_stdout(out):
             setup.os.environ.pop("STRATA_ALLOW_UNPINNED", None)
             dst = Path(d) / "t.gguf"
@@ -186,12 +192,14 @@ class NotFoundOnThePinnedCommit(unittest.TestCase):
 
     def test_the_opt_out_takes_the_current_file_and_says_so(self):
         seen = []
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", self.urlopen(seen)), \
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(setup.urllib.request, "urlopen", self.urlopen(seen)), \
                 mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface", "STRATA_ALLOW_UNPINNED": "1"}), \
                 mock.patch.object(setup, "_unpinned_said", []):
             dst = Path(d) / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"
             _, out = quiet(setup.download, pinned_url("Q2_0/" + dst.name), dst)
-            self.assertEqual(dst.read_bytes(), b"current file")     # not checked against the pin: it is not the pinned file
+            # not checked against the pin: it is not the pinned file
+            self.assertEqual(dst.read_bytes(), b"current file")
         self.assertIn("STRATA_ALLOW_UNPINNED=1", out)
 
     def test_the_opt_out_is_off_by_default(self):

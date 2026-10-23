@@ -221,8 +221,9 @@ std::vector<LogicalCpuInfo> logical_cpu_layout() {
     DWORD_PTR proc_mask = 0, sys_mask = 0;
     const bool limited = GetActiveProcessorGroupCount() == 1 && GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask);
     long core = 0;
-    for (const char* p = buf.data(); p < buf.data() + len; p += ((const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p)->Size) {
-        const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
+    for (const char* p = buf.data(); p < buf.data() + len;
+         p += reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(p)->Size) {
+        const auto* e = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(p);
         if (e->Relationship != RelationProcessorCore) continue;
         for (WORD group = 0; group < e->Processor.GroupCount; ++group) {
             const GROUP_AFFINITY& g = e->Processor.GroupMask[group];
