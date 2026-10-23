@@ -657,6 +657,9 @@ def experts_loading_words(args: list, size: str) -> str:
     return f"loading the experts into RAM ({size}) and locking part of them for the GPU."
 
 
+OPENS_BROWSER = False        # set in main() when the server was started with --open: only then may a message say a browser opens
+
+
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
@@ -694,8 +697,9 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # #505: mapped
                     say("arena", f"[strata] {loading}\n"
-                        "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
-                        "         Please wait and don't close this window; the browser opens when it is ready.")
+                                 "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
+                                 "         Please wait and don't close this window"
+                                 + ("; the browser opens when it is ready." if OPENS_BROWSER else "; the server says when it is ready."))
                 elif " loaded " in line and "GiB at" in line:
                     say("loaded", "[strata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
@@ -7328,6 +7332,8 @@ def main() -> int:
                          "groups and run one engine on each, requests spread over them (also \"replicas\" in the "
                          "config: a number, or [{\"gpus\": [\"0000:03:00.0\"]}, {\"gpus\": [\"0000:09:00.0\"]}])")
     a = ap.parse_args()
+    global OPENS_BROWSER
+    OPENS_BROWSER = bool(a.open)
     if a.engine == "strata" and (_rt := rttime_limit_note()):   # #3238: say it before the first unexplained -9
         print("[strata] WARNING: " + _rt, flush=True)
     cfg = read_config(a.config) if a.config else {}
