@@ -4246,7 +4246,8 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
+            declared_only=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
@@ -4280,7 +4281,8 @@ class Service:
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
-                  OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery))
+                  OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
+                               declared_only=declared_only))
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -4710,6 +4712,10 @@ class Service:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
                   f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
+        if getattr(parser, "unread", 0):              # (the Harmony parser has no such count)
+            print(f"[strata] {parser.unread} <tool_call> block(s) in the answer did not read as a call of a declared "
+                  "tool and went back as text (a name the request did not declare, or a form the template does "
+                  "not use)", flush=True)
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
@@ -4863,7 +4869,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     messages = list(messages)
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
-        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
+        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, declared_only=True):
             if kind == "done":
                 done = cast(dict, x)
                 continue
@@ -5042,7 +5048,7 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
-    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
         if kind == "ping":
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
@@ -5180,7 +5186,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
         if kind == "ping":
             yield None
             continue
