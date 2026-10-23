@@ -113,6 +113,10 @@ def popen(what: str, args: list, **kw):
         raise
 
 
+# How long close() gives the engine at each step of ending it (seconds). Module values so that a test can shorten them.
+ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 20, 5, 20
+
+
 def listen_problem(host: str, port: int, e: OSError) -> str:
     """#769: why the server cannot listen.  Only an address that is taken says "already in use"; anything else (a port
     Windows keeps reserved, an address this PC does not have, no permission) says what the OS said."""
@@ -2319,8 +2323,9 @@ class StrataEngine:
             raise out_of_step(line)
 
     def close(self):
-        """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        """End the engine process: STOP + QUIT first (the engine frees its memory itself - unpinning tens of GB can take
+        a while; ENGINE_QUIT_WAIT_S), then terminate (ENGINE_TERM_WAIT_S), then kill (ENGINE_KILL_WAIT_S).  Raises
+        EngineStuck when it still runs after all three."""
         if self.proc is None:
             return
         try:
@@ -2328,15 +2333,15 @@ class StrataEngine:
                 try:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
-                    self.proc.stdin.close()  # the engine's stdin reader sees EOF
-                    self.proc.wait(timeout=20)
+                    self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
+                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=ENGINE_TERM_WAIT_S)
         except subprocess.TimeoutExpired:
             self.proc.kill()
             try:
-                self.proc.wait(timeout=20)
+                self.proc.wait(timeout=ENGINE_KILL_WAIT_S)
             except subprocess.TimeoutExpired:
                 raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
         except OSError:
