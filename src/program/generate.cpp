@@ -508,7 +508,7 @@ struct Options {
     int prompt_cache = 6;
     /// --serve: parked conversations (upstream ccc660b): a host-RAM budget for whole sessions put aside when another
     /// conversation takes the session, at most `slots` of them, and the RAM that must stay free when one is parked
-    int64_t conversation_cache_mib = 0;
+    int64_t conversation_cache_mib = -1; // host RAM for independent conversations; -1: not given, --serve sizes it from the free RAM (#3493), 0: off
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
     /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
@@ -666,7 +666,7 @@ void usage() {
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
-                 "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
+                 "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: sized from the free RAM, up to 8192; 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
@@ -7336,6 +7336,25 @@ int main(int argc, char** argv) {
         // host RAM first, and a parked one whose tokens start the request is put back instead of read again.  Saved
         // only on a switch or rewind, not on each continuing request; no graph address changes (the images are
         // ordinary host vectors).
+        // #3493 (upstream f0010a60): no --conversation-cache-mib given: size the cache for agent use from the RAM that is free
+        // now that the model is loaded (an agent alternates a long main conversation with shorter ones; with the cache off
+        // every request read its whole prompt again).  An explicit value, 0 included, is never touched.  (XeStrata parks
+        // only with --mtp: a parked conversation carries the draft layer's K/V.)
+        if (o.conversation_cache_mib < 0) {
+            if (o.serve && o.prompt_cache > 0 && o.conversation_cache_slots > 0 && use_mtp) {
+                o.conversation_cache_mib = strata::core::auto_conversation_cache_mib(strata::core::available_host_bytes(),
+                                                                                    o.conversation_cache_min_free_mib);
+                if (o.conversation_cache_mib > 0)
+                    std::fprintf(stderr, "strata serve: conversation cache sized from the free RAM: %lld MiB for up to %d parked "
+                                         "conversations, so an agent's next turn reuses its prompt (--conversation-cache-mib N sets it, 0 turns it off)\n",
+                                 (long long) o.conversation_cache_mib, o.conversation_cache_slots);
+                else
+                    std::fprintf(stderr, "strata serve: conversation cache off: not enough free RAM to park conversations "
+                                         "(--conversation-cache-mib N asks for one anyway)\n");
+            } else {
+                o.conversation_cache_mib = 0;
+            }
+        }
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 && use_mtp ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
