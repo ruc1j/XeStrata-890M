@@ -10,8 +10,9 @@ Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/m
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time
 behind a FIFO (plan: one resident sequence).
 Image generation (optional, when the config has an "images" section): POST /v1/images/generations and
-/v1/images/edits (OpenAI's shapes, plus seed) run Qwen-Image-2.1-Turbo on XeStrata's own image engine (strata-image,
-resident after the first image), one job at a time on the GPU the text engine uses (serve/images.py).
+/v1/images/edits (OpenAI's shapes, plus seed) run the image model setup --images installed (Qwen-Image-2.1-Turbo,
+Qwen-Image-2.1 or Mage-Flow) on XeStrata's own image engine (strata-image, resident after the first image), one job at
+a time on the GPU the text engine uses (serve/images.py; docs/IMAGE.md).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
@@ -64,8 +65,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
-from serve.frontend import (THINK_END, ChatTemplate, Event, HarmonyParser, OutputParser, ToolCall,  # noqa: E402
-                            anthropic_to_messages, forced_call, images_of, literal_tags, mark_think_literals,
+from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
+                            OutputParser, ToolCall, anthropic_to_messages, forced_call, images_of, literal_tags,
+                            mark_think_literals,
                             openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
@@ -114,7 +116,7 @@ def popen(what: str, args: list, **kw):
 
 
 # How long close() gives the engine at each step of ending it (seconds). Module values so that a test can shorten them.
-ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 20, 5, 20
+ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 20, 20, 20
 
 
 def listen_problem(host: str, port: int, e: OSError) -> str:
@@ -710,6 +712,12 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
                     say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
+                elif "IGC's GEP simplification is off" in line:   # Intel's compiler 2.27 to 2.30 (AGENTS.md)
+                    v = line.split("; IGC ", 1)[1].split(")", 1)[0] if "; IGC " in line else "?"
+                    say("igc", f"[strata] Intel's compiler IGC {v} has a bug XeStrata works around: the decode of "
+                        "short prompts is up to 10% slower.\n"
+                        "         For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman "
+                        "(Fedora 44 inside).")
                 elif "session is up" in line:
                     say("up", "[strata] almost ready ...")
         if time.time() - last > heartbeat:
@@ -2375,6 +2383,40 @@ class StrataEngine:
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
 
 
+def private_url_host(url: str) -> str | None:
+    """#28: the address an image URL's host resolves to when it is not a public one (loopback, link-local - the cloud
+    metadata address -, private, reserved, multicast), else None.  A request's image URL must not make the server a
+    proxy into its own network; STRATA_IMAGE_URL_PRIVATE=1 allows it (pictures served from the LAN on purpose).  An
+    address that changes between this check and the connection (DNS rebinding) is not caught."""
+    import ipaddress
+    if (os.environ.get("STRATA_IMAGE_URL_PRIVATE") or "").strip() == "1":
+        return None
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return None                                     # not resolvable: the fetch itself says so
+    for info in infos:
+        addr = ipaddress.ip_address(str(info[4][0]).split("%")[0])
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
+        if not addr.is_global:
+            return str(addr)
+    return None
+
+
+class _PublicRedirects(urllib.request.HTTPRedirectHandler):
+    """#28: a redirect to a private address is refused as the first URL is (a public URL could bounce inward)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if (addr := private_url_host(newurl)) is not None:
+            raise ValueError(f"the image URL redirects to a private address ({addr}); STRATA_IMAGE_URL_PRIVATE=1 "
+                             "allows it")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def network_path(path: str) -> bool:
     r"""A path to another computer: \\host\share or //host/share (either slash), \\?\UNC\host\..., \\.\UNC\host\...
     or the NT form \??\UNC\host\...  Windows connects to that host at the first look at the path (os.path.isfile is
@@ -2656,6 +2698,8 @@ class Vision:
                              "file://host/...) are not read")
         if path and os.path.isfile(path):
             try:
+                if os.path.getsize(path) > IMAGE_URL_MAX:   # #27: not pulled into memory whole (a model file, a log)
+                    raise ValueError(f"the image file is over {IMAGE_URL_MAX >> 20} MiB")
                 return Path(path).read_bytes()
             except OSError as e:
                 raise ValueError(f"the image could not be read from {path} ({e})") from None
@@ -2664,10 +2708,25 @@ class Vision:
     @staticmethod
     def download(url: str) -> bytes:
         """An image URL's bytes, at most IMAGE_URL_MAX of them: the whole response was read, so a huge or endless one
-        filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection."""
+        filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection.
+        Vision.download_public: neither the URL nor a redirect may reach a private address (#28)."""
+        return Vision._fetch(url, False)
+
+    @staticmethod
+    def download_public(url: str) -> bytes:
+        """#28: a request's image URL, fetched by a running server (Service.public_urls): only from a public address,
+        redirects included, so the server is no proxy into its own network (STRATA_IMAGE_URL_PRIVATE=1 allows it)."""
+        return Vision._fetch(url, True)
+
+    @staticmethod
+    def _fetch(url: str, public: bool) -> bytes:
         too_big = f"the image URL's file is over {IMAGE_URL_MAX >> 20} MiB"
+        opener = urllib.request.build_opener(_PublicRedirects) if public else urllib.request.build_opener()
+        if public and (addr := private_url_host(url)) is not None:
+            raise ValueError(f"the image URL points to a private address ({addr}): the server does not fetch from "
+                             "its own network for a request; STRATA_IMAGE_URL_PRIVATE=1 allows it")
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
+            with opener.open(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
                 size = r.headers.get("Content-Length") or ""
                 if size.isdigit() and int(size) > IMAGE_URL_MAX:
                     raise ValueError(too_big)
@@ -2691,9 +2750,10 @@ class Vision:
             return False
 
     @staticmethod
-    def normalize(data: bytes) -> bytes:
+    def normalize(data: bytes, keep_alpha: bool = False) -> bytes:
         """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG.
-        A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow)."""
+        A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow).  `keep_alpha` (an image
+        edit's reference: the image model reads the alpha): a transparent image stays RGBA, else it goes on white."""
         jpeg = data[:3] == b"\xff\xd8\xff"
         if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
                 data[:6] in (b"GIF87a", b"GIF89a"):
@@ -2711,7 +2771,9 @@ class Vision:
             im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied (#1229)
         except Exception as e:
             raise ValueError(f"the image could not be read ({e})") from None
-        if im.mode in ("RGBA", "LA", "P") and "transparency" in im.info or im.mode in ("RGBA", "LA"):
+        if keep_alpha and (im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info):
+            im = im.convert("RGBA")
+        elif im.mode in ("RGBA", "LA", "P") and "transparency" in im.info or im.mode in ("RGBA", "LA"):
             im = im.convert("RGBA")
             bg = Image.new("RGB", im.size, (255, 255, 255))   # transparent areas become white, not black
             bg.paste(im, mask=im.split()[-1])
@@ -3381,6 +3443,14 @@ class Service:
             self.prompts = PromptEncoder(tokenizer, keep=slots) if slots is not None and slots > 0 \
                 else PromptEncoder(tokenizer)
 
+    # #28: the running server (main) sets it: a request's image URLs are fetched only from public addresses
+    public_urls = False
+
+    def download(self, url: str) -> bytes:
+        """A request's image URL (the chat's pictures, a tool's, an edit's references): Vision.download_public on a
+        running server, else Vision.download."""
+        return Vision.download_public(url) if self.public_urls else Vision.download(url)
+
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
@@ -3846,7 +3916,9 @@ class Service:
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
-            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
+            # an image job's seconds are no tok/s: the speed history has a gap there, not zeros
+            self.telemetry = Telemetry(extra=lambda: {"tok_s": None if self._image_running() else self._tok_s(),
+                                                      "tok_s_mean": self._tok_s_mean(),
                                                       "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_pci=getattr(self, "gpu_pci", None),
                                        split_pci=getattr(self, "split_pci", None))
@@ -3854,6 +3926,9 @@ class Service:
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on
                 # a slow card keeps the GPU at work while the host thread sleeps)
                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
+
+    def _image_running(self) -> bool:
+        return self.images is not None and self.images.job is not None
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
@@ -3966,14 +4041,20 @@ class Service:
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
             live["replicas"] = self.engine.replica_view()
+        image = self.images.live() if self.images is not None else None
+        if image is not None:                           # an image job in the GPU's turn: its stage and steps
+            live["image"] = image
+        # the image jobs that ended beside the chat's requests, newest first (the Monitor's Requests table); the
+        # conversation cache counts the chat's only
+        rows = sorted(hist + (self.images.recent() if self.images is not None else []), key=lambda r: r["time"])
         engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = (self.telemetry.snapshot() if getattr(self, "telemetry", None)
                else {"now": {}, "history": {}, "static": {}})
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        return {"engine": engine, "live": live, "requests": rows[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
-                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+                "requests_kept": len(rows), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now,
                 "engine_failure": self.engine_failure}
@@ -4134,7 +4215,7 @@ class Service:
                         if cancel is not None and cancel.is_set():
                             raise ClientGone()
                         if src.startswith(("http://", "https://")):
-                            src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
+                            src = fetched[item["source"]] = self.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
                             self._vision_up()         # an elastic encoder is not running until a picture needs it
                             self.vision.encode(src)
@@ -4176,7 +4257,7 @@ class Service:
             def fetch(src):
                 if cancel is not None and cancel.is_set():
                     raise ClientGone()
-                return fetched[src] if src in fetched else Vision.download(src) \
+                return fetched[src] if src in fetched else self.download(src) \
                     if src.startswith(("http://", "https://")) else src
             images = [fetch(src) for src in images]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
@@ -4411,9 +4492,10 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
+        reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
         parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
-                  OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
-                               declared_only=declared_only))
+                  reader(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
+                         declared_only=declared_only))
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -5065,7 +5147,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             results.append(r["text"])
             yield "mcp", {"event": "result", "id": c.id,
                           **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")},
-                          **({"images": r["images"]} if r.get("images") else {})}
+                          **({"images": r["images"]} if r.get("images") else {}),
+                          **({"image": r["image"]} if r.get("image") else {})}
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
@@ -5371,9 +5454,9 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             stop = "stop_sequence" if x.get("stop_sequence") is not None else \
                 "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
-            # the final counts (message_start could only say the whole prompt): what was
-            # read now stays for the next request, a cache write; input_tokens keeps the
-            # last token, as 0 makes Claude Code count the prompt twice (#1013)
+            # the final counts (message_start could only say the whole prompt): what was read now stays for the next
+            # request, a cache write; input_tokens keeps the last token, as 0 makes Claude Code count the prompt twice
+            # (#1013)
             reused = max(0, min(x.get("reused") or 0, len(ids) - 1))
             read_now = len(ids) - reused
             yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop,
@@ -5435,7 +5518,8 @@ def body_limit() -> int:
 
 def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
     """A multipart/form-data body (OpenAI's /v1/images/edits) -> (its text fields, the bytes of its image or image[]
-    files in order); whole numbers in the fields (n, seed, steps) as ints."""
+    files in order); whole numbers in the fields (n, seed, steps, output_compression) as ints, the mask file's bytes
+    as "mask"."""
     from email.parser import BytesParser
     from email.policy import HTTP
     msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode("latin-1") + b"\r\n\r\n" + body)
@@ -5449,9 +5533,12 @@ def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
         data = raw if isinstance(raw, bytes) else b""
         if name in ("image", "image[]"):
             files.append(data)
+        elif name == "mask":
+            fields["mask"] = data
         elif isinstance(name, str) and name:
             value = data.decode("utf-8", "replace")
-            fields[name] = int(value) if name in ("n", "seed", "steps") and value.strip().isdigit() else value
+            whole = name in ("n", "seed", "steps", "output_compression") and value.strip().isdigit()
+            fields[name] = int(value) if whole else value
     return fields, files
 
 
@@ -5832,7 +5919,7 @@ def make_handler(svc: Service):
                     return
                 body = f.read_bytes()
                 self.send_response(200)
-                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Type", images_api.FORMATS[f.suffix[1:]])
                 self.send_header("Cache-Control", "private, max-age=86400")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -5916,9 +6003,9 @@ def make_handler(svc: Service):
                 self._settings()
                 return
             if path == "/switcher":                     # the web app's model menu: ask the host to swap models
-                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 if not self._own_page("the model can be switched"):   # as /settings: a page elsewhere must not
                     return
+                body = self._body()                     # #26: after the page check, and within body_limit()
                 try:
                     req = json.loads(body or b"{}")
                 except ValueError:
@@ -6088,8 +6175,7 @@ def make_handler(svc: Service):
             gen = svc.images
             if gen is None:
                 self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": "image generation is not set up on this server (run setup "
-                                                      "with --images qwen-image)"}})
+                                           "message": images_api.not_set_up_message()}})
                 return
             job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
             self._image_job(gen, job)
@@ -6102,13 +6188,13 @@ def make_handler(svc: Service):
             gen = svc.images
             if gen is None:
                 self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": "image generation is not set up on this server (run setup "
-                                                      "with --images qwen-image)"}})
+                                           "message": images_api.not_set_up_message()}})
                 return
             body = self._body()
             ctype = self.headers.get("Content-Type", "") or ""
             if ctype.lower().startswith("multipart/form-data"):
                 req, files = parse_multipart(ctype, body)
+                mask = req.pop("mask", None) or None
             else:
                 req = json.loads(body or b"{}")
                 if not isinstance(req, dict):
@@ -6123,8 +6209,21 @@ def make_handler(svc: Service):
                         url = url.get("url")
                     if not isinstance(url, str) or not url:
                         raise ValueError("images: [{\"image_url\": a data: URL, an http(s) URL or a path}]")
-                    files.append(Vision.load(url))
-            job = images_api.parse_edit_request(req, [Vision.normalize(d) for d in files], gen.cfg)
+                    self._no_local_sources([url])     # #27: as the chat routes, before anything is read
+                    files.append(svc.download(url) if url.startswith(("http://", "https://")) else Vision.load(url))
+                # the mask as an image is given ({"image_url": ...} or the URL), its alpha kept (not normalized)
+                mask = req.pop("mask", None)
+                if isinstance(mask, dict):
+                    mask = mask.get("image_url") or mask.get("url")
+                if isinstance(mask, dict):
+                    mask = mask.get("url")
+                if mask is not None:
+                    if not isinstance(mask, str) or not mask:
+                        raise ValueError("mask: {\"image_url\": a data: URL, an http(s) URL or a path}")
+                    self._no_local_sources([mask])
+                    mask = svc.download(mask) if mask.startswith(("http://", "https://")) else Vision.load(mask)
+            job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files], gen.cfg,
+                                                mask)
             self._image_job(gen, job)
 
         def _image_job(self, gen, job):
@@ -6277,8 +6376,11 @@ def make_handler(svc: Service):
             in (["*"]: every page) could name any file and, CORS allowing, read what the model says about it.  data:
             and http(s) images are the page's own to send; files come from Strata's own page, a trusted origin or a
             client that is no browser.  ValueError (a 400)."""
-            if self._foreign_origin() and any(not src.startswith(("data:", "http://", "https://"))
-                                              for src in images_of(messages)):
+            self._no_local_sources(images_of(messages))
+
+        def _no_local_sources(self, sources):
+            """_no_local_images for a list of image sources (the chat routes', and #27 /v1/images/edits')."""
+            if self._foreign_origin() and any(not src.startswith(("data:", "http://", "https://")) for src in sources):
                 raise ValueError("a web page of another origin cannot have a file on this computer read as an "
                                  "image: send it as a data: URL (or add the page's origin to the config's "
                                  "trusted_origins)")
@@ -6358,7 +6460,8 @@ def make_handler(svc: Service):
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
+            force = forced_call(req.get("tool_choice"), tools,      # a bad value is a 400 before anything is sent
+                                getattr(svc.template, "call_form", "qwen"))
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
@@ -6377,7 +6480,8 @@ def make_handler(svc: Service):
                 if extra:
                     hubs.append(svc.mcp)
             if req.get("strata_images") is True and svc.images is not None:   # opt-in: the image tools
-                image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load, Vision.normalize)
+                image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
+                                                    lambda d: Vision.normalize(d, keep_alpha=True))
                 more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
                 if more:
                     extra += more
@@ -6559,7 +6663,11 @@ def make_handler(svc: Service):
             # OpenAI's hosted image_generation tool: this server's image tools, run here (serve/images.py)
             self.image_tools = None
             if "image_generation" in skipped and svc.images is not None and req.get("tool_choice") != "none":
-                self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load, Vision.normalize)
+                spec = next((t for t in req.get("tools") or [] if isinstance(t, dict)
+                             and t.get("type") == "image_generation"), {})
+                self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
+                                                         lambda d: Vision.normalize(d, keep_alpha=True),
+                                                         spec)
                 tools = (tools or []) + self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
                 skipped = [k for k in skipped if k != "image_generation"]
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
@@ -6635,7 +6743,8 @@ def make_handler(svc: Service):
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
+            force = forced_call(req.get("tool_choice"), tools,        # "any" / {"type": "tool", "name": N}
+                                getattr(svc.template, "call_form", "qwen"))
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
@@ -6874,7 +6983,8 @@ def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[
             names.update((pc, pc + ".local"))
         except OSError:
             pass
-        names.update(("host.docker.internal", *lan_addresses()))
+        # the names a container reaches this PC by: Docker's and Podman's
+        names.update(("host.docker.internal", "host.containers.internal", *lan_addresses()))
     names.update(x for x in allowed_hosts if x != "*")
     names.update(filter(None, (host_name(o.split("://", 1)[-1]) for o in trusted_origins)))
     return names
@@ -7280,19 +7390,29 @@ MODEL_CARD_SAMPLING = {
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # Ornith-1.5: the card's set for general tasks (its benchmarks ran at temperature 1.0)
+    "ornith": {"thinking": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+               "instruct": {"temperature": 0.6, "top_p": 0.95, "top_k": 20}},
+    # GLM-5.3-Flash: its generation_config.json
+    "glm5": {"thinking": {"temperature": 1.0, "top_p": 0.95}, "instruct": {"temperature": 1.0, "top_p": 0.95}},
 }
 
 
 def card_family(cfg: dict) -> str | None:
     """Which MODEL_CARD_SAMPLING set a config's model takes: Qwen3.8-Flash-Next and its variants (Swift, Gyro: upstream
-    gives every qwen4exp file the set, "qwen4exp"), Qwen3.6-35B-A3B ("qwen35moe"); None for the other models (Ornith,
-    llm-jp: their cards are not in the table), which stay greedy unless the request or the config's `sampling` block
-    says otherwise.  By the model's name, as the architecture alone does not tell Qwen3.6 from Ornith."""
+    gives every qwen4exp file the set, "qwen4exp"), Qwen3.6-35B-A3B ("qwen35moe"), Ornith-1.5 ("ornith"),
+    GLM-5.3-Flash ("glm5"); None for llm-jp (its card names no sampling), which stays greedy unless the request or the
+    config's `sampling` block says otherwise.  By the model's name, as the architecture alone does not tell Qwen3.6
+    from Ornith."""
     name = str(cfg.get("model_name") or "qwen3.8-flash-next").lower()
     if name.startswith(("qwen3.8", "swift")) or "gyro" in name:
         return "qwen4exp"
     if name.startswith("qwen3.6"):
         return "qwen35moe"
+    if name.startswith("ornith"):
+        return "ornith"
+    if name.startswith("glm"):
+        return "glm5"
     return None
 
 
@@ -7479,6 +7599,7 @@ def main() -> int:
                                                       cfg.get("fit_max_tokens") is not False))
     svc.vision_error = vision_error
     svc.vision_fallback = vision_fallback
+    svc.public_urls = True                             # #28: a request's image URL only from a public address
     if a.engine == "strata":                            # the model card's sampling when nothing else is said
         svc.model_arch = card_family(cfg)
     svc.answer_room = cfg.get("answer_room") is not False

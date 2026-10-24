@@ -90,8 +90,9 @@ sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocmin
   ROCm 7.14's packages from AMD install no ld.so.conf, so setup adds their `lib` to the engine's library path (the config's `lib_dirs`).
   Without it the build has no HIP.
 - Code for AMD GPUs needs libclc's libspirv for AMD and ROCm's device libraries.
-  A compiler reads bitcode of its own LLVM or an older one only (ROCm 7.14's device libraries are LLVM 23's, which intel/llvm 7.1.1's LLVM 22 cannot read),
-  so the script fetches the device libraries of the ROCm release on intel/llvm's LLVM (`amd/device-libs` of ROCm's llvm-project at `rocm-7.2.4`, under the University of Illinois/NCSA license), builds them in the same tree and installs them into `install/amdgcn/bitcode`.
+  A compiler reads bitcode of its own LLVM or an older one only (ROCm 10.1's device libraries are LLVM 24's, which intel/llvm 7.2.0's LLVM 23 cannot read),
+  so the script fetches the device libraries of the ROCm release on intel/llvm's LLVM (ROCm 7.14.1: `amd/device-libs` of ROCm's llvm-project at the commit TheRock's tag `therock-7.14.1` pins, under the University of Illinois/NCSA license), builds them in the same tree and installs them into `install/amdgcn/bitcode`.
+  It installs those a SYCL program's AMD code links (`ocml`, `ockl`, `oclc_*`) and `opencl`, whose presence the driver asks for.
   CMake takes the installed ROCm's device libraries where the compiler reads them, and these where it does not; when they fail to build, intel/llvm is still built.
 - In a Fedora 44 container (ROCm 7.1.1), a SYCL kernel compiled with `-fsycl-targets=amd_gpu_gfx1200` ran correctly on an RX 9060 XT (gfx1200).
   The HIP adapter reports 1 GiB as the largest allocation, but 12 GiB could be allocated.
@@ -190,18 +191,18 @@ cmake --build build/contrib-llvm -j 28
 ccache -s          # the hits
 ```
 
-## Building the packages (Docker)
+## Building the packages (Podman)
 
-The deb and rpm packages (`tools/package/build.sh`, [BUILD.md](BUILD.md#the-deb-and-rpm-packages)) are built in Docker containers.
+The deb and rpm packages and the Windows 7z (`tools/package/build.sh`, [BUILD.md](BUILD.md#the-deb-and-rpm-packages)) are built in rootless Podman containers.
 
 ```sh
-sudo apt install docker.io            # 29.1.3
-sudo usermod -aG docker "$USER"       # after logging in again it runs without sudo
+sudo apt install podman               # 5.7.0 (Fedora: sudo dnf install podman)
+grep "^$USER:" /etc/subuid /etc/subgid   # if nothing: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
 ```
 
-The docker group has the same power as root.
+Rootless, it needs neither sudo nor a group with root's power, and the container's root is this user (what the container writes is this user's).
 The containers get no GPU, so nothing extra for GPUs (such as nvidia-container-toolkit) is needed.
-A build makes intel/llvm too; for Fedora 44's free packages the container grew to 6.8 GB at most (measured every minute; the cuda variants add the CUDA toolkit). The container is removed at the end.
+A build makes intel/llvm too; for Fedora 44's free packages the container grew to 6.8 GB at most (measured every minute; the cuda variants add the CUDA toolkit). The container is removed at the end. The images and containers are kept in `~/.local/share/containers`.
 
 ## Windows cross build
 
@@ -215,7 +216,7 @@ It needs three things:
 - lld-link (LLVM's `lld`): `sudo apt install lld-21` (21.1)
 - the MSVC CRT and the Windows SDK: downloaded from Microsoft with [xwin](https://github.com/Jake-Shadle/xwin) (0.10.0).
   They are not free software; Microsoft's license is accepted with `--accept-license`. They do not go into the repository.
-- intel/llvm's Windows SYCL tree (headers, import libraries, the runtime's DLLs): `tools/intel_llvm_build.py --windows` cross-builds the release XeStrata uses (v7.1.1), with XeStrata's patches, for Windows here ("intel/llvm for Windows" below).
+- intel/llvm's Windows SYCL tree (headers, import libraries, the runtime's DLLs): `tools/intel_llvm_build.py --windows` cross-builds the release XeStrata uses (v7.2.0), with XeStrata's patches, for Windows here ("intel/llvm for Windows" below).
 
 ```sh
 mkdir -p .tools/xwin
@@ -249,19 +250,23 @@ ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$
 ### intel/llvm for Windows
 
 `tools/intel_llvm_build.py --windows` builds the SYCL runtime for Windows from the same clone as the Linux one, into `.tools/intel-llvm-win/install`.
-It builds the parts the engine uses only (`sycl9.dll`, UR's loader and its CUDA and Level Zero adapters, `xptifw.dll`, the device libraries, the NVIDIA libspirv, the headers and the import libraries): no Debug DLLs, no `clang.exe` and no sycl-jit.
+It builds the parts the engine uses only (`sycl9.dll` with UR's loader in it, the CUDA, HIP and Level Zero adapters, `xptifw.dll`, SYCL's device libraries (libdevice), the headers and the import libraries): no Debug DLLs, no `clang.exe` and no sycl-jit.
 
-- The clang-cl of the toolchain `--contrib` built, of the same release, compiles and lld-link links. The tools that make the device libraries and libspirv are that toolchain's too (`--contrib`'s build also copies `opt`, `llvm-as` and `libclc-remangler`, which it does not install, into its install folder). No compiler is built, for Windows or for this machine. Build `--contrib` first.
+- The clang-cl of the toolchain `--contrib` built, of the same release, compiles and lld-link links. The tools that make the device libraries are that toolchain's too (`--contrib`'s build also copies `opt`, which it does not install, into its install folder). No compiler is built, for Windows or for this machine. Build `--contrib` first.
 - The MSVC CRT and the Windows SDK are xwin's splat (`--xwin`, by default `.tools/xwin/sdk`). `llvm-lib`, `llvm-rc`, `llvm-mt` and `llvm-ml` are the distribution's LLVM's (`sudo apt install llvm`).
 - The Windows CUDA headers and import libraries the CUDA adapter links come from NVIDIA's redistributable archives (CUDA 12.4.1's `cuda_cudart`, `cuda_nvml_dev` and `cuda_cccl`). They are not free software and do not go into the 7z.
+- The HIP adapter (AMD GPUs) is built where this machine has ROCm's HIP (Ubuntu's `libamdhip64-dev`) and `--contrib` was built with the HIP target. Its headers are that HIP's (MIT; the license text in `install/licenses/hip-headers.txt`), and the `amdhip64.lib` it links is an import library of `amdhip64_7.dll`, made with `llvm-dlltool` from the C names Linux's `libamdhip64.so.7` exports. AMD's driver (Adrenalin 26.5.1 and later) puts `amdhip64_7.dll` into System32.
+- A Windows engine's code for NVIDIA and AMD GPUs links the Windows l32 libspirv the Linux toolchain builds since v7.2.0 (`lib/clang/<version>/lib/<target>`) and that toolchain's ROCm device libraries: neither carries `wchar_size`, so neither is built again for Windows.
 - It takes about three minutes on the development machine (28 threads).
 
 For NVIDIA GPUs, configure the cross build with `-DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=<the GPU's architecture> -DSTRATA_CUDA_PATH=<a CUDA toolkit>`, a CUDA toolkit no newer than the version the target PC's driver supports.
+For AMD GPUs add `-DSTRATA_HIP_ARCHS=<the gfx names>` (RDNA2 and later, as on Linux).
+For oneMKL add `-DSTRATA_ONEMKL=ON -DMKL_ROOT=<oneMKL for Windows' Library/>`: oneMKL's Windows headers, import libraries and CMake package are in the `Library/` of Intel's PyPI wheels (`mkl-devel`, `mkl-include`, `mkl-devel-dpcpp` and `onemkl-sycl-include`, win_amd64). On Windows oneMKL's CMake package also checks that the DLLs are there, so the `mkl` and `onemkl-sycl-*` wheels' DLLs are unpacked into the same `Library/` (for the build only; the 7z does not carry them). It builds oneMath and its oneMKL backend (`onemath.dll`, `onemath_blas_mklgpu.dll`); on Windows the engine looks for oneMKL of the series it was built with first (the `Library\bin` pip makes in the bundled Python, oneAPI's `mkl\<series>\bin`), before the PATH, and then in oneAPI's `mkl` and `tbb` folders (`ONEAPI_ROOT`, else the installer's default folder) and `MKLROOT`.
 `tools/package/build.sh windows cuda12.4` builds all of this, and the Windows 7z, in a disposable Ubuntu 26.04 container ([BUILD.md](BUILD.md)).
 
 ### Running on a Windows PC
 
-Put `build/win`'s `strata*.exe` in one folder with `.tools/intel-llvm-win/install/bin`'s `sycl9.dll`, `ur_win_proxy_loader.dll`, `ur_loader.dll`, the adapter of the GPU (`ur_adapter_cuda.dll` for NVIDIA, `ur_adapter_level_zero.dll` for Intel) and `xptifw.dll`.
+Put `build/win`'s `strata*.exe` in one folder with `.tools/intel-llvm-win/install/bin`'s `sycl9.dll`, `ur_win_proxy_loader.dll`, the adapter of the GPU (`ur_adapter_cuda.dll` for NVIDIA, `ur_adapter_level_zero.dll` for Intel) and `xptifw.dll`.
 When `strata-device.exe --list-devices` lists the GPU, the engine runs.
 
 ## Intel SDE (the AVX-512 paths)
@@ -288,9 +293,11 @@ sde64 -version
   The decode's `verify window` line (the host's wait for the GPU, the CPU pool) is always printed.
 - `STRATA_VERIFY_NODES=1` prints how many kernels a decode window's graph holds.
 - Scratch probes that time single kernels with SYCL event profiling.
-- `STRATA_VERIFY_PROFILE=1` gives the GPU time of each stage of a decode window (with `STRATA_DECODE_TIMING=1`, the
-  `strata decode GPU stages` line per request). It needs a device-scope clock, which the B70 does not have; on the 890M
-  (HIP) it reads the GPU's REALTIME counter (100 MHz, 1 M ticks = 10 ms). Decode is about a tenth slower while it runs.
+- `STRATA_VERIFY_PROFILE=1` prints the stages of a decode window's layers (device clock ticks) on the `verify profile` line of `--stats`.
+  Level Zero does not report the device clock aspect on the B70, but its compiler runs SPIR-V's OpReadClockKHR, so the engine builds the stamp kernel once at start and uses it where that works (NVIDIA: %globaltimer; AMD: no profile).
+  On the B70 the tick is the GPU's core clock (2.8 GHz against a bandwidth kernel of known length, its `max_freq`), slower when the clock drops, so read the stages as shares.
+  XeStrata-890M on the 890M (HIP) reads the GPU's REALTIME counter (100 MHz, 1 M ticks = 10 ms), and with
+  `STRATA_DECODE_TIMING=1` prints the `strata decode GPU stages` line per request. Decode is about a tenth slower while it runs.
 
 ### The xe driver's kernel log
 

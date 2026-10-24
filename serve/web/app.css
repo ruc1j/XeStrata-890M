@@ -83,7 +83,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .chip .st-btn--icon .st-icon { width: 14px; height: 14px; }
 
 /* ---------------------------------------------------------------- monitor */
-.view--monitor, .view--about { overflow-y: auto; }
+.view--monitor, .view--about, .view--images { overflow-y: auto; }
 .monitor, .about { max-width: 1240px; width: 100%; margin: 0 auto; padding: var(--st-s-6); display: flex; flex-direction: column;
                    gap: var(--st-s-5); }
 .state-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
@@ -124,6 +124,10 @@ main { flex: 1; min-height: 0; display: flex; }
   white-space: nowrap;
   padding-inline: 8px;
 }
+/* an image job's row: its size, references and stages (or its error) across the token columns, wrapped */
+#req-wrap .st-table td.req-image { white-space: normal; min-width: 14em; overflow-wrap: anywhere; }
+#req-wrap .st-table td.req-image--error,
+#req-wrap .st-table td.req-image--error .muted { color: var(--st-danger-text); }
 .req-head { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-2); }
 .table-wrap.all { max-height: 420px; overflow-y: auto; }
 .req-totals { margin: 0; font-size: var(--st-fs-sm); }

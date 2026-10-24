@@ -24,7 +24,8 @@ def tree(repo: str, revision: str) -> dict:
     out = {}
     url: str | None = f"https://huggingface.co/api/models/{repo}/tree/{revision}?recursive=1&expand=0"
     while url:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "strata-pin"}), timeout=60) as r:
+        req = urllib.request.Request(url, headers={"User-Agent": "strata-pin"})
+        with urllib.request.urlopen(req, timeout=60) as r:
             for e in json.load(r):
                 if e.get("type") == "file" and e.get("lfs"):
                     out[e["path"]] = (int(e["lfs"]["size"]), e["lfs"]["oid"])

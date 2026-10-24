@@ -547,8 +547,8 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
         pinned_core = strata::kernels::cpu::pin_current_thread(cores[0]);
         pinned = true;
     }
-    strata::platform::name_this_thread("strata-host");
     strata::aux_cpus::note_owned_thread();   // the host: --aux-cpus leaves it where it is
+    strata::platform::name_this_thread("strata-host");
     return true;
 }
 

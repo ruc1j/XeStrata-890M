@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// SPDX-License-Identifier: MIT
 // src/program/batch_groups_test.cpp - how many pipelined slot groups --batch runs with (header-only, CPU).
 //
 //   1. `auto` picks the most groups, at most one per stage, that divide the slots;
@@ -80,6 +79,25 @@ int main() {
         i.batch_mtp = true;
         const auto r = bg::resolve(i);
         check(r.groups == 1 && r.serial == bg::Serial::None && r.would_be == 1, "auto would be 1 group anyway: no reason");
+    }
+    {   // PROPOSED NVIDIA default: two cards, nothing given: serial windows (measured +12..16% on 2x A4000)
+        bg::Input i = in(4, 1);
+        i.nv_serial_faster = true;
+        auto r = bg::resolve(i);
+        check(r.groups == 1 && r.from_auto && r.serial == bg::Serial::TwoCardsSerialFaster && r.would_be == 2,
+              "nv_serial_faster, 2 cards, 4 slots, nothing given: one group, named");
+        check(bg::serial_what(r.serial)[0] == 's', "the reason names the measurement");
+        check(bg::resolve(in(4, 1)).groups == 2, "flag off: the pipeline default stays");
+        i = in(8, 1); i.nv_serial_faster = true;   // measured too: +15%
+        check(bg::resolve(i).groups == 1, "8 slots (measured +15%): serial too");
+        i = in(4, 3); i.nv_serial_faster = true;
+        check(bg::resolve(i).groups == 4, "4 cards (not measured): the pipeline stays");
+        i = in(4, 1); i.nv_serial_faster = true; i.batch_mtp = true;
+        check(bg::resolve(i).groups == 2 && bg::resolve(i).mtp_dropped, "with --batch-mtp the 0.1.43.1 rule is unchanged");
+        i = in(4, 1); i.nv_serial_faster = true; i.set = true; i.auto_given = true;
+        check(bg::resolve(i).groups == 2, "--batch-groups auto given: the pipeline");
+        i.auto_given = false; i.given = 2;
+        check(bg::resolve(i).groups == 2, "--batch-groups 2 given: 2");
     }
     {   // explicit values are honoured
         bg::Input i = in(4, 1);

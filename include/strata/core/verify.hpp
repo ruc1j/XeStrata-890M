@@ -159,6 +159,11 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// Whether the last run() captured its window's graph: that round's time is mostly the capture's, not the window's
+    bool captured_last() const { return captured_last_; }
+    /// Whether a window of T tokens can run without running the card out of memory: its graph is captured already,
+    /// or the VRAM free leaves room to capture it (half as much again as the most a capture has taken, and 64 MiB)
+    bool window_fits(int T) const;
     /// The head's raw logits for the first `rows` tokens of the last window (the last stage's head):
     /// `rows` x n_vocab floats into `host`.  For --dump-logits; call after `run`, before the next window.
     bool read_logits(int rows, float* host, std::string& err) const;
@@ -536,6 +541,9 @@ private:
     strata::gpu::Stream fetch_side_ = nullptr;   ///< STRATA_FETCH_BRANCH: the PCIe share's fetch beside the VRAM hits
     bool fetch_branch_ = false;
     strata::gpu::Graph* exec_[9] = {};
+    bool captured_last_ = false;
+    size_t graph_bytes_max_ = 0;   ///< the most VRAM a window's capture and first run have taken
+    size_t graph_free0_ = 0;       ///< the VRAM free before the capture of the window run() is running, else 0
     strata::gpu::Graph* commit_exec_ = nullptr;
     // set_gdn_defer: the commit graph that stashes the GDN rows instead of writing the state, the pending rows
     // (layout of h_L_ / gate_L_ / beta_L_) and their count, which every window graph reads and clears
@@ -614,6 +622,10 @@ private:
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
+    float* nat_xr_ = nullptr;     // APR: the Hadamard-rotated expert input (the shared expert and the CPU keep xm); nullptr
+                                  // without a folded gate/up
+    const float* had_sx_ = nullptr;   // APR: this device's sign vectors of the expert input (n_embd) and of h (n_ff)
+    const float* had_sh_ = nullptr;
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;

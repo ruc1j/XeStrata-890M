@@ -90,8 +90,9 @@ sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocmin
   ROCm 7.14 の AMD のパッケージは ld.so.conf を入れないので、setup はその `lib` をエンジンのライブラリの探索先（設定の `lib_dirs`）に加えます。
   見つからなければ HIP なしでビルドします。
 - AMD の GPU 向けのコードには、libclc の libspirv（AMD 向け）と ROCm のデバイスライブラリが要ります。
-  コンパイラが読めるビットコードは自分の LLVM かそれより古いものだけなので（ROCm 7.14 のデバイスライブラリは LLVM 23 製で、intel/llvm 7.1.1 の LLVM 22 では読めません）、
-  スクリプトはデバイスライブラリを、intel/llvm と同じ LLVM の ROCm のリリース（ROCm の llvm-project の `rocm-7.2.4` の `amd/device-libs`、University of Illinois/NCSA ライセンス）から取ってきて、同じツリーでビルドし、`install/amdgcn/bitcode` に入れます。
+  コンパイラが読めるビットコードは自分の LLVM かそれより古いものだけなので（ROCm 10.1 のデバイスライブラリは LLVM 24 製で、intel/llvm 7.2.0 の LLVM 23 では読めません）、
+  スクリプトはデバイスライブラリを、intel/llvm と同じ LLVM の ROCm のリリース（ROCm 7.14.1。TheRock のタグ `therock-7.14.1` が使う ROCm の llvm-project のコミットの `amd/device-libs`、University of Illinois/NCSA ライセンス）から取ってきて、同じツリーでビルドし、`install/amdgcn/bitcode` に入れます。
+  入れるのは、SYCL の AMD 向けのコードがリンクするもの（`ocml`、`ockl`、`oclc_*`）と、ドライバーが有無を確かめる `opencl` です。
   CMake は、入っている ROCm のデバイスライブラリをコンパイラが読めればそちらを使い、読めないときにこれを使います。これが通らなくても intel/llvm はできます。
 - Fedora 44（ROCm 7.1.1）のコンテナで、RX 9060 XT（gfx1200）に `-fsycl-targets=amd_gpu_gfx1200` でコンパイルした SYCL のカーネルが正しく動きました。
   HIP のアダプタは一度に確保できる大きさを 1 GiB と報告しますが、実際には 12 GiB まで確保できました。
@@ -190,18 +191,18 @@ cmake --build build/contrib-llvm -j 28
 ccache -s          # ヒットの数
 ```
 
-## パッケージのビルド（Docker）
+## パッケージのビルド（Podman）
 
-deb と rpm のパッケージ（`tools/package/build.sh`、[BUILD.ja.md](BUILD.ja.md#deb-と-rpm-のパッケージ)）は、Docker のコンテナの中でビルドします。
+deb と rpm のパッケージと Windows の 7z（`tools/package/build.sh`、[BUILD.ja.md](BUILD.ja.md#deb-と-rpm-のパッケージ)）は、rootless の Podman のコンテナの中でビルドします。
 
 ```sh
-sudo apt install docker.io            # 29.1.3
-sudo usermod -aG docker "$USER"       # ログインし直すと sudo なしで動きます
+sudo apt install podman               # 5.7.0（Fedora: sudo dnf install podman）
+grep "^$USER:" /etc/subuid /etc/subgid   # 出なければ: sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
 ```
 
-docker グループは root と同じ権限を持ちます。
+rootless なので sudo も特別なグループも要らず、コンテナの root はこのユーザーです（コンテナが書いたファイルはこのユーザーのもの）。
 コンテナには GPU を渡さないので、GPU のための追加の道具（nvidia-container-toolkit など）は要りません。
-1 回のビルドで intel/llvm も作り、Fedora 44 の free でコンテナは最大 6.8 GB になりました（1 分ごとに測った値。cuda の版は CUDA ツールキットの分だけ増えます）。コンテナは終わると消えます。
+1 回のビルドで intel/llvm も作り、Fedora 44 の free でコンテナは最大 6.8 GB になりました（1 分ごとに測った値。cuda の版は CUDA ツールキットの分だけ増えます）。コンテナは終わると消えます。イメージとコンテナは `~/.local/share/containers` に置かれます。
 
 ## Windows 向けのクロスビルド
 
@@ -215,7 +216,7 @@ intel/llvm の SYCL のランタイムは Windows では MSVC の ABI だけに�
 - lld-link（LLVM の `lld`）: `sudo apt install lld-21`（21.1）
 - MSVC の CRT と Windows SDK: [xwin](https://github.com/Jake-Shadle/xwin)（0.10.0）で Microsoft から落とします。
   自由ソフトウェアではなく、Microsoft のライセンスは `--accept-license` で受け入れます。リポジトリには入れません。
-- intel/llvm の Windows 版の SYCL の木（ヘッダ、インポートライブラリ、ランタイムの DLL）: `tools/intel_llvm_build.py --windows` が、XeStrata の使う版（v7.1.1）を XeStrata のパッチを当てて、ここで Windows 向けにクロスビルドします（下の「Windows 版の intel/llvm」）。
+- intel/llvm の Windows 版の SYCL の木（ヘッダ、インポートライブラリ、ランタイムの DLL）: `tools/intel_llvm_build.py --windows` が、XeStrata の使う版（v7.2.0）を XeStrata のパッチを当てて、ここで Windows 向けにクロスビルドします（下の「Windows 版の intel/llvm」）。
 
 ```sh
 mkdir -p .tools/xwin
@@ -249,19 +250,23 @@ ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$
 ### Windows 版の intel/llvm
 
 `tools/intel_llvm_build.py --windows` は、Linux 版と同じクローンから、Windows 版の SYCL のランタイムを `.tools/intel-llvm-win/install` に作ります。
-エンジンが使う部分（`sycl9.dll`、UR のローダーと CUDA・Level Zero のアダプター、`xptifw.dll`、デバイスライブラリ、NVIDIA 向けの libspirv、ヘッダー、インポートライブラリ）だけで、Debug 版の DLL、`clang.exe`、sycl-jit は作りません。
+エンジンが使う部分（UR のローダーを含む `sycl9.dll`、CUDA・HIP・Level Zero のアダプター、`xptifw.dll`、SYCL のデバイスライブラリ（libdevice）、ヘッダー、インポートライブラリ）だけで、Debug 版の DLL、`clang.exe`、sycl-jit は作りません。
 
-- コンパイルは `--contrib` で作った同じ版のツールチェーンの clang-cl、リンクは lld-link が行います。デバイスライブラリと libspirv を作るツールも、そのツールチェーンのものです（`--contrib` のビルドは、入れ先にない `opt`・`llvm-as`・`libclc-remangler` も入れ先に写します）。Windows 向けにもこの機械向けにも、コンパイラは作りません。先に `--contrib` を作っておきます。
+- コンパイルは `--contrib` で作った同じ版のツールチェーンの clang-cl、リンクは lld-link が行います。デバイスライブラリを作るツールも、そのツールチェーンのものです（`--contrib` のビルドは、入れ先にない `opt` も入れ先に写します）。Windows 向けにもこの機械向けにも、コンパイラは作りません。先に `--contrib` を作っておきます。
 - MSVC の CRT と Windows SDK は xwin の展開（`--xwin`、既定は `.tools/xwin/sdk`）を使います。`llvm-lib`・`llvm-rc`・`llvm-mt`・`llvm-ml` はディストリビューションの LLVM のものです（`sudo apt install llvm`）。
 - CUDA のアダプターがリンクする CUDA の Windows 版のヘッダーとインポートライブラリは、NVIDIA の再配布用のアーカイブ（CUDA 12.4.1 の `cuda_cudart`・`cuda_nvml_dev`・`cuda_cccl`）から取ります。自由ソフトウェアではなく、7z には入れません。
+- HIP のアダプター（AMD の GPU）は、この機械の ROCm の HIP（Ubuntu の `libamdhip64-dev`）があり、`--contrib` が HIP のターゲットつきで作られているときに作ります。ヘッダーはその HIP のもの（MIT。ライセンス文は `install/licenses/hip-headers.txt`）で、リンクする `amdhip64.lib` は、Linux の `libamdhip64.so.7` が出す C の名前から `llvm-dlltool` で作った `amdhip64_7.dll` のインポートライブラリです。`amdhip64_7.dll` は AMD のドライバー（Adrenalin 26.5.1 以降）が System32 に入れます。
+- Windows のエンジンの NVIDIA と AMD の GPU 向けのコードは、Linux のツールチェーンが v7.2.0 から作る Windows 向けの l32 の libspirv（`lib/clang/<版>/lib/<対象>`）と、そのツールチェーンの ROCm のデバイスライブラリをリンクします。どちらも `wchar_size` を持たないので、Windows 向けに作り直す必要はありません。
 - 開発機（28 スレッド）で 3 分ほどです。
 
 NVIDIA の GPU 向けにはクロスビルドを `-DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=<GPU の版> -DSTRATA_CUDA_PATH=<CUDA ツールキット>` で構成します。CUDA ツールキットは動かす PC のドライバの対応する版以下にします。
+AMD の GPU 向けには `-DSTRATA_HIP_ARCHS=<gfx の名前>` を足します（Linux と同じく RDNA2 以降）。
+oneMKL を使うには `-DSTRATA_ONEMKL=ON -DMKL_ROOT=<oneMKL の Windows 版の Library/>` を足します。oneMKL の Windows 版のヘッダー・インポートライブラリ・CMake のパッケージは、Intel の PyPI の wheel（`mkl-devel`・`mkl-include`・`mkl-devel-dpcpp`・`onemkl-sycl-include`、win_amd64）の `Library/` にあります。oneMKL の CMake のパッケージは Windows では DLL があることも確かめるので、`mkl` と `onemkl-sycl-*` の wheel の DLL も同じ `Library/` に展開します（リンクにだけ使い、7z には入れません）。oneMath とその oneMKL の backend（`onemath.dll`・`onemath_blas_mklgpu.dll`）ができ、エンジンは Windows では、ビルドに使った版の oneMKL（同梱の Python に pip で入れた `Library\bin`、oneAPI の `mkl\<版>\bin`）を PATH より先に、そのあとに oneAPI の `mkl` と `tbb` のフォルダー（`ONEAPI_ROOT`、なければインストーラーの既定の場所）と `MKLROOT` を足して oneMKL を探します。
 Windows 版の 7z は、`tools/package/build.sh windows cuda12.4` が Ubuntu 26.04 の使い捨てのコンテナでここまでをすべて作ります（[BUILD.md](BUILD.ja.md)）。
 
 ### Windows の PC で動かす
 
-`build/win` の `strata*.exe` と、`.tools/intel-llvm-win/install/bin` の `sycl9.dll`・`ur_win_proxy_loader.dll`・`ur_loader.dll`・使う GPU のアダプター（NVIDIA は `ur_adapter_cuda.dll`、Intel は `ur_adapter_level_zero.dll`）・`xptifw.dll` を、1 つのフォルダーに置きます。
+`build/win` の `strata*.exe` と、`.tools/intel-llvm-win/install/bin` の `sycl9.dll`・`ur_win_proxy_loader.dll`・使う GPU のアダプター（NVIDIA は `ur_adapter_cuda.dll`、Intel は `ur_adapter_level_zero.dll`）・`xptifw.dll` を、1 つのフォルダーに置きます。
 `strata-device.exe --list-devices` で GPU が見えれば、エンジンは動きます。
 
 ## AVX-512 の経路を確かめる Intel SDE
@@ -288,9 +293,11 @@ sde64 -version
   decode の `verify window` の行（ホストが GPU を待つ時間、CPU のプール）は、いつも出ます。
 - `STRATA_VERIFY_NODES=1` は、decode の窓のグラフに入るカーネルの数を出します。
 - SYCL のイベントのプロファイリングで単独のカーネルを測る使い捨てのプローブ。
-- `STRATA_VERIFY_PROFILE=1` は decode の窓の段ごとの GPU 時間（`STRATA_DECODE_TIMING=1` と一緒に、要求ごとの
-  `strata decode GPU stages` の行）。デバイス全体で共通の時計を必要とし、B70 にはそれがありません。890M（HIP）では
-  GPU の REALTIME カウンター（100 MHz、1 M ticks = 10 ms）を読みます。計測中の decode は 1 割ほど遅くなります。
+- `STRATA_VERIFY_PROFILE=1` は、decode の窓の層内の段ごとの時間（デバイスの時計の tick）を `--stats` の `verify profile` の行に出します。
+  B70 は Level Zero がデバイスの時計の aspect を報告しませんが、SPIR-V の OpReadClockKHR はコンパイラが動かすので、エンジンは起動時にその stamp のカーネルを試しに組んで使います（NVIDIA は %globaltimer、AMD は出ません）。
+  B70 の tick は GPU のコアクロックで（長さの分かる帯域カーネルに対し 2.8 GHz、`max_freq`）、クロックが下がれば遅くなるので、段は比率で読みます。
+  XeStrata-890M では 890M（HIP）その GPU の REALTIME カウンター（100 MHz、1 M ticks = 10 ms）を読み、
+  `STRATA_DECODE_TIMING=1` と一緒に要求ごとの `strata decode GPU stages` の行を出します。計測中の decode は 1 割ほど遅くなります。
 
 ### xe ドライバーのカーネルのログ
 

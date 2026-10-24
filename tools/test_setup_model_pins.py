@@ -78,7 +78,9 @@ class EveryFileIsPinned(unittest.TestCase):
                 with self.subTest(family=fam_name, model=model):
                     if fam_name in setup.FAMILIES:
                         for i in range(1, setup.model_shards(fam, model) + 1):
-                            self.pinned(fam["hf"].format(q=model) + setup.model_file(fam, model, i))
+                            # huihui-ai keeps each model in a folder of its own ("dirs"), as setup formats it
+                            self.pinned(fam["hf"].format(q=model, d=fam.get("dirs", {}).get(model, model)) +
+                                        setup.model_file(fam, model, i))
                     else:
                         self.pinned(fam["hf"] + fam["file"].format(q=model))
 
