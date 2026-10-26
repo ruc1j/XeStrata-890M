@@ -756,8 +756,9 @@ void usage() {
                  "                       accept the drafts that match it, so speculation settings compare on the\n"
                  "                       same text (with --spec; not --serve)\n"
                  "  --window-hashes PATH per verify window, a line with its index, position, size, a 64-bit hash of\n"
-                 "                       its final residual rows and its argmaxes: two builds that do the same\n"
-                 "                       arithmetic write the same file (use with --spec-follow, --adapt-every 0)\n"
+                 "                       its final residual rows and its argmaxes, then each row's position:token:hash\n"
+                 "                       (runs with different windows compare row by row): two builds that do the\n"
+                 "                       same arithmetic write the same file (use with --spec-follow, --adapt-every 0)\n"
                  "  --gpu-stages         R0.9: capture the layer as three graphs (mixer / ffn+router / post)\n"
                  "                       and time them from OUTSIDE the capture.  The per-stage table on the\n"
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
@@ -10605,10 +10606,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: after non-finite logits in a prompt window (#3465): this request reads its "
                                      "whole prompt through the batched path, none of it through the verify windows\n");
             }
+            // XeStrata-890M, #48: the two paths round differently (the batched one's products are not the windows'),
+            // so a greedy request takes the fixed rule (up to --short-read tokens through the windows), not the
+            // measured costs: those change with the requests read before and with the GPU's clock, and with them the
+            // greedy reply.  Sampled requests keep the cheaper path.
+            const bool sr_fixed = o.short_read_given || req_short_read != o.short_read || req_temperature <= 0.0f;
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
 
-                if (no_short || !sr_cost.windows(b - a, req_short_read,
-                                                 o.short_read_given || req_short_read != o.short_read, a))
+                if (no_short || !sr_cost.windows(b - a, req_short_read, sr_fixed, a))
                     return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
@@ -13249,6 +13254,14 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < n_floats * sizeof(float); ++i) h = (h ^ bytes[i]) * 1099511628211ull;
                 std::fprintf(hashes, "%lld %lld %d %016llx", (long long) rounds, (long long) p, T, (unsigned long long) h);
                 for (int i = 0; i < T; ++i) std::fprintf(hashes, " %d", (int) outv[(size_t) i]);
+                // each row's own hash and input token, so that windows of different sizes compare position by position
+                const size_t row_bytes = (size_t) (g.hc * g.n_embd) * sizeof(float);
+                for (int i = 0; i < T; ++i) {
+                    uint64_t hr = 1469598103934665603ull;
+                    for (size_t j = 0; j < row_bytes; ++j) hr = (hr ^ bytes[(size_t) i * row_bytes + j]) * 1099511628211ull;
+                    std::fprintf(hashes, " %lld:%d:%016llx", (long long) (p + i), (int) window[(size_t) i],
+                                 (unsigned long long) hr);
+                }
                 std::fprintf(hashes, "\n");
             }
             if (!follow.empty()) {   // the continuation stands in for the argmax

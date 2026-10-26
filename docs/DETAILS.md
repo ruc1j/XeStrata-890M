@@ -1121,6 +1121,9 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
 - **Temperature, top_p, top_k, min_p and seed** are honored per request (OpenAI and Anthropic fields).
   With the default adaptive expert tier, a sampled result is not reproducible run to run;
   for seed-reproducible output add `--adapt-every 100000` (static residency) to the engine arguments.
+  serve reads a short prompt through the verify windows or the batched path, whichever its measured times say is faster; the two round differently, and which one wins changes with the requests before and the GPU's speed.
+  A greedy request (temperature 0) therefore reads up to `--short-read` tokens (default 64) through the windows whatever the times;
+  for seed-reproducible sampled output add `--short-read 64` to the engine arguments as well.
 - The run config's optional `sampling` block sets the defaults for requests that leave the fields out
   (`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`).
   A request's own fields always win.
