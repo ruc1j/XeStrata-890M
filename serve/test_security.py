@@ -289,6 +289,17 @@ class NoApiKey(unittest.TestCase):
         self.assertIn("anyone who can reach port 8080 can use the model", w)
         self.assertNotIn("tools", w)
         self.assertIn("and its tools", open_server_warning(8080, tools=True))
+        self.assertNotIn("public internet", w)
+        self.assertIn("public internet", open_server_warning(8080, public=True))
+
+    def test_public_address_is_found_from_the_listening_addresses(self):
+        from serve.server import has_public_address
+        self.assertTrue(has_public_address("0.0.0.0", ["192.168.1.5", "8.8.8.8"]))
+        self.assertFalse(has_public_address("0.0.0.0", ["192.168.1.5", "10.0.0.2", "100.64.0.1"]))
+        self.assertFalse(has_public_address("", []))
+        self.assertTrue(has_public_address("8.8.8.8", ["192.168.1.5"]))
+        self.assertFalse(has_public_address("192.168.1.5", ["8.8.8.8"]))
+        self.assertFalse(has_public_address("my-pc.local", ["8.8.8.8"]))
 
 
 if __name__ == "__main__":

@@ -312,6 +312,20 @@ class Progress(FetchCase):
 
 
 class Flaky(FetchCase):
+    def test_permanent_http_errors_are_not_retried_but_temporary_ones_are(self):
+        import urllib.error
+        for code, tries in ((404, 1), (401, 1), (416, 1), (403, 6), (408, 6), (429, 6), (503, 6)):
+            calls = [0]
+
+            def mirror(req, timeout=None, code=code):
+                calls[0] += 1
+                raise urllib.error.HTTPError(req.full_url, code, "x", {}, None)
+
+            with self.subTest(code=code), mock.patch.object(M.urllib.request, "urlopen", mirror), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(urllib.error.HTTPError):
+                M.get("https://hf.example/f")
+            self.assertEqual(calls[0], tries)
+
     def test_a_connection_that_drops_mid_tensor_does_not_end_the_run(self):
         """#3214: every range of the tensor fails past get()'s own
         retries once: the tensor is tried again (fewer connections)."""

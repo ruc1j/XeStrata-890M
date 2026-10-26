@@ -273,6 +273,7 @@ Verifier::~Verifier() {
     if (h_commitb_) strata::gpu::free(h_commitb_);
     if (logit_bias_device_) strata::gpu::free(logit_bias_device_);
     if (stop_ids_device_) strata::gpu::free(stop_ids_device_);
+    if (rs_dev_) strata::gpu::free(rs_dev_);
     if (cs_ && cs_ != ext_stream_) strata::gpu::stream_destroy(cs_);   // set_stream: the stage's stream, shared
     if (ev_done_) strata::gpu::event_destroy(ev_done_);
     if (ev_commit_) strata::gpu::event_destroy(ev_commit_);
@@ -327,9 +328,10 @@ static int verify_ecap_cap() {
     static const int n = [] {
         const char* v = std::getenv("STRATA_VERIFY_ECAP");
         const int c = v != nullptr ? (int) std::strtol(v, nullptr, 10) : 0;
-        if (c > 0) std::fprintf(stderr, "strata verify: STRATA_VERIFY_ECAP=%d: a window reads token 0's experts and at "
-                                        "most %d more picks of its draft rows (an approximation); its rows past 0 never "
-                                        "pick a stop token\n", c, c - 10);
+        if (c > 0) std::fprintf(stderr, "strata verify: STRATA_VERIFY_ECAP=%d: a window's expert set is capped at %d "
+                                        "(it applies only where that is above the layer's expert count K): token 0's "
+                                        "experts, then picks of its draft rows up to the cap (an approximation); its "
+                                        "rows past 0 never pick a stop token\n", c, c);
         return c;
     }();
     return n;

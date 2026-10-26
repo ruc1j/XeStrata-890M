@@ -1014,7 +1014,6 @@ if(STRATA_ENABLE_XE)
     add_executable(kv_steps_parity src/kernels/kv_steps_parity.cpp)
     target_link_libraries(kv_steps_parity PRIVATE strata_kernels)
     add_test(NAME kv_steps_parity COMMAND kv_steps_parity)
-    # #783 PR-c: the multi-token router against the single one, the combine against its contract's host replay
     # the dense decode products' time on this GPU (XeStrata-890M), with an output check against a saved run
     add_executable(mmvq_bench src/kernels/mmvq_bench.cpp)
     target_link_libraries(mmvq_bench PRIVATE strata_kernels)
@@ -1026,6 +1025,7 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(gr_bench PRIVATE strata_kernels)
     add_executable(gemm_bench src/kernels/gemm_bench.cpp)
     target_link_libraries(gemm_bench PRIVATE strata_kernels)
+    # #783 PR-c: the multi-token router against the single one, the combine against its contract's host replay
     add_executable(native_multi_parity src/kernels/native_multi_parity.cpp)
     target_link_libraries(native_multi_parity PRIVATE strata_kernels)
     add_test(NAME native_multi_parity COMMAND native_multi_parity)

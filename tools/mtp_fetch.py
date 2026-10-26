@@ -133,6 +133,12 @@ def _final(url):
     return hit[0] if hit and hit[1] > time.monotonic() else url
 
 
+def permanent_http_error(e):
+    """A 4xx answer will not change on a retry: 401, 404, 416 ... fail at once.  Kept for retry: 408 and 429, and 403
+    (a signed CDN address that expired; the next try asks the origin again)."""
+    return isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500 and e.code not in (403, 408, 429)
+
+
 def get(url, start=None, end=None, retries=6):
     for attempt in range(retries):
         try:
@@ -154,7 +160,7 @@ def get(url, start=None, end=None, retries=6):
         except Exception as e:  # network errors are retried, then surfaced
             with _cdn_lock:
                 _cdn.pop(url, None)
-            if attempt == retries - 1:
+            if attempt == retries - 1 or permanent_http_error(e):
                 raise
             time.sleep(min(2 ** attempt, 16))
             print("retry %s: %s" % (url, e), file=sys.stderr)

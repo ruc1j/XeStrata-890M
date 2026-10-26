@@ -197,20 +197,31 @@ bool session_read(const std::string& path, const std::string& model_id, std::vec
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) { err = "cannot read " + path; return false; }
     auto get = [&](void* p, size_t n) { return std::fread(p, 1, n, f) == n; };
+    // every length below is checked against what is left of the file before it sizes a buffer
+    uint64_t file_size = 0;
+    if (std::fseek(f, 0, SEEK_END) == 0) {
+        const long long end = (long long) std::ftell(f);
+        if (end > 0) file_size = (uint64_t) end;
+    }
+    std::rewind(f);
+    auto left = [&] {
+        const long long at = (long long) std::ftell(f);
+        return at < 0 || (uint64_t) at > file_size ? 0 : file_size - (uint64_t) at;
+    };
     char magic[8];
     uint64_t idn = 0, tok = 0, nt = 0, np = 0;
     std::string id;
-    bool ok = get(magic, 8) && std::memcmp(magic, kSessionMagic, 8) == 0 && get(&idn, 8) && idn < 4096;
+    bool ok = get(magic, 8) && std::memcmp(magic, kSessionMagic, 8) == 0 && get(&idn, 8) && idn < 4096 && idn <= left();
     if (ok) { id.resize(idn); ok = get(id.data(), idn) && id == model_id; }
     if (!ok) { std::fclose(f); err = "not a session file of this model and context"; return false; }
-    ok = get(&tok, 8) && get(&nt, 8) && nt == tok && nt < (1ull << 31);
-    if (ok) { ids.resize(nt); ok = get(ids.data(), nt * 4) && get(&np, 8) && np < 4096; }
+    ok = get(&tok, 8) && get(&nt, 8) && nt == tok && nt < (1ull << 31) && nt * 4 <= left();
+    if (ok) { ids.resize(nt); ok = get(ids.data(), nt * 4) && get(&np, 8) && np < 4096 && np * 8 <= left(); }
     snap.tokens = (int64_t) tok;
     snap.parts.assign(ok ? np : 0, {});
     bytes = 8 + 8 + idn + 8 + 8 + nt * 4 + 8;
     for (auto& part : snap.parts) {
         uint64_t n = 0;
-        ok = ok && get(&n, 8) && n < (1ull << 40);
+        ok = ok && get(&n, 8) && n < (1ull << 40) && n <= left();
         if (!ok) break;
         part.resize(n);
         ok = get(part.data(), n);
@@ -334,7 +345,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
             } else {
                 std::vector<int32_t> ids;
-                if (!session_read(path, model_id, ids, snap, bytes, err)) { refuse("invalid", err); continue; }
+                bool read_ok = false;
+                try {
+                    read_ok = session_read(path, model_id, ids, snap, bytes, err);
+                } catch (const std::exception& e) {
+                    err = std::string("the session file cannot be read: ") + e.what();
+                }
+                if (!read_ok) { refuse("invalid", err); continue; }
                 if (!model.restore_state(snap, err)) { refuse("invalid", err); continue; }
                 live = std::move(ids);
                 std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());

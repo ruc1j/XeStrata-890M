@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/plan/plan_main.cpp - the `strata-plan` CLI: print the memory plan, or say why it does not close.
 //
 // The engine must adapt to the GPU it is running on, so the plan is computed from measured free VRAM and the
@@ -14,6 +15,8 @@
 
 int main(int argc, char** argv) {
     uint64_t ctx = 20480;
+    uint64_t pool_given = 0;
+    bool pool_set = false;
     uint64_t free_vram = 12ull * 1000 * 1000 * 1000; // RTX 5070 nominal; overridden by --vram
     strata::plan::Costs costs;
     bool state_given = false;
@@ -42,7 +45,8 @@ int main(int argc, char** argv) {
         } else if (a == "--pool") {
             uint64_t v = 0;
             next(v);
-            free_vram = v;
+            pool_given = v;
+            pool_set = true;
         } else if (a == "--help" || a == "-h") {
             std::printf("usage: strata-plan [--max-context N] [--vram BYTES] [--dense B] [--embd B]\n"
                         "                   [--workspace B] [--state B] [--pool B]\n"
@@ -59,13 +63,15 @@ int main(int argc, char** argv) {
     // default, it is an omission - and this one was worth 85 cache slots of overcommit.
     if (!state_given) costs.state_bytes = strata::plan::state_bytes(strata::plan::Geometry{});
     // The pool is what the KV cache and the expert cache share.  Derived from the card's free VRAM less the
-    // resident dense weights; `--pool` overrides it for reproducing the standard-tier numbers exactly.
-    const uint64_t pool = free_vram > costs.dense_bytes + costs.embd_bytes
+    // resident dense weights; `--pool` overrides it as given (no dense / embd taken off) for reproducing the
+    // standard-tier numbers exactly.  A pool of 0 stays 0: make_plan reports DoesNotClose, the real GPU is not asked.
+    const uint64_t pool = pool_set ? pool_given
+                          : free_vram > costs.dense_bytes + costs.embd_bytes
                               ? free_vram - costs.dense_bytes - costs.embd_bytes
                               : 0;
     try {
         const strata::plan::Plan p = strata::plan::make_plan(ctx, strata::plan::Geometry{}, costs,
-                                                             pool ? pool : strata::plan::vram_pool_bytes());
+                                                             pool);
         std::printf("%s", strata::plan::to_string(p).c_str());
         return 0;
     } catch (const strata::plan::DoesNotClose& e) {

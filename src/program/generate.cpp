@@ -7591,6 +7591,13 @@ int main(int argc, char** argv) {
             } else {
                 o.conversation_cache_mib = 0;
             }
+            // the automatic size came out 0: the check at the start (which saw -1) did not catch --conversation-save
+            if (o.conversation_cache_mib == 0 && !o.conversation_save.empty()) {
+                if (o.serve)
+                    std::fprintf(stderr, "strata serve: warning: --conversation-save needs conversation parking "
+                                         "(--conversation-cache-mib); not saving conversations\n");
+                o.conversation_save.clear();
+            }
         }
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 && use_mtp ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,

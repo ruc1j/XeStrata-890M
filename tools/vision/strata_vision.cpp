@@ -233,18 +233,26 @@ int main(int argc, char** argv) {
             if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE) ichunk = ch;
         }
         if (err.empty() && !ichunk) err = "no image chunk";
-        if (err.empty() && mtmd_encode_chunk(ctx, ichunk) != 0) err = "the vision encoder failed";
+        // the token count and the grid come from the preprocessing in mtmd_tokenize, so they are checked before the (costly) encode
+        int n = 0, nx = 0, ny = 0;
         if (err.empty()) {
             const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ichunk);
-            const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
-            // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
-            const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
-            const int nx = (int) last.x + 1, ny = (int) last.y + 1;
-            if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
+            n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
+            if (n <= 0) err = "the image has no tokens";
+            if (err.empty()) {
+                // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
+                const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
+                nx = (int) last.x + 1;
+                ny = (int) last.y + 1;
+                if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
+            }
             // never silently produce many times the budget (I7, #3690): over the limit (a rounding margin of an eighth) the picture is refused
             if (err.empty() && max_tokens > 0 && n > max_tokens + max_tokens / 8)
                 err = "the picture became " + std::to_string(n) + " image tokens, over the limit of " + std::to_string(max_tokens) +
                       " (vision.max_tokens); send a smaller picture or raise the limit";
+        }
+        if (err.empty() && mtmd_encode_chunk(ctx, ichunk) != 0) err = "the vision encoder failed";
+        if (err.empty()) {
             const float* embd = mtmd_get_output_embd(ctx);
             FILE* f = err.empty() ? std::fopen(out.c_str(), "wb") : nullptr;
             if (err.empty() && !f) err = "cannot write " + out;

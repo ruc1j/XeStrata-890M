@@ -624,6 +624,11 @@ bool MtpDrafter::make_sketch(std::string& err) {
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     if (!on || sk_bits_ != nullptr || head_ == nullptr) return true;
+    if (head_->type() < 0 || head_->type() >= GGML_TYPE_COUNT) {   // the engine's own row layouts, not GGUF row order
+        std::fprintf(stderr, "strata: mtp: the head sketch is off: the head's type %d is the engine's row layout, "
+                             "not a ggml type\n", (int) head_->type());
+        return true;
+    }
     const ggml_type_traits* tr = ggml_get_type_traits((ggml_type) head_->type());
     const int64_t n_in = g_->n_embd, rows = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
     const size_t row_bytes = head_->row_bytes();

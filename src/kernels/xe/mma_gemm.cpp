@@ -228,13 +228,13 @@ struct Kernel {
     // 4.72 -> 2.83; block_order).  The grid is padded to whole blocks; a work-group past the last tile returns at
     // once.
     static int64_t per_expert(int64_t tiles_m, int64_t tiles_n, int64_t blk_m, int64_t blk_n) {
-        if (blk_m <= 0) return tiles_m * tiles_n;
+        if (blk_m <= 0 || blk_n <= 0) return tiles_m * tiles_n;
         return (tiles_m + blk_m - 1) / blk_m * blk_m * ((tiles_n + blk_n - 1) / blk_n * blk_n);
     }
     bool tile_of(int64_t g, int64_t& ex, int64_t& wm0, int64_t& wn0) const {
         const int64_t per = per_expert(tiles_m, tiles_n, blk_m, blk_n), r = g % per;
         ex = g / per;
-        if (blk_m <= 0) {
+        if (blk_m <= 0 || blk_n <= 0) {
             wm0 = r % tiles_m * WM;
             wn0 = r / tiles_m * WN;
             return true;
@@ -508,7 +508,7 @@ std::pair<int64_t, int64_t> block_order(const sycl::queue& q) {
         char* e = nullptr;
         const long m = std::strtol(v, &e, 10);
         const long n = *e == ',' ? std::strtol(e + 1, nullptr, 10) : m;
-        return std::pair<int64_t, int64_t>{std::max(0L, m), std::max(0L, n)};
+        return m > 0 && n > 0 ? std::pair<int64_t, int64_t>{m, n} : std::pair<int64_t, int64_t>{0, 0};   // a bad or 0 side: M first
     }();
     if (env.first >= 0) return env;
     return amd_wmma(q.get_device()) ? std::pair<int64_t, int64_t>{8, 8} : std::pair<int64_t, int64_t>{0, 0};

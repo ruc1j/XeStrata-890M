@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -34,7 +35,11 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--save") && i + 1 < argc) save = argv[++i];
         else if (!std::strcmp(argv[i], "--check") && i + 1 < argc) check = argv[++i];
-        else gu = std::atoi(argv[i]);
+        else if (argv[i][0] >= '0' && argv[i][0] <= '9') gu = std::atoi(argv[i]);
+        else {
+            std::fprintf(stderr, "usage: expert_bench [--save F | --check F] [gu_type]\n");
+            return 2;
+        }
     }
     const int64_t n_embd = 2560, n_ff = 640;
     const int d = 42;
@@ -133,6 +138,7 @@ int main(int argc, char** argv) {
     }
     if (!save.empty()) {
         FILE* f = std::fopen(save.c_str(), "wb");
+        if (!f) { std::fprintf(stderr, "cannot write %s: %s\n", save.c_str(), std::strerror(errno)); return 1; }
         std::fwrite(all.data(), 4, all.size(), f);
         std::fclose(f);
         std::printf("saved %zu outputs\n", all.size());

@@ -261,6 +261,41 @@ std::vector<LogicalCpuInfo> logical_cpu_layout() {
 double container_cpu_quota() {
 #if defined(__linux__)
     // cgroup v2: "max 100000" (no limit) or "<quota> <period>"; v1: cpu.cfs_quota_us (-1: none) / cpu.cfs_period_us
+    // v2 from the process's own cgroup ("0::<path>" in /proc/self/cgroup) up to the root: the smallest quota of the
+    // path (a systemd service's CPUQuota= sits in a sub-cgroup; a container's namespace shows its own as the root)
+    {
+        std::string path;
+        if (std::FILE* f = std::fopen("/proc/self/cgroup", "r")) {
+            char line[4096];
+            while (std::fgets(line, sizeof line, f))
+                if (std::strncmp(line, "0::", 3) == 0) {
+                    path = line + 3;
+                    while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
+                    break;
+                }
+            std::fclose(f);
+        }
+        double best = 0;
+        bool found = false;
+        while (!path.empty() && path[0] == '/') {
+            if (std::FILE* f = std::fopen(("/sys/fs/cgroup" + path + "/cpu.max").c_str(), "r")) {
+                char a[32] = {0};
+                long period = 0;
+                if (std::fscanf(f, "%31s %ld", a, &period) == 2) {
+                    found = true;
+                    if (std::strcmp(a, "max") != 0 && period > 0) {
+                        const double q = std::atof(a) / (double) period;
+                        if (q > 0 && (best <= 0 || q < best)) best = q;
+                    }
+                }
+                std::fclose(f);
+            }
+            const size_t slash = path.rfind('/');
+            if (slash == std::string::npos) break;
+            path.resize(slash);
+        }
+        if (found) return best;
+    }
     if (std::FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {
         char a[32] = {0};
         long period = 0;

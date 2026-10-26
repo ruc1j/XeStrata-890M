@@ -1751,7 +1751,10 @@ bool Prefill::Impl::hc_mmq(const core::WeightRef* wd, const core::WeightRef* wu,
 // shared expert's SwiGLU).
 bool Prefill::Impl::dense_proj(const core::WeightRef* w, const float* x32, const uint16_t* x16, bool fresh, float* Y,
                                int64_t T, const std::string& name, std::string& err, int64_t ldy) {
-    if (!dense_ok(w)) return native_proj(gemm, w, x16, Y, T, name, err, ldy);
+    if (!dense_ok(w)) {
+        if (fresh) xqd_src = nullptr;   // x holds new values: the group's later projections quantize again
+        return native_proj(gemm, w, x16, Y, T, name, err, ldy);
+    }
     const int t = w->native_type;
     const int64_t K = w->ne0;
     const bool sums = strata::kernels::iq_mmq_type_sums(t), dup = strata::kernels::iq_mmq_type_dup(t);

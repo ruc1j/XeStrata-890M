@@ -18,13 +18,14 @@ main() {
     echo "Getting the newest XeStrata (git pull) ..."
     if ! git pull --ff-only; then
       echo
-      echo "git pull did not succeed (the reason is above): nothing was updated. Files you changed here can stop it:"
-      echo "\"git status\" lists them."
+      echo "git pull did not succeed (the reason is above): nothing was updated. Files you changed here can stop it"
+      echo "(\"git status\" lists them), and so can a branch with no upstream or a detached HEAD (\"git branch -vv\"."
+      echo "shows which branch this is and what it tracks)."
       exit 1
     fi
   else
     echo "This copy of XeStrata was not made with git, so it cannot fetch new files itself. Download the newest one:"
-    echo "  https://github.com/MistVVK/XeStrata/archive/refs/heads/main.zip"
+    echo "  https://github.com/ruc1j/XeStrata-890M/archive/refs/heads/main.zip"
     echo "unzip it anywhere and run ./setup.sh (or ./update.sh) in it: it finds the model files in XeStrata-data and"
     echo "sets itself up the same way - nothing big is downloaded again."
     echo "Checking this copy's engine and settings meanwhile ..."

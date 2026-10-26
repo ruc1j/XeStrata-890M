@@ -17,7 +17,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#if !defined(_WIN32)
 #include <dlfcn.h>
+#endif
 #include <map>
 #include <cstdlib>
 #include <mutex>
@@ -243,12 +245,14 @@ const HipHost& hip_host() {
         try {
             if (rt().device().get_backend() != sycl::backend::ext_oneapi_hip) return r;
         } catch (const std::exception&) { return r; }
+#if !defined(_WIN32)
         void* lib = dlopen("libamdhip64.so", RTLD_NOW | RTLD_GLOBAL);
         if (lib == nullptr) lib = dlopen("libamdhip64.so.7", RTLD_NOW | RTLD_GLOBAL);
         if (lib == nullptr) return r;
         r.malloc_ = reinterpret_cast<int (*)(void**, size_t, unsigned)>(dlsym(lib, "hipHostMalloc"));
         r.free_ = reinterpret_cast<int (*)(void*)>(dlsym(lib, "hipHostFree"));
         if (r.malloc_ == nullptr || r.free_ == nullptr) r = HipHost{};
+#endif   // Windows: no dlopen here, the functions stay null and alloc_host_cached takes alloc_host
         return r;
     }();
     return h;

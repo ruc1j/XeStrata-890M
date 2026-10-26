@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -27,8 +28,15 @@ struct Shape { int n_in, n_out; const char* name; };
 }  // namespace
 
 int main(int argc, char** argv) {
-    const std::string save = argc == 3 && std::strcmp(argv[1], "--save") == 0 ? argv[2] : "";
-    const std::string check = argc == 3 && std::strcmp(argv[1], "--check") == 0 ? argv[2] : "";
+    std::string save, check;
+    for (int i = 1; i < argc; ++i) {
+        if (!std::strcmp(argv[i], "--save") && i + 1 < argc) save = argv[++i];
+        else if (!std::strcmp(argv[i], "--check") && i + 1 < argc) check = argv[++i];
+        else {
+            std::fprintf(stderr, "usage: mmvq_bench [--save F] [--check F]\n");
+            return 2;
+        }
+    }
     const Shape shapes[] = {{2560, 10240, "qkv"}, {2560, 6144, "gate"}, {2560, 640, "shexp"}, {6144, 2560, "ssm_out"}};
     std::mt19937 rng(1234);
     void* s = strata::gpu::stream_create();
@@ -77,6 +85,7 @@ int main(int argc, char** argv) {
     }
     if (!save.empty()) {
         FILE* f = std::fopen(save.c_str(), "wb");
+        if (!f) { std::fprintf(stderr, "cannot write %s: %s\n", save.c_str(), std::strerror(errno)); return 1; }
         std::fwrite(all.data(), 4, all.size(), f);
         std::fclose(f);
         std::printf("saved %zu outputs\n", all.size());

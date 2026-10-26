@@ -7020,6 +7020,20 @@ def explicit_no_key(value) -> bool:
     return isinstance(value, str) and value.strip().lower() == "none"
 
 
+def has_public_address(host, ips) -> bool:
+    """True when the server listens on a publicly routable address: the bound host itself, or (for a wildcard bind)
+    one of this PC's addresses.  Private, loopback, link-local and carrier-grade NAT ranges are not public."""
+    import ipaddress
+    names = list(ips) if host in ("0.0.0.0", "", "::") else [host]
+    for name in names:
+        try:
+            if ipaddress.ip_address(name.strip("[]")).is_global:
+                return True
+        except ValueError:
+            pass                                        # a host name: its addresses are not known here
+    return False
+
+
 def open_server_warning(port, public=False, tools=False) -> str:
     """The one plain warning for a server on the network with no API key (recommend, never force)."""
     msg = f"no API key: anyone who can reach port {port} can use the model" + (" and its tools" if tools else "") + "."
@@ -7777,7 +7791,8 @@ def main() -> int:
         if not ips:
             print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
         if not svc.api_key:
-            print("       WARNING: " + open_server_warning(a.port, tools=svc.mcp is not None),
+            print("       WARNING: " + open_server_warning(a.port, public=has_public_address(a.host, ips),
+                                                       tools=svc.mcp is not None),
                   flush=True)
         if os.name == "nt":
             print("       nothing arrives? Windows Firewall blocks it until allowed: accept its prompt for Python, or "

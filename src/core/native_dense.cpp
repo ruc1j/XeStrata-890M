@@ -38,15 +38,16 @@ bool in_range(const std::string& name) {
 // weights: the output changes (KL 0.025-0.031 against the BF16 read, IQ3_XXS, 2026-10-14).  =1 always, =0 never;
 // unset, the read is timed in both forms at load and the Q8_0 one kept only where it is faster (the user's decision
 // of 2026-10-15: 32K decode B70 +3.7%, RX 9060 XT -2.9% with it).
-enum class HcQ8 { Off, On, Auto };
+enum class HcQ8 { Off, On, OnDefault, Auto };   // OnDefault: On by default (integrated GPU), a failed Q8_0 copy falls back to BF16
 // XeStrata-890M: unset on a GPU that shares the host's RAM is On, not Auto: the decode is bound by the memory there
 // (the 890M: 22.82/23.35 -> 24.21/24.49 tok/s, IQ2_XS, its BF16 matrices quantized below) and the timed choice
-// would say the same; STRATA_HC_Q8=0 turns it off.
+// would say the same; STRATA_HC_Q8=0 turns it off.  Only =1 makes a failed Q8_0 copy fatal: unset, it falls back
+// to the BF16 read as Auto does.
 HcQ8 hc_q8_mode() {
     static const HcQ8 mode = [] {
         const char* v = std::getenv("STRATA_HC_Q8");
         if (v == nullptr || *v == 0)
-            return strata::core::device_info(strata::core::current_device()).integrated ? HcQ8::On : HcQ8::Auto;
+            return strata::core::device_info(strata::core::current_device()).integrated ? HcQ8::OnDefault : HcQ8::Auto;
         return std::strtol(v, nullptr, 10) != 0 ? HcQ8::On : HcQ8::Off;
     }();
     return mode;
@@ -428,7 +429,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 if (status) status = strata::gpu::copy(data.get(), src, bytes);
                 if (!status) {
-                    if (hc_q8_mode() == HcQ8::Auto) { hc_q8_short = true; break; }
+                    if (hc_q8_mode() == HcQ8::Auto || hc_q8_mode() == HcQ8::OnDefault) { hc_q8_short = true; break; }
                     err = "native dense (STRATA_HC_Q8) upload " + tensor.name + ": " + strata::gpu::last_error();
                     return false;
                 }
@@ -455,7 +456,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 const uint64_t bytes_pad = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) hc_q8_rows_of(ref.ne1);
                 void* allocation = nullptr;
                 if (!strata::gpu::alloc_device(&allocation, bytes_pad)) {
-                    if (hc_q8_mode() == HcQ8::Auto) { hc_q8_short = true; break; }
+                    if (hc_q8_mode() == HcQ8::Auto || hc_q8_mode() == HcQ8::OnDefault) { hc_q8_short = true; break; }
                     err = "native dense (STRATA_HC_Q8) alloc " + name + ": " + strata::gpu::last_error();
                     return false;
                 }

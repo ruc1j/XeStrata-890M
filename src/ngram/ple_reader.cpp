@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/ngram/ple_reader.cpp - see include/strata/ngram/ple_reader.hpp.
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -467,6 +468,7 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     }
     // Sorted by offset: prefill chunks then read the SSD in near-sequential order.
     std::sort(jobs.begin(), jobs.end(), [](const Job& a, const Job& b) { return a.offset < b.offset; });
+    if (!m.error.empty()) jobs.clear();   // after an I/O error nothing reads: the ticket completes at once, collect() returns the error
     ts.pending = (uint32_t) jobs.size();
     const bool has_jobs = ts.pending > 0;
     for (Job& j : jobs) m.queue.push_back(std::move(j));
@@ -493,7 +495,7 @@ bool PleReader::collect(Ticket t, std::string& err) {
         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
         m.cv_done.wait(lk, [&] {
             const auto current = m.tickets.find(t.id);
-            return current == m.tickets.end() || current->second.pending == 0;
+            return current == m.tickets.end() || current->second.pending == 0 || !m.error.empty();
         });
         it = m.tickets.find(t.id);
         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
