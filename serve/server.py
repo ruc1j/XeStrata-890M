@@ -3372,6 +3372,9 @@ class Service:
         # #321: origins that count as Strata's own page for /settings and MCP tools, e.g. the web app reached through a
         # reverse proxy or tunnel whose Host differs ("https://strata.example.com"); never a wildcard
         self.trusted_origins: list[str] = []
+        # XeStrata-890M (#43): a client on another computer may name an image file on this PC (the config's
+        # remote_image_files); off, only a client on this PC may
+        self.remote_image_files = False
         # DNS rebinding: extra Host names this server answers to (the config's allowed_hosts, $STRATA_ALLOWED_HOSTS;
         # "*" = any), and every name it answers to, which serve() works out from the address it listens on
         self.allowed_hosts: list[str] = []
@@ -6379,11 +6382,19 @@ def make_handler(svc: Service):
             self._no_local_sources(images_of(messages))
 
         def _no_local_sources(self, sources):
-            """_no_local_images for a list of image sources (the chat routes', and #27 /v1/images/edits')."""
-            if self._foreign_origin() and any(not src.startswith(("data:", "http://", "https://")) for src in sources):
+            """_no_local_images for a list of image sources (the chat routes', and #27 /v1/images/edits').
+            XeStrata-890M (#43): a client on another computer (a LAN address when the server listens beyond this PC)
+            cannot name a file either, unless the config's remote_image_files is true: with no api_key anyone who
+            reaches the server could read an image file of this PC, and the errors told which paths exist."""
+            if not any(not src.startswith(("data:", "http://", "https://")) for src in sources):
+                return
+            if self._foreign_origin():
                 raise ValueError("a web page of another origin cannot have a file on this computer read as an "
                                  "image: send it as a data: URL (or add the page's origin to the config's "
                                  "trusted_origins)")
+            if not svc.remote_image_files and not loopback_peer(self.client_address[0]):
+                raise ValueError("a client on another computer cannot have a file on this computer read as an "
+                                 "image: send it as a data: URL (or set the config's remote_image_files to true)")
 
         def _settings(self):
             # They change what every client gets, so only the app's own page may set them
@@ -6967,6 +6978,17 @@ def allowed_hosts_of(value, env: str = "") -> list[str]:
             raise ValueError(f"allowed_hosts: {raw!r} is not a host name like strata.example.com")
         out.append("." + name if dot else name)
     return list(dict.fromkeys(out))
+
+
+def loopback_peer(address: str) -> bool:
+    """XeStrata-890M (#43): a request's peer address is this PC (127.0.0.0/8, ::1, an IPv4-mapped loopback)."""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return (mapped or ip).is_loopback
 
 
 def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[str]:
@@ -7678,6 +7700,7 @@ def main() -> int:
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
+    svc.remote_image_files = cfg.get("remote_image_files") is True
     try:
         svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"), os.environ.get("STRATA_ALLOWED_HOSTS", ""))
     except ValueError as e:

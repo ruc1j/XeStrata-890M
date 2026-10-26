@@ -926,6 +926,9 @@ print(r.choices[0].message.content)
   `Origin` を送らないクライアント（curl、OpenAI と Anthropic の SDK、ほかのサーバー）には関係ありません。
   API キーがあれば、キーで決まります。
   `POST /unload`、`POST /load`、`POST /config` は、`/settings` と同じく、XeStrata 自身のページ（または `Origin` なし）からの `Content-Type: application/json` を受け付けます。
+- この PC の画像ファイル: 要求の画像にファイルのパス（`/home/...`、`file://...`）を書けるのは、この PC のクライアント（`127.0.0.1`、`::1`）だけです。
+  別のコンピューターからの要求には **400** を返すので、そこからは画像を `data:` の URL で送ります。
+  信頼できる LAN のクライアントにもファイルを読ませるときは、`xestrata-<model>.json` に `"remote_image_files": true` と書きます。
 - 要求ごとに 1 行: server の環境に `STRATA_REQUEST_LINES=1` を設定すると、終わった要求ごとに、エンジンのログの数字を 1 行で出します
   （`request prompt P cached C output O prompt_read R ms total S ms prefill X tok/s decode Y tok/s`）。
   server の出力しか見ない監視のプログラム向けです。

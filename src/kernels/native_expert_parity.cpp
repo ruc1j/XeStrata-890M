@@ -411,7 +411,13 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
     }
     // (d) the CPU's canonical rows (canon_expert.hpp) against the GPU's grouped experts: the same bits, the NT tokens at
     // once and one at a time (an expert's rows on either side of a verify window, #152)
-    if (cpu::canon_layer(f)) {
+    // XeStrata-890M: only upstream's rows promise these bits; the fork's rows for an integrated GPU on the HIP backend
+    // round otherwise (iq_kernels.cpp, apu_rows), so there the comparison is not made
+    const bool canon_rows = strata::kernels::native_expert_canon_rows(s);
+    if (cpu::canon_layer(f) && !canon_rows)
+        std::printf("          canon CPU vs GPU: not compared (the GPU takes the fork's expert rows for an integrated GPU "
+                    "on the HIP backend; STRATA_GPU_CANON=1 compares upstream's)\n");
+    if (cpu::canon_layer(f) && canon_rows) {
         std::vector<float> got_k((size_t) NT * H), ffb((size_t) NT * FF);
         std::vector<cpu::NativeAct> aq((size_t) NT);
         std::vector<std::array<uint8_t, cpu::kNativeHBytes>> hq((size_t) NT);

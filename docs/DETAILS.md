@@ -953,6 +953,9 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Clients that send no `Origin` (curl, the OpenAI and Anthropic SDKs, other servers) are not affected.
   With an API key, the key decides.
   `POST /unload`, `POST /load` and `POST /config` take `Content-Type: application/json` from XeStrata's own page (or no `Origin`), like `/settings`.
+- **Image files on this PC.** Only a client on this PC (`127.0.0.1`, `::1`) may name a file (`/home/...`, `file://...`) as a request's image.
+  A request from another computer gets **400**, so send the picture as a `data:` URL from there.
+  To let clients on a trusted LAN name files as well, write `"remote_image_files": true` in `xestrata-<model>.json`.
 - **One line per request.** `STRATA_REQUEST_LINES=1` in the server's environment prints each finished request's numbers from the engine's log
   (`request prompt P cached C output O prompt_read R ms total S ms prefill X tok/s decode Y tok/s`),
   for a supervisor that only sees the server's output.

@@ -95,6 +95,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
+/// XeStrata-890M: whether `native_expert_grouped` takes upstream's canon rows on the stream's device, whose sums are
+/// the CPU's canonical rows' bit for bit (#152); false where it takes the fork's rows for an integrated GPU on the HIP
+/// backend, which round otherwise.  STRATA_GPU_CANON=1 / 0 forces either.
+bool native_expert_canon_rows(void* stream);
 /// APR (prism.hadamard): y = H_block (signs * x) per block of `block` values of each of `rows` rows of `width`
 /// (x and y may be the same rows); `signs` a DEVICE vector of `width` signs or nullptr, the float values those of
 /// hadamard_rotate.  The f16 form rotates FP16 rows in place, computing in float.

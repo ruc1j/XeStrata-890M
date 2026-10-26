@@ -5009,9 +5009,32 @@ class ImageSources(unittest.TestCase):
                         status, b = post("/v1/chat/completions", src, headers)
                         self.assertEqual(status, 200, b)
                 self.assertEqual(vision.got, [data, f, f, f])
+                # XeStrata-890M (#43): a client on another computer names no file, unless remote_image_files is set
+                vision.got.clear()
+                with mock.patch("serve.server.loopback_peer", return_value=False):
+                    for src in (f, "file://" + f):
+                        with self.subTest(remote=src):
+                            status, b = post("/v1/chat/completions", src, {"Content-Type": "application/json"})
+                            self.assertEqual(status, 400, b)
+                            self.assertIn("another computer", b["error"]["message"])
+                    self.assertEqual(vision.got, [])
+                    status, b = post("/v1/chat/completions", data, {"Content-Type": "application/json"})
+                    self.assertEqual(status, 200, b)
+                    svc.remote_image_files = True
+                    status, b = post("/v1/chat/completions", f, {"Content-Type": "application/json"})
+                    self.assertEqual(status, 200, b)
+                self.assertEqual(vision.got, [data, f])
             finally:
                 httpd.shutdown()
                 httpd.server_close()
+
+    def test_loopback_peer(self):
+        from serve.server import loopback_peer
+        for addr, want in (("127.0.0.1", True), ("127.8.9.1", True), ("::1", True), ("::ffff:127.0.0.1", True),
+                           ("192.168.1.20", False), ("10.0.0.5", False), ("fe80::1%eth0", False),
+                           ("::ffff:192.168.1.20", False), ("", False), ("not an address", False)):
+            with self.subTest(addr=addr):
+                self.assertEqual(loopback_peer(addr), want)
 
 
 class CountingEngine(MockEngine):
