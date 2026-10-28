@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Syntax highlighting for chat.py's streamed output: fenced code blocks get colored (tags, strings, comments,
 keywords, numbers), everything else passes through unchanged. Standard library only, no dependency.
 

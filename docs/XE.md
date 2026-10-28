@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.2.3.1-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.3.1-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+XeStrata xe0.2.7.1-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.7.1-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -30,6 +30,32 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
+
+## Integration through Strata 0.1.53
+
+Of the 796 commits from upstream Strata 0.2.3.1 to 0.2.7.1 (the engine's version is 0.1.53), the 596 that touch the engine, serve, setup and tools layers were looked at, and the changes of 33 commits are carried into XeStrata-890M (Issue #49).
+Most of upstream's changes in this span are for the DeepSeek engine, Metal, the DGX Spark and NVIDIA's kernels, which this fork does not have.
+
+The main things carried over:
+
+- serve: when a call for a tool the request did not declare comes back as text, its name is added to the reply as `strata_rejected_tool_calls` and counted in `/metrics/prometheus`. A namespaced tool is also read as `namespace=member`, `namespace_member`, the bare `member` and with every `__` collapsed to `_`.
+  `--host ::` listens on IPv6, `/v1/responses` reads `max_output_tokens` 0 and -1 as no cap and carries `timings`, and `repair_latex_escapes` repairs JSON broken by LaTeX escapes before it is checked.
+  Chat Completions tool results are put back in call order, a request without messages is a 400, and an image encoder that cannot start gives a 503.
+- engine: the n-gram table is kept in RAM when the RAM holds the table, the expert arena and 8 GiB more (`STRATA_PLE_AUTO_RAM=0` turns it off; the 890M's 62 GiB does not qualify).
+  A failed direct PLE read no longer leaves the next ticket waiting for ever, and the table is protected when several threads use it.
+  `STRATA_RAM_ADAPT` swaps up to four pairs a layer and copies an expert out of its stage buffer instead of reading the file; `--adapt-decay` takes 0 to 1 only; the retained K/V of a restored conversation is never used to park another one.
+- setup and tools: cmake and ninja come from the venv first and an old cmake is not used; a build folder configured with another generator is configured afresh.
+  A download falls back to the published size when the length cannot be read and says so when no data arrives for two minutes; the pip record remembers which OS wrote it. gguf_reader bounds its header reads, and calibrate goes on when an engine dies during a measurement.
+
+Not carried over:
+
+- The DeepSeek engine (src/dsv41, trellis), Metal and the Mac, the DGX Spark (the arm64 CUDA build and the sm_121 table), NVIDIA's kernels and defaults (the sm_80, sm_89 and sm_120 tables, MMVQ-IL, the fused prompt, qsa_select), the two-card layer-major prefill and pipelined batch, the gfx12 (R9700) defaults, the Windows gfx1151 defaults.
+- setup and serve changes that depend on upstream's product layers (app, Terminal, Control, packaging, docker), and the large rework of the web page (history, languages, KaTeX, previews, MCP pictures).
+- Deferred: KVA (the approximate read of long prompts: a large port of the CUDA prompt path, off by default upstream too), the SPEC_PROB proposal law with the window-invariant CPU rows (#3416; it overlaps the fork's row choice of Issue #31), the AVX-512 gather rows (they need exact rows the fork lacks), the conversation-cache changes that depend on CUDA copy streams, the rework of the idle slot's park, and telling a checkpoint copy's failure by a sticky error.
+  The QFUSE commit fix and the q8_1 division fix do not apply: the fork's windows self-commit and all its divisions are IEEE.
+
+Checked: the free build, CTest (passes but for the two tests that need a pack), the serve and tools Python tests, and the decode before and after on the 890M (abliterated IQ2_XS, greedy, three interleaved rounds: 30.93 and 31.46 tok/s before, 31.79, 31.46 and 31.44 after, same answers).
+The contrib-llvm build, the Windows cross build and other GPUs are unverified.
 
 ## Integration through Strata 0.1.48.1
 

@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.2.3.1-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.3.1-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+XeStrata xe0.2.7.1-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.7.1-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
@@ -31,6 +31,32 @@ Qwen3.8 の prompt は xmx_gemm が動く GPU では FP16 の経路のままに�
 `STRATA_VRAM_LIMIT_MIB` はエンジンから見える VRAM を、`STRATA_MAX_ALLOC_MIB` は想定する最大の確保量を制限し、
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は確認用の 2 つ目の実機として使います。
+
+## Strata 0.1.53 の取り込み
+
+upstream の Strata 0.2.3.1 から 0.2.7.1（エンジンの版は 0.1.53）までの 796 コミットのうち、エンジン・serve・setup・tools の層に当たる 596 コミットを見て、33 コミットの変更を XeStrata-890M に移しています（Issue #49）。
+この間の upstream の変更の大半は DeepSeek のエンジン、Metal、DGX Spark、NVIDIA のカーネルのもので、この fork には当たりません。
+
+移したものの主なものは次のとおりです。
+
+- serve: 宣言していない名前のツールの呼び出しを文のまま返すとき、その名前を `strata_rejected_tool_calls` で答えに添え、`/metrics/prometheus` で数えます。名前空間つきのツールを `namespace=member`、`namespace_member`、`member` だけの綴りと、`__` を `_` に潰した綴りでも読みます。
+  `--host ::` で IPv6 で待ち受け、`/v1/responses` は `max_output_tokens` の 0 と -1 を上限なしと読んで答えに `timings` を付け、`repair_latex_escapes` で LaTeX のエスケープで壊れた JSON を直してから確かめます。
+  Chat Completions のツールの結果を呼び出しの順に並べ直し、message のない要求は 400 にし、画像のエンコーダーが起動できなければ 503 を返します。
+- エンジン: n-gram の表を、RAM に表とエキスパートの置き場と 8 GiB の余りが入るときは RAM に置きます（`STRATA_PLE_AUTO_RAM=0` で止まります。890M の 62 GiB では置きません）。
+  PLE の直接読みで、失敗した読みが次のチケットを永久に待たせていたのを直し、表を複数のスレッドから使うときの保護を足しました。
+  `STRATA_RAM_ADAPT` は層ごとに 4 組まで入れ替え、stage のバッファーにあるエキスパートはファイルを読まずに写します。`--adapt-decay` は 0〜1 だけを受けます。復元した会話の retained K/V を、別の会話を置くときに使いません。
+- setup と tools: cmake と ninja は venv のものを先に取り、古い cmake は使いません。別の generator で configure された build フォルダーは作り直します。
+  ダウンロードは、長さが取れなければ公開された大きさを使い、2 分データが来なければそう言います。pip の記録はどの OS が書いたかを覚えます。gguf_reader はヘッダーの読みに上限を置き、calibrate は計測の途中でエンジンが落ちても続けます。
+
+移していないのは次のとおりです。
+
+- DeepSeek のエンジン（src/dsv41、trellis）、Metal と Mac、DGX Spark（arm64 の CUDA ビルドと sm_121 の表）、NVIDIA のカーネルと既定（sm_80・sm_89・sm_120 の表、MMVQ-IL、fused の prompt、qsa_select）、2 枚の GPU の layer-major prefill と pipelined batch、gfx12（R9700）だけの既定、Windows の gfx1151 だけの既定。
+- upstream の製品層（app、Terminal、Control、packaging、docker）に依る setup と serve の変更、web ページの大きな改装（履歴、多言語、KaTeX、プレビュー、MCP の絵）。
+- 見送ったもの: KVA（長い prompt の近似読み。CUDA の prompt の経路の大きな移植で、upstream も既定オフ）、SPEC_PROB の提案則と窓に依らない CPU の行の組（#3416。fork の Issue #31 の行の選び方と重なります）、AVX-512 の gather の行（fork にない exact rows が要ります）、会話キャッシュの CUDA の copy stream に依る変更、idle slot の park の書き直し、checkpoint の写しの失敗を sticky error で見分ける変更。
+  QFUSE の commit の修正と q8_1 の除算の修正は、fork の窓が self-commit し、除算がどれも IEEE なので当たりません。
+
+確かめたのは、free のビルド、CTest（pack のない 2 本を除いて通ります）、serve と tools の Python の試験、890M での decode の前後の比較（abliterated 版 IQ2_XS、greedy、交互 3 周: 前 30.93・31.46 tok/s、後 31.79・31.46・31.44 tok/s、答えは同じ）です。
+contrib-llvm のビルド、Windows のクロスビルド、ほかの GPU は unverified です。
 
 ## Strata 0.1.48.1 の取り込み
 

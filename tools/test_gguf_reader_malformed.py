@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """A malformed GGUF header is refused with a ValueError that names the file, never a KeyError, OverflowError
 or struct.error (#1919). Tensor-size support and setup compatibility policy are unchanged.
 Over minimal GGUF v3 files written here (no download, no model, no GPU).
