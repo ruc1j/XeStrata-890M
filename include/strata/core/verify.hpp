@@ -90,6 +90,8 @@ public:
     virtual void set_history(const int32_t* history, int history_len) = 0;
     /// Same process: the drafter's q rows for the next window (Verifier::set_spec_q).
     virtual void set_spec_q(const int32_t* q, int n_q) = 0;
+    /// Same process: an explicit gated measure for the next window only (Verifier::set_spec_proposal, upstream #3416).
+    virtual void set_spec_proposal(const int32_t* q, int n_q) = 0;
     virtual bool read_logits(int rows, float* host, std::string& err) const = 0;
     virtual bool copy_logits(int t, float* host) const = 0;
     /// The last stage's check of its head logits (#879): the first row that held a NaN or an infinity, its position,
@@ -123,6 +125,7 @@ public:
     bool set_stop_ids(const std::vector<int32_t>& ids, std::string& err) override;
     void set_history(const int32_t* history, int history_len) override;
     void set_spec_q(const int32_t* q, int n_q) override;
+    void set_spec_proposal(const int32_t* q, int n_q) override;
     bool read_logits(int rows, float* host, std::string& err) const override;
     bool copy_logits(int t, float* host) const override;
     int nonfinite_row() const override;
@@ -201,8 +204,20 @@ public:
     void set_spec_q(const int32_t* q, int n_q) {
         spec_q_ = q;
         spec_nq_ = n_q;
+        spec_measure_ = false;
         if (next_) next_->set_spec_q(q, n_q);
     }
+    /// Borrow immutable gated measure rows for the next run only. nq==T denotes
+    /// a NULL tail, nq<T a plain bonus. Errors never fall back to ordinary p.
+    /// nq == 0 accepts a null pointer: point-only rows and a plain bonus (T1: plain p).
+    /// Keep the host rows alive and unchanged until run returns.
+    void set_spec_proposal(const int32_t* q, int n_q) {
+        spec_q_ = q;
+        spec_nq_ = n_q;
+        spec_measure_ = true;
+        if (next_) next_->set_spec_proposal(q, n_q);
+    }
+
     int64_t spec_windows = 0;   ///< windows judged by rejection sampling
     /// XeStrata-890M, STRATA_VERIFY_MARGIN=a,pmin (opt-in): greedy windows keep a draft that is not the row's argmax
     /// when p(draft) >= a * p(argmax) and p(draft) >= pmin (the raw softmax), and go on past it.  The output changes:
@@ -506,6 +521,7 @@ private:
     void accumulate_profile_inner(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
     // pipelined windows (pl_launch ...)
     strata::gpu::Stream ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
+    bool spec_measure_ = false;   ///< explicit per-call measure borrow
     bool always_publish_ = false;
     bool pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
     strata::gpu::Event *ev_done_ = nullptr, *ev_commit_ = nullptr;
@@ -561,6 +577,7 @@ private:
     // segments the host launches one after another, cut before each layer group's experts; no kernel waits on a
     // flag.  STRATA_VERIFY_SEGMENTED=1 / 0 forces it either way.
     bool segmented_ = false;
+    bool no_window_eviction_ = false;   ///< capture_all wants every size at once: it must not free one to capture another (#3702)
     std::vector<strata::gpu::Graph*> segs_[9];
     std::vector<strata::gpu::Graph*>* seg_out_ = nullptr;   // the segments of the window being captured
 

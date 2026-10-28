@@ -147,6 +147,7 @@ It costs about 13.7 KB of RAM per context token, about 1.7 GB at 128K.
 **The elastic K/V** (`--kv-grow` or `STRATA_KV_GROW=1`, upstream 9e3dbfe7): the whole KV cache in VRAM, taking VRAM only for the cells the requests reach.
 The expert cache holds the rest, giving slots to the K/V as the context grows and taking them back after a short request.
 Both live in virtual memory (`sycl_ext_oneapi_virtual_mem`) and neither address moves, so the captured graphs stay valid.
+When a new size's graph cannot be made for lack of VRAM, the largest captured graph of another size is freed and the new one captured (a port of upstream #3702): the larger windows take the most VRAM and are asked for least often, and a freed size is captured again when it is next needed.
 It needs one GPU with virtual memory, an expert profile, no KV streaming and every expert in RAM; otherwise (and with `--batch` or `--vram-elastic`) the engine says so and stays off.
 `STRATA_KV_GROW_HOLD=1` keeps the longest parked conversation's cells in the K/V until it comes back.
 At a 128K context, int8, IQ2_XS and a 4,945-token prompt (one run each) the result differs by card.
@@ -1056,6 +1057,10 @@ A chat and an agent's subagent can then alternate without re-reading each other.
 - A copy that fails to go back stops the engine instead of letting it answer from half a state.
 - After a restore, the K/V pages a conversation has not changed are reused for its next copy (`STRATA_SNAPSHOT_FULL_CAPTURE=1` turns that off).
   The new pages get room for the next turns of at most an eighth of each buffer (and at most 16 MiB), which the budget counts like the rest of the copy (upstream 53f72571).
+- When a request for another conversation is about to overwrite the conversation a slot holds, that conversation is parked first (a port of upstream #2526).
+  Nothing is done when the live session or a parked conversation already holds it. When parking fails, the log says so and the slot is overwritten as before; neither the request nor the engine stops.
+- When the copy that takes a checkpoint fails for lack of memory while the GPU itself is well, that checkpoint is skipped and the request goes on (a port of upstream #3350).
+  Only a failed GPU synchronize ends the request, as before.
 
 **How the available RAM is read** (upstream daa76552): the RAM checked before parking a conversation and before saving or restoring a conversation file is the smallest of:
 

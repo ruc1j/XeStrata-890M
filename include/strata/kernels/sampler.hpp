@@ -83,6 +83,13 @@ void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const in
 bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
                         void* stream);
+// Explicit gated measure: rows<n_q use mu; n_q==n_tokens means a NULL tail.
+// n_q == 0 permits null qbuf: point-only rows, or plain sampling for T1.
+// Same device-buffer layout as sample_tokens_spec. False is a hard failure:
+// work may have been queued; synchronize before releasing buffers. No plain-p fallback.
+bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                        void* stream);
 
 // XeStrata-890M, STRATA_VERIFY_MARGIN (verify.hpp): for each of the first n_rows rows of `logits`, the draft
 // dtok[t]'s log probability against the row's top (out[2t] = log(p_d / p_top)) and its own (out[2t + 1] = log p_d),

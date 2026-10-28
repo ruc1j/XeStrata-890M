@@ -69,6 +69,7 @@
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/adapt_decay.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/core/gated_proposal.hpp"
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/split_rules.hpp"
@@ -944,12 +945,12 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
-void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+void drive_pool_multi_impl(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                           int64_t layer, strata::kernels::cpu::NativeArithmetic arithmetic) {
     Drive* t = (Drive*) user;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
-    strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
+    strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out, arithmetic);
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
     // the routing trace for the serve path: the same record format drive_pool writes (layer, k, ids, weights),
@@ -967,6 +968,15 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     }
 }
 
+/// The verify window's pool as every decode has always run it (Default arithmetic), and the same with the window-invariant native
+/// arithmetic that a probabilistic (STRATA_SPEC_PROB) decode uses, so a row's target distribution does not depend on the window.
+void drive_pool_multi(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
+    drive_pool_multi_impl(u, x, ids, n, k, out, l, strata::kernels::cpu::NativeArithmetic::Default);
+}
+void drive_pool_multi_invariant(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
+    drive_pool_multi_impl(u, x, ids, n, k, out, l, strata::kernels::cpu::NativeArithmetic::WindowInvariant);
+}
+
 /// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
 /// cache and the PCIe share the pool uses for a layer are those of the stage that runs it.
 /// LAYER SPLIT, same process only: one CPU pool, one residency table (Drive::host_res) and one adaptive tier for every
@@ -981,8 +991,8 @@ struct SplitDrive {
     const uint64_t* cache_slot_off[kMax] = {};
     int pcie_num[kMax] = {};
 };
-void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+void drive_pool_split_impl(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                           int64_t layer, strata::kernels::cpu::NativeArithmetic arithmetic) {
     SplitDrive* s = (SplitDrive*) user;
     int st = 0;
     while (st + 1 < s->n && layer >= s->end[st]) ++st;
@@ -991,7 +1001,13 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     d.d.cache_base = s->cache_base[st];
     d.d.cache_slot_off = s->cache_slot_off[st];
     d.d.pcie_num = s->pcie_num[st];
-    drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
+    drive_pool_multi_impl(s->base, x_f, ids, n_tok, k, out, layer, arithmetic);
+}
+void drive_pool_split(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
+    drive_pool_split_impl(u, x, ids, n, k, out, l, strata::kernels::cpu::NativeArithmetic::Default);
+}
+void drive_pool_split_invariant(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
+    drive_pool_split_impl(u, x, ids, n, k, out, l, strata::kernels::cpu::NativeArithmetic::WindowInvariant);
 }
 
 /// Layer split across GPUs: a later stage on its own device, with its own copy of the dense weights, a session, an
@@ -1483,6 +1499,12 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
     std::fprintf(stderr, "strata serve: checkpoint save: %s\n", error.c_str());   // the caller's ERR has no reason
     return false;
 }
+
+/// upstream #3350: a conversation checkpoint is an optimization, like parking.  After a failed save: true when the
+/// device is still well (the copy's own memory ran out: a host or driver allocation, which does not stick), so the
+/// caller goes on without that checkpoint; false when the device itself is unwell (its synchronize fails), which still
+/// ends the request as before.
+bool checkpoint_failure_is_survivable() { return strata::gpu::device_sync(); }
 
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
 bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
@@ -2389,6 +2411,89 @@ void route_stop_signals() {
         _exit(128 + sig);
     }).detach();
 #endif
+}
+
+// STRATA_SPEC_PROB=1 with the default (pick) gate: a draft that fails the confidence gate is still a proposal attempt, and the
+// verifier gets the gated measure (core/gated_proposal.hpp).  That is exact only where the window choice cannot see a draw or a
+// timing that the next rounds draw again.  Where it cannot be kept, say why and return false: the caller keeps the older rule
+// (a warning, not a refusal).
+static bool gated_proposal_usable(bool serial_single_device, int lookup_chain, int adapt_swaps, bool pcie_share, bool own_window_rule,
+                                  int window, double min_p) {
+    const char* why = nullptr;
+#if defined(STRATA_GPU_METAL)
+    why = "the Metal engine has no gated verifier";
+#endif
+    if (why == nullptr && !serial_single_device) why = "it needs serial decode on one device";
+    if (why == nullptr && (lookup_chain != 0 || adapt_swaps != 0 || pcie_share))
+        why = "it needs --lookup-chain 0, --adapt-swaps 0 and --pcie-frac 0";
+    if (why == nullptr && own_window_rule) why = "STRATA_SPEC_COST, STRATA_SPEC_T_CYCLE, DFlash2 and --spec-corrupt change the window by their own rule";
+    if (why == nullptr && window > strata::core::gated::kRows) why = "the window is wider than 8 rows";
+    if (why == nullptr && (!std::isfinite(min_p) || min_p < 0.0)) why = "--spec-min-p must be a finite number >= 0";
+    if (why == nullptr) return true;
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        std::fprintf(stderr, "strata: STRATA_SPEC_PROB=1 keeps the older acceptance rule in this run (%s). That rule's output "
+                             "distribution is off when the confidence gate fails; STRATA_SPEC_PROB_GATE=top is exact here.\n", why);
+    }
+    return false;
+}
+
+// A draft at MTP cell c is sampled at counter c+1. The next target starts
+// there and needs one final cell for its bonus. Cap BEFORE any proposal draw;
+// a zero budget therefore means no attempt, never a discarded failed NULL.
+class GatedDraftLimit {
+public:
+    GatedDraftLimit(strata::core::MtpDrafter& mtp, bool active, int configured_mtp,
+                    int64_t next_target_pos, int64_t context_end)
+        : mtp_(mtp), active_(active), configured_(configured_mtp - 1) {
+        if (active_) {
+            const int64_t room = std::max<int64_t>(0, context_end - next_target_pos);
+            mtp_.set_max_drafts((int) std::min<int64_t>(configured_, std::max<int64_t>(0, room - 1)));
+        }
+    }
+    ~GatedDraftLimit() { if (active_) mtp_.set_max_drafts(configured_); }
+    GatedDraftLimit(const GatedDraftLimit&) = delete;
+    GatedDraftLimit& operator=(const GatedDraftLimit&) = delete;
+private:
+    strata::core::MtpDrafter& mtp_;
+    bool active_;
+    int configured_;
+};
+
+// Prepare one gated window from the last successful producer result. Context room
+// is fixed before consulting D; the producer was already capped before drawing.
+// No max_new/output-cap shortening: the ordinary emission loop owns that limit.
+static bool prepare_gated_window(strata::core::gated::Packet& packet,
+                                 const strata::core::MtpDrafter::DraftResult& generation,
+                                 strata::spec::SuffixDrafter& suffix, const strata::spec::DraftPolicy& policy,
+                                 bool suffix_enabled, bool initial, int room, int configured_mtp,
+                                 int vocab, float threshold, const int32_t* q, const int32_t* drafts,
+                                 const float* scores, int32_t* suffix_tokens, int& match, std::string& err) {
+    if (room < 1 || generation.budget < 0 || generation.generated < 0 ||
+        generation.generated > generation.budget || generation.budget >= room) {
+        err = "gated proposal: invalid context room or producer result";
+        return false;
+    }
+    strata::core::gated::RootChoice root;
+    match = 0;
+    if (suffix_enabled && !initial && room > 1) {
+        const int k = suffix.propose(room - 1, suffix_tokens);
+        match = suffix.last_match();
+        if (k > 0) {
+            // Prefix/configuration only: never inspect a draw or its gated width.
+            const auto pick = policy.choose(std::min(configured_mtp, room), k, match);
+            root.eligible = pick.lookup;
+            root.rescue_id = suffix_tokens[0];
+            root.window = pick.t;
+        }
+    }
+    if (!strata::core::gated::make_packet(packet, q, drafts, scores, generation.generated, generation.budget,
+                                         room, vocab, threshold, initial, root)) {
+        err = std::string("gated proposal: ") + packet.error;
+        return false;
+    }
+    return true;
 }
 
 int main(int argc, char** argv) {
@@ -7489,6 +7594,7 @@ int main(int argc, char** argv) {
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
         const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
+        const strata::core::PoolMultiFn invariant_win_pool_fn = n_stages > 1 ? &drive_pool_split_invariant : &drive_pool_multi_invariant;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
         ver.set_split(o.spec_split);
@@ -7816,34 +7922,52 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
-        auto park_current = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+        // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
+        // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both
+        // (upstream #2526).
+        struct ParkSource {
+            const std::vector<int32_t>& ids;
+            const std::vector<ImgKey>& imgs;
+            std::vector<ConvCheckpoint>& checks;
+            bool cvec;
+            strata::core::SessionState& session;                   ///< the main device's
+            std::vector<strata::core::ConversationStage> stages;   ///< a layer split: every device's session (else empty)
+            const strata::core::QsaState* draft;                   ///< the draft layer's K/V saved with the image
+            bool with_reuse;                                       ///< the retained K/V describes this source (the main session's)
+            std::string what;                                      ///< the log's words after the token count ("", " from slot 1")
+        };
+        auto park_source = [&](const ParkSource& src, size_t held) -> bool {
             // --conversation-cache-min-tokens (upstream 624070c5): a short conversation is not worth one of the slots.
             // Parking is a switch-time decision, so a client's small side requests would otherwise park themselves
             // and, once the cache is full, evict the long conversation they were interleaved with (oldest first) - the
             // reuse it wanted.  Returning true is the same non-error skip the byte-budget and RAM-floor paths take.
-            if (!conversations.wants((int64_t) live.size())) {
+            if (!conversations.wants((int64_t) src.ids.size())) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens, below the %lld "
                                      "minimum; parked=%zu)\n",
-                             live.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
+                             src.ids.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
                 return true;
             }
-            const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
-            const int64_t retained_n = conversations.retained_tokens();
-            auto reuse = conversations.take_reuse_for(live);   // never another conversation's K/V (upstream #1503)
+            const strata::core::ConversationView view{src.ids, src.imgs, src.checks, src.cvec};
+            // a batch slot's image carries no retained K/V (it describes the main session's conversation), and the
+            // main session's stays retained for its own park
+            const int64_t retained_n = src.with_reuse ? conversations.retained_tokens() : 0;
+            auto reuse = src.with_reuse ? conversations.take_reuse_for(src.ids)   // never another conversation's K/V (upstream #1503)
+                                        : strata::core::ConversationKvReuse{};
             if (retained_n > 0 && reuse.unchanged_tokens < retained_n)
                 std::fprintf(stderr, "strata serve: conversation cache: retained K/V reused for %lld of its %lld tokens "
                                      "(the rest is not this conversation's)\n", (long long) reuse.unchanged_tokens,
                              (long long) retained_n);
             size_t estimate = 0;
-            if (!snapshot_bytes(view, estimate, err)) {
+            if (!(src.stages.empty()
+                      ? strata::core::conversation_snapshot_bytes(view, src.session, g, *src.draft, estimate, err)
+                      : strata::core::conversation_split_bytes(view, src.stages, g, *src.draft, estimate, err))) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
                 err.clear();   // a recoverable miss must not poison the batched draft prefill's error channel
                 return true;
             }
             const size_t fresh_estimate = estimate;
             if (!reuse.kv.empty() && !strata::core::conversation_snapshot_capture_bytes(
-                    reuse, view, ss, g, mtp.kv_state(), estimate, err)) {
+                    reuse, view, src.session, g, *src.draft, estimate, err)) {
                 reuse = {};
                 estimate = fresh_estimate;
                 err.clear();
@@ -7853,7 +7977,7 @@ int main(int argc, char** argv) {
             // stays uncapped: it counts the retained buffers' capacity and directories, which put() charges too.
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+            if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             const bool room = conversations.make_room(estimate, held, disk.enabled() ? &evicted : nullptr);
@@ -7909,10 +8033,10 @@ int main(int argc, char** argv) {
                 } park_stage;
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (conv_stages.empty() ? !strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(),
+                if (src.stages.empty() ? !strata::core::conversation_snapshot_save(image, view, src.session, g, *src.draft,
                                                                                     err, std::move(reuse), &reused_bytes)
-                                        : !strata::core::conversation_split_save(image, view, conv_stages, g,
-                                                                                 mtp.kv_state(), err))
+                                        : !strata::core::conversation_split_save(image, view, src.stages, g,
+                                                                                 *src.draft, err))
                     return false;
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
@@ -7924,19 +8048,24 @@ int main(int argc, char** argv) {
                 }
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held, disk.enabled() ? &evicted : nullptr);
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu "
+                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu "
                                      "evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
-                             stored ? "parked" : "skipped", live.size(),
+                             stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes,
                              reused_bytes);
                 save_evicted();
             } catch (const std::bad_alloc&) {
                 evicted.clear();
-                // the live session is untouched: read the prompt the ordinary way instead of ending the server
+                // the src.ids session is untouched: read the prompt the ordinary way instead of ending the server
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
             }
             return true;
+        };
+        auto park_current = [&](size_t held) -> bool {
+            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            ParkSource src{live, live_imgs, checks, cvec_cached, ss, conv_stages, &mtp.kv_state(), true, ""};
+            return park_source(src, held);
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         bool pp_tail_saved = false;
@@ -8140,7 +8269,12 @@ int main(int argc, char** argv) {
                 } else {
                     saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
                 }
-                if (!saved) { e = "saving a conversation checkpoint failed"; return false; }
+                if (!saved) {
+                    // upstream #3350: only a device that is unwell ends the request; a copy that ran out of memory skips this checkpoint
+                    if (!checkpoint_failure_is_survivable()) { e = "saving a conversation checkpoint failed"; return false; }
+                    std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
+                                         "above); the request goes on without it\n", (long long) done);
+                }
                 if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
                 if (tail_checkpoint) pp_tail_saved = true;
             }
@@ -8158,7 +8292,16 @@ int main(int argc, char** argv) {
                     part_next[i] = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
-                    if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
+                    if (!checkpoint_save(part, stage_ss, g)) {
+                        // upstream #3350: the copy ran out of memory (not the device): leave this part out.  The set at `done`
+                        // is then incomplete and the checkpoint is skipped below, as for a part that was never made
+                        if (!checkpoint_failure_is_survivable()) { e = "saving a checkpoint part failed"; return false; }
+                        std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: stage %zu's state could not be copied "
+                                             "out (see above); the request goes on without it\n", (long long) done, i);
+                        std::lock_guard<std::mutex> lk(part_mu);
+                        part_at[done].resize(stages.size() + 1);   // (marks the set as seen; its empty parts make it incomplete)
+                        return true;
+                    }
                     std::lock_guard<std::mutex> lk(part_mu);
                     auto& v = part_at[done];
                     v.resize(stages.size() + 1);
@@ -9172,6 +9315,58 @@ int main(int argc, char** argv) {
         };
         // the session a request just left behind (its prompt and first token) -> slot b's session
         // (a layer split: each GPU's session -> its own slot session, on that GPU; LAYER SPLIT, same process only)
+        // What an idle slot holds (the conversation it decoded last: its sessions, its draft K/V and its checkpoints)
+        // goes to the parked conversations before an admission overwrites it (upstream #2526).  The main session was
+        // parked with that conversation's prompt only (the admission's copy), so the reply the slot decoded lives
+        // nowhere else: without this, the conversation's next turn finds its prompt-read state and reads the whole
+        // reply again.  Nothing to do when the live main session or a parked conversation already holds that state
+        // (or a continuation of it).  Parking is an optimization like a checkpoint: a skip and a failed snapshot are
+        // logged and the slot is overwritten as before.  Nothing here ends the request or the engine.
+        auto park_slot = [&](int b) {
+            BSlot& sl = bs[(size_t) b];
+            if (!conversations.enabled() || sl.active || !sl.cached || sl.img || sl.ids.empty()) return;
+            auto prefix_of = [&](const std::vector<int32_t>& whole) {
+                return whole.size() >= sl.ids.size() && std::equal(sl.ids.begin(), sl.ids.end(), whole.begin());
+            };
+            const bool in_main = live_ok && cvec_cached == sl.cvec && prefix_of(live) &&
+                                 imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
+            if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
+            if (use_mtp && !batch_mtp) {   // no draft K/V of its own: an image without it would not restore beside the drafter
+                std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (its %zu tokens "
+                                     "have no per-slot draft K/V without --batch-mtp)\n", b, sl.ids.size());
+                return;
+            }
+            if (!strata::gpu::device_sync()) {
+                std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (device sync "
+                                     "failed)\n", b);
+                return;
+            }
+            std::string why;
+            if (batch_mtp && !slot_mtp[(size_t) b]->idle(why)) {
+                std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (%s)\n",
+                             b, why.c_str());
+                return;
+            }
+            static const std::vector<ImgKey> no_imgs;
+            std::vector<strata::core::ConversationStage> slot_stages;
+            if (multi_gpu) {
+                slot_stages.push_back({bslot_ss[(size_t) b].get(), 0});
+                for (auto& stp : stages) slot_stages.push_back({stp->bslots[(size_t) b].get(), stp->dev});
+            }
+            ParkSource src{sl.ids, no_imgs, sl.checks, sl.cvec, *bslot_ss[(size_t) b], std::move(slot_stages),
+                           batch_mtp ? &slot_mtp[(size_t) b]->kv_state() : &mtp.kv_state(), false,
+                           " from slot " + std::to_string(b)};
+            try {
+                if (park_source(src, 0)) return;
+                // the snapshot failed (the copy's own memory): the slot is not touched, so go on without the image
+                std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (%s)\n",
+                             b, err.empty() ? "the snapshot failed" : err.c_str());
+                err.clear();
+                (void) checkpoint_failure_is_survivable();
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking slot %d\n", b);
+            }
+        };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             auto one = [&](int dev, strata::core::SessionState& from, strata::core::SessionState& to) -> bool {
@@ -10473,12 +10668,30 @@ int main(int argc, char** argv) {
                         for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
                         bs[(size_t) slot_source].partial = false;
                     }
+                    // the slot's checkpoints come along (the one continued from, and any shorter one that is a prefix
+                    // of the tokens copied back, text only: its cells are then the ones the main session holds), so
+                    // the chain keeps its branch points and the parked copies of this conversation a turn back - whose
+                    // deepest checkpoint the chain holds again - go as superseded (#342) instead of taking a parked
+                    // entry each until the cache evicts another chat (upstream #2526)
+                    const std::vector<ConvCheckpoint>& sc = bs[(size_t) slot_source].checks;
+                    const std::vector<int32_t>& copied_back = slot_ck != nullptr ? slot_ck->ids : bs[(size_t) slot_source].ids;
+                    auto prefix_of_copied = [&](const ConvCheckpoint& c) {
+                        return c.imgs.empty() && c.ids.size() <= copied_back.size() &&
+                               std::equal(c.ids.begin(), c.ids.end(), copied_back.begin());
+                    };
                     if (slot_ck != nullptr) {
                         live = slot_ck->ids;
                         checks.push_back(*slot_ck);   // the main session's chain has it now
                         checks.back().used = ++check_clock;
                     } else {
                         live = bs[(size_t) slot_source].ids;
+                    }
+                    try {   // then the shorter ones: an optimization, so a host allocation that fails skips them
+                        for (const ConvCheckpoint& c : sc)
+                            if ((int64_t) c.ids.size() <= slot_tokens && &c != slot_ck && prefix_of_copied(c)) checks.push_back(c);
+                    } catch (const std::bad_alloc&) {
+                        std::fprintf(stderr, "strata batch: slot %d: its shorter checkpoints were not all copied (out of "
+                                             "memory); the rest are skipped\n", slot_source);
                     }
                     live_imgs.clear();
                     resume = slot_tokens;
@@ -10994,7 +11207,8 @@ int main(int argc, char** argv) {
                         std::string ye;
                         const auto ty = Clock::now();
                         std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
-                        if (can && copy_to_slot(ys, pre, ye)) {
+                        if (can) park_slot(ys);   // the conversation the slot holds, before this read overwrites it
+                    if (can && copy_to_slot(ys, pre, ye)) {
                             BSlot& sl = bs[(size_t) ys];
                             sl = BSlot{};
                             sl.ids = std::move(pre);
@@ -11066,7 +11280,11 @@ int main(int argc, char** argv) {
             }
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
-            if (use_mtp) mtp.set_draft_sampling(req_sp);
+            if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+            // upstream #3416: the gated proposal law for this request's STRATA_SPEC_PROB windows (core/gated_proposal.hpp)
+            const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
+                gated_proposal_usable(o.pipeline_windows < 2 && o.batch == 0 && n_stages == 1 && !multi_gpu && drive.d.remote_count == 0,
+                                      o.lookup_chain, o.adapt_swaps, req_pcie_frac != 0.0, spec_cost, S, req_spec_min_p);
             {   // aux_cpus=0|1: where the non-pool, non-host threads run for this request (-1 = the start-up --aux-cpus); moves
                 // threads only.  An enabled placement is swept at every request: it catches threads created since.
                 static const bool aux_start = strata::aux_cpus::enabled();
@@ -11210,8 +11428,12 @@ int main(int argc, char** argv) {
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at,
                                    to == turn_at && to != root_at && to != message_at && to != pin_at)) {   // the tail kind leaves first
-                    std::printf("ERR saving a conversation checkpoint failed\n");
-                    return 1;
+                    if (!checkpoint_failure_is_survivable()) {   // upstream #3350: only an unwell device ends the request
+                        std::printf("ERR saving a conversation checkpoint failed\n");
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
+                                         "above); the request goes on without it\n", (long long) to);
                 }
                 if (to == pin_at && !pin_checkpoint(pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
@@ -11264,6 +11486,11 @@ int main(int argc, char** argv) {
                 extra_sources_reset();
                 for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
             }
+            // This request's source planner: the live policy at its start, then only committed outcomes (no round
+            // times, no rows past the accepted ones: their Philox counters are drawn again by the next rounds).
+            auto source_policy = policy;
+            strata::core::MtpDrafter::DraftResult generation;
+            strata::core::gated::Packet proposal;   // immutable through the synchronous verifier call
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
@@ -11907,9 +12134,27 @@ int main(int argc, char** argv) {
                 return pr[n - 1] >= (float) req_spec_min_p;
             };
             policy.set_scale_all(req_minp_rule);
+            // the gated proposal's chain: the per-row gate only (the packet reads the failed draw as its NULL tail;
+            // the cumulative rule or the policy's window could stop a chain short of its budget, which the packet refuses)
+            const strata::core::MtpDrafter::More gated_more = [&](int n, const float* pr) { return pr[n - 1] >= (float) req_spec_min_p; };
             while (!pl_ran && !cancelled && produced_n < max_new) {
-                int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
+                int T = 1;
                 policy.set_context(p);
+                bool from_sfx = false;
+                int sfx_match = 0;
+                if (gated_proposal) {
+                    const int room = (int) std::min<int64_t>(S, o.max_context - p);
+                    source_policy.apply_costs(p);   // held round times whose draws are all committed now
+                    if (!prepare_gated_window(proposal, generation, sfx, source_policy, o.suffix_draft > 0,
+                                              first_window, room, S_mtp, (int) ver.vocab(), (float) req_spec_min_p,
+                                              mtp.spec_q(), drafts.data(), dprob.data(), sbuf.data(), sfx_match, err)) {
+                        std::printf("ERR %s\n", err.c_str()); return 1;
+                    }
+                    T = proposal.T; from_sfx = proposal.from_sfx;
+                    if (first_window) T = 1;
+                    std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) std::min<size_t>(dprob.size(), 8), dwin_s.begin());
+                } else {
+                T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && spec_cost && !first_window) {
                     T = std::clamp(chain_rows, 1, S_mtp);
                 } else if (use_mtp && !req_minp_rule) {
@@ -11934,15 +12179,18 @@ int main(int argc, char** argv) {
                 std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) std::min<size_t>(dprob.size(), 8), dwin_s.begin());
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                 // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
-                bool from_sfx = false;
-                int sfx_match = 0;
                 if (o.suffix_draft > 0 && !first_window) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
-                    if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
-                        const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                    // a probabilistic window must not condition the source on the draw: the policy copy fixed at the
+                    // request's start chooses, and the lookup is taken without asking whether the MTP's first guess agrees
+                    const bool probabilistic = use_mtp && mtp.prob();
+                    if (k > 0 && (probabilistic || !use_mtp || sbuf[0] == drafts[0])) {
+                        const strata::spec::DraftPolicy::Pick pk = probabilistic
+                            ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
+                }
                 }
                 // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
                 int chain_n = 0, cm = 0;
@@ -12063,8 +12311,10 @@ int main(int argc, char** argv) {
                 dt_pre += std::chrono::duration<double, std::milli>(tw0 - round0).count();
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
-                if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-                if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
+                else if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
+                if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
@@ -12131,6 +12381,7 @@ int main(int argc, char** argv) {
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
                 draft_accepted += a;
+                const bool initial_round = first_window;   // a single-row window: no proposal to learn from
                 first_window = false;
                 bool eos = false;
                 for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
@@ -12170,8 +12421,12 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw2 = Clock::now();
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                generation = {};   // a skipped or failed production must not expose an older q view
+                const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_more);
+                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(),
+                                               gated_proposal ? gated_more : draft_more, nullptr,
+                                               gated_proposal ? &generation : nullptr);
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -12189,6 +12444,12 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (gated_proposal && !eos && !initial_round)
+                    source_policy.observe_committed(from_sfx, from_sfx ? T : std::min<int>(S_mtp, (int) std::min<int64_t>(S, o.max_context - p)),
+                                                    a, sfx_match);
+                if (gated_proposal && !eos && !initial_round && timed_round)   // after the next draft: its counters too
+                    source_policy.defer_cost(std::max<int64_t>(p + T - 1, p + a + 1 + S_mtp), T,
+                                             std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (spec_cost && use_mtp && timed_round && !from_sfx) policy.observe_probs(dwin_s.data(), T_mtp - 1, a);
                 if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
@@ -12370,6 +12631,7 @@ int main(int argc, char** argv) {
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
+                if (cont) park_slot(admit_slot);   // the conversation the slot holds, before this one overwrites it
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     err.clear();
@@ -13129,6 +13391,13 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
+        auto source_policy = policy;   // this generation's: committed outcomes only (observe_committed; upstream #3416)
+        const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
+            gated_proposal_usable(o.pipeline_windows < 2 && o.batch == 0 && !multi_gpu && drive.d.remote_count == 0,
+                                  o.lookup_chain, o.adapt_swaps, o.pcie_frac != 0.0,
+                                  spec_cost || !t_cycle.empty() || o.spec_corrupt > 0, o.spec, o.spec_min_p);
+        strata::core::MtpDrafter::DraftResult generation;
+        strata::core::gated::Packet proposal;
         // the window rule, as the chain drafts: another draft after n when the rule would keep it (--spec-window)
         const bool minp_rule = o.spec_window == "min-p" ||
                                (o.spec_window == "auto" && strata::core::spec_cum_threshold() > 0.0f);   // as serve's
@@ -13142,10 +13411,15 @@ int main(int argc, char** argv) {
             }
             return pr[n - 1] >= (float) o.spec_min_p;
         };
-        if (use_mtp && !first_window &&
-            !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), draft_more)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
+        const strata::core::MtpDrafter::More gated_more = [&](int n, const float* pr) { return pr[n - 1] >= (float) o.spec_min_p; };
+        {   // Non-native prefill already emitted x; draft_first(cell=p-1) samples at p.
+            const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p, o.max_context);
+            if (use_mtp && !first_window &&
+                !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(),
+                                 gated_proposal ? gated_more : draft_more, nullptr, gated_proposal ? &generation : nullptr)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
         }
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
         std::vector<float> window_logits;       // --dump-logits: the emitted rows of a window
@@ -13242,6 +13516,20 @@ int main(int argc, char** argv) {
             strata::core::progress_at("spec loop: choosing the window", (int64_t) produced.size());
             int T = S_mtp;
             policy.set_context(p);
+            bool from_sfx = false;
+            int sfx_match = 0;
+            if (gated_proposal) {
+                source_policy.apply_costs(p);   // held round times whose draws are all committed now
+                if (!prepare_gated_window(proposal, generation, sfx, source_policy, o.suffix_draft > 0, first_window,
+                                          (int) std::min<int64_t>(o.spec, o.max_context - p), S_mtp, (int) ver.vocab(),
+                                          (float) o.spec_min_p, mtp.spec_q(), drafts.data(), dprob.data(), sbuf.data(),
+                                          sfx_match, err)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1;
+                }
+                T = proposal.T; from_sfx = proposal.from_sfx;
+                if (first_window) T = 1;
+                std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) o.spec, dwin.begin());
+            } else {
             if (use_mtp && spec_cost && !first_window) {
                 T = std::clamp(chain_rows, 1, S_mtp);
             } else if (use_mtp && !minp_rule) {
@@ -13253,15 +13541,18 @@ int main(int argc, char** argv) {
             if (first_window) T = 1;
             std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) o.spec, dwin.begin());
             if (!t_cycle.empty() && !first_window) T = t_cycle[(size_t) (rounds % (int64_t) t_cycle.size())];
-            bool from_sfx = false;
-            int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
-                if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
-                    const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
+                // a probabilistic window must not condition the source on the draw: the policy copy fixed at the start
+                // chooses, and the lookup is taken without asking whether the MTP's first guess agrees
+                const bool probabilistic = use_mtp && mtp.prob();
+                if (k > 0 && (probabilistic || !use_mtp || sbuf[0] == drafts[0])) {
+                    const strata::spec::DraftPolicy::Pick pk = probabilistic
+                        ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
+            }
             }
             // The window's rows sit at p .. p + T - 1, and past the context there is no cell to verify them in: near
             // its end the window takes only the rows that fit (the admission checked the prompt and max_new, which a
@@ -13314,7 +13605,9 @@ int main(int argc, char** argv) {
             // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
             if (adapt_nowait()) apply_pending(false);
             else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
-            if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
+            if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
+            const auto decode_pool_fn = use_mtp && mtp.prob() ? &drive_pool_multi_invariant : &drive_pool_multi;
+            if (!ver.run(T, window.data(), p, decode_pool_fn, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -13356,6 +13649,7 @@ int main(int argc, char** argv) {
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
             if (!from_sfx && !first_window) policy.observe_mtp_drafts(dprob.data(), T_mtp, a);   // before the next drafts
+            const bool initial_round = first_window;   // a single-row window: no proposal to learn from
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -13416,8 +13710,11 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
+            generation = {};
+            const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
             const bool drafted = !use_mtp || (int64_t) produced.size() >= max_new ||
-                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_more);
+                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(),
+                                           gated_proposal ? gated_more : draft_more, nullptr, gated_proposal ? &generation : nullptr);
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {
@@ -13441,6 +13738,9 @@ int main(int argc, char** argv) {
             // A round that captured its window's graph is not the window's cost: on the RX 9060 XT (Gyro-M, 1K) the
             // first 3-token round priced T3 above T4, and the 5- and 6-token windows, scaled from it, were never tried
             // (upstream took them 12 times)
+            if (gated_proposal && !initial_round) source_policy.observe_committed(from_sfx, from_sfx ? T : std::min(S_mtp, room), a, sfx_match);
+            if (gated_proposal && !initial_round && timed_round)   // p has advanced: the window was p - a - 1 ..
+                source_policy.defer_cost(std::max<int64_t>(p - a - 2 + T, p + S_mtp), T, round_ms);
             const bool timed = timed_round && !ver.captured_last();
             if (timed && chain_n == 0) policy.observe(from_sfx, T, a, sfx_match, round_ms);
             else if (timed) policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);

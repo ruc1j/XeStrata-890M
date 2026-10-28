@@ -12,12 +12,14 @@
 #include "strata/core/runtime.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
+#include "strata/core/spec_proposal.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_sampler
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -465,7 +467,11 @@ inline int chain_probs(const float* sel_logit, int k, const SamplerParams& pp, D
 // position | kSpecCtrDraft) and q's (id, probability) list into qrow; or the verifier: row t accepts the draft dtok[t]
 // with min(1, p(d) / q(d)) (q from qbuf for rows < n_q, a point mass otherwise), else samples the residual
 // max(0, p - q); the window's last row takes the exact-match sampler's own draw (pick_from_list).
-template <typename D, bool DRAFT>
+// AUG (sample_tokens_proposal, upstream #3416): the rows are an explicit gated measure (gated_proposal.hpp): rows < n_q
+// offer mu, n_q == n_tokens is a NULL tail (the last row has no draft and no acceptance draw: the residual (p - mu)+
+// is sampled directly), and a candidate without a positive finite mu(D), or a zero NULL residual, writes the error
+// token the verifier rejects after the synchronization.  No plain-p fallback.
+template <typename D, bool DRAFT, bool AUG = false>
 sycl::event spec_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParams pp, int k, int nb, const float* lv,
                         const int* li, int* out, const SamplerParams* device_params, const int32_t* step_rec,
                         const int32_t* sub_to_id, int32_t* ring_out, float* probability, int32_t* qrow,
@@ -535,7 +541,15 @@ sycl::event spec_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParams
                 *probability = n > 0 ? (float) ex[0] : 1.0f;   // q's top: the gate never depends on the draw
             } else {
                 const int d = t < n_tokens - 1 ? dtok[t] : -1;
-                if (d < 0) {   // no draft on this row: the exact-match sampler's own draw
+                const auto kind = core::proposal::rowkind(t, n_tokens, n_q);
+                const bool null_tail = AUG && kind == core::proposal::RowKind::NullTail;
+                if constexpr (AUG) {   // an explicit mu candidate cannot silently become a point proposal
+                    if (kind == core::proposal::RowKind::MuOffer && (d < 0 || d >= n_vocab)) {
+                        out[t] = core::proposal::kProposalSamplerErrorToken;
+                        return;
+                    }
+                }
+                if (d < 0 && !null_tail) {   // no draft on this row: the exact-match sampler's own draw
                     out[t] = pick_from_list<D>(&sel_ids[0], &sel_logit[0], keep, chain, t);
                     return;
                 }
@@ -550,11 +564,19 @@ sycl::event spec_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParams
                 if (t < n_q)
                     for (int i = 0; i < core::kSpecQEntries && qid[i] >= 0; ++i)
                         if (qid[i] == d) { qd = (D) qpr[i]; break; }
-                const bool point = !(qd > 0);
-                const float ua = philox_uniform(chain.seed, pos | core::kSpecCtrAccept);
-                if (pd > 0 && (point ? (D) ua < pd : (D) ua * qd < pd)) {
-                    out[t] = d;
-                    return;
+                if constexpr (AUG) {
+                    if (t < n_q && !null_tail && !(qd > 0 && sycl::isfinite((float) qd))) {
+                        out[t] = core::proposal::kProposalSamplerErrorToken;
+                        return;
+                    }
+                }
+                const bool point = !null_tail && !(qd > 0);   // a NULL tail subtracts its mu row, never a point
+                if (!null_tail) {   // the last row of a NULL tail has no draft and no acceptance draw
+                    const float ua = philox_uniform(chain.seed, pos | core::kSpecCtrAccept);
+                    if (pd > 0 && (point ? (D) ua < pd : (D) ua * qd < pd)) {
+                        out[t] = d;
+                        return;
+                    }
                 }
                 D sum = 0;
                 for (int i = 0; i < n; ++i) {
@@ -572,7 +594,7 @@ sycl::event spec_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParams
                     sum += wi;
                 }
                 if (!(sum > 0)) {   // p and q agree everywhere (rounding): the draft is as likely as it can be
-                    out[t] = d;
+                    out[t] = null_tail ? core::proposal::kProposalSamplerErrorToken : d;   // (a NULL tail has no draft to keep)
                     return;
                 }
                 const float ur = philox_uniform(chain.seed, pos | core::kSpecCtrResid);
@@ -639,7 +661,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                       : (wg == 1024 ? sample_launch<1024, float> : wg == 512 ? sample_launch<512, float>
                                                                       : sample_launch<256, float>);
     // the sampled path split over the GPU; STRATA_OLD_SAMPLER=1: the one-group kernel (A/B and reference)
-    static const bool old_sampler = std::getenv("STRATA_OLD_SAMPLER") != nullptr;
+    static const bool old_sampler = [] { const char* v = std::getenv("STRATA_OLD_SAMPLER"); return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0; }();   // =0: not the old one (upstream's tests set it so)
     int k = (pp.top_k > 0 && pp.top_k < KMAX) ? pp.top_k : KMAX;
     if (k > n_vocab) k = n_vocab;
     const int nb = (n_vocab + SPLIT_BL - 1) / SPLIT_BL;
@@ -743,30 +765,52 @@ void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const in
            nullptr, nullptr, 0, cand);
 }
 
-bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
-                        const SamplerParams& p_in, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
-                        void* stream) {
+template <bool AUG>
+static bool sample_tokens_spec_impl(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                                    const SamplerParams& p_in, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                                    void* stream) {
+    // a refusal of the gated measure (AUG) is a caller's bug or a lost allocation, not a sampling choice: say why
+    auto refuse = [](const char* why) {
+        if constexpr (AUG) std::fprintf(stderr, "sample_tokens_proposal: refused: %s\n", why);
+        return false;
+    };
+    if constexpr (AUG) {
+        if (n_tokens < 1 || n_q < 0 || n_q > n_tokens || (n_q > 0 && qbuf == nullptr) ||
+            (n_tokens > 1 && dtok == nullptr)) return refuse("the rows, the q rows or the drafts do not fit together");
+    }
     SamplerParams p = p_in;
     p.gumbel = p_in.gumbel || gumbel_env();   // the last row's plain draw, as sample_tokens
-    if (n_tokens <= 0 || n_vocab <= 0 || p.greedy || p.temperature <= 0.0f) return false;
-    if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) return false;
-    static const bool old_sampler = std::getenv("STRATA_OLD_SAMPLER") != nullptr;
+    if (n_tokens <= 0 || n_vocab <= 0 || p.greedy || p.temperature <= 0.0f) return refuse("greedy or a temperature of 0");
+    if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) return refuse("a penalty window without history");
+    static const bool old_sampler = [] { const char* v = std::getenv("STRATA_OLD_SAMPLER"); return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0; }();   // =0: not the old one (upstream's tests set it so)
     int k = (p.top_k > 0 && p.top_k < KMAX) ? p.top_k : KMAX;
     if (k > n_vocab) k = n_vocab;
     const int nb = (n_vocab + SPLIT_BL - 1) / SPLIT_BL;
-    if (old_sampler || nb * k > SPLIT_MAX) return false;
+    if (old_sampler || nb * k > SPLIT_MAX) return refuse("STRATA_OLD_SAMPLER, or more list entries than the split sampler takes");
     auto& q = core::Runtime::get().stream(stream);
     const size_t lists = (size_t) n_tokens * nb * k;
     void* scratch = split_scratch(q, lists * 8);
-    if (scratch == nullptr) return false;
+    if (scratch == nullptr) return refuse("the scratch allocation failed");
     auto* lv = static_cast<float*>(scratch);
     auto* li = reinterpret_cast<int*>(lv + lists);
     split_stage1(q, logits, n_tokens, n_vocab, history, history_len, p, k, nb, lv, li);
-    const auto launch = xe::has_fp64(q) ? spec_stage2<double, false> : spec_stage2<float, false>;
+    const auto launch = xe::has_fp64(q) ? spec_stage2<double, false, AUG> : spec_stage2<float, false, AUG>;
     const auto e = launch(q, n_tokens, n_vocab, p, k, nb, lv, li, out, nullptr, nullptr, nullptr, nullptr, nullptr,
                           nullptr, dtok, qbuf, n_q, nullptr);
-    if (!stream) core::Runtime::get().wait(e, "sample_tokens_spec");
+    if (!stream) core::Runtime::get().wait(e, AUG ? "sample_tokens_proposal" : "sample_tokens_spec");
     return true;
+}
+
+bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                        void* stream) {
+    return sample_tokens_spec_impl<false>(logits, n_tokens, n_vocab, history, history_len, p, dtok, qbuf, n_q, out, stream);
+}
+
+bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                            const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                            void* stream) {
+    return sample_tokens_spec_impl<true>(logits, n_tokens, n_vocab, history, history_len, p, dtok, qbuf, n_q, out, stream);
 }
 
 void draft_margins(const float* logits, int n_rows, int n_vocab, const int32_t* dtok, float* out, void* stream) {

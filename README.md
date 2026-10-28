@@ -118,6 +118,14 @@ changes of upstream Strata 0.2.7.1 (engine 0.1.53) ([docs/XE.md](docs/XE.md)).
     abliterated build's 6 chats (28 W, temperature 1.0, average over 4 seeds) the old rule gave 28.61 tok/s and
     this 30.54 (+6.7%); the spread between seeds (differences in the answer text) narrows from 26.2-30.3 to
     29.9-31.3. At temperature 0.7 there is no difference.
+    The confidence gate on a draft tests the drawn token by default (a port of upstream #3416): the probability mass the
+    gate admitted and the rows it refused (NULL) go to verify, and a refused attempt still counts as one proposal.
+    `STRATA_SPEC_PROB_GATE=top` restores the earlier form, which tests q's largest probability before the draw. verify
+    applies a rule per row kind (a mu offer, a point offer, the NULL tail, a plain bonus row), and a draft token that was
+    not in the proposal returns the error token and cuts the window there. The draft policy sets the next window from
+    the rows committed and the proposals refused. With the speculative probabilities on, the CPU's expert rows are
+    computed in a form that does not depend on the window size (the canonical rows are already, so only
+    `STRATA_CANON=0` changes).
   - `STRATA_VERIFY_MARGIN=a,pmin` (opt-in, the answers change): on greedy requests, accept a draft and go on even
     when it is not the main model's argmax, provided the main model's probability for it is at least a times the
     argmax's and at least pmin. On the abliterated build's 6 chats (28 W, `--spec 4`), 0.5,0.3 gave decode +3.3%

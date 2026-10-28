@@ -14,6 +14,9 @@ namespace strata::kernels::cpu {
 
 /// Whether this layer's experts take the canonical rows.
 bool canon_layer(const NativeFmt& f);
+/// Bytes canon_quant writes for n values in groups of `group` (the scales, the sums, the values from a 64-byte boundary);
+/// native_fmt sizes act_bytes and h_bytes by it for the layers canon_layer accepts.
+size_t canon_act_bytes(int64_t n, int group);
 /// The order of an activation's int8 values in memory (the values and their scales are the GPU's either way).
 enum class CanonOrder { plain, q2_planes, iq4nl_calls };
 

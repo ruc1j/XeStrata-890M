@@ -244,6 +244,8 @@ bool canon_layer(const NativeFmt& f) {
            fits(f.n_ff, 32, kNativeHBytes);
 }
 
+size_t canon_act_bytes(int64_t n, int group) { return qs_offset(n, group) + (size_t) n; }
+
 void canon_quant(const float* x, int64_t n, int group, void* dst, CanonOrder order) {
     STRATA_CANON_NO_CONTRACT
     float* ds = static_cast<float*>(dst);

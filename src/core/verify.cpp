@@ -3,14 +3,17 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
+#include "strata/core/window_evict.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/spec_prob.hpp"
+#include "strata/core/spec_proposal.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
+#include "strata/core/spec_proposal.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -1720,30 +1723,52 @@ bool Verifier::capture(int T, std::string& err) {
         if (strata::gpu::mem_info(&free0, &total_b))
             std::fprintf(stderr, "strata verify: capturing the %d-token window (%zu MiB of VRAM free)\n", T, free0 >> 20);
     }
-    if (!strata::gpu::begin_capture(cs_)) {
-        err = "verify: begin capture failed";
-        return false;
-    }
-    std::string rerr;
-    bool ok = false;
-    seg_out_ = &segs_[T];
-    try {
-        ok = record_window(T, cs_, rerr);
-    } catch (const std::exception& e) {
-        rerr = std::string("verify: window capture: ") + e.what();
-    }
-    seg_out_ = nullptr;
-    if (!ok) {
-        strata::gpu::abandon_capture(cs_);
-        for (auto* e : segs_[T]) strata::gpu::graph_destroy(e);
-        segs_[T].clear();
-        err = rerr;
-        return false;
-    }
     strata::gpu::Graph* last = nullptr;
-    if (!strata::gpu::end_capture(cs_, &last)) {
-        err = std::string("verify: end capture: ") + strata::gpu::last_error();
-        return false;
+    for (int freed_sizes = 0;;) {
+        if (!strata::gpu::begin_capture(cs_)) {
+            err = "verify: begin capture failed";
+            return false;
+        }
+        std::string rerr;
+        bool ok = false;
+        seg_out_ = &segs_[T];
+        try {
+            ok = record_window(T, cs_, rerr);
+        } catch (const std::exception& e) {
+            rerr = std::string("verify: window capture: ") + e.what();
+        }
+        seg_out_ = nullptr;
+        if (!ok) {
+            strata::gpu::abandon_capture(cs_);
+            for (auto* e : segs_[T]) strata::gpu::graph_destroy(e);
+            segs_[T].clear();
+            err = rerr;
+            return false;
+        }
+        if (strata::gpu::end_capture(cs_, &last)) {
+            if (freed_sizes > 0)
+                std::fprintf(stderr, "strata verify: no room for the %d-token window graph: freed the graphs of %d other "
+                                     "window sizes (they are captured again when used; a larger --vram-reserve-mib "
+                                     "keeps them)\n", T, freed_sizes);
+            break;
+        }
+        // upstream #3702 (adapted): the recorded window could not be made into a graph, which on a full device is the
+        // room its graph needs.  A window size whose graph does not fit used to end the engine: free the graph of the
+        // largest other size (it is captured again when next used) and record this one again.  Not while capture_all
+        // wants every size at once, and not for the segmented windows (their pieces are freed with the window).
+        const std::string why = strata::gpu::last_error();
+        bool have[9] = {};
+        for (int t = 1; t <= max_t_ && t < 9; ++t) have[t] = exec_[t] != nullptr;
+        const int victim = segmented_ || no_window_eviction_ ? 0
+                                                              : strata::core::pick_window_victim(have, std::min(max_t_, 8), T, 0);
+        if (victim == 0) {
+            err = std::string("verify: end capture: ") + why;
+            return false;
+        }
+        (void) strata::gpu::stream_sync(cs_);
+        strata::gpu::graph_destroy(exec_[victim]);
+        exec_[victim] = nullptr;
+        ++freed_sizes;
     }
     if (segmented_) segs_[T].push_back(last);
     else exec_[T] = last;
@@ -1932,6 +1957,20 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const OnDevice on_device(device_);
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    // upstream #3416: an explicit gated measure borrowed for this run only (set_spec_proposal); it is cleared on every
+    // exit, the propagated stage borrows with it, and it never falls back to ordinary p
+    const bool measure = spec_measure_;
+    struct ProposalBorrow {
+        Verifier* verifier;
+        bool active;
+        ~ProposalBorrow() { if (active) verifier->set_spec_q(nullptr, 0); }
+    } proposal_borrow{this, measure};
+    if (measure && (T > strata::kernels::kVerifyMaxT || spec_nq_ < 0 || spec_nq_ > T || (spec_nq_ > 0 && spec_q_ == nullptr))) {
+        err = "verify: proposal row count/pointer is invalid"; return false;
+    }
+    if (measure && (!head_sampling_ || sampling_.greedy || sampling_.temperature <= 0.0f)) {
+        err = "verify: proposal requires sampled head"; return false;
+    }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) {
@@ -2097,28 +2136,43 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         sp.counter = (uint64_t) pos0;
         // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
         bool judged = false;
-        if (sampled && spec_q_ != nullptr && spec_nq_ > 0 && T > 1 && T <= strata::kernels::kVerifyMaxT) {
+        if (sampled && (measure || (spec_q_ != nullptr && spec_nq_ > 0 && T > 1)) && T <= strata::kernels::kVerifyMaxT) {
             if (d_spec_ == nullptr &&
                 !strata::gpu::alloc_device((void**) &d_spec_, (size_t) strata::kernels::kVerifyMaxT *
                                                                   (1 + strata::core::kSpecQStride) * sizeof(int32_t)))
                 d_spec_ = nullptr;
             if (d_spec_ != nullptr) {
-                const int nq = std::min(spec_nq_, T - 1);
+                const int nq = measure ? spec_nq_ : std::min(spec_nq_, T - 1);
                 int32_t* d_q = d_spec_ + strata::kernels::kVerifyMaxT;
-                if (strata::gpu::copy_async(d_spec_, tokens + 1, (size_t) (T - 1) * sizeof(int32_t), cs_) &&
-                    strata::gpu::copy_async(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t), cs_))
-                    judged = strata::kernels::sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp,
-                                                                 d_spec_, d_q, nq, m_out_, cs_);
+                if ((T == 1 || strata::gpu::copy_async(d_spec_, tokens + 1, (size_t) (T - 1) * sizeof(int32_t), cs_)) &&
+                    (nq == 0 || strata::gpu::copy_async(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t), cs_)))
+                    judged = measure
+                        ? strata::kernels::sample_tokens_proposal(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp,
+                                                                  d_spec_, d_q, nq, m_out_, cs_)
+                        : strata::kernels::sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp,
+                                                              d_spec_, d_q, nq, m_out_, cs_);
             }
         }
         spec_q_ = nullptr;
         spec_nq_ = 0;
+        if (measure && !judged) {
+            (void) strata::gpu::stream_sync(cs_);
+            err = "verify: proposal sampler unavailable or allocation/copy/launch failed";
+            return false;
+        }
         if (judged) ++spec_windows;
         else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
         if (!strata::gpu::stream_sync(cs_)) {   // m_out_ is the mapped h_out_: synced, it is readable
             err = "verify: the head sampling failed";
             return false;
         }
+    }
+    if (measure) {
+        for (int t = 0; t < T; ++t)
+            if (((volatile int32_t*) h_out_)[t] == strata::core::proposal::kProposalSamplerErrorToken) {
+                err = "verify: invalid proposal candidate or zero NULL residual";
+                return false;
+            }
     }
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     // XeStrata-890M, STRATA_VERIFY_MARGIN=a,pmin (opt-in, greedy requests; the output changes): a draft that is not
@@ -2996,6 +3050,11 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
 }
 
 bool Verifier::capture_all(std::string& err) {
+    struct NoEvict {   // every size is wanted at once here: a capture must not free another size's graph (#3702)
+        bool& f;
+        explicit NoEvict(bool& flag) : f(flag) { f = true; }
+        ~NoEvict() { f = false; }
+    } no_evict{no_window_eviction_};
     if (!flush_gdn(err)) return false;   // set_gdn_defer: their graphs carry no stashed rows
     const OnDevice on_device(device_);
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
@@ -3308,6 +3367,7 @@ bool InProcessStage::set_stop_ids(const std::vector<int32_t>& ids, std::string& 
 }
 void InProcessStage::set_history(const int32_t* history, int history_len) { next_->set_history(history, history_len); }
 void InProcessStage::set_spec_q(const int32_t* q, int n_q) { next_->set_spec_q(q, n_q); }
+void InProcessStage::set_spec_proposal(const int32_t* q, int n_q) { next_->set_spec_proposal(q, n_q); }
 bool InProcessStage::read_logits(int rows, float* host, std::string& err) const {
     return next_->read_logits(rows, host, err);
 }

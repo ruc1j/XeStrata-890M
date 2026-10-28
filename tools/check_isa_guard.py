@@ -40,6 +40,9 @@ WIDE_PUBLIC = {
     "q2_0_gguf_rows_multi_avx2_v", "q2_0_gguf_rows_multi_avx2_legacy", "q2_0_gguf_rows_multi_avx2_bitplane",
     "act_quant_q8_1_avx2", "q8k_quant_avx2", "kq256_gu_rows", "kq256_rows", "bf16_rows_dot_multi",
     "tq_rows_avx512",   # the trellis rows (tq_cpu.cpp): reached only through tq_isa_ok (cpu_avx512_ok)
+    # upstream 0.2.5 (iq_avx512.cpp): the exact rows and the window-invariant reference rows, reached only behind
+    # cpu_avx512_ok (native_expert.cpp's `avx512`)
+    "iq512x_rows", "iq512_reference_gu_rows",
 }
 WIDE_OBJECTS = ("expert.cpp", "iq_avx512.cpp", "iq_avx2.cpp", "q2_avx2.cpp", "kq_avx2.cpp", "tq_avx512.cpp")
 

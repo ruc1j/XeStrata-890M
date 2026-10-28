@@ -100,8 +100,13 @@ public:
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
     /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
+    /// Successful producer result, including a generated row that failed admission (upstream #3416).
+    /// budget is the actual producer max_steps; failure/entry resets both fields.
+    /// With result supplied, n_drafts (if supplied too) is also reset on entry.
+    struct DraftResult { int generated = 0; int budget = 0; };
+
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-               float* probs = nullptr, const More& more = {}, int* n_drafts = nullptr);
+               float* probs = nullptr, const More& more = {}, int* n_drafts = nullptr, DraftResult* result = nullptr);
 
     /// STRATA_SPEC_COST (upstream 5f49ec45): called after each draft step with (index, probability) instead of the
     /// `min_p` (or STRATA_SPEC_CUM) test; false ends the chain.  Also called once for the last step of a chain that
@@ -110,7 +115,7 @@ public:
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
-                     float* probs = nullptr, const More& more = {}, int* n_drafts = nullptr);
+                     float* probs = nullptr, const More& more = {}, int* n_drafts = nullptr, DraftResult* result = nullptr);
 
     /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and

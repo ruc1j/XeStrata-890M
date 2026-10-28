@@ -503,9 +503,11 @@ bool MtpDrafter::setup_coupled(std::string& err) {
     coupled_ok_ = true;
     if (spec_prob_on())
         std::fprintf(stderr, "strata mtp: probabilistic draft acceptance on (STRATA_SPEC_PROB): sampled requests at "
-                             "temperature %.2f or more draft by sampling the draft head's distribution over %lld tokens; "
-                             "the verifier accepts with min(1, p/q) and resamples the residual\n",
-                     (double) spec_prob_min_temp(), (long long) nv);
+                             "temperature %.2f or more draft by sampling the draft head's distribution over %lld tokens; %s\n",
+                     (double) spec_prob_min_temp(), (long long) nv,
+                     spec_gate_pick()
+                         ? "pick gate: masked mu offers, min(1, p/mu) acceptance and (p-mu)+ rejection/NULL residuals"
+                         : "top gate (compatibility): q offers, min(1, p/q) acceptance and (p-q)+ rejection residuals");
     else
         std::fprintf(stderr, "strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the "
                              "target's chain and Philox draw over %lld tokens\n", (long long) nv);
@@ -1327,7 +1329,8 @@ float spec_cum_threshold() {
 }
 
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-                       float* probs, const More& more, int* n_drafts) {
+                       float* probs, const More& more, int* n_drafts, DraftResult* result) {
+    if (result) { *result = {}; if (n_drafts) *n_drafts = 0; }
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
     if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
@@ -1431,6 +1434,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
+    if (result) *result = {n, max_steps};
     ms_draft += ms_since(t0);
     ++rounds;
     return true;
@@ -1554,7 +1558,8 @@ int MtpDrafter::chain_poll(std::string& err) {
 }
 
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
-                             float* probs, const More& more, int* n_drafts) {
+                             float* probs, const More& more, int* n_drafts, DraftResult* result) {
+    if (result) { *result = {}; if (n_drafts) *n_drafts = 0; }
     const OnDevice on_device(device_);
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -1564,7 +1569,7 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
             return false;
         }
     std::vector<int32_t> toks((size_t) T, token);
-    return draft(T, toks.data(), cell, 0, drafts, err, probs, more, n_drafts);
+    return draft(T, toks.data(), cell, 0, drafts, err, probs, more, n_drafts, result);
 }
 
 }  // namespace strata::core
