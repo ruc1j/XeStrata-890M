@@ -1130,6 +1130,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # STRATA_KVA's rule (which reads and layers it applies to) and the draft layer's cell floor (upstream 0.2.7; header-only, CPU)
+  add_executable(kva_test src/prefill/kva_test.cpp)
+  target_include_directories(kva_test PRIVATE include)
+  add_test(NAME kva_test COMMAND kva_test)
   # the layer split's pure rules (header-only, no GPU; upstream 1c6c82ef, cb6c549c, a22a0e8c): the automatic split's
   # minimum stage size, the --batch-groups resolution and which path builds the draft layer's prompt K/V
   foreach(rule_test split_rules_test batch_groups_test draft_kv_plan_test)

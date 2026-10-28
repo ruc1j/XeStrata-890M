@@ -160,6 +160,22 @@ B70 では、遅くなるのはキャッシュを仮想メモリに置いた側�
 - `k8v4`: キーを 8 ビット、値を 4 ビットにし、メモリは約 4 分の 3 です。
   ほかの精度と同じように KV をストリーミングします（RAM は文脈 1 トークンあたり約 10.6 KB）
 
+### 長い prompt を近似して読む（STRATA_KVA、任意）
+
+`STRATA_KVA=1` を付けると、長い prompt の初めての読みで、後ろの層を近似します（upstream 0.2.7 の KVA の移植）。
+対象は 1 つの GPU で読む 4,096 トークン以上の prompt の、まだキャッシュにない部分です（`STRATA_KVA_MIN_PROMPT` で変えられます）。
+層 36 から 47 では prompt の最後の 2,048 トークンを除く位置について、状態だけを進めます（`STRATA_KVA_SPLIT` と `STRATA_KVA_SUFFIX` で変えられます）。
+GDN の層では再帰の状態だけを進め、出力の射影は省きます。
+QSA の層では K/V と indexer のページだけを書き、クエリの射影と選択と注意は省きます。
+どちらの層でも MoE の半分は丸ごと省き、そのエキスパートの転送も積みません。
+これらの位置の出力はその先のどの層も読まないので、省いても後ろの層の状態以外は変わりません。
+省いた層の状態は近似なので、長い一覧の項目を落としたり、細かいところを取りこぼしたりすることがあります。
+upstream の計測（RTX 5070、IQ3_S）では、14K トークンで 11%、30K トークンで 18% 速くなり、606 の事実のうち正確な読みと同じ 585 を見つけました。
+読みの終わりに、ログが近似した位置の数と層を出します（`strata prefill: KVA on (state-only): split 36, suffix 2048, approximated N of M positions ...`）。
+この近似で読んだ会話はあとの turn もその状態の上で答えます。`STRATA_KVA=0`（既定）ではどの prompt も正確に読みます。
+`--batch` と層の分割（複数の GPU）では使いません。画像を含む prompt と、4,096 トークン未満の prompt は正確に読みます。
+upstream の capture と oracle のモード（`STRATA_KVA_MODE`）は研究用で、XeStrata には identity のモードだけがあります。
+
 ## モデルの選び方
 
 どのモデルも [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) を圧縮したものです。

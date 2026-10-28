@@ -172,6 +172,22 @@ Unless asked, the device's reported virtual-memory granularity decides: on at 2 
 - `k8v4`: 8-bit keys and 4-bit values, about three quarters of the memory.
   It streams its KV like the other formats (about 10.6 KB of RAM per context token)
 
+### Reading a long prompt approximately (STRATA_KVA, optional)
+
+`STRATA_KVA=1` approximates the late layers on the first read of a long prompt (a port of upstream 0.2.7's KVA).
+It applies to the part not yet in the cache of a prompt of 4,096 tokens or more read on one GPU (`STRATA_KVA_MIN_PROMPT` changes the bound).
+In layers 36 to 47, for the positions before the prompt's last 2,048 tokens, only the state advances (`STRATA_KVA_SPLIT` and `STRATA_KVA_SUFFIX` change these).
+A GDN layer advances its recurrent state and skips its output projection.
+A QSA layer writes its K/V and indexer pages and skips the query projections, the selection and the attention.
+In both, the MoE half is skipped entirely and its expert transfers are not queued.
+No later layer reads those positions' outputs, so skipping them changes nothing but the late layers' state.
+That state is an approximation: it can drop entries of a long list or miss details.
+upstream's measurement (RTX 5070, IQ3_S) was 11% faster at 14K tokens and 18% at 30K, and found the same 585 of 606 facts as the exact read.
+At the end of the read the log says how many positions were approximated and in which layers (`strata prefill: KVA on (state-only): split 36, suffix 2048, approximated N of M positions ...`).
+A conversation read this way answers its later turns on that state. `STRATA_KVA=0` (the default) reads every prompt exactly.
+It is not used with `--batch` or a layer split (several GPUs); a prompt with pictures and one under 4,096 tokens are read exactly.
+upstream's capture and oracle modes (`STRATA_KVA_MODE`) are research; XeStrata has the identity mode only.
+
 ## Which model
 
 Every model is a compression of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next).

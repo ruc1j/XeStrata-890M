@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/kva.hpp"   // STRATA_KVA: the approximate late-layer prompt read (opt-in, upstream 0.2.7)
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -1837,6 +1838,30 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
+    // STRATA_KVA (upstream 0.2.7, opt-in): the approximate-prefix plan of this read, if it qualifies (a cold read of one
+    // long prompt, one stage, no pictures).  Positions [0, kva_frontier) are approximated in the layers at and after
+    // the split: only their state advances (the GDN recurrence, the K/V and indexer pages), their outputs and their MoE
+    // half have no consumer left.  XeStrata keeps the identity mode only (the capture and oracle modes are research).
+    const strata::prefill::KvaConfig& kva = strata::prefill::kva_config();
+    const strata::prefill::KvaEngine& kva_eng = strata::prefill::kva_engine();
+    const int64_t kva_suffix = kva.effective_suffix();
+    bool kva_routine = false;
+    const char* kva_why_not = kva.decline(kva_eng, pos0, n, LB, LE < 0 ? -1 : LE, (int64_t) g.n_layers,
+                                          embd_rows != nullptr, false, &kva_routine, g.n_layers != 48 || g.n_expert != 512);
+    if (kva_why_not == nullptr && kva.mode != strata::prefill::KvaConfig::Mode::Identity) kva_why_not = "only the identity mode is implemented here";
+    if (kva_why_not == nullptr && (g.n_layers != 48 || g.n_expert != 512)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "strata prefill: WARNING: STRATA_KVA_ANY_MODEL=1: KVA was only measured on Qwen3.8-Flash-Next "
+                                 "(48 layers, 512 experts); this model has %lld layers and %lld experts\n",
+                         (long long) g.n_layers, (long long) g.n_expert);
+        }
+    }
+    const bool kva_run = kva_why_not == nullptr;
+    const int64_t kva_split = std::min<int64_t>(std::max<int64_t>(kva.split, 1), g.n_layers);
+    const int64_t kva_frontier = std::max<int64_t>(0, n - kva_suffix);
+    int64_t kva_positions = 0, kva_chunks = 0;   // what actually took the approximate path (diagnostics)
     // the next stage reads chunk c while this one reads chunk c + 1 (declared first: an early return waits for it
     // before anything it reads goes away)
     struct NextWait {
@@ -1899,6 +1924,19 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);
+        // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
+        // before the frontier (a chunk is never split into two regimes)
+        const bool kva_approx = kva_run && (p0 + T <= kva_frontier);
+        if (kva_approx) {
+            kva_positions += T;
+            ++kva_chunks;
+        }
+        // a layer that will not run its MoE half must not queue expert transfers either: the one place the two meet
+        auto kva_skips_layer = [&](int64_t l) {
+            return kva_approx && l >= kva_split &&
+                   (kva.only == strata::prefill::KvaConfig::Only::All ||
+                    (kva.only == strata::prefill::KvaConfig::Only::Gdn) == !core::is_qsa_layer(g, l));
+        };
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
         const auto tsetup = Clock::now();
@@ -2056,6 +2094,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             std::vector<Stager::Job> js;
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
+                if (kva_skips_layer(l)) continue;   // no transfer for a layer whose MoE half is skipped
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     const bool tr = m.src->transient(l, e);   // copied by the source in the stager (never pinned)
@@ -2221,7 +2260,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 }
                 stats_.ms_ple += ms_since(tp);
             }
+            // STRATA_KVA: `kva_layer` means this layer's output has no consumer left for this chunk: with the default
+            // (state-only) form only its state advances and neither half writes the residual; STRATA_KVA_SKIP=moe
+            // runs the attention half in full and skips only the MoE half (its experts were not queued above)
+            const bool kva_layer = kva_skips_layer(l);
+            const bool kva_moe_only = kva_layer && kva.skip == strata::prefill::KvaConfig::Skip::Moe;
+            const bool kva_state_only = kva_layer && !kva_moe_only;
             for (int half = 0; half < 2; ++half) {
+                if (kva_layer && half == 1) continue;   // the MoE half: nothing of it is wanted
                 // ---- the hyper-connection read of this half
                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
                 const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
@@ -2293,6 +2339,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfGdnRec, cs);
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
                     pt.mark(kPfGdnOut, cs);
+                    if (kva_state_only) { ++gdn_index; continue; }   // KVA: the state advanced; no output, no residual write
                     if (!m.dense_proj(wo, nullptr, m.y_h, true, m.bo, T, v.name("ssm_out.weight"), err)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
@@ -2309,9 +2356,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfQsa, cs);
                     if (!m.dense_proj(wk, m.mixed, m.mixed_h, true, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!m.dense_proj(wv, m.mixed, m.mixed_h, false, m.Vc, T, v.name("attn_v.weight"), err)) return false;
-                    if (!m.dense_proj(wq, m.mixed, m.mixed_h, false, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    // KVA: the query projections have no consumer when only the KV/indexer state advances
+                    if (!kva_state_only && !m.dense_proj(wq, m.mixed, m.mixed_h, false, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
-                    if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
                     rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
@@ -2350,12 +2398,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
                                       &st.host, staged ? &m.stage : nullptr);
                     }
-                    split_q(m.Qf, m.q, T, m.cs);
-                    rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
-                    rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
-                    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
-                    rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
-                    rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                    if (!kva_state_only) {   // (KVA: no queries when only the state advances)
+                        split_q(m.Qf, m.q, T, m.cs);
+                        rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
+                        rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
+                        if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
+                        rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
+                        rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                    }
                     // the indexer appends, token by token; then scores + selection for many queries at once:
                     // a query reads completed blocks (final once completed) and `dead` for its own tail block
                     const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
@@ -2376,6 +2426,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                                        strata::kernels::rope_scaling(), m.cs);
                         }
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
+                    // KVA: the KV pages and the indexer's keys/pool are complete for this chunk.  Nothing that follows
+                    // (the selection, the attention, the output) has a consumer when only the state advances.
+                    if (kva_state_only) { ++qsa_index; continue; }
                     pt.mark(kPfQsaSel, cs);
                     for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                         const int64_t nb = std::min(m.sel_batch, T - t0);
@@ -3625,6 +3678,23 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         return false;
     }
     stats_.ms_total += ms_since(t_start);
+    if (kva_run) {
+        std::fprintf(stderr, "strata prefill: KVA %s: split %lld, suffix %lld, approximated %lld of %lld positions in %lld chunk%s%s\n",
+                     kva.skip == strata::prefill::KvaConfig::Skip::Moe ? "on (moe-skip)" : "on (state-only)",
+                     (long long) kva_split, (long long) kva_suffix, (long long) kva_positions, (long long) n,
+                     (long long) kva_chunks, kva_chunks == 1 ? "" : "s",
+                     kva.only == strata::prefill::KvaConfig::Only::Gdn ? ", gdn layers only"
+                     : kva.only == strata::prefill::KvaConfig::Only::Qsa ? ", qsa layers only" : "");
+        if (kva_positions > 0)
+            std::fprintf(stderr, "strata prefill: KVA: the late layers (%lld and up) hold approximated cells for %lld positions of "
+                                 "this conversation; the answers of its later turns are those of this read (STRATA_KVA=0 reads "
+                                 "every prompt exactly)\n", (long long) kva_split, (long long) kva_positions);
+    } else if (kva.on && (kva.explicit_on || (n >= kva.min_prompt && !kva_routine && kva_eng.blocked.empty()))) {
+        // a run that was configured for KVA but fell back completely says so and why (else an operator cannot tell it
+        // apart from a run where the feature was never asked for)
+        if (!kva_routine)
+            std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: %s\n", kva_why_not);
+    }
     if (pt.on) {
         pt.fold();
         double total = 0.0;

@@ -62,6 +62,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/kva.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/plain_generate.hpp"
@@ -2912,6 +2913,9 @@ int main(int argc, char** argv) {
     }
     // a layer split across GPUs; --layer-split auto may give its GPU the helper cache's role instead (below)
     bool multi_gpu = !split_devs.empty() && !split_same;
+    // STRATA_KVA (prefill/kva.hpp): what this engine's configuration rules out for the whole process
+    if (o.batch > 0) strata::prefill::kva_engine().blocked = "batch slots (--batch)";
+    else if (multi_gpu) strata::prefill::kva_engine().blocked = "a layer split";
     // the helper-GPU expert caches (--expert-cache-remote, upstream's docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
     int remote_dev[3] = {1, 2, 3};
