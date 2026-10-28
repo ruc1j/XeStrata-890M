@@ -22,6 +22,8 @@ import time
 import urllib.error
 import urllib.request
 
+from highlight import StreamHighlighter
+
 
 class ServerError(Exception):
     pass
@@ -82,7 +84,9 @@ def main() -> int:
     a = ap.parse_args()
     url = f"http://{a.host}:{a.port}/v1/chat/completions"
     gray, reset = ("\033[90m", "\033[0m") if sys.stdout.isatty() else ("", "")
-    messages, pending = [], []
+    hl = StreamHighlighter(color=sys.stdout.isatty())
+    messages: list = []
+    pending: list = []
     think = "none" if a.no_think else a.think
     print(f"Strata chat ({url}).  /image <path> = attach a picture, /think none|low|medium|high (now: {think}), "
           f"/reset = new conversation, /quit = leave.")
@@ -138,11 +142,14 @@ def main() -> int:
                     if in_think:
                         print(reset + "\n", end="")
                         in_think = False
-                    print(content, end="", flush=True)
+                    print(hl.feed(content), end="", flush=True)
                     answer.append(content)
                 n += 1
             if in_think:
                 print(reset, end="")
+            out = hl.flush()
+            if out:
+                print(out, end="")
         except KeyboardInterrupt:
             print(f"{reset}\n(interrupted)")
             failed = True

@@ -17,9 +17,25 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # runnable from the repo root too
 
 from _paths import add_gguf_py  # noqa: E402
-add_gguf_py()
-from gguf import GGUFWriter, GGMLQuantizationType as Q, quants  # noqa: E402
-import iq_pack  # noqa: E402
+import iq_pack  # noqa: E402            # needs numpy + gguf_reader only, not gguf-py: import it unguarded
+
+try:
+    add_gguf_py()                       # llama.cpp's gguf-py: setup.py clones it; gguf_py() exits when absent
+    from gguf import GGUFWriter, GGMLQuantizationType as Q, quants  # noqa: E402
+except SystemExit:
+    GGUF_PY = None
+else:
+    GGUF_PY = "found"
+
+
+def require_gguf_py(test):
+    """setUpClass for the classes that build GGUF fixtures: skip (not fail) on a checkout without llama.cpp."""
+    @classmethod
+    def setUpClass(cls):
+        if GGUF_PY is None:
+            raise unittest.SkipTest("llama.cpp's gguf-py not found: run setup.py (it clones llama.cpp into "
+                                    "third_party/) or set STRATA_GGUF_PY")
+    return setUpClass
 
 
 def write_gguf(path, tensors, split=None, arch=True):
@@ -40,6 +56,7 @@ def write_gguf(path, tensors, split=None, arch=True):
 
 
 class CompatibilityTests(unittest.TestCase):
+    setUpClass = require_gguf_py(unittest.TestCase)
     def test_bf16_halfway_rounds_to_even(self):
         values = np.array([0x3F808000, 0x3F818000, 0xBF808000, 0xBF818000], dtype=np.uint32)
         got = np.frombuffer(iq_pack.bf16_bytes(values.view(np.uint8), "F32"), dtype=np.uint16)
@@ -256,6 +273,8 @@ class ConversionTests(unittest.TestCase):
     """CS2: FORM decides the engine's form; exact F32->BF16 by default, rounding only with --compat-bf16, the PLE
     conv F32 -> F16 by the loader (index kind 3), non-finite values refused, every conversion in conversions.json."""
 
+    setUpClass = require_gguf_py(unittest.TestCase)
+
     def test_exact_f32_to_bf16_by_default(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             x = bits(np.arange(64, dtype=np.uint32).reshape(2, 32) << 16 | 0x3F000000)   # BF16 values held as F32
@@ -365,8 +384,9 @@ def expert(seed, shape):
     return np.random.default_rng(seed).standard_normal((N_EXPERT, *shape)).astype(np.float32)
 
 
-def split_model(root, name="model", split_layer=True, dup=False, split_no=None, gate1=Q.Q8_0, seed=0):
+def split_model(root, name="model", split_layer=True, dup=False, split_no=None, gate1=None, seed=0):
     """Writes the 4 shards; returns their paths."""
+    gate1 = Q.Q8_0 if gate1 is None else gate1      # not a default arg: the module imports without gguf-py
     gu, dn = (32, 32), (32, 32)
     router = [(f"blk.{li}.ffn_gate_inp.weight", np.full((N_EXPERT, 32), 0.5, np.float32), Q.F32) for li in (0, 1)]
     l0 = [(f"blk.0.ffn_{r}_exps.weight", expert(seed + 10 + i, gu if r != "down" else dn), Q.Q8_0)
@@ -409,6 +429,7 @@ def expected_experts(model):
 
 
 class SplitArtifactTests(unittest.TestCase):
+    setUpClass = require_gguf_py(unittest.TestCase)
     def test_four_shards_and_a_layer_split_per_role(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
@@ -692,6 +713,7 @@ class HadamardTests(unittest.TestCase):
         got = iq_pack.hadamard_spec(self.meta(), self.layout(gu=42), self.N_EMBD, self.N_FF)
         self.assertIn("Q2_0", got)
 
+    setUpClass = require_gguf_py(unittest.TestCase)   # test_packer_refuses_before_writing builds GGUF fixtures
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # runnable as tools/test_x.py from the repo root too
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # runnable from the repo root too
 
 from conversation_cache_soak import STATE_KEYS, answer_text, verify  # noqa: E402

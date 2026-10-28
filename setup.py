@@ -28,7 +28,7 @@ Options: --family qwen|swift, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768
 (--rope-scale F; past the trained 262144 setup adds yarn and the factor final context / 262144),
 --vision yes|no|gpu|cpu, --port 8095, --yes (recommended
 answers, no questions), --setup (install another model / change settings instead of starting), --no-start,
---host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
+--host 0.0.0.0 --api-key KEY (reach it over IPv4; use --host :: for IPv6), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --check (only check this PC), --check-update
 (whether a newer XeStrata release is out), --images qwen-image-turbo|qwen-image-base|...-uncensored|no (image
@@ -2075,21 +2075,57 @@ def gpu_info(pick=None):
     return {**g, "count": len(found)}
 
 
+CMAKE_MIN = (3, 24)                    # CMakeLists.txt: cmake_minimum_required(VERSION 3.24)
+
+
+def _tool_version(path, name):
+    """(ok, version tuple) of `path --version`: ok False when it does not run (a pip launcher whose Python is gone)."""
+    try:
+        done = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False, ()
+    if done.returncode != 0:
+        return False, ()
+    found = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", done.stdout or "")
+    return True, tuple(int(x) for x in found.groups() if x) if found else ()
+
+
 def find_tool(name):
-    """A tool on PATH, or the one pip installed next to this Python (cmake, ninja).  A PATH copy that does not run
-    (a pip launcher whose Python is gone) is skipped for the one next to this Python."""
-    p = shutil.which(name)
-    if p:
-        try:
-            if subprocess.run([p, "--version"], capture_output=True, timeout=30).returncode == 0:
-                return p
-        except (OSError, subprocess.SubprocessError):
-            pass
-    for d in (Path(sys.executable).parent, Path.home() / ".local" / "bin"):
-        c = d / name
-        if c.exists():
-            return str(c)
-    return None
+    """The tool the build uses (cmake, ninja): the one pip installed next to THIS Python first (the virtualenv's own,
+    upstream #3822), then PATH, then ~/.local/bin.  One that does not run (a pip launcher whose Python is gone) is
+    skipped, and so is a cmake older than the one CMakeLists.txt needs while another is found; with only an older one
+    it is returned and the build says so."""
+    exe = name + (".exe" if os.name == "nt" else "")
+    candidates = [str(d / exe) for d in (Path(sys.executable).parent / "Scripts", Path(sys.executable).parent)
+                  if (d / exe).exists()]
+    on_path = shutil.which(name)
+    if on_path and on_path not in candidates:
+        candidates.append(on_path)
+    local = Path.home() / ".local" / "bin" / exe
+    if local.exists() and str(local) not in candidates:
+        candidates.append(str(local))
+    older = None
+    for c in candidates:
+        runs, version = _tool_version(c, name)
+        if not runs:
+            continue
+        if name == "cmake" and version and version[:2] < CMAKE_MIN:
+            older = older or c
+            continue
+        return c
+    return older
+
+
+def tool_usable(name):
+    """find_tool found one that runs and (cmake) is new enough: an older system cmake counts as missing, so pip puts
+    the right one in the venv."""
+    found = find_tool(name)
+    if found is None:
+        return False
+    if name == "cmake":
+        runs, version = _tool_version(found, name)
+        return runs and (not version or version[:2] >= CMAKE_MIN)
+    return True
 
 
 def free_gb(path):
@@ -2509,6 +2545,29 @@ def _piece_worker(src: _Source, st: _Pieces, todo: list, part: Path):
         st.stop.set()
 
 
+class StallNote:
+    """A download that gets no byte for a while says so (upstream #3567): "stalled at 69%" instead of a silent line that
+    never moves.  `check` is called often with the bytes so far; it answers a sentence at most once a minute while
+    nothing arrives, and None otherwise."""
+
+    AFTER = 120.0
+
+    def __init__(self, now: float = 0.0):
+        self.have, self.since, self.said = -1, now, 0.0
+
+    def check(self, have: int, total: int, now: float) -> str | None:
+        if have != self.have:
+            self.have, self.since, self.said = have, now, 0.0
+            return None
+        idle = now - self.since
+        if idle < self.AFTER or now - self.said < 60:
+            return None
+        self.said = now
+        return (f"no data for {int(idle // 60)} min at {100 * have // max(1, total)}%: the connection is stuck. "
+                "It keeps trying; to stop, press Ctrl+C, "
+                "and run the same command again: the download continues where it stopped")
+
+
 def parallel_download(url: str, part: Path, total: int, label: str, conns: int, name: str) -> bool:
     """Fill `part` (total bytes) over `conns` ranged connections.  True when every byte is there; False when the server
     does not do ranges (the caller reads the file in one stream)."""
@@ -2529,6 +2588,7 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
         # no piece list can be kept here: the pieces would not be told from holes
         return False
     last_print = last_save = 0.0
+    stall = StallNote(time.time())
 
     def report(force=False):
         nonlocal last_print, last_save
@@ -2538,6 +2598,10 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
             have = st.have()
             print(f"\r  {label}: {have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)   ", end="",
                   flush=True)
+            note = stall.check(have, total, now)
+            if note:
+                print()
+                warn(note)
         if now - last_save > DL_SAVE_EVERY:
             last_save = now
             _save_pieces(part, total, st.snapshot())
@@ -2830,12 +2894,14 @@ def download(url, dst: Path, what=None):
             time.sleep(5)
     if not total:
         total = range_total(url)
+    meta = ms_meta(*ms) if ms is not None else None
+    if not total:                                  # the published size also governs partial-file completion (#2287)
+        total = pin[0] if pin else (meta[0] if meta else 0)
     if pin and total and total != pin[0]:              # not the pinned file: stop before the download, not after
         fail(f"{what or dst.name} is {total:,} bytes on {url.split('/')[2]}, not the pinned {pin[0]:,}",
              "update XeStrata (the file there has changed since this version pinned it)")
     label = what or dst.name
     conns = dl_connections()
-    meta = ms_meta(*ms) if ms is not None else None
     fixed = pin if pin else (meta if meta is not None and meta[1] else None)
     again = (lambda: repair_download(url, dst, total, label, conns)) if total >= DL_MIN_PARALLEL and conns > 1 else None
     # finished by an older setup (no mark yet), or stopped before the check
@@ -3127,6 +3193,21 @@ def _installed(name: str) -> bool:
         return False
 
 
+def pip_stamp_is_ours(stamp: Path) -> bool:
+    """The list of installed packages was written for THIS system (upstream #3634).  A .venv on a disk that Windows and
+    Linux both start from keeps the stamp of the other one, which then says "already installed" about packages this
+    Python does not have.  A marker beside the stamp names the system that wrote it; an older stamp without a marker is
+    believed only while the packages every run needs can be imported."""
+    marker = stamp.with_name(stamp.name + ".os")
+    try:
+        if marker.exists():
+            return marker.read_text(encoding="utf-8").strip() == sys.platform
+    except OSError:
+        return False
+    import importlib.util
+    return all(importlib.util.find_spec(m) is not None for m in ("numpy", "jinja2", "regex", "yaml"))
+
+
 def pip_install(packages, what):
     """pip install into .venv, skipped when the same list was installed before.  An install from before the pinned
     requirements recorded bare names: those packages are kept as they are (nothing is reinstalled), and the pinned
@@ -3134,7 +3215,7 @@ def pip_install(packages, what):
     # a Python whose prefix this user cannot write (the system's, run without setup.sh's .venv): pip installs into the
     # user's site, and the list is kept there
     stamp = (Path(sys.prefix) if os.access(sys.prefix, os.W_OK) else Path(site.getuserbase())) / ".strata-pip.json"
-    have = json.loads(stamp.read_text()) if stamp.exists() else []
+    have = json.loads(stamp.read_text()) if stamp.exists() and pip_stamp_is_ours(stamp) else []
     bare = {p.lower() for p in have if req_name(p) == p.lower()}
     need = [p for p in packages if p not in have and req_name(p) not in bare
             and not (bare and "==" in p and _installed(req_name(p)))]
@@ -3146,6 +3227,7 @@ def pip_install(packages, what):
     try:
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
+        stamp.with_name(stamp.name + ".os").write_text(sys.platform, encoding="utf-8")
     except OSError as e:                                 # only costs asking pip again next time
         warn(f"could not record the installed packages in {stamp} ({e}): the next run checks them again")
     ok(f"{what} installed")
@@ -3357,6 +3439,7 @@ def intel_gpu_present() -> bool:
 def cuda_toolkits() -> list:
     """The CUDA toolkits on this PC, as cmake/StrataCuda.cmake looks for them (which chooses the one the contrib build
     uses): CUDA_PATH / CUDA_HOME / CUDA_ROOT, /usr/local/cuda-X.Y, /opt/cuda, Debian's /usr/lib/cuda and the nvcc on
+    stamp.with_name(stamp.name + ".os").write_text(sys.platform, encoding="utf-8")
     PATH; a folder counts when it has the libdevice clang needs."""
     import glob
     dirs = [os.environ.get(v, "") for v in ("CUDA_PATH", "CUDA_HOME", "CUDA_ROOT")]
@@ -3559,17 +3642,44 @@ def vulkan_missing() -> list:
     return need
 
 
+def configured_generator(bdir: Path) -> str | None:
+    """The generator a build folder was configured with (CMakeCache.txt), None when it was never configured."""
+    try:
+        for line in (Path(bdir) / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("CMAKE_GENERATOR:"):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def fresh_if_other_generator(bdir: Path, generator: str = "Ninja") -> bool:
+    """CMake refuses to configure a folder with another generator than the one it was made with ("Does not match the
+    generator used previously"): a manual build with CMake's default, Unix Makefiles on Linux, in the same build folder
+    (upstream #4038).  Such a folder is configured afresh: its cache is removed (the compiled objects of the other
+    generator are not reused anyway), with one plain line.  True when it did."""
+    had = configured_generator(bdir)
+    if had is None or had == generator:
+        return False
+    say(f"  {Path(bdir).name}/ was configured with {had}; setup builds with {generator}, so it is configured again "
+        "(the other build is not used)")
+    (Path(bdir) / "CMakeCache.txt").unlink(missing_ok=True)
+    shutil.rmtree(Path(bdir) / "CMakeFiles", ignore_errors=True)
+    return True
+
+
 def cmake_build(src, bdir, target, defs, env=None):
     """Configure `src` in `bdir` and build `target` (a name, or a list of names).  The build helpers already there
     are used (the distribution's, offline too); a missing one is installed from requirements-build.txt."""
     build_packages = requirement_lines(BUILD_REQUIREMENTS) if BUILD_REQUIREMENTS.exists() else BUILD_PACKAGES
-    missing = [package for package in build_packages if find_tool(req_name(package)) is None]
+    missing = [package for package in build_packages if not tool_usable(req_name(package))]
     if missing:
         pip_install(missing, "CMake and Ninja build tools")
     cmake, ninja = find_tool("cmake"), find_tool("ninja")
     if cmake is None or ninja is None:
         fail("cmake / ninja not found after installing them",
              "run: .venv python -m pip install -r requirements-build.txt")
+    fresh_if_other_generator(bdir)
     conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
             "-DCMAKE_BUILD_TYPE=Release", *defs]
     # the tools on PATH too: ggml's Vulkan backend configures its shader generator as a separate CMake project
@@ -5409,10 +5519,12 @@ def derived_factor(ctx: int, trained: int = 262144) -> float:
 def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     """The rope configuration for the context actually served: (scaling, scale); scaling None = no flags.
 
-    An explicit --rope-scaling / --rope-scale wins, a given factor verbatim.  Past the trained range an omitted method
-    is yarn and an omitted factor final / trained; inside it nothing turns on by itself and a chosen method without a
-    factor gets 1 (the trained angles).  An explicit none past the trained range is refused, not overridden.
+    An explicit --rope-scaling / --rope-scale wins, a valid given factor verbatim.  Past the trained range an omitted
+    method is yarn and an omitted factor final / trained; inside it nothing turns on by itself and a chosen method
+    without a factor gets 1 (the trained angles).  An explicit none past the trained range is refused, not overridden.
     """
+    if scale is not None and (not math.isfinite(scale) or scale < 1.0):
+        raise ValueError("--rope-scale must be a finite value >= 1, e.g. --rope-scale 4")
     if ctx <= trained:
         if scale is not None and scaling in (None, "none"):
             raise ValueError("--rope-scale needs --rope-scaling linear or yarn (the chosen context fits the "
@@ -5722,8 +5834,8 @@ def main() -> int:
                          "interpolation) or yarn, llama.cpp's types. Omitted with such a context, setup takes yarn; "
                          "none is refused there")
     ap.add_argument("--rope-scale", type=float,
-                    help="the extension factor (default: the final context over the trained 262144, at least 1: "
-                         "1.5 for 384K, 2 for 512K, 1 inside the trained range)")
+                    help="the extension factor, finite and >= 1 (default: the final context over the trained "
+                         "262144, at least 1: 1.5 for 384K, 2 for 512K, 1 inside the trained range)")
     ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4"],
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
                          "precise) or k8v4 (8-bit keys and 4-bit values: about three quarters of the memory)")
@@ -5776,8 +5888,8 @@ def main() -> int:
     ap.add_argument("--layer-split", help="with --gpus: the first layer of each later GPU's share (e.g. 36, or 16,32 "
                                           "for 3 GPUs), one rising number per GPU after the first - not layers per "
                                           "card; or auto (the default: measured on this PC)")
-    ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = also other "
-                                   "devices on your network (issue #26; an --api-key is recommended)")
+    ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = all IPv4 "
+                                   "interfaces, :: = all IPv6 interfaces (issue #26; an --api-key is recommended)")
     ap.add_argument("--no-browser", dest="browser", action="store_false", default=None,
                     help="do not open the chat page in the browser when the model is ready (for a harness or an app "
                          "that uses the API; remembered for this model, also in run-<model>.sh)")

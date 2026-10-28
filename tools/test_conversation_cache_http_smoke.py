@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # runnable as tools/test_x.py from the repo root too
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # runnable from the repo root too
 
 from conversation_cache_http_smoke import run  # noqa: E402

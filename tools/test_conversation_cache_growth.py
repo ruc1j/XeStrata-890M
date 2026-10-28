@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # runnable as tools/test_x.py from the repo root too
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # runnable from the repo root too
 
 from conversation_cache_growth import NAMES, SECRET, SETTINGS, STATE_KEYS, verify  # noqa: E402

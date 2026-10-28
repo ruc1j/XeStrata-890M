@@ -268,20 +268,11 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     # 3. fewer CPU workers (a restart each), with the chosen share
     if d_workers and len(worker_candidates(d_workers, extra_workers)) > 1:
         tuned = with_arg(base_args, "--pcie-frac", None if chosen is None else f"{chosen:.2f}")
-        by_workers = {}
+        by_workers: dict = {}
         for w in worker_candidates(d_workers, extra_workers):
             say(f"  Measuring with {w} CPU workers (restarts the engine) ...")
-            e = restart(start_engine, with_arg(tuned, "--pool-workers", None if w == d_workers else str(w)),
-                        f"{w} workers", say, report)
-            if e is None:
-                continue
-            try:
-                sw = Session(e, ids_list)
-                sw.warm_up(1)
-                by_workers[w] = [sw.rate(), sw.rate()]
-                say(f"    {w} workers: {statistics.median(by_workers[w]):.1f} tok/s")
-            finally:
-                close(e)
+            measure_candidate(start_engine, with_arg(tuned, "--pool-workers", None if w == d_workers else str(w)),
+                              f"{w} workers", say, report, by_workers, w, ids_list)
         report["workers"] = {str(k): v for k, v in by_workers.items()}
         w_best = pick(by_workers, d_workers) if by_workers else d_workers
         if w_best != d_workers:
@@ -291,7 +282,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             base_rate = statistics.median(by_workers[d_workers])
     # 4. the adaptive expert tier (a restart each), with everything chosen so far
     tuned = apply(base_args, settings)
-    by_adapt = {}
+    by_adapt: dict = {}
     for adapt in ADAPT_CANDIDATES:
         key = "default" if adapt is None else "/".join(adapt)
         args = tuned
@@ -299,16 +290,8 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             args = with_arg(args, flag, v)
         which = "(the engine default)" if adapt is None else f"every {adapt[0]}, {adapt[1]} swaps, decay {adapt[2]}"
         say(f"  Measuring the expert tier {which} (restarts the engine) ...")
-        e = restart(start_engine, args, "the expert tier " + key, say, report)
-        if e is None:
-            continue
-        try:
-            sa = Session(e, ids_list)
-            sa.warm_up(1)
-            by_adapt[key] = [sa.rate(max_new=TIER_MAX_NEW), sa.rate(max_new=TIER_MAX_NEW)]
-            say(f"    {statistics.median(by_adapt[key]):.1f} tok/s")
-        finally:
-            close(e)
+        measure_candidate(start_engine, args, "the expert tier " + key, say, report, by_adapt, key, ids_list,
+                          TIER_MAX_NEW)
     a_best = pick(by_adapt, "default") if by_adapt else "default"
     report["adapt"] = by_adapt
     if a_best != "default":
@@ -322,6 +305,10 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     return {"settings": settings, "report": report}
 
 
+def first_line(exc: Exception) -> str:
+    return str(exc).strip().splitlines()[0][:300] if str(exc).strip() else type(exc).__name__
+
+
 def restart(start_engine, args, what, say, report):
     """#1337: a later step's engine start that fails is a candidate that loses, not a failed run: what the earlier
     steps measured (and the settings they chose) must survive it.  Returns the engine, or None after saying why and
@@ -330,10 +317,31 @@ def restart(start_engine, args, what, say, report):
     try:
         return start_engine(args)
     except Exception as e:  # noqa: BLE001 - whatever the start raised (RuntimeError, EngineDied, OSError ...)
-        why = str(e).strip().splitlines()[0][:300] if str(e).strip() else type(e).__name__
+        why = first_line(e)
         say(f"    the engine did not start for {what}: {why} - this candidate is dropped, the earlier results are kept")
         report.setdefault("failed_starts", {})[what] = why
         return None
+
+
+def measure_candidate(start_engine, args, what, say, report, by: dict, key, ids_list, max_new: int | None = None):
+    """One restart-and-measure candidate (upstream #1337, #3317): a start that fails and an engine that exits
+    mid-measurement are both that candidate losing - `by[key]` gets its two rates, or report["failed_starts"] its
+    reason.  Everything measured earlier and the other candidates survive."""
+    e = restart(start_engine, args, what, say, report)
+    if e is None:
+        return
+    try:
+        s = Session(e, ids_list)
+        s.warm_up(1)
+        by[key] = [s.rate(max_new=max_new), s.rate(max_new=max_new)]
+        say(f"    {what}: {statistics.median(by[key]):.1f} tok/s")
+    except Exception as exc:  # noqa: BLE001 - the engine died mid-measurement: this candidate loses (#1337)
+        why = first_line(exc)
+        say(f"    the engine died while measuring {what}: {why} - this candidate is dropped, "
+            "the earlier results are kept")
+        report.setdefault("failed_starts", {})[what] = why
+    finally:
+        close(e)
 
 
 def close(eng):
