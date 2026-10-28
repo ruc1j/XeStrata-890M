@@ -401,7 +401,8 @@ GPU が持つエキスパートが少ないほど、ファイルから読む分�
   そのぶんページ固定の RAM が増えます（IQ3_XXS・`--adapt-swaps 80` で 1.20 GiB）。B70・IQ3_XXS・4K・`--resident-experts --adapt-every 1 --adapt-swaps 80` の decode は +1.4%（73.2 → 74.3 tok/s）で、トークンは同じでした。
 - `STRATA_RAM_ADAPT=<n>`（opt-in、`--serve`、1 GPU、upstream d7298883）: RAM のコピーも会話に従わせます。
   これがないと、RAM のコピーは起動のときに一度だけ選ぶので、GPU の持たないエキスパートを RAM が全部持てないとき、コピーの外のエキスパートは選ばれるたびにファイル（SSD）から読みます。
-  これがあると、decode の窓の前で適応の回が進んでいないとき、窓が選び続けるエキスパート（適応の段の減衰した数で 2 以上）を最大 `n` 個、同じ層の選ばれていないもの（0.5 未満）の RAM の場所に入れます（層ごとに 1 組、差の大きい順、1 つにつきファイルを 1 回読む）。
+  これがあると、decode の窓の前で適応の回が進んでいないとき、窓が選び続けるエキスパート（適応の段の減衰した数で 2 以上）を、同じ層の選ばれていないもの（0.5 未満）の RAM の場所に入れます（差の大きい順）。
+  組は層ごとに最大 4 つで、入れるのはその層で最も選ばれているもの、出すのは最も選ばれていないものから順に、出すものが 0.5 未満のあいだだけです。入れるエキスパートはたいてい直前の窓のために読んだばかりなので、その読みの stage のバッファーにまだあればそこから写します（ファイルは読みません）。`n` が抑えるのは、ファイルを読む組の数だけです。
   RAM の大きさ、選び方、重み、VRAM の段の規則は変わりません。適応の段（`--adapt-every`）が要り、`STRATA_EXCHANGE_ROTATE=1`、層の分割、補助の GPU、`--batch` では何もしません。
   upstream は RTX 3060 12 GB・RAM 32 GB（IQ2_XS）で decode +16.5% を測りました。B70・IQ3_XXS・RAM の予算 6 GiB の serve 32K では、ファイルの読みが OS のキャッシュから来るので同等でした。
 - 入らないなら、OS のファイルキャッシュ経由で読みます（`--mmap-experts`）。
@@ -607,6 +608,7 @@ setup は選んだときにそう言います。
   高効率コアが性能コアより多い CPU では、調整の前から、setup が性能コア（host の 1 つを除く）と高効率コアの半分を設定に書きます（upstream #642）。
   P コアの数より 1 つ少ない数と、2 ソケットの PC では 1 ソケットのコアの数より 1 つ少ない数も試します。
 - VRAM のエキスパートのキャッシュが会話にどれだけ追いつくか（`--adapt-every`、`--adapt-swaps`、`--adapt-decay`、upstream #907）。
+  `--adapt-decay` は 0 以上 1 以下の値だけを受け、その外の値は 0.7 に戻して stderr に 1 行書きます（1 より大きいと数が際限なく増え、入れ替えの利得が NaN になります）。
   見落としたエキスパートを CPU が遅く読む PC（DDR3 や、チャネルの少ない DDR4）では、多く入れ替える方が速くなります。
   upstream の測定（Xeon E5-2673 v3、DDR3、RTX 4060 Ti を PCIe 3.0 x8）では、毎窓 160 個の入れ替えが既定より 7.9% 速くなりました。
   この段は 512 トークンの答えで測ります。
@@ -824,7 +826,10 @@ print(r.choices[0].message.content)
 - **呼び出しとして返すツールの呼び出し**: 呼び出しになるのは、要求が宣言したツールの名前のものだけです。
   別の名前の呼び出しや、ツールを宣言していない Chat Completions・Anthropic の要求の呼び出しは、書かれたままの文として返すので、クライアントが差し出していないツールを動かすことはありません（Responses は Codex のまとめの要求のために前のままです）。
   囲みが 1 トークンずれた呼び出し（`<function=NAME>` でなく `<=NAME>`、`<function:NAME>`、`<NAME>`）は、NAME が宣言したツールなら呼び出しとして読みます。
+  名前空間つきのツール（`mcp__filesystem.write_file`）は、モデルが `mcp__filesystem__write_file`、`mcp__filesystem=write_file`、`mcp__filesystem_write_file` と書いても、宣言したツールの中でその名前を持つものが 1 つだけなら `write_file` と書いても、その呼び出しとして読みます。
+  名前に `__` を含むツール（`mcp__playwright__browser_navigate`）は、モデルが `__` を全部 `_` に潰して書いても（`mcp_playwright_browser_navigate`）、2 つの宣言したツールが同じ綴りにならない限り、その呼び出しです。名前は推測しません（`bash` は `shell` ではなく、語順を変えた名前も宣言したものとは読みません）。
   それでも呼び出しとして読めない `<tool_call>` の塊は、server のウィンドウで数を出します。
+  宣言していない名前の呼び出しが文として返ったときは、文はモデルが書いたまま、`finish_reason` は `stop`（`/v1/messages` では `end_turn`）のままで、答えに `"strata_rejected_tool_calls": [{"name": "bash", "reason": "undeclared"}]` を添えます（Chat Completions の答えの最上位と、ストリーミングの最後の chunk、`/v1/messages` の `message_delta` と message。名前は 5 つまで）。クライアントはそれを見て、持っているツールの名前をモデルに伝えて聞き直せます。server のウィンドウにも同じ名前が出て、`/metrics/prometheus` は `strata:tool_calls_unread_total` でその塊を数えます。
 - チャットのアプリ: 「OpenAI 互換」の接続先を持つアプリなら使えます。
   ベース URL は `http://127.0.0.1:8095/v1`、API キーは何でも構いません。
 - OpenCode（upstream #543）: `opencode.jsonc`（プロジェクトの中か `~/.config/opencode/`）の出発点です。
@@ -889,6 +894,7 @@ print(r.choices[0].message.content)
 - 同じネットワークのほかの機器から: 指定しなければ、server はこの PC（`127.0.0.1`）でだけ待ち受けます。
   `./setup.sh --host 0.0.0.0 --api-key 長い秘密の文字列` で起動するか（モデルの設定に保存され、次からも使われます）、`xestrata-<model>.json` に `"host": "0.0.0.0"` と `"api_key": "..."` を書きます。
   server のウィンドウに、この PC のアドレスが出ます（`from other devices: http://192.168.x.x:8095/`）。
+  IPv6 なら `--host ::`（または `"host": "::"`、すべての IPv6 のインターフェース）で、URL のアドレスは角かっこで囲みます（`http://[2001:db8::7]:8095/v1`）。
   ほかの機器でそれを開くか、`.../v1` を API のベース URL に使います。
 - インターネットから: 前にトンネルを置きます。
   たとえば [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) なら
@@ -1148,6 +1154,7 @@ JSON の形式とツールや MCP の組み合わせは、はっきり断りま�
 構造化の SSE は keep-alive のコメントを送りながら答えをためておき、確かめてから内容を送り、使用量と時間、`[DONE]` を送ります。
 失敗したときは、正しくない内容を送らずに、SSE のエラーと `[DONE]` を送ります。
 `/v1/status.structured_output` は形式、確かめ方、ためてから送るストリーミングを示します。
+数学の答えには `\alpha` のような LaTeX が入りがちで、JSON のエスケープとしては正しくありません。`response_format`（`/v1/responses` では `text.format`）に `"repair_latex_escapes": true` を足すと、厳密な読み取りに失敗したときだけ、server は正しくないエスケープのバックスラッシュを二重にしてもう一度確かめます。正しい出力には手を触れません。`\b`、`\f`、`\n`、`\r`、`\t`、`\uXXXX` は JSON として正しいので残り、`\alpha` の隣の `\beta` はバックスペースになって返ります。既定はオフです。
 
 ### API の要求のモニター
 
@@ -1185,7 +1192,7 @@ server の起動からの合計（`totals`）も示します。
 | `tools` | `function` のツール、`namespace` のツール（モデルには `namespace.name` に見え、呼び出しは `namespace` と `name` で返ります）、`custom` のツール（自由な文字列の `input` 1 つ）。ホストのツール（`web_search`、`file_search` など）はモデルが動かせないので外します |
 | `tool_choice` | `"none"` はツールを隠します。ほかはモデルが選びます（強制はできません） |
 | `reasoning.effort` | `none`/`minimal`、`low`、`medium`、`high`/`xhigh`。なければ設定の `reasoning_effort`、それもなければモデルの既定（high） |
-| `max_output_tokens` | 出力の上限（思考を含む）。使い切ると応答は `incomplete`（`max_output_tokens`）で終わります |
+| `max_output_tokens` | 出力の上限（思考を含む）。使い切ると応答は `incomplete`（`max_output_tokens`）で終わります。`0` と `-1`（書かないのと同じ）は `max_tokens` と同じく上限なし、`-1` より小さい値は 400 です |
 | `text.format` | `json_schema` と `json_object` は [JSON の応答の形式](#json-の応答の形式) を使います（確かめるだけで、出力を縛りません） |
 | `temperature`、`top_p`、`reasoning_budget_tokens` など | チャットの経路と同じ |
 
@@ -1197,6 +1204,7 @@ Codex と同じく、reasoning の項目も会話の残りと一緒に送り返�
 `"stream": true` では、公式のイベントを順に出します。`response.created`、`response.in_progress`、続いて出力の項目ごとに `response.output_item.added`、その差分（`response.reasoning_text.delta`、`response.output_text.delta`、`response.function_call_arguments.delta`）、その `...done` のイベントと `response.output_item.done`、最後に `response.completed`、`response.incomplete`、`response.failed` のどれかです。
 長いプロンプトを読む間は 15 秒ごとに `response.in_progress` を出します。Codex はこれを動いている印と数えます。
 答えが始まる前のエラーは Responses の形（`{"error": {"message", "type", "param", "code"}}`）で、始まった後は `response.failed` で届きます。
+最後のイベント（`response.completed` か `response.incomplete`）と、ストリーミングでない答えには、`/v1/chat/completions` と同じ最上位の `timings` が付きます。
 
 **Codex CLI**: `~/.codex/config.toml` に次を書きます。
 
@@ -1522,6 +1530,7 @@ issue を立てるときは、秘密や個人情報を除いた報告と必要�
   置き場はデバイスへのコピー用に登録した 1 つの大きなマッピングです。
   GPU にないエキスパートは、CPU がその場で計算し、GPU がキャッシュにあるものを計算するのと同時に進めます（AVX-512 と AVX2 のカーネル、i-quant には ggml のもの。AVX-VNNI のある CPU では Q2_0 と IQ4_NL の内積をそれで計算し、`STRATA_NO_AVXVNNI=1` で AVX2 に戻せます）。
 - SSD: 28.8 GB の n-gram の表を置き、1 トークンごとに数行だけを OS のキャッシュ経由で読みます。
+  RAM に表とエキスパートの置き場と 8 GiB の余りが入るときは、エンジンが表を RAM に置きます（`--ple-io ram` を自分で選びます。`--ple-io` を指定すればそれが勝ち、`STRATA_PLE_AUTO_RAM=0` で止まります）。
 - 推測: モデル自身の MTP の層が最大 3 トークンを推測し、48 層すべてを 1 回通して確かめます。
   B70 では、1 回の確認で平均 2.1〜3.4 トークンを進めます。
   答えが文脈を繰り返すとき（コードの編集、引用）は、**プロンプト照合**が前に出てきた部分から最大 5 トークンを推測します。

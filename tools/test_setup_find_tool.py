@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """setup.find_tool takes the virtualenv's own cmake before a PATH one and skips a cmake older than CMakeLists.txt needs
 (upstream #3822).
 

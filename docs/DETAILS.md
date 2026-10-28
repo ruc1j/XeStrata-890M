@@ -426,7 +426,8 @@ With every expert in RAM, the move into the GPU driver's memory (host USM) for t
   That takes more page-locked RAM (1.20 GiB with IQ3_XXS and `--adapt-swaps 80`). On the B70, IQ3_XXS, 4K, `--resident-experts --adapt-every 1 --adapt-swaps 80` decoded +1.4% (73.2 -> 74.3 tok/s) with the same tokens.
 - `STRATA_RAM_ADAPT=<n>` (opt-in, `--serve`, one GPU, upstream d7298883): the RAM copy follows the conversation too.
   Without it the copy is chosen once, at start, so when the RAM cannot hold every expert the GPU does not, an expert outside the copy is read from the files (the SSD) every time the conversation routes to it.
-  With it, before a decode window and while no adaptive round is in flight, up to `n` experts the windows keep routing to (the adaptive tier's decayed count, 2 or more) take the RAM places of experts of their own layer that are not routed to (below 0.5): one pair per layer, the largest difference first, one file read each.
+  With it, before a decode window and while no adaptive round is in flight, the experts the windows keep routing to (the adaptive tier's decayed count, 2 or more) take the RAM places of experts of their own layer that are not routed to (below 0.5), the largest difference first.
+  Up to four pairs a layer: the layer's most routed experts outside the copy against its least routed ones in it, paired in that order while the outgoing one is below 0.5. The incoming expert was usually just read for the window before, so when it still sits in that read's stage buffer it is copied out of it (no file read); `n` caps only the pairs that need a file read.
   The RAM stays the same size; the routing, the weights and the VRAM tier's rule are untouched. It needs the adaptive tier (`--adapt-every`), and does nothing with `STRATA_EXCHANGE_ROTATE=1`, a layer split, a helper GPU or `--batch`.
   Upstream measured decode +16.5% on an RTX 3060 12 GB with 32 GB of RAM (IQ2_XS). On the B70, IQ3_XXS with a 6 GiB RAM budget, serve at 32K was equal: the file reads come from the OS file cache there.
 - Otherwise they are read through the OS file cache (`--mmap-experts`), which re-reads them from the SSD as it runs: slower.
@@ -633,6 +634,7 @@ window length:
   on a CPU with more efficiency cores than performance cores, setup writes the performance cores (but the host's
   one) and half the efficiency cores into the config before any tuning (upstream #642);
 - how busily the VRAM expert cache follows the conversation (`--adapt-every`, `--adapt-swaps`, `--adapt-decay`, upstream #907):
+  `--adapt-decay` takes a value from 0 to 1; anything else falls back to 0.7 with a line on stderr (above 1 the counts grow without end and the swap gains turn NaN).
   a PC whose CPU reads the missed experts slowly (DDR3, or DDR4 in few channels) gains from swapping more.
   Upstream measured 160 swaps every window 7.9% faster than the default on a Xeon E5-2673 v3 with DDR3 and an RTX 4060 Ti on PCIe 3.0 x8.
   This step measures 512-token answers.
@@ -853,7 +855,14 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
 - **Which tool calls come back as calls.** A call counts only when it names a tool the request declared.
   A call for another name, or any call in a Chat Completions or Anthropic request that declared no tools, is returned as the text it was written as, so a client never runs a tool it did not offer (the Responses route keeps its own rule for Codex's compaction requests).
   A call whose envelope drifted by a token, `<=NAME>`, `<function:NAME>` or `<NAME>` instead of `<function=NAME>`, is read as the call when NAME is a declared tool.
+  A namespaced tool (`mcp__filesystem.write_file`) is that call when the model writes `mcp__filesystem__write_file`, `mcp__filesystem=write_file`, `mcp__filesystem_write_file`,
+  or the bare member (`write_file`) and exactly one declared tool has that member.
+  A name with `__` in it (`mcp__playwright__browser_navigate`) is also that call when the model writes every `__` as `_` (`mcp_playwright_browser_navigate`), unless two declared tools collapse to the same spelling.
+  Names are never guessed: `bash` is not `shell`, and a reordered name is not the declared one.
   A `<tool_call>` block that still does not read as a call is counted in the server window.
+  When a call came back as text because its name was not declared, the text stays exactly as the model wrote it and `finish_reason` stays `stop` (or `end_turn` on `/v1/messages`);
+  next to it the reply carries `"strata_rejected_tool_calls": [{"name": "bash", "reason": "undeclared"}]` (at the top level of a Chat Completions reply, in its last streamed chunk, and in the `message_delta` event and the message of `/v1/messages`; up to five names).
+  A client can answer the model with the tool names it does have and ask again. The server window prints the same names, and `/metrics/prometheus` counts the blocks in `strata:tool_calls_unread_total`.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8095/v1`, any API key.
 - **OpenCode** (upstream #543). A starting point for `opencode.jsonc` (in your project, or `~/.config/opencode/`).
   The field names are OpenCode's, so check its config docs if your version differs.
@@ -916,6 +925,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
   run `./setup.sh --host 0.0.0.0 --api-key some-long-secret` (kept in the model's config for the next starts), or add `"host": "0.0.0.0"` and `"api_key": "..."` to `xestrata-<model>.json`.
   The server window then prints this PC's addresses (`from other devices: http://192.168.x.x:8095/`).
+  For IPv6 use `--host ::` (or `"host": "::"`, all IPv6 interfaces) and put the address in brackets in URLs (`http://[2001:db8::7]:8095/v1`).
   Open that on the other device, or use `.../v1` as an API base URL.
 - **From the internet.** Put a tunnel in front of it, for example
   [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):
@@ -1174,6 +1184,9 @@ Without `response_format`, ordinary text and tool behavior stays the same.
 Structured SSE buffers the answer while sending keep-alive comments, emits the content only after validation, then usage/timings and `[DONE]`.
 A failure emits an SSE error and `[DONE]` without invalid content.
 `/v1/status.structured_output` advertises the formats, the validation method and the buffered streaming.
+Math answers often hold LaTeX such as `\alpha`, which is not a valid JSON escape. Add `"repair_latex_escapes": true` to the `response_format` (or to `text.format` on `/v1/responses`) and,
+only after the strict parse failed, the server doubles the backslashes that are not valid escapes and checks the answer again.
+Valid output is never touched. `\b`, `\f`, `\n`, `\r`, `\t` and `\uXXXX` are valid JSON, so they stay: a `\beta` beside a `\alpha` comes back with a backspace. Off by default.
 
 ### API request monitor
 
@@ -1213,7 +1226,7 @@ are refused with an error that says so.
 | `tools` | `function` tools, `namespace` tools (the model sees `namespace.name`; calls come back with `namespace` and `name`), `custom` tools (one free-form `input` string). Hosted tools (`web_search`, `file_search`, ...) are left out: the model cannot run them |
 | `tool_choice` | `"none"` hides the tools; anything else lets the model choose (it cannot be forced) |
 | `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the config's `reasoning_effort`, else the model's default (high) |
-| `max_output_tokens` | The output cap (thinking included). Running out ends the response `incomplete` (`max_output_tokens`) |
+| `max_output_tokens` | The output cap (thinking included). Running out ends the response `incomplete` (`max_output_tokens`). `0` and `-1` (or leaving it out) mean no cap, as for `max_tokens`; anything below `-1` is a 400 |
 | `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (checked, not constrained) |
 | `temperature`, `top_p`, `reasoning_budget_tokens`, ... | As on the chat path |
 
@@ -1231,6 +1244,7 @@ for each output item `response.output_item.added`, its deltas (`response.reasoni
 While a long prompt is read, a `response.in_progress` event goes out every 15 s, which Codex counts as activity.
 Errors before the answer starts have the Responses form (`{"error": {"message", "type", "param", "code"}}`); after
 it started they arrive as `response.failed`.
+The final event (`response.completed` or `response.incomplete`) and a non-streaming reply carry the same top-level `timings` object as `/v1/chat/completions`.
 
 **Codex CLI.** In `~/.codex/config.toml`.
 
@@ -1557,6 +1571,7 @@ When opening an issue, include the report and necessary log excerpts after remov
   (AVX-512 / AVX2 kernels, ggml's for the i-quants; on a CPU with AVX-VNNI the Q2_0 and IQ4_NL dots use it,
   `STRATA_NO_AVXVNNI=1` goes back to AVX2).
 - **SSD:** the 28.8 GB n-gram table, read a few rows per token through the OS cache.
+  When the RAM holds the table, the expert arena and 8 GiB more, the engine keeps the table in RAM instead (it chooses `--ple-io ram` itself; an explicit `--ple-io` wins, and `STRATA_PLE_AUTO_RAM=0` turns the rule off).
 - **Speculation:** the model's own MTP layer drafts up to 3 tokens; one pass over all 48 layers checks them.
   On the B70 a check advances 2.1–3.4 tokens on average.
   When the reply repeats the context (code edits, quoted text), **prompt lookup** drafts up to 5 tokens from the earlier copy,

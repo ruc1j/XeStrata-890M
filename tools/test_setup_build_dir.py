@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """A build folder made by a manual build (CMake's default generator) does not stop setup --build (upstream #4038).
 
 CMake refuses a folder configured with another generator ("Does not match the generator used previously: Unix

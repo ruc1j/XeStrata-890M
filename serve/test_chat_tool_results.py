@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """Chat Completions tool results must follow call IDs before the template drops them."""
 import copy
 import http.client

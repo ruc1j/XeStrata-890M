@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """serve/test_web_follow.py - the web chat follows the answer only while the reader has not left (#4014).
 
 The page used to pull the view back to the bottom on every frame when it was within 120 px of it, so one wheel notch

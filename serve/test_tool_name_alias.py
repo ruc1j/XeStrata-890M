@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """Codex MCP names that are not the declared namespace.member form.
 
 Observed with Qwen3.8-Flash-Next through Codex CLI against Strata v0.2.2. The model

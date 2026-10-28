@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """A download with no data for two minutes says so (#3567).
 
     python -m unittest tools.test_setup_stall_note

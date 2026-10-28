@@ -244,6 +244,17 @@ set_tests_properties(platform_memory_test PROPERTIES SKIP_RETURN_CODE 77)   # ul
 add_executable(ple_reader_test src/ngram/ple_reader_test.cpp)
 target_link_libraries(ple_reader_test PRIVATE strata_ngram)
 add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
+# upstream #3602: the same reader under load - several clients, a tiny row cache, one in-flight slot, injected delays,
+# rows on every page phase, late-writer checks, the reader after a failed read.  CPU and a temp file only; 77 = no
+# direct reads here.
+add_executable(ple_reader_stress_test src/ngram/ple_reader_stress_test.cpp)
+target_link_libraries(ple_reader_stress_test PRIVATE strata_ngram)
+add_test(NAME ple_reader_stress COMMAND ple_reader_stress_test)
+set_tests_properties(ple_reader_stress PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+# the rule that keeps the n-gram table resident in RAM (header-only, CPU)
+add_executable(ple_residency_test src/core/ple_residency_test.cpp)
+target_include_directories(ple_residency_test PRIVATE include)
+add_test(NAME ple_residency_test COMMAND ple_residency_test)
 
 # ---- Intel Xe foundation --------------------------------------------------
 if(STRATA_ENABLE_XE)
