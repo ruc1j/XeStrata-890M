@@ -51,9 +51,12 @@ upstream の Strata 0.2.3.1 から 0.2.7.1（エンジンの版は 0.1.53）ま�
 移していないのは次のとおりです。
 
 - DeepSeek のエンジン（src/dsv41、trellis）、Metal と Mac、DGX Spark（arm64 の CUDA ビルドと sm_121 の表）、NVIDIA のカーネルと既定（sm_80・sm_89・sm_120 の表、MMVQ-IL、fused の prompt、qsa_select）、2 枚の GPU の layer-major prefill と pipelined batch、gfx12（R9700）だけの既定、Windows の gfx1151 だけの既定。
-- upstream の製品層（app、Terminal、Control、packaging、docker）に依る setup と serve の変更、web ページの大きな改装（履歴、多言語、KaTeX、プレビュー、MCP の絵）。
-- 見送ったもの: KVA（長い prompt の近似読み。CUDA の prompt の経路の大きな移植で、upstream も既定オフ）、SPEC_PROB の提案則と窓に依らない CPU の行の組（#3416。fork の Issue #31 の行の選び方と重なります）、AVX-512 の gather の行（fork にない exact rows が要ります）、会話キャッシュの CUDA の copy stream に依る変更、idle slot の park の書き直し、checkpoint の写しの失敗を sticky error で見分ける変更。
+- upstream の製品層（app、Terminal、Control、packaging、docker）に依る setup と serve の変更。
+- 会話キャッシュの CUDA の copy stream に依る変更（HIP に copy stream がない）、checkpoint の写しの失敗を sticky error で見分ける変更、KVA の capture と oracle のモード、upstream のブラウザでの試験（tools/webtest）。
   QFUSE の commit の修正と q8_1 の除算の修正は、fork の窓が self-commit し、除算がどれも IEEE なので当たりません。
+
+取り込みのときに見送り、2026-10-29 に Issue #50〜#55 で移したもの: DGX Spark 向けの setup の値（`--mtp-hnorm stream` を統合 GPU の既定に）、KVA（`STRATA_KVA`）、SPEC_PROB の提案則と窓に依らない CPU の行（#3416）、AVX-512 の gather の行と exact rows、会話の退避とチェックポイントの失敗の扱いと窓のグラフの解放、web ページの改装（履歴、多言語、KaTeX、プレビュー、Load / Unload、MCP の絵）。
+移植のあとに確かめたのは、free のビルド、CTest（pack のない 2 本を除いて通ります）、serve の Python の試験、890M での decode の前後の比較（abliterated 版 IQ2_XS、greedy、交互 3 周: 取り込み前 31.91・31.88・31.65 tok/s、取り込み後 31.90・31.88・31.97 tok/s、移植後 30.45・31.91・31.95 tok/s、答えは同じ）です。既定の設定では速さも答えも変わらず、速くなるのは setup の既定に入れた `--mtp-hnorm stream`（+5%）と opt-in の `STRATA_KVA=1`（15K トークンの prompt の読みが +18%）です。
 
 確かめたのは、free のビルド、CTest（pack のない 2 本を除いて通ります）、serve と tools の Python の試験、890M での decode の前後の比較（abliterated 版 IQ2_XS、greedy、交互 3 周: 前 30.93・31.46 tok/s、後 31.79・31.46・31.44 tok/s、答えは同じ）です。
 contrib-llvm のビルド、Windows のクロスビルド、ほかの GPU は unverified です。
@@ -588,6 +591,10 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
   CPU の複数トークン用のエキスパートのカーネル（i-quant の gate と up、IQ4_NL の down）を 2 トークンから使い、1 トークンでは ggml の内積を使っていたため、トークンの行が 1 つのときと窓の中のときで足す順が違ったためです。
   2026-10-16 からは、CPU はこれらと Q4_K・Q5_K・Q6_K を 1 トークンから複数トークン用のカーネルで計算し、Q2_K・Q3_K・Q8_0 はどのトークン数でも ggml の内積で計算します。トークンの行は 1 つのときも窓の中でも同じになり、キャッシュが同じなら推測の方式によらずロジットがビット単位で同じになります（複数トークンの窓の GPU 側は、もともと差を生んでいません）。
   `STRATA_IQ_MT_MIN=N` で、以前のように N トークンから複数トークン用のカーネルを使います（比べるため）。
+- AVX-512 の CPU では i-quant の格子の引きを 1 つの gather 命令で行えます（upstream 0.2.5 の移植）。読む語は同じなので、結果はスカラーの引きとビット単位で同じです。
+  既定でオンになるのは、CPUID が AVX-VNNI と hybrid を報告する CPU の P コアだけで（`cpu_gather_fast`。ベンダー名やモデル番号では決めません）、Zen 4・Zen 5 では gather がマイクロコードで遅いので既定でオフです。`STRATA_IQ_GATHER=1` / `0` でどちらにも固定できます。
+  gather がオンの AVX-512 の CPU では、IQ3_XXS と IQ3_S のエキスパートの 1 トークンの gate と up を、ggml の 1 トークンの内積とビット単位で同じ exact rows（`iq512x_rows`）で計算します。最初に使うときに ggml と照合し、合わなければ使いません。`STRATA_NO_IQ512X1=1` でオフにできます。
+  canonical の行を取る層（この fork の既定）では、どちらも使いません。
 
 ### 実行ごとに出力が変わる理由
 

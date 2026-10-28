@@ -50,9 +50,12 @@ The main things carried over:
 Not carried over:
 
 - The DeepSeek engine (src/dsv41, trellis), Metal and the Mac, the DGX Spark (the arm64 CUDA build and the sm_121 table), NVIDIA's kernels and defaults (the sm_80, sm_89 and sm_120 tables, MMVQ-IL, the fused prompt, qsa_select), the two-card layer-major prefill and pipelined batch, the gfx12 (R9700) defaults, the Windows gfx1151 defaults.
-- setup and serve changes that depend on upstream's product layers (app, Terminal, Control, packaging, docker), and the large rework of the web page (history, languages, KaTeX, previews, MCP pictures).
-- Deferred: KVA (the approximate read of long prompts: a large port of the CUDA prompt path, off by default upstream too), the SPEC_PROB proposal law with the window-invariant CPU rows (#3416; it overlaps the fork's row choice of Issue #31), the AVX-512 gather rows (they need exact rows the fork lacks), the conversation-cache changes that depend on CUDA copy streams, the rework of the idle slot's park, and telling a checkpoint copy's failure by a sticky error.
+- setup and serve changes that depend on upstream's product layers (app, Terminal, Control, packaging, docker).
+- The conversation-cache changes that depend on CUDA copy streams (HIP has none), telling a checkpoint copy's failure by a sticky error, KVA's capture and oracle modes, and upstream's browser tests (tools/webtest).
   The QFUSE commit fix and the q8_1 division fix do not apply: the fork's windows self-commit and all its divisions are IEEE.
+
+Deferred at the sync and carried over on 2026-10-29 in Issues #50 to #55: the DGX Spark setup values (`--mtp-hnorm stream` as the integrated GPU's default), KVA (`STRATA_KVA`), the SPEC_PROB proposal law with the window-invariant CPU rows (#3416), the AVX-512 gather rows and exact rows, the slot park, the checkpoint failure handling and the window graph eviction, and the rework of the web page (history, languages, KaTeX, previews, Load / Unload, MCP pictures).
+Checked after the ports: the free build, CTest (passes but for the two tests that need a pack), the serve Python tests, and the decode before and after on the 890M (abliterated IQ2_XS, greedy, three interleaved rounds: 31.91, 31.88 and 31.65 tok/s before the sync, 31.90, 31.88 and 31.97 after it, 30.45, 31.91 and 31.95 after the ports, the same answers). The defaults change neither the speed nor the answers; what is faster is `--mtp-hnorm stream`, now setup's default (+5%), and the opt-in `STRATA_KVA=1` (a 15K-token prompt reads 18% faster).
 
 Checked: the free build, CTest (passes but for the two tests that need a pack), the serve and tools Python tests, and the decode before and after on the 890M (abliterated IQ2_XS, greedy, three interleaved rounds: 30.93 and 31.46 tok/s before, 31.79, 31.46 and 31.44 after, same answers).
 The contrib-llvm build, the Windows cross build and other GPUs are unverified.
@@ -600,6 +603,10 @@ Where the draft modes differ, there are two causes:
   The CPU took its multi-token expert kernels (i-quant gate/up and IQ4_NL down) from two tokens on and ggml's single-token dot for one, so a token's rows were summed in a different order when it ran alone than when it ran in a window.
   From 2026-10-16 the CPU computes these and Q4_K, Q5_K and Q6_K with the multi-token kernels from one token on, and Q2_K, Q3_K and Q8_0 with ggml's dot at every token count. A token's rows are the same alone and in a window, and with the same cache the draft modes give bit-identical logits (the GPU side of a multi-token window added no difference before either).
   `STRATA_IQ_MT_MIN=N` takes the multi-token kernels from N tokens as before (for comparisons).
+- On an AVX-512 CPU the i-quant grid lookups can go through one gather instruction (a port of upstream 0.2.5). The same words are loaded, so the results are bit for bit the scalar lookups'.
+  It is on by default only on the performance cores of a CPU whose CPUID reports AVX-VNNI and hybrid (`cpu_gather_fast`; never a vendor name or a model number), and off on Zen 4 and Zen 5, whose gathers are microcoded and slow. `STRATA_IQ_GATHER=1` / `0` force either.
+  With gathers on, an AVX-512 CPU computes one token's gate and up rows of an IQ3_XXS or IQ3_S expert on the exact rows (`iq512x_rows`), bit for bit ggml's single-token dot. The first use checks them against ggml and leaves them out when they differ. `STRATA_NO_IQ512X1=1` turns them off.
+  The layers the canonical rows take (this fork's default) use neither.
 
 ### Why outputs change from run to run
 

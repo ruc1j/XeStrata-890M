@@ -184,6 +184,7 @@ In both, the MoE half is skipped entirely and its expert transfers are not queue
 No later layer reads those positions' outputs, so skipping them changes nothing but the late layers' state.
 That state is an approximation: it can drop entries of a long list or miss details.
 upstream's measurement (RTX 5070, IQ3_S) was 11% faster at 14K tokens and 18% at 30K, and found the same 585 of 606 facts as the exact read.
+On the 890M (abliterated IQ2_XS, greedy, three interleaved rounds) a 15,143-token prompt read at 373.4 instead of 317.1 tok/s (+18%, 40.6 s instead of 47.8 s), with 12,288 of 15,136 positions approximated. The decode after it fell from 27.4 / 23.8 / 27.3 to 21.2 / 21.0 / 18.9 tok/s, as fewer drafts were accepted, and the answer (a summary of the document) differed from the exact read's.
 At the end of the read the log says how many positions were approximated and in which layers (`strata prefill: KVA on (state-only): split 36, suffix 2048, approximated N of M positions ...`).
 A conversation read this way answers its later turns on that state. `STRATA_KVA=0` (the default) reads every prompt exactly.
 It is not used with `--batch` or a layer split (several GPUs); a prompt with pictures and one under 4,096 tokens are read exactly.
