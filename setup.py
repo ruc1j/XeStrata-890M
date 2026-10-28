@@ -6670,6 +6670,11 @@ def main() -> int:
         args += ["--kv", kv]
     if low_ram:   # the experts from the model files: the ones the GPU does not hold copied into RAM, or mapped
         args += ["--resident-experts" if resident else "--mmap-experts"]
+    if gpu.get("integrated"):
+        # XeStrata-890M (Issue #50): the draft layer's hidden-input norm per hyper-connection stream, the value upstream's
+        # setup gives a unified-memory GPU (the DGX Spark); on the 890M +5.5% decode with the same answers (abliterated
+        # IQ2_XS, greedy, three interleaved rounds: 31.2 -> 32.7 tok/s). --mtp-hnorm pooled in the config's args keeps the default
+        args += ["--mtp-hnorm", "stream"]
     disk = rotational_disk(ple)                        # upstream #605
     if disk:
         tensor = next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)

@@ -118,6 +118,7 @@ The engine counts an integrated GPU's free memory as the smaller of what its run
 For the models that keep a RAM budget of their experts (UD-Q4_K_XL, UD-IQ4_XS), setup writes the expert cache as a number, not `auto` (upstream #1715).
 The cache and the budget draw on the same RAM, so `auto`, sized from the memory free at start, would count what the budget has not taken yet and leave the OS nothing.
 The number is the RAM less 24 GB and the budget (and a KV cache streamed to RAM), in slots; `--expert-cache N` in the config's `args` sets another.
+On an integrated GPU setup normalizes the draft head's hidden input per hyper-connection stream (`--mtp-hnorm stream`, the value upstream's setup gives the DGX Spark). On the 890M decode was 5% faster (greedy, the mean of three interleaved rounds: 31.2 -> 32.7 tok/s) with the same answers; `--mtp-hnorm pooled` in the config's `args` restores the earlier form.
 
 On a Radeon 890M (Ryzen AI 9 HX 370, LPDDR5X-7500, 120 GB/s in theory) the GPU reads a 1 GiB buffer sequentially (16-byte loads) at
 102 GB/s from hipMalloc, 95 GB/s from hipHostMalloc, 101 GB/s from NonCoherent hipHostMalloc, 100 GB/s from hipHostRegister on 2 MB pages
