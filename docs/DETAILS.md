@@ -525,6 +525,17 @@ Given a new place with `--data-dir` while model files are elsewhere, setup leave
 ---
 
 ## Install and start
+- `STRATA_SPEC_PROB=1` with the default `--spec-min-p` gate: the gate tests the token the draft head drew from its distribution
+  q. A draft that fails the gate still counts as a proposal. The verifier keeps q's mass on the tokens that pass the gate
+  (not renormalised; call it mu), accepts an offered token D with probability min(1, p(D)/mu(D)), and draws the replacement
+  for a rejection or a failed gate from the positive part of p - mu. The older rule checked against the unfiltered q and
+  treated a failed gate as a plain sample, which shifts the output: with p = (0.5, 0.5), q = (0.875, 0.125) and a threshold
+  of 0.5 it gave (0.5625, 0.4375). `STRATA_SPEC_PROB_GATE=top` gates on q's largest probability before the draw instead and
+  keeps the normalised-q rule. The gated rule needs serial decode on one device with `--lookup-chain 0 --adapt-swaps 0
+  --pcie-frac 0` and without `STRATA_SPEC_COST`; otherwise the engine says so once and keeps the older rule. This is a
+  correctness change, not a speed change. `spec_admission_test` enumerates the rule exactly for a two-token vocabulary,
+  `gated_proposal_test` checks the proposal packet and `spec_proposal_parity` checks the GPU verifier against a CPU
+  reference. A model-level distribution run is not published yet.
 
 ### Run `./setup.sh`
 
@@ -536,6 +547,12 @@ With the packages, run `xestrata` instead of `./setup.sh`: the same options, and
 1. **Which size?** It recommends one for your RAM.
 1. **How much context?** 8K to 256K tokens; it recommends one for your GPU.
    384K and 512K are offered too, as experiments: past the trained length (262,144) setup adds RoPE scaling.
+- With `STRATA_SPEC_PROB=1` the CPU experts of a native (IQ) pack compute a token's rows the same way whatever the window
+  width: the grouped kernels that round differently from the one-token result are replaced by the one-token arithmetic,
+  and the grouped kernels that already match it stay. Prefill and every other decode keep their arithmetic.
+  `native_arithmetic_parity` checks every group width from 1 to 8 for the supported formats, bit for bit. Comparing other
+  decode modes against each other still needs one target evaluator; `STRATA_IQ_MT_MIN=1` selects the grouped IQ arithmetic
+  at every width and also changes prefill, so keep it the same in both arms.
 1. **KV precision** (above 8K): see [above](#where-the-kv-cache-lives-and-its-precision).
 1. **Images?** (see [Images](#images)).
 1. **The experimental speed projection**: off by default ([below](#experimental-speed-projection-experimental-off-by-default)).
@@ -704,6 +721,57 @@ wait before a 32K follow-up, but the 32K prefill read 3.2% slower, so the defaul
 ```sh
 .venv/bin/python chat.py
 ```
+
+### The web page (Chat, Images, Monitor, About)
+
+Open the server's address in a browser. Everything in it runs from the server's own files: no CDN, no outside address. Chats,
+settings and the API key stay in the browser.
+
+**Chat settings** (the button next to the message box) holds the sampling and thinking settings and the switches below. Every
+switch below is **off by default**; with all of them off the page behaves as it did before.
+
+- **Render math.** Equations written as `\( ... \)`, `\[ ... \]`, `$x$` or `$$ ... $$` are drawn as formulas by KaTeX 0.19.0, which
+  lives in `third_party/main/katex` (MIT; `PROVENANCE.json` there lists the package and a hash of every file) and is served below
+  `/web/vendor/katex/`. The text of a
+  message is never changed: copying, the Markdown export and the next request all carry what the model wrote. Code, prices
+  (`$5 and $10`) and a formula still being written stay text. A formula KaTeX cannot read stays as its source. A formula can only
+  draw: it cannot make a link, load a picture or run anything (`\href`, `\url`, `\includegraphics` and `\htmlClass` are shown as
+  their own names).
+- **Saved chats list.** Keeps every chat in a list on the left, with search over titles and text, rename, delete (with Undo) and
+  days as headings. The chats live in this browser's IndexedDB; a picture or file is kept by name only. Nothing goes to the server.
+  In a private window, or when the browser's storage is full, the list stays in memory and the page says so once. Turning it on
+  keeps the chat on the screen as the first one in the list; turning it off keeps that chat as the single chat.
+- **Edit and rewind messages.** Under each message: **Regenerate** (a new answer to the same question), **Edit answer** (correct its
+  text; the old thinking and tool calls go and no request is sent) and **Rewind to here**. Rewind asks what you want. On your
+  message, **Edit and send again here** hides it and the messages after it and puts it in the box; on an answer, **Continue from
+  here** hides the messages after it. **Branch from here** (needs the saved chats list) starts a new chat from the messages up to
+  that point and leaves this chat as it is; the branch keeps a name such as "Branch of ..." and links back to the original. An
+  **Undo** bar above the box brings back what was hidden, until your next question, another chat or a reload. A picture or file
+  that was only kept by name is not sent again: the page asks you to attach it again.
+- **When you send while it is answering.** *Wait* (the default): Send is off until the answer is done. *Send after*: your message
+  waits and goes when the answer is done. *Interrupt*: the answer stops where it is, what was written stays and is marked
+  interrupted, and your message goes at once; a tool that is running finishes first. Only one message waits, and **Take back**
+  returns it to the box. Stop keeps a waiting message for you to send yourself.
+
+An answer's ` ```svg ` or ` ```html ` block gets a **Preview** button. The code is drawn in a frame that is cut off from the page:
+an empty sandbox (no scripts, forms, popups or downloads, and no access to the page, its storage or the server), a policy inside
+the frame that allows no address at all, and a page header (`Content-Security-Policy: frame-src 'none'`) that keeps a link or a
+redirect in the model's HTML from loading a web page into it. An svg is shown as a picture. For an HTML page there is also a
+warning button, **Run scripts**: after you confirm, that one block runs with scripts, still with no way to the page and no network,
+until you close the preview. It can still use your CPU, and it is code the model wrote.
+
+When an MCP tool returns pictures (`image_results`), the chat shows them.
+
+**Load / Unload** in the header loads the model or frees the GPU (`POST /load`, `POST /unload`). It asks before unloading and is off
+while an answer is being written or an image is made.
+
+**Language.** About > Settings lists the page's languages: English (the default), German, Spanish, French, Japanese, Korean,
+Portuguese, Russian and Chinese. The Chat view, its settings and the header are translated; Monitor, Images and About are still English. A
+language is a file `serve/web/locales/<lang>.json`; the English text lives in the code next to its key, and
+`python tools/web_i18n.py` checks every file for the same keys and placeholders (`--write` rewrites `en.json`). `/?lang=de` shows a
+language for one visit.
+
+Tests: `serve/test_web_*.py` and `serve/test_web_*.js` (Node). upstream's browser run (`tools/webtest/`) is not brought in.
 
 ---
 
@@ -1651,5 +1719,6 @@ The model files are not part of it; their licenses apply to them (below).
      models merges; the code is written anew).
 - The web app's font: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;
   without it the app uses the system font). Its Monitor tab started from @code-martin's dashboard idea (PR #22).
+- The web app's math: [KaTeX](https://katex.org) (MIT, `third_party/main/katex/LICENSE`). The chat page's rework (the wide-window layout, svg/html preview, math, Load/Unload, saved chats, edit and rewind, languages) came from upstream Strata's PRs #3176, #1628, #2972, #2974, #3550, #1787 and #2615 and issues #3823 and #4004.
 - `third_party/nonfree/`: Qwen Community License 1.0, not free; XeStrata runs without it.
   It holds the experimental speed projection's vector, made from the model's activations, and the original model's chat template (see its README).

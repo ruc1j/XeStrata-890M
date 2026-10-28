@@ -65,6 +65,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
+from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
                             OutputParser, ToolCall, anthropic_to_messages, forced_call, images_of, literal_tags,
                             mark_think_literals,
@@ -413,6 +414,11 @@ class GpuBusy(RuntimeError):
     def __init__(self, message="", retry_after=None):
         super().__init__(message)
         self.retry_after = retry_after
+
+
+# The page's only CSP directive: its preview frames (srcdoc) may not load any address. Other directives are left out
+# on purpose: a frame made from srcdoc inherits the page's policy, and the opt-in "run scripts" preview needs its own inline script.
+PAGE_CSP = "frame-src 'none'"
 
 
 def unload_wait(value, default: float) -> float:
@@ -4248,6 +4254,24 @@ class Service:
         prompt; with thinking, Service.run writes it once the thinking is over."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
+        # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
+        for message in messages:
+            for part in message.get("content", []) if isinstance(message.get("content"), list) else []:
+                source = part.get("source", "") if isinstance(part, dict) else ""
+                if isinstance(part, dict) and part.get("type") == "image" and isinstance(source, str) and source.startswith("strata-tool-media:"):
+                    name = source[len("strata-tool-media:"):]
+                    if not re.fullmatch(r"[0-9a-f]{64}\.(png|jpg|webp)", name):
+                        raise ValueError("invalid tool image reference")
+                    # Clients resend old tool results. A removed cache or disabled feature must not poison
+                    # every later turn; keep the other text and replace only the unavailable picture.
+                    media_dir = self.mcp.media_dir if self.mcp is not None else None
+                    image = Path(media_dir) / name if media_dir is not None else None
+                    if image is None or not image.is_file():
+                        why = "tool image cache is disabled" if image is None else "cached tool image is no longer available"
+                        part.clear()
+                        part.update(type="text", text=f"[image omitted: {why}]")
+                    else:
+                        part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
@@ -5096,7 +5120,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
-    one ("done", ...) at the very end with the output tokens of every round.
+    one ("done", ...) at the very end with the output tokens of every round. After the last tool round, one final
+    reply uses the results already obtained, with no tools offered or executed.
 
     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
@@ -5104,6 +5129,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     max_rounds = int(hub.settings["max_rounds"])
     total, rounds = 0, 0
     done: dict = {}
+    finalizing = False
     messages = list(messages)
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
@@ -5127,10 +5153,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                     reasoning.append(ev.text)
             yield kind, x
         total += done["completion_tokens"]
-        run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
-        if run_them and rounds >= max_rounds:
-            yield "mcp", {"event": "limit", "max_rounds": max_rounds}
-            run_them = False
+        run_them = calls and not own_calls and not finalizing and done["finish"] == "stop" and not cancel.is_set()
         if not run_them:
             for c in calls:                              # announced, never run: close them in the client's view
                 yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
@@ -5166,10 +5189,10 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             r = box["r"]
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            results.append(r["text"])
+            results.append(r.get("model_content", r["text"]) if svc.vision is not None else r["text"])
             yield "mcp", {"event": "result", "id": c.id,
                           **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")},
-                          **({"images": r["images"]} if r.get("images") else {}),
+                          **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
                           **({"image": r["image"]} if r.get("image") else {})}
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
@@ -5178,6 +5201,16 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                          **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
+        if rounds >= max_rounds:
+            finalizing = True
+            tools = None
+            system_end = next((index for index, message in enumerate(messages)
+                               if message.get("role") not in ("system", "developer")), len(messages))
+            messages.insert(system_end, {"role": "system", "content":
+                f"The tool-use limit of {max_rounds} rounds has been reached. No tools are available for this final "
+                "reply. Answer the user's original request in their language using the results already obtained. "
+                "Explain any gaps in the available evidence. Do not request or emit further tool calls."})
+            yield "mcp", {"event": "limit", "max_rounds": max_rounds}
         try:
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
         except ClientGone:                                      # #1999: the client left while a picture was prepared
@@ -5839,6 +5872,28 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/tool-media/"):
+                if not self._authorized():
+                    return
+                name = path[len("/tool-media/"):]
+                hub = svc.mcp
+                if not re.fullmatch(r"[0-9a-f]{64}\.(png|jpg|webp)", name) or not hub or not hub.media_dir:
+                    self._json(404, {"error": {"message": "not found"}})
+                    return
+                file = Path(hub.media_dir) / name
+                if not file.is_file():
+                    self._json(404, {"error": {"message": "not found"}})
+                    return
+                body = file.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", {".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp"}[file.suffix])
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "private, max-age=86400")
+                self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL 1.1, third_party/main/outfit); without it the page uses the
                 # system font
@@ -5851,6 +5906,21 @@ def make_handler(svc: Service):
                 self.send_response(200)
                 self.send_header("Content-Type", "font/woff2")
                 self.send_header("Cache-Control", "max-age=86400")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            sub = web_subtree_file(path)
+            if path.startswith(("/web/locales/", "/web/vendor/")):
+                # the page's translations (serve/web/locales/<lang>.json) and the vendored KaTeX (serve/web/vendor):
+                # only whitelisted names and types, never a path out of those folders
+                if sub is None:
+                    self._json(404, {"error": {"message": "not found"}})
+                    return
+                body = sub[0].read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", sub[1])
+                self.send_header("Cache-Control", "no-cache")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -5928,6 +5998,10 @@ def make_handler(svc: Service):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                if not path:
+                    # the chat's svg/html preview is a sandboxed frame; this keeps it from navigating away to a web page
+                    # (a link or <meta refresh> inside a model's html), which no sandbox flag does (serve/web/preview.js)
+                    self.send_header("Content-Security-Policy", PAGE_CSP)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -7828,6 +7902,8 @@ def main() -> int:
     if hub is not None:
         import atexit
         svc.mcp = hub
+        if hub.settings["image_results"]:
+            hub.media_dir = Path(a.config).with_suffix(".tool-media") if a.config else Path.cwd() / ".tool-media"
         print(f"[strata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()

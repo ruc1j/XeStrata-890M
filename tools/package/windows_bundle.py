@@ -93,6 +93,8 @@ COMPONENTS = [
     ("gguf-py (llama.cpp)", "llama.cpp", "MIT", "https://github.com/ggml-org/llama.cpp", ["llama:LICENSE"], []),
     ("Outfit (the web app's font)", "outfit", "OFL-1.1", "https://github.com/Outfitio/Outfit-Fonts",
      ["src:third_party/main/outfit/OFL.txt"], []),
+    ("KaTeX (the web app's math rendering)", "katex", "MIT", "https://katex.org",
+     ["src:third_party/main/katex/LICENSE"], []),
     ("AOTriton (its library and kernels' images)", "0.14.2b", "MIT; the images can carry parts of aiter (MIT), "
      "FlyDSL's kernels (Apache-2.0) and Triton (MIT)", "https://github.com/ROCm/aotriton",
      ["src:third_party/main/aotriton/LICENSE", "src:third_party/main/aotriton/LICENSE.aiter",
@@ -114,7 +116,8 @@ COMPONENTS = [
 
 # the program's files from the source tree (as cmake/packaging.cmake installs them on Linux)
 APP_FILES = ("setup.py", "chat.py", "requirements.txt")
-APP_DIRS = ("serve", "tools", "ref", "data", "third_party/main/outfit", "third_party/main/quantscope")
+APP_DIRS = ("serve", "tools", "ref", "data", "third_party/main/outfit", "third_party/main/katex",
+            "third_party/main/quantscope")
 APP_SKIP = ("__pycache__", "test_*", "mcp_fake_server.py", "lint", "vision", "package")
 
 
@@ -248,7 +251,7 @@ def main() -> None:
     lic = top / "licenses"
     lic.mkdir()
     versions = {"version": a.version, "dotnet": "10", "llama.cpp": "the commit setup.py pins",
-                "outfit": "third_party/main/outfit", "quantscope": "bfdf205",
+                "outfit": "third_party/main/outfit", "katex": "0.19.0 (third_party/main/katex)", "quantscope": "bfdf205",
                 "python": a.python_zip.stem.split("-")[1]}
     sycl_rec = json.loads((a.sycl / "XESTRATA.json").read_text())
     versions["intel-llvm"] = f"{sycl_rec['tag']} ({sycl_rec['commit'][:12]}, with XeStrata's patches)"
