@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // Chat math (serve/web/math.js + math-adapter.js + the vendored KaTeX), run in Node.
 //   node serve/test_web_math.js      (serve/test_web_math.py runs it too and skips when node is missing)
 //

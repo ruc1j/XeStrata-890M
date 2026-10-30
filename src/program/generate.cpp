@@ -4526,6 +4526,7 @@ int main(int argc, char** argv) {
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
     strata::kernels::PleTable ple_table;
+    bool ple_lock_by_policy = false;   // locked in RAM by the residency policy, not by --ple-io ram: #4518 may give it back
     std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
     float* ple_scratch = nullptr;
@@ -4584,6 +4585,7 @@ int main(int argc, char** argv) {
                 std::string ram_err;
                 if (ple_table.open(o.ple_gguf, ram_err, pio)) {
                     ple_auto_ram = true;
+                    ple_lock_by_policy = ple_table.locked();
                     std::fprintf(stderr, "strata generate: --ple-io ram chosen by the residency policy (the table is "
                                          "%.1f GiB, the expert arena still to fill %.1f GiB and %.1f GiB of RAM is available; "
                                          "STRATA_PLE_AUTO_RAM=0 keeps the direct reads, --ple-io direct forces them)\n",
@@ -7742,8 +7744,24 @@ int main(int argc, char** argv) {
         // every request read its whole prompt again).  An explicit value, 0 included, is never touched.  (XeStrata parks
         // only with --mtp: a parked conversation carries the draft layer's K/V.)
         if (o.conversation_cache_mib < 0) {
-            if (o.serve && o.prompt_cache > 0 && o.conversation_cache_slots > 0 && use_mtp) {
-                o.conversation_cache_mib = strata::core::auto_conversation_cache_mib(strata::core::available_host_bytes(),
+            const bool auto_cache = o.serve && o.prompt_cache > 0 && o.conversation_cache_slots > 0 && use_mtp;
+            auto cache_room = strata::core::available_host_bytes();
+            // #4518 (upstream 587a47443): the residency policy locked the PLE table before it knew what the rest of the
+            // load would take; if the lock is what leaves the automatic cache too little (or none), the lock is given
+            // back (the pages stay cached, the OS may reclaim them).  --ple-io ram asked for by hand is never touched.
+            if (auto_cache && ple_lock_by_policy && ple_table.locked() &&
+                strata::core::ple_lock_blocks_cache(cache_room, ple_table.table_bytes(), o.conversation_cache_min_free_mib)) {
+                const auto before = cache_room;
+                if (ple_table.unlock()) {
+                    cache_room = strata::core::available_host_bytes();
+                    std::fprintf(stderr, "strata serve: PLE table lock given back: the lock left %.1f GiB of RAM for the "
+                                         "conversation cache, %.1f GiB without it (the table stays cached)\n",
+                                 before ? (double) *before / (1ull << 30) : 0.0,
+                                 cache_room ? (double) *cache_room / (1ull << 30) : 0.0);
+                }
+            }
+            if (auto_cache) {
+                o.conversation_cache_mib = strata::core::auto_conversation_cache_mib(cache_room,
                                                                                     o.conversation_cache_min_free_mib);
                 if (o.conversation_cache_mib > 0)
                     std::fprintf(stderr, "strata serve: conversation cache sized from the free RAM: %lld MiB for up to %d parked "
@@ -9331,6 +9349,13 @@ int main(int argc, char** argv) {
             const bool in_main = live_ok && cvec_cached == sl.cvec && prefix_of(live) &&
                                  imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
             if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
+            if (conversations.supersedes_richer(sl.ids, {}, sl.checks, sl.cvec)) {
+                // its park would drop the main session's copy of this conversation, and with it the checkpoints the slot does
+                // not hold (upstream c7a0cef13, #4420)
+                std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (a parked copy "
+                                     "of its conversation holds checkpoints the slot does not; it stays)\n", b);
+                return;
+            }
             if (use_mtp && !batch_mtp) {   // no draft K/V of its own: an image without it would not restore beside the drafter
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (its %zu tokens "
                                      "have no per-slot draft K/V without --batch-mtp)\n", b, sl.ids.size());

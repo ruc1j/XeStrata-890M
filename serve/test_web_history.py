@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """The web page's chat history: saved chats in the browser (#1787), edit / regenerate / rewind with an Undo (#2615), the rewind
 choice between "here" and a branch (#3823), and sending while an answer is written (#4004). One design, opt-in, off by default.
 

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/prefill/kva.hpp - STRATA_KVA: the approximate late-layer prompt read (opt-in since 0.2.7).
 //
 // After layer `split` the prompt's late layers need only their recurrent state (GDN recurrence + conv history)

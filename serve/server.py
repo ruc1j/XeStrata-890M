@@ -3434,7 +3434,7 @@ class Service:
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
-        self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
+        self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images: Any = None                           # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = stop_token_ids(tokenizer)
@@ -4110,6 +4110,8 @@ class Service:
             ("strata:tool_calls_unread_total", "counter",
              "<tool_call> blocks returned as text (an undeclared name or a form the template does not use)",
              t.get("tool_calls_unread", 0)),
+            ("strata:tool_args_repaired_total", "counter", "Tool call arguments (a JSON array or object) that were damaged and read as written",
+             t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
@@ -4961,6 +4963,14 @@ class Service:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
                   f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
+        if getattr(parser, "stray_think", 0):
+            # #4077: the model wrote a closing think tag while thinking; the reasoning after it was sent as the answer
+            self.totals["stray_think_closers"] = self.totals.get("stray_think_closers", 0) + parser.stray_think
+            print(f"[strata] {parser.stray_think} extra closing think tag(s) in the answer were dropped (the model wrote one "
+                  "while thinking, so the rest of its reasoning went out as the answer; a call after it still counts)", flush=True)
+        if getattr(parser, "notes", None):
+            self.totals["tool_args_repaired"] = self.totals.get("tool_args_repaired", 0) + len(parser.notes)
+            print(f"[strata] {len(parser.notes)} tool call argument(s) repaired: {'; '.join(sorted(set(parser.notes)))}", flush=True)
         unread = getattr(parser, "unread", 0)         # (the Harmony parser has no such count)
         rejected = []
         if unread:
@@ -7565,6 +7575,15 @@ def model_card_sampling(arch, thinking) -> dict:
     return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
 
 
+def tool_call_recovery_setting(cfg: dict) -> bool:
+    """The config's "tool_call_recovery" (see OutputParser's recover): ON when the config does not name it (since 0.2.8; 0.2.7 and before: off),
+    "tool_call_recovery": false turns it off. Anything but true or false stops the start."""
+    recovery = cfg.get("tool_call_recovery", True)
+    if not isinstance(recovery, bool):
+        raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
+    return recovery
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -7852,10 +7871,7 @@ def main() -> int:
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
-    recovery = cfg.get("tool_call_recovery", False)     # opt-in: see OutputParser's recover
-    if not isinstance(recovery, bool):
-        raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
-    svc.tool_call_recovery = recovery
+    svc.tool_call_recovery = tool_call_recovery_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")

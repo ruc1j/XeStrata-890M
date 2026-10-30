@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // window_evict_test: pick_window_victim (#3702) - the largest captured window size other than the one being captured
 // and the prelaunched one; 0 when none is left.
 #include "strata/core/window_evict.hpp"

@@ -79,7 +79,8 @@ decode の速さは文章によっても変わります。
 | serve の decode（なし → あり、1K と 32K、greedy と温度 0.7） | −1.0〜+12.7% | +7.5〜+24.5% | +6.3〜+55.4% |
 
 `STRATA_ROUTE_RESIDENT=<margin>`（upstream 5df35dcb、実験的、opt-in）は、検証の窓で上位 10 のうち順位 6〜9 の VRAM にないエキスパートを、ロジットの差が margin 以内なら VRAM にあるエキスパートに入れ替えます（`STRATA_ROUTE_RESIDENT_RANKS=lo-hi`）。
-`STRATA_ROUTE_PRIOR=<lambda>`（upstream 2de9ae06、opt-in）は、VRAM にあるエキスパートのロジットに lambda を足して選び直します（重みはルーターのもの）。
+`STRATA_ROUTE_PRIOR=<lambda>`（upstream 2de9ae06）は、VRAM にあるエキスパートのロジットに lambda を足して選び直します（重みはルーターのもの）。
+既定では使いません。upstream は 0.2.7 で小さいカードの既定にしましたが、長いエージェントの作業で同じ文を繰り返し、結果も落ちるので、0.2.8 で既定から外しました（upstream #4402）。
 どちらも答えが変わります。
 
 ### 小さい GPU と XMX のない GPU
