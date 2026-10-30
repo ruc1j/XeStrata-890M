@@ -38,7 +38,7 @@ XeStrata's as they are.
 
 The build is the free build only, of free software only (ROCm is free software). oneMKL and CUDA are not used.
 The fork carries in the original XeStrata's changes up to xe0.2.2-1 (Strata 0.2.2) and the engine, serve and setup
-changes of upstream Strata 0.2.7.1 (engine 0.1.53) ([docs/XE.md](docs/XE.md)).
+changes of upstream Strata 0.2.8 (engine 0.1.54) ([docs/XE.md](docs/XE.md)).
 
 **What an 890M is, and how to use this fork**
 

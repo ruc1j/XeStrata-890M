@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.2.7.1-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.7.1-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+XeStrata xe0.2.8-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
@@ -31,6 +31,30 @@ Qwen3.8 の prompt は xmx_gemm が動く GPU では FP16 の経路のままに�
 `STRATA_VRAM_LIMIT_MIB` はエンジンから見える VRAM を、`STRATA_MAX_ALLOC_MIB` は想定する最大の確保量を制限し、
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は確認用の 2 つ目の実機として使います。
+
+## Strata 0.1.54 の取り込み
+
+upstream の Strata 0.2.7.1 から 0.2.8（エンジンの版は 0.1.54）までの 70 コミットのうち、エンジン・serve・setup の層に当たるものを XeStrata-890M に移しています（Issue #56）。
+上流の XeStrata（MistVVK/XeStrata）が 2026-10-30 に SYCL の形で取り込んだ 13 コミットを 3-way で当てました。
+この間の upstream の変更の大半は、upstream 自身の sycl/ の移植（Battlemage の prompt の注意、2 枚の Arc の流れ作業）、DeepSeek、app と Terminal、Mac のもので、この fork には当たりません。
+
+移したものは次のとおりです。
+
+- エンジン: エキスパートの領域に要る RAM を最大 20 秒待ってから読み込みます。方針で RAM に固定した PLE の表が自動の会話のキャッシュの余地を奪うときは、固定を返します。バッチの空いた枠の退避で、本体の写しと共有の根のチェックポイントを消しません。AVX-512 のない CPU で止まるときは、原因が CPU でなく `native_experts.txt` のないパックだと言います。
+- serve: ツール呼び出しの回復（`tool_call_recovery`）を既定で入れ、`"tool_call_recovery": false` で切ります。壊れた引数、余分な思考の閉じタグ、`</function>` の抜けで呼び出しを失わず、呼び出しを丸ごと引く値や同じ引数名が続く値を値の一部として読みます。
+- setup: 使わない APU に大きな BIOS の割り当てがあるときは、OS が失う RAM と直し方を言います。
+
+移していないのは次のとおりです。
+
+- upstream の sycl/ の変更（lane-cell の prompt の注意、問いのまとめ、2 枚の Battlemage の流れ作業の既定）: この fork のエンジンは別のコードです。
+- 検証とバッチの窓を 16 行にする HIP の既定: `--batch` の 1 組 8 枠を超えるときだけ効きます。
+- 自動のエキスパートキャッシュが読み込みの後の確保を見込む変更: この fork の設定は `--expert-cache` を明示し、XeStrata にはその警告がありません。
+- route prior の既定: この fork は 0.2.7 の自動の 1.5 を取っていないので、upstream が既定から外した理由を文書に書いただけです。
+- 終わり印を 1 トークンのものに限る変更: fork の `stop_token_ids` がすでにそうしています。前の run が残したエンジンの待ちは `strata_control/procs.py` に依るので、エンジンの側の待ちだけを入れました。
+- DeepSeek、app と Terminal と Control、Mac、DGX Spark、2 枚の GPU の既定。
+
+確かめたのは、free のビルド、CTest（pack のない 2 本を除いて通ります）、serve の Python の試験（852 本、12 skip）、890M での decode の前後の比較（abliterated 版 IQ2_XS、greedy、交互 3 周: 前 31.42・31.47・31.43 tok/s、後 31.07・31.41・30.38 tok/s、答えは同じ）です。
+contrib-llvm のビルド、Windows のクロスビルド、ほかの GPU は unverified です。
 
 ## Strata 0.1.53 の取り込み
 

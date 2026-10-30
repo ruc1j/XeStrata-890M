@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.2.7.1-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.7.1-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+XeStrata xe0.2.8-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -30,6 +30,30 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
+
+## Integration through Strata 0.1.54
+
+Of the 70 commits from upstream Strata 0.2.7.1 to 0.2.8 (the engine's version is 0.1.54), those that touch the engine, serve and setup are carried into XeStrata-890M (Issue #56).
+The 13 commits upstream XeStrata (MistVVK/XeStrata) integrated in SYCL form on 2026-10-30 were applied three-way.
+Most of upstream's changes in this span are its own `sycl/` port (Battlemage's prompt attention, the pipelined pair of Arc cards), DeepSeek, the app and Terminal, and the Mac, none of which this fork has.
+
+Carried over:
+
+- Engine: the RAM the expert arena needs is waited for up to 20 s before the load. A PLE table the residency policy locked in RAM gives its lock back when the lock is what leaves the automatic conversation cache too little room. Parking an idle batch slot no longer drops the main session's copy with the shared root checkpoint. A CPU without AVX-512 is told that the pack folder without `native_experts.txt`, not the CPU, is what stops the engine.
+- serve: tool-call recovery (`tool_call_recovery`) is on by default, `"tool_call_recovery": false` turns it off. Damaged arguments, a stray closing think tag and a missing `</function>` no longer cost the call, and a value that quotes a whole call or repeats a parameter name is read as part of the value.
+- setup: when the BIOS gives a big carve-out to an APU this run does not use, setup says what RAM the OS loses and how to change it.
+
+Not carried over:
+
+- upstream's `sycl/` changes (the lane-cell prompt attention, the query batch, the pipelined default of two Battlemage cards): this fork's engine is other code.
+- Verify and batch windows of 16 rows as the HIP default: it only matters beyond 8 slots in a `--batch` group.
+- The automatic expert cache pricing the allocations after the load: this fork's config names `--expert-cache`, and XeStrata has no such warning.
+- The route prior default: this fork never took 0.2.7's automatic 1.5, so only the reason upstream took its default back is in the documents.
+- Stop ids limited to one-token end markers: the fork's `stop_token_ids` already does that. The wait for an engine an earlier run left behind depends on `strata_control/procs.py`, so only the engine-side wait went in.
+- DeepSeek, the app, Terminal and Control, the Mac, the DGX Spark, the defaults of two GPUs.
+
+Checked: the free build, CTest (passes except the two tests that need a pack), the serve Python tests (852, 12 skipped), and the decode before and after on the 890M (the abliterated IQ2_XS, greedy, three interleaved rounds: 31.42, 31.47 and 31.43 tok/s before, 31.07, 31.41 and 30.38 tok/s after, the same answers).
+The contrib-llvm build, the Windows cross build and other GPUs are unverified.
 
 ## Integration through Strata 0.1.53
 
