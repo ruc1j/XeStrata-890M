@@ -41,6 +41,10 @@ void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64
 void quantize_f16(const uint16_t* x, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows, void* stream);
 /// The same from BF16 rows.
 void quantize_bf16(const uint16_t* x, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows, void* stream);
+/// quantize() of swiglu(gu)'s rows (`swiglu` below, ld n_ff) in one kernel, the same bytes: the H rows are never
+/// stored (upstream dd97421d3).
+void swiglu_quantize(const float* gu, void* xq, int ggml_type, int64_t rows, int64_t n_ff, bool interleaved,
+                     void* stream);
 /// The rows quantize(x, src, ...) writes for tokens x k_used rows in expert order, written token by token: token t's
 /// row of x is quantized once and stored at rows slot[t * k_used + k] (`slot` the inverse of `src`) - the same bytes,
 /// a k_used-th of the quantizations (upstream c675f5b7).  STRATA_QUANT_GATHER=1: quantize() over `src`, as before.

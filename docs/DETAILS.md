@@ -175,6 +175,14 @@ Unless asked, the device's reported virtual-memory granularity decides: on at 2 
 - `k8v4`: 8-bit keys and 4-bit values, about three quarters of the memory.
   It streams its KV like the other formats (about 10.6 KB of RAM per context token)
 
+### Optional prefill switches (STRATA_DEQUANT_SIDE, STRATA_SWIGLU_QUANT, STRATA_PREFILL_WARM)
+
+The three prefill switches upstream XeStrata carried over as opt-ins with Strata 0.2.7 came in with Issue #58 (the engine's environment; none of them changes a bit of the answers).
+
+- `STRATA_DEQUANT_SIDE`: the dense weights' dequantization runs on a side stream into a double-buffered scratch, overlapping the product before it. On the integrated GPU on the HIP backend it is on by default (`STRATA_DEQUANT_SIDE=0` turns it off); a 15K-token prompt on the 890M read 314.1, 305.8 and 310.8 -> 311.1, 308.1 and 308.6 tok/s, the same.
+- `STRATA_SWIGLU_QUANT=1`: swiglu and the down product's int8 rows in one kernel. Not on: on the 890M a 15K-token prompt read 314.1, 305.8 and 310.8 -> 269.3, 277.3 and 276.9 tok/s (-11%), slower.
+- `STRATA_PREFILL_WARM=1`: the per-layer walk of chunks below 2,048 tokens warms the pages of this layer's and the next layer's file-tier experts ahead. Not on: on the 890M the experts are in RAM and the warming only adds RAM reads.
+
 ### Reading a long prompt approximately (STRATA_KVA, optional)
 
 `STRATA_KVA=1` approximates the late layers on the first read of a long prompt (a port of upstream 0.2.7's KVA).
@@ -1148,6 +1156,23 @@ Measured on the B70 with IQ2_XS: a 970-token conversation (8K context, FP16 KV) 
 Its answers and state match a run without parking byte for byte:
 with FP16, INT8 (also with KV streaming), Q4_0 and K8V4 KV, and with INT8 on the small configuration (8 GB, no XMX).
 With parking off, the engine gives the same tokens and state as the engine before the change.
+
+### Conversation cache copies on a slow host link
+
+Where the card sits behind a slow host link, the conversation cache's copies are on the path of the next request.
+A checkpoint copies the DeltaNet state (118 MB on Qwen3.8-Flash-Next) from the card to RAM, and parking a conversation copies its K/V and its checkpoints before the next prompt can start.
+These variables (the engine's environment) move the copies card-to-card in VRAM and onto background threads (upstream #3779).
+The answers and the parked images are the same bytes.
+Under `--serve`, when the link to the card probes below 12 GB/s, or the GPU is an integrated one (XeStrata-890M, Issue #58: on unified memory the copies are memcpys, and still on the request's path), and none of the three is set, `STRATA_CKPT_ASYNC`, `STRATA_CKPT_GATHER` and `STRATA_PARK_ASYNC` are set to 1 by themselves (the start log says so). Otherwise they are off, and setting any of them to 0 keeps all three as set.
+
+- `STRATA_CKPT_ASYNC=1`: a checkpoint's state is copied into a VRAM stage and moved to RAM by a background thread (the checkpoint at the start of the assistant turn into its pinned staging buffer). A reader waits only for the copy it needs. The stage is the size of the state, allocated at the first save; if it cannot be had, the save copies as before.
+- `STRATA_CKPT_VRAM_SLOTS=N` (0-16, with `STRATA_CKPT_ASYNC=1`): the last N saved states also stay in VRAM (N x 118 MB), and a restore from one copies card-to-card.
+- `STRATA_CKPT_GATHER=1`: a checkpoint's 37 small copies are gathered into one buffer and fetched with one copy.
+- `STRATA_PARK_ASYNC=1`: a park copies the K/V into a VRAM stage and moves it to RAM in the background. The checkpoints the request drops move into the parked image instead of being copied.
+- `STRATA_PARK_VRAM_MIB=N` (with `STRATA_PARK_ASYNC=1`): a parked conversation's K/V also stays in VRAM slots (64 MiB granules, up to N MiB in all), and switching back restores it card-to-card. When the K/V needs the VRAM to grow, the slots go first.
+- `STRATA_PARK_TRACE=1`: diagnostic, the save and park steps' waits and timings on stderr.
+
+The VRAM stages and slots are taken only while a sixteenth of the card's memory stays free beside them.
 
 ### Keeping parked conversations across restarts (opt-in)
 

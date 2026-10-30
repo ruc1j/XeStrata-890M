@@ -465,6 +465,54 @@ struct PinnedUpload {
     }
 };
 
+// STRATA_PREFILL_WARM=1 (upstream 162dec341, opt-in there too): chunks below STREAM_ALL_MIN take the per-layer walk,
+// where each layer's file-tier experts are page faults of the stager's few threads.  This thread hands the source a
+// layer's whole list at once (ExpertSource::warm: the drive sees one deep queue), and the next layer's list from the
+// previous chunk while this layer computes.  Only warms pages: what the stager copies is unchanged.
+struct PrefillWarmer {
+    core::ExpertSource* src = nullptr;
+    struct Job { int64_t layer = 0; std::vector<int64_t> experts; };
+    std::deque<Job> queue;
+    bool quit = false;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::thread thread;
+
+    explicit PrefillWarmer(core::ExpertSource* s) : src(s) {
+        thread = std::thread([this] {
+            strata::aux_cpus::pin_current_thread();
+            for (;;) {
+                Job j;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return quit || !queue.empty(); });
+                    if (quit) return;
+                    j = std::move(queue.front());
+                    queue.pop_front();
+                }
+                src->warm(j.layer, j.experts.data(), (int64_t) j.experts.size());
+            }
+        });
+    }
+    ~PrefillWarmer() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            quit = true;
+        }
+        cv.notify_all();
+        if (thread.joinable()) thread.join();
+    }
+    void submit(int64_t layer, std::vector<int64_t> experts) {
+        if (experts.empty()) return;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            while (queue.size() >= 4) queue.pop_front();   // behind: the oldest layer is done or nearly so
+            queue.push_back({layer, std::move(experts)});
+        }
+        cv.notify_one();
+    }
+};
+
 // STRATA_HANDOFF_PIPE=P (2..16, default 8; 0/1 = the one copy; upstream 1d9758f8, opt-in there): a layer split hands a
 // chunk's rows on in P row pieces.  The stage records an event when its chunk's work is done and one after each piece's copy
 // into the pinned hand-off buffer, waits on the host only for the first (what on_stage_chunk's checkpoint parts and the
@@ -579,6 +627,8 @@ struct Prefill::Impl {
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
+    std::unique_ptr<PrefillWarmer> warmer;   // STRATA_PREFILL_WARM=1: the per-layer walk's page warming
+    std::vector<std::vector<int64_t>> warm_prev;   // per layer: the file-tier experts of the previous chunk
     strata::gpu::Event *copied[RING_MAX] = {}, *used[RING_MAX] = {};
     int used_of[RING_MAX] = {};              // the slot whose `used` event releases this one (a gathered group's last)
     bool stage_live[RING_MAX] = {};
@@ -1233,6 +1283,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
     }
+    if (!m.warmer && src != nullptr && src->warms() && env_on("STRATA_PREFILL_WARM")) {
+        m.warmer = std::make_unique<PrefillWarmer>(src);
+        m.warm_prev.assign((size_t) g.n_layers, {});
+        std::fprintf(stderr, "prefill: STRATA_PREFILL_WARM=1: the per-layer walk warms this layer's and the next layer's "
+                             "file-tier experts\n");
+    }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.steps_up.init(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
@@ -1263,8 +1319,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     o.owned = &m.owned;
     {
         uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+        // STRATA_DEQUANT_SIDE: the second dequant scratch (counted by bytes_needed, retaken by relayout)
+        uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         m.gemm.init_external(stream, gs, GEMM_SCRATCH);
+        if (std::string side_err; !m.gemm.set_dequant_side(gs2, side_err))
+            std::fprintf(stderr, "prefill: STRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
+                                 "front of their products\n", side_err.c_str());
     }
     if (!carve(T, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit" +
@@ -1433,7 +1494,11 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     o.cap = borrow_bytes;
     o.owned = &m.owned;
     uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+    uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;   // STRATA_DEQUANT_SIDE
     if (ok) m.gemm.rebind(gs, GEMM_SCRATCH);
+    if (std::string side_err; ok && !m.gemm.set_dequant_side(gs2, side_err))
+        std::fprintf(stderr, "prefill: STRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
+                             "front of their products\n", side_err.c_str());
     if (!ok || !carve((size_t) chunk, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit" +
               fit_failure(o);
@@ -1618,6 +1683,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     Alloc o;
     o.count_only = true;
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+    if (gemm_dequant_side()) o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);   // STRATA_DEQUANT_SIDE: the second scratch
     auto f = [&](size_t n) { o.take<float>(n, ok); };
     f(T * N); f(T * D); f(T * HC);
     if (!hc_in_region()) o.take<uint8_t>((size_t) hc_set_bytes(T), ok);
@@ -3122,6 +3188,22 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             job_of[j] = (int) js.size();
                             js.push_back({b, (size_t) lay.blob_bytes(l), tr ? m.src : nullptr, (int32_t) l, e});
                         }
+                        if (m.warmer) {   // STRATA_PREFILL_WARM: this layer's list, and the next layer's of the last chunk
+                            std::vector<int64_t> cur;
+                            for (size_t j = 0; j < order.size(); ++j)
+                                if (job_of[j] >= 0) cur.push_back(order[j]);
+                            m.warm_prev[(size_t) l] = cur;
+                            m.warmer->submit(l, std::move(cur));
+                            if (l + 1 < m.g->n_layers) {
+                                std::vector<int64_t> nxt;
+                                for (const int64_t e : m.warm_prev[(size_t) (l + 1)]) {
+                                    if (m.host_res && m.cache && m.host_res[(size_t) (l + 1) * m.g->n_expert + e] >= 0) continue;
+                                    if (m.src->pinned(l + 1, (int32_t) e)) continue;
+                                    nxt.push_back(e);
+                                }
+                                m.warmer->submit(l + 1, std::move(nxt));
+                            }
+                        }
                         m.stager->start(std::move(js));
                     }
                     StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
@@ -3302,9 +3384,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (in_place) { gu.w = nullptr; gu.expert_bytes = 0; gu.wtab = m.wtab_dev + j0; gu.woff = 0; }
                             else if (mtab) { gu.wtab = tabs + j0; gu.woff = 0; }
                             m.mmq_ctx->run(gu, m.cs);
-                            mmq::swiglu(m.GU, m.H, nr, 640, !lay.native, m.cs);
-                            pt.mark(kPfGemmD, cs);
-                            mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+                            // STRATA_SWIGLU_QUANT=1: swiglu and the down product's int8 rows in one kernel, the same
+                            // bytes (upstream dd97421d3).  Opt-in: 32K prompt equal on the B70 and the RTX 4070, 5%
+                            // slower on the RX 9060 XT (2026-10-28)
+                            static const bool sq = [] {
+                                const char* e = std::getenv("STRATA_SWIGLU_QUANT");
+                                return e != nullptr && e[0] == '1';
+                            }();
+                            if (sq) {
+                                pt.mark(kPfGemmD, cs);
+                                mmq::swiglu_quantize(m.GU, m.Hq, mmq_dt, nr, 640, !lay.native, m.cs);
+                            } else {
+                                mmq::swiglu(m.GU, m.H, nr, 640, !lay.native, m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+                            }
                             grp_rows_last = nr;
                             mmq::Product dn;
                             dn.w = mmq_direct ? ring0 + f.down_off : m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640;

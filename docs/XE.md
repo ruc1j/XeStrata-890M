@@ -62,6 +62,13 @@ Under that rule `STRATA_SPEC_COST` became the default of the integrated GPU on t
 Two rows a sub-group for the dense GEMV at five columns or more did not go in: it equals the current default (the IQ4_XS local-memory kernel) and is 10% slower on the 8-column ssm_out.
 The 890M's decode (the abliterated IQ2_XS, greedy, three interleaved rounds) was 31.88, 29.40 and 28.47 tok/s after the sync and 31.90, 30.79 and 31.71 tok/s after the review, with the same answers; a 15K-token prompt read 314.3, 313.8 and 311.3 -> 314.9, 314.4 and 314.5 tok/s, the same.
 
+### Upstream XeStrata's opt-in speed ports (Issue #58)
+
+The opt-in speed changes upstream XeStrata carried in SYCL form with Strata 0.2.7 came in under Issue #57's rule.
+The conversation cache's background copies (, , ) are the default of  on an integrated GPU, and the dense weights' dequantization on a side stream () is the default of the integrated GPU on the HIP backend (a 15K-token prompt read 314.1, 305.8 and 310.8 -> 311.1, 308.1 and 308.6 tok/s, the same answers).
+ (swiglu and the int8 quantization in one kernel) reads a 15K-token prompt 11% slower on the 890M, and  (the per-layer walk warming the experts' pages) has nothing to warm on the 890M, whose experts are in RAM, so both stay opt-in ([DETAILS](DETAILS.md)).
+The 890M's decode (the abliterated IQ2_XS, greedy, three interleaved rounds) was 31.52, 30.87 and 31.66 tok/s before and 31.62, 30.73 and 30.41 tok/s with the new defaults, with the same answers.
+
 ## Integration through Strata 0.1.53
 
 Of the 796 commits from upstream Strata 0.2.3.1 to 0.2.7.1 (the engine's version is 0.1.53), the 596 that touch the engine, serve, setup and tools layers were looked at, and the changes of 33 commits are carried into XeStrata-890M (Issue #49).
