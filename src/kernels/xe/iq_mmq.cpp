@@ -128,6 +128,9 @@ inline Dw2 load_dw2(const void* p) {   // the aligned words around 4 bytes at a 
 inline uint32_t join4(const Dw2& w, const void* p) { return ((uintptr_t) p & 2) ? (w.w0 >> 16) | (w.w1 << 16) : w.w0; }
 template<typename T, typename = void> struct split_dec : std::false_type {};
 template<typename T> struct split_dec<T, std::void_t<typename T::Raw>> : std::true_type {};
+// the decoder's raw words where it splits its load from its decode, else a placeholder (never read)
+template<typename T, typename = void> struct raw_of { using type = int; };
+template<typename T> struct raw_of<T, std::void_t<typename T::Raw>> { using type = typename T::Raw; };
 
 template<int TY> struct Dec;
 template<> struct Dec<16> {   // IQ2_XXS: d (0.5 + ls) / 4
@@ -981,13 +984,32 @@ struct Kernel {
                 gl = reinterpret_cast<const typename GridOf<TY>::type*>(g);
             }
             const int64_t kb = K / 32;   // activation scales a row
+            // the step's loads (XeStrata-890M): the counts a lane are compile-time, the loops unrolled, and the
+            // weights' bytes are all loaded before any block is decoded (Dec::load, Dec::decode)
+            constexpr int AV = WM * (KC / 16), SV = WM * NB, DV = WN * NB;
+            constexpr int APL = (AV + lanes - 1) / lanes, SPL = (SV + lanes - 1) / lanes, DPL = (DV + lanes - 1) / lanes;
+            // The weights' raw words of a step are loaded one step ahead (#25): the step decodes the words the
+            // previous step loaded and issues the next step's loads before its products, so the loads' latency is
+            // behind the products instead of in front of the decode (the 890M, IQ2_XS at 16 rows an expert: 640 -> 617
+            // us a launch of the parity bench).  The words and the sums are the same, so every output is bitwise the
+            // one-step kernel's.
+            [[maybe_unused]] typename raw_of<Dec<TY>>::type raw[DPL];
+            auto load_raw = [&](auto dec, int64_t k0) {   // generic: its body exists only for a decoder with Raw
+                using D = decltype(dec);
+                const bool last = TAIL && k0 + KC > K;
+#pragma unroll
+                for (int u = 0; u < DPL; ++u) {
+                    const int v = lid + u * lanes;
+                    if (DV % lanes != 0 && v >= DV) break;
+                    const int nn = v / NB, b = v % NB;
+                    if (!last || k0 / 32 + b < kb)
+                        raw[u] = D::load(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes);
+                }
+            };
+            if constexpr (split_dec<Dec<TY>>::value) load_raw(Dec<TY>{}, 0);
             for (int64_t k0 = 0; k0 < K; k0 += KC) {
                 sycl::group_barrier(it.get_group());   // the last step's tiles are read
                 const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
-                // the step's loads (XeStrata-890M): the counts a lane are compile-time, the loops unrolled, and the
-                // weights' bytes are all loaded before any block is decoded (Dec::load, Dec::decode)
-                constexpr int AV = WM * (KC / 16), SV = WM * NB, DV = WN * NB;
-                constexpr int APL = (AV + lanes - 1) / lanes, SPL = (SV + lanes - 1) / lanes, DPL = (DV + lanes - 1) / lanes;
 #pragma unroll
                 for (int u = 0; u < APL; ++u) {
                     const int v = lid + u * lanes;
@@ -1008,15 +1030,6 @@ struct Kernel {
                     if constexpr (MIN) xul[v] = row < rows && (!last || k0 / 32 + b < kb) ? xug[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
                 }
                 if constexpr (split_dec<Dec<TY>>::value) {
-                    typename Dec<TY>::Raw raw[DPL];
-#pragma unroll
-                    for (int u = 0; u < DPL; ++u) {
-                        const int v = lid + u * lanes;
-                        if (DV % lanes != 0 && v >= DV) break;
-                        const int nn = v / NB, b = v % NB;
-                        if (!last || k0 / 32 + b < kb)
-                            raw[u] = Dec<TY>::load(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes);
-                    }
 #pragma unroll
                     for (int u = 0; u < DPL; ++u) {
                         const int v = lid + u * lanes;
@@ -1032,6 +1045,7 @@ struct Kernel {
                         wsl[(2 * b + 1) * WN + nn] = d.s1;
                         if constexpr (MIN) wml[b * WN + nn] = d.m;
                     }
+                    if (k0 + KC < K) load_raw(Dec<TY>{}, k0 + KC);   // the next step's words, behind this step's products
                 } else {
 #pragma unroll
                     for (int u = 0; u < DPL; ++u) {

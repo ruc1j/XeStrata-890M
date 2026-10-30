@@ -1310,6 +1310,20 @@ float spec_prob_min_temp() {
     return std::getenv("STRATA_SPEC_MIN_TEMP") != nullptr || !spec_prob_auto() ? spec_min_temp() : 0.7f;
 }
 
+bool spec_cost_default() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SPEC_COST");
+        if (v != nullptr && v[0] != '\0') return v[0] == '1';
+        const sycl::device& d = Runtime::get().device();
+        const bool on = d.get_backend() == sycl::backend::ext_oneapi_hip && integrated_gpu(d);
+        if (on)
+            std::fprintf(stderr, "strata mtp: the MTP window is scheduled by its cost (STRATA_SPEC_COST, the integrated "
+                                 "GPU's default; STRATA_SPEC_COST=0 keeps the min-p rule)\n");
+        return on;
+    }();
+    return on;
+}
+
 float spec_cum_threshold() {
     static const float c = [] {
         const char* v = std::getenv("STRATA_SPEC_CUM");

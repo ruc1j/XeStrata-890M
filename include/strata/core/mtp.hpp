@@ -46,6 +46,13 @@ class NativeHead;
 /// HIP backend, 0 elsewhere (mtp.cpp has the measurement).
 float spec_cum_threshold();
 
+/// XeStrata-890M: whether the cost-scheduled MTP window (STRATA_SPEC_COST, upstream 68781055: the window by expected
+/// tokens per ms at this machine's measured row costs) is on.  STRATA_SPEC_COST=1 on, 0 off; unset: on for an
+/// integrated GPU on the HIP backend (the 890M: three interleaved rounds gave a median 30.9 -> 31.5 tok/s, within
+/// the noise, and the rule drafts fewer rows where the table says a row would not pay), off elsewhere (B70 and
+/// RTX 4070 were 1.4-4.7% slower at 1K with it, upstream XeStrata's record).
+bool spec_cost_default();
+
 class MtpDrafter {
 public:
     MtpDrafter() = default;

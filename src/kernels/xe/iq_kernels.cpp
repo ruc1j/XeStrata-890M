@@ -122,7 +122,7 @@ template<> struct Split<42> {   // Q2_0
         const uint16_t* qs = (const uint16_t*) bq2_0->qs + (ptrdiff_t) iqs * 4;
         W r{};
         for (int j = 0; j < 4; ++j) {
-            const uint32_t q = qs[j];   // eight codes, the lowest bits first
+            const uint32_t q = iq_bits::load_u16_nt(qs + j);   // eight codes, the lowest bits first (non-temporal, #20)
             r.qx[j] = (int) q2_0_bytes(q & 0xFFu);
             r.qy[j] = (int) q2_0_bytes(q >> 8);
         }
@@ -1048,7 +1048,7 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
                 const int k = sycl::min(k0 + u * LPR, K - 1);
                 const block_q2_0* b = (const block_q2_0*) block_at<F>(row, k / F::ipb);
                 const uint16_t* qs = (const uint16_t*) b->qs + (ptrdiff_t) (k % F::ipb) * 4;
-                for (int j = 0; j < 4; ++j) q[u][j] = qs[j];
+                for (int j = 0; j < 4; ++j) q[u][j] = iq_bits::load_u16_nt(qs + j);
                 dh[u] = b->d;
             }
 #pragma unroll

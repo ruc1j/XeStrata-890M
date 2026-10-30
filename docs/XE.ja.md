@@ -56,6 +56,13 @@ upstream の Strata 0.2.7.1 から 0.2.8（エンジンの版は 0.1.54）まで
 確かめたのは、free のビルド、CTest（pack のない 2 本を除いて通ります）、serve の Python の試験（852 本、12 skip）、890M での decode の前後の比較（abliterated 版 IQ2_XS、greedy、交互 3 周: 前 31.42・31.47・31.43 tok/s、後 31.07・31.41・30.38 tok/s、答えは同じ）です。
 contrib-llvm のビルド、Windows のクロスビルド、ほかの GPU は unverified です。
 
+### 実測で差が出なかった変更の見直し（Issue #57）
+
+2026-10-31 からの方針として、890M の実測で差が揺れの中だったことだけを理由に、変更を不採用や opt-in のままにしません。答えが同じで、はっきり遅くならない限り、論理的に速くなる変更は既定に入れます。
+この方針で、`STRATA_SPEC_COST` を HIP の統合 GPU の既定にし（上の推測デコードの項）、重みの 16 bit の読みに AMD の device compile だけ non-temporal の hint を付け（重みは窓ごとに 1 回しか読まないので、キャッシュを活性化と格子表に残します）、prefill の MMQ の 16 行のカーネルで重みの生のワードを 1 ステップ先に読むようにしました（カーネル単体で IQ2_XS の 16 行が 594 → 575 us、ビット同一）。
+密な GEMV の 2 行 / サブグループを 5 列以上で使う規則は、今の既定の IQ4_XS の LDS 版と同等で 8 列の ssm_out では 10% 遅いので、入れていません。
+890M の decode（abliterated 版 IQ2_XS、greedy、交互 3 周）は取り込み後 31.88・29.40・28.47 tok/s、見直し後 31.90・30.79・31.71 tok/s で答えは同じ、15K トークンの prompt の読みは 314.3・313.8・311.3 → 314.9・314.4・314.5 tok/s で同じです。
+
 ## Strata 0.1.53 の取り込み
 
 upstream の Strata 0.2.3.1 から 0.2.7.1（エンジンの版は 0.1.53）までの 796 コミットのうち、エンジン・serve・setup・tools の層に当たる 596 コミットを見て、33 コミットの変更を XeStrata-890M に移しています（Issue #49）。
@@ -92,8 +99,8 @@ upstream の 0.2 は app と Terminal と Control の層を加えた版で、エ
 
 移したものの主なものは次のとおりです。
 
-- 推測デコード: 費用を見て MTP の窓を決める `STRATA_SPEC_COST=1`（opt-in）。下書きごとの確率から幅ごとの期待トークン数を求め、測った採択率と 1 周の時間で割って比べます。
-  890M の 6 チャット（abliterated 版、28 W、`--spec 6`、greedy、3 回の交互の計測）の結果: 3 周の中央値は既定（`STRATA_SPEC_CUM`）30.9 tok/s、`STRATA_SPEC_COST=1` 31.5 tok/s で、差は揺れの幅の中でした（2 周目の既定は温度の揺れで 27.4 tok/s）。費用の規則は下書きを 2〜7% 多く出し、採択数は同じで、答えは一致しました。890M では速くならないので既定は変えていません。
+- 推測デコード: 費用を見て MTP の窓を決める `STRATA_SPEC_COST`。下書きごとの確率から幅ごとの期待トークン数を求め、測った採択率と 1 周の時間で割って比べます。
+  890M の 6 チャット（abliterated 版、28 W、`--spec 6`、greedy、3 回の交互の計測、2026-10-23）の 3 周の中央値は既定（`STRATA_SPEC_CUM`）30.9 tok/s、`STRATA_SPEC_COST=1` 31.5 tok/s で差は揺れの幅の中でしたが、費用の表で負ける幅の下書きをやめる規則なので、2026-10-31 に HIP の統合 GPU の既定にしました（Issue #57。`STRATA_SPEC_COST=0` で `STRATA_SPEC_CUM` の規則に戻ります。ほかの GPU では opt-in のままです）。
   推測の輪の始まりの規則を `spec_loop_runs()` に名づけ、実行の始めだけ適応の段の入れ替えを頻繁にする `STRATA_SPEC_ADAPT_EVERY` と `STRATA_SPEC_ADAPT_WARM`（opt-in）を足しました。
   計測用の `STRATA_SPEC_TRACE`、`STRATA_SPEC_T_CYCLE`、`STRATA_ROUTE_STATS`、`STRATA_SPEC_WATCH`、`STRATA_BATCH_TELEMETRY` は既定で無効です。
 - serve: prompt の末尾を読む窓で logits が有限でなくなったら、次の要求は prompt を全部バッチの経路で読みます（#3465）。

@@ -9159,10 +9159,11 @@ int main(int argc, char** argv) {
         if (use_mtp && (S_mtp < S || mtp.max_t() > S_mtp)) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
-        // STRATA_SPEC_COST=1 (upstream 68781055 and the commits after it; an A/B arm, off by default): the MTP window by
+        // STRATA_SPEC_COST (upstream 68781055 and the commits after it; XeStrata-890M: on by default on the HIP
+        // integrated GPU, core::spec_cost_default, off elsewhere): the MTP window by
         // expected tokens per ms at this machine's measured row costs (DraftPolicy::keep_draft, step by step) instead of
         // "draft probability >= --spec-min-p" (or STRATA_SPEC_CUM's product)
-        const bool spec_cost = [] { const char* v = std::getenv("STRATA_SPEC_COST"); return v != nullptr && v[0] == '1'; }();
+        const bool spec_cost = strata::core::spec_cost_default();   // STRATA_SPEC_COST; on by default on the HIP integrated GPU
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // the window the cost-aware rule kept in the MTP chain just drafted
         policy.set_robust(spec_cost);
@@ -13405,10 +13406,11 @@ int main(int argc, char** argv) {
         // lookup window, round ms, the MTP draft probabilities), for offline window-length policy studies
         std::FILE* spec_trace = nullptr;
         if (const char* tf = std::getenv("STRATA_SPEC_TRACE"); tf != nullptr && tf[0] != '\0') spec_trace = std::fopen(tf, "w");
-        // STRATA_SPEC_COST=1 (upstream 68781055 and the commits after it; an A/B arm, off by default): the MTP window by
+        // STRATA_SPEC_COST (upstream 68781055 and the commits after it; XeStrata-890M: on by default on the HIP
+        // integrated GPU, core::spec_cost_default, off elsewhere): the MTP window by
         // expected tokens per ms at this machine's measured row costs (DraftPolicy::keep_draft, step by step) instead of
         // "draft probability >= --spec-min-p" (or STRATA_SPEC_CUM's product)
-        const bool spec_cost = [] { const char* v = std::getenv("STRATA_SPEC_COST"); return v != nullptr && v[0] == '1'; }();
+        const bool spec_cost = strata::core::spec_cost_default();   // STRATA_SPEC_COST; on by default on the HIP integrated GPU
         std::vector<float> dwin((size_t) o.spec, 0.0f);   // the draft probabilities this round's window was chosen from
         // plan v0.3 P6: with a native pack the first window is the last prompt token alone (it produces the first
         // generated token and the MTP's first cell); otherwise the token loop already did that.

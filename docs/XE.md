@@ -55,6 +55,13 @@ Not carried over:
 Checked: the free build, CTest (passes except the two tests that need a pack), the serve Python tests (852, 12 skipped), and the decode before and after on the 890M (the abliterated IQ2_XS, greedy, three interleaved rounds: 31.42, 31.47 and 31.43 tok/s before, 31.07, 31.41 and 30.38 tok/s after, the same answers).
 The contrib-llvm build, the Windows cross build and other GPUs are unverified.
 
+### Changes once set aside for a measured difference within the noise (Issue #57)
+
+From 2026-10-31 a change is no longer rejected or left opt-in only because its measured difference on the 890M was within the noise: one that is faster by its logic goes in by default as long as the answers are the same and it is not clearly slower.
+Under that rule `STRATA_SPEC_COST` became the default of the integrated GPU on the HIP backend (the speculative decoding item above), the 16-bit reads of the weights carry the non-temporal hint in the AMD device compile (the weights are read once a window, so the cache keeps the activations and the grids), and the 16-row MMQ kernel of the prefill loads the weights' raw words one step ahead (IQ2_XS at 16 rows 594 -> 575 us in the kernel bench, bit-identical).
+Two rows a sub-group for the dense GEMV at five columns or more did not go in: it equals the current default (the IQ4_XS local-memory kernel) and is 10% slower on the 8-column ssm_out.
+The 890M's decode (the abliterated IQ2_XS, greedy, three interleaved rounds) was 31.88, 29.40 and 28.47 tok/s after the sync and 31.90, 30.79 and 31.71 tok/s after the review, with the same answers; a 15K-token prompt read 314.3, 313.8 and 311.3 -> 314.9, 314.4 and 314.5 tok/s, the same.
+
 ## Integration through Strata 0.1.53
 
 Of the 796 commits from upstream Strata 0.2.3.1 to 0.2.7.1 (the engine's version is 0.1.53), the 596 that touch the engine, serve, setup and tools layers were looked at, and the changes of 33 commits are carried into XeStrata-890M (Issue #49).
@@ -91,8 +98,8 @@ Upstream's 0.2 added the app, the Terminal and the Control layer around the engi
 
 The main ones:
 
-- Speculative decoding: the cost-aware MTP window, `STRATA_SPEC_COST=1` (opt-in). From each draft's probability it computes the expected tokens of every window width and divides by the measured acceptance and round time.
-  On the 890M (6 chats, the abliterated file, 28 W, `--spec 6`, greedy, 3 interleaved rounds): the medians of 3 rounds were 30.9 tok/s with the default (`STRATA_SPEC_CUM`) and 31.5 tok/s with `STRATA_SPEC_COST=1`, within the noise (the default's second round was 27.4 tok/s from thermal throttling). The cost rule offers 2–7% more drafts for the same number accepted, and the answers are identical. It does not speed up the 890M, so the default stays.
+- Speculative decoding: the cost-aware MTP window, `STRATA_SPEC_COST`. From each draft's probability it computes the expected tokens of every window width and divides by the measured acceptance and the round's time.
+  On the 890M (6 chats, the abliterated file, 28 W, `--spec 6`, greedy, 3 interleaved rounds, 2026-10-23) the medians of 3 rounds were 30.9 tok/s with the default (`STRATA_SPEC_CUM`) and 31.5 tok/s with `STRATA_SPEC_COST=1`, within the noise; since the rule stops drafting the widths its cost table says would lose, it became the default of the integrated GPU on the HIP backend on 2026-10-31 (Issue #57; `STRATA_SPEC_COST=0` restores the `STRATA_SPEC_CUM` rule; elsewhere it stays opt-in).
   The speculative loop's start rule is named `spec_loop_runs()`, and `STRATA_SPEC_ADAPT_EVERY` / `STRATA_SPEC_ADAPT_WARM` (opt-in) swap the adaptive tier more often at the start of a run.
   The measurement switches `STRATA_SPEC_TRACE`, `STRATA_SPEC_T_CYCLE`, `STRATA_ROUTE_STATS`, `STRATA_SPEC_WATCH` and `STRATA_BATCH_TELEMETRY` are off by default.
 - serve: after non-finite logits in a window that reads the prompt's tail, the next request reads its whole prompt through the batched path (#3465).

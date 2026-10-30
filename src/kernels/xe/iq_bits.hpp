@@ -20,9 +20,19 @@ namespace strata::kernels::iq_bits {
 
 using xe::byte_perm;
 
+// A 16-bit word of the weights (XeStrata-890M, #20): the expert weights are read once a window and not again, so
+// on AMD GPUs the load carries the non-temporal hint (the cache keeps the activations and the grids instead; the
+// value is the same).  Elsewhere a plain load.
+inline uint16_t load_u16_nt(const uint16_t* p) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+    return __builtin_nontemporal_load(p);
+#else
+    return *p;
+#endif
+}
 inline int get_int_b2(const void* x, int i32) {
     const uint16_t* x16 = (const uint16_t*) x;
-    return (int) ((uint32_t) x16[2 * i32 + 0] | ((uint32_t) x16[2 * i32 + 1] << 16));
+    return (int) ((uint32_t) load_u16_nt(x16 + 2 * i32 + 0) | ((uint32_t) load_u16_nt(x16 + 2 * i32 + 1) << 16));
 }
 inline int get_int_b4(const void* x, int i32) { return ((const int*) x)[i32]; }
 // Two consecutive ints at a two-byte aligned address (get_int_b2 at i32 and i32 + 1): the aligned words around them,

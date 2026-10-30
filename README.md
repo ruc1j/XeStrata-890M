@@ -98,7 +98,8 @@ changes of upstream Strata 0.2.8 (engine 0.1.54) ([docs/XE.md](docs/XE.md)).
     decode is +2.5-3.0% (35.5 → 36.5 tok/s). `STRATA_SH_BRANCH=0` for the original order.
   - the draft chain and the window length are cut by the product of the drafts' probabilities so far
     (`STRATA_SPEC_CUM=c`, default 0.5 on HIP's integrated GPU, 0 elsewhere for the old rule; not used when
-    `--spec-min-p` is 0) rather than each draft's own probability (`--spec-min-p`): draft long while the head is
+    `--spec-min-p` is 0; on HIP's integrated GPU the cost-aware window `STRATA_SPEC_COST` is the default since
+    2026-10-31, and `STRATA_SPEC_COST=0` brings this rule back) rather than each draft's own probability (`--spec-min-p`): draft long while the head is
     confident and cut short once it starts to waver; used with `--spec 6`. On the abliterated build's 6 chats
     (28 W), `--spec 4` with `--spec-min-p 0.5` gave 32.18 / 31.99 tok/s, and `--spec 6` with 0.5 gave 32.76 / 32.67
     (+2.0%); 0.45 gave +2.3% (a comparison from another run), 0.55 gave +1.1%, and 0.4 or below with `--spec 8` are
