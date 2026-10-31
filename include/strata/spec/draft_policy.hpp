@@ -31,7 +31,11 @@ public:
     static constexpr int kBuckets = 4;
     static constexpr int kCtxBuckets = 3;   // STRATA_SPEC_COST: row costs per context length (< 6K, < 24K, longer)
 
-    explicit DraftPolicy(int max_t, double margin = 0.03);
+    /// `source_costs`: the lookup windows' round times in a table of their own (cost_ms(t, true)), apart from the
+    /// MTP windows': a lookup window skips the draft layer, so the two differ in cost at the same size, and one EMA
+    /// over both priced each by the other's rounds (htbmixbox/Strata-890M ba96856d1).  The gated path's times
+    /// (defer_cost / apply_costs) stay in the shared table.
+    explicit DraftPolicy(int max_t, double margin = 0.03, bool source_costs = false);
 
     struct Pick {
         bool lookup = false;
@@ -65,7 +69,9 @@ public:
     void observe_chain(int t_mtp, int k, int accepted, int match, double round_ms);
     double chain_rate(int match) const;
     double lookup_rate(int match) const;   // current q for a match length
-    double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
+    /// measured or scaled round time of a window of t tokens; `lookup`: a lookup window's, from its own table where
+    /// source_costs is on and the size was measured (else the shared table, as for the MTP's)
+    double cost_ms(int t, bool lookup = false) const;
     /// A per-card row-cost table (round ms of the windows of 1..n rows, the draft included) counted as `weight` earlier rounds each:
     /// the start of a process that already knows the card (STRATA_SPEC_COST_TABLE; tuning time), replaced by what it then measures.
     void seed_costs(const double* ms, int n, double weight, int bucket = 0);
@@ -126,7 +132,7 @@ public:
 private:
     static int bucket(int match);
     double mtp_tokens(int t) const;
-    bool stale(int t) const;               // a size not measured for a long stretch of rounds
+    bool stale(int t, bool lookup = false) const;               // a size not measured for a long stretch of rounds
     double draft_q(float p) const;         // a draft's acceptance, from its probability and the calibration
     double draft_q_mean() const;           // the mean acceptance of a tested draft
     bool mtp_step_pays(int t, double held, double q, double expected) const;
@@ -134,6 +140,8 @@ private:
     int max_t_;
     double margin_;
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> cost_{}, cost_n_{};   // round ms by context bucket and window size
+    bool source_costs_ = false;                            // the lookup windows' times apart (below), not in cost_
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> lookup_cost_{}, lookup_cost_n_{};
     int bk_ = 0;                                           // the current context bucket
     bool scale_all_ = false;
     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
@@ -141,7 +149,7 @@ private:
     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
     double rounds_ = 0;                                    // rounds observed so far
     bool robust_ = false;
-    double clamp_sample(int t, double ms) const;
+    double clamp_sample(int t, double ms, bool lookup = false) const;
     static constexpr int kPBuckets = 8;
     std::array<double, kPBuckets> pa_ok_{}, pa_n_{};       // MTP drafts reached / accepted by probability bucket (decayed)
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> last_{};   // the round at which each size was last measured

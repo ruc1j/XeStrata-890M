@@ -80,6 +80,17 @@ Ben1078/Strata's 8b90ab807 came in: with `"effort_position": "end"` a request's 
 shoftee/Strata's 2feece509 came in as well: a stop closes the listening socket first, writes the engine STOP before QUIT so it finishes its request, and joins the handler threads last (a busy stop 20 s -> about 1 s in shoftee's measurement). A write to a closed pipe (ValueError) counts as the engine's end too.
 Ben1078's e8e0cdc40 (a metadata-only GGUF shard) was already in this fork's gguf_reader.hpp.
 
+### Memory sizing on an integrated GPU and the expert source's bounds (Issue #67)
+
+Three changes of shoftee/Strata came in: the expert cache is sized from `MemAvailable`, not from the figure clamped by the cgroup's cap (48defc12e: the cache's pages are not charged to the cgroup); with `--conversation-cache-mib N` on an integrated GPU's `--serve` the auto expert cache's reserve grows by N (ff5809230); and ArenaExpertSource's prefetch, release and pinned check the layer's upper bound (f6094ff1e: 172K-190K prompts read past the table and stopped the engine). The fatal-signal backtrace did not come in.
+Ben1078's bd0e37bb4 (mlock of the HIP expert arena) did not come in: this fork's expert cache is hipHostMalloc memory, which the driver pins, and the mapped experts are page cache, not something mlock applies to.
+
+### Separate cost tables for the lookup and MTP windows, the O_DIRECT fallback (Issue #64)
+
+htbmixbox/Strata-890M's ba96856d1 came in. The speculative decoding's DraftPolicy kept one EMA of the round times of the lookup (prompt-lookup, suffix) windows and the MTP windows, but a lookup window runs no draft layer, so the two differ in cost at the same width and each priced the other's rounds. With `STRATA_SPEC_SOURCE_COST` the lookup windows' times go into a table of their own (per context bucket), and the choice of a lookup window reads that table. A width not measured keeps the shared guess, and the gated path (defer_cost / apply_costs) keeps the shared table. On by default on the integrated GPU on the HIP backend; `STRATA_SPEC_SOURCE_COST=0` goes back to one table.
+The 890M's decode (the abliterated IQ2_XS, greedy, three interleaved rounds) was 31.53, 30.38 and 26.66 tok/s before, 30.93, 30.02 and 31.78 tok/s with the new default and 28.86, 30.14 and 28.37 tok/s with `STRATA_SPEC_SOURCE_COST=0`, with the same answers; single requests show thermal dips, and the rounds' differences are within the noise.
+The same fork's d3ed6bb4a came in too: on a file system that refuses `O_DIRECT`, DirectFile opens the file again through the page cache ([DETAILS](DETAILS.md#troubleshooting)).
+
 ## Integration through Strata 0.1.53
 
 Of the 796 commits from upstream Strata 0.2.3.1 to 0.2.7.1 (the engine's version is 0.1.53), the 596 that touch the engine, serve, setup and tools layers were looked at, and the changes of 33 commits are carried into XeStrata-890M (Issue #49).

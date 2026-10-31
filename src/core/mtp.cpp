@@ -1324,6 +1324,20 @@ bool spec_cost_default() {
     return on;
 }
 
+bool spec_source_costs_default() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SPEC_SOURCE_COST");
+        if (v != nullptr && v[0] != '\0') return v[0] == '1';
+        const sycl::device& d = Runtime::get().device();
+        const bool on = d.get_backend() == sycl::backend::ext_oneapi_hip && integrated_gpu(d);
+        if (on)
+            std::fprintf(stderr, "strata mtp: the lookup windows' round times are priced apart from the MTP windows' "
+                                 "(STRATA_SPEC_SOURCE_COST, the integrated GPU's default; =0 keeps one table)\n");
+        return on;
+    }();
+    return on;
+}
+
 float spec_cum_threshold() {
     static const float c = [] {
         const char* v = std::getenv("STRATA_SPEC_CUM");

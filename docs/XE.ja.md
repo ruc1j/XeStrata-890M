@@ -81,6 +81,17 @@ Ben1078/Strata の 8b90ab807 を移しました。`"effort_position": "end"` の
 shoftee/Strata の 2feece509 も移しました。停止のときは listening socket を先に閉じ、エンジンには QUIT の前に STOP を書いて要求を終えさせてから、handler のスレッドを待ちます（shoftee の計測で、忙しい停止が 20 秒 → 約 1 秒）。閉じた pipe への書き込み（ValueError）もエンジンの終了として扱います。
 Ben1078 の e8e0cdc40（GGUF のメタデータだけの shard）は、この fork の gguf_reader.hpp に既にありました。
 
+### 統合 GPU のメモリーの決め方と expert source の上限の検査（Issue #67）
+
+shoftee/Strata の 3 つを移しました。expert cache の大きさは cgroup の上限で丸めた値でなく `MemAvailable` から決め（48defc12e。cache のページは cgroup に課金されない）、統合 GPU の `--serve` で `--conversation-cache-mib N` を書いたときは自動の expert cache の reserve に N を足し（ff5809230）、ArenaExpertSource の prefetch・release・pinned に層の上限の検査を足しました（f6094ff1e。172K〜190K の prompt で表の外を読んで止まっていた）。fatal signal の backtrace は入れていません。
+Ben1078 の bd0e37bb4（HIP の expert の arena の mlock）は入れていません。この fork の expert cache は hipHostMalloc で、ドライバーが固定します。mmap のエキスパートはページキャッシュで、mlock の対象ではありません。
+
+### lookup の窓と MTP の窓で別の費用の表、O_DIRECT の開き直し（Issue #64）
+
+htbmixbox/Strata-890M の ba96856d1 を移しました。推測デコードの DraftPolicy は、lookup（prompt-lookup、suffix）の窓と MTP の窓の 1 周の時間を 1 つの EMA で持っていましたが、lookup の窓は下書きの層を走らせないので同じ幅でも費用が違い、互いの周で値段を付けていました。`STRATA_SPEC_SOURCE_COST` で lookup の窓の時間を別の表（文脈の bucket ごと）に持ち、lookup を選ぶ側はその表を見ます。測っていない幅は共有の見積もりのままで、gated の経路（defer_cost / apply_costs）も共有の表のままです。HIP の統合 GPU では既定で on、`STRATA_SPEC_SOURCE_COST=0` で 1 つの表に戻ります。
+890M の decode（abliterated 版 IQ2_XS、greedy、交互 3 周）は移す前 31.53・30.38・26.66 tok/s、移したあとの既定で 30.93・30.02・31.78 tok/s、`STRATA_SPEC_SOURCE_COST=0` で 28.86・30.14・28.37 tok/s で、答えは同じです。要求ごとの値に熱の落ち込みがあり、周ごとの差は揺れの中です。
+同じ fork の d3ed6bb4a も移しました。`O_DIRECT` を断るファイルシステムでは DirectFile がページキャッシュを通して開き直します（[DETAILS](DETAILS.ja.md#困ったとき)）。
+
 ## Strata 0.1.53 の取り込み
 
 upstream の Strata 0.2.3.1 から 0.2.7.1（エンジンの版は 0.1.53）までの 796 コミットのうち、エンジン・serve・setup・tools の層に当たる 596 コミットを見て、33 コミットの変更を XeStrata-890M に移しています（Issue #49）。

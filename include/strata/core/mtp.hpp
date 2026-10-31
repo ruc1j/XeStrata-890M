@@ -52,6 +52,9 @@ float spec_cum_threshold();
 /// the noise, and the rule drafts fewer rows where the table says a row would not pay), off elsewhere (B70 and
 /// RTX 4070 were 1.4-4.7% slower at 1K with it, upstream XeStrata's record).
 bool spec_cost_default();
+/// STRATA_SPEC_SOURCE_COST: the lookup windows' round times priced apart from the MTP windows' (DraftPolicy's source_costs):
+/// "1" on, "0" off, unset: on for the integrated GPU on the HIP backend (XeStrata-890M), off elsewhere.
+bool spec_source_costs_default();
 
 class MtpDrafter {
 public:

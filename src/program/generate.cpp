@@ -9221,7 +9221,8 @@ int main(int argc, char** argv) {
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
         if (use_mtp && (S_mtp < S || mtp.max_t() > S_mtp)) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
-        strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        // the lookup windows' costs apart from the MTP's (STRATA_SPEC_SOURCE_COST; on by default on the HIP integrated GPU)
+        strata::spec::DraftPolicy policy(S, 0.03, strata::core::spec_source_costs_default());   // MTP or lookup window, learned over the whole process
         // STRATA_SPEC_COST (upstream 68781055 and the commits after it; XeStrata-890M: on by default on the HIP
         // integrated GPU, core::spec_cost_default, off elsewhere): the MTP window by
         // expected tokens per ms at this machine's measured row costs (DraftPolicy::keep_draft, step by step) instead of
@@ -13500,7 +13501,7 @@ int main(int argc, char** argv) {
         bool first_window = native_pack;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
-        strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
+        strata::spec::DraftPolicy policy(o.spec, 0.03, strata::core::spec_source_costs_default());   // MTP or lookup window (see draft_policy.hpp)
         auto source_policy = policy;   // this generation's: committed outcomes only (observe_committed; upstream #3416)
         const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
             gated_proposal_usable(o.pipeline_windows < 2 && o.batch == 0 && !multi_gpu && drive.d.remote_count == 0,

@@ -33,8 +33,8 @@ constexpr double kProbeHeld = 0.5;
 
 }  // namespace
 
-DraftPolicy::DraftPolicy(int max_t, double margin)
-    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {}
+DraftPolicy::DraftPolicy(int max_t, double margin, bool source_costs)
+    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin), source_costs_(source_costs) {}
 
 int DraftPolicy::bucket(int match) {
     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
@@ -45,8 +45,9 @@ double DraftPolicy::lookup_rate(int match) const {
     return (ok_[b] + kPriorN * kPriorQ[b]) / (ok_[b] + bad_[b] + kPriorN);
 }
 
-double DraftPolicy::cost_ms(int t) const {
+double DraftPolicy::cost_ms(int t, bool lookup) const {
     t = std::clamp(t, 1, kMaxT);
+    if (source_costs_ && lookup && lookup_cost_n_[bk_][t] > 0) return lookup_cost_[bk_][t];
     if (cost_n_[bk_][t] > 0) return cost_[bk_][t];
     // scale from the nearest measured size below: a round's fixed part flattens the measured curve at its small end,
     // and scaled from there the wider sizes came out too dear to be tried (Gyro-M on the RX 9060 XT: 46 ms at one
@@ -64,10 +65,10 @@ double DraftPolicy::cost_ms(int t) const {
     return den > 0 ? num / den : kShape[t];
 }
 
-double DraftPolicy::clamp_sample(int t, double ms) const {
+double DraftPolicy::clamp_sample(int t, double ms, bool lookup) const {
     if (!robust_) return ms;
-    const double known = cost_ms(t);           // the measured value, or the scaled guess from the other widths
-    if (cost_n_[bk_][t] == 0) {
+    const double known = cost_ms(t, lookup);   // the measured value, or the scaled guess from the other widths
+    if ((source_costs_ && lookup ? lookup_cost_n_ : cost_n_)[bk_][t] == 0) {
         // the first use of a width captures its graph: that round says nothing about its cost, the guess from the other widths stands in
         for (int u = 1; u <= kMaxT; ++u)
             if (cost_n_[bk_][u] > 0) return known;
@@ -125,7 +126,9 @@ std::string DraftPolicy::cost_table_text() const {
     return out;
 }
 
-bool DraftPolicy::stale(int t) const { return cost_n_[bk_][t] > 0 && rounds_ - last_[bk_][t] > kStaleRounds; }
+bool DraftPolicy::stale(int t, bool lookup) const {
+    return (source_costs_ && lookup ? lookup_cost_n_ : cost_n_)[bk_][t] > 0 && rounds_ - last_[bk_][t] > kStaleRounds;
+}
 
 double DraftPolicy::mtp_tokens(int t) const {
     if (mtp_n_[t] > 0) return mtp_tok_[t];
@@ -143,7 +146,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     for (int k = 1; k <= std::min(lookup_k, max_t_ - 1); ++k) {
         qi *= q;
         e += qi;
-        const double r = e / cost_ms(k + 1);
+        const double r = e / cost_ms(k + 1, true);
         if (r > best) { best = r; best_t = k + 1; }
     }
     const int t_full = std::min(lookup_k, max_t_ - 1) + 1;
@@ -151,12 +154,13 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
         p.lookup = true;
         p.t = best_t;
         // a wider size whose cost has gone stale is re-measured, so one slow stretch cannot price it out for good
-        if (best_t < t_full && q >= 0.85 && stale(t_full)) p.t = t_full;
+        if (best_t < t_full && q >= 0.85 && stale(t_full, true)) p.t = t_full;
         return p;
     }
     // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would
     // need a size not measured yet, it is tried (verification keeps the output; only the one round's speed is at stake)
-    if (t_full > p.t && (cost_n_[bk_][t_full] - delayed_n_[bk_][t_full] + tried_[bk_][t_full] < kProbes || stale(t_full)) && q >= 0.85) {
+    const double measured = source_costs_ ? lookup_cost_n_[bk_][t_full] : cost_n_[bk_][t_full] - delayed_n_[bk_][t_full];
+    if (t_full > p.t && (measured + tried_[bk_][t_full] < kProbes || stale(t_full, true)) && q >= 0.85) {
         p.lookup = true;
         p.t = t_full;
     }
@@ -166,10 +170,13 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
     if (round_ms > 0) {
-        round_ms = clamp_sample(t, round_ms);
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
-        cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
-        cost_n_[bk_][t] += 1.0;
+        round_ms = clamp_sample(t, round_ms, lookup);
+        // source_costs: a lookup window's time goes into the lookup table, so neither source prices the other's rounds
+        auto& ms = source_costs_ && lookup ? lookup_cost_ : cost_;
+        auto& n = source_costs_ && lookup ? lookup_cost_n_ : cost_n_;
+        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (n[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
+        ms[bk_][t] = n[bk_][t] > 0 ? (1.0 - alpha) * ms[bk_][t] + alpha * round_ms : round_ms;
+        n[bk_][t] += 1.0;
         last_[bk_][t] = rounds_;
     }
     rounds_ += 1.0;

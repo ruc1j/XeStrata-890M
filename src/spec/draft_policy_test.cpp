@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/spec/draft_policy_test.cpp - DraftPolicy: when does a lookup window beat the MTP's?
 //
 // Simulated rounds with the costs measured on the RTX 5070 (window-cost: ~10 ms more per token) check that
@@ -10,6 +11,7 @@
 //   5. the policy never proposes a window beyond its cap.
 #include "strata/spec/draft_policy.hpp"
 
+#include <cmath>
 #include <cstdio>
 
 using strata::spec::DraftPolicy;
@@ -44,6 +46,20 @@ int main() {
         check(k.lookup && k.t == 6, "accepted long matches: the full lookup window is taken");
         check(!p.choose(4, 5, 4).lookup, "buckets are separate: short matches still not taken");
         check(p.choose(4, 20, 30).t <= 6, "never beyond the window cap");
+    }
+    {
+        // source costs: lookup windows priced in their own table, so a dear lookup does not price the MTP's window
+        DraftPolicy shared(6), apart(6, 0.03, true);
+        for (DraftPolicy* p : {&shared, &apart}) {
+            for (int i = 0; i < 50; ++i) p->observe(false, 4, 2, 0, cost(4));          // MTP windows of 4
+            for (int i = 0; i < 50; ++i) p->observe(true, 4, 2, 30, 3.0 * cost(4));    // lookup windows of 4, three times as dear
+        }
+        check(shared.cost_ms(4) > 2.0 * cost(4), "one table: the lookup rounds raise the MTP window's cost");
+        check(std::fabs(apart.cost_ms(4) - cost(4)) < 1e-6, "source costs: the MTP window's cost is its own rounds'");
+        check(std::fabs(apart.cost_ms(4, true) - 3.0 * cost(4)) < 1e-6, "source costs: the lookup window's cost is its own");
+        check(std::fabs(apart.cost_ms(6, true) - apart.cost_ms(6)) < 1e-6, "source costs: an unmeasured lookup size takes the shared guess");
+        check(!apart.choose(4, 3, 30).lookup && shared.choose(4, 3, 30).lookup == false,
+              "a lookup three times as dear as the MTP window is not taken either way");
     }
     {
         DraftPolicy p(8);

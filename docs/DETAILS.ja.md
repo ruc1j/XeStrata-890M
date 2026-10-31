@@ -110,6 +110,8 @@ setup はホストの設定を変えません。
 数は RAM から 24 GB と予算（と RAM に置く KV）を引いた分のスロットで、設定の `args` の `--expert-cache N` で変えられます。
 統合 GPU では、setup は推測ヘッドの隠れ入力の正規化をハイパーコネクションのストリームごとにします（`--mtp-hnorm stream`。upstream の setup が DGX Spark に入れる値です）。890M では decode が 5% 速くなり（greedy、交互 3 周の平均で 31.2 → 32.7 tok/s）、答えは同じでした。設定の `args` の `--mtp-hnorm pooled` で前の形に戻せます。
 890M の prompt の塊は、`--prefill auto` に `--no-prefill-borrow` を付けた設定では 2,048 トークンで、15K トークンの prompt を 8 つの塊で読みます。`--prefill 8192` にすると、エキスパートの積が 1 回の起動に持つ行が 4 倍になり、各層のエキスパートを流す回数が 8 から 2 になって、15K トークンの prompt の読みは 1 周目に 283〜294 → 324 tok/s でした。ただし塊のバッファが約 4 GiB 増え（160 + 塊 × 680 / 1024 MiB）、62 GiB の RAM に 33 GiB の expert cache と mmap のページキャッシュが入らなくなり、2 周目は swap（zram）に出て 71 tok/s に落ちました。積の組の形が変わるので答えも変わります。既定は 2,048 のままで、RAM に余りのある機械では `--prefill 8192` を試せます。
+expert cache のページ（GTT、またはホストのメモリー）はドライバーのもので cgroup に課金されないので、エンジンは cache の大きさを cgroup の上限で丸めた値でなく Linux が返せる RAM（`MemAvailable`）から決めます（shoftee/Strata 48defc12e。MemoryMax を小さくした unit で「cache の余地なし」になっていました）。cgroup の値が小さいときはログに言います。ホストの確保は cgroup の値のままです。
+統合 GPU の `--serve` で `--conversation-cache-mib N` を書いたときは、置いた会話が同じ RAM を使うので、自動の expert cache の reserve にその N を足します（shoftee/Strata ff5809230）。空き RAM から後で決める会話キャッシュ（既定）ではそのままです。
 
 Radeon 890M（Ryzen AI 9 HX 370、LPDDR5X-7500、理論値 120 GB/s）で GPU が読める帯域を 1 GiB の連続読み（16 バイトのロード）で測ると、
 hipMalloc 102 GB/s、hipHostMalloc 95 GB/s、NonCoherent の hipHostMalloc 101 GB/s、2 MB ページの hipHostRegister 100 GB/s、Managed 100 GB/s です。
@@ -1556,6 +1558,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib-llvm のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[BUILD.ja.md](BUILD.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |
 | `no access to the GPU` | 自分のユーザーで `/dev/dri/renderD*` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
 | `no access to the GPU's compute device (/dev/kfd)` | AMD の GPU の計算に使う `/dev/kfd` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
+| `DirectFile: ... does not support O_DIRECT (...): reading it through the page cache instead` | そのファイルシステム（暗号化した home の eCryptfs、2.3 より前の ZFS、古いカーネルの tmpfs、FUSE など）は `O_DIRECT` を断ります。エンジンはページキャッシュを通して読み直すので動きますが、冷えた読みは遅く、ページキャッシュを使います（htbmixbox/Strata-890M d3ed6bb4a）。 |
 | `... the engine needs an RDNA2 or later AMD GPU` | RDNA2 より前の AMD の GPU では動きません。 |
 | `... rocBLAS ... has no code for gfx...`、`... has no code for gfx...` | ディストリビューションの rocBLAS（パッケージではそのエンジン）が、その GPU のコードを持っていません。Ubuntu 26.04 なら、Fedora 44 で動くことがあります（[README](../README.ja.md#amd-の-gpu)）。 |
 | `building for the AMD GPU needs ROCm's ...` | AMD の GPU のコードを作る ROCm のパッケージが足りません。示されたものを入れて、setup をやり直します（`./setup.sh --packages` も参照）。 |

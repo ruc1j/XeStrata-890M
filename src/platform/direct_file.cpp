@@ -6,8 +6,10 @@
 #include "strata/platform/aux_cpus.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -316,7 +318,28 @@ DirectFile::~DirectFile() { close(); delete impl_; }
 bool DirectFile::open(const std::string& path, std::string& err) {
     close();
     impl_->fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
-    if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
+    if (impl_->fd < 0) {
+        const int e = errno;
+        // Some file systems refuse O_DIRECT (EINVAL / EOPNOTSUPP: an encrypted home such as eCryptfs, ZFS before 2.3,
+        // tmpfs on older kernels, some FUSE mounts).  Every read here is aligned already, so the same preads work on
+        // a buffered descriptor: slower on a cold read and it fills the page cache, but the engine runs instead of
+        // stopping (htbmixbox/Strata-890M d3ed6bb4a).
+        const bool retried = e == EINVAL || e == EOPNOTSUPP;
+        if (retried) {
+            impl_->fd = ::open(path.c_str(), O_RDONLY);
+            if (impl_->fd >= 0) {
+#ifdef POSIX_FADV_RANDOM
+                (void) posix_fadvise(impl_->fd, 0, 0, POSIX_FADV_RANDOM);   // random 4 KiB reads: no read-ahead
+#endif
+                std::fprintf(stderr, "strata: DirectFile: %s does not support O_DIRECT (%s): reading it through the "
+                                     "page cache instead\n", path.c_str(), std::strerror(e));
+            }
+        }
+        if (impl_->fd < 0) {
+            err = "DirectFile: cannot open " + path + " (" + std::strerror(retried ? errno : e) + ")";
+            return false;
+        }
+    }
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
