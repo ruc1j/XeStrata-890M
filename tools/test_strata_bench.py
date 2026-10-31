@@ -207,8 +207,19 @@ class RedactionTests(unittest.TestCase):
                "args": ["--native", "/home/me/models/m-IQ3_XXS.gguf", "--ctx", "65536"],
                "api_key": "hunter2", "model_name": "Fake Model", "log": "/tmp/x.log", "port": 8080,
                "env": {"STRATA_FOO": "/home/me/z", "PATH": "/usr/bin", "STRATA_TOKEN": "t"}}
+        cfg["mcp_servers"] = {"files": {"command": "/opt/mcp/bin/server", "args": ["--root", "/home/me/docs"],
+                                        "headers": {"X-Api-Key": "k1234567"}, "env": {"SOME_TOKEN": "t7654321"}}}
+        cfg["images"] = {"model": "/home/me/models/img-Q8_0.gguf", "steps": 20}
         v = B.config_view(cfg)
         self.assertEqual(v["exe"], "strata.exe")
+        # nested settings are cut and cleaned at every depth (an MCP server's headers and env hold live tokens)
+        self.assertEqual(v["mcp_servers"]["files"]["command"], "server")
+        self.assertEqual(v["mcp_servers"]["files"]["args"], ["--root", "docs"])
+        self.assertEqual(v["mcp_servers"]["files"]["headers"], {})       # X-Api-Key: a secret key, dropped
+        self.assertEqual(v["mcp_servers"]["files"]["env"], {})           # SOME_TOKEN: the same
+        self.assertEqual(v["images"], {"model": "img-Q8_0.gguf", "steps": 20})
+        for secret in ("k1234567", "t7654321", "/opt/mcp", "/home/me"):
+            self.assertNotIn(secret, json.dumps(v))
         self.assertEqual(v["args"], ["--native", "m-IQ3_XXS.gguf", "--ctx", "65536"])
         self.assertNotIn("api_key", v)
         self.assertNotIn("log", v)

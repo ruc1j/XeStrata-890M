@@ -145,10 +145,24 @@ def atomic_replace(src, dst, *, patience: float = 5.0, sleep=time.sleep, clock=t
             step = min(step * 1.5, 0.25)
 
 
+class _HeadRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirected HEAD stays a HEAD.  Some Python versions turn it into a GET (3.14 keeps it), and a Hugging Face
+    file answers its HEAD with a 302 to the CDN: the size probe of download() would then receive the whole shard."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and req.get_method() == "HEAD":
+            new.method = "HEAD"
+        return new
+
+
+_opener = urllib.request.build_opener(_HeadRedirect)
+
+
 def _urlopen(req, timeout=None):
     """Every download request of this file goes through here
     (upstream's name, kept so its download code reads the same)."""
-    return urllib.request.urlopen(req, timeout=timeout)
+    return _opener.open(req, timeout=timeout)
 
 
 def allow_unpinned() -> bool:
@@ -2888,7 +2902,8 @@ def download(url, dst: Path, what=None):
     for attempt in range(5):
         try:
             req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
-            total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
+            with _urlopen(req, timeout=60) as r:          # closed: a HEAD's answer has no body to keep the socket for
+                total = int(r.headers.get("Content-Length", 0))
             break
         except urllib.error.HTTPError as e:
             if e.code == 404 and hf_unpinned(url) != url:  # the pinned revision is gone from the repository

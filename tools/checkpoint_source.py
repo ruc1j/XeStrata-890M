@@ -9,6 +9,8 @@ import sys
 import time
 import urllib.request
 
+ENDPOINT = "https://huggingface.co"
+
 
 class Source:
     """The checkpoint's files: a local directory, or a Hugging Face repository read with HTTP range requests."""
@@ -22,12 +24,17 @@ class Source:
             with open(self.model / name, "rb") as f:
                 f.seek(off)
                 return f.read(n)
-        url = "https://huggingface.co/%s/resolve/main/%s" % (self.repo, name)
+        url = "%s/%s/resolve/main/%s" % (ENDPOINT, self.repo, name)
         for attempt in range(8):
             try:
                 req = urllib.request.Request(url, headers={"Range": "bytes=%d-%d" % (off, off + n - 1)})
                 with urllib.request.urlopen(req, timeout=120) as r:
-                    b = r.read()
+                    # a range read is only the range asked for when the server says so (206 and its Content-Range);
+                    # a mirror or proxy that ignores Range answers 200 with the whole file, which is not read
+                    want = "bytes %d-%d/" % (off, off + n - 1)
+                    if r.status != 206 or not (r.headers.get("Content-Range") or "").startswith(want):
+                        raise OSError("the server ignored the Range header (HTTP %d)" % r.status)
+                    b = r.read(n)
                 if len(b) == n:
                     return b
             except OSError as e:
@@ -38,7 +45,7 @@ class Source:
     def text(self, name):
         if self.model is not None:
             return (self.model / name).read_text(encoding="utf-8")
-        url = "https://huggingface.co/%s/resolve/main/%s" % (self.repo, name)
+        url = "%s/%s/resolve/main/%s" % (ENDPOINT, self.repo, name)
         with urllib.request.urlopen(url, timeout=120) as r:
             return r.read().decode("utf-8")
 

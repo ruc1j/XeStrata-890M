@@ -579,6 +579,18 @@ class Runs(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("could not finish downloading", out)
 
+    def test_a_redirected_head_stays_a_head(self):
+        """The size probe is a HEAD; Hugging Face answers it with a 302 to the CDN.  A redirect handler that follows
+        with a GET (some Python versions) would download the whole shard to read its Content-Length."""
+        import urllib.request
+        handler = setup._HeadRedirect()
+        for method in ("HEAD", "GET"):
+            req = urllib.request.Request("http://127.0.0.1:1/a", method=method, headers={"User-Agent": "x"})
+            new = handler.redirect_request(req, None, 302, "Found", {"location": "http://127.0.0.1:1/b"},
+                                           "http://127.0.0.1:1/b")
+            self.assertEqual(new.get_method(), method)
+            self.assertEqual(new.full_url, "http://127.0.0.1:1/b")
+
     def test_the_default_is_many_connections_and_runs(self):
         self.assertGreaterEqual(setup.DL_CONNECTIONS, 8)
         self.assertGreaterEqual(setup.DL_RUN, 2)

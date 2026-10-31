@@ -572,6 +572,16 @@ def base_if_path(v):
     return v
 
 
+def view_nested(v):
+    """A nested setting (mcp_servers, images) for the report: secret keys dropped and paths cut at every depth, as
+    for the top level - an MCP server's headers and env are where a live token would be."""
+    if isinstance(v, dict):
+        return {k: view_nested(x) for k, x in v.items() if not (isinstance(k, str) and SECRET_KEY.search(k))}
+    if isinstance(v, list):
+        return [view_nested(x) for x in v]
+    return base_if_path(v)
+
+
 def config_view(cfg: dict) -> dict:
     """The settings worth reporting, with paths cut to file names and secrets dropped."""
     out = {}
@@ -585,7 +595,7 @@ def config_view(cfg: dict) -> dict:
         elif isinstance(v, (str, int, float, bool)) or v is None:
             out[k] = base_if_path(v)
         elif isinstance(v, (list, dict)):
-            out[k] = json.loads(json.dumps(v))
+            out[k] = view_nested(v)
     env = cfg.get("env")
     if isinstance(env, dict):
         out["env"] = {k: base_if_path(str(v)) for k, v in env.items()
