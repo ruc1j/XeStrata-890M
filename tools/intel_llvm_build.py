@@ -326,8 +326,11 @@ def prepare_source(tag: str) -> None:
                               text=True).stdout.strip()
         if have != tag:
             run(["git", "-C", SRC, "fetch", "--depth", "1", "origin", "tag", tag])
-            # the patched files back to the release first
-            run(["git", "-C", SRC, "checkout", "--", *patched_files()])
+            # every file the earlier tag's patches changed back to the release first (that set can differ from this
+            # tag's: a patch dropped since still has its file changed in the clone), and the files they added removed
+            run(["git", "-C", SRC, "checkout", "--", "."])
+            for f in added_files():
+                (SRC / f).unlink(missing_ok=True)
             run(["git", "-C", SRC, "checkout", "--detach", tag])
     else:
         run(["git", "clone", "--depth", "1", "--branch", tag, REPO, SRC])
