@@ -134,6 +134,33 @@ class Hardening(unittest.TestCase):
                                                        "max_tokens": 8, "temperature": "0.7", "top_k": "40"})
         self.assertEqual(code, 200, out)
 
+    def test_non_finite_json_numbers_are_400(self):
+        """1e999, Infinity and NaN parse as floats: int() of an infinite one raises OverflowError, which was not caught
+        (the connection dropped with no answer), and the sampling check let the numeric ones through to the engine."""
+        chat = b'{"messages": [{"role": "user", "content": "hi"}], '
+        for path, body in (("/v1/chat/completions", chat + b'"max_tokens": 1e999}'),
+                           ("/v1/chat/completions", chat + b'"max_completion_tokens": Infinity}'),
+                           ("/v1/chat/completions", chat + b'"temperature": Infinity}'),
+                           ("/v1/chat/completions", chat + b'"top_p": NaN}'),
+                           ("/v1/messages", chat + b'"max_tokens": 1e999}'),
+                           ("/v1/messages", chat + b'"max_tokens": 8, "temperature": NaN}'),
+                           ("/settings", b'{"defaults": {"seed": 1e999}}'),
+                           ("/settings", b'{"defaults": {"top_p": NaN}}')):
+            with mock.patch("builtins.print"):
+                code, out = self.post(path, body)
+            self.assertEqual(code, 400, (path, body, out))
+            self.assertIn("error", out)
+
+    def test_the_sampling_check_rejects_non_finite_numbers(self):
+        from serve.server import check_request_sampling
+        for key in ("temperature", "top_p", "presence_penalty"):
+            for bad in (float("inf"), float("-inf"), float("nan")):
+                with self.assertRaises(ValueError, msg=(key, bad)):
+                    check_request_sampling({key: bad})
+        with self.assertRaises(ValueError):
+            check_request_sampling({"top_k": float("inf")})
+        check_request_sampling({"temperature": 0.7, "top_p": 1.0, "top_k": 40})   # finite values pass as before
+
     def test_llama_cpp_names_for_the_repetition_penalty(self):
         """#1819: repeat_penalty / repeat_last_n are repetition_penalty / penalty_last_n; the OpenAI-style name wins."""
         from serve.server import SAMPLING_ALIASES, check_request_sampling, sampling_defaults_from_config

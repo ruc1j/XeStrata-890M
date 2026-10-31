@@ -5655,6 +5655,9 @@ def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
     return fields, files
 
 
+BODY_SECONDS = 30.0        # the longest wait for the next bytes of a request body (Handler._body)
+
+
 class BadBody(Exception):
     """A request body that cannot be read (a malformed or oversized chunked body): the status and the sentence."""
 
@@ -5735,21 +5738,32 @@ def make_handler(svc: Service):
                     raise BadBody(400, "malformed chunked request body")
 
         def _body(self) -> bytes:
+            """The request body.  Each receive waits at most BODY_SECONDS (a client that announces a body and stops
+            sending would otherwise hold this handler thread until it closes; the headers' reader and the drain are
+            bounded the same way): a stalled body is a 408 and the connection ends."""
             self.body_read = True
             limit = body_limit()
-            if self._chunked():
-                return self._read_chunked(limit)
+            timeout = self.connection.gettimeout()
             try:
-                length = int(self.headers.get("Content-Length", 0))
-            except ValueError:
-                raise BadBody(400, "invalid Content-Length") from None
-            if length < 0:
-                raise BadBody(400, "invalid Content-Length")
-            if length > limit:
-                self.close_connection = True               # the body is not read: the connection ends with the answer
-                raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
-                                   "(STRATA_MAX_BODY_MIB raises the limit)")
-            return self.rfile.read(length)
+                self.connection.settimeout(BODY_SECONDS)
+                if self._chunked():
+                    return self._read_chunked(limit)
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                except ValueError:
+                    raise BadBody(400, "invalid Content-Length") from None
+                if length < 0:
+                    raise BadBody(400, "invalid Content-Length")
+                if length > limit:
+                    self.close_connection = True           # the body is not read: the connection ends with the answer
+                    raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
+                                       "(STRATA_MAX_BODY_MIB raises the limit)")
+                return self.rfile.read(length)
+            except TimeoutError:
+                self.close_connection = True
+                raise BadBody(408, f"the request body stopped arriving for {BODY_SECONDS:g} s") from None
+            finally:
+                self.connection.settimeout(timeout)
 
         def _drain_body(self):
             """An answer sent before the body was read (a 401, a 403, /load, a method with no handler) must not close
@@ -6276,7 +6290,7 @@ def make_handler(svc: Service):
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
                            else {"error": {"type": "server_error", "message": str(e)}})
-            except ValueError as e:
+            except (ValueError, OverflowError) as e:            # OverflowError: int() of a JSON number such as 1e999
                 print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
@@ -6560,7 +6574,7 @@ def make_handler(svc: Service):
                                                           'or {"defaults": null} to clear them'}})
                     return
                 shared = svc.set_shared(req["defaults"])
-            except ValueError as e:
+            except (ValueError, OverflowError) as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
             print("[strata] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
@@ -7321,7 +7335,7 @@ def clean_shared_defaults(d) -> dict:
     for key, value in d.items():
         if value is None or value == "":
             continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        number = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
         if key == "reasoning_effort":
             if value not in ("none", "low", "medium", "high"):
                 raise ValueError("reasoning_effort: none, low, medium or high")
@@ -7443,7 +7457,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     for key, value in block.items():
         if value is None:
             continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool)
+        number = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
         if key == "temperature":
             if not number or value < 0:
                 raise SystemExit(f"[strata] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
@@ -7525,6 +7539,8 @@ def check_request_sampling(req) -> None:
             req[key] = value = num
         if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
+        if isinstance(value, float) and not math.isfinite(value):   # JSON's Infinity and NaN parse as floats
+            raise ValueError(f"{key}: a finite number")
 
 
 def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: list[str], lazy: bool):

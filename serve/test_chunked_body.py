@@ -9,7 +9,9 @@ apply an otherwise valid JSON body.
 """
 import json
 import socket
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from serve.frontend import ChatTemplate
@@ -62,6 +64,27 @@ class ChunkedBody(unittest.TestCase):
     def chat(self, extra: bytes, body: bytes):
         return self.send(b"/v1/chat/completions HTTP/1.1" + CRLF + b"Content-Type: application/json" + CRLF + extra,
                          body)
+
+    def test_a_stalled_body_is_a_408_and_frees_the_thread(self):
+        """A client that announces a body and stops sending held the handler thread until it closed (no timeout on
+        the body read, unlike the headers, the drain and the control body)."""
+        for head, body in ((b"/v1/chat/completions HTTP/1.1" + CRLF + b"Content-Type: application/json" + CRLF +
+                            b"Content-Length: 100" + CRLF, b'{"messages": '),
+                           (b"/v1/chat/completions HTTP/1.1" + CRLF + b"Content-Type: application/json" + CRLF +
+                            b"Transfer-Encoding: chunked" + CRLF, b"5" + CRLF + b"{\"me")):
+            with mock.patch.object(server, "BODY_SECONDS", 0.5), \
+                    socket.create_connection(("127.0.0.1", self.port), timeout=20) as s:
+                s.sendall(b"POST " + head + b"Host: 127.0.0.1" + CRLF + CRLF + body)   # and then nothing more
+                t0 = time.monotonic()
+                data = b""
+                while True:
+                    piece = s.recv(65536)
+                    if not piece:
+                        break
+                    data += piece
+                self.assertLess(time.monotonic() - t0, 10)
+                self.assertEqual(int(data.split(b" ", 2)[1]), 408, data)
+                self.assertIn(b"stopped arriving", data)
 
     def test_a_chunked_chat_request_is_read(self):
         req = json.dumps({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}).encode()
