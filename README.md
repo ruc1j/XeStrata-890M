@@ -83,7 +83,7 @@ changes of upstream Strata 0.2.9 (engine 0.1.55) ([docs/XE.md](docs/XE.md)).
   - GDN's step and commit load the token's inputs into LDS first and reduce the per-token barriers.
   - GDN's commit is folded into the next window (`STRATA_GDN_DEFER`, default): commit parks only the adopted rows'
     k, v, gate and beta, and the next window's step hits them while reading the state and writes back once; the
-    state (36 layers, about 113 MB) is read and written 3 times per window instead of 2, and the order of the
+    state (36 layers, about 113 MB) is read and written 2 times per window instead of 3, and the order of the
     computation is the same, so the answers are bit-identical (`STRATA_GDN_DEFER=0` for the original commit).
   - parked rows are kept over several windows and the write-backs are batched (`STRATA_GDN_ACC=K`, default 6 on
     HIP's integrated GPU, 1 elsewhere): commit accumulates the parked rows, a window's step hits all the accumulated

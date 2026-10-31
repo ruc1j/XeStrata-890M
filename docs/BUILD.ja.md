@@ -459,7 +459,7 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 
 ## Podman
 
-`container/` の Containerfile と compose のファイルで、XeStrata を rootless の Podman のコンテナで動かします（使い方は [README](../README.ja.md#podman)）。
+`container/` の Containerfile と compose のファイルで、XeStrata を rootless の Podman のコンテナで動かします。
 イメージは使う人の PC で作り、配布しません。contrib の版のイメージには、自由ソフトウェアでない cuBLAS と oneMKL が入るためです。
 
 - 中身: `tools/package/build.sh` と同じ Fedora 44 のイメージ（ダイジェストで固定）に、Releases の rpm を `SHA256SUMS` で確かめて入れます。

@@ -461,7 +461,7 @@ xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
 
 ## Podman
 
-The Containerfile and the compose files in `container/` run XeStrata in a rootless Podman container (how to use it: [README](../README.md#podman)).
+The Containerfile and the compose files in `container/` run XeStrata in a rootless Podman container.
 The image is built on the user's PC and not distributed: the contrib packages' image holds cuBLAS and oneMKL, which are not free software.
 
 - What it holds: the Fedora 44 image `tools/package/build.sh` uses (pinned by digest), with the release's rpm, checked against `SHA256SUMS`.
