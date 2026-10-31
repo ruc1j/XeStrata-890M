@@ -72,7 +72,7 @@ without `pkg-config` the runtime adapter takes an installed loader without check
 
 The toolchain is `.tools/intel-llvm/install/bin/clang++`, its runtime `.tools/intel-llvm/install/lib/libsycl.so`.
 Configure the engine with `-DCMAKE_CXX_COMPILER=$PWD/.tools/intel-llvm/install/bin/clang++` and run it with that `lib/` on `LD_LIBRARY_PATH`.
-On the development machine (28 threads, 91 GiB) v7.1.1 built in 13 minutes.
+On the development machine (28 threads, 91 GiB) v7.1.1 built in 13 minutes; on the 890M's machine (a Ryzen AI 9 HX 370, 24 threads) v7.2.0 built in 13 minutes.
 The clone (2.8 GB) and `install/` (0.7 GB) stay; the build tree is deleted.
 This runtime gives the Arc Pro B70 XMX (FP16 and BF16); 6.2's does not.
 
@@ -114,7 +114,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are sixteen fixes now; none of the first twelve is fixed in intel/llvm's `sycl` branch either (2026-10-08), nor the fifteenth (2026-10-14).
+  There are twenty fixes now, for v7.2.0 (2026-10-31). The seventh (`hip-libclc-target`) and the eleventh (`hip-libclc-fma`) of the v7.1.1 set are no longer needed in v7.2.0 and were dropped, the seventeenth keeps only its lowered-attribute part (its clang part is in v7.2.0), and an eighteenth and a nineteenth were added. The others only had their context updated for the SPDX headers upstream added.
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -131,6 +131,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Seventh, libclc builds the AMD libspirv only for the target name `amdgcn--amdhsa`, but left that name out of the targets it accepts.
   Configured with another name (`amdgcn-amd-amdhsa`), the build went through without an AMD libspirv, and no SYCL program for AMD GPUs compiled.
   Fixed, `amdgcn--amdhsa` is accepted (`hip-libclc-target`; the `sycl` branch has reorganized libclc's AMD target).
+  In v7.2.0 libclc is an LLVM runtime per target triple and accepts amdgcn, so this fix was dropped.
   Eighth, the HIP adapter, like the CUDA one in the third, left host memory registration out of its table as functions doing nothing, so the loader refused it with `UR_RESULT_ERROR_UNINITIALIZED` (`pinned_shared_test` and `elementwise_parity` failed).
   Fixed, it page-locks the memory with `hipHostRegister` and has the functions in its table (`hip-host-register`; CTest passes on an RX 9060 XT).
   Ninth, the HIP adapter's queue-empty query took `hipErrorNotReady`, the answer for a stream still at work, as an error and logged it every time.
@@ -140,6 +141,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Eleventh, libclc took an amdgcn GPU for one without FMA instructions unless the compiler defined `__HAS_FMAF__`.
   The AMD libspirv is built for no processor and lacks it, so `sycl::fma` and the math built on it ran a software FMA on every AMD GPU (the engine's DeltaNet recurrence about 95 µs a token on an RX 9060 XT).
   Every amdgcn GPU has `v_fma_f32`: fixed, only r600 keeps the software FMA (`hip-libclc-fma`).
+  v7.2.0's `math.h` uses the fast FMA for `__AMDGPU__`, so this fix was dropped.
   Twelfth, a kernel bundle (`get_kernel_bundle`) of a program with code for several AMD architectures got the first architecture's image, which the GPU refused (`hipErrorInvalidImage`).
   AMD images carry no `compile_target`; the runtime asked the HIP adapter about each image alone without handing it the image, and the adapter falls back on the first AMD image when none matches.
   An engine for many AMD GPUs, as the packages build it, stopped with no usable GPU (kernels submitted to a queue were not affected: that path hands the adapter all the images and their bytes).
@@ -162,6 +164,9 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Fixed, with the tools given they depend on the SYCL headers alone (`build-libdevice-custom-tools`; a build without them is unchanged). A fix to the build only, it asks no finished toolchain to be built again.
   Seventeenth, the AMDGPU backend budgets a kernel's registers by the "amdgpu-flat-work-group-size" attribute, which clang set only from OpenCL's reqd_work_group_size and HIP's --gpu-max-threads-per-block. As a result, a SYCL kernel was budgeted for 1024 work-items (128 VGPRs on gfx1150) whatever its [[sycl::reqd_work_group_size(N)]] or work_group_size property said, and the larger tiles of the products spilled registers.
   Fixed, the attribute is set from SYCL's reqd_work_group_size too, the attribute's and the property's (`hip-reqd-work-group-size`; the 890M's int8 expert product went from 12-26 spilled registers to none, and the dense product's 64 x 128 tile became usable).
+  In v7.2.0 clang sets the attribute from SYCL's reqd_work_group_size attribute itself, so the fix keeps only its lowered-attribute (property) part.
+  Eighteenth: libclc's `configure.py` builds the AMD libspirv as the target `amdgcn-amd-amdhsa-llvm`, but the driver compiles SYCL's AMD device code for `amdgcn-amd-amdhsa` and looks for `libspirv.l64.signed_char.bc` under that name, so every compile for an AMD GPU stopped. Fixed, it is built for `amdgcn-amd-amdhsa` (`hip-libclc-triple`, from MarchRaBBiT/XeStrata).
+  Nineteenth: since v7.2.0 SYCL's sub-group shuffles call the SPIR-V GroupNonUniform forms on every target but NVIDIA's, and AMD's libspirv defines only the SubgroupShuffle*INTEL ones, so every AMD program with a shuffle failed to link (`__spirv_GroupNonUniformShuffleXor` undefined). Fixed, AMD's libspirv defines the four GroupNonUniform shuffles for the scalar types with its SubgroupShuffle*INTEL (`hip-group-shuffle`, from MarchRaBBiT/XeStrata).
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
   `offload-bundle-arch` and `l0-static-graph` ask every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).

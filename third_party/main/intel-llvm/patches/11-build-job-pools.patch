@@ -10,7 +10,7 @@ job pools again.  A pool defined twice makes Ninja refuse the build file ("dupli
 limited the links.  Fixed, each pool is appended only once.
 ---
 diff --git a/llvm/cmake/modules/HandleLLVMOptions.cmake b/llvm/cmake/modules/HandleLLVMOptions.cmake
-index d0a094f..e4ae4c2 100644
+index c9694e384a..c19df7f84d 100644
 --- a/llvm/cmake/modules/HandleLLVMOptions.cmake
 +++ b/llvm/cmake/modules/HandleLLVMOptions.cmake
 @@ -1,3 +1,4 @@

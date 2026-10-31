@@ -46,7 +46,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
 
 - free（`-DSTRATA_LICENSE=free`）: intel/llvm の DPC++ 7 以降（SYCL ランタイムが libsycl 9）でビルドします。
   自由ソフトウェアだけで済み、oneAPI の環境は使いません。
-  `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.1.1）で確かめています（[setup](#setup) を参照）。
+  `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.2.0。v7.1.1 でも）で確かめています（[setup](#setup) を参照）。
   ディストリビューションのパッケージも 7 以降なら使えます。それより古いもの（Ubuntu 26.04 の `dpclang++` 6.2）は、CMake と setup が断ります。
   6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、prefill の経路が約 1.6 倍遅くなっていました。
   ROCm の HIP 付きでビルドした intel/llvm なら、`STRATA_HIP_ARCHS`（例 `gfx1200`）で AMD の GPU（RDNA2 以降: gfx103x、gfx11xx、gfx12xx）向けのコードも作ります。
@@ -294,7 +294,7 @@ Level Zero のローダーとヘッダーも、ディストリビューション
 - 途中で止まったビルドは続きから進めます。
 - ビルドの作業フォルダーは終わったら消します。`--intel-llvm-keep-build` で残し、`--intel-llvm-rebuild` でビルドし直します。
 
-v7.1.1 のビルドは開発機（28 スレッド）で 13 分かかり、3.5 GB を使います。
+v7.1.1 のビルドは開発機（28 スレッド）で 13 分かかり、3.5 GB を使います。v7.2.0 のビルドは 890M の機械（24 スレッド）で 13 分かかりました。
 ビルドに要るパッケージは [下の表](#パッケージ) と [DEVTOOLS.ja.md](DEVTOOLS.ja.md#intelllvm-をソースからビルドする) にあります。
 
 ### パッケージ

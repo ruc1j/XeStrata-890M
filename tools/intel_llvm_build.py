@@ -19,7 +19,8 @@ import libraries and DLLs).  A finished install/ carries XESTRATA.json (the tag,
 its commit, the date, the GPUs' matrix engines as tools/xmx_probe.cpp saw them).  Run again, it uses a finished install
 of the same tag as it is, asks before building another tag over an older one, and continues an interrupted build where
 it stopped.  build/ is deleted once install/ is done, unless --keep-build: keeping it makes the next tag's build
-incremental.  v7.1.1 built in 13 minutes on 28 threads and keeps 3.5 GB (the clone 2.8, install/ 0.7).
+incremental.  v7.1.1 built in 13 minutes on 28 threads and keeps 3.5 GB (the clone 2.8, install/ 0.7); v7.2.0 in 13
+minutes on 24 threads (a Ryzen AI 9 HX 370).
 
 Prints the toolchain's folder on its last line.  setup.py runs it for --intel-llvm-build."""
 import argparse
@@ -43,13 +44,14 @@ OUT, BUILD, INSTALL, RECORD = BASE, BASE / "build", BASE / "install", BASE / "in
 REPO = "https://github.com/intel/llvm.git"
 # The release this script builds: one with the Arc Pro B70 in the runtime's matrix table (v7.0.0 or later).  Raised by
 # a change to this line, not by following the newest release, so a run does not start a build by itself.
-TAG = "v7.1.1"
+TAG = "v7.2.0"
 
 # ROCm's device libraries (ocml, ockl and the others; the University of Illinois/NCSA license), which the AMD code
 # links: built with the toolchain, into install/amdgcn/bitcode, since a clang reads bitcode of its own LLVM or older
 # only - ROCm 7.14's (LLVM 23) stopped v7.1.1's (LLVM 22) build for an RX 7900 XTX (a field report).  CMake takes them
 # where the installed ROCm's do not build (cmake/StrataHip.cmake).  amd/device-libs of
-# ROCm's llvm-project at a release on TAG's LLVM (rocm-7.2.x is LLVM 22): raised with TAG.  third_party/main/
+# ROCm's llvm-project at a release on TAG's LLVM or the one before (rocm-7.2.x is LLVM 22; v7.2.0's LLVM 23 builds them
+# with the target features and the two -Wno-error below, target_options): raised with TAG.  third_party/main/
 # rocm-device-libs/.
 DEVICE_LIBS_REPO = "https://github.com/ROCm/llvm-project.git"
 DEVICE_LIBS_TAG = "rocm-7.2.4"
@@ -66,12 +68,29 @@ def patch_id(patch: Path) -> str:
 
 
 def patched_files() -> list:
-    """The files the patches change, as paths in the clone."""
+    """The files the patches change, as paths in the clone: the ones the release has (a file a patch adds, such as
+    hip-group-shuffle's, is not in HEAD and is removed by added_files() before the patches are applied again)."""
     files = set()
     for patch in PATCHES:
         for line in patch.read_text().splitlines():
             if line.startswith("diff --git a/"):
                 files.add(line.split()[2][2:])
+
+    def in_head(f: str) -> bool:
+        r = subprocess.run(["git", "-C", str(SRC), "cat-file", "-e", "HEAD:" + f], capture_output=True)
+        return r.returncode == 0
+    return sorted(f for f in files if in_head(f))
+
+
+def added_files() -> list:
+    """The files the patches add (their "--- /dev/null" entries), as paths in the clone."""
+    files, path = set(), None
+    for patch in PATCHES:
+        for line in patch.read_text().splitlines():
+            if line.startswith("diff --git a/"):
+                path = line.split()[2][2:]
+            elif line.startswith("--- /dev/null") and path is not None:
+                files.add(path)
     return sorted(files)
 
 
@@ -220,7 +239,7 @@ def rocm_dirs() -> tuple | None:
 def target_options(contrib: bool) -> list:
     """configure.py's options for the GPU targets besides Intel's: HIP where ROCm is installed (free software, in both
     modes), and CUDA for the contrib toolchain."""
-    opts, libclc = [], []
+    opts = []
     if contrib:
         if shutil.which("nvcc") is None and not Path("/usr/local/cuda/include/cuda.h").exists():
             p = PREREQUISITES[distro_family()]
@@ -228,7 +247,6 @@ def target_options(contrib: bool) -> list:
                  "install it: " + p["how"] + p["cuda"] +
                  (" (Ubuntu: multiverse; Debian: non-free)" if distro_family() == "ubuntu" else ""))
         opts.append("--cuda")
-        libclc.append("nvptx64--nvidiacl")
     rocm = rocm_dirs()
     if rocm is None:
         say("note: no ROCm HIP (hipcc's headers, libamdhip64): building without the HIP target (AMD GPUs)")
@@ -243,13 +261,17 @@ def target_options(contrib: bool) -> list:
             link.unlink()
         link.symlink_to(fetch_device_libs())
         features = ";".join(f"-Xclang;-target-feature;-Xclang;+{f}"
-                            for f in ("lerp-inst", "cube-insts", "qsad-insts", "sad-insts"))
+                            for f in ("lerp-inst", "cube-insts", "qsad-insts", "sad-insts",
+                                      # rocm-7.2.4's libraries (LLVM 22) built by v7.2.0's clang (LLVM 23): three more
+                                      # features it asks for, and two warnings it made errors (2026-10-31)
+                                      "msad-insts", "mqsad-pk-insts", "mqsad-u32-insts"))
         opts += ["--hip", "--hip-platform", "AMD", f"--cmake-opt=-DUR_HIP_ROCM_DIR={rocm[0]}",
                  f"--cmake-opt=-DUR_HIP_LIB_DIR={rocm[1]}", "--llvm-external-projects", "device-libs",
-                 f"--cmake-opt=-DCLANG_OPTIONS_APPEND={features}"]
-        # the name libclc builds the AMD libspirv for (its list of known targets lacks it: the fix hip-libclc-target)
-        libclc.append("amdgcn--amdhsa")
-    return opts + ([f"--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD={';'.join(libclc)}"] if libclc else [])
+                 "--cmake-opt=-DCLANG_OPTIONS_APPEND=" + features +
+                 ";-Wno-error=attribute-alias;-Wno-error=deprecated-builtins"]
+    # v7.2.0 builds libclc as an LLVM runtime per target triple (the AMD libspirv for amdgcn-amd-amdhsa with the fix
+    # hip-libclc-triple): LIBCLC_TARGETS_TO_BUILD is gone, and the targets follow the backends configured
+    return opts
 
 
 def fetch_device_libs() -> Path:
@@ -283,8 +305,10 @@ def build_device_libs(jobs: int) -> bool:
 
 
 def fix_sources() -> None:
-    # the patched files back to the release, then every patch in order
+    # the patched files back to the release (the files the patches add removed), then every patch in order
     run(["git", "-C", SRC, "checkout", "--", *patched_files()])
+    for f in added_files():
+        (SRC / f).unlink(missing_ok=True)
     for patch in PATCHES:
         r = subprocess.run(["git", "-C", str(SRC), "apply", str(patch)], capture_output=True, text=True)
         if r.returncode != 0:
@@ -519,7 +543,8 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
         # no sycl-jit (the runtime compiler, kernel_compiler's), which the engine does not use: it would build most of
         # LLVM's code generation and clang for Windows
         "-DSYCL_ENABLE_EXTENSION_JIT=OFF",
-        "-DSYCL_ENABLE_MAJOR_RELEASE_PREVIEW_LIB=OFF", "-DLIBCLC_TARGETS_TO_BUILD=nvptx64--nvidiacl",
+        # (v7.2.0 has no LIBCLC_TARGETS_TO_BUILD: libclc follows the backends; the Windows build is unverified with it)
+        "-DSYCL_ENABLE_MAJOR_RELEASE_PREVIEW_LIB=OFF",
         "-DLIBCLC_GENERATE_REMANGLED_VARIANTS=ON", "-DLIBCLC_NATIVECPU_HOST_TARGET=OFF",
         "-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON", f"-DCUDAToolkit_ROOT={cuda}", "-DLLVM_ENABLE_DIA_SDK=OFF",
         "-DLLVM_ENABLE_ZSTD=OFF",

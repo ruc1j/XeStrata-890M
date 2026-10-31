@@ -243,7 +243,7 @@ This fork has no packages. It is installed from the source.
    ./setup.sh --license free
    ```
 
-   setup checks the GPU, the RAM and the CPU, asks whether to build intel/llvm (v7.1.1, with ROCm's HIP target)
+   setup checks the GPU, the RAM and the CPU, asks whether to build intel/llvm (v7.2.0, with ROCm's HIP target)
    here, builds the engine, downloads the model and starts it. Pressing Enter at the questions takes the
    recommended choice.
    - The model and its size: Qwen3.8-Flash-Next at IQ2_XS.
@@ -393,7 +393,7 @@ Each part is explained in [docs/DETAILS.md](docs/DETAILS.md#how-it-works) (the o
 Before sending a report or a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md) (no dependence on the model number, the licenses, the additional
 permission under GPL section 7, what goes in, and how to report).
 
-- **Building:** the free build only (`build/free`, `-DSTRATA_LICENSE=free`, intel/llvm v7.1.1 built with HIP by
+- **Building:** the free build only (`build/free`, `-DSTRATA_LICENSE=free`, intel/llvm v7.2.0 built with HIP by
   `tools/intel_llvm_build.py`). The steps are in [docs/BUILD.md](docs/BUILD.md). This machine's facts (paths,
   settings, tools) are written in `LOCAL.md` (not in git).
 - **Measuring a kernel alone:** `build/free/gemm_bench` (dense products), `iq_mmq_parity --bench` (the experts'

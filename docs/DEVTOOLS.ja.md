@@ -72,7 +72,7 @@ Arch の `zstd` には `libzstd.a` がありません（`zstd-static` は AUR �
 
 ツールチェーンは `.tools/intel-llvm/install/bin/clang++`、そのランタイムは `.tools/intel-llvm/install/lib/libsycl.so` です。
 エンジンは `-DCMAKE_CXX_COMPILER=$PWD/.tools/intel-llvm/install/bin/clang++` で構成し、その `lib/` を `LD_LIBRARY_PATH` に入れて動かします。
-開発機（28 スレッド、91 GiB）では v7.1.1 のビルドに 13 分かかりました。
+開発機（28 スレッド、91 GiB）では v7.1.1 のビルドに 13 分かかりました。890M の機械（Ryzen AI 9 HX 370、24 スレッド）では v7.2.0 のビルドに 13 分かかりました。
 clone（2.8 GB）と `install/`（0.7 GB）は残り、ビルドの作業フォルダーは消します。
 このランタイムは Arc Pro B70 に XMX（FP16 と BF16）を使わせます。6.2 のランタイムは使わせません。
 
@@ -114,7 +114,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - スクリプトはリリースにない修正を `third_party/main/intel-llvm/patches/` のパッチ（`NN-<id>.patch`、intel/llvm と同じ Apache-2.0 WITH LLVM-exception）として番号順にソースに当ててからビルドし、当てた修正の id を `install/XESTRATA.json` に残します。
   修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
-  今の修正は 16 で、最初の 12 はどれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。15 番目も直っていません（2026-10-14）。
+  今の修正は v7.2.0 向けに 20 本です（2026-10-31）。v7.1.1 向けにあった 7 つ目（`hip-libclc-target`）と 11 番目（`hip-libclc-fma`）は v7.2.0 で要らなくなったので外し、17 番目は clang の部分が v7.2.0 に入ったので lowered attribute の部分だけを残し、18 番目と 19 番目を足しました。ほかは SPDX のヘッダーが足されたぶんの文脈だけを直しています。
   1 つ目: CUDA と HIP のアダプタがコマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。
   2 つ目: SYCL のランタイムがどの NVIDIA の GPU にも最初に見つけた NVIDIA の像を、アーキテクチャを見ずに渡していました。
   いくつかのアーキテクチャのコードを持つ実行ファイルでは、その像より古い GPU は動かず、新しい GPU は古いコードを走らせていました。
@@ -131,6 +131,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   7 つ目: libclc は AMD 向けの libspirv を対象名 `amdgcn--amdhsa` でだけ作るのに、その名前を受け付ける対象の一覧に入れていませんでした。
   別の名前（`amdgcn-amd-amdhsa`）で設定するとビルドは通るものの AMD 向けの libspirv がなく、AMD の GPU 向けの SYCL のプログラムはどれもコンパイルできませんでした。
   修正後は `amdgcn--amdhsa` を受け付けます（`hip-libclc-target`。`sycl` ブランチでは libclc の AMD の対象の作りが変わっています）。
+  v7.2.0 では libclc が target triple ごとの LLVM runtime になって amdgcn を受け付けるので、この修正は外しました。
   8 つ目: HIP のアダプタも 3 つ目の CUDA と同じく、ホストのメモリの登録を何もしない関数のまま関数表から漏らしていて、ローダーが `UR_RESULT_ERROR_UNINITIALIZED` で断っていました（`pinned_shared_test` と `elementwise_parity` が落ちていました）。
   修正後は `hipHostRegister` でページを固定し、関数表にも入れます（`hip-host-register`。RX 9060 XT で CTest が通りました）。
   9 つ目: HIP のアダプタのキューが空かどうかの問い合わせが、まだ動いているストリームの答え（`hipErrorNotReady`）をエラーとして毎回記録していました。
@@ -140,6 +141,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   11 番目: libclc は、コンパイラが `__HAS_FMAF__` を定義しない amdgcn を、FMA の命令がない GPU として扱っていました。
   AMD 向けの libspirv はプロセッサを指定せずにビルドするのでこの定義がなく、`sycl::fma` とそれを使う数学関数が、どの AMD の GPU でもソフトウェアの FMA になっていました（RX 9060 XT でエンジンの DeltaNet の漸化式が 1 トークン約 95 µs）。
   amdgcn の GPU はどれも `v_fma_f32` を持つので、修正後はソフトウェアの FMA を r600 だけに残します（`hip-libclc-fma`）。
+  v7.2.0 の `math.h` は `__AMDGPU__` で速い FMA を使うので、この修正は外しました。
   12 番目: いくつかの AMD のアーキテクチャのコードを持つプログラムで、カーネルバンドル（`get_kernel_bundle`）が最初のアーキテクチャの像を取り、GPU が断っていました（`hipErrorInvalidImage`）。
   AMD の像には `compile_target` がなく、ランタイムは像を 1 つずつ、中身を渡さずに HIP のアダプタに尋ね、アダプタは合うものがないと最初の AMD の像を代わりに選ぶためです。
   パッケージのように AMD の GPU をいくつも対象にしたエンジンは、使える GPU がないと言って止まっていました（キューに投げるカーネルは、像をまとめて中身ごと渡すので選べていました）。
@@ -162,6 +164,9 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   修正後はツールを渡したときは SYCL のヘッダーにだけ依存します（`build-libdevice-custom-tools`。渡さないビルドは変わりません）。ビルドだけの修正なので、できあがったツールチェーンの作り直しは求めません。
   17 番目: AMDGPU のバックエンドはカーネルのレジスター予算を "amdgpu-flat-work-group-size" 属性で決め、clang はその属性を OpenCL の reqd_work_group_size と HIP の --gpu-max-threads-per-block からしか付けません。そのため SYCL のカーネルは [[sycl::reqd_work_group_size(N)]] や work_group_size プロパティを付けても 1024 ワークアイテムの予算（gfx1150 で 128 VGPR）で組まれ、大きいタイルの積がレジスターを溢れていました。
   修正後はSYCL の reqd_work_group_size（属性でもプロパティでも）からも同じ属性を付けます（`hip-reqd-work-group-size`。890M の int8 のエキスパートの積は 12〜26 個の spill が 0 に、64 x 128 のタイルの密な積が使えるように）。
+  v7.2.0 では clang が SYCL の reqd_work_group_size の属性からこの属性を付けるので、修正は lowered attribute（プロパティ）の部分だけです。
+  18 番目: libclc の `configure.py` は AMD 向けの libspirv を対象 `amdgcn-amd-amdhsa-llvm` として作りますが、driver は SYCL の AMD のコードを `amdgcn-amd-amdhsa` 向けにコンパイルしてその名前の `libspirv.l64.signed_char.bc` を探すので、AMD の GPU 向けのコンパイルがどれも止まっていました。修正後は `amdgcn-amd-amdhsa` 向けに作ります（`hip-libclc-triple`。MarchRaBBiT/XeStrata から）。
+  19 番目: v7.2.0 から SYCL の sub-group の shuffle は NVIDIA 以外で SPIR-V の GroupNonUniform の形を呼びますが、AMD の libspirv は SubgroupShuffle*INTEL しか定義せず、shuffle を使う AMD のプログラムがどれもリンクできませんでした（`__spirv_GroupNonUniformShuffleXor` が未定義）。修正後は AMD の libspirv がスカラーの型の 4 つの GroupNonUniform の shuffle を SubgroupShuffle*INTEL で定義します（`hip-group-shuffle`。MarchRaBBiT/XeStrata から）。
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
   `offload-bundle-arch` と `l0-static-graph` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。

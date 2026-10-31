@@ -47,7 +47,7 @@ The split follows the Debian archive's main, contrib and non-free.
 
 - free (`-DSTRATA_LICENSE=free`): built with intel/llvm's DPC++ 7 or later (its SYCL runtime is libsycl 9).
   Free software only; no oneAPI environment is used.
-  Validated with intel/llvm v7.1.1 built from source by `tools/intel_llvm_build.py` (see [Setup](#setup)).
+  Validated with intel/llvm v7.2.0 (and v7.1.1) built from source by `tools/intel_llvm_build.py` (see [Setup](#setup)).
   A distribution's package of version 7 or later serves as well; an older one (Ubuntu 26.04's `dpclang++` 6.2) is refused by CMake and setup.
   6.2's SYCL runtime reported no XMX for the Arc Pro B70, and the prefill path took about 1.6 times as long.
   With intel/llvm built with ROCm's HIP, `STRATA_HIP_ARCHS` (`gfx1200`, for example) makes the code for AMD GPUs (RDNA2 and later: gfx103x, gfx11xx, gfx12xx) as well.
@@ -293,7 +293,7 @@ The install keeps a record (`XESTRATA.json`: the tag, its commit, each GPU's XMX
 - It continues an interrupted build.
 - The build tree is deleted when it is done; `--intel-llvm-keep-build` keeps it, `--intel-llvm-rebuild` builds again.
 
-v7.1.1 built in 13 minutes on the development machine (28 threads) and keeps 3.5 GB.
+v7.1.1 built in 13 minutes on the development machine (28 threads) and keeps 3.5 GB; v7.2.0 built in 13 minutes on the 890M's machine (24 threads).
 The packages it needs are in [the table below](#packages) and in [DEVTOOLS.md](DEVTOOLS.md#intelllvm-from-source).
 
 ### Packages

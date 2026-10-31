@@ -195,7 +195,7 @@ AMD の GPU では intel/llvm の DPC++ の HIP のターゲットでその SYCL
    ./setup.sh --license free
    ```
 
-   setup は GPU と RAM と CPU を確かめ、intel/llvm（v7.1.1、ROCm の HIP のターゲット付き）をここでビルドするかを尋ね、
+   setup は GPU と RAM と CPU を確かめ、intel/llvm（v7.2.0、ROCm の HIP のターゲット付き）をここでビルドするかを尋ね、
    エンジンをビルドし、モデルをダウンロードして起動します。質問は Enter を押せばおすすめの選択になります。
    - モデルと大きさ: Qwen3.8-Flash-Next の IQ2_XS。
    - 文脈の長さ: 一度に覚えておける文章の量です。32,768 を使っています。
@@ -323,7 +323,7 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
 
 報告やプルリクエストを送る前に、[CONTRIBUTING.ja.md](CONTRIBUTING.ja.md)（型番に依存しないこと、ライセンス、GPL 第 7 条の追加の許可、取り込む変更の条件、報告の仕方）を読んでください。
 
-- ビルド: free 方式だけです（`build/free`、`-DSTRATA_LICENSE=free`、intel/llvm v7.1.1 を `tools/intel_llvm_build.py` で HIP 付きにビルドしたもの）。
+- ビルド: free 方式だけです（`build/free`、`-DSTRATA_LICENSE=free`、intel/llvm v7.2.0 を `tools/intel_llvm_build.py` で HIP 付きにビルドしたもの）。
   手順は [docs/BUILD.ja.md](docs/BUILD.ja.md) にあります。この機械の事実（パス、設定、道具）は `LOCAL.md`（git には入れません）に書きます。
 - カーネル単体の計測: `build/free/gemm_bench`（密な積）、`iq_mmq_parity --bench`（エキスパートの int8 の積）、`expert_bench`、`gdn_bench`、`gr_bench`、`mmvq_bench`。
   単体はクロックを固定せず高い側（`dpm high`）で測り、A/B は同じ条件で交互に、GPU を冷ましてから測ります（熱で数 % 動きます）。
