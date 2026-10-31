@@ -91,6 +91,12 @@ htbmixbox/Strata-890M's ba96856d1 came in. The speculative decoding's DraftPolic
 The 890M's decode (the abliterated IQ2_XS, greedy, three interleaved rounds) was 31.53, 30.38 and 26.66 tok/s before, 30.93, 30.02 and 31.78 tok/s with the new default and 28.86, 30.14 and 28.37 tok/s with `STRATA_SPEC_SOURCE_COST=0`, with the same answers; single requests show thermal dips, and the rounds' differences are within the noise.
 The same fork's d3ed6bb4a came in too: on a file system that refuses `O_DIRECT`, DirectFile opens the file again through the page cache ([DETAILS](DETAILS.md#troubleshooting)).
 
+### The file tier with every expert cached, the streamed walk's floor, where a decode's time goes (Issues #69, #71, #72)
+
+01xjw/Strata's 735a40ec3 came in: when every expert is in the GPU cache once it is filled, the io prefetch (and the decode gate) the Linux defaults turned on go off and the routing-aware prefetch (a router product a layer on the CPU) does not start ([DETAILS](DETAILS.md#amd-apus)). The 890M's decode (the abliterated IQ2_XS, greedy, three interleaved rounds) was 31.65, 31.71 and 31.65 tok/s before and 32.35, 32.29 and 30.64 tok/s after (one request of the third round dipped with the heat), with the same answers. The same issue's STRATA_MMAP_PREFETCH (a read-ahead of the experts the CPU pool computes) did not come in, since the CPU computes no expert in this setup; the parallel profile fill at start-up (chenyb999's STRATA_FILL_THREADS) is about the start-up time and is not measured yet.
+Of Indigoshores/Strata's (Strix Halo) ideas, the streamed walk from 16 tokens can be tried with `STRATA_STREAM_ALL_MIN` (the default stays 2048): a 523-token prompt read in 1,844 ms either way, so there is nothing to gain. Tiles of three heights exist here already, as the MMQ's choice of kernel by the row count; the PLE prefetch does not apply, since this fork pins the table in RAM.
+Where a decode's time goes (`STRATA_DECODE_TIMING=1`, six chats): of a window's 74-87 ms, 61-71 ms wait for the GPU, 5-7 ms are the draft, and the per-layer host work is under 0.2 ms. A decode is one graph a window, so the persistent launches of unimatrix099 and ryan4yin, which assume HIP kernels launched one by one, do not apply.
+
 ## Integration through Strata 0.1.53
 
 Of the 796 commits from upstream Strata 0.2.3.1 to 0.2.7.1 (the engine's version is 0.1.53), the 596 that touch the engine, serve, setup and tools layers were looked at, and the changes of 33 commits are carried into XeStrata-890M (Issue #49).

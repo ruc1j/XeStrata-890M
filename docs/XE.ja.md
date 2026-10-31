@@ -92,6 +92,12 @@ htbmixbox/Strata-890M の ba96856d1 を移しました。推測デコードの D
 890M の decode（abliterated 版 IQ2_XS、greedy、交互 3 周）は移す前 31.53・30.38・26.66 tok/s、移したあとの既定で 30.93・30.02・31.78 tok/s、`STRATA_SPEC_SOURCE_COST=0` で 28.86・30.14・28.37 tok/s で、答えは同じです。要求ごとの値に熱の落ち込みがあり、周ごとの差は揺れの中です。
 同じ fork の d3ed6bb4a も移しました。`O_DIRECT` を断るファイルシステムでは DirectFile がページキャッシュを通して開き直します（[DETAILS](DETAILS.ja.md#困ったとき)）。
 
+### 全エキスパートが cache にあるときの file tier、streamed walk の下限、decode の時間の内訳（Issue #69、#71、#72）
+
+01xjw/Strata の 735a40ec3 を移しました。cache を満たしたあと全エキスパートが GPU の cache にあれば、Linux の既定で入った io prefetch（と decode gate）を切り、routing-aware prefetch（層ごとに router の積を CPU で計算する）を始めません（[DETAILS](DETAILS.ja.md#amd-の-apu)）。890M の decode（abliterated 版 IQ2_XS、greedy、交互 3 周）は前 31.65・31.71・31.65 tok/s、あと 32.35・32.29・30.64 tok/s（3 周目は 1 つの要求が熱で落ちた）で、答えは同じです。同じ Issue の STRATA_MMAP_PREFETCH（CPU の pool が計算するエキスパートの先読み）は、この設定では CPU がエキスパートを計算しないので入れていません。起動の profile の充填の並列化（chenyb999 の STRATA_FILL_THREADS）は起動の時間の話で、まだ測っていません。
+Indigoshores/Strata（Strix Halo）の考えのうち、streamed walk を 16 トークンから使う形は `STRATA_STREAM_ALL_MIN` で試せるようにしました（既定は 2048 のまま）。523 トークンの prompt では既定と 16 がどちらも 1,844 ms で同じで、得はありません。3 段の高さのタイルは、この fork の MMQ が行の数でカーネルを選ぶ形で既にあります。PLE の先読みは、この fork が表を RAM に固定するので当たりません。
+decode の時間の内訳（`STRATA_DECODE_TIMING=1`、6 チャット）は、1 窓 74〜87 ms のうち GPU の待ち 61〜71 ms、下書き 5〜7 ms、層ごとの host 0.2 ms 未満です。decode は 1 窓 1 グラフなので、HIP のカーネルを 1 つずつ起動する前提の persistent な起動（unimatrix099、ryan4yin）は当たりません。
+
 ## Strata 0.1.53 の取り込み
 
 upstream の Strata 0.2.3.1 から 0.2.7.1（エンジンの版は 0.1.53）までの 796 コミットのうち、エンジン・serve・setup・tools の層に当たる 596 コミットを見て、33 コミットの変更を XeStrata-890M に移しています（Issue #49）。

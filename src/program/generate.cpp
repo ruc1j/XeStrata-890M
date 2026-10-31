@@ -5193,6 +5193,7 @@ int main(int argc, char** argv) {
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
+    bool io_pf_by_default = false;   // the Linux file-tier defaults turned io prefetch on (no STRATA_IO_PREFETCH given)
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
     std::vector<uint8_t> fill_tmp;   // blob_to_copy's buffer for a transient source
@@ -5257,6 +5258,7 @@ int main(int argc, char** argv) {
         if (io_pf_default || (io_pf_env != nullptr && std::strtol(io_pf_env, nullptr, 10) != 0)) {
             const char* th = std::getenv("STRATA_IO_PF_THREADS");
             src.set_io_prefetch(true, th != nullptr ? (int) std::strtol(th, nullptr, 10) : 0);
+            io_pf_by_default = io_pf_default && src.io_prefetch();
             const char* cv = std::getenv("STRATA_COLD_OVERLAP");
             const bool zc = cv != nullptr && cv[0] != '\0' ? std::strtol(cv, nullptr, 10) == 4 : src.gguf_mode();
             if (src.io_prefetch())
@@ -6038,13 +6040,38 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+    // Every expert in the GPU cache once it is filled: the decode reads nothing from the file tier, and its Linux
+    // defaults (io prefetch, the decode gate) and the routing-aware prefetch (a router product a layer on the CPU, which
+    // on an APU shares the package's power with the GPU) only cost time.  01xjw/Strata 735a40ec3: 2x W7900D, IQ3_S,
+    // 24576 of 24576 held, decode 57 -> 80 tok/s, the output byte-identical.  STRATA_IO_PREFETCH=1 keeps io prefetch,
+    // STRATA_LOOKAHEAD=1 the routing-aware prefetch.  One GPU only (a layer split's stages hold their own caches).
+    bool gpu_holds_all = false;
+    if (srcp == &src && !multi_gpu) {
+        int64_t held = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e) held += xcache.slot_of(l, e) != strata::core::kNotResident;
+        gpu_holds_all = held == g.n_layers * g.n_expert;
+        if (gpu_holds_all && io_pf_by_default) {
+            src.set_io_prefetch(false, 0);
+            const char* sv = std::getenv("STRATA_IO_STATS");
+            src.set_io_stats(sv != nullptr && std::strtol(sv, nullptr, 10) != 0);
+            std::fprintf(stderr, "strata generate: every expert is in the GPU cache (%lld of %lld): the file tier's Linux defaults "
+                                 "(io prefetch, the decode gate) are off, the decode reads nothing from it (STRATA_IO_PREFETCH=1 keeps them)\n",
+                         (long long) held, (long long) (g.n_layers * g.n_expert));
+        }
+    }
+    const char* la_env = std::getenv("STRATA_LOOKAHEAD");
+    const bool la_asked = la_env != nullptr && la_env[0] != '\0' && std::strtol(la_env, nullptr, 10) != 0;
     // CS-T: routing-aware prefetch of the file tier: the next layer's router on this layer's MoE input predicts its
     // experts, and with io prefetch (upstream 149) the I/O threads read them ahead (else their pages are only advised).
     // It never changes what is computed; STRATA_LOOKAHEAD=0 is the A/B arm, STRATA_LOOKAHEAD_K the experts per token
     // (default 10).  Measured on the RX 9060 XT in a 32 GiB cgroup (IQ3_XXS, upstream v0.2.2, 1K): decode 22.4 tok/s
     // with it, 18.8 without; as a page hint alone (2026-10-04, UD-Q4_K_XL in 62 GiB) it was no faster.
     strata::core::RouterLookahead lookahead;
-    if (srcp == &src && src.warms() && [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }()) {
+    if (gpu_holds_all && !la_asked && srcp == &src && src.warms())
+        std::fprintf(stderr, "strata generate: routing-aware prefetch off: every expert is in the GPU cache (STRATA_LOOKAHEAD=1 keeps it)\n");
+    if (srcp == &src && src.warms() && (la_asked || !gpu_holds_all) &&
+        [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }()) {
         std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
         bool ok = true;
         for (int64_t l = 0; l < g.n_layers && ok; ++l) {

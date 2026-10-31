@@ -112,6 +112,7 @@ setup はホストの設定を変えません。
 890M の prompt の塊は、`--prefill auto` に `--no-prefill-borrow` を付けた設定では 2,048 トークンで、15K トークンの prompt を 8 つの塊で読みます。`--prefill 8192` にすると、エキスパートの積が 1 回の起動に持つ行が 4 倍になり、各層のエキスパートを流す回数が 8 から 2 になって、15K トークンの prompt の読みは 1 周目に 283〜294 → 324 tok/s でした。ただし塊のバッファが約 4 GiB 増え（160 + 塊 × 680 / 1024 MiB）、62 GiB の RAM に 33 GiB の expert cache と mmap のページキャッシュが入らなくなり、2 周目は swap（zram）に出て 71 tok/s に落ちました。積の組の形が変わるので答えも変わります。既定は 2,048 のままで、RAM に余りのある機械では `--prefill 8192` を試せます。
 expert cache のページ（GTT、またはホストのメモリー）はドライバーのもので cgroup に課金されないので、エンジンは cache の大きさを cgroup の上限で丸めた値でなく Linux が返せる RAM（`MemAvailable`）から決めます（shoftee/Strata 48defc12e。MemoryMax を小さくした unit で「cache の余地なし」になっていました）。cgroup の値が小さいときはログに言います。ホストの確保は cgroup の値のままです。
 統合 GPU の `--serve` で `--conversation-cache-mib N` を書いたときは、置いた会話が同じ RAM を使うので、自動の expert cache の reserve にその N を足します（shoftee/Strata ff5809230）。空き RAM から後で決める会話キャッシュ（既定）ではそのままです。
+cache を満たしたあと全エキスパートが GPU の cache にあるときは、decode は file tier から何も読まないので、Linux の既定で入った io prefetch（と decode gate）を切り、routing-aware prefetch（層ごとに router の積を CPU で計算して次の層のエキスパートを予測する）を始めません（01xjw/Strata 735a40ec3。2× W7900D の層の分割で decode 57 → 80 tok/s、出力は同じ）。APU では CPU の仕事が package の電力を GPU と分け合います。`STRATA_IO_PREFETCH=1` で io prefetch を、`STRATA_LOOKAHEAD=1` で routing-aware prefetch を残せます。GPU が 1 つのときだけです。
 
 Radeon 890M（Ryzen AI 9 HX 370、LPDDR5X-7500、理論値 120 GB/s）で GPU が読める帯域を 1 GiB の連続読み（16 バイトのロード）で測ると、
 hipMalloc 102 GB/s、hipHostMalloc 95 GB/s、NonCoherent の hipHostMalloc 101 GB/s、2 MB ページの hipHostRegister 100 GB/s、Managed 100 GB/s です。
