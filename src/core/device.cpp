@@ -30,6 +30,7 @@
 #endif
 #endif
 
+#include <cerrno>
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -663,12 +664,24 @@ void Runtime::free(void* pointer) noexcept {
     } catch (const std::exception& e) { fatal(e.what()); }
 }
 
-namespace {
-uint64_t env_mib(const char* name) {
+uint64_t env_mib(const char* name, uint64_t fallback_mib) {
     const char* v = std::getenv(name);
-    return v ? (uint64_t) std::strtoull(v, nullptr, 10) << 20 : 0;
+    if (v == nullptr || v[0] == '\0') return fallback_mib << 20;
+    const char* p = v;
+    while (*p == ' ' || *p == '\t') ++p;
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long mib = std::strtoull(p, &end, 10);
+    // Not a count of MiB: a sign (strtoull would wrap -1 to 2^64-1), other characters, or 2^44 MiB and more, whose
+    // << 20 wraps to 0 or a small number.  A limit read as 0 would be no limit at all, silently: say it and keep the
+    // default instead.
+    if (*p == '-' || *p == '+' || end == p || *end != '\0' || errno == ERANGE || mib >= (1ull << 44)) {
+        std::fprintf(stderr, "strata: %s=%s is not a size in MiB (a whole number below %llu): ignored\n", name, v,
+                     1ull << 44);
+        return fallback_mib << 20;
+    }
+    return (uint64_t) mib << 20;
 }
-}  // namespace
 
 uint64_t vram_limit_bytes() {
     static const uint64_t v = env_mib("STRATA_VRAM_LIMIT_MIB");

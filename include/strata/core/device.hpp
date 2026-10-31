@@ -42,6 +42,9 @@ DeviceInfo device_info(int ordinal = 0);
 /// STRATA_MAX_ALLOC_MIB the largest allocation it assumes.  0 when unset.
 uint64_t vram_limit_bytes();
 uint64_t max_alloc_limit_bytes();
+/// `name`'s value as bytes, read as a whole number of MiB; `fallback_mib` when it is unset or not such a number (said on
+/// stderr: a sign, other characters, or 2^44 MiB and more, which `<< 20` would wrap).
+uint64_t env_mib(const char* name, uint64_t fallback_mib = 0);
 /// `free` and `total` as the engine sees them under STRATA_VRAM_LIMIT_MIB.  `held`: the bytes this process holds on the
 /// device, when the device's report may not show them yet.
 void apply_vram_limit(uint64_t& free, uint64_t& total, uint64_t held = 0);

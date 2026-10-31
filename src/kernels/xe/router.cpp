@@ -348,7 +348,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
                 for (int r = 0; r < 10; ++r) id[r] = idp[r];
                 int swaps = 0, tail = 0, before = 0;
                 for (int r = 0; r < 10; ++r) before += res_layer[id[r]] < 0;
-                for (int r = lo; r <= hi && r < 10; ++r) {
+                for (int r = lo < 0 ? 0 : lo; r <= hi && r < 10; ++r) {   // bounded on both sides: id[10]
                     const int e = id[r];
                     if (res_layer[e] >= 0) continue;
                     ++tail;
@@ -395,7 +395,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
         int32_t* id = ids + t * 10;
         int swaps = 0, tail = 0, before = 0;
         for (int r = 0; r < 10; ++r) before += res_layer[id[r]] < 0;
-        for (int r = lo; r <= hi && r < 10; ++r) {
+        for (int r = lo < 0 ? 0 : lo; r <= hi && r < 10; ++r) {   // bounded on both sides: id[10]
             const int e = id[r];
             if (res_layer[e] >= 0) continue;
             ++tail;

@@ -20,6 +20,7 @@
 #include "strata/core/on_device.hpp"
 
 #include <algorithm>
+#include <system_error>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -666,7 +667,9 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
         for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
     }
     if (!warm_stamp_) warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
-    io_threads_ = threads > 0 ? threads : 8;
+    // STRATA_IO_PF_THREADS: 1 to 64 (a value past the OS's thread limit would end the process in std::terminate when
+    // std::thread's constructor throws; thousands would thrash the disk); 8 when unset
+    io_threads_ = threads > 0 ? std::clamp(threads, 1, 64) : 8;
     if (const char* v = std::getenv("STRATA_IO_PF_AHEAD")) io_ahead_ = std::strtol(v, nullptr, 10) != 0;
     io_fill_ = role_ptr_.empty();   // experts.bin: fill the page cache, the kernels read the mapping
     gate_on_ = true;                // the decode gate comes with io prefetch; STRATA_IO_PF_GATE=0 turns it off
@@ -681,7 +684,12 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     io_pf_ = true;
     io_stats_ = true;
     io_quit_ = false;
-    for (int i = 0; i < io_threads_; ++i) io_workers_.emplace_back([this] { io_worker(); });
+    try {
+        for (int i = 0; i < io_threads_; ++i) io_workers_.emplace_back([this] { io_worker(); });
+    } catch (const std::system_error& e) {   // no thread to be had: the prefetch is off, the mapping still serves
+        std::fprintf(stderr, "strata: io prefetch: cannot start %d I/O threads (%s): off\n", io_threads_, e.what());
+        io_stop();
+    }
 #else
     (void) on; (void) threads;
     (void) io_threads_; (void) gate_lo_; (void) gate_hi_; (void) gate_min_useful_;   // the Linux path's settings

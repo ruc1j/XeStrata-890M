@@ -448,10 +448,7 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
         // Issue #10: host USM is GPU driver memory, which the OS cannot take back when RAM runs short (the GPU VM's
         // rebind swapped it in and the OOM killer emptied the host).  Each layer moves only while the RAM has room
         // for it and a reserve (STRATA_HOST_USM_RESERVE_MIB, default 1024); otherwise the arena stays as it was.
-        static const uint64_t reserve = [] {
-            const char* v = std::getenv("STRATA_HOST_USM_RESERVE_MIB");
-            return (uint64_t) (v != nullptr ? std::strtoull(v, nullptr, 10) : 1024) << 20;
-        }();
+        static const uint64_t reserve = env_mib("STRATA_HOST_USM_RESERVE_MIB", 1024);
         const uint64_t avail = ram_available ? ram_available() : UINT64_MAX;   // the caller's reading of the RAM
         const bool room = avail >= n + pad + reserve;
         void* q = room ? sycl::malloc_host((size_t) (n + pad), runtime.context()) : nullptr;

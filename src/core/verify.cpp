@@ -120,11 +120,16 @@ RouteResidentCfg& route_resident_cfg() {
         if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) {   // lo-hi
             char* end = nullptr;
             const long lo = std::strtol(v, &end, 10);
+            bool ok = false;
             if (end != v && *end == '-') {
                 const char* h = end + 1;
                 const long hi = std::strtol(h, &end, 10);
-                if (end != h) { c.lo = (int) lo; c.hi = (int) hi; }
+                // ranks of the window's top 10: anything else would index the kernel's id[10] outside it
+                if (end != h && *end == '\0' && lo >= 0 && lo <= hi && hi <= 9) { c.lo = (int) lo; c.hi = (int) hi; ok = true; }
             }
+            if (!ok)
+                std::fprintf(stderr, "strata: STRATA_ROUTE_RESIDENT_RANKS=%s is not lo-hi with 0 <= lo <= hi <= 9: "
+                                     "the default 6-9 is used\n", v);
         }
         return true;
     }();

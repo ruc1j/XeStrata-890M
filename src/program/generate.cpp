@@ -5264,7 +5264,11 @@ int main(int argc, char** argv) {
         const bool io_pf_default = (io_pf_env == nullptr || io_pf_env[0] == '\0') && src.linux_io_defaults();
         if (io_pf_default || (io_pf_env != nullptr && std::strtol(io_pf_env, nullptr, 10) != 0)) {
             const char* th = std::getenv("STRATA_IO_PF_THREADS");
-            src.set_io_prefetch(true, th != nullptr ? (int) std::strtol(th, nullptr, 10) : 0);
+            const long th_n = th != nullptr ? std::strtol(th, nullptr, 10) : 0;
+            if (th != nullptr && (th_n < 1 || th_n > 64))
+                std::fprintf(stderr, "strata generate: STRATA_IO_PF_THREADS=%s is outside 1..64: %s\n", th,
+                             th_n < 1 ? "the default 8 is used" : "64 threads are used");
+            src.set_io_prefetch(true, th != nullptr ? (int) std::clamp<long>(th_n, 0, 64) : 0);
             io_pf_by_default = io_pf_default && src.io_prefetch();
             const char* cv = std::getenv("STRATA_COLD_OVERLAP");
             const bool zc = cv != nullptr && cv[0] != '\0' ? std::strtol(cv, nullptr, 10) == 4 : src.gguf_mode();
@@ -5276,7 +5280,7 @@ int main(int argc, char** argv) {
                              src.gguf_mode() ? (zc ? "page-cached experts computed from the mapping (zero-copy)"
                                                    : "page-cached experts copied (STRATA_COLD_OVERLAP=0)")
                                              : "experts.bin read from the mapping, its pages filled by the I/O threads",
-                             th != nullptr ? th : "8",
+                             std::to_string(th_n < 1 ? 8 : std::min<long>(th_n, 64)).c_str(),   // as clamped
                              src.gate_on() ? "only while the page cache has room for it and it pays" : "always (STRATA_IO_PF_GATE=0)");
             else if (!io_pf_default)
                 std::fprintf(stderr, "strata generate: STRATA_IO_PREFETCH=1 is not available here (the Linux mapped file "
