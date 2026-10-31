@@ -186,6 +186,7 @@ The three prefill switches upstream XeStrata carried over as opt-ins with Strata
 - `STRATA_DEQUANT_SIDE`: the dense weights' dequantization runs on a side stream into a double-buffered scratch, overlapping the product before it. On the integrated GPU on the HIP backend it is on by default (`STRATA_DEQUANT_SIDE=0` turns it off); a 15K-token prompt on the 890M read 314.1, 305.8 and 310.8 -> 311.1, 308.1 and 308.6 tok/s, the same.
 - `STRATA_SWIGLU_QUANT=1`: swiglu and the down product's int8 rows in one kernel. Not on: on the 890M a 15K-token prompt read 314.1, 305.8 and 310.8 -> 269.3, 277.3 and 276.9 tok/s (-11%), slower.
 - `STRATA_PREFILL_WARM=1`: the per-layer walk of chunks below 2,048 tokens warms the pages of this layer's and the next layer's file-tier experts ahead. Not on: on the 890M the experts are in RAM and the warming only adds RAM reads.
+- `STRATA_STREAM_ALL_MIN=N`: a chunk of N tokens or more takes the streamed walk (every non-resident expert of a layer streamed in id order, the products on gathered groups), a smaller one the per-layer walk with the staging ring. The default is 2,048. Indigoshores/Strata sets 16 on a Strix Halo; on the 890M a 523-token prompt read in 1,844 ms with either.
 
 ### Reading a long prompt approximately (STRATA_KVA, optional)
 
