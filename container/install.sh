@@ -1,13 +1,14 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# container/install.sh - the inside of the Containerfile: installs XeStrata's rpm (container/rpm/*.rpm when there is
-# one, else the release's, checked against its SHA256SUMS), then every GPU maker's packages its BUILD.json records
-# ("runtime"), so that the image runs Intel's, AMD's and NVIDIA's GPUs; NVIDIA's driver libraries come from the host
-# (CDI), and those of NVIDIA's libraries Fedora's own repositories do not have (cuBLAS, cuDNN, the CUDA runtime) from
-# pip, into the image (on the linker's path).  XESTRATA_NONFREE=0 leaves out oneMKL (and its repository) and those.
+# container/install.sh - the inside of the Containerfile: installs XeStrata-890M's rpm (container/rpm/*.rpm when there
+# is one, else the fork's release's, checked against its SHA256SUMS; the fork publishes no packages, so without a
+# local rpm it stops and says how the rpm is built), then the packages its BUILD.json records ("runtime": ROCm's HIP
+# runtime, rocBLAS and hipBLASLt for the free build).  The code for upstream XeStrata's contrib rpms stays: with
+# XESTRATA_NONFREE=1 it adds oneMKL's repository and NVIDIA's pip libraries (cuBLAS, cuDNN, the CUDA runtime) where
+# such an rpm records them; this fork's free build records none.
 set -eu
-repo=https://github.com/MistVVK/XeStrata
+repo=https://github.com/ruc1j/XeStrata-890M
 local=$(find /ctx/rpm -maxdepth 1 -name '*.rpm' 2>/dev/null | head -n 1)
 if [ -n "$local" ]; then
   rpm=$local
@@ -17,6 +18,15 @@ else
     tag=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$repo/releases/latest")
     tag=${tag##*/}
   fi
+  case "$tag" in
+    xe*) ;;
+    *)
+      echo "$repo has no release: this fork publishes no packages.  Build the rpm with" >&2
+      echo "  tools/package/build.sh fedora44 free" >&2
+      echo "and put it (build/pkg/fedora44-free/*.rpm) in container/rpm/, then build the image again." >&2
+      exit 1
+      ;;
+  esac
   cd /tmp
   curl -fsSL -o SHA256SUMS "$repo/releases/download/$tag/SHA256SUMS"
   name=$(sed -n "s/^[0-9a-f]\{64\} [ *]\(xestrata-$XESTRATA_VARIANT-[^ ]*\.x86_64\.rpm\)$/\1/p" SHA256SUMS | head -n 1)

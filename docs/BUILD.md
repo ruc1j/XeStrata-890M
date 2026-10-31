@@ -461,31 +461,24 @@ xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
 
 ## Podman
 
-The Containerfile and the compose files in `container/` run XeStrata in a rootless Podman container.
-The image is built on the user's PC and not distributed: the contrib packages' image holds cuBLAS and oneMKL, which are not free software.
+The Containerfile and the compose file in `container/` run XeStrata-890M in a rootless Podman container.
+This fork publishes no packages, so the rpm that goes in is one you build; the image, too, is built on your PC and not distributed.
 
-- What it holds: the Fedora 44 image `tools/package/build.sh` uses (pinned by digest), with the release's rpm, checked against `SHA256SUMS`.
-  Then every maker's package its `BUILD.json` records in `runtime` (Level Zero, ROCm's HIP runtime, rocBLAS and hipBLASLt, cuBLAS, oneMKL)
-  and Mesa's Vulkan drivers (`container/install.sh`).
-  NVIDIA's driver libraries and `nvidia-smi` are not in it: CDI brings the host's.
+- What it holds: the Fedora 44 image `tools/package/build.sh` uses (pinned by digest), with the rpm put in `container/rpm/`.
+  Then what its `BUILD.json` records in `runtime` (ROCm's HIP runtime, rocBLAS and hipBLASLt) and Mesa's Vulkan drivers (`container/install.sh`).
+- Making the rpm: `tools/package/build.sh fedora44 free` writes it to `build/pkg/fedora44-free/`; put that one rpm in `container/rpm/`.
+  Without it, `install.sh` looks at ruc1j/XeStrata-890M's Releases, finds no release, stops and prints these steps.
+  When the Releases do have one, the rpm of the tag `XESTRATA_VERSION` is installed, checked against `SHA256SUMS`.
 - Build arguments: environment variables for `podman compose build`.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `XESTRATA_VERSION` | `latest` | the release's tag (`xe0.1.43.1`, for example) |
-| `XESTRATA_VARIANT` | `contrib-cuda13.4` | the rpm's variant |
-| `XESTRATA_NONFREE` | `1` | `0` leaves out oneMKL and NVIDIA's cuBLAS and cuDNN (Intel's and NVIDIA's dense products and NVIDIA's image attention then run on XeStrata's own kernels) |
+| `XESTRATA_VERSION` | `latest` | the release's tag, when the rpm comes from the Releases |
+| `XESTRATA_VARIANT` | `free` | the rpm's variant (this fork builds free only) |
+| `XESTRATA_NONFREE` | `0` | `1` also installs oneMKL and NVIDIA's cuBLAS and cuDNN where the rpm's `BUILD.json` records them (for an upstream XeStrata contrib rpm put there; this fork's rpm records none) |
 
-- A local rpm: one rpm in `container/rpm/` is installed instead of the release's.
-  `xestrata-free`, which the Releases do not have, is made with `tools/package/build.sh fedora44 free` and put there.
-- GPU: `/dev/dri` is passed, and `userns_mode: keep-id` with `group_add: keep-groups` opens it as the host's user, with its uid and render group
-  (`keep-groups` needs the crun runtime). For AMD, `compose.amd.yaml` adds `/dev/kfd`.
-  For NVIDIA, `compose.nvidia.yaml` passes CDI's `nvidia.com/gpu=all`: install the NVIDIA Container Toolkit (`nvidia-container-toolkit`, in NVIDIA's repository) on the host and make its CDI specification once.
-
-```bash
-sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-```
-
+- GPU: `/dev/dri` and ROCm's `/dev/kfd` are passed, and `userns_mode: keep-id` with `group_add: keep-groups` opens them as the host's user, with its uid and render group
+  (`keep-groups` needs the crun runtime).
 - Network: the host's. The server listens on 127.0.0.1:8095, as the packages' does;
   for other devices, `--host 0.0.0.0 --api-key <a secret>` as with the packages.
 - Where things go: `~/.config/xestrata`, `~/.local/state/xestrata` and `~/.local/share/xestrata` are passed at the same paths as on the host, and `HOME` is the host's.

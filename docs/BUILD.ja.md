@@ -459,31 +459,24 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 
 ## Podman
 
-`container/` の Containerfile と compose のファイルで、XeStrata を rootless の Podman のコンテナで動かします。
-イメージは使う人の PC で作り、配布しません。contrib の版のイメージには、自由ソフトウェアでない cuBLAS と oneMKL が入るためです。
+`container/` の Containerfile と compose のファイルで、XeStrata-890M を rootless の Podman のコンテナで動かします。
+このフォークはパッケージを配っていないので、入れる rpm は自分で作ります。イメージも使う人の PC で作り、配布しません。
 
-- 中身: `tools/package/build.sh` と同じ Fedora 44 のイメージ（ダイジェストで固定）に、Releases の rpm を `SHA256SUMS` で確かめて入れます。
-  続けて、その `BUILD.json` の `runtime` にあるメーカーのもの（Level Zero、ROCm の HIP の実行時と rocBLAS と hipBLASLt、cuBLAS、oneMKL）と
-  Mesa の Vulkan のドライバーをすべて入れます（`container/install.sh`）。
-  NVIDIA のドライバーのライブラリと `nvidia-smi` は入れず、CDI でホストのものを使います。
+- 中身: `tools/package/build.sh` と同じ Fedora 44 のイメージ（ダイジェストで固定）に、`container/rpm/` に置いた rpm を入れます。
+  続けて、その `BUILD.json` の `runtime` にあるもの（ROCm の HIP の実行時と rocBLAS と hipBLASLt）と Mesa の Vulkan のドライバーを入れます（`container/install.sh`）。
+- rpm の作り方: `tools/package/build.sh fedora44 free` が `build/pkg/fedora44-free/` に作る rpm を、`container/rpm/` に 1 つ置きます。
+  置いていないと、`install.sh` は ruc1j/XeStrata-890M の Releases を見に行き、リリースがないので止まって、この作り方を出します。
+  Releases にリリースがあるときは、`XESTRATA_VERSION` のタグの rpm を `SHA256SUMS` で確かめて入れます。
 - ビルドの引数: 環境変数で `podman compose build` に渡します。
 
 | 変数 | 既定 | 意味 |
 | --- | --- | --- |
-| `XESTRATA_VERSION` | `latest` | リリースのタグ（`xe0.1.43.1` など） |
-| `XESTRATA_VARIANT` | `contrib-cuda13.4` | 入れる rpm の版 |
-| `XESTRATA_NONFREE` | `1` | `0` で oneMKL と、NVIDIA の cuBLAS・cuDNN を入れません（Intel と NVIDIA の密な積と NVIDIA の画像の注意は XeStrata の自前のカーネルになります） |
+| `XESTRATA_VERSION` | `latest` | Releases から取るときのタグ |
+| `XESTRATA_VARIANT` | `free` | 入れる rpm の版（このフォークのビルドは free だけです） |
+| `XESTRATA_NONFREE` | `0` | `1` で、rpm の `BUILD.json` が oneMKL や NVIDIA の cuBLAS・cuDNN を記録していればそれも入れます（元の XeStrata の contrib の rpm を置いたときのもの。このフォークの rpm は記録しません） |
 
-- 手元の rpm: `container/rpm/` に rpm を 1 つ置くと、Releases から取らずにそれを入れます。
-  Releases にない `xestrata-free` は `tools/package/build.sh fedora44 free` で作ってここに置きます。
-- GPU: `/dev/dri` を渡し、`userns_mode: keep-id` と `group_add: keep-groups` で、ホストのユーザーの uid と render グループの権限のまま開きます
-  （`keep-groups` には crun のランタイムが要ります）。AMD は `compose.amd.yaml` が `/dev/kfd` を足します。
-  NVIDIA は `compose.nvidia.yaml` が CDI の `nvidia.com/gpu=all` を渡すので、ホストに NVIDIA Container Toolkit（`nvidia-container-toolkit`、NVIDIA のリポジトリにあります）を入れて、一度 CDI の設定を作ります。
-
-```bash
-sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
-```
-
+- GPU: `/dev/dri` と、ROCm が使う `/dev/kfd` を渡し、`userns_mode: keep-id` と `group_add: keep-groups` で、ホストのユーザーの uid と render グループの権限のまま開きます
+  （`keep-groups` には crun のランタイムが要ります）。
 - ネットワーク: ホストのネットワークを使い、サーバーはパッケージと同じく 127.0.0.1:8095 で待ちます。
   ほかの機器から使うときも、パッケージと同じく `--host 0.0.0.0 --api-key <秘密の文字列>` です。
 - 置き場所: `~/.config/xestrata`・`~/.local/state/xestrata`・`~/.local/share/xestrata` をホストと同じパスに渡し、`HOME` もホストと同じにします。

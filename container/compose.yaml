@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# XeStrata with rootless Podman (PODMAN_COMPOSE_PROVIDER=podman-compose: README, Podman): podman compose build, then
-# podman compose run --rm xestrata --setup, then podman compose up -d (http://127.0.0.1:8095).  Intel GPUs as it is; AMD's add compose.amd.yaml, NVIDIA's
-# compose.nvidia.yaml (podman compose -f compose.yaml -f compose.nvidia.yaml ...).  docs/BUILD.md#podman
+# XeStrata-890M with rootless Podman (PODMAN_COMPOSE_PROVIDER=podman-compose): put the rpm built with
+# tools/package/build.sh fedora44 free in container/rpm/, podman compose build, then
+# podman compose run --rm xestrata --setup, then podman compose up -d (http://127.0.0.1:8095).  The AMD GPU's
+# /dev/kfd is passed with /dev/dri.  docs/BUILD.md#podman
 name: xestrata
 # podman-compose: no pod (a pod and the user namespace below cannot go together)
 x-podman:
@@ -15,8 +16,8 @@ services:
       dockerfile: Containerfile
       args:
         XESTRATA_VERSION: ${XESTRATA_VERSION:-latest}
-        XESTRATA_VARIANT: ${XESTRATA_VARIANT:-contrib-cuda13.4}
-        XESTRATA_NONFREE: ${XESTRATA_NONFREE:-1}
+        XESTRATA_VARIANT: ${XESTRATA_VARIANT:-free}
+        XESTRATA_NONFREE: ${XESTRATA_NONFREE:-0}
     image: localhost/xestrata
     # the server as the package's: on 127.0.0.1, which with the host's network is the host's own
     network_mode: host
@@ -26,6 +27,8 @@ services:
       - keep-groups
     devices:
       - /dev/dri
+      # ROCm's compute device, besides the render node
+      - /dev/kfd
     # SELinux (Fedora): the folders below are the host's own, not relabeled for the container
     security_opt:
       - label=disable

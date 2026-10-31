@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# XeStrata in a container: the Fedora 44 package from the GitHub Releases (or an rpm put in container/rpm/), with the
-# GPU makers' libraries the package records.  Built on the user's PC (podman compose build), never distributed: the
-# contrib packages' cuBLAS and oneMKL are not free software.  docs/BUILD.md#podman
+# XeStrata-890M in a container: this fork's Fedora 44 rpm, built with tools/package/build.sh fedora44 free and put in
+# container/rpm/ (the fork publishes no packages: README), with the free runtime its BUILD.json records (ROCm's HIP,
+# rocBLAS, hipBLASLt).  Built on the user's PC (podman compose build).  docs/BUILD.md#podman
 # the image tools/package/build.sh builds the Fedora 44 packages in
 ARG FEDORA=docker.io/library/fedora@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
 FROM ${FEDORA}
 ARG XESTRATA_VERSION=latest
-ARG XESTRATA_VARIANT=contrib-cuda13.4
-ARG XESTRATA_NONFREE=1
+ARG XESTRATA_VARIANT=free
+ARG XESTRATA_NONFREE=0
 # (relabel: SELinux lets the build read the folder)
 RUN --mount=type=bind,source=.,target=/ctx,relabel=shared \
     XESTRATA_VERSION="$XESTRATA_VERSION" XESTRATA_VARIANT="$XESTRATA_VARIANT" XESTRATA_NONFREE="$XESTRATA_NONFREE" \
