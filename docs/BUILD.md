@@ -14,7 +14,7 @@ The Japanese version ([BUILD.ja.md](BUILD.ja.md)) is the original; this is its t
 
 On a distribution without the packages, or for development, install from the repository with `./setup.sh`.
 
-1. [Download this project](https://github.com/MistVVK/XeStrata/archive/refs/heads/main.zip) and unpack it
+1. [Download this project](https://github.com/ruc1j/XeStrata-890M/archive/refs/heads/main.zip) and unpack it
    (`git clone` works too).
 1. Install the packages in the [table](#packages): setup installs no system packages.
 1. Run **`./setup.sh`** in a terminal and answer its questions, the same as in the [README](../README.md#install).

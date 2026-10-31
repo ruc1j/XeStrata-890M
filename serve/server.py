@@ -597,7 +597,7 @@ def start_exit_note(rc: int | None) -> str:
             note += f" ({', '.join(m.upper() for m in missing)} missing; {isa})"
         elif isa:
             note += f"; the CPU reports AVX, AVX2, FMA and F16C ({isa}), so this is a bug in the engine"
-        note += ".  Please report it with the CPU model (github.com/MistVVK/XeStrata/issues)."
+        note += ".  Please report it with the CPU model (github.com/ruc1j/XeStrata-890M/issues)."
     return note
 
 
@@ -2256,7 +2256,7 @@ class StrataEngine:
         sends), so the next request starts it again: killed now, its GPU and RAM go back with the process."""
         self.silent_note = ("The engine and the server lost step (issue #481; a very slow PC can raise "
                             "\"engine_silence_s\" in the config, 0 = wait forever). If it happens again, please add "
-                            "the end of the engine log to an issue at github.com/MistVVK/XeStrata/issues.")
+                            "the end of the engine log to an issue at github.com/ruc1j/XeStrata-890M/issues.")
         self.ended = True                               # not alive from now: the next request restarts it
         proc = self.proc
         try:

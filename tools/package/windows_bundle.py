@@ -53,7 +53,7 @@ WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "p
 # name, version (a key of `versions`, or the text), license, source, license texts (paths relative to `roots`' keys, or
 # URLs), the files in the folder it covers (globs relative to its top)
 COMPONENTS = [
-    ("XeStrata", "version", "LGPL-3.0-or-later (with MIT parts: NOTICE)", "https://github.com/MistVVK/XeStrata",
+    ("XeStrata", "version", "LGPL-3.0-or-later (with MIT parts: NOTICE)", "https://github.com/ruc1j/XeStrata-890M",
      [], ["xestrata.exe", "xestrata-cli.exe", "xestrata.dll", "xestrata-cli.dll", "Xestrata.Launcher.Core.dll",
           *(f"app/engine/{e}" for e in ENGINE_EXES), f"app/engine/{AOTRITON_DLLS[0]}"]),
     ("oneMath (XeStrata's fork)", "onemath", "Apache-2.0", "https://github.com/MistVVK/oneMath", ["onemath:LICENSE"],
@@ -325,7 +325,7 @@ def main() -> None:
 
     lines = ["# Third-party notices", "",
              f"XeStrata {a.version} for Windows carries the components below. XeStrata itself is under the LGPL "
-             "(`NOTICE`, `COPYING`, `COPYING.LESSER`); its source is at https://github.com/MistVVK/XeStrata. "
+             "(`NOTICE`, `COPYING`, `COPYING.LESSER`); its source is at https://github.com/ruc1j/XeStrata-890M. "
              "The license texts are in `licenses/`.", "",
              "The Microsoft Visual C++ runtime, the GPU makers' drivers and NVIDIA's libraries are not part of it: "
              "they come with Windows' Visual C++ Redistributable and the drivers.", "",

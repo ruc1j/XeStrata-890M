@@ -96,7 +96,7 @@ Before committing, run `tools/lint/run.sh` and the existing tests the change can
 
 ## Reports
 
-Open an [issue](https://github.com/MistVVK/XeStrata/issues).
+Open an [issue](https://github.com/ruc1j/XeStrata-890M/issues).
 Every report names the XeStrata version, how it was installed (from the source or the deb/rpm package), the build mode,
 and the GPUs and CPU.
 Remove user names, personal paths, host names, IP addresses and keys before pasting anything.

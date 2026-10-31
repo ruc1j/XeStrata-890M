@@ -728,7 +728,7 @@ ESP_SIZE, ESP_SHA256 = 483520, "ef0724c5b79297e481017be85769832bc26eb220c984ecba
 def esp_release_url(name: str) -> str:
     """A file of the vector's folder at the installed version's tag on GitHub: the package leaves third_party/nonfree
     out, so its setup downloads the vector from there."""
-    return (f"https://raw.githubusercontent.com/MistVVK/XeStrata/xe{source_version()}/"
+    return (f"https://raw.githubusercontent.com/{release_check.REPO}/xe{source_version()}/"
             f"third_party/nonfree/experimental-speed-projection/{name}")
 
 
@@ -4624,8 +4624,11 @@ def check_update() -> int:
     current = source_version()
     try:
         latest = release_check.fetch_latest(current)
+    except release_check.NoRelease:
+        say(f"This is XeStrata-890M xe{current}. {release_check.REPO} has no release yet: see {release_check.RELEASES}")
+        return 0
     except (OSError, ValueError) as e:
-        say(f"This is XeStrata xe{current}. {release_check.error_text(e)}: see {release_check.RELEASES}")
+        say(f"This is XeStrata-890M xe{current}. {release_check.error_text(e)}: see {release_check.RELEASES}")
         return 1
     newer = release_check.is_newer(latest, current)
     if JSON_OUT:                                       # the launcher's banner
@@ -4633,9 +4636,9 @@ def check_update() -> int:
               "url": latest["url"], "how": release_check.how_to_update(ROOT)})
         return 0
     if not newer:
-        say(f"XeStrata xe{current} is up to date (the latest release is {latest['tag']}).")
+        say(f"XeStrata-890M xe{current} is up to date (the latest release is {latest['tag']}).")
         return 0
-    say(f"XeStrata {latest['tag']} is out (this is xe{current}): {latest['url']}")
+    say(f"XeStrata-890M {latest['tag']} is out (this is xe{current}): {latest['url']}")
     say(f"To update: {release_check.how_to_update(ROOT)}.")
     return 0
 

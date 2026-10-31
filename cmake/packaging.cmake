@@ -202,7 +202,7 @@ set(CPACK_PACKAGE_VERSION ${XESTRATA_PACKAGE_UPSTREAM})
 set(CPACK_PACKAGE_VENDOR "MistVVK and the XeStrata contributors")
 set(CPACK_PACKAGE_CONTACT "MistVVK <jffyc82pzv@privaterelay.appleid.com>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Qwen3.8-Flash-Next on a PC: a GPU, system RAM and the CPU")
-set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/MistVVK/XeStrata")
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/ruc1j/XeStrata-890M")
 set(CPACK_PACKAGING_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX})
 set(CPACK_STRIP_FILES ON)
 

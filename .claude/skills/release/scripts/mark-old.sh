@@ -12,7 +12,7 @@ set -eu
 
 [ $# -eq 1 ] || { echo "usage: $0 TAG (e.g. xe0.1.40.2.2)" >&2; exit 2; }
 tag=$1
-repo=MistVVK/XeStrata
+repo=ruc1j/XeStrata-890M
 latest=https://github.com/$repo/releases/latest
 
 body=$(mktemp)

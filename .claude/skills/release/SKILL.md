@@ -17,7 +17,7 @@ Rules for the whole run:
 - Invoking /release is the user's go-ahead for pushing `main` and the tag and for publishing and updating the release at each stage (the user's decision, 2026-10-09): do not stop to ask.
   Stop and report only when the scan of step 7 finds something not clearly public (then push nothing), a package build fails, or an engine of the speed table does not run.
 - `gh` only as `gh release ...` (the one exception to "git commands only" in the user's global instructions); everything else with git.
-  Every `gh release` names `--repo MistVVK/XeStrata`: without it gh takes the `upstream` remote (Niko1221/Strata).
+  Every `gh release` names `--repo ruc1j/XeStrata-890M`: without it gh takes the `upstream` remote (MistVVK/XeStrata).
   Never print or read gh's token (`gh auth status` shows the account; leave its token lines out).
 - A release ships the contrib-llvm packages (the user's decision, 2026-10-09) and the Windows 7z, a contrib-llvm build for Windows (the user's decision, 2026-10-14). The free packages are built only when the user asks (`build-packages.sh xe<VERSION> free`), and not attached otherwise.
 - The check of the packages and the 7z is their build alone (the user's decision, 2026-10-07): no CTest, no incus run, no Windows run, unless the user asks for them.
@@ -136,9 +136,9 @@ When `summary-contrib.txt` ends with `ALLDONE`: `build/release/xe<VERSION>/` hol
 git push origin main
 git push origin xe<VERSION>
 d=build/release/xe<VERSION>
-gh release create xe<VERSION> --repo MistVVK/XeStrata --verify-tag --title "XeStrata xe<VERSION>" --notes-file "$d/NOTES.md" \
+gh release create xe<VERSION> --repo ruc1j/XeStrata-890M --verify-tag --title "XeStrata xe<VERSION>" --notes-file "$d/NOTES.md" \
   "$d"/*.deb "$d"/*.rpm "$d"/*.7z "$d/SHA256SUMS"
-gh release view xe<VERSION> --repo MistVVK/XeStrata --json url,isDraft
+gh release view xe<VERSION> --repo ruc1j/XeStrata-890M --json url,isDraft
 ```
 
 Retry a push only for a network failure (up to four times, waiting 2, 4, 8, 16 s).
@@ -151,7 +151,7 @@ A wrong asset or note is fixed with `gh release upload --clobber`, `gh release d
 Once the new release is published (it is then the latest), mark every older one:
 
 ```sh
-gh release list --repo MistVVK/XeStrata --limit 1000 --json tagName,isLatest -q '.[] | select(.isLatest | not) | .tagName' |
+gh release list --repo ruc1j/XeStrata-890M --limit 1000 --json tagName,isLatest -q '.[] | select(.isLatest | not) | .tagName' |
   while read -r t; do .claude/skills/release/scripts/mark-old.sh "$t"; done
 ```
 
@@ -321,5 +321,5 @@ Right after the section's opening lines, once (not repeated for each GPU), one n
 ```
 
 ```sh
-gh release edit xe<VERSION> --repo MistVVK/XeStrata --notes-file build/release/xe<VERSION>/NOTES.md
+gh release edit xe<VERSION> --repo ruc1j/XeStrata-890M --notes-file build/release/xe<VERSION>/NOTES.md
 ```

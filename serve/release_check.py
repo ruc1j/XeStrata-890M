@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""serve/release_check.py - whether a newer XeStrata release is out: GitHub's latest release of MistVVK/XeStrata
-against this copy's version.  Only says so; updating stays the user's (a new deb or rpm, or ./update.sh).
+"""serve/release_check.py - whether a newer XeStrata-890M release is out: GitHub's latest release of this fork
+(ruc1j/XeStrata-890M; not upstream XeStrata's, whose versions read the same) against this copy's version.  A
+repository without a release is NoRelease: nothing to say.
 
 setup.py (--check-update; the system's python3 in a package) and server.py (at the start, every six hours, the web
 app's About) both use it, so it imports nothing beyond the standard library.  XESTRATA_UPDATE_CHECK=0 turns the
@@ -14,10 +15,11 @@ import os
 import re
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
-REPO = "MistVVK/XeStrata"
+REPO = "ruc1j/XeStrata-890M"
 RELEASES = f"https://github.com/{REPO}/releases"
 API = f"https://api.github.com/repos/{REPO}/releases/latest"   # drafts and pre-releases are not "latest"
 EVERY_S = 6 * 3600
@@ -74,12 +76,21 @@ def how_to_update(root: Path = ROOT) -> str:
     return "run ./update.sh in the XeStrata folder"
 
 
+class NoRelease(Exception):
+    """The repository has no release (GitHub answers 404 to releases/latest)."""
+
+
 def fetch_latest(current: str, timeout: float = 10.0) -> dict:
-    """The latest release: {"tag", "version", "url", "published"}.  Raises OSError or ValueError."""
+    """The latest release: {"tag", "version", "url", "published"}.  Raises NoRelease, OSError or ValueError."""
     req = urllib.request.Request(API, headers={"Accept": "application/vnd.github+json",
                                                "User-Agent": f"xestrata/{current}"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        rel = json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            rel = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise NoRelease() from None
+        raise
     tag = str(rel.get("tag_name") or "")
     if vtuple(tag) is None:
         raise ValueError(f"the latest release's tag is not a version ({tag[:40]!r})")
@@ -120,6 +131,8 @@ class Checker:
             if age is None or age >= (FORCE_GAP_S if force else EVERY_S):
                 try:
                     self.latest, self.error = fetch_latest(self.current), None
+                except NoRelease:
+                    self.latest, self.error = None, None
                 except (OSError, ValueError) as e:
                     self.error = error_text(e)
                 self.checked_at = time.time()
@@ -130,7 +143,7 @@ class Checker:
 
     def info(self) -> dict:
         newer = self.newer()
-        return {"current": self.current, "latest": self.latest and self.latest["version"],
+        return {"current": self.current, "repo": REPO, "latest": self.latest and self.latest["version"],
                 "tag": self.latest and self.latest["tag"], "url": self.latest and self.latest["url"],
                 "published": self.latest and self.latest["published"], "newer": newer,
                 "checked_at": int(self.checked_at) if self.checked_at else None, "error": self.error,
@@ -145,7 +158,7 @@ class Checker:
                 self.check()
                 if self.newer() and self.latest["tag"] not in told:
                     told.add(self.latest["tag"])
-                    say(f"XeStrata {self.latest['tag']} is out (this is xe{self.current}): {self.latest['url']} - "
+                    say(f"XeStrata-890M {self.latest['tag']} is out (this is xe{self.current}): {self.latest['url']} - "
                         f"{how_to_update(self.root)}")
                 time.sleep(EVERY_S)
 

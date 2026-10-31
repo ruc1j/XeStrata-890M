@@ -95,7 +95,7 @@ XeStrata に入る変更は、この追加の許可を含めた条件で入り�
 
 ## 報告の仕方
 
-[issue](https://github.com/MistVVK/XeStrata/issues) に書いてください。
+[issue](https://github.com/ruc1j/XeStrata-890M/issues) に書いてください。
 どの報告でも、XeStrata の版、入れ方（ソース版か deb/rpm 版か）、ビルドの方式、GPU と CPU を書いてください。
 ユーザー名、個人のパス、ホスト名、IP アドレス、キーは消してから貼ってください。
 
