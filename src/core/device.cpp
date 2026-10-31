@@ -684,12 +684,15 @@ uint64_t max_alloc_limit_bytes() {
 // with only Intel's or only NVIDIA's (the runtime opens each backend's library when it is there).  The HIP runtime
 // does not answer the integrated-GPU aspect; it says the same as unified host memory (hipDeviceAttributeIntegrated).
 bool integrated_gpu(const sycl::device& d) {
-    if (d.has(sycl::aspect::ext_oneapi_is_integrated_gpu)) return true;
-    if (d.get_backend() != sycl::backend::ext_oneapi_hip) return false;
+    // HIP first: intel/llvm v7.2.0's HIP adapter answers the aspect's query with an error line on stderr ("Unsupported
+    // ParamName in urDeviceGetInfo ... IS_INTEGRATED_GPU") before the runtime says false, six times a start
+    if (d.get_backend() == sycl::backend::ext_oneapi_hip) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return d.get_info<sycl::info::device::host_unified_memory>();
+        return d.get_info<sycl::info::device::host_unified_memory>();
 #pragma clang diagnostic pop
+    }
+    return d.has(sycl::aspect::ext_oneapi_is_integrated_gpu);
 }
 
 // upstream 004b15cd (#409): an integrated GPU's memory is the system RAM, and what its runtime reports free need not
