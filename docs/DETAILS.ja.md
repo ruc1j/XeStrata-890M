@@ -471,6 +471,7 @@ B70 の Coder（アリーナ 23.4 GiB、すべて VRAM）では、23.38 GiB を 
 upstream の測定（Gen3 NVMe、RTX 5090、32 GB、Q2_0 を RAM に置いて 262K）では、起動が約 920 秒から 70 秒になりました。
 `STRATA_READ_AHEAD=0` で止め、`STRATA_FILL_AHEAD=N` でキャッシュの充填で先に頼む組の数を決めます（既定 256）。
 `STRATA_FILL_THREADS=N`（既定 8、0 か 1 で 1 スレッド）は、起動の充填で blob の読みとコピーを行うスレッドの数です。pair の admit は順に 1 スレッドで行い、読みとコピーは互いに重ならない slot を複数のスレッドで行います（chenyb999-zhcn/Strata 0c16171ce）。unbuffered の tier は 1 スレッドのままです。
+8 スレッドの充填では先読みを 1,024 組にします（890M で 256 の 11.3 秒に対して 10.9 秒。4,096 では advise したページがコピーと競って 9.8〜17.9 秒に揺れました）。1 スレッドの充填は 256 のままです。
 host USM の cache（`STRATA_CACHE_HOST=1`）では、`STRATA_FILL_HOST_COPY=1` で起動の充填が slot を CPU の memcpy で書きます（起動の時点では GPU はまだその slot を読んでいないので、古い値を持つキャッシュはありません）。890M では SYCL の queue のコピーと同じ 12.4 秒で、上限は mmap のファイルの読み（約 2.85 GB/s）なので、既定は変えていません。
 
 CPU 内蔵のグラフィックスは RAM を共有するので、省 RAM モードにはなりません。

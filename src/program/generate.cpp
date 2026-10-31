@@ -5811,17 +5811,6 @@ int main(int argc, char** argv) {
     int64_t prefilled = 0;
     if (!profile.empty() && srcp != nullptr) {
         const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
-        // mapped reads: advise the next `fill_ahead` pairs so their reads overlap; STRATA_FILL_AHEAD=0 turns it off
-        int64_t fill_ahead = 0;
-        if (srcp == &src && !src.unbuffered()) {
-            const char* v = std::getenv("STRATA_FILL_AHEAD");
-            fill_ahead = v == nullptr ? 256 : std::max<int64_t>(0, std::strtol(v, nullptr, 10));
-            if (fill_ahead > 0 && !src.advise_pairs(profile.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
-            std::fprintf(stderr, "strata generate: the profile fill asks for %lld pairs ahead (STRATA_FILL_AHEAD)\n",
-                         (long long) fill_ahead);
-        }
-        const auto fill_t0 = std::chrono::steady_clock::now();
-        uint64_t fill_bytes = 0;
         // STRATA_FILL_THREADS (default 8; 0 or 1 = the loop below): the pairs admitted first, in order (the residency
         // table and the slot counters are the host thread's), then their reads and copies on several threads over
         // disjoint slots, as the decode-time refill already does - one thread reading a 1.4 MB blob from the mapped
@@ -5833,6 +5822,19 @@ int main(int argc, char** argv) {
         }();
         const bool fill_parallel = fill_threads >= 2 && !(srcp == &src && src.unbuffered());
         bool host_fill_used = false;
+        // mapped reads: advise the next `fill_ahead` pairs so their reads overlap; STRATA_FILL_AHEAD=0 turns it off
+        int64_t fill_ahead = 0;
+        if (srcp == &src && !src.unbuffered()) {
+            const char* v = std::getenv("STRATA_FILL_AHEAD");
+            // 8 threads keep more reads in flight: 1024 pairs ahead filled the 890M's cache in 10.9 s against 11.3 at 256
+            // and 9.8-17.9 at 4096 (the advised pages then crowd the copies), the one-thread loop keeps its 256
+            fill_ahead = v == nullptr ? (fill_parallel ? 1024 : 256) : std::max<int64_t>(0, std::strtol(v, nullptr, 10));
+            if (fill_ahead > 0 && !src.advise_pairs(profile.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
+            std::fprintf(stderr, "strata generate: the profile fill asks for %lld pairs ahead (STRATA_FILL_AHEAD)\n",
+                         (long long) fill_ahead);
+        }
+        const auto fill_t0 = std::chrono::steady_clock::now();
+        uint64_t fill_bytes = 0;
         if (fill_parallel) {
             struct FillJob { int64_t i; int32_t layer, expert, slot; int64_t bytes; };
             std::vector<FillJob> jobs;
@@ -5857,6 +5859,9 @@ int main(int argc, char** argv) {
                     if (bad.load(std::memory_order_relaxed) >= 0) return;
                     const size_t k = next.fetch_add(1);
                     if (k >= jobs.size()) return;
+                    // the read-ahead rolls with the fill, as in the loop below (the first fill_ahead pairs were advised above)
+                    if (fill_ahead > 0 && k + (size_t) fill_ahead < jobs.size())
+                        (void) src.advise_pairs(profile.data() + jobs[k + (size_t) fill_ahead].i, 1);
                     const FillJob& j = jobs[k];
                     std::string e;
                     const uint8_t* b = blob_to_copy(srcp, j.layer, j.expert, tmp);

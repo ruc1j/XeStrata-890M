@@ -495,6 +495,7 @@ The drive then sees a deep queue instead of one page fault at a time.
 Upstream measured it on a Gen3 NVMe (RTX 5090, 32 GB, Q2_0 kept in RAM at 262K): ready in 70 s instead of ~920 s.
 `STRATA_READ_AHEAD=0` turns it off; `STRATA_FILL_AHEAD=N` sets how many pairs the cache fill asks for ahead (default 256).
 `STRATA_FILL_THREADS=N` (default 8; 0 or 1 = one thread) is how many threads read and copy the blobs in the start-up fill: the pairs are admitted in order on one thread, and the reads and copies run on disjoint slots from several (chenyb999-zhcn/Strata 0c16171ce). An unbuffered tier keeps the one thread.
+The eight-thread fill asks 1,024 pairs ahead (10.9 s on the 890M against 11.3 s at 256; at 4,096 the advised pages crowd the copies and the fill swung between 9.8 and 17.9 s). The one-thread fill keeps 256.
 With a host USM cache (`STRATA_CACHE_HOST=1`), `STRATA_FILL_HOST_COPY=1` makes the start-up fill write the slots with the CPU's memcpy (the GPU has not read those slots at start-up, so no cache of its holds an older value). On the 890M it took the same 12.4 s as the SYCL queue's copies, the reads of the mapped files (about 2.85 GB/s) being the limit, so the default is unchanged.
 
 The processor's own graphics share the RAM, so they never take the low-RAM mode.
