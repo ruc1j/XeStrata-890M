@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.2.8-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+XeStrata xe0.2.9-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -30,6 +30,20 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
+
+## Integration through Strata 0.1.55
+
+Of the 169 upstream Strata commits from 0.2.8 to 0.2.9 (engine version 0.1.55, 2026-10-31), the ones that touch the engine, serve and setup layers come into XeStrata-890M (Issue #76). Upstream XeStrata (MistVVK/XeStrata) has not taken 0.2.9 yet, so Strata's commits were applied 3-way and the shifted hunks placed by hand.
+Most of upstream's changes in this span are Metal, the CUDA engines of DeepSeek and Qwen3.6, the CUDA tensor-core and gfx12 GDN, `--batch`'s co-reads and research switches, replicas, Windows, the app and Terminal, and upstream's own sycl/: none applies to this fork.
+
+What came in:
+
+- serve: a tool the conversation already called counts as declared, so a call to it comes back as a tool call, not raw text; a call written inside a code fence or an indented code block is not run.
+- setup: a child's non-UTF-8 output no longer stops it (`errors="replace"`).
+- prefill: `STRATA_PREFILL_TIMING=1` splits the hyper-connection read into down+silu, up, inject and mix (a 15K-token prompt's 10.6% became 0.1 + 3.1 + 2.9 + 0.7 + 3.4%).
+
+Not taken yet: the CUDA hyper-connection read v3 (more rows a warp for 5-8-token windows; here it would mean more rows a sub-group in fused_gr.cpp, but the 890M's windows are 3-4 rows, so few windows would gain).
+The engine's arithmetic is unchanged, so no before/after speed comparison was run.
 
 ## Integration through Strata 0.1.54
 

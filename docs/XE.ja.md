@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.2.8-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+XeStrata xe0.2.9-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
@@ -31,6 +31,20 @@ Qwen3.8 の prompt は xmx_gemm が動く GPU では FP16 の経路のままに�
 `STRATA_VRAM_LIMIT_MIB` はエンジンから見える VRAM を、`STRATA_MAX_ALLOC_MIB` は想定する最大の確保量を制限し、
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は確認用の 2 つ目の実機として使います。
+
+## Strata 0.1.55 の取り込み
+
+upstream の Strata 0.2.8 から 0.2.9（エンジンの版は 0.1.55、2026-10-31）までの 169 コミットのうち、エンジン・serve・setup の層に当たるものを XeStrata-890M に移しています（Issue #76）。上流の XeStrata（MistVVK/XeStrata）はまだ 0.2.9 を取り込んでいないので、Strata のコミットを 3-way で当て、ずれは手で置き直しました。
+この間の upstream の変更の大半は、Metal、DeepSeek と Qwen3.6 の CUDA のエンジン、CUDA の tensor core と gfx12 の GDN、`--batch` の co-read と研究の切り替え、replica、Windows、app と Terminal、upstream 自身の sycl/ のもので、この fork には当たりません。
+
+移したものは次のとおりです。
+
+- serve: 会話で既に呼んだツールは宣言済みとして扱い、その呼び出しを文でなくツール呼び出しとして返します。コードフェンスの中と字下げしたコードブロックの中に書かれた呼び出しは実行しません。
+- setup: 子の出力に UTF-8 でないバイトがあっても落ちません（`errors="replace"`）。
+- prefill: `STRATA_PREFILL_TIMING=1` が hyper-connection の読みを down+silu、up、inject、mix に分けて出します（15K トークンの prompt では 10.6% が 0.1 + 3.1 + 2.9 + 0.7 + 3.4%）。
+
+まだ入れていないもの: CUDA の hyper-connection の読み v3（5〜8 トークンの窓で warp あたりの行を増やす。fork の fused_gr.cpp で sub-group あたりの行を増やす形になりますが、890M の窓は 3〜4 行なので当たる窓は少ないです）。
+エンジンの計算は変わらないので、取り込み前後の速さの比較はしていません。
 
 ## Strata 0.1.54 の取り込み
 
