@@ -74,6 +74,12 @@ The 890M's decode (the abliterated IQ2_XS, greedy, three interleaved rounds) was
 The layer-major prefill upstream XeStrata ported to SYCL (`STRATA_PREFILL_LAYER_MAJOR=1`: a super-chunk read layer by layer, so the experts' transfers shrink by the number of chunks and the routed rows are multiplied in groups) did not go in. On the 890M the phase that is the transfer (gather) is 0.9% of a 15K-token prompt's GPU time and the copy wait is 0, so fewer transfers gain nothing; the gain is in the rows an expert product holds a launch, and `--prefill 8192` gives the same (283-294 -> 324 tok/s in the first round). With 62 GiB of RAM the second round went to swap and 71 tok/s, layer-major places residual rows and group buffers of the same size, and its sum order changes the answers, so the chunk stays at 2,048 ([DETAILS](DETAILS.md#amd-apus)).
 MarchRaBBiT/XeStrata's change that passes the RDNA matrix attentions a work-group bound to cut their register spills (dd9c2a66a) has nothing to change here: `STRATA_AMD_REQD_WG` of 2026-10-14 gives this fork's kernels the same bound, and on gfx1150 WmmaKernel<256,12,4> takes 236 VGPRs with no spill and PromptAttnMma 216-236 with none. Adding it leaves the ISA the same.
 
+### Serve fixes from other forks (Issue #66)
+
+Ben1078/Strata's 8b90ab807 came in: with `"effort_position": "end"` a request's final user message that holds nothing but a `<system-reminder>` moves into the system turn right before the answer, and the next turn reuses the conversation's checkpoint ([DETAILS](DETAILS.md#api)).
+shoftee/Strata's 2feece509 came in as well: a stop closes the listening socket first, writes the engine STOP before QUIT so it finishes its request, and joins the handler threads last (a busy stop 20 s -> about 1 s in shoftee's measurement). A write to a closed pipe (ValueError) counts as the engine's end too.
+Ben1078's e8e0cdc40 (a metadata-only GGUF shard) was already in this fork's gguf_reader.hpp.
+
 ## Integration through Strata 0.1.53
 
 Of the 796 commits from upstream Strata 0.2.3.1 to 0.2.7.1 (the engine's version is 0.1.53), the 596 that touch the engine, serve, setup and tools layers were looked at, and the changes of 33 commits are carried into XeStrata-890M (Issue #49).

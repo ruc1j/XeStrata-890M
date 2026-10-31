@@ -902,6 +902,36 @@ class EffortAtTheEnd(unittest.TestCase):
         # without it the checkpoint held the effort turn and the next turn reused nothing (what #458 measured)
         self.assertEqual(self.session([(turn1, low), (turn2, low)], True, False), [0])
 
+    REMINDER = {"role": "user", "content": "<system-reminder>\nThe memory catalog: 12 entries.\n</system-reminder>"}
+
+    def test_a_transient_reminder_turn_keeps_the_conversation(self):
+        """A client that appends a reminder-only user turn to every request and drops it from the next one
+        (Qwen Code's memory catalog): the reminder goes into the trailing system turn, so the engine's checkpoint in
+        front of it holds the conversation and the next turn reuses it (Ben1078/Strata 8b90ab807)."""
+        turn1, turn2 = self.CHAT + [self.REMINDER], self.CHAT + [self.REPLY, self.NEXT, self.REMINDER]
+        text = self.tok.decode(self.ids(turn1, True))
+        self.assertTrue(text.endswith("<|im_end|>\n<|im_start|>system\n<system-reminder>\nThe memory catalog: 12 "
+                                      "entries.\n</system-reminder><|im_end|>\n<|im_start|>assistant\n<think>\n"),
+                        text[-300:])
+        self.assertNotIn("<|im_start|>user\n<system-reminder>", text)       # not a user turn any more
+        conversation = len(self.checkpoint(self.ids(self.CHAT, True), True))
+        self.assertEqual(self.session([(turn1, {}), (turn2, {})], True, True), [conversation])
+        # with an effort as well, both texts share the trailing turn
+        text = self.tok.decode(self.ids(turn1, True, reasoning_effort="low"))
+        self.assertIn("</system-reminder>\n\nReasoning effort is set to low.", text)
+        self.assertEqual(self.session([(turn1, {"reasoning_effort": "low"}), (turn2, {"reasoning_effort": "low"})],
+                                      True, True), [conversation])
+        # a user turn with text beside the reminder, or a reminder at the top, stays where the client put it
+        mixed = self.CHAT + [{"role": "user", "content": "<system-reminder>x</system-reminder> and a question"}]
+        self.assertEqual(self.ids(mixed, True), self.ids(mixed, False))
+        self.assertEqual(self.ids([self.REMINDER], True), self.ids([self.REMINDER], False))
+        # off (STRATA_TRAILING_REMINDER=0, or "effort_position": "start"): the reminder is a user turn, and the
+        # next turn reuses nothing (the checkpoint held the reminder)
+        self.assertEqual(self.session([(turn1, {}), (turn2, {})], False, False), [0])
+        with mock.patch.dict(os.environ, {"STRATA_TRAILING_REMINDER": "0"}):
+            self.assertEqual(self.ids(turn1, True), self.ids(turn1, False))
+            self.assertEqual(self.session([(turn1, {}), (turn2, {})], True, True), [0])
+
     def test_the_config(self):
         from serve.server import effort_end_args
 

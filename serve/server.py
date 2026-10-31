@@ -176,6 +176,29 @@ EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief 
                "xhigh": "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
                         "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
                         "clarity in the final answer."}
+
+
+def trailing_reminder(messages):
+    """The text of a final user message that holds nothing but <system-reminder> blocks, else None.  Some agent
+    clients (Qwen Code, for example) append such a transient user turn to every request and drop it from the next
+    one, so the engine's checkpoint of the conversation (taken up to the newest turn) never matched the next request
+    and the prompt was read again from the last periodic checkpoint (5-19 s at 18K tokens).  With `effort_end` that
+    text goes into the trailing system turn the engine (--tail-role-token) checkpoints in front of, and the next turn
+    reuses the conversation (Ben1078/Strata 8b90ab807: 18,271 of 18,822 tokens reused).  STRATA_TRAILING_REMINDER=0
+    turns it off."""
+    if os.environ.get("STRATA_TRAILING_REMINDER", "1") == "0" or not isinstance(messages, list) or len(messages) < 3:
+        return None
+    last = messages[-1]
+    if not isinstance(last, dict) or last.get("role") != "user":
+        return None
+    c = last.get("content")
+    if isinstance(c, list) and all(isinstance(x, dict) and x.get("type") == "text" for x in c):
+        c = "".join(x.get("text") or "" for x in c)
+    if not isinstance(c, str) or "<system-reminder>" not in c:
+        return None
+    if re.sub(r"<system-reminder>[\s\S]*?</system-reminder>", "", c).strip():
+        return None
+    return c.strip()
 VISION_START = "<|vision_start|>"
 # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
@@ -1376,7 +1399,7 @@ class StrataEngine:
                     raise OSError("no engine")
                 proc.stdin.write(text + "\n")
                 proc.stdin.flush()
-        except OSError:                                  # the pipe is gone: the engine died (not the client)
+        except (OSError, ValueError):                    # the pipe is gone (closed: ValueError): the engine died
             raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
 
     def _control(self, cancel, on_token, stop_when=None, on_quiet=None):
@@ -2078,7 +2101,7 @@ class StrataEngine:
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
-        except OSError:                                  # the pipe is gone: the engine died (not the client)
+        except (OSError, ValueError):                    # the pipe is gone (closed: ValueError): the engine died
             raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
@@ -2162,7 +2185,7 @@ class StrataEngine:
                     try:
                         self.proc.stdin.write("STOP\n")
                         self.proc.stdin.flush()
-                    except OSError:
+                    except (OSError, ValueError):
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
                 # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
@@ -2262,7 +2285,7 @@ class StrataEngine:
                 raise OSError("no engine")
             proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
             proc.stdin.flush()
-        except OSError:
+        except (OSError, ValueError):
             raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
@@ -2354,6 +2377,8 @@ class StrataEngine:
         try:
             if self.proc.poll() is None:
                 try:
+                    if self.can_stop:        # an engine in a request finishes it and frees its memory itself (shoftee
+                        self.proc.stdin.write("STOP\n")   # 2feece509: a busy stop 20 s -> ~1 s, exit code -15 -> 0)
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
@@ -4172,7 +4197,13 @@ class Service:
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
-        if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
+        default_effort = not off and effort in (None, "", "xhigh", "high")
+        # a client's transient reminder as the LAST user message (trailing_reminder) goes into the trailing system
+        # turn as well, so the checkpoint in front of it covers the conversation and the next turn reuses it
+        reminder = trailing_reminder(messages) if self.effort_end else None
+        if reminder is not None:
+            messages = messages[:-1]
+        if not self.effort_end or (reminder is None and default_effort):
             return self.template.render(messages, tools=tools, **kwargs)
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
         history = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
@@ -4180,7 +4211,14 @@ class Service:
         mine = self.template.render(messages, tools=tools, add_generation_prompt=False, **kwargs)
         if not full.startswith(mine):                  # a template this cannot take apart: rendered as asked
             return full
-        tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
+        texts = []
+        if reminder is not None:
+            texts.append(reminder)
+        if not default_effort and not off:
+            texts.append(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
+        tail = EFFORT_TURN.format("\n\n".join(texts)) if texts else ""
+        if reminder is not None and default_effort:
+            history = mine                             # default effort: the history exactly as a default request renders
         return history + tail + full[len(mine):]
 
     def encode_prompt(self, messages, tools, kwargs, store: bool = True) -> list[int]:
@@ -7971,7 +8009,14 @@ def main() -> int:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+        # the listening socket closes right after shutdown(), so the port stops answering at once; server_close()
+        # (which also joins the handler threads, untimed) comes after the engine has ended (shoftee 2feece509)
+        httpd.shutdown()
+        try:
+            httpd.socket.close()
+        except OSError:
+            pass
+        closers = [getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:
@@ -7980,6 +8025,10 @@ def main() -> int:
                 proc = getattr(engine, "proc", None)
                 if proc:
                     proc.kill()
+        try:
+            httpd.server_close()
+        except (OSError, KeyboardInterrupt):
+            pass
         try:
             from serve import cache_drop
             cache_drop.drop_after_exit(engine)           # opt-in (STRATA_DROP_CACHE_ON_EXIT=1), default unchanged

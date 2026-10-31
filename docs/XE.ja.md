@@ -75,6 +75,12 @@ swiglu と int8 の量子化を 1 つにする `STRATA_SWIGLU_QUANT` は 890M �
 上流 XeStrata が SYCL に移した layer-major prefill（`STRATA_PREFILL_LAYER_MAJOR=1`。大きな塊を層ごとに読み、エキスパートの転送を塊の数ぶんの 1 にし、ルーティングされた行を群ごとの積にまとめる）は入れていません。890M では 15K トークンの prompt の GPU 時間のうち転送に当たる段階（gather）が 0.9% でコピー待ちは 0 なので、転送を減らしても得はありません。得があるのはエキスパートの積が 1 回に持つ行の数で、同じ効果は `--prefill 8192` で出ます（1 周目 283〜294 → 324 tok/s）。しかし 62 GiB の RAM では 2 周目に swap に出て 71 tok/s に落ち、layer-major も同じ大きさの残差の行と群のバッファを置くうえ、和の順が変わって答えも変わるので、塊は 2,048 のままです（[DETAILS](DETAILS.ja.md#amd-の-apu)）。
 MarchRaBBiT/XeStrata の、RDNA の行列の attention に work-group の上限を渡してレジスタのあふれを減らす変更（dd9c2a66a）は、この fork では 2026-10-14 の `STRATA_AMD_REQD_WG` が同じ上限を付けていて、gfx1150 の WmmaKernel<256,12,4> は VGPR 236 であふれ 0、PromptAttnMma は 216〜236 であふれ 0 です。足しても ISA は同じなので、変えるものはありません。
 
+### ほかの fork の serve の直し（Issue #66）
+
+Ben1078/Strata の 8b90ab807 を移しました。`"effort_position": "end"` のとき、要求の最後の `<system-reminder>` だけの user の発言を答えの直前の system のターンに移し、次のターンが会話のチェックポイントを再利用します（[DETAILS](DETAILS.ja.md#api)）。
+shoftee/Strata の 2feece509 も移しました。停止のときは listening socket を先に閉じ、エンジンには QUIT の前に STOP を書いて要求を終えさせてから、handler のスレッドを待ちます（shoftee の計測で、忙しい停止が 20 秒 → 約 1 秒）。閉じた pipe への書き込み（ValueError）もエンジンの終了として扱います。
+Ben1078 の e8e0cdc40（GGUF のメタデータだけの shard）は、この fork の gguf_reader.hpp に既にありました。
+
 ## Strata 0.1.53 の取り込み
 
 upstream の Strata 0.2.3.1 から 0.2.7.1（エンジンの版は 0.1.53）までの 796 コミットのうち、エンジン・serve・setup・tools の層に当たる 596 コミットを見て、33 コミットの変更を XeStrata-890M に移しています（Issue #49）。
