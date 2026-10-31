@@ -681,6 +681,26 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
     return true;
 }
 
+bool ExpertCache::fill_slot_host(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
+    if (!host_usm_) {
+        err = "ExpertCache::fill_slot_host: the slots are not host USM";
+        return false;
+    }
+    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    uint8_t* dst = device_slot(slot);
+    if (dst == nullptr) {
+        err = "ExpertCache::fill_slot_host: slot outside the arena";
+        return false;
+    }
+    if (host_blob == nullptr) {
+        err = "ExpertCache::fill_slot_host: the host blob is null";
+        return false;
+    }
+    std::memcpy(dst, host_blob, n);
+    ++fills_;
+    return true;
+}
+
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);

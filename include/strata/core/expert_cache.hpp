@@ -219,6 +219,10 @@ public:
     static bool host_usm_requested();
     /// Whether this cache's slots are in host USM (set_host_usm).
     bool host_usm() const { return host_usm_; }
+    /// A host USM slot written by the CPU (std::memcpy), for the start-up fill only: the GPU has not read a fresh
+    /// slot yet, so no cache of its holds an older value; a refill of a slot the GPU has read goes through
+    /// fill_slot_blocking (the device's copy).  False when the slots are not host USM, or the indices are out of range.
+    bool fill_slot_host(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
     /// The arena's range (null: one allocation).
     VmmRange* vmm_range() { return vmm_.get(); }
     /// Byte offset of slot `s` in the arena (s == slots(): the end).

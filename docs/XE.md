@@ -101,6 +101,10 @@ Where a decode's time goes (`STRATA_DECODE_TIMING=1`, six chats): of a window's 
 
 chenyb999-zhcn/Strata's 0c16171ce came in: the pairs are admitted in order on one thread, and the blobs' reads and copies into the cache run on disjoint slots from 8 threads (`STRATA_FILL_THREADS`; 0 or 1 = one thread) ([DETAILS](DETAILS.md)). On the 890M (the abliterated IQ2_XS, 24,576 experts, about 35 GB) the fill went from 28.0, 25.9 and 15.7 s to 13.2, 13.4 and 12.5 s and the time to ready from 52, 63 and 42 s to 42, 43 and 37 s, with the same decode and answers. The copy is still the SYCL queue's synchronous memcpy, so eight threads reach only 2.6-2.8 GB/s; a CPU memcpy into a host USM cache (the GPU has not touched those slots yet at start-up) is the next candidate.
 
+### The start-up fill with the CPU's memcpy (Issue #75)
+
+`STRATA_FILL_HOST_COPY=1` (opt-in) makes the start-up fill write a host USM cache's slots with the CPU's memcpy. On the 890M it took the same 12.4 s (2.85 GB/s) as the SYCL queue's copies, and the time to ready was the same too (43, 37 and 38 s against 43, 36 and 37 s): the limit is the reads of the mapped files, not the copies. The answers are the same.
+
 ## Integration through Strata 0.1.53
 
 Of the 796 commits from upstream Strata 0.2.3.1 to 0.2.7.1 (the engine's version is 0.1.53), the 596 that touch the engine, serve, setup and tools layers were looked at, and the changes of 33 commits are carried into XeStrata-890M (Issue #49).

@@ -102,6 +102,10 @@ decode の時間の内訳（`STRATA_DECODE_TIMING=1`、6 チャット）は、1 
 
 chenyb999-zhcn/Strata の 0c16171ce を移しました。pair の admit は順に 1 スレッドで行い、blob の読みと cache へのコピーは互いに重ならない slot を 8 スレッド（`STRATA_FILL_THREADS`、0 か 1 で 1 スレッド）で行います（[DETAILS](DETAILS.ja.md)）。890M（abliterated 版 IQ2_XS、24,576 のエキスパート、約 35 GB）では充填が 28.0・25.9・15.7 秒 → 13.2・13.4・12.5 秒、ready まで 52・63・42 秒 → 42・43・37 秒で、decode と答えは同じです。コピーは SYCL の queue の同期の memcpy のままなので、8 スレッドでも 2.6〜2.8 GB/s にとどまります。host USM の cache なら CPU の memcpy で書ける（起動の充填では GPU がまだその slot に触っていない）のが次の候補です。
 
+### 起動の充填を CPU の memcpy で（Issue #75）
+
+host USM の cache の slot を起動の充填で CPU の memcpy で書く形を `STRATA_FILL_HOST_COPY=1` で試せるようにしました（opt-in）。890M では SYCL の queue のコピーと同じ 12.4 秒（2.85 GB/s）で、ready までも 43・37・38 秒対 43・36・37 秒と同じです。上限は mmap のファイルの読みで、コピーではありません。答えは同じです。
+
 ## Strata 0.1.53 の取り込み
 
 upstream の Strata 0.2.3.1 から 0.2.7.1（エンジンの版は 0.1.53）までの 796 コミットのうち、エンジン・serve・setup・tools の層に当たる 596 コミットを見て、33 コミットの変更を XeStrata-890M に移しています（Issue #49）。

@@ -5832,6 +5832,7 @@ int main(int argc, char** argv) {
             return v == nullptr ? (int64_t) 8 : std::clamp<int64_t>(std::strtol(v, nullptr, 10), 0, 32);
         }();
         const bool fill_parallel = fill_threads >= 2 && !(srcp == &src && src.unbuffered());
+        bool host_fill_used = false;
         if (fill_parallel) {
             struct FillJob { int64_t i; int32_t layer, expert, slot; int64_t bytes; };
             std::vector<FillJob> jobs;
@@ -5842,6 +5843,10 @@ int main(int argc, char** argv) {
                 jobs.push_back({i, profile[(size_t) i].first, profile[(size_t) i].second, slot,
                                 (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first)});
             }
+            // STRATA_FILL_HOST_COPY=1 (opt-in): a host USM cache's slots written by the CPU's memcpy instead of the SYCL
+            // queue's copy (which lines the threads up).  Measured the same on the 890M (12.4 s either way, 8 threads):
+            // the reads of the mapped files are the limit, not the copies (Issue #75)
+            const bool host_fill = xcache.host_usm() && [] { const char* v = std::getenv("STRATA_FILL_HOST_COPY"); return v != nullptr && v[0] == '1'; }();
             std::atomic<size_t> next{0};
             std::atomic<int64_t> done{0}, bad{-1};
             std::atomic<uint64_t> copied{0};
@@ -5855,7 +5860,9 @@ int main(int argc, char** argv) {
                     const FillJob& j = jobs[k];
                     std::string e;
                     const uint8_t* b = blob_to_copy(srcp, j.layer, j.expert, tmp);
-                    if (b == nullptr || !xcache.fill_slot_blocking(j.slot, b, e, j.bytes)) {
+                    // (host_fill: the CPU writes the slot itself; the GPU has not read a fresh slot, so no stale line)
+                    if (b == nullptr || !(host_fill ? xcache.fill_slot_host(j.slot, b, e, j.bytes)
+                                                    : xcache.fill_slot_blocking(j.slot, b, e, j.bytes))) {
                         std::lock_guard<std::mutex> lk(err_mu);
                         int64_t none = -1;
                         if (bad.compare_exchange_strong(none, j.i)) err = b == nullptr ? "the blob is null" : e;
@@ -5876,6 +5883,7 @@ int main(int argc, char** argv) {
             }
             prefilled = done.load();
             fill_bytes = copied.load();
+            host_fill_used = host_fill;
         }
         for (int64_t i = 0; i < want && !fill_parallel; ++i) {
             if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
@@ -5911,7 +5919,7 @@ int main(int argc, char** argv) {
                              "slot 0 verified\n",
                      (long long) prefilled, (long long) want, fill_s,
                      fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0,
-                     fill_parallel ? (", " + std::to_string(fill_threads) + " threads").c_str() : "");
+                     fill_parallel ? (", " + std::to_string(fill_threads) + " threads" + (host_fill_used ? ", CPU copies" : "")).c_str() : "");
     }
 
 
