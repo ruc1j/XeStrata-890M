@@ -92,6 +92,7 @@ XeStrata に入る変更は、この追加の許可を含めた条件で入り�
 - 確かめていないことには `unverified`
 
 コミットの前に `tools/lint/run.sh` を通し、変更が関わる既存のテストを動かしてください（[AGENTS.md](AGENTS.md#lints)）。
+GPU の要らない検査（serve と tools のテスト、shellcheck、`reuse lint`、Markdown のリンク、ライセンスの種別）は、プルリクエストで GitHub Actions も動かします。
 
 ## 報告の仕方
 

@@ -175,6 +175,8 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 | the whole repository | `reuse lint` (see Licenses above) |
 
 The files a change touches must get no new findings; findings that were there before may stay.
+A lint whose tool is not installed does not run, and `run.sh` then exits 1 with the list of them (`STRATA_LINT_ALLOW_SKIP=1` accepts that); install the tools as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#lints) describes.
+`.github/workflows/checks.yml` runs the checks that need no GPU (the Python tests of `serve/` and `tools/`, shellcheck, `reuse lint`, the Markdown links, `tools/license_class.py`) on every push to `main` and `apu-speed` and every pull request to `main`; the build and CTest are not in it.
 Other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
 clang-tidy reads `compile_commands.json` from the build folder (`build/free`, or `STRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
 

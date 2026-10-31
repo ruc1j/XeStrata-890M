@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# The checks that need no GPU, on every push to main and apu-speed and every pull request to main: the Python tests of
+# serve/ and tools/, shellcheck, reuse lint, the Markdown files' links and the license classes (AGENTS.md, Lints).
+# The engine's build, CTest and the measurements need the GPU and run on the developer's machine (docs/BUILD.md).
+name: checks
+on:
+  push:
+    branches: [main, apu-speed]
+  pull_request:
+    branches: [main]
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # license_class reads upstream's history (a file upstream deleted before the tag)
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: the tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q shellcheck
+          python3 -m pip install -q reuse
+          mkdir -p .lint/bin
+          curl -sSL https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C .lint/bin --strip-components=1 lychee-x86_64-unknown-linux-gnu/lychee
+      - name: license classes (fetches upstream Strata's tag)
+        run: python3 tools/license_class.py
+      - name: reuse lint
+        run: reuse lint
+      - name: shellcheck
+        run: git ls-files -- '*.sh' ':!third_party' | xargs shellcheck
+      - name: Markdown links
+        run: git ls-files -- '*.md' ':!third_party' | xargs .lint/bin/lychee --offline --no-progress
+      - name: serve tests
+        run: python3 -m unittest discover -s serve -t .
+      - name: tools tests
+        run: python3 -m unittest $(ls tools/test_*.py | sed 's|/|.|; s|\.py$||')

@@ -59,3 +59,8 @@ windows/launcher/*/obj/
 /.ccache/
 # notes about this machine for coding agents (AGENTS.md)
 /LOCAL.md
+
+# this machine's tool settings (not XeStrata's)
+.claude/settings.local.json
+.hermes/
+.serena/

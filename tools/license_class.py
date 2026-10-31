@@ -16,7 +16,8 @@ same content as upstream's is unchanged, any other is mixed:
 
 A file without a header of its own is checked against the last REUSE.toml annotation that covers it.  --fix rewrites
 the headers that differ (only the holder and identifier lines); REUSE.toml and a file without a header are reported
-for a hand edit.  Exits 1 when anything differs and is not fixed; a tag missing from the clone is skipped with a note.
+for a hand edit.  Exits 1 when anything differs and is not fixed.  A tag missing from the clone is fetched from
+upstream Strata's repository (UPSTREAM_GIT, the tag alone); when that fails, the check cannot run and exits 1.
 """
 from __future__ import annotations
 
@@ -36,6 +37,7 @@ PERMISSIVE = ("Niko1221 and the Strata contributors", "The ggml authors", "Debia
 OWN = "LGPL-3.0-or-later"
 MIXED = "LGPL-3.0-or-later AND MIT"
 # the files the classes do not cover: other projects' folders, license texts, the notices
+UPSTREAM_GIT = "https://github.com/Niko1221/Strata.git"   # upstream Strata, whose tags the classes compare against
 SKIP = re.compile(r"^(third_party/|LICENSES/|COPYING|NOTICE$)")
 HEAD_LINES = 40  # an SPDX line further down is an example in the text, not the header
 SPDX = re.compile(rb"^(?P<pre>.*?)SPDX-(?P<key>FileCopyrightText|License-Identifier): (?P<val>.*?)"
@@ -186,9 +188,15 @@ def main(argv: list[str] | None = None) -> int:
     if not tag:
         m = re.search(r'STRATA_UPSTREAM_VERSION "([^"]+)"', Path("CMakeLists.txt").read_text())
         tag = "v" + m[1] if m else ""
+    if not tag:
+        print("license classes: cannot run (no STRATA_UPSTREAM_VERSION in CMakeLists.txt and no --tag)")
+        return 1
     if subprocess.run(["git", "rev-parse", "-q", "--verify", f"{tag}^{{commit}}"], capture_output=True).returncode:
-        print(f"license classes: skipped (upstream's tag {tag or '?'} is not in this clone: git fetch upstream --tags)")
-        return 0
+        print(f"license classes: upstream's tag {tag} is not in this clone: "
+              f"git fetch --no-tags {UPSTREAM_GIT} tag {tag}")
+        if subprocess.run(["git", "fetch", "-q", "--no-tags", UPSTREAM_GIT, "tag", tag]).returncode:
+            print(f"license classes: cannot run (the tag could not be fetched; is {UPSTREAM_GIT} reachable?)")
+            return 1
     files = a.files or git("ls-files", "-z").decode().split("\0")
     up = Upstream(tag)
     rules = reuse_rules()

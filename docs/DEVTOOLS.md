@@ -21,6 +21,9 @@ The commands are for Ubuntu and Debian; the versions are those last used on the 
 ## Lints
 
 [AGENTS.md](../AGENTS.md#lints) says which lints to run and how (`tools/lint/run.sh`).
+When `run.sh` skips a lint because its tool is not installed, it lists those at the end and exits 1.
+With `STRATA_LINT_ALLOW_SKIP=1` it still prints the list but exits 0 when nothing else reports.
+`run.sh` puts `.lint/venv/bin`, `.lint/bin` and `.lint/node_modules/.bin` at the front of the PATH, so a tool installed there is found as it is.
 
 From the distribution.
 
@@ -30,6 +33,7 @@ sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyf
 ```
 
 `tools/lint/run.sh` runs oneAPI's clang-tidy, which knows SYCL (found under `/opt/intel/oneapi/compiler`), not the distribution's.
+A clang-tidy elsewhere is named with `STRATA_CLANG_TIDY`.
 clang-tidy reads `compile_commands.json` from the build folder (by default `build/free`; `STRATA_LINT_BUILD` changes it).
 
 ```sh
@@ -41,11 +45,19 @@ The ones the distribution does not package, or packages too old, go into `.lint/
 ```sh
 python3 -m venv .lint/venv && .lint/venv/bin/pip install ruff reuse        # ruff 0.16, reuse 6.2
 npm install --prefix .lint stylelint stylelint-config-recommended         # stylelint 17
-mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/latest/download/lychee-x86_64-unknown-linux-gnu.tar.gz \
-    | tar -xz -C .lint/bin lychee                                          # lychee 0.24
+mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-x86_64-unknown-linux-gnu.tar.gz \
+    | tar -xz -C .lint/bin --strip-components=1 lychee-x86_64-unknown-linux-gnu/lychee   # lychee 0.24
 ```
 
+On a distribution without apt, shellcheck and cmake-lint come from pip (`.lint/venv/bin/pip install shellcheck-py cmakelang`),
+gitleaks as the binary of its GitHub Releases into `.lint/bin/`, and eslint from npm (`npm install --prefix .lint eslint@8`: `run.sh` passes an eslintrc-style configuration, which is the 8 series).
 `tools/lint/run.sh` uses the distribution's `reuse` when there is one and `.lint/venv/bin/reuse` otherwise.
+
+### CI
+
+`.github/workflows/checks.yml` runs the checks that need no GPU on GitHub Actions, on every push to main and apu-speed and every pull request to main:
+the Python tests of serve and tools, shellcheck, `reuse lint`, the Markdown files' links (lychee's `--offline`) and the license classes (`tools/license_class.py`, which fetches upstream's tag from Strata's repository).
+The engine's build, CTest and the measurements need the GPU, so they are not in the CI and run on the development machine.
 
 ## intel/llvm from source
 

@@ -3,15 +3,20 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 #
 # tools/lint/run.sh [FILE...] - the lints of AGENTS.md on the given files, by kind; without files, on the files that
-# differ from HEAD (changed or new, not deleted).  Run from the repository root.  Exits 1 when any lint reports.
-# The tools come from apt, except ruff, lychee and stylelint, which are in .lint/ (see AGENTS.md, Lints).
+# differ from HEAD (changed or new, not deleted).  Run from the repository root.  Exits 1 when any lint reports, and
+# when a lint could not run because its tool is not installed (the tools are listed at the end; STRATA_LINT_ALLOW_SKIP=1
+# accepts that and exits 0 when nothing else reports).  The tools come from the distribution or from .lint/
+# (docs/DEVTOOLS.md#lints): .lint/venv/bin, .lint/bin and .lint/node_modules/.bin are put on the PATH here.
 # STRATA_LINT_BUILD names the build folder whose compile_commands.json clang-tidy reads (default build/free;
-# configure it with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON).
+# configure it with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON); STRATA_CLANG_TIDY names a clang-tidy that knows SYCL
+# (default: oneAPI's under /opt/intel/oneapi/compiler).
 set -u
 cd "$(git rev-parse --show-toplevel)" || exit 2
 C=tools/lint
 BUILD=${STRATA_LINT_BUILD:-build/free}
-CLANG_TIDY=$(find /opt/intel/oneapi/compiler -path '*/bin/compiler/clang-tidy' 2>/dev/null | sort -V | tail -1)
+PATH=$PWD/.lint/venv/bin:$PWD/.lint/bin:$PWD/.lint/node_modules/.bin:$PATH
+export PATH
+CLANG_TIDY=${STRATA_CLANG_TIDY:-$(find /opt/intel/oneapi/compiler -path '*/bin/compiler/clang-tidy' 2>/dev/null | sort -V | tail -1)}
 
 if [ $# -gt 0 ]; then
   files=("$@")
@@ -28,10 +33,12 @@ mapfile -t files < <(printf '%s\n' "${files[@]}" | while read -r f; do
 done)
 
 status=0
-run() {   # run NAME TOOL ARGS...: run a lint, or say it is not installed
+skipped=()
+run() {   # run NAME TOOL ARGS...: run a lint, or say it is not installed (and count it: the run then fails)
   local name=$1 tool=$2; shift 2
   if ! command -v "$tool" >/dev/null 2>&1 && [ ! -x "$tool" ]; then
-    echo "== $name: skipped ($tool not installed)"
+    echo "== $name: not run ($tool not installed)"
+    skipped+=("$name")
     return
   fi
   echo "== $name"
@@ -56,7 +63,7 @@ mapfile -t text < <(pick '\.(py|sh|cpp|hpp|cu|h|inc|cmake|md|css|js|html|jinja|t
 
 if [ ${#py[@]} -gt 0 ]; then
   run flake8 flake8 --config "$C/flake8.ini" "${py[@]}"
-  run ruff .lint/venv/bin/ruff check --quiet --config "$C/ruff.toml" "${py[@]}"
+  run ruff ruff check --quiet --config "$C/ruff.toml" "${py[@]}"
   run mypy mypy --config-file "$C/mypy.ini" --no-error-summary "${py[@]}"
 fi
 [ ${#sh[@]} -gt 0 ] && run shellcheck shellcheck "${sh[@]}"
@@ -83,7 +90,8 @@ if [ ${#cpp[@]} -gt 0 ]; then
       done
     fi
   else
-    echo "== clang-tidy: skipped (needs oneAPI's clang-tidy and $BUILD/compile_commands.json)"
+    echo "== clang-tidy: not run (needs a clang-tidy that knows SYCL, STRATA_CLANG_TIDY or oneAPI's, and $BUILD/compile_commands.json)"
+    skipped+=(clang-tidy)
   fi
   run cppcheck cppcheck --quiet --error-exitcode=1 --std=c++20 --enable=warning,performance --library="$C/cppcheck.cfg" \
     --suppress=missingIncludeSystem --suppress=noCopyConstructor --suppress=noOperatorEq "${cpp[@]}"
@@ -91,9 +99,9 @@ fi
 [ ${#cmake[@]} -gt 0 ] && run cmake-lint cmake-lint -c "$C/cmake-format.py" -- "${cmake[@]}"
 if [ ${#md[@]} -gt 0 ]; then
   run markdownlint mdl --style "$C/mdl_style.rb" "${md[@]}"
-  run lychee .lint/bin/lychee --offline --no-progress "${md[@]}"
+  run lychee lychee --offline --no-progress "${md[@]}"
 fi
-[ ${#css[@]} -gt 0 ] && run stylelint .lint/node_modules/.bin/stylelint --config "$C/stylelint.config.mjs" \
+[ ${#css[@]} -gt 0 ] && run stylelint stylelint --config "$C/stylelint.config.mjs" \
   --config-basedir .lint "${css[@]}"
 [ ${#js[@]} -gt 0 ] && run eslint eslint --no-eslintrc -c "$C/eslintrc.js" "${js[@]}"
 for f in "${html[@]}"; do run "tidy $f" tidy -config "$C/tidy.conf" -errors -quiet "$f"; done
@@ -106,6 +114,13 @@ done
 # each file's SPDX header against where its code comes from (AGENTS.md, Licenses)
 echo "== license classes"
 python3 tools/license_class.py "${all[@]}" || status=1
-REUSE=$(command -v reuse || echo .lint/venv/bin/reuse)
-run reuse "$REUSE" lint --quiet
+run reuse reuse lint --quiet
+if [ ${#skipped[@]} -gt 0 ]; then
+  echo "== not run, their tools are not installed: ${skipped[*]} (docs/DEVTOOLS.md#lints)"
+  if [ "${STRATA_LINT_ALLOW_SKIP:-0}" = 1 ]; then
+    echo "   accepted (STRATA_LINT_ALLOW_SKIP=1)"
+  else
+    status=1
+  fi
+fi
 exit $status

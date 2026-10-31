@@ -21,6 +21,9 @@ XeStrata の開発で、リント、確認、測定のために入れる道具�
 ## リント
 
 どのリントをどう動かすか（`tools/lint/run.sh`）は [AGENTS.md](../AGENTS.md#lints) にあります。
+`run.sh` は、道具が入っていないリントを飛ばしたら、最後にその一覧を出して 1 で終わります。
+`STRATA_LINT_ALLOW_SKIP=1` を付けると、一覧は出したまま、ほかに指摘がなければ 0 で終わります。
+`.lint/venv/bin`、`.lint/bin`、`.lint/node_modules/.bin` は `run.sh` が PATH の先頭に足すので、そこに入れた道具はそのまま見つかります。
 
 ディストリビューションから入れるもの。
 
@@ -30,6 +33,7 @@ sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyf
 ```
 
 `tools/lint/run.sh` は、ディストリビューションの clang-tidy ではなく、SYCL を理解する oneAPI の clang-tidy（`/opt/intel/oneapi/compiler` の下）を使います。
+ほかの場所の clang-tidy は `STRATA_CLANG_TIDY` で指定します。
 clang-tidy はビルドフォルダー（既定は `build/free`、`STRATA_LINT_BUILD` で変えられます）の `compile_commands.json` を読みます。
 
 ```sh
@@ -41,11 +45,19 @@ cmake -S . -B build/free -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 ```sh
 python3 -m venv .lint/venv && .lint/venv/bin/pip install ruff reuse        # ruff 0.16, reuse 6.2
 npm install --prefix .lint stylelint stylelint-config-recommended         # stylelint 17
-mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/latest/download/lychee-x86_64-unknown-linux-gnu.tar.gz \
-    | tar -xz -C .lint/bin lychee                                          # lychee 0.24
+mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-x86_64-unknown-linux-gnu.tar.gz \
+    | tar -xz -C .lint/bin --strip-components=1 lychee-x86_64-unknown-linux-gnu/lychee   # lychee 0.24
 ```
 
+apt のないディストリビューションでは、shellcheck と cmake-lint は pip から（`.lint/venv/bin/pip install shellcheck-py cmakelang`）、
+gitleaks は GitHub の Releases のバイナリを `.lint/bin/` に、eslint は npm から（`npm install --prefix .lint eslint@8`。`run.sh` は eslintrc の形の設定を渡すので 8 系です）入れられます。
 `tools/lint/run.sh` は、ディストリビューションの `reuse` があればそれを使い、なければ `.lint/venv/bin/reuse` を使います。
+
+### CI
+
+`.github/workflows/checks.yml` は、main と apu-speed への push と main へのプルリクエストで、GPU の要らない検査を GitHub Actions で動かします:
+serve と tools の Python のテスト、shellcheck、`reuse lint`、Markdown のリンク（lychee の `--offline`）、ライセンスの種別（`tools/license_class.py`。upstream のタグを Strata のリポジトリから取ってきます）。
+エンジンのビルドと CTest と計測は GPU が要るので CI にはなく、開発機で動かします。
 
 ## intel/llvm をソースからビルドする
 

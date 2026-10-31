@@ -93,6 +93,7 @@ A pull request says:
 - what was not checked, marked `unverified`.
 
 Before committing, run `tools/lint/run.sh` and the existing tests the change can affect ([AGENTS.md](AGENTS.md#lints)).
+GitHub Actions also runs the checks that need no GPU (the serve and tools tests, shellcheck, `reuse lint`, the Markdown links, the license classes) on a pull request.
 
 ## Reports
 
