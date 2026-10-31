@@ -7614,7 +7614,8 @@ def model_card_sampling(arch, thinking) -> dict:
 
 
 def tool_call_recovery_setting(cfg: dict) -> bool:
-    """The config's "tool_call_recovery" (see OutputParser's recover): ON when the config does not name it (since 0.2.8; 0.2.7 and before: off),
+    """The config's "tool_call_recovery" (see OutputParser's recover): ON when the config does not name it (since 0.2.8;
+    0.2.7 and before: off),
     "tool_call_recovery": false turns it off. Anything but true or false stops the start."""
     recovery = cfg.get("tool_call_recovery", True)
     if not isinstance(recovery, bool):
@@ -7981,7 +7982,7 @@ def main() -> int:
             print(f"       from other devices: http://{address}:{a.port}/", flush=True)
         if not svc.api_key:
             print("       WARNING: " + open_server_warning(a.port, public=has_public_address(a.host, ips),
-                                                       tools=svc.mcp is not None),
+                                                           tools=svc.mcp is not None),
                   flush=True)
         if os.name == "nt":
             print("       nothing arrives? Windows Firewall blocks it until allowed: accept its prompt for Python, or "

@@ -1161,7 +1161,8 @@ class ToolCallTagInProse(unittest.TestCase):
 
 
 class ToolCallRecovery(unittest.TestCase):
-    """On by default in the server since 0.2.8 (config "tool_call_recovery": false turns it off): the model sometimes writes a call in a form next to the template's.  These
+    """On by default in the server since 0.2.8 (config "tool_call_recovery": false turns it off): the model sometimes
+    writes a call in a form next to the template's.  These
     shapes are from a corpus of 1,462 agent turns (Qwen3.8 under Claude Code, signalnine/q27): with the switch on, a
     declared tool's call in one of them is the call; anything else stays content, verbatim."""
     SCHEMA = ToolCallTerminators.SCHEMA
@@ -1309,7 +1310,8 @@ class ToolCallRecoverySwitch(unittest.TestCase):
     def test_a_fresh_service_reads_the_call_without_being_told(self):
         tok = ByteTokenizer()
         script = "</think>\n\n<function=write>\n" + ToolCallRecovery.PARAMS
-        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         with contextlib.redirect_stdout(io.StringIO()):
             evs = [x for kind, x in svc.run(tok.encode("hi"), True, ToolCallRecovery.SCHEMA, 3000, {},
                                             threading.Event()) if kind == "event"]
