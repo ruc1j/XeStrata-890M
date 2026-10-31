@@ -337,6 +337,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     status.dwLength = sizeof(status);
     if (!GlobalMemoryStatusEx(&status)) return false;
     m.available = (uint64_t) status.ullAvailPhys;
+    m.mem_available = m.available;
     return m.available > 0;
 #else
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
@@ -351,6 +352,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
             value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
     }
     if (bytes == 0) return false;
+    m.mem_available = bytes;   // the physical figure, before the cgroup clamp below
     // Account for the tightest cgroup ancestor limit when its normal mount is visible.
     // This is a point-in-time guard, not a reservation against concurrent allocations.
     std::ifstream groups(self_cgroup);
@@ -3978,7 +3980,11 @@ void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
 #if defined(_WIN32)
     (void) layer; (void) expert;
 #else
-    if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return;
+    // the layer's upper bound too: blob_offset() indexes the layout's per-layer table, and a layer at or past the
+    // last (a draft layer, a stale index) read past it - the engine aborted three times in 172K-190K prompts
+    // (shoftee/Strata f6094ff1e)
+    if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_ ||
+        (n_expert_ > 0 && layer >= blobs_ / n_expert_)) return;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const uint64_t off = lay.blob_offset(layer, expert) & ~(uint64_t) 4095;
     const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer);
@@ -3997,7 +4003,8 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
     (void) layer; (void) expert;
     return 0;
 #else
-    if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
+    if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_ ||
+        (n_expert_ > 0 && layer >= blobs_ / n_expert_)) return 0;
     const auto& lay = strata::kernels::cpu::expert_layout();
     const uint64_t off = (lay.blob_offset(layer, expert) + 4095) & ~(uint64_t) 4095;
     const uint64_t end = (lay.blob_offset(layer, expert) + lay.blob_bytes(layer)) & ~(uint64_t) 4095;
@@ -4008,7 +4015,8 @@ uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
-    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_ ||
+        (n_expert_ > 0 && layer >= blobs_ / n_expert_)) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();
     return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
 }

@@ -5458,10 +5458,17 @@ int main(int argc, char** argv) {
         if (!cache_host) return strata::gpu::mem_info(free_b, total_b);
         strata::core::detail::HostMemory hm;
         if (!strata::core::detail::host_available_memory(hm)) return false;
-        uint64_t f = hm.available;
+        // the cache's pages are the driver's (host USM), which memcg never charges: sized from the RAM the OS has
+        // available (MemAvailable), not from the cgroup's cap, which a cap set low on purpose made read as "no room"
+        // (shoftee/Strata 48defc12e); the host allocations keep the cap
+        uint64_t f = hm.mem_available != 0 ? hm.mem_available : hm.available;
+        if (hm.mem_available != 0 && hm.available < hm.mem_available)
+            std::fprintf(stderr, "strata generate: the expert cache is sized from the RAM Linux has available (%.2f GiB), not from "
+                                 "this cgroup's cap (%.2f GiB left): the cache's memory is not charged to the cgroup\n",
+                         (double) hm.mem_available / 1073741824.0, (double) hm.available / 1073741824.0);
         strata::core::apply_uma_limit(f);
         *free_b = (size_t) f;
-        *total_b = (size_t) hm.available;
+        *total_b = (size_t) hm.mem_available != 0 ? (size_t) hm.mem_available : (size_t) hm.available;
         return true;
     };
     if (cache_host)
@@ -5489,6 +5496,15 @@ int main(int argc, char** argv) {
                              : 160 + (o.prefill_chunk * 680) / 1024)
                 : 0;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        // on a GPU that shares the host's RAM the parked conversations are host allocations made after the cache is
+        // sized, so a --conversation-cache-mib given spends memory the reserve promised to leave free: on an
+        // integrated GPU that budget is held out of the auto cache too (shoftee/Strata ff5809230: 125 GiB, a 32768 MiB
+        // reserve, 7 GiB parked -> 23 GiB free).  A budget sized later from the free RAM (-1), parking off, or a
+        // discrete card size as before.
+        const int64_t parking_mib =
+            o.serve && o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0 &&
+                    strata::core::device_info(strata::core::current_device()).integrated
+                ? o.conversation_cache_mib : 0;
         int64_t mtp_bind = 0, reserve = 0, slots = 0;
         auto size_cache = [&] {
             cache_mem_info(&free_b, &total_b);
@@ -5504,7 +5520,7 @@ int main(int argc, char** argv) {
                            ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
             if (stages.empty())   // (with a layer split the slot drafters bind on the last stage, sized from its VRAM)
                 for (const auto& d : slot_mtp) mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
-            reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
+            reserve = (((int64_t) o.vram_reserve_mib + prefill_mib + parking_mib) << 20) + mtp_bind + pipe_first;
             // Not rounded: free VRAM moves the cache by a slot or two between starts, and with it the last bits of
             // the output (the 2026-10-02-new-machine record), but rounding to 64 slots cost the RTX 4070 3-4% of its
             // decode.  Runs that must give the same tokens fix the size with --expert-cache N.
@@ -5529,9 +5545,12 @@ int main(int argc, char** argv) {
                                      "%lld slots it needs\n", (long long) min_slots);
         }
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
-        std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
+        std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved%s (+%lld MiB for the "
                              "draft head; %lld MiB of it the matrix library's) -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
+                     (double) free_b / 1073741824.0, o.vram_reserve_mib,
+                     parking_mib > 0 ? (" and the " + std::to_string(parking_mib) + " MiB conversation-cache budget held back, "
+                                        "since this GPU shares the host's RAM").c_str() : "",
+                     (long long) (mtp_bind >> 20),
                      (long long) (blas_bytes >> 20), o.expert_cache);
         // #496 (upstream e1ee248, 4731a9b): the verify window cannot start without a cache, and a cache too small to
         // lend the prompt path a 256-token chunk's buffers (plus the 128 slots a loan leaves; one slot without
@@ -5545,10 +5564,10 @@ int main(int argc, char** argv) {
         constexpr int kSmallReserveMib = 300;
         if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
             // the largest reserve (in MiB) that still leaves min_slots
-            const int64_t fit_mib = ((int64_t) free_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;
+            const int64_t fit_mib = ((int64_t) free_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib - parking_mib;
             if (fit_mib >= kSmallReserveMib) {
                 const int r = (int) std::min<int64_t>(fit_mib, o.vram_reserve_mib);
-                int64_t s2 = ((int64_t) free_b - ((((int64_t) r + prefill_mib) << 20) + mtp_bind + pipe_first)) / blob;
+                int64_t s2 = ((int64_t) free_b - ((((int64_t) r + prefill_mib + parking_mib) << 20) + mtp_bind + pipe_first)) / blob;
                 // not below the slots a working cache needs (s2 >= min_slots: r leaves them)
                 s2 = std::max<int64_t>(min_slots, s2);
                 if (!profile.empty()) s2 = std::min<int64_t>(s2, (int64_t) profile.size());
@@ -5564,7 +5583,7 @@ int main(int argc, char** argv) {
             // what is short, and what makes room: the numbers a small card picks from
             const int64_t at_reserve = o.vram_reserve_given ? o.vram_reserve_mib
                                                             : std::min(o.vram_reserve_mib, kSmallReserveMib);
-            const int64_t need_b = (((int64_t) at_reserve + prefill_mib) << 20) + mtp_bind + pipe_first + min_slots * blob;
+            const int64_t need_b = (((int64_t) at_reserve + prefill_mib + parking_mib) << 20) + mtp_bind + pipe_first + min_slots * blob;
             const int64_t short_mib = std::max<int64_t>(1, (need_b - (int64_t) free_b + (1 << 20) - 1) >> 20);
             const int64_t session_mib = (int64_t) (strata::core::session_bytes(g, o.max_context, K) >> 20);
             const std::string reserve_tip =
@@ -5572,14 +5591,18 @@ int main(int argc, char** argv) {
                     ? ", a smaller --vram-reserve-mib (" + std::to_string(o.vram_reserve_mib) + " now; " +
                           std::to_string(kSmallReserveMib) + " is enough on a small card)"
                     : std::string();
+            const std::string parking_tip =
+                parking_mib > 0 ? ", a smaller --conversation-cache-mib (its " + std::to_string(parking_mib) +
+                                      " MiB are held out of the cache too, since this GPU shares the host's RAM)"
+                                : std::string();
             std::fprintf(stderr, "strata generate: no VRAM is left for the expert cache: it needs at least %lld slots "
                                  "(%lld MiB), about %lld MiB more than this card has free. To make room: a smaller "
                                  "--max-context (the session, mostly its KV cache, takes %lld MiB at %lld tokens), "
                                  "--kv q4_0, the English draft subset (setup --draft-vocab en; the draft head takes "
-                                 "%lld MiB now)%s, images on the CPU, or close other programs that use the GPU\n",
+                                 "%lld MiB now)%s%s, images on the CPU, or close other programs that use the GPU\n",
                          (long long) min_slots, (long long) ((min_slots * blob) >> 20), (long long) short_mib,
                          (long long) session_mib, (long long) o.max_context, (long long) (mtp_bind >> 20),
-                         reserve_tip.c_str());
+                         reserve_tip.c_str(), parking_tip.c_str());
         }
     } else if (multi_gpu && o.expert_cache > 0 && o.no_prefill_borrow) {
         // a layer split's prompt path with buffers of its own (--no-prefill-borrow): an explicit cache size leaves
