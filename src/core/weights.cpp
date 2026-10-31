@@ -208,6 +208,32 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         err = "arena is " + std::to_string(arena_bytes) + " B but the index needs " + std::to_string(pool);
         return false;
     }
+    // Every kept row must lie inside the pool, and no two may share bytes: the copies below and the WeightRefs
+    // handed out trust dst_off, and the arena is allocated at exactly `pool` (the skip path re-places the rows itself,
+    // so only an index as written can be wrong here).
+    {
+        std::vector<size_t> order;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (skipped[i]) continue;
+            const IndexRow& r = rows[i];
+            if (r.dst_off > pool || r.dst_bytes > pool - r.dst_off) {
+                err = "index.txt: " + r.name + " ends at " + std::to_string(r.dst_off) + " + " +
+                      std::to_string(r.dst_bytes) + " B, past the pool of " + std::to_string(pool) + " B";
+                return false;
+            }
+            if (r.dst_bytes != 0) order.push_back(i);
+        }
+        std::sort(order.begin(), order.end(),
+                  [&](size_t a, size_t b) { return rows[a].dst_off < rows[b].dst_off; });
+        for (size_t k = 1; k < order.size(); ++k) {
+            const IndexRow& a = rows[order[k - 1]];
+            const IndexRow& b = rows[order[k]];
+            if (a.dst_off + a.dst_bytes > b.dst_off) {
+                err = "index.txt: " + a.name + " and " + b.name + " overlap in the arena";
+                return false;
+            }
+        }
+    }
 
     // Two pinned staging buffers, both reused.  Pinned because a 5 GB pageable upload spends its time in the
     // driver copying through a bounce buffer, and bounded by CHUNK rather than by the largest tensor.

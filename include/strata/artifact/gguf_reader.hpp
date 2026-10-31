@@ -230,9 +230,14 @@ struct TensorInfo {
     std::vector<uint64_t> shape; // GGUF order: dim 0 varies fastest
     uint32_t type = 0;
     uint64_t offset = 0;
+    /// The element count from the shape; 0 when the product overflows (a corrupt file), so that no caller sizes a
+    /// read by a wrapped count.
     uint64_t elements() const {
         uint64_t n = 1;
-        for (auto d : shape) n *= d;
+        for (auto d : shape) {
+            if (d != 0 && n > (std::numeric_limits<uint64_t>::max)() / d) return 0;
+            n *= d;
+        }
         return n;
     }
     const char* type_name() const { return ggml_type_name(type); }
@@ -244,7 +249,9 @@ class Cursor {
 public:
     Cursor(const uint8_t* base, size_t size) : base_(base), size_(size) {}
     void need(size_t n) const {
-        if (pos_ + n > size_) throw std::runtime_error("GGUF: unexpected end of file in header");
+        // n is a length read from the file: compared against the room left, not added to pos_, so that a length near
+        // 2^64 cannot wrap the sum into range
+        if (n > size_ - pos_) throw std::runtime_error("GGUF: unexpected end of file in header");
     }
     template <class T> T read() {
         need(sizeof(T));
@@ -439,6 +446,9 @@ private:
             MetaType t = (MetaType)c.read<uint32_t>();
             meta_.emplace(std::move(key), read_value(c, t));
         }
+        // the count is the file's word: a corrupt one would ask for a reserve of petabytes (the metadata arrays have
+        // the same bound above)
+        if (n_tensors > (1u << 24)) throw std::runtime_error("GGUF: implausible tensor count");
         tensors_.reserve((size_t)n_tensors);
         // GGUF has no index to arbitrate between two tensors of one name: find() is first-match, so a
         // duplicate would silently win by position.  Refuse the file at open instead, naming both.

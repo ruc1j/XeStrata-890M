@@ -1548,6 +1548,13 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
                     err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
                     return false;
                 }
+                // the tensor's bytes must lie inside the file: a truncated or edited file is an error, not a read
+                // past the mapping (as the native head and embed shards check theirs)
+                const uint64_t payload = f.file_size() - f.data_start();
+                if (t.offset > payload || (uint64_t) N * 4 > payload - t.offset) {
+                    err = path + ": " + t.name + " lies past the end of the file";
+                    return false;
+                }
                 const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
                 for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
                 have[(size_t) l] = true;

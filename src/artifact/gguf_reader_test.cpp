@@ -126,6 +126,49 @@ int main() {
         check(err.find("data section starts past EOF") != std::string::npos,
               "one tensor, ends before the aligned data start: refused at open");
     }
+    {
+        // a header whose tensor count is the file's word alone: 2^40 tensors would reserve petabytes
+        std::vector<uint8_t> b;
+        put<uint32_t>(b, 0x46554747u);
+        put<uint32_t>(b, 3);
+        put<uint64_t>(b, (uint64_t) 1 << 40);   // n_tensors
+        put<uint64_t>(b, 0);                    // n_kv
+        const auto path = std::filesystem::temp_directory_path() / "strata_gguf_reader_test.gguf";
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize) b.size());
+        std::string err;
+        try {
+            strata::GgufFile g(path.string());
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        std::filesystem::remove(path);
+        check(err.find("implausible tensor count") != std::string::npos, "a tensor count of 2^40 is refused at open");
+    }
+    {
+        // a metadata key whose length is near 2^64: pos + n wrapped into range and the string was built with that length
+        std::vector<uint8_t> b;
+        put<uint32_t>(b, 0x46554747u);
+        put<uint32_t>(b, 3);
+        put<uint64_t>(b, 0);                              // n_tensors
+        put<uint64_t>(b, 1);                              // n_kv
+        put<uint64_t>(b, (uint64_t) 0 - 16);              // the key's length
+        b.resize(b.size() + 64, 0);
+        const auto path = std::filesystem::temp_directory_path() / "strata_gguf_reader_test.gguf";
+        std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize) b.size());
+        std::string err;
+        try {
+            strata::GgufFile g(path.string());
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        std::filesystem::remove(path);
+        check(err.find("unexpected end of file") != std::string::npos, "a string length near 2^64 is an end-of-file error");
+    }
+    {
+        strata::TensorInfo t;
+        t.shape = {(uint64_t) 1 << 40, (uint64_t) 1 << 40};
+        check(t.elements() == 0, "elements() is 0 when the shape's product overflows");
+    }
     std::printf(g_fail ? "gguf_reader_test: %d FAILED\n" : "gguf_reader_test: all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
