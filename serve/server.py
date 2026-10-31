@@ -199,6 +199,8 @@ def trailing_reminder(messages):
     if re.sub(r"<system-reminder>[\s\S]*?</system-reminder>", "", c).strip():
         return None
     return c.strip()
+
+
 VISION_START = "<|vision_start|>"
 # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
