@@ -156,13 +156,14 @@ class _HeadRedirect(urllib.request.HTTPRedirectHandler):
         return new
 
 
-_opener = urllib.request.build_opener(_HeadRedirect)
+# installed, so that urllib.request.urlopen (the one name the tests patch) opens every request with it
+urllib.request.install_opener(urllib.request.build_opener(_HeadRedirect))
 
 
 def _urlopen(req, timeout=None):
     """Every download request of this file goes through here
     (upstream's name, kept so its download code reads the same)."""
-    return _opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
 
 
 def allow_unpinned() -> bool:
