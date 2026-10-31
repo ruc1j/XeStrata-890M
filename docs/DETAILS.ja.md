@@ -109,6 +109,7 @@ setup はホストの設定を変えません。
 キャッシュと予算は同じ RAM を使うので、起動時の空きから決める `auto` は予算がまだ取っていない分まで数え、OS の分が残らなくなります。
 数は RAM から 24 GB と予算（と RAM に置く KV）を引いた分のスロットで、設定の `args` の `--expert-cache N` で変えられます。
 統合 GPU では、setup は推測ヘッドの隠れ入力の正規化をハイパーコネクションのストリームごとにします（`--mtp-hnorm stream`。upstream の setup が DGX Spark に入れる値です）。890M では decode が 5% 速くなり（greedy、交互 3 周の平均で 31.2 → 32.7 tok/s）、答えは同じでした。設定の `args` の `--mtp-hnorm pooled` で前の形に戻せます。
+890M の prompt の塊は、`--prefill auto` に `--no-prefill-borrow` を付けた設定では 2,048 トークンで、15K トークンの prompt を 8 つの塊で読みます。`--prefill 8192` にすると、エキスパートの積が 1 回の起動に持つ行が 4 倍になり、各層のエキスパートを流す回数が 8 から 2 になって、15K トークンの prompt の読みは 1 周目に 283〜294 → 324 tok/s でした。ただし塊のバッファが約 4 GiB 増え（160 + 塊 × 680 / 1024 MiB）、62 GiB の RAM に 33 GiB の expert cache と mmap のページキャッシュが入らなくなり、2 周目は swap（zram）に出て 71 tok/s に落ちました。積の組の形が変わるので答えも変わります。既定は 2,048 のままで、RAM に余りのある機械では `--prefill 8192` を試せます。
 
 Radeon 890M（Ryzen AI 9 HX 370、LPDDR5X-7500、理論値 120 GB/s）で GPU が読める帯域を 1 GiB の連続読み（16 バイトのロード）で測ると、
 hipMalloc 102 GB/s、hipHostMalloc 95 GB/s、NonCoherent の hipHostMalloc 101 GB/s、2 MB ページの hipHostRegister 100 GB/s、Managed 100 GB/s です。

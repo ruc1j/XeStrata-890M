@@ -65,9 +65,14 @@ The 890M's decode (the abliterated IQ2_XS, greedy, three interleaved rounds) was
 ### Upstream XeStrata's opt-in speed ports (Issue #58)
 
 The opt-in speed changes upstream XeStrata carried in SYCL form with Strata 0.2.7 came in under Issue #57's rule.
-The conversation cache's background copies (, , ) are the default of  on an integrated GPU, and the dense weights' dequantization on a side stream () is the default of the integrated GPU on the HIP backend (a 15K-token prompt read 314.1, 305.8 and 310.8 -> 311.1, 308.1 and 308.6 tok/s, the same answers).
- (swiglu and the int8 quantization in one kernel) reads a 15K-token prompt 11% slower on the 890M, and  (the per-layer walk warming the experts' pages) has nothing to warm on the 890M, whose experts are in RAM, so both stay opt-in ([DETAILS](DETAILS.md)).
+The conversation cache's background copies (`STRATA_CKPT_ASYNC`, `STRATA_PARK_ASYNC`, `STRATA_CKPT_GATHER`) are the default of `--serve` on an integrated GPU, and the dense weights' dequantization on a side stream (`STRATA_DEQUANT_SIDE`) is the default of the integrated GPU on the HIP backend (a 15K-token prompt read 314.1, 305.8 and 310.8 -> 311.1, 308.1 and 308.6 tok/s, the same answers).
+`STRATA_SWIGLU_QUANT` (swiglu and the int8 quantization in one kernel) reads a 15K-token prompt 11% slower on the 890M, and `STRATA_PREFILL_WARM` (the per-layer walk warming the experts' pages) has nothing to warm on the 890M, whose experts are in RAM, so both stay opt-in ([DETAILS](DETAILS.md)).
 The 890M's decode (the abliterated IQ2_XS, greedy, three interleaved rounds) was 31.52, 30.87 and 31.66 tok/s before and 31.62, 30.73 and 30.41 tok/s with the new defaults, with the same answers.
+
+### Layer-major prefill and the chunk size, the attentions' work-group bound (Issues #59, #63)
+
+The layer-major prefill upstream XeStrata ported to SYCL (`STRATA_PREFILL_LAYER_MAJOR=1`: a super-chunk read layer by layer, so the experts' transfers shrink by the number of chunks and the routed rows are multiplied in groups) did not go in. On the 890M the phase that is the transfer (gather) is 0.9% of a 15K-token prompt's GPU time and the copy wait is 0, so fewer transfers gain nothing; the gain is in the rows an expert product holds a launch, and `--prefill 8192` gives the same (283-294 -> 324 tok/s in the first round). With 62 GiB of RAM the second round went to swap and 71 tok/s, layer-major places residual rows and group buffers of the same size, and its sum order changes the answers, so the chunk stays at 2,048 ([DETAILS](DETAILS.md#amd-apus)).
+MarchRaBBiT/XeStrata's change that passes the RDNA matrix attentions a work-group bound to cut their register spills (dd9c2a66a) has nothing to change here: `STRATA_AMD_REQD_WG` of 2026-10-14 gives this fork's kernels the same bound, and on gfx1150 WmmaKernel<256,12,4> takes 236 VGPRs with no spill and PromptAttnMma 216-236 with none. Adding it leaves the ISA the same.
 
 ## Integration through Strata 0.1.53
 

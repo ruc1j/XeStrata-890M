@@ -66,9 +66,14 @@ contrib-llvm のビルド、Windows のクロスビルド、ほかの GPU は un
 ### 上流 XeStrata の opt-in の速さの移植（Issue #58）
 
 上流の XeStrata が Strata 0.2.7 の取り込みで SYCL の形で持っていた opt-in の速さの変更を、Issue #57 の方針で移しました。
-会話のキャッシュの裏のコピー（・・）は統合 GPU の  で既定に、密な重みの逆量子化を別のストリームで重ねる  は HIP の統合 GPU の既定にしました（15K トークンの prompt の読み 314.1・305.8・310.8 → 311.1・308.1・308.6 tok/s、答えは同じ）。
-swiglu と int8 の量子化を 1 つにする  は 890M で 15K トークンの prompt が 11% 遅く、層ごとの歩き方でエキスパートのページを温める  は 890M ではエキスパートが RAM にあるので、どちらも opt-in のままです（[DETAILS](DETAILS.ja.md)）。
+会話のキャッシュの裏のコピー（`STRATA_CKPT_ASYNC`・`STRATA_PARK_ASYNC`・`STRATA_CKPT_GATHER`）は統合 GPU の `--serve` で既定に、密な重みの逆量子化を別のストリームで重ねる `STRATA_DEQUANT_SIDE` は HIP の統合 GPU の既定にしました（15K トークンの prompt の読み 314.1・305.8・310.8 → 311.1・308.1・308.6 tok/s、答えは同じ）。
+swiglu と int8 の量子化を 1 つにする `STRATA_SWIGLU_QUANT` は 890M で 15K トークンの prompt が 11% 遅く、層ごとの歩き方でエキスパートのページを温める `STRATA_PREFILL_WARM` は 890M ではエキスパートが RAM にあるので、どちらも opt-in のままです（[DETAILS](DETAILS.ja.md)）。
 890M の decode（abliterated 版 IQ2_XS、greedy、交互 3 周）は移す前 31.52・30.87・31.66 tok/s、移したあとの既定で 31.62・30.73・30.41 tok/s で、答えは同じです。
+
+### layer-major prefill と塊の大きさ、attention の work-group の上限（Issue #59、#63）
+
+上流 XeStrata が SYCL に移した layer-major prefill（`STRATA_PREFILL_LAYER_MAJOR=1`。大きな塊を層ごとに読み、エキスパートの転送を塊の数ぶんの 1 にし、ルーティングされた行を群ごとの積にまとめる）は入れていません。890M では 15K トークンの prompt の GPU 時間のうち転送に当たる段階（gather）が 0.9% でコピー待ちは 0 なので、転送を減らしても得はありません。得があるのはエキスパートの積が 1 回に持つ行の数で、同じ効果は `--prefill 8192` で出ます（1 周目 283〜294 → 324 tok/s）。しかし 62 GiB の RAM では 2 周目に swap に出て 71 tok/s に落ち、layer-major も同じ大きさの残差の行と群のバッファを置くうえ、和の順が変わって答えも変わるので、塊は 2,048 のままです（[DETAILS](DETAILS.ja.md#amd-の-apu)）。
+MarchRaBBiT/XeStrata の、RDNA の行列の attention に work-group の上限を渡してレジスタのあふれを減らす変更（dd9c2a66a）は、この fork では 2026-10-14 の `STRATA_AMD_REQD_WG` が同じ上限を付けていて、gfx1150 の WmmaKernel<256,12,4> は VGPR 236 であふれ 0、PromptAttnMma は 216〜236 であふれ 0 です。足しても ISA は同じなので、変えるものはありません。
 
 ## Strata 0.1.53 の取り込み
 
