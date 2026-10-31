@@ -494,6 +494,7 @@ The loads at start (the weights, the native dense matrices, the GPU cache's fill
 The drive then sees a deep queue instead of one page fault at a time.
 Upstream measured it on a Gen3 NVMe (RTX 5090, 32 GB, Q2_0 kept in RAM at 262K): ready in 70 s instead of ~920 s.
 `STRATA_READ_AHEAD=0` turns it off; `STRATA_FILL_AHEAD=N` sets how many pairs the cache fill asks for ahead (default 256).
+`STRATA_FILL_THREADS=N` (default 8; 0 or 1 = one thread) is how many threads read and copy the blobs in the start-up fill: the pairs are admitted in order on one thread, and the reads and copies run on disjoint slots from several (chenyb999-zhcn/Strata 0c16171ce). An unbuffered tier keeps the one thread.
 
 The processor's own graphics share the RAM, so they never take the low-RAM mode.
 setup's estimate of how much of a model the GPU holds is upstream's (its VRAM less ~5 GB).

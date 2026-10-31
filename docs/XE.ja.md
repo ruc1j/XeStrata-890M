@@ -98,6 +98,10 @@ htbmixbox/Strata-890M の ba96856d1 を移しました。推測デコードの D
 Indigoshores/Strata（Strix Halo）の考えのうち、streamed walk を 16 トークンから使う形は `STRATA_STREAM_ALL_MIN` で試せるようにしました（既定は 2048 のまま）。523 トークンの prompt では既定と 16 がどちらも 1,844 ms で同じで、得はありません。3 段の高さのタイルは、この fork の MMQ が行の数でカーネルを選ぶ形で既にあります。PLE の先読みは、この fork が表を RAM に固定するので当たりません。
 decode の時間の内訳（`STRATA_DECODE_TIMING=1`、6 チャット）は、1 窓 74〜87 ms のうち GPU の待ち 61〜71 ms、下書き 5〜7 ms、層ごとの host 0.2 ms 未満です。decode は 1 窓 1 グラフなので、HIP のカーネルを 1 つずつ起動する前提の persistent な起動（unimatrix099、ryan4yin）は当たりません。
 
+### 起動の profile の充填を複数のスレッドで（Issue #74）
+
+chenyb999-zhcn/Strata の 0c16171ce を移しました。pair の admit は順に 1 スレッドで行い、blob の読みと cache へのコピーは互いに重ならない slot を 8 スレッド（`STRATA_FILL_THREADS`、0 か 1 で 1 スレッド）で行います（[DETAILS](DETAILS.ja.md)）。890M（abliterated 版 IQ2_XS、24,576 のエキスパート、約 35 GB）では充填が 28.0・25.9・15.7 秒 → 13.2・13.4・12.5 秒、ready まで 52・63・42 秒 → 42・43・37 秒で、decode と答えは同じです。コピーは SYCL の queue の同期の memcpy のままなので、8 スレッドでも 2.6〜2.8 GB/s にとどまります。host USM の cache なら CPU の memcpy で書ける（起動の充填では GPU がまだその slot に触っていない）のが次の候補です。
+
 ## Strata 0.1.53 の取り込み
 
 upstream の Strata 0.2.3.1 から 0.2.7.1（エンジンの版は 0.1.53）までの 796 コミットのうち、エンジン・serve・setup・tools の層に当たる 596 コミットを見て、33 コミットの変更を XeStrata-890M に移しています（Issue #49）。

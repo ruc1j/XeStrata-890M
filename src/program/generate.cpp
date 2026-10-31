@@ -5822,7 +5822,62 @@ int main(int argc, char** argv) {
         }
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
-        for (int64_t i = 0; i < want; ++i) {
+        // STRATA_FILL_THREADS (default 8; 0 or 1 = the loop below): the pairs admitted first, in order (the residency
+        // table and the slot counters are the host thread's), then their reads and copies on several threads over
+        // disjoint slots, as the decode-time refill already does - one thread reading a 1.4 MB blob from the mapped
+        // files and copying it took 15 s for the 890M's 24,576 experts (2.3 GB/s), the SSD's queue almost empty.  An
+        // unbuffered source keeps the loop (its own batched reads).  chenyb999-zhcn/Strata 0c16171ce; Issue #74.
+        const int64_t fill_threads = [] {
+            const char* v = std::getenv("STRATA_FILL_THREADS");
+            return v == nullptr ? (int64_t) 8 : std::clamp<int64_t>(std::strtol(v, nullptr, 10), 0, 32);
+        }();
+        const bool fill_parallel = fill_threads >= 2 && !(srcp == &src && src.unbuffered());
+        if (fill_parallel) {
+            struct FillJob { int64_t i; int32_t layer, expert, slot; int64_t bytes; };
+            std::vector<FillJob> jobs;
+            jobs.reserve((size_t) want);
+            for (int64_t i = 0; i < want; ++i) {
+                const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
+                if (slot == strata::core::kNotResident) break;
+                jobs.push_back({i, profile[(size_t) i].first, profile[(size_t) i].second, slot,
+                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first)});
+            }
+            std::atomic<size_t> next{0};
+            std::atomic<int64_t> done{0}, bad{-1};
+            std::atomic<uint64_t> copied{0};
+            std::mutex err_mu;
+            auto worker = [&] {
+                std::vector<uint8_t> tmp;   // blob_to_copy's buffer, this thread's
+                for (;;) {
+                    if (bad.load(std::memory_order_relaxed) >= 0) return;
+                    const size_t k = next.fetch_add(1);
+                    if (k >= jobs.size()) return;
+                    const FillJob& j = jobs[k];
+                    std::string e;
+                    const uint8_t* b = blob_to_copy(srcp, j.layer, j.expert, tmp);
+                    if (b == nullptr || !xcache.fill_slot_blocking(j.slot, b, e, j.bytes)) {
+                        std::lock_guard<std::mutex> lk(err_mu);
+                        int64_t none = -1;
+                        if (bad.compare_exchange_strong(none, j.i)) err = b == nullptr ? "the blob is null" : e;
+                        return;
+                    }
+                    copied.fetch_add((uint64_t) j.bytes, std::memory_order_relaxed);
+                    done.fetch_add(1, std::memory_order_relaxed);
+                    // (the host USM cache's rule below: the file pages back to the OS as each blob is copied)
+                    if (xcache.host_usm() && j.i > 0) (void) srcp->release(j.layer, j.expert);
+                }
+            };
+            std::vector<std::thread> pool;
+            for (int64_t t = 0; t < std::min<int64_t>(fill_threads, (int64_t) jobs.size()); ++t) pool.emplace_back(worker);
+            for (auto& t : pool) t.join();
+            if (bad.load() >= 0) {
+                std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n", (long long) bad.load(), err.c_str());
+                return 1;
+            }
+            prefilled = done.load();
+            fill_bytes = copied.load();
+        }
+        for (int64_t i = 0; i < want && !fill_parallel; ++i) {
             if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
             if (slot == strata::core::kNotResident) break;
@@ -5852,10 +5907,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         mem_mark("the profile fill");
-        std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile in %.1f s (%.0f MB/s); "
+        std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile in %.1f s (%.0f MB/s%s); "
                              "slot 0 verified\n",
                      (long long) prefilled, (long long) want, fill_s,
-                     fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0);
+                     fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0,
+                     fill_parallel ? (", " + std::to_string(fill_threads) + " threads").c_str() : "");
     }
 
 

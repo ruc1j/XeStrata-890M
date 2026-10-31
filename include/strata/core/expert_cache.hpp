@@ -29,6 +29,7 @@
 // kernel. This is that first step, and the step it unblocks is the one that can be measured.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -206,7 +207,7 @@ public:
     bool verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
 
     /// Slots filled so far, for the startup report.
-    int64_t fills() const { return fills_; }
+    int64_t fills() const { return fills_.load(std::memory_order_relaxed); }
 
     /// The elastic K/V (--kv-grow): the arena in a VMM range (vmm.hpp) instead of one allocation, so the K/V can take
     /// single chunks of it and give them back. Applies to the next `open`; ignored where VMM is not available.
@@ -257,7 +258,7 @@ private:
     int64_t n_expert_ = 0;
     int64_t blob_ = 0;
     int64_t next_free_ = 0;
-    int64_t fills_ = 0;
+    std::atomic<int64_t> fills_{0};   ///< the start-up profile fill writes slots from several threads (generate.cpp)
     /// R4.2g.  `per_layer_` off (the default) leaves `next_free_` as the only admission counter, so the
     /// pre-existing path is untouched.
     bool per_layer_ = false;

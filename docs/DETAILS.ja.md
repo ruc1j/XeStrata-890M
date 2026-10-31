@@ -470,6 +470,7 @@ B70 の Coder（アリーナ 23.4 GiB、すべて VRAM）では、23.38 GiB を 
 ページフォールトを 1 つずつ待たずに、ドライブに深いキューで読ませるためです。
 upstream の測定（Gen3 NVMe、RTX 5090、32 GB、Q2_0 を RAM に置いて 262K）では、起動が約 920 秒から 70 秒になりました。
 `STRATA_READ_AHEAD=0` で止め、`STRATA_FILL_AHEAD=N` でキャッシュの充填で先に頼む組の数を決めます（既定 256）。
+`STRATA_FILL_THREADS=N`（既定 8、0 か 1 で 1 スレッド）は、起動の充填で blob の読みとコピーを行うスレッドの数です。pair の admit は順に 1 スレッドで行い、読みとコピーは互いに重ならない slot を複数のスレッドで行います（chenyb999-zhcn/Strata 0c16171ce）。unbuffered の tier は 1 スレッドのままです。
 
 CPU 内蔵のグラフィックスは RAM を共有するので、省 RAM モードにはなりません。
 GPU がモデルのどれだけを持てるかの setup の見積もりは upstream のもの（VRAM から約 5 GB を引く）です。
