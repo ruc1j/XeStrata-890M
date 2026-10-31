@@ -4220,7 +4220,7 @@ class Service:
             texts.append(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         tail = EFFORT_TURN.format("\n\n".join(texts)) if texts else ""
         if reminder is not None and default_effort:
-            history = mine                             # default effort: the history exactly as a default request renders
+            history = mine                             # default effort: the history as a default request renders it
         return history + tail + full[len(mine):]
 
     def encode_prompt(self, messages, tools, kwargs, store: bool = True) -> list[int]:
@@ -4572,7 +4572,7 @@ class Service:
                 budget = max(1, max_new - reserve)
         reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
         parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
-                  reader(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
+                  reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True, recover=self.tool_call_recovery,
                          declared_only=declared_only))
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
@@ -7613,6 +7613,31 @@ def model_card_sampling(arch, thinking) -> dict:
     """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family)."""
     sets = MODEL_CARD_SAMPLING.get(arch) if arch else None
     return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
+
+
+def with_history_tools(tools, req) -> list:
+    """#4663 (upstream 3282c6134): an agent's tool set changes between turns (deferred tools, MCP servers, a compacted
+    history), and the model calls a tool it used earlier in this conversation that this turn's `tools` no longer lists.
+    That call came back as raw text with finish_reason "stop", and the client took it for prose and stopped.  A name the
+    conversation's own assistant messages called is a tool the client has, so it counts as declared (the call comes back
+    as a tool call; the client says what it does with it).  Nothing is added when the request declared no tools at all,
+    or for a name that is already declared."""
+    if not tools or not isinstance(req, dict):
+        return tools
+    try:
+        have = {t.get("name") for t in tools if isinstance(t, dict)}
+        extra = []
+        for message in req.get("messages") or []:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                name = (call.get("function") or {}).get("name") if isinstance(call, dict) else None
+                if isinstance(name, str) and name and name not in have:
+                    have.add(name)
+                    extra.append({"name": name, "parameters": {"type": "object", "properties": {}}})
+        return [*tools, *extra] if extra else tools
+    except Exception:
+        return tools
 
 
 def tool_call_recovery_setting(cfg: dict) -> bool:
