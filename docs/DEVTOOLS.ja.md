@@ -298,7 +298,7 @@ sde64 -version
   decode の `verify window` の行（ホストが GPU を待つ時間、CPU のプール）は、いつも出ます。
 - `STRATA_VERIFY_NODES=1` は、decode の窓のグラフに入るカーネルの数を出します。
 - SYCL のイベントのプロファイリングで単独のカーネルを測る使い捨てのプローブ。
-- `STRATA_VERIFY_PROFILE=1` は、decode の窓の層内の段ごとの時間（デバイスの時計の tick）を `--stats` の `verify profile` の行に出します。
+- `STRATA_VERIFY_PROFILE=1` は、decode の窓の層内の段ごとの時間（デバイスの時計の tick）を `--stats` の `verify profile` の行に出します。serve では「strata decode GPU stages」の行として、要求ごとにエンジンのログに出ます。
   B70 は Level Zero がデバイスの時計の aspect を報告しませんが、SPIR-V の OpReadClockKHR はコンパイラが動かすので、エンジンは起動時にその stamp のカーネルを試しに組んで使います（NVIDIA は %globaltimer、AMD は出ません）。
   B70 の tick は GPU のコアクロックで（長さの分かる帯域カーネルに対し 2.8 GHz、`max_freq`）、クロックが下がれば遅くなるので、段は比率で読みます。
   XeStrata-890M では 890M（HIP）その GPU の REALTIME カウンター（100 MHz、1 M ticks = 10 ms）を読み、

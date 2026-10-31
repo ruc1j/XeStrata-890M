@@ -298,7 +298,7 @@ sde64 -version
   The decode's `verify window` line (the host's wait for the GPU, the CPU pool) is always printed.
 - `STRATA_VERIFY_NODES=1` prints how many kernels a decode window's graph holds.
 - Scratch probes that time single kernels with SYCL event profiling.
-- `STRATA_VERIFY_PROFILE=1` prints the stages of a decode window's layers (device clock ticks) on the `verify profile` line of `--stats`.
+- `STRATA_VERIFY_PROFILE=1` prints the stages of a decode window's layers (device clock ticks) on the `verify profile` line of `--stats`; in serve it is the `strata decode GPU stages` line of the engine's log, one a request.
   Level Zero does not report the device clock aspect on the B70, but its compiler runs SPIR-V's OpReadClockKHR, so the engine builds the stamp kernel once at start and uses it where that works (NVIDIA: %globaltimer; AMD: no profile).
   On the B70 the tick is the GPU's core clock (2.8 GHz against a bandwidth kernel of known length, its `max_freq`), slower when the clock drops, so read the stages as shares.
   XeStrata-890M on the 890M (HIP) reads the GPU's REALTIME counter (100 MHz, 1 M ticks = 10 ms), and with
