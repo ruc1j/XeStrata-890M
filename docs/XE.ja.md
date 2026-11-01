@@ -39,7 +39,7 @@ CPU 内蔵のグラフィックス（開発機では UHD 770）は確認用の 2
 
 入ったものは次のとおりです。
 
-- 画像のエンジン: HunyuanImage 3.0、MOSS-Image、MageTrail と Flux2 VAE、LoRA（LoKr、DoRA、LoHa、OFT/BOFT、GLoRA を含む）、img2img とマスク、途中の画像、RDNA3 の int8 の注意。setup の `--images` で複数のモデルを入れられます。この fork では画像のモデルを動かしていません（未検証）。
+- 画像のエンジン: HunyuanImage 3.0、MOSS-Image、MageTrail と Flux2 VAE、LoRA（LoKr、DoRA、LoHa、OFT/BOFT、GLoRA を含む）、img2img とマスク、途中の画像、RDNA3 の int8 の注意。setup の `--images` で複数のモデルを入れられます。890M では Mage-Flow-Turbo（bf16、DiT は読みながら 8 ビットに）で 1024 x 1024 の 1 枚を 4 ステップ 29.9 秒で作れました（文の読み取り 4.1 秒、サンプリング 23.8 秒。AOTriton の注意のモジュールはないので自前のカーネルです）。ほかの画像のモデルは動かしていません。
 - serve: OpenAI と Anthropic の API の抜けを埋める一連の修正（`/v1/responses` の tool_choice と allowed_tools、Chat の `n` と古い `functions`、Anthropic の構造化出力、PDF とテキストのファイルの読み取り、エラーの形の統一）、strict の道具とスキーマの文法での縛り（XGrammar、`STRATA_GRAMMAR=0` で切る）、Project Maya のループ対策（`loop_guard`、既定で入る）、モデルの思考の段を `/health` で知らせる仕組み、SIGHUP での後始末。
 - web ページ: 画像のタブの拡張、言語の既定をブラウザーから選ぶこと、XeStrata だけの画面の文の 9 言語の訳、min_p の欄。
 - エンジン: TQP5〜TQP7（Gyro-Coder）の型、エキスパートの int8 の積の Q5_1、2 ビットの下書きのヘッド（この fork では `STRATA_MTP_SKETCH=0` のときだけ使います。1 ビットの写しが同じ役を担うためです）、`STRATA_PARK_VRAM_MIB`、`STRATA_ROUTE_DUMP` / `STRATA_ROUTE_REPLAY`、`STRATA_DOWN_WS`（Pascal 向け、APU の行とは組み合わせません）、READY の前にページの移動が落ち着くまで待つこと、`STRATA_SETTLE_S`、Qwen3.5-9B（密なモデル）とそのエンコーダー。
@@ -54,7 +54,7 @@ fork の形を残したものは次のとおりです。両側が同じ Strata �
 - README とこの fork の文書、`container/`、CI、リリースの確認の宛先。
 
 確かめたこと: free ビルド、CTest（pack の要る 2 本を除いて通ります）、serve の Python の試験（1,016 本、28 本は skip）、tools の試験（388 本、8 本は skip）、`reuse lint` と `tools/license_class.py`、Python と JavaScript の lint で merge が新しく足した指摘がないこと。
-画像の生成、contrib-llvm のビルド、Windows のクロスビルド、ほかの GPU は未検証です。
+Mage-Flow-Turbo 以外の画像のモデル、contrib-llvm のビルド、Windows のクロスビルド、ほかの GPU は未検証です。
 
 ## Strata 0.1.55 の取り込み
 

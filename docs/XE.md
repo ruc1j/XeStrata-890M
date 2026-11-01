@@ -38,7 +38,7 @@ Of its 1,645 commits, 491 are upstream's own rather than Strata's, and 108 of th
 
 What came in:
 
-- The image engine: HunyuanImage 3.0, MOSS-Image, MageTrail with the Flux2 VAE, LoRA (LoKr, DoRA, LoHa, OFT/BOFT and GLoRA included), img2img and masks, partial images, the int8 attention on RDNA3. Setup's `--images` takes several models. This fork has not run an image model (unverified).
+- The image engine: HunyuanImage 3.0, MOSS-Image, MageTrail with the Flux2 VAE, LoRA (LoKr, DoRA, LoHa, OFT/BOFT and GLoRA included), img2img and masks, partial images, the int8 attention on RDNA3. Setup's `--images` takes several models. On the 890M, Mage-Flow-Turbo (bf16; its DiT read into 8 bits) made one 1024 x 1024 image in 4 steps in 29.9 s (the text encoding 4.1 s, the sampling 23.8 s; AOTriton's attention module is not there, so the engine's own kernel runs). The other image models were not run.
 - serve: the run of fixes that fill the gaps of the OpenAI and Anthropic APIs (`/v1/responses` tool_choice and allowed_tools, Chat's `n` and the old `functions`, Anthropic's structured output, PDF and text files in requests, one shape of error), strict tools and schemas constrained by a grammar (XGrammar; `STRATA_GRAMMAR=0` turns it off), Project Maya's loop guard (`loop_guard`, on by default), the model's thinking levels announced by `/health`, the clean-up on SIGHUP.
 - The web page: the Images tab's extensions, the browser's language as the default, the XeStrata-only strings in nine languages, a min_p field.
 - The engine: the TQP5 to TQP7 types (Gyro-Coder), Q5_1 in the experts' int8 products, the draft head at 2 bits (used here only with `STRATA_MTP_SKETCH=0`, since the one-bit sketch plays the same part), `STRATA_PARK_VRAM_MIB`, `STRATA_ROUTE_DUMP` / `STRATA_ROUTE_REPLAY`, `STRATA_DOWN_WS` (for Pascal; never combined with the APU rows), the wait before READY until the kernel's page moves settle, `STRATA_SETTLE_S`, Qwen3.5-9B (a dense model) and its encoder.
@@ -53,7 +53,7 @@ What keeps the fork's form, where both sides held the same Strata change in othe
 - The README and this fork's documents, `container/`, the CI and the update check's destination.
 
 Checked: the free build, CTest (passes but for the two tests that need a pack), the serve Python tests (1,016, 28 skipped), the tools tests (388, 8 skipped), `reuse lint` and `tools/license_class.py`, and that the Python and JavaScript lints report nothing the merge added.
-Image generation, the contrib-llvm build, the Windows cross build and other GPUs are unverified.
+The image models other than Mage-Flow-Turbo, the contrib-llvm build, the Windows cross build and other GPUs are unverified.
 
 ## Integration through Strata 0.1.55
 
