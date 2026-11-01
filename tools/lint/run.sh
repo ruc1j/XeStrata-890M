@@ -17,6 +17,8 @@ BUILD=${STRATA_LINT_BUILD:-build/free}
 PATH=$PWD/.lint/venv/bin:$PWD/.lint/bin:$PWD/.lint/node_modules/.bin:$PATH
 export PATH
 CLANG_TIDY=${STRATA_CLANG_TIDY:-$(find /opt/intel/oneapi/compiler -path '*/bin/compiler/clang-tidy' 2>/dev/null | sort -V | tail -1)}
+# else the clang-tidy of the intel/llvm built from source (docs/DEVTOOLS.md#lints: clang-tools-extra), which knows SYCL too
+[ -z "$CLANG_TIDY" ] && [ -x .tools/intel-llvm/install/bin/clang-tidy ] && CLANG_TIDY=.tools/intel-llvm/install/bin/clang-tidy
 
 if [ $# -gt 0 ]; then
   files=("$@")

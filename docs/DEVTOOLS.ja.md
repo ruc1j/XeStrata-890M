@@ -33,6 +33,7 @@ sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyf
 ```
 
 `tools/lint/run.sh` は、ディストリビューションの clang-tidy ではなく、SYCL を理解する oneAPI の clang-tidy（`/opt/intel/oneapi/compiler` の下）を使います。
+oneAPI がなければ、ソースから建てた intel/llvm の clang-tidy（`.tools/intel-llvm/install/bin/clang-tidy`）を使います。これは `tools/intel_llvm_build.py` のビルドには入っていないので、そのビルド木に `cmake -S .tools/intel-llvm/src/llvm -B .tools/intel-llvm/build -DLLVM_ENABLE_PROJECTS='<今の一覧>;clang-tools-extra'` で clang-tools-extra を足し、`ninja -C .tools/intel-llvm/build clang-tidy` で建てて `bin/clang-tidy` をそこへ写します（今の一覧は `CMakeCache.txt` の `LLVM_ENABLE_PROJECTS`）。SYCL のソースをそのまま読めます。
 ほかの場所の clang-tidy は `STRATA_CLANG_TIDY` で指定します。
 clang-tidy はビルドフォルダー（既定は `build/free`、`STRATA_LINT_BUILD` で変えられます）の `compile_commands.json` を読みます。
 

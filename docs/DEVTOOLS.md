@@ -33,6 +33,7 @@ sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyf
 ```
 
 `tools/lint/run.sh` runs oneAPI's clang-tidy, which knows SYCL (found under `/opt/intel/oneapi/compiler`), not the distribution's.
+Without oneAPI it takes the clang-tidy of the intel/llvm built from source (`.tools/intel-llvm/install/bin/clang-tidy`). `tools/intel_llvm_build.py` does not build it, so add clang-tools-extra to that build tree with `cmake -S .tools/intel-llvm/src/llvm -B .tools/intel-llvm/build -DLLVM_ENABLE_PROJECTS='<the list as it is>;clang-tools-extra'`, build it with `ninja -C .tools/intel-llvm/build clang-tidy` and copy `bin/clang-tidy` there (the list as it is: `LLVM_ENABLE_PROJECTS` in `CMakeCache.txt`). It reads the SYCL sources as they are.
 A clang-tidy elsewhere is named with `STRATA_CLANG_TIDY`.
 clang-tidy reads `compile_commands.json` from the build folder (by default `build/free`; `STRATA_LINT_BUILD` changes it).
 
