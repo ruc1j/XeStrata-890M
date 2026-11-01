@@ -37,8 +37,8 @@ fork rebuilds that AMD path for the Radeon 890M. The models, the install flow, t
 XeStrata's as they are.
 
 The build is the free build only, of free software only (ROCm is free software). oneMKL and CUDA are not used.
-The fork carries in the original XeStrata's changes up to xe0.2.2-1 (Strata 0.2.2) and the engine, serve and setup
-changes of upstream Strata 0.2.9 (engine 0.1.55) ([docs/XE.md](docs/XE.md)).
+The fork carries in the original XeStrata's changes up to xe0.2.8-1 (its main of 2026-10-30) and the engine, serve and
+setup changes of upstream Strata 0.2.9 (engine 0.1.55) ([docs/XE.md](docs/XE.md)).
 
 **What an 890M is, and how to use this fork**
 
@@ -426,12 +426,15 @@ permission under GPL section 7, what goes in, and how to report).
    - [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF), by agentionai.
    - the [abliterated versions](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF), by huihui-ai.
    - [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones by pfeifferj), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp,
-     [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth).
-   - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, and Qwen3-VL as the text encoder ([IMAGE](docs/IMAGE.md#licenses)).
+     [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);
+   - [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth), and the version with its refusals removed, [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive), by HauhauCS;
+   - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image, and Qwen3-VL and Qwen3.5-9B as the text encoders ([IMAGE](docs/IMAGE.md#licenses)).
 
   Each model's own license applies to its files.
 - **Parts it uses:**
    - parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT); Gyro's formats from agentionai's fork of llama.cpp (MIT);
+   - [Project Maya](https://github.com/mw00/project-maya), by Peasant Smith and the Project Maya contributors (MIT): the
+     server's loop guard (`serve/loop_guard.py`);
    - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the rocBLAS backend (the startup comparison and `STRATA_BLAS=1`),
      which CMake fetches from XeStrata's fork with XeStrata's changes ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), under the same license);
    - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the compiler and the SYCL runtime,
@@ -443,22 +446,25 @@ permission under GPL section 7, what goes in, and how to report).
    - the image engine's attention: [oneDNN](https://github.com/uxlfoundation/oneDNN) (Apache-2.0, Intel GPUs), [AOTriton](https://github.com/ROCm/aotriton) (MIT, AMD GPUs)
      and [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend) (Apache-2.0, parts MIT, NVIDIA GPUs); for reading reference images, [stb_image](https://github.com/nothings/stb) (MIT or the Unlicense);
    - [quantscope](https://github.com/1872183316/quantscope) (MIT or Apache-2.0): what `setup.py --inspect` reads a GGUF's contents with;
-   - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1).
+   - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1);
+   - [KaTeX](https://katex.org/) (MIT), which draws the math in the chat.
 - **Ideas from:** those in the original XeStrata's [credits](https://github.com/MistVVK/XeStrata#credits):
    - [Splash](https://github.com/incoai/splash), by Inco AI and the Splash contributors;
    - [ninfer](https://github.com/Neroued/ninfer), by Neroued;
    - [HyperQwen](https://github.com/syv-ai/HyperQwen), by syv.ai and the HyperQwen contributors;
-   - [Project Maya](https://github.com/mw00/project-maya), by mw00 and the Project Maya contributors (how many of the
-     experts missing from VRAM the CPU computes and how many are read over PCIe);
+   - [Project Maya](https://github.com/mw00/project-maya), by Peasant Smith and the Project Maya contributors (how many
+     of the experts missing from VRAM the CPU computes and how many are read over PCIe; skipping the experts read from the
+     SSD by their rank);
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
      models merges). The IQ4 lookup's form follows llama.cpp's HIP version.
 - The parts are listed in [third_party/main/README.md](third_party/main/README.md); more in [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
 
 ## License
 
-XeStrata (copyright MistVVK and the XeStrata contributors) is free software, distributed whole under the
-[GNU Lesser General Public License, version 3 or later](COPYING.LESSER) (`COPYING.LESSER` and `COPYING`). So is
-this fork.
+XeStrata is free software. The code written for it, by MistVVK and the XeStrata contributors, is under the
+[GNU Lesser General Public License, version 3 or later](COPYING.LESSER) (`COPYING.LESSER`, with `COPYING`), and
+XeStrata as a combined work is distributed under that license. So is this fork. Some parts keep their own licenses:
+the code that comes from Strata and ggml / llama.cpp (MIT) and the components listed below.
 
 - **Linking with the makers' compute libraries:** what is linked with a compute library and its runtime libraries
   that a GPU or CPU maker publishes for its own products may be distributed as well: an additional permission under
@@ -474,6 +480,7 @@ this fork.
    - Unmodified copies: ggml's `ggml-common.h` and agentionai's llama.cpp's `ggml-common-tq.h` (`third_party/main/ggml/`, MIT),
      `quantscope.py` (`third_party/main/quantscope/`, MIT or Apache-2.0), `stb_image.h` (`third_party/main/stb/`, MIT or the Unlicense).
    - The app's font Outfit (`third_party/main/outfit/`): SIL Open Font License 1.1.
+   - KaTeX, which draws the math in the chat (`third_party/main/katex/`): MIT.
    - `third_party/nonfree/`: what is not free software. The original model's chat template and the experimental
      speed projection's vector, both under the Qwen Community License 1.0.
 - **Without `third_party/nonfree/`,** XeStrata still builds and runs. The packages leave it out.

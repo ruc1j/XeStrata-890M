@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/chats-ui.js - the chat history on the page: the saved-chats list, and edit / regenerate / go back / branch / undo.
 // One design for the proposals in PRs #1787 (list), #2615 (edit, regenerate, undo) and issue #3823 (rewind asks: here or a branch);
 // the pure part is serve/web/history.js, the browser store is serve/web/chatstore.js.
@@ -10,6 +11,9 @@
 // This file is loaded before app.js and uses its globals when its functions run: $, esc, icon, node, toast, store, settings,
 // messages, attachments, busy, pending, setBusy, renderChat, renderAttachments, autosize, generateReply, releasePending.
 // app.js calls initChats() once, from start().
+/* global tr, $, esc, icon, toast, store, settings, messages:writable, attachments:writable, busy, pending, setBusy, renderChat,
+          renderAttachments, autosize, generateReply, releasePending, StrataHistory, StrataChatStore */
+/* exported initChats, setChatList, syncActions, renderParent */
 "use strict";
 
 const H = StrataHistory;
@@ -51,7 +55,7 @@ function stillWriting() { toast("warn", tr("busy.stillWriting", "Still writing")
 
 // ------------------------------------------------------------------ the saved-chats list (#1787)
 // Turning the list on: the chat on the screen becomes the first record. Only when the switch is flipped in this visit: on a page
-// load the list is the list, so a fresh chat stays empty and the single chat of before ("strata.chat") is read once, when the
+// load the list is the list, so a fresh chat stays empty and the single chat of before ("xestrata.chat") is read once, when the
 // store is empty.
 async function openChats(fromScreen) {
   await chatStore.start();

@@ -22,7 +22,6 @@ breaking.
 from __future__ import annotations
 
 import collections
-from typing import Any
 import base64
 import hashlib
 from pathlib import Path
@@ -34,12 +33,14 @@ import signal
 import subprocess
 import sys
 import threading
+from typing import cast
 import time
 import urllib.error
 import urllib.request
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
-DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False}
+DEFAULTS: dict[str, float | int | bool] = {
+    "timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False}
 
 
 class McpError(RuntimeError):
@@ -627,9 +628,11 @@ class McpHub:
         if cap > 0 and full > cap:
             text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
                                  f"{cap:,} are shown]")
-        if ok and out.get("images") and self.media_dir is not None:
-            out["model_content"] = [{"type": "text", "text": text.replace(": not shown to the model]", ": image attached]")}] + [
-                {"type": "image", "source": str(Path(self.media_dir) / im["url"].split("/")[-1])}
+        if ok and out.get("images"):
+            media = cast(Path, self.media_dir)                 # (image_results is on only with a media folder)
+            shown = text.replace(": not shown to the model]", ": image attached]")
+            out["model_content"] = [{"type": "text", "text": shown}] + [
+                {"type": "image", "source": str(media / im["url"].split("/")[-1])}
                 for im in out["images"]]
         out.update(ok=ok, text=text, chars=full, truncated=cap > 0 and full > cap,
                    ms=int((time.monotonic() - t0) * 1000))
@@ -687,8 +690,9 @@ def servers_from(block, where: str) -> dict[str, dict]:
 
 
 def settings_from(cfg: dict) -> dict:
-    """The run config's optional `"mcp"` block: timeout_s, max_result_chars, max_rounds, start_timeout_s, image_results."""
-    out: dict[str, Any] = {}
+    """The run config's optional `"mcp"` block: timeout_s, max_result_chars, max_rounds, start_timeout_s,
+    image_results."""
+    out: dict[str, float | int | bool] = {}
     for key, value in (cfg.get("mcp") or {}).items():
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "image_results":

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/history.js - what the chat history does to a list of messages. Pure functions: no page, no storage, no clock of
-// their own, so they can be tested alone (serve/test_web_history.js). app.js draws the controls and keeps the state.
+// their own, so they can be tested alone. app.js draws the controls and keeps the state.
 //
 // One design for five proposals (see docs/DETAILS.md, "The web page"):
 //   #2615 (uppet)         edit your question, correct an answer, regenerate, go back, undo
@@ -10,6 +11,7 @@
 //   #3550 / #4004           the header's Load / Unload; sending while an answer is being written (app.js)
 // A message list is an array of {role, text, time, images, files, reasoning, tools, meta, ...}; an attachment that was read
 // in this page has its contents (image url, file text), one that came back from the browser's store has its name only.
+/* global module, globalThis */   // module: Node, when a script loads this file
 "use strict";
 (function (root) {
   const TITLE_MAX = 60;

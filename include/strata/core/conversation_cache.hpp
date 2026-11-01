@@ -55,6 +55,14 @@ struct ConversationKv {
     int format = 0;
     int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
     ConversationBuffer k, v, k_scale, v_scale, pooled;
+    // STRATA_PARK_VRAM_MIB: the tag this layer's parts were recorded under in the park's VRAM slot (0: none).  Set by
+    // conversation_kv_save; a restore that finds the slot copies from it instead of from the buffers above.
+    uint64_t dev_tag = 0;
+    // STRATA_PARK_VRAM_MIB: set while a background copy fills the buffers above from the slot; its deleter waits for
+    // that copy and releases the slot.  This layer's own token (not shared): the layers outlive their image when they
+    // are retained for the next park (ConversationCache::retain), and go in any order.  Last member: it goes before
+    // any buffer.
+    std::shared_ptr<void> pending;
     size_t bytes() const {
         return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();
     }
@@ -146,6 +154,21 @@ inline bool conversation_chain_holds(const ConversationCheckpoint& c, const std:
     for (const auto& k : checkpoints)
         if (k.ids == c.ids && k.imgs == c.imgs) return true;
     return false;
+}
+
+/// `c` holds the state `ids` (with `images`) describes, or a continuation of it: its tokens start with `ids` and its
+/// pictures below ids.size() are exactly `images` (upstream 01e404c14: an idle batch slot need not park it again).
+inline bool conversation_covers(const ConversationCheckpoint& c, const std::vector<int32_t>& ids,
+                                const std::vector<ConversationImageKey>& images) {
+    const size_t n = ids.size();
+    if (n == 0 || c.ids.size() < n || !std::equal(ids.begin(), ids.end(), c.ids.begin())) return false;
+    size_t j = 0;
+    for (const auto& image : c.imgs) {
+        if (image.start >= (int64_t) n) continue;
+        if (j == images.size() || !(images[j] == image)) return false;
+        ++j;
+    }
+    return j == images.size();
 }
 
 class ConversationCache {

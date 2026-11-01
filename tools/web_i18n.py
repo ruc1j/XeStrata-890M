@@ -9,9 +9,10 @@
 The English text lives in the code (see serve/web/i18n.js):
     tr("key", "English text", vars)                          in serve/web/*.js
     tr("key", {one: "{n} chat", other: "{n} chats"}, vars)   a plural
-    <span data-i18n="key">English text</span>                in serve/web/index.html (also data-i18n-title, -label, -placeholder)
+    <span data-i18n="key">English text</span>                in serve/web/index.html
+                                                             (also data-i18n-title, -label, -placeholder)
 Both must be plain string literals (no template strings, no joined strings), so that this reader and a translator see
-the same text. serve/test_web_i18n.py runs the check.
+the same text.
 """
 from __future__ import annotations
 
@@ -123,7 +124,8 @@ def html_strings(src: str) -> dict:
 def english() -> dict:
     """Every key in serve/web with its English text; the same key twice must have the same text."""
     out: dict = {}
-    sources = {p.name: js_strings(p.read_text(encoding="utf-8"), p.name) for p in sorted(WEB.glob("*.js")) if p.name != "i18n.js"}
+    sources = {p.name: js_strings(p.read_text(encoding="utf-8"), p.name)
+               for p in sorted(WEB.glob("*.js")) if p.name != "i18n.js"}
     sources["index.html"] = html_strings((WEB / "index.html").read_text(encoding="utf-8"))
     for name, found in sources.items():
         for key, value in found.items():
@@ -136,10 +138,9 @@ def english() -> dict:
 def languages() -> list:
     src = (WEB / "i18n.js").read_text(encoding="utf-8")
     found = re.search(r"const LANGUAGES = (\[.*?\]);", src, re.S)
-    if found is None:
-        raise SystemExit("serve/web/i18n.js: no `const LANGUAGES = [...]` block")
-    block = found.group(1)
-    return [m for m in re.findall(r'\["([\w-]+)",', block)]
+    if not found:
+        raise Problem("serve/web/i18n.js has no LANGUAGES")
+    return [m for m in re.findall(r'\["([\w-]+)",', found.group(1))]
 
 
 def placeholders(value) -> set:
@@ -160,7 +161,8 @@ def check_catalog(code: str, catalog: dict, en: dict) -> list:
         if isinstance(value, dict):
             bad = [c for c in value if c not in PLURAL_CATEGORIES]
             if bad or "other" not in value:
-                problems.append(f"{code}: {key!r}: plural forms must be CLDR names with an 'other' form, got {sorted(value)}")
+                problems.append(f"{code}: {key!r}: plural forms must be CLDR names with an 'other' form, "
+                                f"got {sorted(value)}")
             if not isinstance(en[key], dict):
                 problems.append(f"{code}: {key!r} is a plural here but not in the code")
         elif isinstance(en[key], dict):
@@ -171,7 +173,8 @@ def check_catalog(code: str, catalog: dict, en: dict) -> list:
         if placeholders(value) != placeholders(en[key]) and not (
                 isinstance(value, dict) and isinstance(en[key], dict)
                 and all(placeholders(f) <= placeholders(en[key]) for f in value.values())):
-            problems.append(f"{code}: {key!r} uses {sorted(placeholders(value))}, the code uses {sorted(placeholders(en[key]))}")
+            problems.append(f"{code}: {key!r} uses {sorted(placeholders(value))}, "
+                            f"the code uses {sorted(placeholders(en[key]))}")
     return problems
 
 

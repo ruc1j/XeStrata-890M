@@ -16,7 +16,6 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-header .st-tabs { margin-left: var(--st-s-4); }
 #unload-btn { flex: none; height: 32px; padding: 0 12px; min-width: 7.75rem; }
 .st-header--clip #pill-text { display: none; }
-#drawer-close .st-icon { transform: rotate(-90deg); }
 
 /* ---------------------------------------------------------------- chat */
 .chat-scroll { flex: 1; min-height: 0; overflow-y: auto; }
@@ -26,7 +25,8 @@ main { flex: 1; min-height: 0; display: flex; }
 .chat-empty__title { font-weight: var(--st-fw-black); font-size: var(--st-fs-display); line-height: var(--st-lh-tight);
                      letter-spacing: -.02em; }
 .chat-empty__sub { overflow-wrap: anywhere; margin-top: var(--st-s-3); color: var(--st-ink-muted); }
-.st-msg { width: 100%; }
+/* a message may use the room a wide window gives the chat column (#3176 widened the column; the kit's 720px kept the messages narrow in it) */
+.st-msg { width: 100%; min-width: 0; max-width: min(100%, 900px); }
 .st-msg--assistant { align-self: flex-start; }
 .st-msg--assistant .st-bubble { width: 100%; overflow-wrap: anywhere; }
 .st-msg--user .st-bubble { white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -51,7 +51,6 @@ main { flex: 1; min-height: 0; display: flex; }
 .tool-images img { max-width: min(100%, 512px); max-height: 512px; }
 .st-msg .st-collapse { width: 100%; }
 .st-collapse__body.thinking { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; overflow-y: auto; }
-.st-msg { min-width: 0; }
 .st-msg__meta .st-btn--icon { width: 28px; height: 28px; }
 .st-msg__meta .st-btn--icon .st-icon { width: 16px; height: 16px; }
 .cursor::after { content: ""; display: inline-block; width: 8px; height: 1.1em; margin-left: 2px; vertical-align: -3px;
@@ -220,8 +219,8 @@ main { flex: 1; min-height: 0; display: flex; }
   .monitor, .about { padding: var(--st-s-4); }
   .facts { grid-template-columns: 1fr; gap: 2px; }
   .facts dd { margin-bottom: var(--st-s-2); }
-  .cfg-form .st-input { max-width: none; }
   .st-btn, .st-input, .seg button, .st-tab { min-height: 40px; }
+  .cfg-form .st-input { max-width: none; }
   .st-btn--icon, .st-composer__bar .st-btn--icon { width: 40px; height: 40px; }
   .st-btn--send { width: 44px; }
   .st-msg__meta .st-btn--icon, .facts .st-btn--icon { width: 40px; height: 40px; }
@@ -252,6 +251,39 @@ main { flex: 1; min-height: 0; display: flex; }
 .img-form{display:flex;flex-direction:column;gap:12px}
 .img-prompt{height:auto;padding:10px 14px;resize:vertical}
 .img-row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
+.chat-images{width:auto;max-width:220px;height:36px;padding:0 10px;font-size:13px}
+.img-row input[type=number]{width:120px}
+.img-check{flex-direction:row;align-items:center;min-height:44px}
+.img-mask{display:flex;flex-direction:column;gap:8px}
+.img-mask-tools{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.img-mask-stage{position:relative;align-self:flex-start;max-width:100%}
+.img-mask-stage img{display:block;max-width:100%;max-height:512px;border-radius:8px}
+.img-mask-stage canvas{position:absolute;inset:0;width:100%;height:100%;opacity:.5;touch-action:none;cursor:crosshair}
+.img-moss{display:flex;flex-direction:column;gap:12px}
+.img-moss[hidden],.img-layout[hidden]{display:none}
+.img-moss-more .st-collapse__body{padding:10px 14px}
+.img-lora{display:flex;flex-direction:column;gap:8px}
+.img-lora[hidden]{display:none}
+.img-lora-chips{display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+.img-lora-chip{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:4px 8px;border:1px solid var(--st-line);
+  border-radius:var(--st-r-md);background:var(--st-surface-2)}
+.img-lora-chip__name{font-size:var(--st-fs-sm);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.img-lora-chip input[type=number]{width:84px}
+.img-lora-chip .st-btn--icon{font-size:var(--st-fs-md);line-height:1}
+.img-layout{display:flex;flex-direction:column;gap:8px}
+.img-layout-stage{position:relative;width:100%;max-width:512px;border:1px dashed var(--st-line);border-radius:8px;
+  background:var(--st-surface-2) center/100% 100% no-repeat;touch-action:none;cursor:crosshair;user-select:none;overflow:hidden}
+.img-box{position:absolute;box-sizing:border-box;border:2px solid #2563eb;background:rgba(37,99,235,.12);cursor:move;
+  overflow:hidden;font-size:var(--st-fs-xs);color:var(--st-ink);padding:2px 4px;line-height:1.2}
+.img-box[data-label=text]{border-color:#e11d48;background:rgba(225,29,72,.12)}
+.img-box[data-label=character]{border-color:#16a34a;background:rgba(22,163,74,.12)}
+.img-box[aria-selected=true]{outline:2px solid var(--st-focus);outline-offset:1px}
+.img-box__handle{position:absolute;right:0;bottom:0;width:18px;height:18px;background:currentColor;opacity:.6;cursor:nwse-resize}
+.img-box-wide{flex:1 1 200px}
+.img-box-wide .st-input{width:100%}
+.img-enhanced{font-size:var(--st-fs-sm, 13px);color:var(--st-ink-muted);margin-top:4px;display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+.img-n{display:flex;gap:8px;align-items:center}
+.img-n-est{font-size:var(--st-fs-xs);color:var(--st-ink-muted);font-variant-numeric:tabular-nums;white-space:nowrap}
 .img-wh{display:flex;gap:6px}
 .img-wh .st-input{width:6.5em}
 .img-results{display:flex;flex-direction:column;gap:12px}
@@ -277,11 +309,11 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-code .st-btn--icon[aria-pressed="true"] { background: rgba(255, 255, 255, .12); color: #fff; }
 .st-code__preview { display: none; }
 .st-code[data-preview="true"] > pre { display: none; }
+.st-code--run .st-code__preview { outline: 2px solid var(--st-warn-text); outline-offset: -2px; }
 .st-code[data-preview="true"] .st-code__preview { display: block; height: min(340px, 60vh); background: var(--st-surface-2); }
 .st-code [data-preview-scripts] { display: none; }
 .st-code[data-preview="true"] [data-preview-scripts] { display: inline-flex; }
 .st-code .st-btn--icon[data-preview-scripts][aria-pressed="true"] { background: var(--st-warn-tint); color: var(--st-warn-text); }
-.st-code--run .st-code__preview { outline: 2px solid var(--st-warn-text); outline-offset: -2px; }
 .st-code__preview iframe { display: block; width: 100%; height: 100%; border: 0; background: transparent; }
 
 /* ---------------------------------------------------------------- chat history (chats-ui.js)
@@ -292,12 +324,8 @@ main { flex: 1; min-height: 0; display: flex; }
                 padding: var(--st-s-4); background: var(--st-surface); border-right: 1px solid var(--st-line); }
 .sidebar-head { display: flex; align-items: center; gap: var(--st-s-2); }
 .sidebar-head .card-title { flex: 1; }
-#sidebar-toggle .st-icon { transform: rotate(90deg); transition: transform var(--st-dur) var(--st-ease); }
 .chat-sidebar[data-open="false"] { width: 60px; }
 .chat-sidebar[data-open="false"] .sidebar-head { flex-direction: column; }
-.chat-sidebar[data-open="false"] #sidebar-toggle .st-icon { transform: rotate(-90deg); }
-.chat-sidebar[data-open="false"] .sidebar-title, .chat-sidebar[data-open="false"] .sidebar-search,
-.chat-sidebar[data-open="false"] .sidebar-list, .chat-sidebar[data-open="false"] .sidebar-foot { display: none; }
 .sidebar-search { height: 36px; font-size: var(--st-fs-sm); }
 .sidebar-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
 .sidebar-group { margin: 0; padding: var(--st-s-3) 8px var(--st-s-1); font-size: var(--st-fs-xs);
@@ -316,6 +344,8 @@ main { flex: 1; min-height: 0; display: flex; }
 .chat-item__input { flex: 1; min-width: 0; height: 34px; font-size: var(--st-fs-sm); }
 .sidebar-empty { margin: 0; padding: var(--st-s-2) 8px; }
 .sidebar-foot { margin: 0; }
+.chat-sidebar[data-open="false"] .sidebar-title, .chat-sidebar[data-open="false"] .sidebar-search,
+.chat-sidebar[data-open="false"] .sidebar-list, .chat-sidebar[data-open="false"] .sidebar-foot { display: none; }
 .chat-parent { display: flex; align-items: center; justify-content: center; gap: var(--st-s-3); flex-wrap: wrap; padding: var(--st-s-2) var(--st-s-4);
                border-bottom: 1px solid var(--st-line-soft); font-size: var(--st-fs-sm); }
 .chat-parent .st-btn { height: 30px; padding: 0 12px; font-size: var(--st-fs-xs); }
@@ -346,6 +376,14 @@ main { flex: 1; min-height: 0; display: flex; }
 .seg--3 { grid-template-columns: repeat(3, 1fr); }
 .seg--3 button { padding: 0 4px; }
 #lang { width: 100%; }
+#drawer-close .st-icon { transform: rotate(-90deg); }
+#sidebar-toggle .st-icon { transform: rotate(90deg); transition: transform var(--st-dur) var(--st-ease); }
+.chat-sidebar[data-open="false"] #sidebar-toggle .st-icon { transform: rotate(-90deg); }
+/* an image job's row in the Monitor's request table: its size, references and stages (or its error) across the token
+   columns, wrapped (after the chat history's less specific .muted rule) */
+#req-wrap .st-table td.req-image { white-space: normal; min-width: 14em; overflow-wrap: anywhere; }
+#req-wrap .st-table td.req-image--error,
+#req-wrap .st-table td.req-image--error .muted { color: var(--st-danger-text); }
 @media (max-width: 640px) {
   .chat-settings-label, .composer-hint { display: none; }
   .chat-settings-short { display: inline; }
@@ -358,6 +396,10 @@ main { flex: 1; min-height: 0; display: flex; }
   .chat-sidebar { padding: var(--st-s-3); }
 }
 
-/* a message may use the room a wide window gives the chat column (#3176 widened the column; the kit's 720px kept the messages narrow in it) */
-.st-msg { max-width: min(100%, 900px); }
 .st-toast .st-btn { white-space: nowrap; }
+
+/* Raster MCP results remain visible outside the collapsed tool details. */
+.tool-image { margin: 16px 0; max-width: 100%; }
+.tool-image img { display: block; width: 100%; max-width: 640px; height: auto; border-radius: var(--st-r-md); }
+.tool-image figcaption { margin-top: 10px; }
+.tool-image a:not([href]) { opacity: .5; pointer-events: none; }

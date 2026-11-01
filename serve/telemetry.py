@@ -626,13 +626,9 @@ class Telemetry:
         self._stop.set()
 
     def _loop(self):
-        """One sample a second, for as long as the server lives.
-
-        A failing sample must not end the thread: on a machine where the GPU/psutil source is not readable
-        (a CI runner, a container without NVML) the first exception used to kill the sampler outright, so
-        `GET /metrics` silently stopped updating and `test_responses.NoLeakedSampler` saw "the server did
-        not start its hardware sampler" - the thread had started and died between two readings.
-        """
+        """One sample a second, for as long as the server lives.  A failing sample (a machine whose GPU or psutil
+        source is not readable) must not end the thread, or `GET /metrics` silently stops updating: it says so once
+        and keeps trying (upstream b3db5a1c8, #3590)."""
         complained = False
         while not self._stop.is_set():
             try:

@@ -19,9 +19,9 @@ APP = Path(__file__).with_name("web") / "app.js"
 class WebApiKey(unittest.TestCase):
     def run_js(self, actions, *, stored=None, blocked=False, quota=False):
         src = APP.read_text(encoding="utf-8")
-        rule = "// ------------------------------------------------------------------ "
-        store = src[src.index("const store ="):src.index(rule + "toasts")]
-        access = src[src.index(rule + "server access"):src.index("let health =")]
+        rule = "// " + "-" * 66
+        store = src[src.index("const store ="):src.index(rule + " toasts")]
+        access = src[src.index(rule + " server access"):src.index("let health =")]
         js = f"""
 const data = new Map(Object.entries({json.dumps(stored or {})}));
 const field = {{value: ""}};

@@ -35,7 +35,7 @@ AMD の GPU では intel/llvm の DPC++ の HIP のターゲットでその SYCL
 モデル、インストールの流れ、画面、API は Strata と XeStrata のままです。
 
 ビルドは自由ソフトウェアだけの free 方式だけです（ROCm は自由ソフトウェアです）。oneMKL や CUDA は使いません。
-元の XeStrata の xe0.2.2-1（Strata 0.2.2）までの変更と、upstream の Strata 0.2.9（エンジン 0.1.55）のエンジン・serve・setup の変更を取り込んでいます（[docs/XE.ja.md](docs/XE.ja.md)）。
+元の XeStrata の xe0.2.8-1（2026-10-30 の main）までの変更と、upstream の Strata 0.2.9（エンジン 0.1.55）のエンジン・serve・setup の変更を取り込んでいます（[docs/XE.ja.md](docs/XE.ja.md)）。
 
 **890M の性質と、このフォークの使い方**
 
@@ -348,15 +348,17 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
      [Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)。
    - UkisAI による [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
    - [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) による UD-IQ4_XS、UD-Q4_K_XL、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0。
-   - agentionai による [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)。
+   - agentionai による [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) と [Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
    - huihui-ai による [abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
    - Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、
      Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
-   - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、文の読み手の Qwen3-VL（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
+   - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
+   - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image、文の読み手の Qwen3-VL と Qwen3.5-9B（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
 
   モデルのファイルには、それぞれのライセンスが適用されます。
 - 使っている部品:
    - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。Gyro の形式は agentionai の llama.cpp のフォーク（MIT）から。
+   - Peasant Smith と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（MIT）: server のループ対策（`serve/loop_guard.py`）。
    - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: rocBLAS の後端（起動時の比較と `STRATA_BLAS=1`）。
      CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: コンパイラと SYCL の実行時。
@@ -368,11 +370,12 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
      [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend)（Apache-2.0、一部 MIT、NVIDIA の GPU）。参照画像の読み込みに [stb_image](https://github.com/nothings/stb)（MIT か Unlicense）。
    - [quantscope](https://github.com/1872183316/quantscope)（MIT か Apache-2.0）: `setup.py --inspect` が GGUF の中身を確かめるのに使います。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
+   - チャットの数式を描く [KaTeX](https://katex.org/)（MIT）。
 - 参考にした考え方: 元の XeStrata の[クレジット](https://github.com/MistVVK/XeStrata#credits)にあるもの。
    - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
    - Neroued による [ninfer](https://github.com/Neroued/ninfer)。
    - syv.ai と HyperQwen の貢献者による [HyperQwen](https://github.com/syv-ai/HyperQwen)。
-   - mw00 と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方）。
+   - Peasant Smith と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、SSD から読むエキスパートを順位で飛ばすやり方）。
    - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方）。
   IQ4 の表引きの形は llama.cpp の HIP 版を参考にしています。
   IQ4 の表引きの形は llama.cpp の HIP 版を参考にしています。
@@ -380,20 +383,27 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
 
 ## ライセンス
 
-XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフトウェアで、全体を
-[GNU Lesser General Public License の第 3 版以降](COPYING.LESSER)（`COPYING.LESSER` と `COPYING`）で配布します。このフォークも同じです。
+XeStrata は自由ソフトウェアです。MistVVK と XeStrata の貢献者が XeStrata のために書いたコードは
+[GNU Lesser General Public License の第 3 版以降](COPYING.LESSER)（`COPYING.LESSER` と `COPYING`）で、
+それらを組み合わせた XeStrata 全体も同じライセンスで配布します。このフォークも同じです。ただし、Strata と ggml / llama.cpp から来たコード（MIT）と
+下に挙げる部品は、元のライセンスのままです。
 
-- メーカーの計算ライブラリとのリンク: GPU や CPU のメーカーが自社の製品向けに出している計算ライブラリとその実行時ライブラリとリンクしたものも配布できます。
+- **メーカーの計算ライブラリと OS のランタイムとのリンク**: GPU や CPU のメーカーが自社の製品向けに出している計算ライブラリとその実行時ライブラリ
+  （oneMKL や Intel oneAPI のコンパイラの実行時ライブラリ、cuBLAS や CUDA のランタイムとドライバなど）、
+  OS とその標準のコンパイラの C・C++ の実行時ライブラリ（Microsoft の Universal C Runtime や Visual C++ の実行時ライブラリなど）とリンクしたものも配布できます。
   GPL 第 3 版の第 7 条による追加の許可で、文面は [NOTICE](NOTICE) にあります。このフォークが使う ROCm は自由ソフトウェアなので、この許可は要りません。
-- Strata と ggml から来たコード: MIT ライセンスの Strata と ggml / llama.cpp から来たコード（`src/` に書き写したカーネルを含む）も、
-  XeStrata の一部として LGPL です。MIT の条件どおり、著作権表示と許諾表示を [NOTICE](NOTICE) に残しています。
-- 例外: `third_party/` の次のものは元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
+- **Strata と ggml から来たコード**: MIT ライセンスの Strata と ggml / llama.cpp から来たコード（`src/` に書き写したカーネルを含む）は、
+  MIT のままです。XeStrata が変えていない Strata のファイルは MIT だけで、XeStrata が手を入れたファイルや書き写したコードを含むファイルは、
+  XeStrata の変更とファイル全体が LGPL です（ヘッダーは `LGPL-3.0-or-later AND MIT`）。著作権表示と許諾表示は [NOTICE](NOTICE) にあります。
+  Debian の rocm-llvm のパッケージ（Expat）から `tools/intel_llvm_build.py` に写した部分も同じです。
+- **例外**: `third_party/` の次のものは、元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
    - intel/llvm への XeStrata の修正のパッチ（`third_party/main/intel-llvm/`）: Apache-2.0 WITH LLVM-exception。
    - oneMath への XeStrata の変更（フォーク、`third_party/main/oneMath/`）: Apache-2.0。
    - AOTriton を Windows 向けにビルドするための XeStrata のパッチ（`third_party/main/aotriton/`）: AOTriton のライセンス（MIT）。
    - 変えていない写し: ggml の `ggml-common.h` と、agentionai の llama.cpp の `ggml-common-tq.h`（`third_party/main/ggml/`、MIT）、
      `quantscope.py`（`third_party/main/quantscope/`、MIT か Apache-2.0）、`stb_image.h`（`third_party/main/stb/`、MIT か Unlicense）。
    - 画面のフォント Outfit（`third_party/main/outfit/`）: SIL Open Font License 1.1。
+   - チャットの数式を描く KaTeX（`third_party/main/katex/`）: MIT。
    - `third_party/nonfree/`: 自由ソフトウェアでないもの。元のモデルのチャットテンプレートと、実験的な速度向上用の射影のベクトルで、
      どちらも Qwen Community License 1.0 です。
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。パッケージには入れていません。

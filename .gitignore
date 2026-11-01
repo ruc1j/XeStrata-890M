@@ -64,3 +64,7 @@ windows/launcher/*/obj/
 .claude/settings.local.json
 .hermes/
 .serena/
+
+# Optional MCP raster cache
+*.tool-media/
+/.tool-media/

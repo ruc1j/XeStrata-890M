@@ -9,6 +9,7 @@
 #include "../kernels/xe/amd_wmma.hpp"
 #include "../kernels/xe/device_target.hpp"
 #include "../kernels/xe/xe_shuffle.hpp"
+#include "gdn_tc.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -79,6 +80,9 @@ inline float block_sum(const sycl::nd_item<1>& it, float v, float* sh) {
 constexpr int CONV_TILE = 64;
 constexpr int RG = 4, RPG = S / RG;
 constexpr int CB = 32, NCB = S / CB;
+// STRATA_GDN_TC: the prep and the scan's two launches a super-block cost more than they save on shorter chunks
+// (upstream's threshold, measured on a CMP 170HX)
+constexpr int64_t kGdnTcMin = 128;
 
 template <int REG>
 void route_launch(sycl::queue& q, const float* logits, int32_t* ids, float* wout, int64_t T) {
@@ -1222,21 +1226,25 @@ struct Gdn {
         });
     }
 
+    // `with_out` false (KVA's state-only layer): the same recurrence kernels without the output normalization, so z,
+    // gamma and y16 are not read; the one-group-per-head kernel fuses that norm, so it runs only with the output
     static void recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                           const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, bool silu, void* stream) {
+                           const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, bool silu, void* stream,
+                           bool with_out = true) {
         static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-group-per-head kernel (A/B)
         auto& q = Q(stream);
         // STRATA_GDN_CHUNKED (the default; =0 the FP32 kernels below): the chunked recurrence on GFX11's matrix cores
         // (gw above), other bits.  On the 890M (Qwen3.8 IQ2_XS) one layer's recurrence and norm take 8.0 ms for 3,481
         // tokens against 14.4 ms, the prompt 2-3% less time; the next token's KL after 20 prompts 0.020 (top-1 equal;
         // run to run 0.0002).  Splitting the state into two FP16 operands left the error as it was (the rounding of k,
-        // q, T, P and D is most of it).
+        // q, T, P and D is most of it).  A state-only layer (`with_out` false, KVA) takes the FP32 kernels below.
         static const bool chunked = [] {
             const char* v = std::getenv("STRATA_GDN_CHUNKED");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
-        if (chunked && !serial && rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, silu, q)) return;
-        if (serial || T <= 0) {
+        if (chunked && with_out && !serial && rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, silu, q)) return;
+        if (!with_out && T <= 0) return;
+        if ((serial && with_out) || T <= 0) {
             q.submit([&](sycl::handler& hd) {
                 sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
                     red(sycl::range<1>((size_t) RG * S), hd), wsum(sycl::range<1>(16), hd);
@@ -1287,11 +1295,11 @@ struct Gdn {
             const char* v = std::getenv("STRATA_GDN_KEYHEAD");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
-        auto launch_kh = [&](float* st, float* yy) {
+        auto launch_kh = [&](float* st, float* yy, const int64_t n) {
             q.submit([&](sycl::handler& hd) {
             using L = sycl::local_accessor<float, 1>;
             hd.parallel_for(sycl::nd_range<1>((size_t) HK * NCB * GdnRecKh::NT, GdnRecKh::NT),
-                            GdnRecKh{st, h, gate, beta, yy, T, L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
+                            GdnRecKh{st, h, gate, beta, yy, n, L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
                                      L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
                                      L(sycl::range<1>((size_t) 2 * GDN_TB * VPK * CB), hd),
                                      L(sycl::range<1>((size_t) 2 * GdnRecKh::GB), hd),
@@ -1299,7 +1307,7 @@ struct Gdn {
                                      L(sycl::range<1>((size_t) VPK * RG * CB), hd)});
         });
         };
-        auto launch_d2 = [&](float* st, float* yy) {
+        auto launch_d2 = [&](float* st, float* yy, const int64_t n) {
             q.submit([&](sycl::handler& hd) {
             sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
                 red(sycl::range<1>((size_t) RG * CB), hd);
@@ -1312,7 +1320,7 @@ struct Gdn {
                 const size_t rs = (size_t) HV * S;
                 for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
                 if (!pipe) {
-                    for (int64_t t = 0; t < T; ++t) {
+                    for (int64_t t = 0; t < n; ++t) {
                         const float oc = rec_step<CB>(it, s, h + t * C, gate, beta, t, head, qh, rg, c, col, tid, &sk[0],
                                                       &sq[0], &red[0]);
                         if (rg == 0) yy[t * HV * S + (int64_t) head * S + col] = oc;
@@ -1329,14 +1337,14 @@ struct Gdn {
                     ng = gate[t * HV + head];
                     nb = beta[t * HV + head];
                 };
-                if (T > 0) fetch(0);
-                for (int64_t t = 0; t < T; ++t) {
+                if (n > 0) fetch(0);
+                for (int64_t t = 0; t < n; ++t) {
                     const float cq = nq, ck = nk, cv = nv, cg = ng, cbt = nb;
                     sycl::group_barrier(it.get_group());
                     sq[tid] = cq;
                     sk[tid] = ck;
                     sycl::group_barrier(it.get_group());
-                    if (t + 1 < T) fetch(t + 1);
+                    if (t + 1 < n) fetch(t + 1);
                     const float g = sycl::exp(cg);
                     float kv = 0.0f;
                     for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
@@ -1363,12 +1371,24 @@ struct Gdn {
         // D-2 or the key-head form, whichever ran a chunk faster on this device: timed once, on copies of the state, at
         // the first call of at least 64 tokens.  RTX 4070: 2175 -> 459 us for 512 tokens (+2.4% prompt speed); the B70
         // without GdnRecLane: 56 -> 92 ms a prompt (the key-head form keeps 3 x 32 state rows a work-item in registers).
+        // Timed on the chunk's first 1024 tokens at most: the ratio does not move with the length (RTX 4070: 5.2x at
+        // 1016 tokens, 5.3x at 16384), and the output copy of a 16384-token chunk (256 MiB) did not fit beside a full
+        // expert cache, which left the 5x slower D-2 on unmeasured (32K serve prompt 1,943 -> 1,687 tok/s).
         static int pick = -1;   // 1: the key-head form
-        if (gdn_lane_ok(q))
+        // STRATA_GDN_TC=1 (opt-in, upstream 8c2a84694): the recurrence of a prompt chunk of kGdnTcMin+ tokens as a
+        // chunked scan on the matrix engines (gdn_tc.cpp; not these kernels' bits).  A GPU without them, a shorter
+        // chunk or no room for its scratch takes the kernels below
+        static const bool tc_on = [] {
+            const char* v = std::getenv("STRATA_GDN_TC");
+            return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+        }();
+        if (tc_on && T >= kGdnTcMin && gdn_rec_tc(q, HK, HV, state, h, gate, beta, y, T)) {
+        } else if (gdn_lane_ok(q))
             q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
         else {
             if (pick < 0 && kh_on && T >= 64) {
-                const size_t ns = (size_t) S * HV * S, ny = (size_t) T * HV * S;
+                const int64_t tn = std::min<int64_t>(T, 1024);
+                const size_t ns = (size_t) S * HV * S, ny = (size_t) tn * HV * S;
                 float* st = sycl::malloc_device<float>(ns, q);
                 float* yy = sycl::malloc_device<float>(ny, q);
                 if (st != nullptr && yy != nullptr) {
@@ -1377,7 +1397,7 @@ struct Gdn {
                         for (int r = 0; r < 2; ++r) {
                             q.copy(state, st, ns).wait();
                             const auto t0 = std::chrono::steady_clock::now();
-                            launch(st, yy);
+                            launch(st, yy, tn);
                             q.wait();
                             us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                         }
@@ -1386,16 +1406,21 @@ struct Gdn {
                     const double d2 = time(launch_d2), kh = time(launch_kh);
                     pick = kh < d2 ? 1 : 0;
                     std::fprintf(stderr, "strata: the DeltaNet recurrence, %lld tokens: D-2 %.0f us, the key-head form %.0f "
-                                 "us: %s\n", (long long) T, d2, kh, pick ? "the key-head form" : "D-2");
+                                 "us: %s\n", (long long) tn, d2, kh, pick ? "the key-head form" : "D-2");
                 } else {
-                    pick = 0;
+                    static bool said = false;   // D-2 meanwhile; the next call tries again
+                    if (!said)
+                        std::fprintf(stderr, "strata: the DeltaNet recurrence: no VRAM to time the two forms on %lld "
+                                             "tokens, D-2 until it can be timed\n", (long long) tn);
+                    said = true;
                 }
                 if (st != nullptr) sycl::free(st, q);
                 if (yy != nullptr) sycl::free(yy, q);
             }
-            if (kh_on && pick == 1) launch_kh(state, y);
-            else launch_d2(state, y);
+            if (kh_on && pick == 1) launch_kh(state, y, T);
+            else launch_d2(state, y, T);
         }
+        if (!with_out) return;
         q.submit([&](sycl::handler& hd) {
             sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
             hd.parallel_for(sycl::nd_range<2>({(size_t) T, (size_t) HV * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
@@ -1439,6 +1464,13 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
                     int64_t h_v, bool silu) {
     gdn_dispatch(h_k, h_v, "gdn_recurrence", [&](auto g) {
         decltype(g)::recurrence(state, h, gate, beta, z, gamma, eps, y, y16, T, silu, stream);
+    });
+}
+
+void gdn_recurrence_state_only(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                               void* stream, int64_t h_k, int64_t h_v) {
+    gdn_dispatch(h_k, h_v, "gdn_recurrence_state_only", [&](auto g) {
+        decltype(g)::recurrence(state, h, gate, beta, nullptr, nullptr, 0.0f, y, nullptr, T, false, stream, false);
     });
 }
 
@@ -1500,6 +1532,24 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
         float s = 0.0f;
         for (int k = 0; k < 10; ++k) s = sycl::fma(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
         bo[i] = s + shared[i] * sigm(sg[t]);
+    });
+}
+void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream) {
+    if (T <= 0) return;
+    Q(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        acc[i] = shared[i] * sigm(sg[i / N]);
+    });
+}
+// one work-item per (token of the group, column): the token's rows summed in the group's row order
+void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
+                     const float* u_w, int64_t n_u, float* acc, void* stream) {
+    if (n_u <= 0) return;
+    Q(stream).parallel_for(sycl::range<2>((size_t) n_u, (size_t) N), [=](sycl::id<2> id) {
+        const int64_t u = (int64_t) id[0], d = (int64_t) id[1];
+        float s = 0.0f;
+        for (int32_t j = u_off[u]; j < u_off[u + 1]; ++j) s = sycl::fma(u_w[j], Dm[(int64_t) u_rows[j] * N + d], s);
+        acc[(int64_t) u_tok[u] * N + d] += s;
     });
 }
 

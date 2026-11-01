@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/preview.js - the preview of an ```svg or ```html block in an answer (PR #1628 by thoives).
 //
 // A block is shown in an <iframe srcdoc> that is cut off from the page:
@@ -14,6 +15,7 @@
 // has sandbox="allow-scripts" (still an opaque origin, still no network), and the CSP allows its inline script.
 //
 // This file builds strings and frames only; app.js decides when. Nothing in it touches the page's own DOM.
+/* global module, globalThis */   // module: Node, when a script loads this file
 "use strict";
 (function (root) {
   // no allow-same-origin: that would give the frame the page's origin and with it the page itself

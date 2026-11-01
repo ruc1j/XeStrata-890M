@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/math.js - chat math that never changes the source. Engine-independent: a renderer (math-adapter.js) is plugged in.
 // Ported from PR #2972 by CC-David-CC. The text of a message stays as the model wrote it (history, copying, the Markdown
 // export and the requests all use it); math is only drawn over a placeholder in the page, and a formula that cannot be drawn
 // stays as its source text.
+/* global module, globalThis */   // module: Node, when a script loads this file
 "use strict";
 (function (root) {
   const escape = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));

@@ -434,7 +434,7 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     TicketState& ts = m.tickets[id];
     // After a failed read the reader stays failed (`collect` reports `error` until the next `open`) and its worker has
     // parked (worker_loop). A ticket queued now would never be read and `collect` would wait for it for ever, so it
-    // is not queued: it has no jobs, and `collect` returns the error at once.
+    // is not queued: it has no jobs, and `collect` returns the error at once (upstream ebe3383a3, #3602).
     if (!m.error.empty()) {
         ts.pending = 0;
         return Ticket{id};

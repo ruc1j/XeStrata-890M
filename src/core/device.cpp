@@ -5,6 +5,7 @@
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_device
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/memory.hpp"
 
 
 #if defined(__has_include)
@@ -505,6 +506,17 @@ std::string Runtime::device_status() {
         }
     }
 #endif
+    // no status query here (CUDA, HIP, Windows): whether the driver still answers a question about the device's free
+    // memory, which CUDA refuses once a kernel has faulted its context (its errors stick).  A failure report on these
+    // said "the GPU: unknown" every time (#36, #39).
+    if (device_.has(sycl::aspect::ext_intel_free_memory)) {
+        try {
+            (void) device_.get_info<sycl::ext::intel::info::device::free_memory>();
+            return "answers a memory query";
+        } catch (const std::exception& e) {
+            return std::string("does not answer a memory query (") + e.what() + ")";
+        }
+    }
     return "unknown";
 }
 
@@ -694,23 +706,33 @@ uint64_t max_alloc_limit_bytes() {
 
 // Whether the GPU is the processor's own graphics (its memory is the system RAM), as the SYCL runtime reports it.
 // Not asked of Level Zero directly: the engine links no maker's driver library, so a contrib build starts on a PC
-// with only Intel's or only NVIDIA's (the runtime opens each backend's library when it is there).  The HIP runtime
-// does not answer the integrated-GPU aspect; it says the same as unified host memory (hipDeviceAttributeIntegrated).
+// with only Intel's or only NVIDIA's (the runtime opens each backend's library when it is there).  Only Level Zero
+// answers the integrated-GPU aspect: the CUDA and HIP adapters print an error each time it is asked ("<CUDA>[ERROR]:
+// Unsupported ParamName", UR_DEVICE_INFO_IS_INTEGRATED_GPU) and report it absent.  The HIP runtime says the same as
+// unified host memory (hipDeviceAttributeIntegrated), which is asked in its place.
 bool integrated_gpu(const sycl::device& d) {
-    // HIP first: intel/llvm v7.2.0's HIP adapter answers the aspect's query with an error line on stderr ("Unsupported
-    // ParamName in urDeviceGetInfo ... IS_INTEGRATED_GPU") before the runtime says false, six times a start
-    if (d.get_backend() == sycl::backend::ext_oneapi_hip) {
+    // Level Zero answers the aspect; the HIP adapter (intel/llvm v7.2.0) answers its query with an error line on
+    // stderr ("Unsupported ParamName in urDeviceGetInfo ... IS_INTEGRATED_GPU") before the runtime says false, six
+    // times a start, and CUDA's the same: those two are not asked, HIP's unified host memory stands in
+    const sycl::backend b = d.get_backend();
+    if (b == sycl::backend::ext_oneapi_level_zero) return d.has(sycl::aspect::ext_oneapi_is_integrated_gpu);
+    if (b != sycl::backend::ext_oneapi_hip) return false;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        return d.get_info<sycl::info::device::host_unified_memory>();
+    return d.get_info<sycl::info::device::host_unified_memory>();
 #pragma clang diagnostic pop
-    }
-    return d.has(sycl::aspect::ext_oneapi_is_integrated_gpu);
 }
 
 // upstream 004b15cd (#409): an integrated GPU's memory is the system RAM, and what its runtime reports free need not
 // subtract the CPU's allocations (an AMD APU's figure counts its whole shared pool).  The engine takes the smaller of
 // that figure and what the OS can give back, less STRATA_UMA_HEADROOM_GIB (default 6) for the system.
+void apply_os_budget(const std::string& pci, uint64_t& free) {
+    uint64_t budget = 0, usage = 0;
+    std::string why;
+    if (strata::platform::gpu_local_memory_budget(pci, budget, usage, why))
+        free = std::min(free, budget > usage ? budget - usage : 0);
+}
+
 void apply_uma_limit(uint64_t& free) {
     static const uint64_t headroom = [] {
         const char* v = std::getenv("STRATA_UMA_HEADROOM_GIB");
@@ -779,10 +801,15 @@ DeviceInfo device_info(int ordinal) {
         } catch (const sycl::exception&) { /* Optional telemetry; never substitute zero for unknown. */ }
     }
     uint64_t free = out.free_bytes_known ? out.free_bytes : out.total_bytes;
+    if (out.free_bytes_known && !integrated(d)) apply_os_budget(pci_of(d), free);
     apply_vram_limit(free, out.total_bytes);
     if (out.free_bytes_known) out.free_bytes = free;
     out.compute_units = d.get_info<sycl::info::device::max_compute_units>();
     out.pci = pci_of(d);
+    if (d.get_backend() == sycl::backend::ext_oneapi_hip) {   // gcnArchName: "gfx1030:sramecc-:xnack-" on some
+        const std::string v = d.get_info<sycl::info::device::version>();
+        out.arch = v.substr(0, v.find(':'));
+    }
     out.integrated = integrated(d);
     out.subgroup_sizes = d.get_info<sycl::info::device::sub_group_sizes>();
     out.fp64 = d.has(sycl::aspect::fp64);

@@ -2,13 +2,14 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/math-adapter.js - the KaTeX renderer for math.js (PR #2974 by CC-David-CC). KaTeX 0.19.0 is vendored in
-// third_party/main/katex (MIT, see PROVENANCE.json there; served below web/vendor/katex/): no network, no CDN. Nothing is loaded until "Render math" is
-// switched on and an answer holds a formula.
+// third_party/main/katex (MIT, see PROVENANCE.json there), which the server hands out as web/vendor/katex/: no network,
+// no CDN. Nothing is loaded until "Render math" is switched on and an answer holds a formula.
 //
 // What a formula may do: nothing but draw. `trust: false` turns off \href, \url, \includegraphics and \htmlClass-style
 // commands, so a formula cannot make a link, load a picture or add an attribute; the macros are not shared between
 // formulas; \def loops are cut by maxExpand and a huge \rule or \kern by maxSize. KaTeX builds DOM nodes itself (no
 // innerHTML), the result is cloned into the page by math.js, and an error returns the source text instead.
+/* global module, globalThis */   // module: Node, when a script loads this file
 "use strict";
 (function (root) {
   const OPTIONS = {output: "htmlAndMathml", trust: false, throwOnError: true, strict: "ignore", maxExpand: 1000, maxSize: 20};

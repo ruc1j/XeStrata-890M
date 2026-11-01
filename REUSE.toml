@@ -13,21 +13,27 @@ SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 # upstream Strata's files without a comment of their own, unchanged (AGENTS.md, Licenses)
 [[annotations]]
-path = ["data/draft_vocab.bin", "data/draft_vocab_cyrillic.bin", "data/draft_vocab_en.bin", "data/draft_vocab_fr.bin", "data/expert-profile.bin", "data/expert-profile-coder.bin", "data/quant_quality/**", "docs/paper/**", "serve/fixtures/rcall_specimens.json", "serve/web/favicon.svg", "serve/web/sprite.svg", "serve/web/locales/*.json",
+path = ["data/draft_vocab.bin", "data/draft_vocab_cyrillic.bin", "data/draft_vocab_en.bin", "data/draft_vocab_fr.bin", "data/expert-profile.bin", "data/expert-profile-coder.bin", "data/quant_quality/v1/**", "docs/paper/**", "serve/fixtures/rcall_specimens.json", "serve/web/favicon.svg", "serve/web/sprite.svg",
         "third_party/main/katex/PROVENANCE.json", "tests/data/native_experts/**"]
 SPDX-FileCopyrightText = "2026 Niko1221 and the Strata contributors"
 SPDX-License-Identifier = "MIT"
 
 # upstream's data files XeStrata has changed or added to (the Japanese draft vocabulary; the fingerprints of the files XeStrata adds)
 [[annotations]]
-path = ["data/draft_vocab_ja.bin", "data/gguf_fingerprints.json"]
+path = ["data/draft_vocab_ja.bin", "data/gguf_fingerprints.json", "serve/web/locales/*.json"]
 SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
 SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
+# the icon sprite: upstream's as it is (0.2.7)
+[[annotations]]
+path = ["serve/web/sprite.svg"]
+SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors"]
+SPDX-License-Identifier = "MIT"
+
 # XeStrata's own files without a comment of their own: the expert profiles of the other models
 [[annotations]]
-path = ["data/expert-profile-glm53.bin", "data/expert-profile-llmjp.bin", "data/expert-profile-ornith.bin",
-        "data/expert-profile-qwen36.bin"]
+path = ["data/expert-profile-glm53.bin", "data/expert-profile-gyro-coder.bin", "data/expert-profile-llmjp.bin",
+        "data/expert-profile-ornith.bin", "data/expert-profile-qwen36.bin"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
@@ -44,7 +50,7 @@ SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 Mis
 SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 [[annotations]]
-path = ["cmake/BUILD.json.in", ".claude/skills/**/SKILL.md", ".claude/skills/**/references/*.md"]
+path = ["data/quant_quality/long/set.ids.json", "cmake/BUILD.json.in", ".claude/skills/**/SKILL.md", ".claude/skills/**/references/*.md"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
@@ -90,6 +96,11 @@ SPDX-FileCopyrightText = ["Advanced Micro Devices, Inc.", "2026 MistVVK and the 
 SPDX-License-Identifier = "MIT"
 
 [[annotations]]
+path = ["third_party/main/aozora-bunko/nowaki-*.txt"]
+SPDX-FileCopyrightText = "1907 Natsume Soseki"
+SPDX-License-Identifier = "LicenseRef-PublicDomain"
+
+[[annotations]]
 path = ["third_party/main/aotriton/LICENSE.triton"]
 SPDX-FileCopyrightText = ["2018-2020 Philippe Tillet", "2020-2022 OpenAI"]
 SPDX-License-Identifier = "MIT"
@@ -126,3 +137,17 @@ path = ["third_party/nonfree/qwen3.8-flash-next/**", "third_party/nonfree/experi
 SPDX-FileCopyrightText = "2026 Qwen"
 SPDX-License-Identifier = "LicenseRef-Qwen-Community-License-1.0"
 
+[[annotations]]
+path = ["third_party/main/xgrammar/LICENSE", "third_party/main/xgrammar/NOTICE"]
+SPDX-FileCopyrightText = "2024 XGrammar Contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["third_party/main/picojson/LICENSE"]
+SPDX-FileCopyrightText = ["2009-2010 Cybozu Labs, Inc.", "2011-2014 Kazuho Oku"]
+SPDX-License-Identifier = "BSD-2-Clause"
+
+[[annotations]]
+path = ["third_party/main/dlpack/LICENSE"]
+SPDX-FileCopyrightText = "The DLPack contributors"
+SPDX-License-Identifier = "Apache-2.0"

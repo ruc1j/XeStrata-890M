@@ -15,6 +15,7 @@
 #include <sycl/ext/oneapi/virtual_mem/virtual_mem.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #if !defined(_WIN32)
@@ -136,7 +137,9 @@ std::string failure_report(const std::exception& e) {
     try {
         auto& runtime = rt();
         const std::string status = runtime.device_status();
-        r += "; the GPU: " + status;
+        // with more than one GPU, which one (the logs' CUDA<n>)
+        r += (core::Runtime::count() > 1 ? "; GPU " + std::to_string(runtime.ordinal()) : std::string("; the GPU")) +
+             ": " + status;
         size_t free_b = 0, total_b = 0;
         if (status != "lost" && mem_info(&free_b, &total_b)) {
             char buf[64];
@@ -279,9 +282,7 @@ void pin_reserve_take() {
         mib = std::strtoull(e, nullptr, 10);
     } else {
 #if defined(_WIN32)
-        try {
-            if (rt().device().get_backend() == sycl::backend::ext_oneapi_cuda) mib = 640;
-        } catch (const std::exception&) { mib = 0; }
+        mib = 640;   // WDDM caps what a process pins for any GPU, Level Zero's and HIP's as CUDA's (#36)
 #endif
     }
     if (mib == 0) return;
@@ -482,6 +483,11 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
         uint64_t free = d.get_info<sycl::ext::intel::info::device::free_memory>();
         uint64_t total = d.get_info<sycl::info::device::global_mem_size>();
         if (core::integrated_gpu(d)) core::apply_uma_limit(free);   // its memory is the system RAM
+        else if (d.has(sycl::aspect::ext_intel_pci_address)) {
+            std::string pci = d.get_info<sycl::ext::intel::info::device::pci_address>();
+            for (auto& c : pci) c = (char) std::tolower((unsigned char) c);
+            core::apply_os_budget(pci, free);
+        }
         size_t held = 0;
         {
             std::lock_guard<std::mutex> lock(g_live_mu);
@@ -528,6 +534,11 @@ bool peer_access(int a, int b) {
     (void) b;
     return false;
 #endif
+}
+
+bool same_backend(int a, int b) {
+    try { return core::Runtime::at(a).device().get_backend() == core::Runtime::at(b).device().get_backend(); }
+    catch (const std::exception& e) { return fail("same_backend", e); }
 }
 
 std::string device_name(int device) {

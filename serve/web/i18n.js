@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/i18n.js - the web page's translations.
 //
 // The English text sits in the code, next to the key:  tr("chat.rewind", "Rewind to here")  and
@@ -7,10 +8,11 @@
 // data-i18n="key" (also data-i18n-title, data-i18n-label, data-i18n-placeholder) and holds its English text in the HTML.
 // So the page reads fine with no catalog at all.  Every other language is a catalog, serve/web/locales/<lang>.json
 // (a flat {"key": "text"} object; a plural is {"one": "...", "other": "..."}, the CLDR names of the language).
-// serve/test_web_i18n.py keeps the catalogs complete: same keys as the English text in the code, same {placeholders}.
+// tools/web_i18n.py checks that the catalogs are complete: same keys as the English text in the code, same {placeholders}.
 //
-// The language is the user's choice (About > Settings), kept in this browser.  Nothing is chosen for them from the
-// browser's language: a page that is translated in part would mix two languages.
+// The language is the user's choice (About > Settings), kept in this browser.  Until they choose one, or after they
+// choose "Automatic", it is the first of the browser's languages (navigator.languages) the page has, else English.
+/* global module, globalThis */   // module: Node, when a script loads this file
 "use strict";
 (function (root) {
   // [code, the language's own name].  A new language is a locales/<code>.json file plus one line here.
@@ -54,6 +56,17 @@
   }
 
   const known = (code) => LANGUAGES.some((l) => l[0] === code);
+  // the page's language: ?lang= of this visit, then the user's saved choice, then the first of the browser's languages
+  // the page has (ja-JP is ja, pt-BR is pt: the region is dropped when the whole tag is not one), then English
+  function choose(urlLang, saved, browser) {
+    for (const code of [urlLang, saved]) if (known(code)) return code;
+    for (const tag of browser || []) {
+      const t = String(tag || "").toLowerCase();
+      if (known(t)) return t;
+      if (known(t.split("-")[0])) return t.split("-")[0];
+    }
+    return "en";
+  }
   // load a catalog; English, or a catalog that cannot be read, leaves the English text in the code
   async function setLanguage(code) {
     code = known(code) ? code : "en";
@@ -72,7 +85,7 @@
     return lang;
   }
 
-  const api = {LANGUAGES, tr, apply, setLanguage, get lang() { return lang; }, fill, pick};
+  const api = {LANGUAGES, tr, apply, setLanguage, choose, get lang() { return lang; }, fill, pick};
   root.StrataI18n = api;
   root.tr = tr;
   if (typeof module !== "undefined" && module.exports) module.exports = api;

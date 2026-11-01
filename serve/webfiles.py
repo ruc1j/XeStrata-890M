@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""Which files the server hands out below /web/: the page's translations (serve/web/locales) and KaTeX, which XeStrata keeps
-in third_party/main/katex (the URL stays /web/vendor/katex/, as upstream's page asks for it).
+"""Which files the server hands out below /web/ from folders: the page's translations and the vendored KaTeX.
 
 The flat files (app.js, app.css, ...) are served by serve/server.py itself. The two folders here hold more than one
 level, so each has its own whitelist: a name pattern and the types it may have. Nothing outside these folders is ever
 read, a name with a backslash, a colon or a percent sign is refused, and the resolved path must stay inside the folder.
+The translations are serve/web/locales; KaTeX is another project's (MIT), so it lives in third_party/main/katex and is
+served at upstream's URL, /web/vendor/katex/.
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ import re
 from pathlib import Path
 
 WEB = Path(__file__).resolve().parent / "web"
-KATEX = Path(__file__).resolve().parent.parent / "third_party" / "main" / "katex"   # KaTeX (MIT): third_party/main/katex
+KATEX = Path(__file__).resolve().parents[1] / "third_party" / "main" / "katex"
 
 # /web/locales/<lang>.json   e.g. de.json, pt-BR.json
 LOCALE = re.compile(r"^/web/locales/(?P<name>[a-z]{2,3}(?:-[A-Z]{2})?\.json)$")

@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""setup.find_tool takes the virtualenv's own cmake before a PATH one and skips a cmake older than CMakeLists.txt needs
-(upstream #3822).
+"""setup.find_tool takes the virtualenv's own cmake before a PATH one and skips a cmake older than CMakeLists.txt
+needs (#3822).
 
     python -m unittest tools.test_setup_find_tool
 """

@@ -482,6 +482,11 @@ struct ExpertDispatch {
     /// The decode loop counts `usage` itself from the windows' accepted rows (Verifier::add_routing): the dispatch
     /// then leaves it alone.
     bool usage_by_window = false;
+    /// With usage_by_window, the window's routing of layers [0, route_rec_layers) kept here for the caller to count
+    /// the rows it accepts (core/expert_tier's add_route_rows): [layer][route_rec_t][k], the layers past it counted as
+    /// they run (PlainModel's MTP layer, run once a draft).  Empty: the caller has its own record (the Verifier's).
+    std::vector<int32_t> route_rec;
+    int64_t route_rec_layers = 0, route_rec_t = 0;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
@@ -529,6 +534,12 @@ int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h);
 /// computing experts from its memory, the PCIe fetch of experts in RAM, and the CPU's and the link's sides beside each
 /// other from the rate the memory serves.  False, with `why`, when a side cannot be timed (too few experts in RAM).
 bool measure_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, std::string& why);
+/// Both engines' (generate.cpp, PlainModel): the split measured into `t` and set on `d` (`overlap`: the fetch beside
+/// the VRAM hits), unless `keep` says why the share stays `frac` (a --pcie-frac given, a layer split, ...) or a side
+/// cannot be timed; logs which, and the split's row (of f = 1..16 missed experts with as many hits, the number read
+/// over PCIe).  `who` names the engine.  True when the measured split is set.
+bool setup_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, bool overlap, const char* keep, double frac,
+                      const char* who);
 /// The memory's rate for measure_pcie_split, read now (before a long prompt, where the split is set up after it: after a
 /// 64K prompt the reading came out up to 3x low on the RX 9060 XT's machine).
 void read_memory_rate_before(const ExpertDispatch& d, int64_t n_layers);
@@ -632,6 +643,12 @@ public:
     void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
         stage_lend_regions_ = std::move(regions);
     }
+    /// A layer split over GPUs of different makers: the engine device whose runtime takes each layer's page-locked
+    /// experts (-1: the current one).  One maker's host USM cannot be registered on another's GPU (the B70's on an
+    /// RTX 3080 Ti: CUDA_ERROR_INVALID_VALUE, #38), so that stage's GPU could neither read its misses over PCIe nor
+    /// copy from them fast.  Set BEFORE `pin_cache_complement`: a page-locked copy then keeps each device's layers in
+    /// host USM of its own, the same bytes in RAM.
+    void layer_devices(std::vector<int> devices) { layer_dev_ = std::move(devices); }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -684,8 +701,8 @@ public:
     /// windows, with no adaptive round in flight.  A failed read leaves the copy as it was.  Not with
     /// STRATA_EXCHANGE_ROTATE (false, nothing changes).
     bool replace_resident(int64_t layer, int64_t in, int64_t out);
-    /// STRATA_RAM_ADAPT: the same move as replace_resident, but `in` is copied out of the finished stage buffer
-    /// a demand read left it in (no file read).  False, nothing changed, when `in` is not staged or still filling.
+    /// STRATA_RAM_ADAPT: the same move as replace_resident, but `in` is copied out of the finished stage buffer a
+    /// demand read left it in (no file read).  False, nothing changed, when `in` is not staged or still filling.
     bool replace_resident_staged(int64_t layer, int64_t in, int64_t out);
     int64_t ram_adapts() const { return ram_adapts_; }
     int64_t ram_staged() const { return ram_staged_; }   ///< of ram_adapts(): copied out of a stage buffer
@@ -932,8 +949,9 @@ private:
     uint64_t mapped_bytes_ = 0;
     std::vector<uint64_t> layer_offsets_, layer_blob_bytes_;
     void* complement_arena_ = nullptr;
-    /// The complement in page-locked parts when one host allocation of it was refused: [start, end) of the offsets.
-    struct ComplementChunk { uint64_t start, end; uint8_t* host; const uint8_t* device; };
+    /// The complement in page-locked parts when one host allocation of it was refused, or one part per device of
+    /// `layer_devices`: [start, end) of the offsets, and the engine device whose runtime holds it (-1: the current one).
+    struct ComplementChunk { uint64_t start, end; uint8_t* host; const uint8_t* device; int owner = -1; };
     std::vector<ComplementChunk> complement_chunks_;
     static const ComplementChunk* chunk_of(const std::vector<ComplementChunk>& chunks, uint64_t offset) {
         auto it = std::upper_bound(chunks.begin(), chunks.end(), offset,
@@ -948,6 +966,9 @@ private:
         return complement_chunks_.empty() ? (uint8_t*) complement_host_ + (size_t) offset
                                           : chunk_at(complement_chunks_, offset);
     }
+    /// layer_devices: the page-locked copy as one part per device, each in its device's own host USM, `offsets`
+    /// packed again device by device; false (nothing changed) with one device, or when a device refuses its part.
+    bool pin_by_device(std::vector<uint64_t>& offsets, std::vector<ComplementChunk>& chunks, std::string& note) const;
     const uint8_t* complement_host_ = nullptr;
     const uint8_t* complement_device_ = nullptr;
     uint64_t complement_bytes_ = 0;
@@ -961,12 +982,14 @@ private:
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
+    std::vector<int> layer_dev_;              ///< layer_devices: each layer's engine device (empty: one runtime)
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;
     uint8_t* xstage_ = nullptr;               ///< exchange buffers, `xstage_cap_ x xstage_blob_`
     std::vector<std::pair<int, std::vector<void*>>> stage_reg_;   ///< register_on: a device, its registrations
     bool xstage_pinned_ = false;
+    int xstage_dev_ = 0;                      ///< the engine device whose host USM holds pinned exchange buffers
     int64_t xstage_cap_ = 0;
     uint64_t xstage_blob_ = 0;
     int64_t exchanges_ = 0;

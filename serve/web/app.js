@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
+/* global tr, StrataI18n, StrataMath, StrataPreview, node, panel, msgActions, saveChat, stillWriting, initChats, setChatList,
+          clearUndo, syncActions, closePanel, renderSidebar, renderParent, renderUndoBar, setSidebar, sidebarOpen */
+// serve/web/i18n.js, math.js, preview.js and chats-ui.js, loaded before this file
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -18,6 +21,7 @@ const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memo
 const store = {
   get(k, d) { try { const v = localStorage.getItem("xestrata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem("xestrata." + k, JSON.stringify(v)); return true; } catch (e) { return false; } },
+  del(k) { try { localStorage.removeItem("xestrata." + k); } catch (e) { /* ignore */ } },
 };
 
 // ------------------------------------------------------------------ toasts
@@ -85,7 +89,7 @@ function showTab(name) {
     $("img-prompt").focus();
     if (health.image_note && !noteShown) {   // once a page load: setup lowered the image model's size for the RAM
       noteShown = true;
-      toast("info", "Image model size lowered", health.image_note, 12000);
+      toast("info", tr("img.noteToast", "Image model size lowered"), health.image_note, 12000);
     }
   }
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
@@ -131,6 +135,8 @@ async function loadHealth() {
     $("tab-btn-images").hidden = !health.image_generation;
     $("img-note").hidden = !health.image_note;
     $("img-note").textContent = health.image_note || "";
+    imgModels();
+    thinkingButtons();
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
@@ -156,17 +162,17 @@ async function loadSwitcher() {
   }));
   sel.disabled = !!sw.starting || !!switching;
   $("model-switch").hidden = false;
-  if (sw.starting && !switching) setPill("reading", `Loading ${sw.choices[sw.starting] || sw.starting}…`);
+  if (sw.starting && !switching) setPill("reading", tr("switch.loading", "Loading {name}…", {name: sw.choices[sw.starting] || sw.starting}));
 }
 $("model-select").onchange = async () => {
   const mode = $("model-select").value, name = $("model-select").selectedOptions[0].textContent;
-  if (!confirm(`Load ${name}? The current model is unloaded first; it takes about 2 minutes and stops any answer in progress.`)) {
+  if (!confirm(tr("switch.confirm", "Load {name}? The current model is unloaded first; it takes about 2 minutes and stops any answer in progress.", {name}))) {
     loadSwitcher();
     return;
   }
   switching = {mode, from: health.model, t0: Date.now()};
   $("model-select").disabled = true;
-  setPill("reading", `Switching to ${name}… (about 2 minutes)`, true);
+  setPill("reading", tr("switch.switching", "Switching to {name}… (about 2 minutes)", {name}), true);
   try {
     await fetch("switcher", {method: "POST", headers: headers(true), body: JSON.stringify({mode})});
   } catch (e) { /* this server may already be going down */ }
@@ -176,11 +182,11 @@ $("model-select").onchange = async () => {
       if (h.model && h.model !== switching.from) { location.reload(); return; }
     } catch (e) { /* down while the models swap */ }
     if (Date.now() - switching.t0 > 6 * 60 * 1000) {
-      setPill("error", `${name} did not come up in 6 minutes`, true);
+      setPill("error", tr("switch.failed", "{name} did not come up in 6 minutes", {name}), true);
       switching = null;
       return;
     }
-    setPill("reading", `Switching to ${name}… ${Math.round((Date.now() - switching.t0) / 1000)} s`, true);
+    setPill("reading", tr("switch.switchingFor", "Switching to {name}… {s} s", {name, s: Math.round((Date.now() - switching.t0) / 1000)}), true);
     setTimeout(wait, 3000);
   };
   setTimeout(wait, 5000);
@@ -242,7 +248,7 @@ function spark(id, values, max, gaps = false) {
 }
 // an image job's step for the header and the state card: "step 3/8", or its stage before and after the sampling
 function imageStep(img) {
-  return img.stage === "sampling" ? `step ${img.step}/${img.steps}` : img.label;
+  return img.stage === "sampling" ? tr("img.step", "step {i}/{n}", {i: img.step, n: img.steps}) : img.label;
 }
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
@@ -311,10 +317,10 @@ window.addEventListener("resize", fitHeader);
 let modelOp = null;
 let imageBusy = false;
 function pageBusy() { return busy != null || imageBusy; }
-// "generating an image" is the job a refresh can see. imageBusy is this page's POST before that phase is published. A chat
-// phase already on the metrics wins, because Stop still stops that reply.
+// live.image (the image engine's job, on the metrics) is the job a refresh can see. imageBusy is this page's POST before
+// that job is published. A chat phase already on the metrics wins, because Stop still stops that reply.
 function imageLive(live) {
-  if (live && (live.image || live.phase === "generating an image")) return true;   // live.image: the Images view's job
+  if (live && live.image) return true;
   const state = live && live.state;
   if (state === "reading" || state === "generating") return false;
   return imageBusy;
@@ -322,7 +328,7 @@ function imageLive(live) {
 function paintLive() { if (lastMetrics) render(lastMetrics); }
 function turnBlocksUnload(live) {
   const state = (live && live.state) || "";
-  return pageBusy() || state === "reading" || state === "generating" || (live && live.queued > 0);
+  return pageBusy() || imageLive(live) || state === "reading" || state === "generating" || (live && live.queued > 0);
 }
 function setModelButton(text, title, disabled) {
   const btn = $("unload-btn");
@@ -337,7 +343,8 @@ function modelButton(live) {
   const imageNow = imageLive(live);
   const unload = tr("model.unload", "Unload");
   if (state === "unloaded") {
-    if (imageNow) return setModelButton(tr("model.loading", "Loading…"), tr("model.imageLoading", "An image is already loading the model"), true);
+    // an image job runs on its own engine beside the unloaded text model: Load waits until it has finished
+    if (imageNow) return setModelButton(tr("model.load", "Load"), tr("model.imageBusy", "An image is generating. It finishes on its own."), true);
     if (pageBusy()) return setModelButton(tr("model.loading", "Loading…"), tr("model.replyLoading", "A reply is already loading the model"), true);
     return setModelButton(tr("model.load", "Load"), tr("model.loadTitle", "Load the model now. A message also loads it."), false);
   }
@@ -351,9 +358,9 @@ $("unload-btn").onclick = async () => {
   const live = (lastMetrics && lastMetrics.live) || {};
   const loading = live.state === "unloaded";
   const busyCopy = (sample, stillLoading) => stillLoading
-    ? (imageLive(sample) ? tr("model.imageLoadingDot", "An image is already loading the model.") : tr("model.replyLoadingDot", "A reply is already loading the model."))
+    ? (imageLive(sample) ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.replyLoadingDot", "A reply is already loading the model."))
     : (imageLive(sample) ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.stopFirstDot", "Stop the reply, then unload."));
-  if (loading ? pageBusy() : turnBlocksUnload(live)) {
+  if (loading ? pageBusy() || imageLive(live) : turnBlocksUnload(live)) {
     toast("warn", tr("model.busy", "Model is busy"), busyCopy(live, loading));
     return;
   }
@@ -366,7 +373,7 @@ $("unload-btn").onclick = async () => {
   }
   const now = (lastMetrics && lastMetrics.live) || {};
   const loadingNow = loading;
-  if (loadingNow ? pageBusy() : turnBlocksUnload(now)) {
+  if (loadingNow ? pageBusy() || imageLive(now) : turnBlocksUnload(now)) {
     modelOp = null;
     if (lastMetrics) render(lastMetrics); else modelButton(now);
     toast("warn", tr("model.busy", "Model is busy"), busyCopy(now, loadingNow));
@@ -428,16 +435,17 @@ function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || []).find((r) => r.kind !== "image");   // the chat's last request (image jobs aside)
   // the header pill. modelOp and a local load win over "N queued": with parallel requests, queued stays up through
-  // ensure_loaded(), and metrics stay "unloaded" until the engine is READY. An image POST in that window is still a load.
-  const localLoad = live.state === "unloaded" && (busy != null || imageBusy);
+  // ensure_loaded(), and metrics stay "unloaded" until the engine is READY. An image job runs beside an unloaded text
+  // model (it has its own engine), so only a chat turn here counts as a load.
+  const localLoad = live.state === "unloaded" && busy != null;
   if (modelOp === "load") {
     setPill("idle", tr("model.loading", "Loading…"));
   } else if (modelOp === "unload") {
     setPill("idle", tr("model.unloading", "Unloading…"));
+  } else if (live.image) {
+    setPill("generating", tr("img.pill", "Image · {step}", {step: imageStep(live.image)}));
   } else if (localLoad) {
     setPill("idle", tr("model.loading", "Loading…"));
-  } else if (live.image) {
-    setPill("generating", `Image · ${imageStep(live.image)}`);
   } else if (imageLive(live)) {
     setPill("reading", tr("pill.image", "Generating image…"));
   } else if (live.state === "reading") {
@@ -455,14 +463,14 @@ function render(m) {
   // issue #10: an engine that stopped in a request says why once (the server starts it again for the next one)
   const fail = m.engine_failure;
   if (fail && fail.at !== failureSeen) {
-    if (failureSeen !== null || Date.now() / 1000 - fail.at < 600) toast("error", "The engine stopped", fail.message, 15000);
+    if (failureSeen !== null || Date.now() / 1000 - fail.at < 600) toast("error", tr("engine.stopped", "The engine stopped"), fail.message, 15000);
     failureSeen = fail.at;
   }
   // Intel's compiler 2.27 to 2.30: the engine works around a bug of it (INFO igc_workaround); said once a version
   if (eng.igc_workaround && eng.igc_workaround !== "none" && store.get("igc-told", "") !== eng.igc_workaround) {
     store.set("igc-told", eng.igc_workaround);
-    toast("warn", "Intel's compiler slows the decode", `IGC ${eng.igc_workaround} has a bug XeStrata works around; the decode of short prompts is up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).`, 12000,
-          {label: "Show", run: () => showTab("about")});
+    toast("warn", tr("igc.toast", "Intel's compiler slows the decode"), tr("igc.toastText", "IGC {version} has a bug XeStrata works around; the decode of short prompts is up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).", {version: eng.igc_workaround}), 12000,
+          {label: tr("show", "Show"), run: () => showTab("about")});
   }
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, fail);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
@@ -515,7 +523,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   // model state
   // A local turn keeps metrics on "unloaded" for the whole engine start.
   const imageNow = imageLive(live);
-  const starting = modelOp === "load" || imageNow || (busy != null && live.state === "unloaded");
+  const starting = modelOp === "load" || (busy != null && live.state === "unloaded");
   const on = !modelOp && live.queued > 0 ? "queued" : live.image ? "generating" : live.state;
   for (const b of document.querySelectorAll("#state-badges .st-badge")) {
     const lit = (b.dataset.s === on || (!live.image && b.dataset.s === live.state)) && !(starting && b.dataset.s === "unloaded");
@@ -529,16 +537,21 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     detail = "The model is loading.";
   } else if (live.image) {
     const img = live.image;
-    label = img.label + (img.images > 1 ? ` · image ${img.image} of ${img.images}` : "");
+    label = img.label + (img.images > 1 ? ` · ${tr("img.nOf", "image {i} of {n}", {i: img.image, n: img.images})}` : "");
     delete prog.dataset.tone;
     pct = 100 * (img.progress || 0);
-    detail = [`step ${img.step}/${img.steps}`, img.step_s != null ? `${fmt(img.step_s, 2)} s/step` : null,
-              `${fmt(img.elapsed_s, 0)} s`, img.size, img.refs ? `${img.refs} reference${img.refs > 1 ? "s" : ""}` : null]
+    detail = [tr("img.step", "step {i}/{n}", {i: img.step, n: img.steps}), img.step_s != null ? `${fmt(img.step_s, 2)} s/step` : null,
+              `${fmt(img.elapsed_s, 0)} s`, img.size,
+              img.refs ? tr("img.refs", {one: "{n} reference", other: "{n} references"}, {n: img.refs}) : null]
       .filter(Boolean).join(" · ");
-  } else if (imageNow && (live.state === "unloaded" || live.state === "reading" || live.state === "generating" || live.state === "idle")) {
-    label = live.state === "unloaded" ? "Loading" : "Generating image";
+  } else if (modelOp === "load" || (busy != null && live.state === "unloaded")) {
+    label = "Loading";
     delete prog.dataset.tone;
-    detail = live.state === "unloaded" ? "The model is loading." : "An image is generating. It finishes on its own.";
+    detail = "The model is loading.";
+  } else if (imageNow) {
+    label = tr("img.generating", "Generating image");
+    delete prog.dataset.tone;
+    detail = tr("model.imageBusy", "An image is generating. It finishes on its own.");
   } else if (modelOp === "unload") {
     label = "Unloading";
     delete prog.dataset.tone;
@@ -566,7 +579,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
   }
   if (fail && live.state === "idle") {   // issue #10: the last engine that stopped, until a request runs again
-    label = `Engine stopped at ${new Date(fail.at * 1000).toLocaleTimeString()}`;
+    label = tr("engine.stoppedAt", "Engine stopped at {time}", {time: new Date(fail.at * 1000).toLocaleTimeString()});
     detail = fail.message;
     for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === "error");
   }
@@ -577,7 +590,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   // the eight cards
   if (live.image) {   // an image job: its seconds a step, not a decode rate
     setMetric("speed", live.image.step_s == null ? null : fmt(live.image.step_s, 2), "s/step",
-              `Image · ${imageStep(live.image)}`);
+              tr("img.pill", "Image · {step}", {step: imageStep(live.image)}));
   } else {
     const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
     setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
@@ -585,7 +598,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   }
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
                 : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
-  if (live.image) setMetric("prefill", null, "t/s", "Image job");
+  if (live.image) setMetric("prefill", null, "t/s", tr("img.job", "Image job"));
   else setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
                  live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
   spark("sp-speed", h.tok_s, undefined, true);
@@ -603,7 +616,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   // an idle GPU on the xe driver may report its last temperature, not its present one (Battlemage's hwmon): dimmed
   const stale = Boolean(hw.gpu_temp_may_be_stale) && hw.gpu_temp != null;
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
-            stale ? "GPU idle (the reading may be old)"
+            stale ? tr("mon.tempStale", "GPU idle (the reading may be old)")
             : multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`))
             : hw.gpu_mem_temp == null ? "" : `VRAM ${fmt(hw.gpu_mem_temp)} °C`);
   $("mv-temp").classList.toggle("is-stale", stale);
@@ -613,7 +626,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
   setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
             hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
-            (hw.gpu_pcie_own_gen && gen && hw.gpu_pcie_own_gen < gen ? ` · now Gen${hw.gpu_pcie_own_gen}` : ""));
+            (hw.gpu_pcie_own_gen && gen && hw.gpu_pcie_own_gen < gen ? ` · ${tr("mon.nowGen", "now Gen{n}", {n: hw.gpu_pcie_own_gen})}` : ""));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
@@ -652,25 +665,31 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
-                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
+                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"],
+                   timeout: ["st-badge--queued", "Timeout"]};
     body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       if (r.kind === "image") {   // an image job: its size, references and stages in place of the token columns
-        const what = [`${r.edit ? "Edit" : "Image"} ${r.size}`, r.n > 1 ? `${r.n} images` : null,
-                      r.refs ? `${r.refs} reference${r.refs > 1 ? "s" : ""}` : null].filter(Boolean).join(" · ");
+        const what = [r.edit ? tr("img.rowEdit", "Edit {size}", {size: r.size}) : tr("img.rowImage", "Image {size}", {size: r.size}),
+                      r.n > 1 ? tr("img.rowCount", {one: "{n} image", other: "{n} images"}, {n: r.n}) : null,
+                      r.refs ? tr("img.refs", {one: "{n} reference", other: "{n} references"}, {n: r.refs}) : null].filter(Boolean).join(" · ");
         const stages = r.error ? r.error
-          : [r.text_encode_ms != null ? `text ${fmt(r.text_encode_ms / 1000, 1)} s` : null,
-             r.sampling_s != null ? `sampling ${fmt(r.sampling_s, 1)} s` : null,
-             r.vae_decode_s != null ? `VAE ${fmt(r.vae_decode_s, 1)} s` : null].filter(Boolean).join(" · ");
-        return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span> <span class="st-badge st-badge--reading">Image</span></td>
+          : [r.text_encode_ms != null ? tr("img.stageText", "text {s} s", {s: fmt(r.text_encode_ms / 1000, 1)}) : null,
+             r.sampling_s != null ? tr("img.stageSampling", "sampling {s} s", {s: fmt(r.sampling_s, 1)}) : null,
+             r.vae_decode_s != null ? tr("img.stageVae", "VAE {s} s", {s: fmt(r.vae_decode_s, 1)}) : null].filter(Boolean).join(" · ");
+        return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span> <span class="st-badge st-badge--reading">${esc(tr("img.badge", "Image"))}</span></td>
           <td colspan="6" class="req-image${r.error ? " req-image--error" : ""}">${esc(what)}${stages ? ` <span class="muted">· ${esc(stages)}</span>` : ""}</td>
           <td class="num">${fmt(r.seconds != null ? r.seconds : r.duration_s, 1)} s</td></tr>`;
       }
       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
       // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
-        (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
+        (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "") +
+        // the experts below VRAM: taken from the RAM copy and read from the model files (the SSD), as the engine counts them
+        ([r.ram_blobs ? `RAM ${fmt(r.ram_blobs)}` : null,
+          r.file_blobs ? `SSD ${fmt(r.file_blobs)}${r.file_mb ? ` (${fmt(r.file_mb / 1000, 1)} GB)` : ""}` : null]
+          .filter(Boolean).map((t) => ` <span class="muted" title="${esc(tr("mon.belowVram", "experts taken from the RAM copy and read from the model files"))}">${t}</span>`).join(""));
       // Reused tokens are not prefetched again. Match the Monitor's existing Prefill metric.
       const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
       const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
@@ -711,10 +730,10 @@ function renderAbout(eng, hw, st) {
     ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
     ["Images", eng.images ? "on" : "off"],
     ["Experimental speed projection", projectionText(eng.cvec)],
-    ["Intel compiler", eng.igc_workaround && eng.igc_workaround !== "none" ? `IGC ${eng.igc_workaround} has a bug (2.27 to 2.30 miscompile some reads for Xe2 and later GPUs); XeStrata works around it, the decode of short prompts up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).` : null],
+    [tr("igc.label", "Intel compiler"), eng.igc_workaround && eng.igc_workaround !== "none" ? tr("igc.about", "IGC {version} has a bug (2.27 to 2.30 miscompile some reads for Xe2 and later GPUs); XeStrata works around it, the decode of short prompts up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).", {version: eng.igc_workaround}) : null],
   ]);
   facts($("facts-hw"), [
-    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : "not readable (xe driver)"],
+    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : tr("about.gpuUnreadable", "not readable (xe driver)")],
     ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
   ]);
@@ -743,30 +762,31 @@ async function loadUpdate(force = false) {
   renderUpdate(u);
   if (u.newer && store.get("update-told", "") !== u.tag) {   // once for each release
     store.set("update-told", u.tag);
-    toast("info", `XeStrata ${u.tag} is out`, "About > Updates says how to update.", 8000,
-          {label: "Show", run: () => showTab("about")});
+    toast("info", tr("update.out", "XeStrata {tag} is out", {tag: u.tag}), tr("update.outText", "About > Updates says how to update."), 8000,
+          {label: tr("show", "Show"), run: () => showTab("about")});
   }
   return true;
 }
 function renderUpdate(u) {
   const when = u.checked_at ? new Date(u.checked_at * 1000).toLocaleString([], {dateStyle: "medium", timeStyle: "short"}) : null;
   facts($("facts-update"), [
-    ["This version", `xe${u.current}`],
-    ["Latest release", u.tag ? `${u.tag}${u.newer ? " (newer)" : " (up to date)"}` : null],
-    ["Checked", when ? `${when}${u.automatic ? "" : " (automatic checks off)"}` : (u.automatic ? "not yet" : "automatic checks off")],
+    [tr("update.version", "This version"), `xe${u.current}`],
+    [tr("update.latest", "Latest release"), u.tag ? `${u.tag} ${u.newer ? tr("update.newer", "(newer)") : tr("update.isLatest", "(up to date)")}` : null],
+    [tr("update.checked", "Checked"), when ? `${when}${u.automatic ? "" : ` ${tr("update.autoOffNote", "(automatic checks off)")}`}`
+                                           : (u.automatic ? tr("update.notYet", "not yet") : tr("update.autoOff", "automatic checks off"))],
   ]);
   $("update-dot").hidden = !u.newer;
   $("update-how").hidden = !u.newer;
   if (u.newer) {
-    $("update-how").innerHTML = `<a href="${esc(u.url)}" target="_blank" rel="noopener noreferrer">Release notes of ${esc(u.tag)}</a>. ` +
-                                `To update: ${esc(u.how)}.`;
+    $("update-how").innerHTML = `<a href="${esc(u.url)}" target="_blank" rel="noopener noreferrer">${esc(tr("update.notes", "Release notes of {tag}", {tag: u.tag}))}</a>. ` +
+                                esc(tr("update.how", "To update: {how}.", {how: u.how}));
   }
   $("update-msg").textContent = u.error || "";
 }
 $("update-check").onclick = async () => {
   $("update-check").disabled = true;
-  $("update-msg").textContent = "Checking…";
-  if (!await loadUpdate(true)) $("update-msg").textContent = "The server did not answer.";
+  $("update-msg").textContent = tr("update.checking", "Checking…");
+  if (!await loadUpdate(true)) $("update-msg").textContent = tr("model.noAnswer", "The server did not answer.");
   $("update-check").disabled = false;
 };
 
@@ -958,14 +978,16 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, math: false,
-                  chatList: false, chatEdit: false, whileBusy: "wait"};
+const DEFAULTS = {thinking: "", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: "", max: "", seed: "", show: true, esp: true,
+                  mcp: true, math: false, chatList: false, chatEdit: false, whileBusy: "wait"};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
   return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
+// before the model's own levels (thinking_v 2) "high" was every model's default and saved as it: the default again
+if (settings.thinking_v !== 2 && settings.thinking === "high") settings.thinking = "";
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);   // the open chat's messages (chats-ui.js: with the saved-chats list on, also that chat's own)
 let attachments = [];                 // {name, url}
@@ -1042,9 +1064,17 @@ function toolHtml(t, k) {
     `<span class="tool-call__preview muted">${esc(preview.slice(0, 200))}</span>` +
     `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
     `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>` +
-    // the images an image tool made, under its block (the server keeps them: /v1/images/files/)
-    (t.images && t.images.some((u) => typeof u === "string") ? `<div class="msg-images tool-images">${t.images.filter((u) => typeof u === "string").map((u) =>
-      `<a href="${esc(u.replace(/^\//, ""))}" target="_blank" rel="noopener"><img src="${esc(u.replace(/^\//, ""))}" alt="${esc(t.tool || "image")}"></a>`).join("")}</div>` : "");
+    // the images an image tool made, under its block (the server keeps them: /v1/images/files/). Their addresses are
+    // strings; an MCP server's picture ({url: "tool-media/..."}, mcp.image_results) is drawn by toolImages below
+    imageToolHtml(t, k);
+}
+// a generate_image call with a layout (MOSS-Image's boxes) also gets a button that opens it in the Images tab
+function imageToolHtml(t, k) {
+  const urls = (t.images || []).filter((u) => typeof u === "string");
+  const a = t.arguments, layout = t.tool === "generate_image" && a && (typeof a === "string" ? a.includes('"layout"') : a.layout);
+  const open = layout && t.state === "done" ? `<button type="button" class="st-btn" data-tool-layout="${k}">${esc(tr("img.layoutToImages", "Open the layout in Images"))}</button>` : "";
+  return urls.length || open ? `<div class="msg-images tool-images">${urls.map((u) =>
+    `<a href="${esc(u.replace(/^\//, ""))}" target="_blank" rel="noopener"><img src="${esc(u.replace(/^\//, ""))}" alt="${esc(t.tool || "image")}"></a>`).join("")}${open}</div>` : "";
 }
 // Raster tool results are same-origin cached files; credentials stay in request headers.
 const mediaBlobs = new Map();
@@ -1103,7 +1133,7 @@ function onTool(m, x) {
   if (x.event === "call") {
     Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
   } else if (x.event === "result") {
-    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images, vision: x.vision === true,
+    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images || [], vision: x.vision === true,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
   }
 }
@@ -1129,8 +1159,8 @@ function updateAssistant(el, m, streaming) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
     bubble.innerHTML = answerHtml(m);
-    hydrateToolImages(bubble);
     if (settings.math) StrataMath.hydrate(bubble);
+    hydrateToolImages(bubble);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? tr("chat.stopped", "Stopped") : "");
@@ -1203,6 +1233,12 @@ $("chat").addEventListener("click", (e) => {
   }
   const mc = e.target.closest("[data-msg-copy]");
   if (mc) { const i = +mc.closest(".st-msg").dataset.i; copyText(messages[i].text, mc); return; }
+  const tl = e.target.closest("[data-tool-layout]");
+  if (tl) {
+    const m = messages[+tl.closest(".st-msg").dataset.i], t = m && m.tools && m.tools[+tl.dataset.toolLayout];
+    if (t) imgLayoutFromTool(t);
+    return;
+  }
   // a tool block: its open state lives in the message (the answer is rebuilt while it streams), so the click sets it
   const sum = e.target.closest(".tool-call > summary");
   if (sum) {
@@ -1387,18 +1423,22 @@ async function generateReply() {
   setBusy(true);
   paintLive();
 
-  const body = {model: health.model, messages: apiMessages(), stream: true,
-                reasoning_effort: settings.thinking};
+  const body = {model: health.model, messages: apiMessages(), stream: true};
+  const effort = thinkingEffort(settings);
+  if (effort) body.reasoning_effort = effort;
   if (!(settings.temperature > 0)) {
     body.temperature = 0;
   } else if (!samplingUntouched(settings)) {
     Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
   }
+  if (settings.temperature > 0 && settings.min_p !== "" && settings.min_p != null) body.min_p = +settings.min_p;
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
-  if (health.image_generation) body.strata_images = true;   // and make images when the conversation asks for one
+  // and make images when the conversation asks for one: by the model the words choose (auto), by one, or none
+  const ci = $("chat-images").value;
+  if (health.image_generation && ci !== "off") body.strata_images = ci === "auto" || !ci ? true : {model: ci};
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -1469,7 +1509,7 @@ async function generateReply() {
   for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null; }
   const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
   if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${tr("chat.toolCalls", {one: "{n} tool call", other: "{n} tool calls"}, {n: ran})}`;
-  if (m.limit) m.meta = `${m.meta || ""} · ${tr("chat.toolLimit", "stopped at the limit of {n} tool rounds (mcp.max_rounds)", {n: m.limit})}`;
+  if (m.limit) m.meta = `${m.meta || ""} · ${tr("chat.toolLimit", "tool limit reached ({n} rounds, mcp.max_rounds)", {n: m.limit})}`;
   busy = null;
   setBusy(false);
   paintLive();
@@ -1611,9 +1651,10 @@ function openDrawer(open) {
 const checked = (id) => $(id).getAttribute("aria-checked") === "true";
 const segValue = (id) => { const b = [...$(id).children].find((x) => x.getAttribute("aria-checked") === "true"); return b ? b.dataset.v : null; };
 function loadDrawer(s = settings) {
-  for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === s.thinking));
+  const level = thinkingChosen(s);
+  for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === level));
   $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
-  $("s-max").value = s.max; $("s-seed").value = s.seed;
+  $("s-max").value = s.max; $("s-seed").value = s.seed; $("s-minp").value = s.min_p ?? "";
   $("s-math").setAttribute("aria-checked", String(!!s.math));
   $("s-show").setAttribute("aria-checked", String(!!s.show));
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
@@ -1635,9 +1676,12 @@ async function loadShared() {
   $("s-share").setAttribute("aria-checked", String(sharedOn));
 }
 function sharedDefaults(s) {
-  const d = {reasoning_effort: s.thinking};
+  const d = {};
+  const effort = thinkingEffort(s);
+  if (effort) d.reasoning_effort = effort;
   if (!(+s.temperature > 0)) d.temperature = 0;
   else if (!samplingUntouched(s)) Object.assign(d, {temperature: +s.temperature, top_p: +s.top_p, top_k: +s.top_k});
+  if (+s.temperature > 0 && s.min_p !== "" && s.min_p != null) d.min_p = +s.min_p;
   if (s.seed) d.seed = +s.seed;
   if (s.max) d.max_tokens = +s.max;
   if (projectionLoaded()) d.experimental_speed_projection = s.esp !== false;
@@ -1658,21 +1702,51 @@ function projectionLoaded() {
   const c = lastMetrics && lastMetrics.engine ? lastMetrics.engine.cvec : 0;
   return !!c && c !== "0";
 }
+// the thinking levels: the model's own (/health's "thinking": GLM-5.3-Flash's low, high and max, a model that only
+// turns its thinking on and off its on), an older server's the four of before.  The model's default is sent as no
+// reasoning_effort at all, so the model's own default applies (llm-jp-4.1's medium, GLM-5.3-Flash's max)
+function thinkingInfo() {
+  return health.thinking || {levels: ["none", "low", "medium", "high"], default: "high"};
+}
+function thinkingChosen(s) {
+  const t = thinkingInfo();
+  return t.levels.includes(s.thinking) ? s.thinking : t.default;
+}
+function thinkingEffort(s) {
+  const v = thinkingChosen(s);
+  return v && v !== thinkingInfo().default && v !== "on" ? v : undefined;
+}
+function thinkingButtons() {
+  const t = thinkingInfo();
+  const names = {none: tr("drawer.off", "Off"), low: tr("drawer.low", "Low"), medium: tr("drawer.medium", "Medium"),
+                 high: tr("drawer.high", "High"), max: tr("drawer.max", "Max"), on: tr("drawer.on", "On")};
+  $("s-thinking").replaceChildren(...t.levels.map((v) => {
+    const b = document.createElement("button");
+    Object.assign(b, {type: "button", textContent: names[v] || v});
+    b.setAttribute("role", "radio");
+    b.dataset.v = v;
+    b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
+    return b;
+  }));
+  $("s-thinking").closest(".st-field").hidden = !t.levels.length;
+  loadDrawer();
+}
 function outputs() {
   const t = +$("s-temp").value;
   $("o-temp").textContent = t === 0 ? tr("drawer.greedy", "0 · greedy") : t.toFixed(2);
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
   $("o-topk").textContent = $("s-topk").value;
   const sel = segValue("s-thinking");
-  $("o-thinking").textContent = sel ? {none: tr("drawer.thinkNone", "answers right away"), low: tr("drawer.thinkLow", "short"),
-    medium: tr("drawer.thinkMedium", "medium"), high: tr("drawer.thinkHigh", "thorough (default)")}[sel] : "";
+  const what = {none: tr("drawer.thinkNone", "answers right away"), low: tr("drawer.thinkLow", "short"),
+                medium: tr("drawer.thinkMedium", "medium"), high: tr("drawer.thinkHigh", "thorough"),
+                max: tr("drawer.thinkMax", "the most thorough"), on: tr("drawer.thinkOn", "thinks first")};
+  $("o-thinking").textContent = sel ? what[sel] + (sel === thinkingInfo().default ? ` ${tr("drawer.thinkDefault", "(default)")}` : "") : "";
   const busyMode = segValue("s-busy");
   $("o-busy").textContent = {wait: tr("drawer.busyWaitNote", "Send is off until the answer is done, as before."),
     queue: tr("drawer.busyQueueNote", "Your message waits and goes as soon as the answer is done."),
     interject: tr("drawer.busyInterjectNote", "The answer stops where it is (what is written stays) and your message goes at once. A tool that is running finishes first.")}[busyMode] || "";
-  for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
+  for (const id of ["s-topp", "s-topk", "s-minp"]) $(id).disabled = t === 0;
 }
-for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const b of $("s-busy").children) b.onclick = () => { for (const x of $("s-busy").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
 for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit"]) {
@@ -1683,8 +1757,10 @@ $("s-apply").onclick = async () => {
   const prev = settings;
   // the list and the edit controls change the messages on the screen: not while an answer is written or something is open
   const locked = !!busy || !!panel;
-  settings = {thinking: segValue("s-thinking") || "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
-              top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
+  const sel = segValue("s-thinking");
+  settings = {thinking: sel && sel !== thinkingInfo().default ? sel : "", thinking_v: 2, temperature: +$("s-temp").value, top_p: +$("s-topp").value,
+              top_k: +$("s-topk").value, min_p: $("s-minp").value.trim(), max: $("s-max").value.trim(),
+              seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
               whileBusy: segValue("s-busy") || "wait"};
@@ -1718,28 +1794,42 @@ $("scrim").onclick = () => openDrawer(false);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
 
 // ------------------------------------------------------------------ language (serve/web/i18n.js)
-// The user's own choice, kept in this browser: English until they pick another. /?lang=de shows one for this visit only.
+// The user's own choice, kept in this browser; without one ("Automatic"), the browser's language where the page has it,
+// else English. /?lang=de shows one for this visit only.
 const urlLang = new URLSearchParams(location.search).get("lang");
-$("lang").innerHTML = StrataI18n.LANGUAGES.map(([code, name]) => `<option value="${esc(code)}">${esc(name)}</option>`).join("");
+function browserLanguage() {
+  return StrataI18n.choose(urlLang, store.get("lang", ""), navigator.languages || [navigator.language]);
+}
+// the choices: Automatic first (in the language of the moment), then each language in its own name
+function languageChoices() {
+  $("lang").innerHTML = `<option value="auto">${esc(tr("settings.languageAuto", "Automatic (browser language)"))}</option>` +
+    StrataI18n.LANGUAGES.map(([code, name]) => `<option value="${esc(code)}">${esc(name)}</option>`).join("");
+  const saved = store.get("lang", "");
+  $("lang").value = urlLang && urlLang === StrataI18n.lang ? StrataI18n.lang
+                  : StrataI18n.LANGUAGES.some((l) => l[0] === saved) ? saved : "auto";
+}
 function showLanguage() {
-  $("lang").value = StrataI18n.lang;
+  languageChoices();
   renderEmptyChat();
   setSidebar(sidebarOpen, false);
-  outputs();
+  thinkingButtons();   // the level buttons are built in the code, in the language of the moment
+  imgModels();         // so are the Images tab's texts and the chat's image choice
+  loadUpdate();        // and About's Updates card
   renderChat();
   setBusy(!!busy);
   if (lastMetrics) render(lastMetrics);
 }
 $("lang").onchange = async () => {
-  store.set("lang", $("lang").value);
-  await StrataI18n.setLanguage($("lang").value);
+  const v = $("lang").value;
+  if (v === "auto") store.del("lang"); else store.set("lang", v);   // Automatic forgets the choice
+  await StrataI18n.setLanguage(v === "auto" ? StrataI18n.choose(null, null, navigator.languages || [navigator.language]) : v);
   showLanguage();
 };
 
 // ------------------------------------------------------------------ start
 async function start() {
-  await StrataI18n.setLanguage(urlLang || store.get("lang", "en"));
-  $("lang").value = StrataI18n.lang;
+  await StrataI18n.setLanguage(browserLanguage());
+  languageChoices();
   renderEmptyChat();
   initChats();
   if (settings.chatList) await setChatList(true, false);       // the saved-chats list is read before the first draw
@@ -1747,9 +1837,11 @@ async function start() {
   renderChat();
   const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
   if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
+  thinkingButtons();   // the four of before until /health says the model's own
   loadHealth().then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
   showTab(location.hash.slice(1) || "chat");
   poll();
+  setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too
   requestAnimationFrame(fitHeader);
 }
 start();
@@ -1764,48 +1856,656 @@ function readAsDataURL(f) {
   });
 }
 $("img-size").onchange = () => { $("img-custom").hidden = $("img-size").value !== "custom"; };
+// the image model's defaults (/health's image_defaults, what the API gives a request that leaves a field out): the
+// fields' placeholders, the steps hidden where they are fixed (Turbo), the transparent background where it has one,
+// the negative prompt hidden where the guidance is one token the model reads (HunyuanImage 3.0: guidance_token), and
+// the sizes snapped to the model's own (buckets) for the estimate
+// the image models (/health's image_models, the default first): a choice where there are several, its defaults and
+// whether it edits; one without edits takes one image to start from (img2img) instead of reference images
+function imgModel() {
+  const ms = health.image_models || [];
+  return ms.find(m => m.id === $("img-model").value) || ms[0] || {defaults: health.image_defaults || {}, edits: true};
+}
+// the chat's image choice: auto (the words choose the model; the default otherwise), off, or one model; kept here
+function chatImages() {
+  const ms = health.image_models || [], sel = $("chat-images");
+  const was = sel.value || store.get("chat_images", "auto");
+  const opts = [new Option(ms.length > 1 ? tr("chatImages.auto", "Images: auto") : tr("chatImages.on", "Images: on"), "auto"),
+                new Option(tr("chatImages.off", "Images: off"), "off")];
+  if (ms.length > 1) opts.push(...ms.map(m => new Option(tr("chatImages.model", "Images: {model}", {model: m.id}), m.id)));
+  sel.replaceChildren(...opts);
+  sel.value = [...sel.options].some(o => o.value === was) ? was : "auto";
+  sel.hidden = !health.image_generation;
+}
+$("chat-images").onchange = () => store.set("chat_images", $("chat-images").value);
+function imgModels() {
+  chatImages();
+  const ms = health.image_models || [], sel = $("img-model"), was = sel.value;
+  sel.replaceChildren(...ms.map(m => new Option(m.id, m.id)));
+  if (ms.some(m => m.id === was)) sel.value = was;
+  $("img-model-f").hidden = ms.length < 2;
+  imgDefaults();
+}
+$("img-model").onchange = () => {
+  if (!imgModel().edits && ($("img-ref").files || []).length > 1) $("img-ref").value = "";
+  imgDefaults();
+  imgMaskSetup();
+};
+function imgDefaults() {
+  const d = imgModel().defaults || {}, edits = imgModel().edits;
+  // an image: an edit's references, or (a model without edits) the one image img2img starts from; its strength
+  // (how much of the schedule runs from it) beside it, the model's default as the placeholder
+  $("img-ref-l").textContent = edits ? tr("img.edit", "Edit an image (optional)") : tr("img.img2img", "Start from an image (optional, img2img)");
+  $("img-ref").multiple = !!edits;
+  const refs = ($("img-ref").files || []).length > 0;
+  $("img-strength-f").hidden = !refs;
+  $("img-steps-f").hidden = !!d.steps_fixed;
+  $("img-steps").min = d.steps_min || 1;
+  $("img-steps").max = d.steps_max || 100;
+  $("img-steps").placeholder = String((refs && edits ? d.edit_steps : d.steps) || "");
+  const token = !!d.guidance_token;   // one token, not a second pass with a negative prompt
+  $("img-neg-f").hidden = token;
+  $("img-cfg-l").textContent = token ? tr("img.guidance", "Guidance") : tr("img.guidanceCfg", "Guidance (CFG)");
+  $("img-cfg").placeholder = d.guidance > 1 || token ? String(d.guidance) : tr("img.off", "off");
+  $("img-bg-f").hidden = !d.transparency;
+  imgCount();
+  imgFormat();
+  imgNegHint();
+  imgMossSetup();
+  imgLoras();
+}
+// the adapters this image model applies (/health's image_models[].defaults.loras, serve/loras.py's listing): the ones
+// it takes, chosen here, with a strength each (the API's -2 to 2, starting from the listing's recommended one) and,
+// where the file names them, its trigger words, which a button puts into the prompt.  The choice is kept in this
+// browser for each model (xestrata.img_loras.<model>) and comes back with it.  A model whose listing is empty takes no
+// adapter (HunyuanImage 3.0, whose config names none: the DiT is not one of TARGETS): the block is hidden and none is sent.
+const IMG_LORA_COUNT = 4, IMG_LORA_SCALE = 2;   // serve/loras.py's MAX_LORA, and its SCALE_MIN..SCALE_MAX
+let imgLoraSel = [];   // [{name, scale}]: the adapters the next request applies, in the order they were chosen
+function imgLoras() {
+  const list = (imgModel().defaults || {}).loras || [];
+  $("img-lora").hidden = !list.length;
+  const by = new Map(list.map(e => [e.name, e]));
+  const kept = list.length ? store.get(`img_loras.${imgModel().id || "default"}`, []) : [];
+  const names = new Set();
+  imgLoraSel = (Array.isArray(kept) ? kept : []).filter(u => {
+    if (!u || typeof u.name !== "string" || !by.has(u.name) || names.has(u.name)) return false;
+    names.add(u.name);
+    return true;
+  }).slice(0, IMG_LORA_COUNT)
+    .map(u => ({name: u.name, scale: imgLoraStrength(u.scale, by.get(u.name).scale)}));
+  imgLoraDraw(list);
+}
+// a strength the API takes: the field's number within -2..2 at two decimals, `fallback` (the listing's recommended
+// one) when the field is empty or not a number, else the API's default 1
+function imgLoraStrength(value, fallback) {
+  const v = value == null || value === "" || typeof value === "boolean" ? NaN : Number(value);
+  const want = Number.isFinite(v) ? v : Number(fallback);
+  const use = Number.isFinite(want) ? want : 1;
+  return Math.max(-IMG_LORA_SCALE, Math.min(IMG_LORA_SCALE, Math.round(use * 100) / 100));
+}
+// the picker (the adapters not chosen yet) and a chip for each chosen one: its name, its strength, its trigger words
+// when it has them, and the button that takes it off
+function imgLoraDraw(list) {
+  const add = $("img-lora-add"), chosen = new Set(imgLoraSel.map(u => u.name));
+  const open = list.filter(e => !chosen.has(e.name));
+  add.replaceChildren(new Option(tr("img.loraAdd", "Add a LoRA…"), ""), ...open.map(e => new Option(e.name, e.name)));
+  add.value = "";
+  add.disabled = !open.length || imgLoraSel.length >= IMG_LORA_COUNT;
+  $("img-lora-chips").replaceChildren(...imgLoraSel.map(u => {
+    const e = list.find(x => x.name === u.name) || {name: u.name};
+    const chip = document.createElement("div"), name = document.createElement("span");
+    chip.className = "img-lora-chip";
+    chip.dataset.name = u.name;
+    name.className = "img-lora-chip__name";
+    name.textContent = u.name;
+    name.title = imgLoraAbout(e);
+    const scale = document.createElement("input");
+    scale.className = "st-input";
+    scale.type = "number";
+    scale.min = String(-IMG_LORA_SCALE);
+    scale.max = String(IMG_LORA_SCALE);
+    scale.step = "0.05";
+    scale.value = String(u.scale);
+    scale.setAttribute("aria-label", tr("img.strength", "Strength"));
+    scale.onchange = () => { u.scale = imgLoraStrength(scale.value, e.scale); scale.value = String(u.scale); imgLoraSave(); };
+    chip.append(name, scale);
+    if (e.trigger) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "st-btn st-btn--secondary";
+      b.textContent = tr("img.loraTrigger", "Trigger");
+      b.title = tr("img.loraTriggerTitle", "Put its trigger words into the prompt");
+      b.onclick = () => imgLoraTrigger(e.trigger);
+      chip.append(b);
+    }
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "st-btn st-btn--icon";
+    rm.textContent = "×";
+    rm.title = tr("img.loraRemove", "Remove this LoRA");
+    rm.setAttribute("aria-label", rm.title);
+    rm.onclick = () => { imgLoraSel = imgLoraSel.filter(x => x !== u); imgLoraSave(); imgLoraDraw(list); };
+    chip.append(rm);
+    return chip;
+  }));
+  const most = imgLoraSel.length >= IMG_LORA_COUNT ? tr("img.loraMost", "Up to {n} LoRAs at once (the API's limit)", {n: IMG_LORA_COUNT}) : "";
+  $("img-lora-hint").textContent = most;
+  $("img-lora-hint").hidden = !most;
+}
+// a chip's tooltip: the rank and the file's size, and the kinds of weight it changes
+function imgLoraAbout(e) {
+  const parts = [tr("img.loraAbout", "rank {rank}, {size} MiB", {rank: e.rank || "–", size: e.size_mib == null ? "–" : e.size_mib})];
+  if ((e.targets || []).length) parts.push(e.targets.join(", "));
+  return parts.join(" · ");
+}
+// an adapter's trigger words into the prompt, once: after what is written there, comma-separated (the file's own
+// words, not a <lora:...> tag: the page names its adapters in the request's field)
+function imgLoraTrigger(words) {
+  const p = $("img-prompt"), was = p.value.trim();
+  if (!was) p.value = words;
+  else if (!was.includes(words)) p.value = `${was.replace(/[\s,]+$/, "")}, ${words}`;
+  p.focus();
+}
+function imgLoraSave() {
+  store.set(`img_loras.${imgModel().id || "default"}`, imgLoraSel.map(u => ({name: u.name, scale: u.scale})));
+}
+// the adapters this request asks for, as the API's field (serve/loras.py's "lora": [{"name", "scale"}]); none for a
+// model whose block is hidden, or when none is chosen (the model's own weights)
+function imgLorasBody() {
+  return $("img-lora").hidden ? [] : imgLoraSel.slice(0, IMG_LORA_COUNT).map(u => ({name: u.name, scale: imgLoraStrength(u.scale)}));
+}
+$("img-lora-add").onchange = () => {
+  const list = (imgModel().defaults || {}).loras || [], e = list.find(x => x.name === $("img-lora-add").value);
+  if (e && imgLoraSel.length < IMG_LORA_COUNT && !imgLoraSel.some(u => u.name === e.name)) {
+    imgLoraSel.push({name: e.name, scale: imgLoraStrength(null, e.scale)});
+    imgLoraSave();
+  }
+  imgLoraDraw(list);
+};
+// the count: up to max_n, and as many as take budget_s at the speed the server measured (its rates; before it has
+// made an image, 4), with the time the images chosen take (the server refuses more, ImageGen.check_n)
+function imgEstimate(n) {
+  const d = imgModel().defaults || {}, rates = d.rates || {};
+  const refs = ($("img-ref").files || []).length > 0, edit = refs && imgModel().edits;
+  const pts = rates[edit ? "edit" : "generate"] || rates.generate || rates.edit;
+  if (!pts || !pts.length) return null;
+  let [w, h] = $("img-size").value === "custom" ? [+$("img-w").value, +$("img-h").value]
+    : ($("img-size").value === "auto" ? "1024x1024" : $("img-size").value).split("x").map(Number);
+  w = Math.ceil((w || 1024) / 16) * 16;
+  h = Math.ceil((h || 1024) / 16) * 16;
+  if (d.buckets && d.buckets.length) {   // the model's own sizes: the one whose shape is nearest (the server's choice)
+    const r = h / w;
+    [w, h] = d.buckets.reduce((a, b) => Math.abs(b[1] / b[0] - r) < Math.abs(a[1] / a[0] - r) ? b : a);
+  }
+  let steps = d.steps_fixed ? d.steps : (+$("img-steps").value || (edit ? d.edit_steps : d.steps) || 1);
+  if (refs) {   // a strength runs part of the schedule (the server's strength_run)
+    const s = $("img-strength").value !== "" ? Number($("img-strength").value) : imgStrength(d, steps);
+    if (s > 0 && s < 1) steps -= Math.floor(Math.max(steps - steps * s, 0));
+  }
+  const g = $("img-cfg").value !== "" ? Number($("img-cfg").value) : (d.guidance || 1);
+  if (g > 1 && !d.guidance_token && (d.negative_prompt != null || $("img-neg").value.trim())) steps *= 2;
+  // as the server's ImageGen.estimate_s: the size measured nearest, a step's time scaled (size_exp above it)
+  const mp = w * h / 1e6;
+  const [near, stepS, restS] = pts.reduce((a, p) => Math.abs(Math.log(mp / p[0])) < Math.abs(Math.log(mp / a[0])) ? p : a);
+  const scale = mp / near;
+  return n * (steps * stepS * scale ** (scale > 1 ? (d.size_exp || 1.5) : 1) + restS * scale);
+}
+// the strength a request without one gets: an edit's 1; an img2img's d.strength at most, lowered with few steps so
+// that it skips one (the server's img2img_strength)
+function imgStrength(d, steps) {
+  const s = d.strength != null ? d.strength : 1;
+  return !d.img2img || s >= 1 || steps < 2 ? s : Math.min(s, 1 - 1 / steps);
+}
+function imgStrengthHint() {
+  const d = imgModel().defaults || {};
+  const steps = d.steps_fixed ? d.steps : (+$("img-steps").value || d.steps || 1);
+  $("img-strength").placeholder = String(+imgStrength(d, steps).toFixed(2));
+}
+function imgCount() {
+  imgStrengthHint();
+  const d = imgModel().defaults || {}, n = $("img-n"), was = +n.value || 1;
+  const maxN = d.max_n || 16, budget = d.budget_s || 600, one = imgEstimate(1);
+  const most = one == null ? Math.min(maxN, 4) : Math.max(1, Math.min(maxN, Math.floor(budget / one)));
+  if (n.options.length !== most)
+    n.replaceChildren(...Array.from({length: most}, (_, i) => new Option(String(i + 1))));
+  n.value = String(Math.min(was, most));
+  const est = imgEstimate(+n.value);
+  $("img-n-est").textContent = est == null ? "" : est < 90 ? tr("img.aboutS", "about {n} s", {n: Math.max(1, Math.round(est))})
+    : tr("img.aboutMin", "about {n} min", {n: (est / 60).toFixed(est < 600 ? 1 : 0)});
+  $("img-n-f").title = one == null ? tr("img.countFirst", "Up to 4 until the server has made an image and measured its speed")
+    : tr("img.countMost", "Up to {n}: the images one request makes in {min} min at most (budget_s)", {n: most, min: Math.round(budget / 60)});
+}
+for (const id of ["img-size", "img-w", "img-h", "img-steps", "img-cfg", "img-n", "img-strength"])
+  $(id).addEventListener("input", imgCount);
+$("img-size").addEventListener("change", imgCount);
+// whether the negative prompt is used: only with guidance above 1, and some models guide only with one
+function imgNegHint() {
+  const d = imgModel().defaults || {};
+  const g = $("img-cfg").value !== "" ? Number($("img-cfg").value) : (d.guidance || 1);
+  const neg = $("img-neg").value.trim() !== "";
+  let msg = "";
+  if (d.guidance_token) msg = "";   // no negative prompt: the field is hidden
+  else if (neg && g <= 1) msg = tr("img.negUnused", "The negative prompt is used only with guidance above 1.");
+  else if (!neg && g > 1 && d.negative_prompt == null) msg = tr("img.negNeeded", "This image model guides only with a negative prompt.");
+  $("img-neg-hint").textContent = msg;
+  $("img-neg-hint").hidden = !msg;
+}
+// the mask (every model takes one): the first image (an edit's reference, or img2img's) under a canvas of its own
+// size, painted where it is to change; sent as OpenAI's mask, a PNG of that size transparent where it was painted
+let imgMaskURL = null;
+function imgMaskSetup() {
+  const d = imgModel().defaults || {};
+  const f = ($("img-ref").files || [])[0];
+  if (imgMaskURL) URL.revokeObjectURL(imgMaskURL);
+  imgMaskURL = null;
+  $("img-mask").hidden = !(f && d.mask);
+  if ($("img-mask").hidden) { imgLayoutDraw(); return; }
+  imgMaskURL = URL.createObjectURL(f);
+  const img = $("img-mask-img"), c = $("img-mask-paint");
+  img.onload = () => { c.width = img.naturalWidth; c.height = img.naturalHeight; imgLayoutDraw(); };
+  img.src = imgMaskURL;
+}
+(() => {
+  const c = $("img-mask-paint");
+  let last = null;
+  const at = (ev) => {
+    const r = c.getBoundingClientRect();
+    return [(ev.clientX - r.left) * c.width / r.width, (ev.clientY - r.top) * c.height / r.height, c.width / r.width];
+  };
+  const stroke = (a, b) => {
+    const g = c.getContext("2d");
+    g.globalCompositeOperation = $("img-erase").checked ? "destination-out" : "source-over";
+    g.strokeStyle = "#e11d48";
+    g.lineCap = g.lineJoin = "round";
+    g.lineWidth = Number($("img-brush").value) * b[2];   // the brush in screen pixels, at the image's size
+    g.beginPath();
+    g.moveTo(a[0], a[1]);
+    g.lineTo(b[0], b[1]);
+    g.stroke();
+  };
+  c.onpointerdown = (ev) => { c.setPointerCapture(ev.pointerId); last = at(ev); stroke(last, last); };
+  c.onpointermove = (ev) => { if (!last) return; const p = at(ev); stroke(last, p); last = p; };
+  c.onpointerup = c.onpointercancel = () => { last = null; };
+})();
+$("img-mask-clear").onclick = () => { const c = $("img-mask-paint"); c.getContext("2d").clearRect(0, 0, c.width, c.height); };
+// the mask as a data: URL, or null where nothing is painted
+function imgMask() {
+  const c = $("img-mask-paint");
+  if ($("img-mask").hidden || !c.width) return null;
+  const px = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+  let painted = false;
+  for (let i = 3; i < px.length && !painted; i += 4) painted = px[i] > 0;
+  if (!painted) return null;
+  const m = document.createElement("canvas");
+  m.width = c.width;
+  m.height = c.height;
+  const g = m.getContext("2d");
+  g.fillRect(0, 0, m.width, m.height);
+  g.globalCompositeOperation = "destination-out";
+  g.drawImage(c, 0, 0);
+  return m.toDataURL("image/png");
+}
+// MOSS-Image's own fields, shown where /health's defaults have a layout: the prompt written out by the chat's model
+// (enhance), the schedule's shift, the blocks guidance's negative pass skips, skip-layer guidance, and a layout of
+// boxes drawn over the image.  A box is kept in shares of the image's sides, so a change of size keeps it in place;
+// it goes as the API's layout, [x_min, y_min, x_max, y_max] in the image's pixels from its top-left corner.
+const imgLayout = {boxes: [], sel: -1};
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+// the size the boxes are counted in: the size chosen; "auto" is 1024 x 1024, or the starting image's shape at about
+// as many pixels (sent as that size, so that the boxes and the image agree)
+function imgLayoutWH() {
+  const v = $("img-size").value;
+  if (v === "custom") return [+$("img-w").value || 1024, +$("img-h").value || 1024];
+  if (v !== "auto") return v.split("x").map(Number);
+  const im = $("img-mask-img");
+  if (!imgMaskURL || !im.naturalWidth) return [1024, 1024];
+  const s = Math.sqrt(1024 * 1024 / (im.naturalWidth * im.naturalHeight));
+  return [Math.max(256, Math.round(im.naturalWidth * s / 16) * 16), Math.max(256, Math.round(im.naturalHeight * s / 16) * 16)];
+}
+function imgMossSetup() {
+  const d = imgModel().defaults || {};
+  $("img-moss").hidden = !d.layout;
+  if (!d.layout) return;
+  const boxes = $("img-layout-on").checked;
+  $("img-enhance-f").hidden = !d.enhance || boxes;   // the layout is the prompt already: nothing to write out
+  $("img-shift").placeholder = String(d.shift);
+  $("img-uskip").placeholder = (d.uncond_skip_layers || []).join(", ") || tr("img.noBlocks", "none");
+  $("img-slg-scale").placeholder = String(d.slg_scale || 0);
+  $("img-slg-start").placeholder = String(d.slg_start || 0);
+  $("img-slg-stop").placeholder = String(d.slg_stop == null ? 1 : d.slg_stop);
+  $("img-layout").hidden = !boxes;
+  imgLayoutDraw();
+  imgLayoutFields();
+}
+function imgBoxName(label) {
+  return label === "text" ? tr("img.boxText", "Text") : label === "character" ? tr("img.boxCharacter", "Character") : tr("img.boxObject", "Object");
+}
+function imgLayoutDraw() {
+  if ($("img-layout").hidden) return;
+  const st = $("img-layout-stage"), [w, h] = imgLayoutWH();
+  st.style.aspectRatio = `${w} / ${h}`;
+  st.style.backgroundImage = imgMaskURL ? `url("${imgMaskURL}")` : "none";
+  st.replaceChildren(...imgLayout.boxes.map((b, i) => {
+    const e = document.createElement("div"), hd = document.createElement("span");
+    e.className = "img-box";
+    e.dataset.i = String(i);
+    e.dataset.label = b.label;
+    e.setAttribute("aria-selected", String(i === imgLayout.sel));
+    Object.assign(e.style, {left: `${b.x0 * 100}%`, top: `${b.y0 * 100}%`, width: `${(b.x1 - b.x0) * 100}%`, height: `${(b.y1 - b.y0) * 100}%`,
+                            zIndex: String(1 + Math.round((1 - (b.x1 - b.x0) * (b.y1 - b.y0)) * 1000))});   // a smaller box over a larger one
+    e.textContent = b.label === "text" && b.text ? `"${b.text}"` : b.caption || imgBoxName(b.label);
+    hd.className = "img-box__handle";
+    e.append(hd);
+    return e;
+  }));
+}
+// the selected box's fields (set when the selection changes, not while they are typed in)
+function imgLayoutFields() {
+  const b = imgLayout.boxes[imgLayout.sel];
+  $("img-layout-item").hidden = !b;
+  if (!b) return;
+  $("img-box-label").value = b.label;
+  $("img-box-caption").value = b.caption;
+  $("img-box-text").value = b.text;
+  $("img-box-text-f").hidden = b.label !== "text";
+}
+(() => {
+  const st = $("img-layout-stage"), least = 0.02;
+  let drag = null;   // {i, mode: "new" | "move" | "size", p: where it began, b: the box as it was}
+  st.tabIndex = 0;
+  const at = (ev) => {
+    const r = st.getBoundingClientRect();
+    return [clamp01((ev.clientX - r.left) / r.width), clamp01((ev.clientY - r.top) / r.height)];
+  };
+  st.onpointerdown = (ev) => {
+    const p = at(ev), el = ev.target.closest(".img-box");
+    st.setPointerCapture(ev.pointerId);
+    if (el) {
+      const i = +el.dataset.i;
+      drag = {i, mode: ev.target.classList.contains("img-box__handle") ? "size" : "move", p, b: {...imgLayout.boxes[i]}};
+    } else {
+      imgLayout.boxes.push({x0: p[0], y0: p[1], x1: p[0], y1: p[1], label: "object", caption: "", text: ""});
+      drag = {i: imgLayout.boxes.length - 1, mode: "new", p, b: null};
+    }
+    imgLayout.sel = drag.i;
+    imgLayoutDraw();
+    imgLayoutFields();
+  };
+  st.onpointermove = (ev) => {
+    if (!drag) return;
+    const p = at(ev), b = imgLayout.boxes[drag.i];
+    if (drag.mode === "new") {
+      [b.x0, b.x1] = [Math.min(drag.p[0], p[0]), Math.max(drag.p[0], p[0])];
+      [b.y0, b.y1] = [Math.min(drag.p[1], p[1]), Math.max(drag.p[1], p[1])];
+    } else if (drag.mode === "move") {   // kept inside the image
+      const o = drag.b, dx = Math.min(1 - o.x1, Math.max(-o.x0, p[0] - drag.p[0])), dy = Math.min(1 - o.y1, Math.max(-o.y0, p[1] - drag.p[1]));
+      Object.assign(b, {x0: o.x0 + dx, x1: o.x1 + dx, y0: o.y0 + dy, y1: o.y1 + dy});
+    } else {
+      b.x1 = Math.max(b.x0 + least, p[0]);
+      b.y1 = Math.max(b.y0 + least, p[1]);
+    }
+    imgLayoutDraw();
+  };
+  st.onpointerup = st.onpointercancel = () => {
+    if (!drag) return;
+    const b = imgLayout.boxes[drag.i], made = drag.mode === "new";
+    if (made && (b.x1 - b.x0 < least || b.y1 - b.y0 < least)) {   // a tap, not a box: nothing selected
+      imgLayout.boxes.splice(drag.i, 1);
+      imgLayout.sel = -1;
+    }
+    drag = null;
+    imgLayoutDraw();
+    imgLayoutFields();
+    if (made && imgLayout.sel >= 0) $("img-box-caption").focus();
+  };
+  st.onkeydown = (ev) => {
+    if ((ev.key === "Delete" || ev.key === "Backspace") && imgLayout.sel >= 0) { ev.preventDefault(); $("img-box-delete").click(); }
+  };
+})();
+const imgBox = () => imgLayout.boxes[imgLayout.sel];
+$("img-box-label").onchange = () => { const b = imgBox(); if (!b) return; b.label = $("img-box-label").value; imgLayoutFields(); imgLayoutDraw(); };
+$("img-box-caption").oninput = () => { const b = imgBox(); if (b) { b.caption = $("img-box-caption").value; imgLayoutDraw(); } };
+$("img-box-text").oninput = () => { const b = imgBox(); if (b) { b.text = $("img-box-text").value; imgLayoutDraw(); } };
+$("img-box-delete").onclick = () => {
+  if (imgLayout.sel < 0) return;
+  imgLayout.boxes.splice(imgLayout.sel, 1);
+  imgLayout.sel = -1;
+  imgLayoutDraw();
+  imgLayoutFields();
+};
+$("img-layout-clear").onclick = () => { imgLayout.boxes = []; imgLayout.sel = -1; imgLayoutDraw(); imgLayoutFields(); };
+$("img-layout-on").onchange = imgMossSetup;
+for (const id of ["img-size", "img-w", "img-h"]) $(id).addEventListener("input", imgLayoutDraw);
+$("img-size").addEventListener("change", imgLayoutDraw);
+// a layout made elsewhere (the prompt enhancer's, a chat's generate_image) into the boxes, at the size it was made
+// for: that size chosen, and the boxes on, for a change and another image
+function imgLayoutLoad(layout, size, prompt) {
+  const [w, h] = String(size || "").split("x").map(Number);
+  if (!(w > 0 && h > 0) || !layout || !Array.isArray(layout.items)) return;
+  const sel = $("img-size");
+  if ([...sel.options].some(o => o.value === `${w}x${h}`)) sel.value = `${w}x${h}`;
+  else { sel.value = "custom"; $("img-w").value = String(w); $("img-h").value = String(h); }
+  $("img-custom").hidden = sel.value !== "custom";
+  imgLayout.boxes = layout.items.filter(it => Array.isArray(it.bbox) && it.bbox.length === 4).map(it => {
+    const [x0, y0, x1, y1] = it.bbox.map(Number);
+    return {x0: clamp01(Math.min(x0, x1) / w), y0: clamp01(Math.min(y0, y1) / h), x1: clamp01(Math.max(x0, x1) / w), y1: clamp01(Math.max(y0, y1) / h),
+            label: ["object", "character", "text"].includes(it.label) ? it.label : "object", caption: String(it.caption || ""), text: String(it.text || "")};
+  });
+  imgLayout.sel = -1;
+  if (prompt != null) $("img-prompt").value = prompt;
+  $("img-layout-on").checked = true;
+  $("img-enhance").value = "";
+  imgCount();
+  imgMossSetup();
+  $("img-layout").scrollIntoView({block: "nearest"});
+}
+// a chat's generate_image call with a layout (MOSS-Image's): its prompt, model, size and boxes in the Images tab
+function imgLayoutFromTool(t) {
+  let a = t.arguments;
+  if (typeof a === "string") { try { a = JSON.parse(a); } catch (e) { return; } }
+  if (!a || !a.layout) return;
+  const ms = health.image_models || [];
+  const m = ms.find(x => x.id === a.model && (x.defaults || {}).layout) || ms.find(x => (x.defaults || {}).layout);
+  if (!m) return;
+  $("img-model").value = m.id;
+  imgDefaults();
+  const size = /^\d+x\d+$/.test(a.size || "") ? a.size : (String(t.result || "").match(/\((\d+x\d+),/) || [])[1] || "1024x1024";
+  showTab("images");
+  imgLayoutLoad(a.layout, size, typeof a.prompt === "string" ? a.prompt : null);
+}
+// MOSS-Image's fields into a request's body: an error's text when a box cannot go (a text box without its words)
+function imgMossBody(body) {
+  if ($("img-moss").hidden) return null;
+  const num = (id, key) => { if ($(id).value !== "") body[key] = Number($(id).value); };
+  num("img-shift", "shift");
+  num("img-slg-scale", "slg_scale");
+  num("img-slg-start", "slg_start");
+  num("img-slg-stop", "slg_stop");
+  const blocks = (id, key) => {
+    const v = $(id).value.trim();
+    if (v) body[key] = /^(none|-)$/i.test(v) ? [] : v.split(/[\s,]+/).filter(Boolean).map(Number);
+  };
+  blocks("img-uskip", "uncond_skip_layers");
+  blocks("img-slg", "slg_layers");
+  if ($("img-layout-on").checked && imgLayout.boxes.length) {
+    const [w, h] = imgLayoutWH(), items = [];
+    for (const b of imgLayout.boxes) {
+      const words = b.text.trim(), text = b.label === "text";
+      if (text && !words) return tr("img.boxNeedsWords", "A text box needs its words.");
+      items.push({label: b.label, caption: b.caption.trim() || (text ? words : imgBoxName(b.label)),
+                  ...(text ? {text: words} : {}),
+                  bbox: [Math.round(b.x0 * w), Math.round(b.y0 * h), Math.round(b.x1 * w), Math.round(b.y1 * h)]});
+    }
+    body.layout = {items};
+    if (body.size === "auto") body.size = `${w}x${h}`;
+  } else if ($("img-enhance").value && !$("img-enhance-f").hidden) {
+    body.enhance = $("img-enhance").value;
+  }
+  return null;
+}
+// what the prompt enhancer did (the response's strata.enhance), under the image: the prompt it wrote, or its layout
+// with a button that loads it into the boxes, or why it gave nothing
+function imgEnhanced(j, item) {
+  const e = j.strata && j.strata.enhance;
+  if (!e) return null;
+  const div = document.createElement("div"), p = document.createElement("span");
+  div.className = "img-enhanced";
+  if (e.error) p.textContent = tr("img.enhanceFailed", "The chat's model gave nothing usable ({error}); the prompt was used as it was.", {error: e.error});
+  else if (e.made === "layout") p.textContent = tr("img.enhancedLayout", {one: "The chat's model laid the image out in {n} box.", other: "The chat's model laid the image out in {n} boxes."}, {n: (e.layout.items || []).length});
+  else p.textContent = tr("img.enhancedCaption", "The chat's model wrote the prompt: {prompt}", {prompt: (item && item.revised_prompt) || e.prompt || ""});
+  div.append(p);
+  if (!e.error && e.made === "layout" && e.layout) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "st-btn";
+    b.textContent = tr("img.layoutEdit", "Edit this layout");
+    b.onclick = () => imgLayoutLoad(e.layout, j.size, null);
+    div.append(b);
+  }
+  return div;
+}
+// whether this browser shows JPEG XL (a 1 x 1 image, decoded); older browsers do not
+const imgJxl = new Promise(ok => {
+  const i = new Image();
+  i.onload = () => ok(i.naturalWidth === 1);
+  i.onerror = () => ok(false);
+  i.src = "data:image/jxl;base64,/woAEBAJCAABABgASxiLFYIB";
+});
+let imgJxlOK = false;
+imgJxl.then(ok => { imgJxlOK = ok; imgFormat(); });
+const IMG_FMT_NAMES = {png: "PNG", jpeg: "JPEG", webp: "WebP", jxl: "JPEG XL"};
+// the format: the server's (/health's formats) that this browser shows; the one chosen last, else JPEG XL (lossless)
+// where it can, else PNG.  JPEG, WebP and JPEG XL take a quality (JPEG XL's 100: lossless), kept per format; a
+// transparent background has no JPEG (no alpha channel)
+function imgFormat() {
+  const d = imgModel().defaults || {};
+  const f = $("img-fmt"), bg = $("img-bg").checked && !$("img-bg-f").hidden;
+  const fmts = (d.formats || ["png", "jpeg", "webp"]).filter(x => x !== "jxl" || imgJxlOK);
+  const was = store.get("img_fmt", fmts.includes("jxl") ? "jxl" : "png");
+  if ([...f.options].map(o => o.value).join() !== fmts.join())
+    f.replaceChildren(...fmts.map(x => new Option(IMG_FMT_NAMES[x] || x, x)));
+  f.value = fmts.includes(was) ? was : "png";
+  for (const o of f.options) o.disabled = bg && o.value === "jpeg";
+  if (bg && f.value === "jpeg") f.value = "png";
+  $("img-q-f").hidden = f.value === "png";
+  $("img-q").value = String(store.get("img_q_" + f.value, f.value === "jxl" ? 100 : 90));
+  $("img-q-f").title = f.value === "jxl" ? tr("img.lossless", "100: lossless") : "";
+}
+$("img-fmt").onchange = () => { store.set("img_fmt", $("img-fmt").value); imgFormat(); };
+$("img-q").onchange = () => store.set("img_q_" + $("img-fmt").value, +$("img-q").value);
+$("img-bg").onchange = imgFormat;
+$("img-partial").checked = store.get("img_partial", false);
+$("img-partial").onchange = () => store.set("img_partial", $("img-partial").checked);
+// a streamed job (the "show partial images" setting): one figure shows the engine's partial images as they come, and
+// the completed events become the body the plain request answers with
+async function imgStream(r, prompt) {
+  const fig = document.createElement("figure"), img = document.createElement("img"), cap = document.createElement("figcaption");
+  img.alt = prompt;
+  fig.append(img, cap);
+  const j = {data: []};
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:")) continue;              // event: lines and ": keep-alive" comments
+        let e;
+        try { e = JSON.parse(line.slice(5).trim()); } catch (err) { continue; }
+        if (e.type === "error") throw new Error((e.error && e.error.message) || tr("img.none", "No image"));
+        if (e.type.endsWith(".partial_image")) {
+          img.src = `data:image/${e.output_format || "png"};base64,` + e.b64_json;
+          cap.textContent = tr("img.partialCap", "Partial image {n}…", {n: e.partial_image_index + 1});
+          if (!fig.isConnected) $("img-results").prepend(fig);
+        } else if (e.type.endsWith(".completed")) {
+          Object.assign(j, {model: e.model, size: e.size, output_format: e.output_format, strata: e.strata});
+          j.data.push({b64_json: e.b64_json, seed: e.seed});
+        }
+      }
+    }
+  } finally {
+    fig.remove();
+  }
+  if (!j.data.length) throw new Error(tr("img.none", "No image"));
+  return j;
+}
+$("img-neg").oninput = () => { imgNegHint(); imgCount(); };
+$("img-cfg").addEventListener("input", imgNegHint);
+$("img-ref").onchange = () => { imgDefaults(); imgMaskSetup(); };
 $("img-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const prompt = $("img-prompt").value.trim();
   if (!prompt) return;
   const size = $("img-size").value === "custom" ? `${$("img-w").value}x${$("img-h").value}` : $("img-size").value;
   const refs = Array.from($("img-ref").files || []);
-  const body = {prompt, size: size === "auto" && !refs.length ? "1024x1024" : size, response_format: "b64_json"};
+  // "auto" goes as it is: the server makes it 1024 x 1024, a reference's shape, or the model's own choice
+  const body = {prompt, size, response_format: "b64_json"};
+  if (!$("img-model-f").hidden) body.model = $("img-model").value;
+  const loras = imgLorasBody();
+  if (loras.length) body.lora = loras;
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
+  const neg = $("img-neg").value.trim();
+  if (neg) body.negative_prompt = neg;
+  if ($("img-steps").value !== "" && !$("img-steps-f").hidden) body.steps = Number($("img-steps").value);
+  if ($("img-cfg").value !== "") body.true_cfg_scale = Number($("img-cfg").value);
+  if ($("img-bg").checked && !$("img-bg-f").hidden) body.background = "transparent";
+  if (refs.length && $("img-strength").value !== "") body.strength = Number($("img-strength").value);
+  if (+$("img-n").value > 1) body.n = +$("img-n").value;
+  body.output_format = $("img-fmt").value;
+  if (body.output_format !== "png") body.output_compression = Math.max(0, Math.min(100, +$("img-q").value || 0));
+  const bad = imgMossBody(body);
+  if (bad) { toast("error", tr("img.none", "No image"), bad, 8000); return; }
+  const partial = $("img-partial").checked;
+  if (partial) Object.assign(body, {stream: true, partial_images: 2});
   imageBusy = true;
   $("img-go").disabled = true;
   paintLive();
   const t0 = performance.now();
-  $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
+  $("img-hint").textContent = tr("img.generatingHint", "Generating… (a minute or more on a small GPU)");
   try {
-    // with reference images: an edit, in JSON with data: URLs (without an API key the server takes only JSON from a
-    // browser page, so that another site's form cannot use it)
+    // with an image: an edit (or a model without edits, img2img), in JSON with data: URLs (without an API key the
+    // server takes only JSON from a browser page, so that another site's form cannot use it)
     if (refs.length) body.images = await Promise.all(refs.map(async f => ({image_url: await readAsDataURL(f)})));
+    const mask = refs.length ? imgMask() : null;
+    if (mask) body.mask = {image_url: mask};
     const url = refs.length ? "v1/images/edits" : "v1/images/generations";
     const r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body)});
-    const j = await r.json();
+    const j = partial && r.ok ? await imgStream(r, prompt) : await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
     for (const d of j.data) {
       const fig = document.createElement("figure");
       const img = document.createElement("img");
-      img.src = "data:image/png;base64," + d.b64_json;
+      img.src = `data:image/${j.output_format || "png"};base64,` + d.b64_json;
       img.alt = prompt;
       const cap = document.createElement("figcaption");
-      const made = j.strata && j.strata.made_size ? ` (made at ${j.strata.made_size}, middle cut out)` : "";
-      cap.textContent = `${j.size}${made}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
+      const made = j.strata && j.strata.made_size ? ` ${tr("img.madeCut", "(made at {size}, middle cut out)", {size: j.strata.made_size})}`
+        : j.strata && j.strata.requested_size ? ` ${tr("img.madeNearest", "({size} asked: the model's nearest size)", {size: j.strata.requested_size})}` : "";
+      const by = $("img-model-f").hidden ? "" : `${j.model}, `;
+      cap.textContent = `${by}${j.size}${made}, ${tr("img.capSeed", "seed {seed}", {seed: d.seed})}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
       fig.append(img, cap);
+      const note = imgEnhanced(j, d);
+      if (note) fig.append(note);
       $("img-results").prepend(fig);
     }
-    $("img-hint").textContent = "Done. Right-click an image to save it.";
+    $("img-hint").textContent = tr("img.done", "Done. Right-click an image to save it.");
     if (j.strata && j.strata.made_size)
-      toast("info", `Made at ${j.strata.made_size}`, `The image model needs sides that are multiples of 16: the middle ${j.size} was cut out.`, 8000);
+      toast("info", tr("img.madeAt", "Made at {size}", {size: j.strata.made_size}), tr("img.madeCutText", "The image model needs sides that are multiples of 16: the middle {size} was cut out.", {size: j.size}), 8000);
+    else if (j.strata && j.strata.requested_size)
+      toast("info", tr("img.madeAt", "Made at {size}", {size: j.size}), tr("img.madeNearestText", "This image model makes a fixed set of sizes: {size} is the one whose shape is nearest the {asked} asked for.", {size: j.size, asked: j.strata.requested_size}), 8000);
   } catch (e) {
     $("img-hint").textContent = "";
-    toast("error", "No image", String(e.message || e), 8000);
+    toast("error", tr("img.none", "No image"), String(e.message || e), 8000);
   } finally {
     imageBusy = false;
     $("img-go").disabled = false;
     $("img-ref").value = "";   // the reference images go with this job only: the next Generate is a new image
     paintLive();
+    await loadHealth();        // the speed the job measured (the count's limit and estimate)
+    imgMaskSetup();
   }
 };

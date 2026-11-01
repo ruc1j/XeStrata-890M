@@ -265,7 +265,8 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     if chosen is not None:
         settings["--pcie-frac"] = f"{chosen:.2f}"
     base_rate = statistics.median(confirm[chosen]) if confirm.get(chosen) else None
-    # 3. fewer CPU workers (a restart each), with the chosen share
+    # 3. fewer CPU workers (a restart each), with the chosen share.  #1337's rule covers a death during a
+    # measurement too: an engine that exits mid-rate is that candidate losing; the measurements so far stay.
     if d_workers and len(worker_candidates(d_workers, extra_workers)) > 1:
         tuned = with_arg(base_args, "--pcie-frac", None if chosen is None else f"{chosen:.2f}")
         by_workers: dict = {}
@@ -280,7 +281,9 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             base_rate = statistics.median(by_workers[w_best])
         elif by_workers.get(d_workers):
             base_rate = statistics.median(by_workers[d_workers])
-    # 4. the adaptive expert tier (a restart each), with everything chosen so far
+    # 4. the adaptive expert tier (a restart each), with everything chosen so far.  A candidate whose engine dies
+    # during its own measurement is dropped like a failed start (#1337); the other candidates and every earlier
+    # result survive.
     tuned = apply(base_args, settings)
     by_adapt: dict = {}
     for adapt in ADAPT_CANDIDATES:
