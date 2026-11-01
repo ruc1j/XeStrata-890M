@@ -52,6 +52,9 @@ mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/d
 On a distribution without apt, shellcheck and cmake-lint come from pip (`.lint/venv/bin/pip install shellcheck-py cmakelang`),
 gitleaks as the binary of its GitHub Releases into `.lint/bin/`, and eslint from npm (`npm install --prefix .lint eslint@8`: `run.sh` passes an eslintrc-style configuration, which is the 8 series).
 `tools/lint/run.sh` uses the distribution's `reuse` when there is one and `.lint/venv/bin/reuse` otherwise.
+On a PC where root is not at hand, tidy and mdl can be unpacked from the distribution's packages into `.lint/` (Fedora's, for example).
+For tidy, unpack the rpms of `dnf download tidy libtidy` with `rpm2cpio | cpio -idm`, put `usr/bin/tidy` and `usr/lib64/libtidy.so*` under `.lint/tidy/`, and make `.lint/bin/tidy` a shell script that runs it with `LD_LIBRARY_PATH` pointed there.
+For mdl, unpack the rpms of `dnf download --resolve ruby rubygems` under `.lint/ruby/usr/`, set `RUBYLIB` to `share/rubygems`, `share/ruby`, `lib64/ruby`, `share/gems/gems/*/lib` and `lib64/gems/ruby/*` (the rpm's extensions point at `/usr/lib64/gems/ruby`, which is not there, so they are given directly), run `ruby-mri usr/bin/gem install --no-document mdl` with `GEM_HOME=.lint/ruby/gems`, and make `.lint/bin/mdl` a script that runs `ruby-mri .lint/ruby/gems/bin/mdl` in that environment.
 
 ### CI
 

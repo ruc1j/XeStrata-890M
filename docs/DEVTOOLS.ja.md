@@ -52,6 +52,12 @@ mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/d
 apt のないディストリビューションでは、shellcheck と cmake-lint は pip から（`.lint/venv/bin/pip install shellcheck-py cmakelang`）、
 gitleaks は GitHub の Releases のバイナリを `.lint/bin/` に、eslint は npm から（`npm install --prefix .lint eslint@8`。`run.sh` は eslintrc の形の設定を渡すので 8 系です）入れられます。
 `tools/lint/run.sh` は、ディストリビューションの `reuse` があればそれを使い、なければ `.lint/venv/bin/reuse` を使います。
+root になれない PC では tidy と mdl もディストリビューションのパッケージを `.lint/` に展開して使えます（Fedora の例）。
+tidy は `dnf download tidy libtidy` の rpm を `rpm2cpio | cpio -idm` で展開し、`usr/bin/tidy` と `usr/lib64/libtidy.so*` を `.lint/tidy/` に置いて、
+`.lint/bin/tidy` を `LD_LIBRARY_PATH` をそこに向けて実行するシェルスクリプトにします。
+mdl は `dnf download --resolve ruby rubygems` の rpm を `.lint/ruby/usr/` に展開し、`RUBYLIB` に `share/rubygems`、`share/ruby`、`lib64/ruby` と
+`share/gems/gems/*/lib`、`lib64/gems/ruby/*`（rpm の拡張は `/usr/lib64/gems/ruby` を指して読めないので、ここで直接渡します）を並べ、
+`GEM_HOME=.lint/ruby/gems` で `ruby-mri usr/bin/gem install --no-document mdl` を実行して、`.lint/bin/mdl` を同じ環境で `ruby-mri .lint/ruby/gems/bin/mdl` を実行するスクリプトにします。
 
 ### CI
 
