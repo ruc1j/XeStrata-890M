@@ -390,6 +390,12 @@ sycl::event launch_merge(sycl::queue& queue, const float* part_acc_all, const fl
 // 67.6 tok/s; the B70 (256 units) keeps one a chunk (with 512 slots for 516 chunks its decode was 0.8% slower).
 int slots_for(sycl::queue& q, int64_t cap, int nkv, size_t n_q) {
     const int64_t chunks = (cap + CHUNK - 1) / CHUNK;
+    // XeStrata-890M: opt-in (STRATA_QSA_CU_SLOTS=1).  A slot that folds several chunks sums them in another order,
+    // and that changed the greedy answers (two of the bench's six chats on the 890M, 2026-11-02) at the same decode
+    // speed (31.6-32.0 against 31.5-31.9 tok/s, three interleaved rounds), so every chunk keeps its own slot, as
+    // before, unless asked for.
+    static const bool cu_slots = [] { const char* v = std::getenv("STRATA_QSA_CU_SLOTS"); return v != nullptr && v[0] == '1'; }();
+    if (!cu_slots) return (int) chunks;
     const int64_t cu = (int64_t) q.get_device().get_info<sycl::info::device::max_compute_units>();
     const int64_t want = std::max<int64_t>(1, cu * 8 / std::max<int64_t>(1, (int64_t) nkv * (int64_t) n_q));
     return (int) (chunks >= 2 * want ? want : chunks);

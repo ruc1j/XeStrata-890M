@@ -50,6 +50,7 @@ fork の形を残したものは次のとおりです。両側が同じ Strata �
 
 - KVA（`STRATA_KVA`）: この fork の identity モードだけの形。上流の capture / oracle のモードは入れていません。
 - 推測デコードの費用の規則（`STRATA_SPEC_COST`、HIP の統合 GPU で既定）と lookup の窓の別の表（`STRATA_SPEC_SOURCE_COST`）、`STRATA_SPEC_ADAPT_WARM`、起動の profile の充填のスレッド（`STRATA_FILL_THREADS`）、PLE の表の RAM の方針の既定、会話のキャッシュの裏のコピーの統合 GPU での既定、`STRATA_DEQUANT_SIDE` の既定、GDN の WMMA の再帰（`STRATA_GDN_CHUNKED`）、APU の down の行、サブグループの xor の交換、`STRATA_VERIFY_ECAP` と `STRATA_ROUTE_STATS`、`STRATA_RAM_ADAPT` の fork の形。
+- decode の注意のカーネル（qsa_decode_attn.cpp）: 上流の 2026-10-27 のカーネルは入れましたが、KV ヘッドのセルを計算ユニットの数に合わせた枠に分け、枠ごとに複数の塊をオンラインの softmax で足す形（merge が読む部分和が減ります）は、足す順が変わるので greedy の答えを変えます（bench の 6 チャットのうち 2 つ）。890M の decode は同じ速さでした（3 周の交互で 31.6〜32.0 対 31.5〜31.9 tok/s）ので、`STRATA_QSA_CU_SLOTS=1` の opt-in にし、既定では以前どおり塊ごとに 1 枠です。スコアのループが 1 歩で読むセルの数を GPU ごとに測る部分（`STRATA_QSA_NC`）と問いのヘッド 4 つの和はそのまま入っています。merge のほかの部分は答えを変えません。
 - README とこの fork の文書、`container/`、CI、リリースの確認の宛先。
 
 確かめたこと: free ビルド、CTest（pack の要る 2 本を除いて通ります）、serve の Python の試験（1,016 本、28 本は skip）、tools の試験（388 本、8 本は skip）、`reuse lint` と `tools/license_class.py`、Python と JavaScript の lint で merge が新しく足した指摘がないこと。

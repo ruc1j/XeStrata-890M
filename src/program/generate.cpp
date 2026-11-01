@@ -72,7 +72,6 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/program/plain_generate.hpp"
 #include "strata/program/logits_selection.hpp"
-#include "strata/program/adapt_decay.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/core/gated_proposal.hpp"
 #include "strata/program/draft_kv_plan.hpp"
@@ -2656,20 +2655,7 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::strtoll(next("--mtp-window"), nullptr, 10);
         else if (a == "--pcie-frac") o.pcie_frac = std::strtod(next("--pcie-frac"), nullptr);
-        else if (a == "--adapt-every") { o.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10); o.adapt_every_given = true; }
-        else if (a == "--adapt-decay")   // upstream #1284: outside 0..1 -> 0.7, said
-            o.adapt_decay = strata::program::adapt_decay_checked(std::atof(next("--adapt-decay")));
-        else if (a == "--adapt-min-gain") o.adapt_min_gain = std::strtof(next("--adapt-min-gain"), nullptr);
         else if (a == "--adapt-async") o.adapt_async = std::strtol(next("--adapt-async"), nullptr, 10) != 0 ? 1 : 0;
-        else if (a == "--spec-min-p") o.spec_min_p = std::strtod(next("--spec-min-p"), nullptr);
-        else if (a == "--spec-window") {
-            o.spec_window = next("--spec-window");
-            o.spec_window_given = true;
-            if (o.spec_window != "auto" && o.spec_window != "min-p") {
-                std::fprintf(stderr, "strata generate: --spec-window takes auto or min-p, not %s\n", o.spec_window.c_str());
-                return 2;
-            }
-        }
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
