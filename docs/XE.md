@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.2.9-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+XeStrata xe0.2.10-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -54,6 +54,32 @@ What keeps the fork's form, where both sides held the same Strata change in othe
 
 Checked: the free build, CTest (passes but for the two tests that need a pack), the serve Python tests (1,016, 28 skipped), the tools tests (388, 8 skipped), `reuse lint` and `tools/license_class.py`, and that the Python and JavaScript lints report nothing the merge added.
 The image models other than Mage-Flow-Turbo, the contrib-llvm build, the Windows cross build and other GPUs are unverified.
+
+## Integration through Strata 0.1.56
+
+Of the 708 upstream Strata commits from 0.2.9 to 0.2.10 (engine version 0.1.56, 2026-11-02), the ones that touch the engine, serve and setup layers come into XeStrata-890M. Upstream XeStrata's (MistVVK/XeStrata) main stops at 2026-10-30 and has not taken 0.2.10, so, as before, Strata's commits were applied with `patch -F3` and the shifted hunks placed by hand. The list is `.upstream-0156.md` (the repository root, outside git).
+Most of upstream's changes in this span are the DFlash2 drafter (99 commits), the all-cards split engine (one model over several cards on Linux), DeepSeek's ISTA-DAS Coder, DeepSeek pictures on a Mac, 128K on 8 GB discrete cards, the gfx12 and CUDA kernel defaults, Metal, Windows, and the app, Terminal and Control: none applies to this fork.
+
+What came in:
+
+- engine: the repeat, frequency and presence penalties count only the tokens the answer has written. The numbers or a quoted earlier answer in the prompt are no longer penalised for being there; `STRATA_PENALTY_PROMPT=1` brings the old window back (the last `penalty_last_n` tokens of prompt and answer) (upstream #4590, penalty_window_test).
+- engine: a request commits only the rows it can emit, so a request stopped by `--max-tokens` or EOS leaves no rows it could not emit in the cache and the saved conversation matches what the client got (upstream #4677; upstream made it the default on HIP only, this fork on every backend; `STRATA_SERVE_STOP_BOUND=0` turns it off).
+- engine: after a fatal GPU error (a memory access fault, a lost device) the engine prints `ERR fatal GPU error: ...` and ends itself; the server answers the request with a 503 and starts the engine again on the next request, and stops restarting at the third death in ten minutes (upstream #4350). Upstream reads CUDA's sticky error; SYCL has none, so the text of the error the failed call returned is read. `STRATA_INJECT_FATAL=N` is the test hook.
+- engine: before the PLE table is locked in RAM, the memlock soft limit is raised to the hard limit, and when that is still short the message says how much may be locked and what to set (upstream #4671). When the expert arena's RAM is still short after the wait, this lock is given back to free RAM (upstream #4846).
+- engine: a projection a pack keeps in BF16 (layer 0's attn_gate of Heretic v2 IQ4_NL) is served as Q8_0 like the other layers (upstream #4741). `--vram-elastic` on a runtime without virtual memory starts with the cache as one block.
+- serve: Anthropic's tool search on `/v1/messages` (`defer_loading` tools, `tool_reference`) is supported, and a call for an undeclared name comes back as a `tool_use`. A tool the conversation already called counts as declared on the Anthropic and Responses routes too, and a name written as `tools.write`, `functions.write` or `default_api.write` reads as `write`. A call's closing tag ends a value only when no prose and further closing tags follow (a value that lists closing tags inside a file is no longer cut).
+- serve: a context overflow on `/v1/messages` starts with Anthropic's own wording. Files are closed after reading, which removes the `ResourceWarning` lines.
+- setup: a download that cannot reach its server says how to set a proxy. The finish marks of a read-only model folder go into Strata's own folder.
+- web: the speed cards show the run's average when no request runs.
+
+Not taken:
+
+- The DFlash2 drafter (upstream 0.2.10's default drafter). Its 5-layer drafter kernels, the taps from the verify window and the prompt path, and the ring log would have to be written again for this fork's SYCL kernels and verify: a job of its own. Upstream measured it 4 to 12% faster than the MTP on AMD HIP (Strix Halo on Windows, the R9700) and 2.6% slower on the Intel Arc A750's SYCL build. This fork's MTP carries the sketch drafting.
+- The 12- and 16-row prompt lookup windows (`--lookup-max-t`): this fork's verify kernels take 8 rows.
+- The series that drops the arena to the `--mmap-experts` form when RAM is short: the 890M's setup chooses `--mmap-experts` from the start.
+- The stop that arrives at the ready file (this fork's serve has no ready file) and Qwen's on-demand picture reader (this fork's serve lacks its base).
+
+The decode arithmetic is unchanged, so only the greedy answers of the six chats were checked against the installed engine: the same.
 
 ## Integration through Strata 0.1.55
 

@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.2.9-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+XeStrata xe0.2.10-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
@@ -55,6 +55,32 @@ fork の形を残したものは次のとおりです。両側が同じ Strata �
 
 確かめたこと: free ビルド、CTest（pack の要る 2 本を除いて通ります）、serve の Python の試験（1,016 本、28 本は skip）、tools の試験（388 本、8 本は skip）、`reuse lint` と `tools/license_class.py`、Python と JavaScript の lint で merge が新しく足した指摘がないこと。
 Mage-Flow-Turbo 以外の画像のモデル、contrib-llvm のビルド、Windows のクロスビルド、ほかの GPU は未検証です。
+
+## Strata 0.1.56 の取り込み
+
+upstream の Strata 0.2.9 から 0.2.10（エンジンの版は 0.1.56、2026-11-02）までの 708 コミットのうち、エンジン・serve・setup の層に当たるものを XeStrata-890M に移しています。上流の XeStrata（MistVVK/XeStrata）の main は 2026-10-30 で止まっていて 0.2.10 を取り込んでいないので、前回と同じく Strata のコミットを `patch -F3` で当て、ずれた hunk は手で置き直しました。一覧は `.upstream-0156.md`（リポジトリの根、git の外）です。
+この間の upstream の変更の大半は、DFlash2 の drafter（99 コミット）、Linux で複数のカードに 1 つのモデルを割る split エンジン、DeepSeek の ISTA-DAS Coder、Mac の DeepSeek の画像、8 GB のディスクリート GPU での 128K、gfx12 と CUDA のカーネルの既定、Metal、Windows、app と Terminal と Control のもので、この fork には当たりません。
+
+移したものは次のとおりです。
+
+- エンジン: repeat・frequency・presence のペナルティは、答えが書いたトークンだけを数えます。プロンプトの中の数字や引用した前の答えがそれだけで罰せられることはなくなり、`STRATA_PENALTY_PROMPT=1` で前の窓（プロンプトと答えの直近 `penalty_last_n` トークン）に戻ります（upstream #4590、penalty_window_test）。
+- エンジン: 要求は出せる行だけを commit します。`--max-tokens` や EOS で止まる要求の、出せない行がキャッシュに残らず、保存した会話が客が受け取ったものと一致します（upstream #4677。upstream は HIP だけで既定にしましたが、この fork は全バックエンドで既定です。`STRATA_SERVE_STOP_BOUND=0` で切ります）。
+- エンジン: 致命の GPU のエラー（メモリアクセスの違反、デバイスの消失）のあとは、エンジンが `ERR fatal GPU error: ...` を出して自分で終わり、サーバーは要求を 503 で返して次の要求でエンジンを起動し直します。10 分に 3 回目で起動し直しを止めます（upstream #4350）。upstream は CUDA の sticky error を読みますが、SYCL にはないので、失敗した呼び出しが返したエラーの文で見ます。`STRATA_INJECT_FATAL=N` は試験の仕掛けです。
+- エンジン: PLE の表を RAM に固定する前に memlock の soft limit を hard limit まで上げ、足りないときは固定できる量と設定する値を言います（upstream #4671）。エキスパートの arena の RAM が待っても足りないときは、この固定を返して RAM を空けます（upstream #4846）。
+- エンジン: pack が BF16 のまま持つ射影（Heretic v2 IQ4_NL の層 0 の attn_gate）を、ほかの層と同じ Q8_0 にして出します（upstream #4741）。仮想メモリのない runtime で `--vram-elastic` を指定しても、キャッシュを 1 ブロックにして起動します。
+- serve: `/v1/messages` の Anthropic のツール検索（`defer_loading` のツール、`tool_reference`）に対応し、宣言にない名前の呼び出しを `tool_use` として返します。会話で既に呼んだツールは Anthropic と Responses の経路でも宣言済みとして扱い、`tools.write`・`functions.write`・`default_api.write` の形の名前は `write` として読みます。呼び出しの閉じタグが値を終えるのは、あとに本文がなく閉じタグが続くときだけです（ファイルの中に閉じタグを並べた値が切れなくなります）。
+- serve: `/v1/messages` の context overflow は Anthropic と同じ文で始まります。読んだあとのファイルを閉じて `ResourceWarning` をなくしました。
+- setup: ダウンロードがサーバーに届かないときに proxy の設定の仕方を言います。読み取り専用のモデルフォルダーの完了の印は Strata 自身のフォルダーに置きます。
+- web: 速さのカードは、要求がないときは run の平均を出します。
+
+入れていないものは次のとおりです。
+
+- DFlash2 の drafter（upstream の 0.2.10 の既定の drafter）。5 層の drafter のカーネル、verify の窓と prompt の経路からの tap、ring の記録を、この fork の SYCL のカーネルと verify に書き直す必要があり、別の作業です。upstream の計測は AMD の HIP（Strix Halo の Windows、R9700）で MTP より 4〜12% 速く、Intel Arc A750 の SYCL では 2.6% 遅いものでした。この fork の MTP は sketch の drafting を持っています。
+- 12 行と 16 行の prompt lookup の窓（`--lookup-max-t`）。この fork の verify のカーネルは 8 行です。
+- RAM が足りないときに arena を `--mmap-experts` の形に落とす一連の変更。890M の setup は初めから `--mmap-experts` を選びます。
+- ready file の直後の stop の扱い（この fork の serve に ready file はありません）と、Qwen の on-demand の画像の読み手（この fork の serve には、それが前提にする elastic な読み手の仕組みがありません）。
+
+decode の計算は変わらないので、6 チャットの greedy の答えが設置済みのエンジンと同じことだけを確かめました。
 
 ## Strata 0.1.55 の取り込み
 
