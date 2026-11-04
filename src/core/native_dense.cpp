@@ -83,6 +83,34 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
+// #4741 (upstream b0b942fa9): a native-eligible projection a pack keeps unquantized (BF16, GGUF type 30; Heretic v2 IQ4_NL has
+// its layer-0 attn_gate so) has no native kernel.  Its siblings are Q8_0, so it is served as Q8_0 made from the file's BF16
+// values (ggml's rounding), and the dispatchers that need a native projection find one.  The pack's BF16 copy stays where it is.
+bool bf16_as_q8_0(const strata::TensorInfo& tensor, const WeightRef& ref) {
+    return tensor.type == 30 && tensor.name != "blk.1.ple_key.weight" && tensor.shape.size() == 2 &&
+           !ref.quantized() && ref.kind == WeightKind::Bf16InF32 &&
+           ref.ne0 > 0 && ref.ne0 <= INT_MAX && ref.ne1 > 0 && ref.ne1 <= INT_MAX && ref.ne0 % 32 == 0 &&
+           tensor.shape[0] == (uint64_t) ref.ne0 && tensor.shape[1] == (uint64_t) ref.ne1;
+}
+// A BF16 matrix (the file's values) as Q8_0, ggml's reference rounding (quantize_row_q8_0_ref): per 32 values
+// d = amax / 127 (fp16), q = round(x / d)
+std::vector<uint8_t> q8_0_of_bf16(const uint16_t* bf, uint64_t n) {
+    std::vector<uint8_t> q8((size_t) (n / 32 * 34));
+    for (uint64_t b = 0; b < n / 32; ++b) {
+        float v[32], amax = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            const uint32_t u = (uint32_t) bf[b * 32 + i] << 16;
+            std::memcpy(&v[i], &u, 4);
+            amax = std::max(amax, std::fabs(v[i]));
+        }
+        const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+        const sycl::half dh(d);
+        uint8_t* blk = q8.data() + b * 34;
+        std::memcpy(blk, &dh, 2);
+        for (int i = 0; i < 32; ++i) blk[2 + i] = (uint8_t) (int8_t) std::lround(v[i] * id);
+    }
+    return q8;
+}
 struct DeviceFree { void operator()(void* p) const { if (p) strata::gpu::free(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
@@ -170,11 +198,16 @@ bool NativeDense::layer_bytes(const std::vector<std::string>& shards, bool inclu
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key) || !strata::kernels::native_mmvq_supported((int) tensor.type) ||
-                    tensor.shape.size() != 2 || tensor.shape[0] > INT_MAX || tensor.shape[1] > INT_MAX)
+                if (!eligible(tensor, include_ple_key) || tensor.shape.size() != 2 || tensor.shape[0] > INT_MAX ||
+                    tensor.shape[1] > INT_MAX)
                     continue;
-                const uint64_t b = strata::kernels::native_mmvq_weight_bytes((int) tensor.type, (int) tensor.shape[0],
-                                                                             (int) tensor.shape[1]);
+                // #4741: a BF16 projection is served as Q8_0 (bf16_as_q8_0; this count has no weight table to ask, so it
+                // counts every eligible BF16 matrix of 32-aligned width, a little high for a pack that quantized it itself)
+                const bool as_q8 = tensor.type == 30 && tensor.name != "blk.1.ple_key.weight" && tensor.shape[0] % 32 == 0;
+                if (!as_q8 && !strata::kernels::native_mmvq_supported((int) tensor.type)) continue;
+                const uint64_t b = as_q8 ? tensor.shape[0] / 32 * 34 * tensor.shape[1]
+                                         : strata::kernels::native_mmvq_weight_bytes((int) tensor.type, (int) tensor.shape[0],
+                                                                                     (int) tensor.shape[1]);
                 const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
                 if (tensor.name.find("ple") != std::string::npos || l < 0 || l >= n_layers) shared += b;
                 else per_layer[(size_t) l] += b;
@@ -354,6 +387,28 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
+                if (bf16_as_q8_0(tensor, ref)) {   // #4741: a BF16 projection of the pack, served as Q8_0 like its siblings
+                    const std::vector<uint8_t> q8 = q8_0_of_bf16((const uint16_t*) gguf.tensor_data(tensor),
+                                                                 (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
+                    void* allocation = nullptr;
+                    bool status = strata::gpu::alloc_device(&allocation, q8.size());
+                    DevicePtr data(allocation);
+                    if (status) status = strata::gpu::copy(data.get(), q8.data(), q8.size());
+                    if (!status) {
+                        err = "native dense upload " + tensor.name + ": " + strata::gpu::last_error(); return false;
+                    }
+                    int type = 8;
+                    if (strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {
+                        strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
+                        type = strata::kernels::kNativeQ8Rows;
+                    }
+                    max_in = (std::max)(max_in, (int) ref.ne0);
+                    total += q8.size();
+                    std::fprintf(stderr, "native dense: %s is BF16 in the file: served as Q8_0 like its siblings (#4741)\n",
+                                 tensor.name.c_str());
+                    pending.push_back(Pending{&ref, type, (uint64_t) q8.size(), std::move(data)});
+                    continue;
+                }
                 if (!strata::kernels::native_mmvq_supported((int) tensor.type)) continue;
                 // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
@@ -408,23 +463,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     status = strata::gpu::memset(static_cast<uint8_t*>(data.get()) + bytes, 0, bytes_pad - bytes);
                 std::vector<uint8_t> q8;
                 const void* src = gguf.tensor_data(tensor);
-                if (tensor.type == 30) {   // BF16 -> Q8_0: per 32 values d = amax / 127 (fp16), q = round(x / d)
-                    const uint64_t n = (uint64_t) ref.ne0 * (uint64_t) ref.ne1;
-                    const auto* bf = static_cast<const uint16_t*>(src);
-                    q8.resize(bytes);
-                    for (uint64_t b = 0; b < n / 32; ++b) {
-                        float v[32], amax = 0.0f;
-                        for (int i = 0; i < 32; ++i) {
-                            const uint32_t u = (uint32_t) bf[b * 32 + i] << 16;
-                            std::memcpy(&v[i], &u, 4);
-                            amax = std::max(amax, std::fabs(v[i]));
-                        }
-                        const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
-                        const sycl::half dh(d);
-                        uint8_t* blk = q8.data() + b * 34;
-                        std::memcpy(blk, &dh, 2);
-                        for (int i = 0; i < 32; ++i) blk[2 + i] = (uint8_t) (int8_t) std::lround(v[i] * id);
-                    }
+                if (tensor.type == 30) {   // BF16 -> Q8_0 (q8_0_of_bf16 above)
+                    q8 = q8_0_of_bf16(static_cast<const uint16_t*>(src), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
                     src = q8.data();
                 }
                 if (status) status = strata::gpu::copy(data.get(), src, bytes);
