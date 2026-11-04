@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # container/install.sh - the inside of the Containerfile: installs XeStrata-890M's rpm (container/rpm/*.rpm when there
-# is one, else the fork's release's, checked against its SHA256SUMS; the fork publishes no packages, so without a
-# local rpm it stops and says how the rpm is built), then the packages its BUILD.json records ("runtime": ROCm's HIP
+# is one, else the fork's release's, checked against its SHA256SUMS; without a release and a local rpm it stops and
+# says how the rpm is built), then the packages its BUILD.json records ("runtime": ROCm's HIP
 # runtime, rocBLAS and hipBLASLt for the free build).  The code for upstream XeStrata's contrib rpms stays: with
 # XESTRATA_NONFREE=1 it adds oneMKL's repository and NVIDIA's pip libraries (cuBLAS, cuDNN, the CUDA runtime) where
 # such an rpm records them; this fork's free build records none.
@@ -21,7 +21,7 @@ else
   case "$tag" in
     xe*) ;;
     *)
-      echo "$repo has no release: this fork publishes no packages.  Build the rpm with" >&2
+      echo "$repo has no release.  Build the rpm with" >&2
       echo "  tools/package/build.sh fedora44 free" >&2
       echo "and put it (build/pkg/fedora44-free/*.rpm) in container/rpm/, then build the image again." >&2
       exit 1

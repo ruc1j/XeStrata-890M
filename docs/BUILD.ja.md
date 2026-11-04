@@ -462,13 +462,12 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 ## Podman
 
 `container/` の Containerfile と compose のファイルで、XeStrata-890M を rootless の Podman のコンテナで動かします。
-このフォークはパッケージを配っていないので、入れる rpm は自分で作ります。イメージも使う人の PC で作り、配布しません。
+入れる rpm は、このフォークの Releases の最新のものをコンテナの中で取ってきます（自分で作った rpm を置いて使うこともできます）。イメージは使う人の PC で作り、配布しません。
 
-- 中身: `tools/package/build.sh` と同じ Fedora 44 のイメージ（ダイジェストで固定）に、`container/rpm/` に置いた rpm を入れます。
+- 中身: `tools/package/build.sh` と同じ Fedora 44 のイメージ（ダイジェストで固定）に、rpm を入れます。
   続けて、その `BUILD.json` の `runtime` にあるもの（ROCm の HIP の実行時と rocBLAS と hipBLASLt）と Mesa の Vulkan のドライバーを入れます（`container/install.sh`）。
-- rpm の作り方: `tools/package/build.sh fedora44 free` が `build/pkg/fedora44-free/` に作る rpm を、`container/rpm/` に 1 つ置きます。
-  置いていないと、`install.sh` は ruc1j/XeStrata-890M の Releases を見に行き、リリースがないので止まって、この作り方を出します。
-  Releases にリリースがあるときは、`XESTRATA_VERSION` のタグの rpm を `SHA256SUMS` で確かめて入れます。
+- rpm: `container/rpm/` に rpm がなければ、`install.sh` は ruc1j/XeStrata-890M の Releases から `XESTRATA_VERSION` のタグ（既定は最新）の rpm を取ってきて、`SHA256SUMS` で確かめて入れます。
+  自分で作った rpm（`tools/package/build.sh fedora44 free` が `build/pkg/fedora44-free/` に作るもの）を `container/rpm/` に 1 つ置くと、そちらを入れます。
 - ビルドの引数: 環境変数で `podman compose build` に渡します。
 
 | 変数 | 既定 | 意味 |

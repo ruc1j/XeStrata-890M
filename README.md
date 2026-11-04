@@ -26,7 +26,7 @@ The "original XeStrata" prefill column was measured on this 890M along the origi
 answers are the same apart from rounding differences.
 
 > **Contents:** [About XeStrata-890M](#about-xestrata-890m) · [What you need](#what-you-need) · [The model](#the-model) ·
-> [Install](#install) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
+> [Install](#install) ([Releases](https://github.com/ruc1j/XeStrata-890M/releases)) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
 > [How it works](#how-it-works) · [For developers](#for-developers) · [All the details](docs/DETAILS.md) · [Image generation](docs/IMAGE.md)
 
 ## About XeStrata-890M
@@ -222,7 +222,70 @@ free memory in the startup log).
 
 ## Install
 
-This fork has no packages. It is installed from the source.
+On Fedora 44, in one of three ways. The rpm is the simplest.
+Each ends with the step [Set it up for the 890M](#set-it-up-for-the-890m).
+
+### 1. rpm (Fedora 44)
+
+1. Download `xestrata-free-<version>.x86_64.rpm` and `SHA256SUMS` from the
+   [Releases](https://github.com/ruc1j/XeStrata-890M/releases/latest) and check the file.
+
+   ```bash
+   sha256sum -c SHA256SUMS --ignore-missing
+   ```
+
+1. Install it. The ROCm libraries (HIP, rocBLAS, hipBLASLt) come with it as recommended dependencies.
+
+   ```bash
+   sudo dnf install ./xestrata-free-0.2.10-1.x86_64.rpm
+   sudo usermod -aG render,video $USER    # to open /dev/kfd and /dev/dri/renderD*; log out and back in
+   ```
+
+1. Run `xestrata --setup` in a terminal and answer the questions. Pressing Enter takes the recommended choice.
+   setup checks the GPU, the RAM and the CPU, downloads the model and starts it. If something is missing, it prints
+   the command that installs it and stops.
+   - The model and its size: Qwen3.8-Flash-Next at IQ2_XS.
+   - The context: how much text it can keep in mind at once. 32,768 is used.
+   - Images: whether it should also read pictures.
+   - The experimental speed projection: an experimental feature that changes how it answers, off by default. Read
+     [what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) before you use it.
+1. Once it has started, stop it (close its window) and
+   [set up](#set-it-up-for-the-890m) `~/.config/xestrata/xestrata-iq2_xs.json` for the 890M.
+1. Run `xestrata`: it starts, and your browser opens `http://127.0.0.1:8095`.
+
+- **Where things go:** the model files in `~/.local/share/xestrata` (68 GB, and about 6 GB for the MTP layer), the
+  settings in `~/.config/xestrata`, the logs in `~/.local/state/xestrata`. Nothing is written under `/usr`.
+- **Updating:** install the new rpm the same way, `sudo dnf install ./<file>.rpm`. The server tells you in About when
+  a new release is out (`xestrata --check-update` checks at any time). After an update, check that the `"args"` and
+  `"env"` you added to the settings are still there.
+- **Removing it:** `xestrata --remove-data` deletes the model files, the settings and the logs (it shows their sizes
+  and asks), then `sudo dnf remove xestrata-free`.
+
+### 2. Podman
+
+Only Podman and podman-compose go on the host. XeStrata goes into a Fedora 44 container, which fetches the latest
+release's rpm inside (rootless). ROCm goes into the container, so the host's ROCm version does not matter.
+
+```bash
+git clone https://github.com/ruc1j/XeStrata-890M.git && cd XeStrata-890M/container
+mkdir -p ~/.config/xestrata ~/.local/state/xestrata ~/.local/share/xestrata
+export PODMAN_COMPOSE_PROVIDER=podman-compose
+podman compose build                         # the image, with the latest release's rpm and the ROCm libraries
+podman compose run --rm xestrata --setup     # answer the questions; it downloads the model
+podman compose up -d                         # http://127.0.0.1:8095 (podman compose down stops it)
+```
+
+- **podman-compose**: `PODMAN_COMPOSE_PROVIDER` makes `podman compose` run podman-compose. Where Docker's compose
+  plugin is installed too, it is taken otherwise, and stops unless Podman's API socket runs.
+- **What the host needs**: the amdgpu kernel driver (Fedora 44 has it) and your user in the `render` and `video`
+  groups (`sudo usermod -aG render,video $USER`). ROCm goes into the container.
+- **The settings and the model**: the host's `~/.config/xestrata`, `~/.local/share/xestrata` and
+  `~/.local/state/xestrata` are used as they are. Once it has started, stop it and
+  [set up](#set-it-up-for-the-890m) the host's `~/.config/xestrata/xestrata-iq2_xs.json` for the 890M.
+  The container shares the model files and the settings with the rpm.
+- Details: [docs/BUILD.md](docs/BUILD.md#podman).
+
+### 3. From the source
 
 1. On Fedora 44, install the packages the build needs and ROCm (`./setup.sh --packages fedora44/amd --license free`
    prints the same one line).
@@ -244,60 +307,62 @@ This fork has no packages. It is installed from the source.
    ```
 
    setup checks the GPU, the RAM and the CPU, asks whether to build intel/llvm (v7.2.0, with ROCm's HIP target)
-   here, builds the engine, downloads the model and starts it. Pressing Enter at the questions takes the
-   recommended choice.
-   - The model and its size: Qwen3.8-Flash-Next at IQ2_XS.
-   - The context: how much text it can keep in mind at once. 32,768 is used.
-   - Images: whether it should also read pictures.
-   - The experimental speed projection: an experimental feature that changes how it answers, off by default. Read
-     [what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) before you use it.
-1. Once it has started, stop it (close its window) and set the configuration for the 890M. Open
-   `xestrata-iq2_xs.json`, which setup wrote in XeStrata's folder, set the value of `--expert-cache` in `"args"` to
-   `24576`, add `--mmap-experts` and `--no-prefill-borrow`, and add `STRATA_CACHE_HOST` to `"env"`.
-
-   ```json
-   "args": [ ..., "--expert-cache", "24576", ..., "--mmap-experts", "--no-prefill-borrow" ],
-   "env": { "STRATA_CACHE_HOST": "1" }
-   ```
-
-   To use it in Japanese, replace the `draft_vocab.bin` in the folder `--mtp` points at with
-   `data/draft_vocab_ja.bin` (the answers do not change and it is a bit faster; setup writes the original file back
-   next time, so copy it into a folder under another name, replace it there, and point `--mtp` at that folder).
+   here, builds the engine, downloads the model and starts it. The questions are the rpm's.
+1. Once it has started, stop it (close its window) and [set up](#set-it-up-for-the-890m) the
+   `xestrata-iq2_xs.json` setup wrote in XeStrata's folder for the 890M.
 1. Run `./setup.sh`: it starts, and your browser opens `http://127.0.0.1:8095`.
 
 - **Time:** the first time, the download (68 GB) and building intel/llvm and the engine take a while. If you stop
   it, the next run continues where it stopped. The driver compiles the GPU code the first time it is used, so it
   ends by running the model once to get that done.
-- **The PC is heavy while the model starts:** starting the model reads about 34 GiB of experts into RAM. The first
-  start takes longest, and the PC can respond slowly for 1-3 minutes. Don't close the window; wait.
 - **Where things go:** the model files in `XeStrata-data` next to XeStrata's folder; the model's settings
   (`xestrata-<model>.json`) and the logs in XeStrata's folder.
+- **Next time**, run `./setup.sh`: it starts right away. Close its window to stop it. The chat in the terminal is
+  `.venv/bin/python chat.py`.
+- **Updating:** after `git pull`, run `./update.sh`: it updates the engine, the Python packages and the model's
+  settings (the model does not start). After an update or a re-choosing in `./setup.sh`, check that the `"args"` and
+  `"env"` you added to `xestrata-iq2_xs.json` are still there.
+- **Removing it:** `./setup.sh --remove-data` deletes the model files, the settings and the logs (it shows their
+  sizes and asks), then delete the folder.
+
+Details of the build (the free build, building intel/llvm, what setup does) are in [docs/BUILD.md](docs/BUILD.md).
+
+### Set it up for the 890M
+
+The model settings setup writes are the original XeStrata's, so after the first start and stop, add three things for
+the 890M. Open `xestrata-iq2_xs.json` (in `~/.config/xestrata/` for the rpm and Podman, in XeStrata's folder for the
+source), set the value of `--expert-cache` in `"args"` to `24576`, add `--mmap-experts` and `--no-prefill-borrow`,
+and add `STRATA_CACHE_HOST` to `"env"`.
+
+```json
+"args": [ ..., "--expert-cache", "24576", ..., "--mmap-experts", "--no-prefill-borrow" ],
+"env": { "STRATA_CACHE_HOST": "1" }
+```
+
+With this, all 24,576 experts (about 34 GiB) stay in RAM (host USM) and the GPU reads them there directly
+([How it works](#how-it-works)). Without it, the engine runs along the original XeStrata's path and decode stays at
+15-22 tok/s.
+
+- To use it in Japanese, replace the `draft_vocab.bin` in the folder `--mtp` points at with `data/draft_vocab_ja.bin`
+  (`/usr/share/xestrata/data/draft_vocab_ja.bin` in the rpm): the answers do not change and it is a bit faster. setup
+  writes the original file back next time, so copy the folder under another name, replace the file there, and point
+  `--mtp` at that folder.
+- **The PC is heavy while the model starts:** starting the model reads about 34 GiB of experts into RAM. The first
+  start takes longest, and the PC can respond slowly for 1-3 minutes. Don't close the window; wait.
 - **RAM headroom:** the engine counts as the GPU's free memory what Linux can give back minus 6 GiB
   (`STRATA_UMA_HEADROOM_GIB`). On a 64 GB PC that runs few other programs, adding
   `"STRATA_UMA_HEADROOM_GIB": "3"` to `"env"` increases the memory usable for the context.
 
-**Next time**, run `./setup.sh`: it starts right away. Close its window to stop it. The chat in the terminal is
-`.venv/bin/python chat.py`.
-
 **Running it while you are logged in:** `systemctl --user enable --now xestrata` keeps the model set up last
-running (no browser opens). Set it up with `./setup.sh` once first.
+running (no browser opens). Set it up once first.
 
-**Updating:** after `git pull`, run `./update.sh`: it updates the engine, the Python packages and the model's
-settings (the model does not start). After an update or a re-choosing in `./setup.sh`, check that the `"args"` and
-`"env"` you added to `xestrata-iq2_xs.json` are still there.
+**Fitting it to your PC:** `xestrata --calibrate` (`./setup.sh --calibrate` from the source) measures some of the
+engine's settings on this PC and keeps the fastest (about 5-10 minutes).
 
-**Fitting it to your PC:** `./setup.sh --calibrate` measures some of the engine's settings on this PC and keeps the
-fastest (about 5-10 minutes).
-
-**Measuring its speed:** `./setup.sh --bench` measures the speed on this PC of the installed model (give it with
+**Measuring its speed:** `xestrata --bench` measures the speed on this PC of the installed model (give it with
 `--model IQ2_XS` and the like) and where the time goes, and writes a record to the data folder's
 `records/bench-<date-time>/` (about 40 minutes; stop a running XeStrata first). What it measures and what the
 record holds: [docs/BENCH.md](docs/BENCH.md).
-
-**Removing it:** `./setup.sh --remove-data` deletes the model files, the settings and the logs (it shows their
-sizes and asks), then delete the folder.
-
-Details of the build (the free build, building intel/llvm, what setup does) are in [docs/BUILD.md](docs/BUILD.md).
 
 ## Using it
 

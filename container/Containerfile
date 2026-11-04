@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# XeStrata-890M in a container: this fork's Fedora 44 rpm, built with tools/package/build.sh fedora44 free and put in
-# container/rpm/ (the fork publishes no packages: README), with the free runtime its BUILD.json records (ROCm's HIP,
-# rocBLAS, hipBLASLt).  Built on the user's PC (podman compose build).  docs/BUILD.md#podman
+# XeStrata-890M in a container: this fork's Fedora 44 rpm, the latest release's (fetched by install.sh) or one built
+# with tools/package/build.sh fedora44 free and put in container/rpm/, with the free runtime its BUILD.json records
+# (ROCm's HIP, rocBLAS, hipBLASLt).  Built on the user's PC (podman compose build).  docs/BUILD.md#podman
 # the image tools/package/build.sh builds the Fedora 44 packages in
 ARG FEDORA=docker.io/library/fedora@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
 FROM ${FEDORA}

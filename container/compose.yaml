@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# XeStrata-890M with rootless Podman (PODMAN_COMPOSE_PROVIDER=podman-compose): put the rpm built with
-# tools/package/build.sh fedora44 free in container/rpm/, podman compose build, then
+# XeStrata-890M with rootless Podman (PODMAN_COMPOSE_PROVIDER=podman-compose): podman compose build (the latest
+# release's rpm, or one built with tools/package/build.sh fedora44 free and put in container/rpm/), then
 # podman compose run --rm xestrata --setup, then podman compose up -d (http://127.0.0.1:8095).  The AMD GPU's
 # /dev/kfd is passed with /dev/dri.  docs/BUILD.md#podman
 name: xestrata

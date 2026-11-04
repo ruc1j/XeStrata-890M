@@ -464,13 +464,12 @@ xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
 ## Podman
 
 The Containerfile and the compose file in `container/` run XeStrata-890M in a rootless Podman container.
-This fork publishes no packages, so the rpm that goes in is one you build; the image, too, is built on your PC and not distributed.
+The rpm that goes in is the latest one of this fork's Releases, fetched inside the container (an rpm you built can be put in instead). The image is built on your PC and not distributed.
 
-- What it holds: the Fedora 44 image `tools/package/build.sh` uses (pinned by digest), with the rpm put in `container/rpm/`.
+- What it holds: the Fedora 44 image `tools/package/build.sh` uses (pinned by digest), with the rpm.
   Then what its `BUILD.json` records in `runtime` (ROCm's HIP runtime, rocBLAS and hipBLASLt) and Mesa's Vulkan drivers (`container/install.sh`).
-- Making the rpm: `tools/package/build.sh fedora44 free` writes it to `build/pkg/fedora44-free/`; put that one rpm in `container/rpm/`.
-  Without it, `install.sh` looks at ruc1j/XeStrata-890M's Releases, finds no release, stops and prints these steps.
-  When the Releases do have one, the rpm of the tag `XESTRATA_VERSION` is installed, checked against `SHA256SUMS`.
+- The rpm: without one in `container/rpm/`, `install.sh` fetches the rpm of the tag `XESTRATA_VERSION` (the latest by default) from ruc1j/XeStrata-890M's Releases and installs it, checked against `SHA256SUMS`.
+  An rpm you built (`tools/package/build.sh fedora44 free` writes it to `build/pkg/fedora44-free/`), put in `container/rpm/` as the one file there, is installed instead.
 - Build arguments: environment variables for `podman compose build`.
 
 | Variable | Default | Meaning |
