@@ -1301,10 +1301,24 @@ def nvidia_smi() -> dict:
 AMD_ARCH = re.compile(r"gfx(103[0-9a-f]|11[0-9a-f]{2}|12[0-9a-f]{2})")
 
 
+def kfd_integrated(props: dict) -> bool:
+    """Whether a KFD GPU node is a processor's own graphics, from the node's properties: it has CPU cores as well
+    (upstream c4a329fe), or it has no local memory of its own (local_mem_size 0: an APU's memory is the host's RAM,
+    and the kernel lists its carve-out as system memory).  XeStrata-890M: on the Radeon 890M (Linux 7.2) the KFD puts
+    the CPU cores in a node of their own and the GPU node has none, so the first sign alone read the 890M as a card
+    with 0.5 GB of VRAM.  A node without the property is not an APU by this sign."""
+    try:
+        cores = int(props.get("cpu_cores_count", "0"))
+        local_mem = int(props.get("local_mem_size", "-1"))
+    except ValueError:
+        return False
+    return cores > 0 or local_mem == 0
+
+
 def kfd_nodes() -> dict:
     """Each AMD GPU the kernel's KFD (amdgpu's compute part) has, by PCI address ("0000:0c:00.0"): its ISA name
     ("gfx1200"; gfx_target_version is major * 10000 + minor * 100 + stepping, the last two in hex in the name, as
-    cmake/StrataHip.cmake reads it) and whether it is a processor's own graphics (the node has CPU cores as well)."""
+    cmake/StrataHip.cmake reads it) and whether it is a processor's own graphics (kfd_integrated)."""
     found = {}
     for props in Path("/sys/class/kfd/kfd/topology/nodes").glob("*/properties"):
         try:
@@ -1316,7 +1330,7 @@ def kfd_nodes() -> dict:
             continue
         pci = f"{int(f.get('domain', '0')):04x}:{loc >> 8:02x}:{(loc >> 3) & 0x1f:02x}.{loc & 7:x}"
         found[pci] = {"gfx": f"gfx{v // 10000}{(v // 100) % 100:x}{v % 100:x}",
-                      "integrated": int(f.get("cpu_cores_count", "0")) > 0, "simds": int(f.get("simd_count", "0"))}
+                      "integrated": kfd_integrated(f), "simds": int(f.get("simd_count", "0"))}
     return found
 
 
@@ -4603,6 +4617,21 @@ def uma_expert_cache(model, ram, budget_gib, kv_ram_gb=0.0):
     return slots if slots >= 256 else None
 
 
+def uma_host_cache(gpu: dict, model: str, low_ram: bool, budget, multi: bool) -> bool:
+    """XeStrata-890M: whether the model's config puts the expert cache in host USM (STRATA_CACHE_HOST=1, with every
+    expert of the model as its size, --mmap-experts and --no-prefill-borrow), so the GPU reads all of the experts in
+    RAM directly and the CPU computes none.  Chosen from what the device reports, not from its name: an integrated AMD
+    GPU (the HIP backend, where the cache's pages are memory the GPU caches), whose carve-out does not hold the
+    model's experts (they live in RAM either way: the GPU's own pool, the GTT, is half of the RAM by the kernel's
+    default), on a PC whose RAM holds the model (not the low-RAM mode, where the engine's own path is kept: the host
+    cache with part of the experts is not measured), one GPU, and a model kept whole in RAM (not a RAM budget's).
+    On the Radeon 890M (Ryzen AI 9 HX 370, 64 GB) decode goes from 15-22 to about 31 tok/s (README).  The engine cuts
+    the count to what the RAM has free at start.  Not checked on another integrated GPU: a Strix Halo's carve-out can
+    hold the experts, and then the default path is kept."""
+    return (bool(gpu.get("integrated")) and gpu.get("vendor") == "amd" and not low_ram and budget is None
+            and not multi and gpu.get("carve_gb", 0.0) < MODELS[model]["arena_gb"])
+
+
 def budget_choice(model, ram, asked) -> float:
     """UD-Q4_K_XL's or UD-IQ4_XS's RAM budget: --resident-budget-gib N as given, else the recommendation
     (resident_budget_gib).  More than the recommendation is kept, with what it risks (setup recommends, it never
@@ -5352,7 +5381,10 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
 # = with Chinese, Japanese and Korean (the default), en = English and code only (the subset before it), cyrillic =
 # English, code and the Cyrillic script.  The ones setup copied before are replaced; a subset made by hand is kept.
 DRAFT_VOCABS = {"cjk": "draft_vocab.bin", "en": "draft_vocab_en.bin", "cyrillic": "draft_vocab_cyrillic.bin",
-                "fr": "draft_vocab_fr.bin"}
+                "fr": "draft_vocab_fr.bin",
+                # XeStrata-890M: English, code and Japanese (56,554 tokens): the draft layer reads about half the
+                # default subset's bytes, the same answers
+                "ja": "draft_vocab_ja.bin"}
 
 
 def vision_tokens(asked: int | None, vision: str, earlier: Path) -> int:
@@ -5391,7 +5423,8 @@ def saved_draft_vocab(cfg_path: Path) -> str | None:
 
 
 # the draft head's VRAM per subset (IQ3_S: the largest)
-DRAFT_VOCAB_MIB = {"cjk": 348, "cyrillic": 193, "fr": 151, "en": 133}
+DRAFT_VOCAB_MIB = {"cjk": 348, "cyrillic": 193, "fr": 151, "en": 133,
+                   "ja": 185}   # ja: from its token count (56,554) at cjk's bytes a token (not measured)
 SMALL_DRAFT_VRAM_GB = 14   # #474: below this the default subset's head can be what does not fit
 
 
@@ -5431,7 +5464,8 @@ def refresh_draft_vocab(rt: Path, choice: str = "cjk") -> None:
                    for f in DRAFT_VOCABS.values() if (ROOT / "data" / f).exists()}
         if old not in shipped or old == hashlib.sha256(new.read_bytes()).hexdigest():
             return
-        what = {"cjk": "with Chinese, Japanese and Korean", "cyrillic": "with the Cyrillic script", "fr": "for French"}
+        what = {"cjk": "with Chinese, Japanese and Korean", "cyrillic": "with the Cyrillic script", "fr": "for French",
+                "ja": "for Japanese"}
         ok("draft layer: the token subset " + what.get(choice, "for English and code"))
     shutil.copyfile(new, dst)
 
@@ -5738,7 +5772,7 @@ def warm_up(cfg_path: Path) -> None:
     if share is not None:
         fix_prefill_share(cfg_path, share)
     free = start_free_mib(elog, since)
-    if free is not None:
+    if free is not None and not host_cache_on(json.loads(cfg_path.read_text(encoding="utf-8"))):
         fix_vram_free(cfg_path, free)
 
 
@@ -5778,6 +5812,15 @@ def fix_vram_free(cfg_path: Path, free_mib: int) -> None:
     save_settings(st)
     ok(f"the expert cache is sized from at most {v} MiB of free VRAM (what this start saw, less "
        f"{VRAM_FREE_MARGIN_MIB}; kept in the config, so it holds the same experts every run)")
+
+
+def host_cache_on(cfg: dict) -> bool:
+    """XeStrata-890M: whether a run config puts the expert cache in host USM (uma_host_cache wrote STRATA_CACHE_HOST=1
+    into its env).  Then the cache is sized from the RAM Linux can give at each start, which moves far more than a
+    card's free VRAM, and it is meant to hold every expert: the warm-up's --vram-free-mib (a figure of one start,
+    kept so the cache holds the same experts every run) and the prompt's CPU share saved for the default path are
+    not written into it."""
+    return str((cfg.get("env") or {}).get("STRATA_CACHE_HOST", "")) == "1"
 
 
 def saved_vram_free(cfg: dict) -> str | None:
@@ -6322,10 +6365,10 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
     for line in notes:
         say("  " + line)
     share = saved_prefill_share(cfg)                   # measured once per PC and model: the warm-up then keeps it
-    if share is not None and "--prefill-cpu-share" not in cfg["args"]:
+    if share is not None and "--prefill-cpu-share" not in cfg["args"] and not host_cache_on(cfg):
         cfg["args"] = [*cfg["args"], "--prefill-cpu-share", share]
     free = saved_vram_free(cfg)                        # the same for the free VRAM the cache is sized from
-    if free is not None and "--vram-free-mib" not in cfg["args"]:
+    if free is not None and "--vram-free-mib" not in cfg["args"] and not host_cache_on(cfg):
         cfg["args"] = [*cfg["args"], "--vram-free-mib", free]
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None,
                        getattr(a, "gpus_chosen", False))
@@ -6576,6 +6619,11 @@ def main() -> int:
                          "a big GPU and little RAM); auto: when the experts would not fit the RAM. In this mode the "
                          "experts the GPU does not hold are copied into RAM once when they fit (resident), else read "
                          "through the OS file cache (mmap); resident / mmap force one of the two")
+    ap.add_argument("--host-cache", choices=["auto", "off"], default="auto",
+                    help="XeStrata-890M: auto puts the expert cache in host USM, with every expert of the model in it, "
+                         "on an integrated AMD GPU whose carve-out does not hold the experts and whose RAM holds the "
+                         "model (STRATA_CACHE_HOST=1, --mmap-experts, --no-prefill-borrow: decode 15-22 -> about 31 "
+                         "tok/s on the Radeon 890M); off writes the engine's default path instead")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
                     help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, "
                          "~38 on 64 GB; more is kept as you choose, with a note)")
@@ -6624,7 +6672,8 @@ def main() -> int:
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
                     help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
                          "and code only (~110 MiB less VRAM), cyrillic = English, code and the Cyrillic script, fr = "
-                         "English, code and French (French answers draft more)")
+                         "English, code and French (French answers draft more), ja = English, code and Japanese "
+                         "(XeStrata-890M: the draft layer reads about half of cjk's bytes; the same answers)")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 15-30 minutes, longer on a slow card), "
                          "then start the model; usually not needed, the engine and setup fit them by themselves "
@@ -6889,6 +6938,10 @@ def main() -> int:
     if gpu.get("integrated") and "uma_gb" not in gpu:
         warn("the processor's own graphics: Strata will run, but slowly - its memory is the system RAM, and it has "
              "no matrix engines (XMX) on most processors")
+    elif gpu.get("integrated") and gpu.get("vendor") == "amd" and gpu.get("carve_gb", 0.0) < 11:
+        # XeStrata-890M: the experts go into the RAM the GPU shares (uma_host_cache), not into the carve-out
+        say("  unified memory: when the RAM holds the model, every expert goes into the RAM the GPU shares and the GPU "
+            "reads it there (the expert cache in host USM); the carve-out's size does not limit it")
     elif gpu["vram_gb"] < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
     ram = ram_gb()
@@ -7317,7 +7370,10 @@ def main() -> int:
     draft_vocab = a.draft_vocab or saved_draft_vocab(CONF / f"xestrata-{tag.lower()}.json")
     refresh_draft_vocab(rt, draft_vocab or "cjk")
     ok(f"MTP draft layer: {rt}")
-    for line in draft_vocab_note(gpu_expert_vram(gpu), draft_vocab):   # #474: a recommendation, nothing changes
+    # (#474: a recommendation, nothing changes; not for an integrated AMD GPU, whose carve-out is not the draft head's
+    # room: the engine takes it from the RAM the GPU shares)
+    apu = bool(gpu.get("integrated")) and gpu.get("vendor") == "amd"
+    for line in draft_vocab_note(0.0 if apu else gpu_expert_vram(gpu), draft_vocab):
         say("  " + line)
 
     # ---- 7. the start script
@@ -7342,6 +7398,17 @@ def main() -> int:
         # setup gives a unified-memory GPU (the DGX Spark); on the 890M +5.5% decode with the same answers (abliterated
         # IQ2_XS, greedy, three interleaved rounds: 31.2 -> 32.7 tok/s). --mtp-hnorm pooled in the config's args keeps the default
         args += ["--mtp-hnorm", "stream"]
+    host_cache = a.host_cache != "off" and uma_host_cache(gpu, model, low_ram, budget, len(sel) > 1)
+    if host_cache:
+        # XeStrata-890M: the expert cache in host USM (uma_host_cache): the engine's size is every expert of the
+        # model, cut at start to what the RAM has free; the experts come from the model files through the OS file
+        # cache, and the prompt path keeps buffers of its own instead of borrowing cache slots
+        args[args.index("--expert-cache") + 1] = str(UMA_EXPERTS)
+        args += ["--mmap-experts", "--no-prefill-borrow"]
+        ok(f"expert cache in host USM: this GPU shares the RAM, so all {UMA_EXPERTS} experts of the model go into RAM "
+           "and the GPU reads them there (STRATA_CACHE_HOST=1 in the config's env; the experts are read from the model "
+           f"files, --mmap-experts, and the prompt path has buffers of its own, --no-prefill-borrow). {SETUP_CMD} "
+           "--host-cache off writes the engine's default path instead")
     disk = rotational_disk(ple)                        # upstream #605
     if disk:
         tensor = next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)
@@ -7424,8 +7491,9 @@ def main() -> int:
             args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
         ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert cache takes "
            "that much less)")
-    if 0 < gpu_expert_vram(gpu) < SMALL_CARD_GB:
+    if 0 < gpu_expert_vram(gpu) < SMALL_CARD_GB and not host_cache:
         # #496, #41: on a 6 GB card the expert cache can get no room at all; the engine lowers its own reserve when
+        # (not with the expert cache in host USM: there the carve-out's size is not the cache's room)
         # that is what it takes, and says what is short when even that is not enough.  Setup names the models instead.
         lines = small_card_note()                       # a recommendation: nothing changes
         warn(lines[0])
@@ -7445,6 +7513,8 @@ def main() -> int:
                            "tokenizer": str(pack / "tokenizer"),
                            "model_name": f"{fam['name']}-{model.lower()}",
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
+    if host_cache:
+        cfg["env"] = {"STRATA_CACHE_HOST": "1"}        # the engine's environment (serve/server.py child_env)
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
     if len(sel) > 1:                                   # --gpus: the layer split's other cards (docs/MULTIGPU.md)
