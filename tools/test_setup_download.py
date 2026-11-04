@@ -596,3 +596,71 @@ class Runs(unittest.TestCase):
         self.assertGreaterEqual(setup.DL_RUN, 2)
         # the piece list on disk names this size: resumes need it
         self.assertEqual(setup.DL_CHUNK, 32 << 20)
+
+
+class ProxyHint(unittest.TestCase):
+    """0.2.9.1: a download that cannot reach its server says what to do behind a proxy."""
+
+    def test_the_hint_names_the_variable_and_notices_one_already_set(self):
+        names = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for n in names:
+                os.environ.pop(n, None)
+            self.assertIn("set HTTPS_PROXY", setup.proxy_hint())
+            os.environ["HTTPS_PROXY"] = "http://user:secret@proxy:3128"
+            hint = setup.proxy_hint()
+            self.assertIn("a proxy is set", hint)
+            self.assertNotIn("secret", hint)
+
+
+class ReadOnlyModelFolderMark(unittest.TestCase):
+    """0.2.9.1: a model folder Strata cannot write to (a read-only disk) keeps its finish marks under Strata's own
+    folder, so the SHA-256 of the 110 GB Engram is not computed again on every launch."""
+
+    def test_the_mark_is_kept_elsewhere_and_the_hash_is_not_repeated(self):
+        real_write = Path.write_text
+
+        def write(self, *a, **k):
+            if self.name.endswith(".done") and "strata_marks" not in str(self):
+                raise PermissionError(13, "read-only")
+            return real_write(self, *a, **k)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = Path(tmp) / "strata_marks", Path(tmp) / "share"
+            share.mkdir()
+            f = share / "engram.gguf"
+            f.write_bytes(b"abc" * 10)
+            sha = "f" * 64
+            hashed = []
+
+            def fake_hash(path, size):
+                hashed.append(path)
+                return sha
+
+            with mock.patch.object(setup, "ROOT", root), mock.patch.object(Path, "write_text", write), \
+                    mock.patch.object(setup, "_hash_file", fake_hash):
+                setup.verify_sha256(f, 30, sha)
+                self.assertEqual(len(hashed), 1)
+                self.assertFalse((share / "engram.gguf.done").exists())
+                self.assertTrue(setup.done(f))
+                setup.verify_sha256(f, 30, sha)                       # the second launch
+                self.assertEqual(len(hashed), 1, "the kept mark is found; nothing is hashed again")
+                f.write_bytes(b"abcd" * 10)                           # a changed file has no mark
+                self.assertFalse(setup.done(f))
+
+
+class OfflineStart(unittest.TestCase):
+    """0.2.9.1: a PC with every file and no internet starts a model that is already prepared."""
+
+    def test_a_pinned_file_copied_in_by_hand_is_checked_here_without_the_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "drafter.gguf"
+            f.write_bytes(b"abc" * 10)
+            url = "https://huggingface.co/x/y/resolve/main/drafter.gguf"
+            with mock.patch.object(setup, "file_pin", lambda u: (30, "a" * 64)), \
+                    mock.patch.object(setup, "_hash_file", lambda p, n: "a" * 64), \
+                    mock.patch.object(setup, "_urlopen", side_effect=OSError("no network")), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                setup.download(url, f, "drafter")
+            self.assertTrue(setup.done(f))
+            self.assertIn("sha256 " + "a" * 64, setup.mark_text(f))

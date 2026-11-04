@@ -494,9 +494,10 @@ def free_vram_mib(gpu_pci=None):
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
     if os.path.exists("/proc/cpuinfo"):
-        for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
-            if line.startswith("model name"):
-                return line.split(":", 1)[1].strip()
+        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
     return platform.processor() or None
 
 
@@ -508,7 +509,8 @@ class _CpuRamFallback:
 
     def _times(self):
         try:
-            f = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+            with open("/proc/stat") as fh:
+                f = [int(x) for x in fh.readline().split()[1:]]
             return f[3] + f[4], sum(f)
         except (OSError, ValueError):
             return None
@@ -523,7 +525,8 @@ class _CpuRamFallback:
     @staticmethod
     def ram():
         try:
-            info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
+            with open("/proc/meminfo") as fh:
+                info = dict(line.split(":", 1) for line in fh)
             total = int(info["MemTotal"].split()[0]) * 1024
             avail = int(info["MemAvailable"].split()[0]) * 1024
             return total - avail, total
