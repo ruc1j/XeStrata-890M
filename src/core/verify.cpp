@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
+#include "strata/kernels/dflash2.hpp"
 #include "strata/core/window_evict.hpp"
 
 #include "strata/core/native_head.hpp"
@@ -390,6 +391,7 @@ Verifier::~Verifier() {
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     if (cs_) strata::gpu::stream_sync(cs_);
     if (d_spec_) strata::gpu::free(d_spec_);
+    if (tap_dev_) strata::gpu::free(tap_dev_);
     if (h_margin_) strata::gpu::free(h_margin_);
     for (auto& e : exec_)
         if (e) strata::gpu::graph_destroy(e);
@@ -591,6 +593,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    // DFlash2 taps (set_taps): off, and nothing is allocated or recorded, otherwise
+    if (!tap_req_.empty() && lb_ == 0 && le_ == g.n_layers) {
+        tap_layers_.clear();
+        for (int l : tap_req_) if (l >= 0 && l < g.n_layers - 1) tap_layers_.push_back(l);
+        tap_slot_.assign((size_t) g.n_layers, -1);
+        for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot_[(size_t) tap_layers_[i]] = (int) i;
+        const size_t nt = tap_layers_.size();
+        if (nt == 0 || !strata::gpu::alloc_device(&tap_dev_, (size_t) T * nt * N * sizeof(float))) {
+            err = "verify: the DFlash2 tap buffers could not be allocated";
+            return false;
+        }
+        tap_on_ = true;
+    }
     {
         RouteTrace& rt = route_trace();
         if (!rt.error.empty()) { err = rt.error; return false; }
@@ -1654,6 +1669,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
         }
         stamp(l, 24, grp);
+        if (tap_on_ && !batch_rec_ && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
+            // DFlash2: the layer's completed output, R with this FFN half's write applied (the next layer's read
+            // would fold it), the mean of the hc streams; all rows of the group in one launch
+            const int64_t nt = (int64_t) tap_layers_.size();
+            strata::kernels::df2_tap_gr(Rt(tb), HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC,
+                                        tap_dev_ + ((size_t) tb * nt + (size_t) tap_slot_[(size_t) l]) * N, nt * N, n, N,
+                                        (int) HC, cs);
+        }
         if (l == g.n_layers - 1) {
             if (dec_batch) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
             else for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);

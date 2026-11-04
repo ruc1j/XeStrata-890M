@@ -418,7 +418,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp src/kernels/xe/prompt_attn.cpp
                                     src/kernels/xe/q8_mma.cpp
                                     src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp
-                                    src/kernels/xe/draft_head.cpp)
+                                    src/kernels/xe/draft_head.cpp src/kernels/xe/dflash2.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/main/ggml)
@@ -434,7 +434,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp src/core/draft_head.cpp
-                                   src/core/grammar.cpp)
+                                   src/core/grammar.cpp src/core/dflash2.cpp)
   target_include_directories(strata_engine PUBLIC include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_spec)
   # grammar-constrained decoding (src/core/grammar.cpp, --serve's grammar=): xgrammar (Apache-2.0) at a pinned release
@@ -510,6 +510,12 @@ if(STRATA_ENABLE_XE)
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
     target_link_libraries(pinned_shared_test PRIVATE strata_engine)
     add_test(NAME pinned_shared_test COMMAND pinned_shared_test)
+    # the DFlash2 drafter's ring log (upstream Strata 0.2.10's SYCL port): rebuilt K/V rows are the original ones.
+    # Needs the Q4_0 pack (STRATA_DF2_PACK, or the argument); skipped without it (exit 77)
+    add_executable(dflash2_ring_test src/core/dflash2_ring_test.cpp)
+    target_link_libraries(dflash2_ring_test PRIVATE strata_engine)
+    add_test(NAME dflash2_ring_test COMMAND dflash2_ring_test)
+    set_tests_properties(dflash2_ring_test PROPERTIES SKIP_RETURN_CODE 77)
     foreach(core_gpu_test expert_cache_per_layer_test expert_cache_pieces_test native_dense_ple_key_test vmm_test)
       add_executable(${core_gpu_test} tests/core/${core_gpu_test}.cpp)
       target_link_libraries(${core_gpu_test} PRIVATE strata_engine)

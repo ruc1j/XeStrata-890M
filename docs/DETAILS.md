@@ -483,6 +483,11 @@ The engine's options (added to the settings' `args`).
 | `--spec N` | the most tokens of a window checking the MTP layer's drafts (default 3: two drafts; 0: off) |
 | `--spec-window all\|auto\|min-p` | how many of the drafts a window checks: `all` (the default) every draft made; `auto`, as Qwen3.8-Flash-Next does, while the drafts' probabilities and the measured window times say a draft raises the tokens per ms; `min-p` while a draft is at least `--spec-min-p P` likely |
 | `--draft-vocab PATH` | the MTP layer drafts only tokens of this subset (`data/draft_vocab*.bin`), reading less of the head (setup writes it into Qwen3.6's settings, after its `--draft-vocab` choice) |
+| `--draft mtp\|dflash2` | the drafter (default `mtp`). `dflash2` is the DFlash2 drafter ("The DFlash2 drafter" below): it needs `--draft-model PACK`, `--spec` 2 or more and `--mtp DIR` (for DIR/draft_vocab.bin) or `--mtp-draft-vocab FILE`; no MTP layer is loaded |
+| `--draft-model PACK` | the DFlash2 drafter's pack (the Q4_0 file `tools/dflash2_pack.py --q4_0` makes) |
+| `--draft-conf P` | with `--draft dflash2`: end the window where the product of the selector's probabilities falls below P (default 0.6; 0: the `--spec-min-p` rule) |
+| `--draft-cap N` | with `--draft dflash2`: the widest window |
+| `--mtp-draft-vocab FILE` | with `--draft dflash2`: the draft head's token subset from this file (default `<--mtp DIR>/draft_vocab.bin`) |
 | `--layer-split K[,K2..]` / `auto` | split the layers across the GPUs: the first runs the layers before K, the next those from K on, ... (`auto`: by each GPU's share of the free memory; setup's `--gpus` writes it) |
 | `--split-device D[,D2..]` | the later GPUs (engine numbers or PCI addresses; by default the other discrete GPUs) |
 | `--vision` | with `--serve`, take requests with images (Qwen3.5-9B and the qwen35moe models; setup writes it when images are chosen) |
@@ -925,6 +930,25 @@ The draft layer's VRAM (about 0.7-1 GiB with its head) goes to the expert cache:
 Parked and saved conversations carry the draft layer's K/V, so without `--mtp` the conversation cache's parking, `--conversation-save` and the session files are off.
 
 A native Qwen3.8-Flash-Next pack (one whose experts are read from the GGUF files) takes `--spec` 2 at the smallest: the engine refuses to start with `--spec 0` or `--spec 1` (`it needs --native SHARD1, --spec T (T >= 2) and --prefill CHUNK`).
+
+### The DFlash2 drafter (optional, experimental)
+
+`--draft dflash2` takes upstream Strata 0.2.10's default drafter, DFlash2 (incoai/Qwen3.8-Flash-Next-DFlash2, Apache-2.0), in place of the MTP layer.
+A small 5-layer transformer reads the model's hidden states after layers 5, 15, 25, 35 and 45 and, from the last accepted token and 7 mask tokens, drafts 7 tokens in one pass; a selector picks one path through the candidates.
+No MTP layer is loaded; only the draft vocabulary (`draft_vocab.bin` in `--mtp DIR`, or `--mtp-draft-vocab FILE`) is used.
+On the 890M it was 6 to 7% slower than the MTP, so the MTP stays the default (the measurement: "The DFlash2 drafter's port" in docs/XE.md).
+
+The pack is made on your own PC. Take `model.safetensors` (1,206,140,008 bytes, SHA-256 `d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f`) and `config.json` from Hugging Face's incoai/Qwen3.8-Flash-Next-DFlash2, then
+
+```sh
+python3 tools/dflash2_pack.py model.safetensors config.json qwen3.8-flash-next-dflash2.q4_0.pack --q4_0
+```
+
+makes the Q4_0 pack (522,458,112 bytes, SHA-256 `cda40d62d0eb8f37ed6e272142641a1d2f0de4a32f9e14d0416e7a71534849f1`, the bytes upstream pinned); add `--draft dflash2 --draft-model <path of the pack>` to the args of the settings file (`--spec` 2 or more, `--mtp DIR` as it is).
+It takes 0.5 GiB of VRAM for the pack, 0.2 GiB for the buffers and the K/V ring and about 0.07 to 0.3 GiB for the draft head (the rows of the vocabulary subset).
+`--draft-conf P` (default 0.6) ends a window where the product of the selector's probabilities falls below P.
+As upstream's SYCL build, it reads only a pack whose selector codebooks are bf16, and does not combine with `--batch`, a layer split or a fallback to the MTP.
+serve and setup do not know this drafter: it is written into the settings by hand.
 
 ---
 

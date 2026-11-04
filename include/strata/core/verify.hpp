@@ -372,6 +372,12 @@ public:
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU).  0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
+    /// DFlash2 taps (upstream Strata's SYCL verifier): before init(), the zero-based layers whose completed output the
+    /// drafter reads.  Each window then leaves tap_dev() = [max_t][n_taps][n_embd] floats (the mean of the hc streams
+    /// after the layer's FFN write), valid until the next window.  Single-stage only; a batch window writes none.
+    void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
+    const float* tap_dev() const { return tap_dev_; }
+    bool tapping() const { return tap_on_; }
 
     // ---- The stages of a layer split as a PIPELINE (upstream PR #559, --batch-groups).  A batch window over the slot
     // GROUP [base, base + S) is launched on ONE stage with its commit right behind it on the stage's queue (a batch
@@ -505,6 +511,11 @@ private:
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
+    bool tap_on_ = false;                  ///< DFlash2 taps (set_taps) are recorded into the windows
+    std::vector<int> tap_req_;             ///< set_taps
+    std::vector<int> tap_layers_;          ///< the tapped layer ids (zero-based, completed outputs)
+    std::vector<int> tap_slot_;            ///< layer -> slot in tap_layers_, or -1
+    float* tap_dev_ = nullptr;             ///< [max_t][n_taps][n_embd]
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
     /// key: batch_key(rows, S, hand-off base) - the whole row layout (--batch-mtp repeats a slot over its rows)

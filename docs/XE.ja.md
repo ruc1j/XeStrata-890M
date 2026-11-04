@@ -56,6 +56,27 @@ fork の形を残したものは次のとおりです。両側が同じ Strata �
 確かめたこと: free ビルド、CTest（pack の要る 2 本を除いて通ります）、serve の Python の試験（1,016 本、28 本は skip）、tools の試験（388 本、8 本は skip）、`reuse lint` と `tools/license_class.py`、Python と JavaScript の lint で merge が新しく足した指摘がないこと。
 Mage-Flow-Turbo 以外の画像のモデル、contrib-llvm のビルド、Windows のクロスビルド、ほかの GPU は未検証です。
 
+## DFlash2 の drafter の移植
+
+upstream の Strata 0.2.10 の既定の drafter、DFlash2（incoai/Qwen3.8-Flash-Next-DFlash2、Apache-2.0）を、upstream 自身の SYCL 版（`sycl/` の DF2-SYCL、Intel Arc 向け）からこの fork に移しました（2026-11-04）。`--draft dflash2 --draft-model PACK` で選ぶ任意の機能で、既定は MTP のままです。使い方は docs/DETAILS.ja.md の「DFlash2 の drafter」にあります。
+
+- 移したもの: drafter のカーネル（Q4_0 の GEMM、2 tap の動的 conv、窓つき attention、top-16、selector の歩き。`src/kernels/xe/dflash2.cpp`）、drafter 本体（pack の読み込み、K/V の ring、ring の記録と組み直し、1〜8 行の round の graph。`src/core/dflash2.cpp`）、verify の窓と prompt の経路の tap（層 5・15・25・35・45 の完了出力、hc 4 本の平均）、generate の CLI と serve の経路、窓の規則（selector の確率の積が `--draft-conf` を下回ったところで窓を終える）、pack を作る `tools/dflash2_pack.py` とその試験、ring の記録の試験（`dflash2_ring_test`。pack があるときだけ動き、組み直した K/V の行が元の更新と同じビットかを見ます。890M で通りました）。
+- この fork での違い: GEMM の既定の variant はGPU が報告する sub-group の大きさで選びます（16 がある Intel は upstream の SIMD16 の対のカーネル、ない AMD と NVIDIA の device compile は 32 lane のカーネル）。AMD の device compile ではカーネルが work-group の大きさを宣言します（レジスタの割り当て）。drafter の stream、graph、メモリは `strata/core/gpu.hpp` を通ります。
+- 入れていないもの: `--draft auto` と MTP への fallback、batch slot と layer split の DFlash2、Q4_0 の selector codebook（upstream の SYCL 版も bf16 だけ）、lookup を先に取る規則の配線（`STRATA_DF2_LOOKUP_SKIP`、既定 0）、layer-major の prefill の tap、serve・setup・app の組み込み（pack の取得と変換、Drafting の選択）。pack は手で作ります。
+
+計測（890M、abliterated IQ2_XS、bench の 6 チャット、greedy、`--spec 6`、枠 24,576、1 周ずつ）:
+
+| drafter | decode（tok/s） | 下書きの採択 / 提案 | drafter の 1 round |
+|---|---|---|---|
+| MTP（sketch、CUM 0.5。既定） | 31.0 | 1,313 / 2,045 | 約 4 ms |
+| DFlash2、confidence 0.35 | 29.2 | 1,333 / 2,362 | 7.9 ms |
+| DFlash2、confidence 0.6（既定） | 29.5 | 1,243 / 1,707 | 7.8 ms |
+| DFlash2、confidence 0.8 | 27.9 | 1,141 / 1,357 | 7.7 ms |
+
+交互 3 周（枠 24,576、冷却つき）: MTP 31.6 / 31.7 / 32.0 tok/s、DFlash2（confidence 0.6）29.6 / 29.6 / 29.8 tok/s で、中央値で 6.7% 遅いです。drafter は 7.7 ms/round、2,191 トークンに 942 round（1 round 2.3 トークン。MTP は 874 round、2.5 トークン）。6 チャットの greedy の答えは 3 周とも MTP と同じでした。チャットごとに見ると、コードと英語の 3 つ（クイックソート 37.2 対 36.5、transformer 33.2 対 32.4、bash 42.6 対 40.5）では DFlash2 が 2〜5% 速く、日本語の文章の 2 つ（四季 21.5 対 25.6、光合成 25.0 対 28.8）で 13〜16%、TCP/UDP（32.9 対 34.0）で 3% 遅いです。
+
+1 round に受け入れるトークンの数は MTP と同じほど（約 2.5）ですが、drafter 自身が 1 round に 7.8 ms かかり（5 層の Q4_0 の重み 0.5 GB を 890M の帯域で読む時間が大半）、MTP の約 4 ms より長いので、decode は 6〜7% 遅くなります。upstream が AMD の HIP で MTP より 4〜12% 速かったのは、帯域が 2.5〜6 倍のカード（Strix Halo、R9700）です。Issue #23（2026-10-24）の見積もり（drafter の重みの読みが MTP の 4 ms を超え、+2〜3% が上限）のとおりでした。drafter は下書きを変えるだけで、答えは verify が決めます。
+
 ## Strata 0.1.56 の取り込み
 
 upstream の Strata 0.2.9 から 0.2.10（エンジンの版は 0.1.56、2026-11-02）までの 708 コミットのうち、エンジン・serve・setup の層に当たるものを XeStrata-890M に移しています。上流の XeStrata（MistVVK/XeStrata）の main は 2026-10-30 で止まっていて 0.2.10 を取り込んでいないので、前回と同じく Strata のコミットを `patch -F3` で当て、ずれた hunk は手で置き直しました。一覧は `.upstream-0156.md`（リポジトリの根、git の外）です。
@@ -75,7 +96,7 @@ upstream の Strata 0.2.9 から 0.2.10（エンジンの版は 0.1.56、2026-11
 
 入れていないものは次のとおりです。
 
-- DFlash2 の drafter（upstream の 0.2.10 の既定の drafter）。5 層の drafter のカーネル、verify の窓と prompt の経路からの tap、ring の記録を、この fork の SYCL のカーネルと verify に書き直す必要があり、別の作業です。upstream の計測は AMD の HIP（Strix Halo の Windows、R9700）で MTP より 4〜12% 速く、Intel Arc A750 の SYCL では 2.6% 遅いものでした。この fork の MTP は sketch の drafting を持っています。
+- DFlash2 の drafter（upstream の 0.2.10 の既定の drafter）は、この取り込みのあとに別の作業で移しました（次の「DFlash2 の drafter の移植」）。
 - 12 行と 16 行の prompt lookup の窓（`--lookup-max-t`）。この fork の verify のカーネルは 8 行です。
 - RAM が足りないときに arena を `--mmap-experts` の形に落とす一連の変更。890M の setup は初めから `--mmap-experts` を選びます。
 - ready file の直後の stop の扱い（この fork の serve に ready file はありません）と、Qwen の on-demand の画像の読み手（この fork の serve には、それが前提にする elastic な読み手の仕組みがありません）。

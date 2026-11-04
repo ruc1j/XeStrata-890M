@@ -451,6 +451,11 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--spec N` | MTP の層の推測デコードの窓の最大のトークン数（既定 3: 下書き 2 個。0 で使わない） |
 | `--spec-window all\|auto\|min-p` | 窓で確かめる下書きの数の決め方。`all`（既定）は作った下書きをすべて、`auto` は Qwen3.8-Flash-Next と同じく、下書きの確率と測った窓の時間から 1 ms あたりの出力が増える間だけ、`min-p` は下書きの確率が `--spec-min-p P` 以上の間だけ |
 | `--draft-vocab PATH` | MTP の層の下書きを、このトークンの部分集合（`data/draft_vocab*.bin`）の中だけで作る。ヘッドを読む量が減ります（setup が Qwen3.6 の設定に、`--draft-vocab` の選択に従って書きます） |
+| `--draft mtp\|dflash2` | 下書きの作り手（既定 `mtp`）。`dflash2` は DFlash2 の drafter（下の「DFlash2 の drafter」）。`--draft-model PACK`、`--spec` 2 以上、`--mtp DIR`（DIR/draft_vocab.bin のため）か `--mtp-draft-vocab FILE` が要ります。MTP の層は読み込みません |
+| `--draft-model PACK` | DFlash2 の drafter の pack（`tools/dflash2_pack.py --q4_0` が作る Q4_0 のファイル） |
+| `--draft-conf P` | `--draft dflash2` で、selector の確率の積が P を下回ったところで窓を終える（既定 0.6。0 で `--spec-min-p` の規則） |
+| `--draft-cap N` | `--draft dflash2` で、窓の最大のトークン数 |
+| `--mtp-draft-vocab FILE` | `--draft dflash2` で、draft head のトークンの部分集合をこのファイルから取る（既定は `<--mtp DIR>/draft_vocab.bin`） |
 | `--layer-split K[,K2..]` / `auto` | 層を GPU に分ける。最初の GPU が層 K の前まで、次の GPU が K から、…（`auto`: 各 GPU の空いたメモリの割合で。setup の `--gpus` で書かれます） |
 | `--split-device D[,D2..]` | 2 枚目以降の GPU（エンジンの番号か PCI アドレス。既定はほかの単体の GPU） |
 | `--vision` | `--serve` で画像つきの要求を受ける（Qwen3.5-9B と qwen35moe のモデル。setup が画像を選んだとき書きます） |
@@ -839,6 +844,25 @@ upstream の 8 GB のカードでの比較では、キャッシュが 1,000 か�
 退避した会話とファイルに保存した会話は推測の層の K/V を含むので、`--mtp` なしでは会話のキャッシュの退避、`--conversation-save`、セッションファイルは使えません。
 
 Qwen3.8-Flash-Next のネイティブの pack（エキスパートを GGUF のファイルから読む pack）では、`--spec` は 2 以上が要ります。`--spec 0` と `--spec 1` では、エンジンは起動しません（`it needs --native SHARD1, --spec T (T >= 2) and --prefill CHUNK`）。
+
+### DFlash2 の drafter（任意、実験的）
+
+upstream の Strata 0.2.10 の既定の drafter、DFlash2（incoai/Qwen3.8-Flash-Next-DFlash2、Apache-2.0）を `--draft dflash2` で選べます。
+MTP の層の代わりに、5 層の小さな transformer が本体の層 5・15・25・35・45 の隠れ状態を読み、最後に受け入れたトークンと 7 個の mask トークンから 7 トークンを一度に下書きし、selector が候補の中から 1 本の道を選びます。
+MTP の層は読み込みません。使うのは下書きの語彙（`--mtp DIR` の `draft_vocab.bin`、または `--mtp-draft-vocab FILE`）だけです。
+890M では MTP より 6〜7% 遅かったので、既定は MTP のままです（計測は docs/XE.ja.md の「DFlash2 の drafter の移植」）。
+
+pack は自分の PC で作ります。Hugging Face の incoai/Qwen3.8-Flash-Next-DFlash2 から `model.safetensors`（1,206,140,008 バイト、SHA-256 `d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f`）と `config.json` を取り、
+
+```sh
+python3 tools/dflash2_pack.py model.safetensors config.json qwen3.8-flash-next-dflash2.q4_0.pack --q4_0
+```
+
+で Q4_0 の pack（522,458,112 バイト、SHA-256 `cda40d62d0eb8f37ed6e272142641a1d2f0de4a32f9e14d0416e7a71534849f1`。upstream が固定した値と同じになります）を作り、設定ファイルの args に `--draft dflash2 --draft-model <pack のパス>` を足します（`--spec` は 2 以上、`--mtp DIR` はそのまま）。
+VRAM は pack に 0.5 GiB、バッファーと K/V の ring に 0.2 GiB、draft head（語彙の部分集合の行）に約 0.07〜0.3 GiB です。
+`--draft-conf P`（既定 0.6）は、selector の確率の積が P を下回ったところで窓を終えます。
+upstream の SYCL 版と同じく、selector の codebook が bf16 の pack だけを読み、`--batch`、layer split、MTP への fallback とは組み合わせられません。
+serve と setup はこの drafter を知らないので、設定に手で書きます。
 
 ---
 

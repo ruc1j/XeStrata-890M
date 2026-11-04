@@ -226,6 +226,19 @@ public:
     /// mid-prompt checkpoint takes each stage's part.  Runs on that stage's thread, with its device current.
     std::function<bool(int64_t done, std::string& err)> on_stage_chunk;
 
+    /// DFlash2 prompt taps (upstream Strata's SYCL prefill; single stage): before `run`, ask for the completed output
+    /// of each layer in `layers` (zero-based; the mean of the hc streams) for the rows at positions >= first_pos (the
+    /// drafter looks back one window).  The staging of cap_rows x layers x n_embd floats is allocated at the first
+    /// chunk, or by `reserve_taps` before (so the expert cache is sized around it).  After each chunk that has such
+    /// rows, on_taps(taps [rows][layers][n_embd] device, rows, first position, err) runs with the stream synchronized.
+    /// clear_taps frees the staging.
+    void set_taps(const std::vector<int>& layers, int64_t first_pos, int64_t cap_rows) {
+        tap_layers_ = layers; tap_first_ = first_pos; tap_cap_ = cap_rows;
+    }
+    void clear_taps();
+    bool reserve_taps(const std::vector<int>& layers, int64_t cap_rows, int64_t n_embd, std::string& err);
+    std::function<bool(const float* taps, int64_t rows, int64_t pos0, std::string& err)> on_taps;
+
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
 
@@ -278,6 +291,9 @@ private:
     std::future<bool> lm_next_run_;   ///< a layer split: the next stage's run of the last super-chunk handed on
     std::string lm_next_err_;
     int64_t stage_lb_ = 0, stage_le_ = -1;
+    std::vector<int> tap_layers_;       ///< DFlash2 taps (set_taps)
+    int64_t tap_first_ = 0, tap_cap_ = 0;
+    float* tap_dev_ = nullptr;          ///< the taps' staging [cap_rows][layers][n_embd]
     PrefillLink* next_ = nullptr;       ///< set_stage: the next stage, through this link only
     InProcessPrefill local_next_;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)

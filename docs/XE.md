@@ -55,6 +55,27 @@ What keeps the fork's form, where both sides held the same Strata change in othe
 Checked: the free build, CTest (passes but for the two tests that need a pack), the serve Python tests (1,016, 28 skipped), the tools tests (388, 8 skipped), `reuse lint` and `tools/license_class.py`, and that the Python and JavaScript lints report nothing the merge added.
 The image models other than Mage-Flow-Turbo, the contrib-llvm build, the Windows cross build and other GPUs are unverified.
 
+## The DFlash2 drafter's port
+
+Upstream Strata 0.2.10's default drafter, DFlash2 (incoai/Qwen3.8-Flash-Next-DFlash2, Apache-2.0), was ported to this fork from upstream's own SYCL port (DF2-SYCL in its `sycl/`, written for Intel Arc) on 2026-11-04. It is an option, `--draft dflash2 --draft-model PACK`; the MTP stays the default. How to use it: "The DFlash2 drafter" in docs/DETAILS.md.
+
+- Ported: the drafter's kernels (the Q4_0 GEMM, the 2-tap dynamic convolution, the windowed attention, the top-16, the selector's walk; `src/kernels/xe/dflash2.cpp`), the drafter itself (the pack's loading, the K/V ring, the ring log and its rebuild, one round graph per 1 to 8 rows; `src/core/dflash2.cpp`), the taps of the verify window and the prompt path (the completed outputs of layers 5, 15, 25, 35 and 45, the mean of the 4 hc streams), the CLI and serve paths of generate, the window rule (the window ends where the product of the selector's probabilities falls below `--draft-conf`), `tools/dflash2_pack.py` with its test, and the ring log's test (`dflash2_ring_test`: it runs only with the pack and checks that the rebuilt K/V rows are bitwise the original update's; it passes on the 890M).
+- This fork's differences: the GEMM's default variant is chosen from the sub-group sizes the device reports (upstream's SIMD16 pair kernels where 16 is among them, Intel; the 32-lane kernels on the AMD and NVIDIA device compiles, which have no 16). In AMD's device compile the kernels state their work-group size (the register budget). The drafter's stream, graphs and memory go through `strata/core/gpu.hpp`.
+- Not taken: `--draft auto` and the fallback to the MTP, DFlash2 in batch slots and on a layer split, the Q4_0 selector codebooks (upstream's SYCL build reads bf16 only too), the wiring of the lookup-first rule (`STRATA_DF2_LOOKUP_SKIP`, default 0), the taps of the layer-major prefill, and the serve, setup and app integration (fetching and converting the pack, the Drafting choice). The pack is made by hand.
+
+Measured (the 890M, the abliterated IQ2_XS, the bench's 6 chats, greedy, `--spec 6`, 24,576 slots, one run each):
+
+| drafter | decode (tok/s) | drafts accepted / offered | the drafter's round |
+|---|---|---|---|
+| MTP (sketch, CUM 0.5; the default) | 31.0 | 1,313 / 2,045 | about 4 ms |
+| DFlash2, confidence 0.35 | 29.2 | 1,333 / 2,362 | 7.9 ms |
+| DFlash2, confidence 0.6 (the default) | 29.5 | 1,243 / 1,707 | 7.8 ms |
+| DFlash2, confidence 0.8 | 27.9 | 1,141 / 1,357 | 7.7 ms |
+
+Three interleaved rounds (24,576 slots, cooled between runs): the MTP 31.6 / 31.7 / 32.0 tok/s, DFlash2 (confidence 0.6) 29.6 / 29.6 / 29.8 tok/s, 6.7% slower by the medians. The drafter took 7.7 ms a round, 942 rounds for 2,191 tokens (2.3 tokens a round; the MTP 874 rounds, 2.5). The six chats' greedy answers were the MTP's in all three rounds. By chat, DFlash2 was 2 to 5% faster on the three code and English chats (quicksort 37.2 against 36.5, the transformer 33.2 against 32.4, bash 42.6 against 40.5), 13 to 16% slower on the two Japanese prose chats (the seasons 21.5 against 25.6, photosynthesis 25.0 against 28.8) and 3% slower on TCP/UDP (32.9 against 34.0).
+
+The tokens accepted a round are about the MTP's (about 2.5), but the drafter itself takes 7.8 ms a round (mostly the time the 890M's bandwidth needs to read the 5 layers' 0.5 GB of Q4_0 weights), longer than the MTP's about 4 ms, so decode is 6 to 7% slower. Where upstream measured DFlash2 4 to 12% faster than the MTP on AMD HIP, the cards (Strix Halo, the R9700) have 2.5 to 6 times the bandwidth. Issue #23's estimate (2026-10-24: the drafter's weight reads exceed the MTP's 4 ms, +2 to 3% at best) held. The drafter changes only the drafts; the verify decides the answers.
+
 ## Integration through Strata 0.1.56
 
 Of the 708 upstream Strata commits from 0.2.9 to 0.2.10 (engine version 0.1.56, 2026-11-02), the ones that touch the engine, serve and setup layers come into XeStrata-890M. Upstream XeStrata's (MistVVK/XeStrata) main stops at 2026-10-30 and has not taken 0.2.10, so, as before, Strata's commits were applied with `patch -F3` and the shifted hunks placed by hand. The list is `.upstream-0156.md` (the repository root, outside git).
@@ -74,7 +95,7 @@ What came in:
 
 Not taken:
 
-- The DFlash2 drafter (upstream 0.2.10's default drafter). Its 5-layer drafter kernels, the taps from the verify window and the prompt path, and the ring log would have to be written again for this fork's SYCL kernels and verify: a job of its own. Upstream measured it 4 to 12% faster than the MTP on AMD HIP (Strix Halo on Windows, the R9700) and 2.6% slower on the Intel Arc A750's SYCL build. This fork's MTP carries the sketch drafting.
+- The DFlash2 drafter (upstream 0.2.10's default drafter) was ported after this integration, as a job of its own ("The DFlash2 drafter's port" below).
 - The 12- and 16-row prompt lookup windows (`--lookup-max-t`): this fork's verify kernels take 8 rows.
 - The series that drops the arena to the `--mmap-experts` form when RAM is short: the 890M's setup chooses `--mmap-experts` from the start.
 - The stop that arrives at the ready file (this fork's serve has no ready file) and Qwen's on-demand picture reader (this fork's serve lacks its base).

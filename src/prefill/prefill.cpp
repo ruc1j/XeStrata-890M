@@ -18,6 +18,7 @@
 #include "strata/platform/direct_file.hpp"
 
 #include "strata/core/layout.hpp"
+#include "strata/kernels/dflash2.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
@@ -935,7 +936,32 @@ bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::str
 }
 
 Prefill::Prefill() : impl_(new Impl) {}
-Prefill::~Prefill() { release(); }
+Prefill::~Prefill() {
+    clear_taps();
+    release();
+}
+
+// DFlash2 prompt taps (single stage): staging for the completed output of each tapped layer for the last prompt rows
+// (include/strata/prefill/prefill.hpp)
+bool Prefill::reserve_taps(const std::vector<int>& layers, int64_t cap_rows, int64_t n_embd, std::string& err) {
+    tap_layers_ = layers;
+    tap_cap_ = cap_rows;
+    if (tap_dev_ != nullptr) return true;
+    if (!strata::gpu::alloc_device(&tap_dev_, (size_t) cap_rows * layers.size() * (size_t) n_embd * sizeof(float))) {
+        err = "the prompt staging of the DFlash2 taps does not fit in VRAM";
+        return false;
+    }
+    return true;
+}
+
+void Prefill::clear_taps() {
+    if (tap_dev_ != nullptr) {
+        strata::gpu::free(tap_dev_);
+        tap_dev_ = nullptr;
+    }
+    tap_layers_.clear();
+    on_taps = nullptr;
+}
 void Prefill::reset() { release(); impl_ = std::make_unique<Impl>(); stats_ = {}; }
 void Prefill::release() {
     if (!impl_) return;
@@ -2224,6 +2250,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
+    // DFlash2 prompt taps (set_taps): on a single stage, the slot of each tapped layer and the staging
+    std::vector<int> tap_slot;
+    if (!tap_layers_.empty() && stage_lb_ == 0 && (stage_le_ < 0 || stage_le_ == m.g->n_layers)) {
+        if (tap_dev_ == nullptr &&
+            !strata::gpu::alloc_device(&tap_dev_, (size_t) tap_cap_ * tap_layers_.size() * (size_t) m.g->n_embd * sizeof(float))) {
+            err = "prefill: the DFlash2 tap staging does not fit in VRAM";
+            return false;
+        }
+        tap_slot.assign((size_t) m.g->n_layers, -1);
+        for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot[(size_t) tap_layers_[i]] = (int) i;
+    }
     for (int64_t c0 = 0; c0 < n; c0 += m.T) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         if (std::getenv("STRATA_TRACE")) {   // the stage and the time, one clock for the process (upstream 14d076ee2, 3a2675302)
@@ -2234,6 +2271,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::fflush(stderr);
         }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+        // DFlash2 prompt taps: the rows of this chunk at positions >= tap_first_ (the drafter looks back one window)
+        const int64_t tap_t0 = !tap_slot.empty() ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : T;
+        const int64_t tap_rows = T - tap_t0;
+        if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);
         // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
         // before the frontier (a chunk is never split into two regimes)
@@ -3898,6 +3939,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (steered)   // --control-vector-scaled
                         strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
                 }
+                if (half == 1 && tap_rows > 0 && tap_slot[(size_t) l] >= 0)   // DFlash2: this layer's completed output, mean of the streams
+                    strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D, tap_dev_ + (size_t) tap_slot[(size_t) l] * N,
+                                                  (int64_t) tap_layers_.size() * N, N, (int) HC, (int) tap_rows, m.cs);
             }
         }
         // STRATA_DUMP_RFINAL=<path> (XeStrata-890M, a diagnostic): every chunk's final residual (after the last layer,
@@ -4002,6 +4046,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 std::fclose(f);
             }
+        }
+        if (tap_rows > 0 && on_taps) {   // DFlash2: the chunk's tapped rows to the drafter, the stream drained first
+            if (!strata::gpu::stream_sync(m.cs)) {
+                err = std::string("prefill: ") + strata::gpu::last_error();
+                return false;
+            }
+            if (!on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
         }
         if (on_chunk || on_stage_chunk) {
             const auto toc = Clock::now();
