@@ -120,7 +120,7 @@ upstream の Strata 0.2.9 から 0.2.10（エンジンの版は 0.1.56、2026-11
 入れていないものは次のとおりです。
 
 - DFlash2 の drafter（upstream の 0.2.10 の既定の drafter）は、この取り込みのあとに別の作業で移しました（次の「DFlash2 の drafter の移植」）。
-- 12 行と 16 行の prompt lookup の窓（`--lookup-max-t`）。この fork の verify のカーネルは 8 行です。
+- 12 行と 16 行の prompt lookup の窓（`--lookup-max-t`）。この fork に移して 890M で測りましたが、速くならなかったので入れていません（2026-11-06）。ファイルの書き直し 3 課題（greedy、交互 2 周）は 8 行 47.4 / 45.6、12 行 46.4 / 44.8、16 行 31.8 / 47.1 トークン/秒で、16 行の 1 周目は VRAM が空いていない中で窓の graph を作った分だけ遅くなりました。6 チャットでは長い窓に出した下書きがほとんど通りませんでした。8 行を超える窓は kernel の数が 2 倍になり、HIP の kernel 引数のバッファーに収まらず、launch と host の待ちが互いを待って止まるので、移すなら launch を別のスレッドで行う必要があります。
 - RAM が足りないときに arena を `--mmap-experts` の形に落とす一連の変更。890M の setup は初めから `--mmap-experts` を選びます。
 - ready file の直後の stop の扱い（この fork の serve に ready file はありません）と、Qwen の on-demand の画像の読み手（この fork の serve には、それが前提にする elastic な読み手の仕組みがありません）。
 

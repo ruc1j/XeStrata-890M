@@ -119,7 +119,7 @@ What came in:
 Not taken:
 
 - The DFlash2 drafter (upstream 0.2.10's default drafter) was ported after this integration, as a job of its own ("The DFlash2 drafter's port" below).
-- The 12- and 16-row prompt lookup windows (`--lookup-max-t`): this fork's verify kernels take 8 rows.
+- The 12- and 16-row prompt lookup windows (`--lookup-max-t`): ported to this fork and measured on the 890M, they were not faster, so they are not taken (2026-11-06). The three file rewrites (greedy, two interleaved rounds) decoded 47.4 / 45.6 tokens/s with 8 rows, 46.4 / 44.8 with 12 and 31.8 / 47.1 with 16; 16's first round was slow by the window graphs it built with no VRAM free. In the six chats the drafts offered in the long windows were almost never accepted. A window past 8 rows has twice the kernels, more than HIP's kernel-argument buffers hold, so its launch and the host's wait end up waiting for each other: a port needs the launch on a thread of its own.
 - The series that drops the arena to the `--mmap-experts` form when RAM is short: the 890M's setup chooses `--mmap-experts` from the start.
 - The stop that arrives at the ready file (this fork's serve has no ready file) and Qwen's on-demand picture reader (this fork's serve lacks its base).
 
