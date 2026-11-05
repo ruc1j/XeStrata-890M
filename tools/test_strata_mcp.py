@@ -559,10 +559,13 @@ class Helpers(unittest.TestCase):
         UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 (upstream 0.1.44, not run in XeStrata) follow by size, experimental too."""
         s = M.Strata(HERE.parent)
         for models in (s.tables()[0], M.FALLBACK_MODELS):
+            # (upstream 9ed3c7789 adds the v3.1 sets after the fork's five: experimental, not run in XeStrata)
             self.assertEqual(s.sizes_of(models, "unsloth"),
-                             ["UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"])
+                             ["UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0", "UD-IQ1_M", "UD-Q2_0",
+                              "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL", "UD-IQ4_XS-v31"])
             self.assertFalse(models["UD-IQ4_XS"].get("experimental"))
-            for m in ("UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"):
+            for m in ("UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0", "UD-IQ1_M", "UD-Q2_0", "UD-IQ2_XS",
+                      "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL", "UD-IQ4_XS-v31"):
                 self.assertTrue(models[m].get("experimental"))
         fam = next(f for f in s.model_table({"ram_gb": 63.7, "gpus": []}) if f["family"] == "unsloth")
         self.assertFalse(fam["experimental"])

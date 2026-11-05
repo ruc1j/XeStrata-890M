@@ -52,6 +52,58 @@ class HostCacheRule(unittest.TestCase):
         self.assertTrue(setup.uma_host_cache({"vendor": "amd", "integrated": True}, "IQ2_XS", False, None, False))
 
 
+class V31SetsOnUnifiedMemory(unittest.TestCase):
+    """upstream 86ffdbeb1 (uma_holds_experts) beside the fork's host-cache rule: on the 890M a v3.1 Unsloth set whose
+    experts the RAM holds gets no RAM budget, and then uma_host_cache puts every expert into host USM; a set too big for
+    the RAM keeps the budget plan (no host cache); the sets measured under the budget mode are never touched."""
+    RAM = 62.6      # ram_gb() on a 64 GB PC
+    FITS = ("UD-IQ1_M", "UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL")
+    TOO_BIG = ("UD-IQ3_XXS", "UD-Q3_K_XL", "UD-IQ4_XS-v31")
+
+    def test_the_sets_the_ram_holds_take_the_host_cache_path(self):
+        for m in self.FITS:
+            with self.subTest(model=m):
+                self.assertTrue(setup.MODELS[m].get("uma_pool_auto"))
+                self.assertTrue(setup.uma_holds_experts(m, self.RAM, APU))
+                self.assertGreaterEqual(self.RAM, setup.MODELS[m]["arena_gb"] / 1.073741824
+                                        + setup.UNSLOTH_RESIDENT_BESIDE_GB)
+                self.assertTrue(setup.uma_host_cache(APU, m, False, None, False))   # budget None: the host cache wins
+
+    def test_the_sets_too_big_for_the_ram_keep_the_budget(self):
+        for m in self.TOO_BIG:
+            with self.subTest(model=m):
+                self.assertFalse(setup.uma_holds_experts(m, self.RAM, APU))
+                budget = setup.resident_budget_gib(m, self.RAM)
+                self.assertFalse(setup.uma_host_cache(APU, m, False, budget, False))
+        self.assertTrue(setup.uma_holds_experts("UD-Q3_K_XL", 96.0, APU))        # with the RAM for it
+
+    def test_the_measured_sets_keep_their_plans(self):
+        for m in ("UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"):
+            self.assertNotIn("uma_pool_auto", setup.MODELS[m])
+            self.assertFalse(setup.uma_holds_experts(m, 124.0, APU), m)
+
+    def test_a_large_carve_out_holds_them_in_the_pool_and_keeps_the_default_path(self):
+        # a Strix Halo with a 64 GB carve-out (upstream's case): the pool, carve-out + shared memory, holds UD-IQ2_XS
+        # beside the fixed part; no budget, and no host cache either (the carve-out holds the experts)
+        halo = dict(APU, name="AMD Radeon 8060S (gfx1151)", gfx="gfx1151", carve_gb=64.0, shared_gb=32.0, uma_gb=96.0)
+        self.assertTrue(setup.uma_holds_experts("UD-IQ2_XS", self.RAM, halo))
+        self.assertFalse(setup.uma_host_cache(halo, "UD-IQ2_XS", False, None, False))
+        small = dict(halo, carve_gb=48.0, shared_gb=8.0, uma_gb=56.0)      # a pool too small for the experts + 16.5
+        self.assertFalse(setup.uma_holds_experts("UD-IQ2_XS", self.RAM, small))
+
+    def test_not_for_a_card_or_another_makers_integrated_gpu(self):
+        for gpu in (CARD, INTEL_IGPU, {"vram_gb": 12.0}, None):
+            self.assertFalse(setup.uma_holds_experts("UD-IQ2_XS", self.RAM, gpu))
+
+    def test_the_new_sets_are_after_the_forks_and_never_the_default(self):
+        names = [m for m in setup.MODELS if "unsloth" in setup.MODELS[m].get("families", ())]
+        self.assertEqual(names[:5], ["UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"])
+        self.assertEqual(sorted(names[5:]), sorted(self.FITS + self.TOO_BIG))
+        for m in names[5:]:
+            self.assertTrue(setup.MODELS[m].get("experimental"), m)        # sorted after the regular sizes in the menu
+            self.assertNotIn("huihui-unsloth", setup.MODELS[m]["families"])
+
+
 class JapaneseDraftSubset(unittest.TestCase):
     def test_the_subset_is_a_choice_and_shipped(self):
         self.assertEqual(setup.DRAFT_VOCABS["ja"], "draft_vocab_ja.bin")

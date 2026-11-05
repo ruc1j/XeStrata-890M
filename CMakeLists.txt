@@ -6,14 +6,14 @@ project(XeStrata LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
   message(FATAL_ERROR "XeStrata builds for Linux and Windows")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.2.10")
+set(STRATA_UPSTREAM_VERSION "0.2.11")
 set(STRATA_UPSTREAM_COMMIT "ffa80d7")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
 # XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does, and the
 # version is <upstream>-<revision> everywhere: the version name (the tag, what the engine says) xe<upstream>-<revision>
 # (xe0.1.43.1-1), the packages <upstream>-<revision> (rpm: Version and Release).  Before 2026-10-13 a later release
 # took a fifth number instead (xe0.1.43.1 was 0.1.43's second), which upstream's own 0.1.43.1 then collided with.
-set(XESTRATA_REVISION 2)
+set(XESTRATA_REVISION 1)
 set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}-${XESTRATA_REVISION}")
 set(STRATA_VERSION_NAME "xe${XESTRATA_VERSION}")
 # The packages' version: an upstream pre-release (0.2.0-beta) with "~" for its "-" (0.2.0~beta), which deb and rpm
@@ -1429,6 +1429,16 @@ if(STRATA_NATIVE_EXPERTS)
       string(REPLACE "@" "_" pair_name "${pair_name}")
       add_test(NAME native_expert_parity_${pair_name} COMMAND native_expert_parity --synthetic ${pair})
       set_tests_properties(native_expert_parity_${pair_name} PROPERTIES TIMEOUT 120)
+    endforeach()
+    # Unsloth's v3.1 Qwen3.8-Flash-Next sets (UD-IQ1_M .. UD-IQ4_XS-v31, upstream Strata 0.2.11, c1d5e4d5e): every gate/up x
+    # down pair their layers use at the model's shape (2560/640): gate/up IQ1_M IQ2_XXS IQ2_XS IQ2_S Q2_0 IQ3_XXS IQ4_XS, down
+    # Q2_0 IQ4_NL Q5_0 Q8_0 (IQ4_XS is 256-wide, so n_ff 640 needs a 32- or 64-block down).  Q5_0 down (UD-IQ4_XS-v31's 33 layers,
+    # UD-Q3_K_XL's 20) is held to 1.8e-2 against the float reference, the other down types to 3e-2.
+    foreach(_gu iq1_m iq2_xxs iq2_xs iq2_s q2_0 iq3_xxs iq4_xs)
+      foreach(_dn q2_0 iq4_nl q5_0 q8_0)
+        add_test(NAME native_expert_parity_v31_${_gu}_${_dn} COMMAND native_expert_parity --synthetic ${_gu}/${_dn})
+        set_tests_properties(native_expert_parity_v31_${_gu}_${_dn} PROPERTIES TIMEOUT 300)
+      endforeach()
     endforeach()
     # APR (prism.hadamard, upstream fbf045eb6): a Hadamard-folded expert, the GPU rotation (float and the prompt path's
     # FP16) against the CPU's, and the folded expert on the GPU and the CPU against the float reference

@@ -79,6 +79,28 @@ FALLBACK_MODELS = {
     "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC; not tested in XeStrata",
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth", "huihui-unsloth"),
              "budget": True, "experimental": True, "vision": True},
+    # upstream 9ed3c7789: Unsloth's v3.1 sets (setup.py MODELS: experimental, not run in XeStrata)
+    "UD-IQ1_M": {"about": "~1-bit (Unsloth Dynamic v3.1), the smallest download; not tested in XeStrata",
+                 "download_gb": 68.0, "ram_gb": 48, "arena_gb": 34.8, "families": ("unsloth",), "budget": True,
+                 "experimental": True, "vision": True},
+    "UD-Q2_0": {"about": "2-bit (Unsloth Dynamic v3.1); not tested in XeStrata", "download_gb": 70.5, "ram_gb": 48,
+                "arena_gb": 37.4, "families": ("unsloth",), "budget": True, "experimental": True, "vision": True},
+    "UD-IQ2_XS": {"about": "2-bit i-quant (Unsloth Dynamic v3.1); not tested in XeStrata", "download_gb": 75.8,
+                  "ram_gb": 48, "arena_gb": 42.3, "families": ("unsloth",), "budget": True, "experimental": True,
+                  "vision": True},
+    "UD-Q2_K_XL": {"about": "2-bit (Unsloth Dynamic v3.1) with some 3-bit experts; not tested in XeStrata",
+                   "download_gb": 79.6, "ram_gb": 48, "arena_gb": 46.0, "families": ("unsloth",), "budget": True,
+                   "experimental": True, "vision": True},
+    "UD-IQ3_XXS": {"about": "3-bit i-quant (Unsloth Dynamic v3.1); not tested in XeStrata", "download_gb": 83.6,
+                   "ram_gb": 48, "arena_gb": 50.3, "families": ("unsloth",), "budget": True, "experimental": True,
+                   "vision": True},
+    "UD-Q3_K_XL": {"about": "3-bit (Unsloth Dynamic v3.1) with some 4-bit experts; not tested in XeStrata",
+                   "download_gb": 89.5, "ram_gb": 48, "arena_gb": 56.2, "families": ("unsloth",), "budget": True,
+                   "experimental": True, "vision": True},
+    "UD-IQ4_XS-v31": {"about": "~4-bit i-quant (Unsloth Dynamic v3.1), a newer file than UD-IQ4_XS with other "
+                               "tensor types; not tested in XeStrata", "download_gb": 93.7, "ram_gb": 48,
+                      "arena_gb": 60.4, "families": ("unsloth",), "budget": True, "experimental": True,
+                      "vision": True},
     # Gyro (agentionai): "ram_gb" in RAM alone; with less, RAM and VRAM together of "arena_gb" + 12 (setup.py)
     "Gyro-S": {"about": "for PCs with little memory (36 GB of RAM, or 38 GB of RAM and VRAM together)",
                "download_gb": 58.5, "ram_gb": 35.8, "arena_gb": 25.8, "families": ("gyro",), "vision": True},
@@ -105,7 +127,8 @@ FALLBACK_FAMILIES = {
                                                             "of RAM, faster; weaker outside coding", "tag": "coder-"},
     "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "UD-IQ4_XS: a 94 GB download; with less than ~80 GB "
                                                                   "of RAM part of its experts are read from the SSD "
-                                                                  "(UD-Q4_K_XL, 111 GB: experimental)",
+                                                                  "(UD-Q4_K_XL, 111 GB, and the v3.1 sets UD-IQ1_M "
+                                                                  "to UD-Q3_K_XL, 68 to 90 GB: experimental)",
                 "tag": "unsloth-", "vision": False},
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)",
              "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together), Gyro-M (43 or 45 GB) and Gyro-L "

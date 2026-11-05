@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.2.10-2 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+XeStrata xe0.2.11-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
@@ -76,6 +76,29 @@ upstream の Strata 0.2.10 の既定の drafter、DFlash2（incoai/Qwen3.8-Flash
 交互 3 周（枠 24,576、冷却つき）: MTP 31.6 / 31.7 / 32.0 tok/s、DFlash2（confidence 0.6）29.6 / 29.6 / 29.8 tok/s で、中央値で 6.7% 遅いです。drafter は 7.7 ms/round、2,191 トークンに 942 round（1 round 2.3 トークン。MTP は 874 round、2.5 トークン）。6 チャットの greedy の答えは 3 周とも MTP と同じでした。チャットごとに見ると、コードと英語の 3 つ（クイックソート 37.2 対 36.5、transformer 33.2 対 32.4、bash 42.6 対 40.5）では DFlash2 が 2〜5% 速く、日本語の文章の 2 つ（四季 21.5 対 25.6、光合成 25.0 対 28.8）で 13〜16%、TCP/UDP（32.9 対 34.0）で 3% 遅いです。
 
 1 round に受け入れるトークンの数は MTP と同じほど（約 2.5）ですが、drafter 自身が 1 round に 7.8 ms かかり（5 層の Q4_0 の重み 0.5 GB を 890M の帯域で読む時間が大半）、MTP の約 4 ms より長いので、decode は 6〜7% 遅くなります。upstream が AMD の HIP で MTP より 4〜12% 速かったのは、帯域が 2.5〜6 倍のカード（Strix Halo、R9700）です。Issue #23（2026-10-24）の見積もり（drafter の重みの読みが MTP の 4 ms を超え、+2〜3% が上限）のとおりでした。drafter は下書きを変えるだけで、答えは verify が決めます。
+
+## Strata 0.1.57 の取り込み
+
+upstream の Strata 0.2.10 から 0.2.11（エンジンの版は 0.1.57、2026-11-05）までの 205 コミットのうち、エンジン・serve・setup の層に当たるものを XeStrata-890M に移しました。前回と同じく Strata のコミットを `patch -F3` で当て、ずれた hunk は手で置き直しました。一覧は `.upstream-0157.md`（リポジトリの根、git の外）です。
+0.2.11 の upstream の変更の大半は、NVIDIA のカードの既定（K-quant の MMQ、32768 トークンの塊、FP16 の重みのキャッシュ、CPU と PCIe の分担）、Linux の gfx12（R9700）の既定、複数のカードの split エンジンと layer split、Windows の Strix Halo、Metal、app と Terminal と Control のもので、この fork には当たりません。
+
+移したものは次のとおりです。
+
+- setup: Unsloth が 2026-11-04 に出し直した Qwen3.8-Flash-Next の 7 セット（UD-IQ1_M、UD-Q2_0、UD-IQ2_XS、UD-Q2_K_XL、UD-IQ3_XXS、UD-Q3_K_XL、UD-IQ4_XS-v31。revision d9620119、SHA-256 と大きさの pin、読めない UD-IQ1_S は断ります）をカタログに入れました。この fork では experimental の印が付き、890M では動かしていません。統合 GPU でエキスパートが RAM に収まるセットは RAM の予算を取らず（uma_holds_experts）、890M ではそのあとに host USM の設定（xe0.2.10-2 の uma_host_cache）が書かれます。
+- エンジン: その 7 セットの gate/up と down の型の組（IQ1_M・IQ2_XXS・IQ2_XS・IQ2_S・Q2_0・IQ3_XXS・IQ4_XS と Q2_0・IQ4_NL・Q5_0・Q8_0 の 28 組）の native_expert_parity を CTest に入れ、890M で 28 組とも通りました。合成の重みを量子化するとき、importance matrix の要る型（IQ2_XXS、IQ2_XS、IQ1_M）には平らな行列を渡します（渡さないと ggml が止まります）。Q5_0 の down の GPU の許容は 1.8e-2 に締めました。upstream は Q5_0 の内積の -16 の項を、量子化した活性化の和で取るように直しましたが、この fork は d652cd6 を移したときから同じ形です。
+- setup: pin のある shard は hash を確かめてから完了の印を付けます（upstream #4088）。`quant_formats --hf` はファイルの大きさを tree の一覧から取ります（#5075）。tools/strata_bench.py は鍵を語として伏せます（#4484）。tools/stream_ownership_probe.py を入れました。
+- serve: 同じモデルを 2 つ動かす replicas で、要求は自分の pipe を交換の終わりまで持ちます（#2892。答えが別の要求に混ざる不具合）。`--batch` では frame と交換の終わりが 1 つの要求と 1 つのエンジンの process に属し（#4451）、vram() と session_file() も control の行を要求と同じ順で取ります。読まなくなった streaming の client はエンジンの turn を持ちません（#4271、`STRATA_STREAM_WRITE_TIMEOUT_S`、既定 60 秒）。console の出力は有限の queue を通ります（#4479、`STRATA_BLOCKING_CONSOLE=1` で元に）。control の行を待つ要求が wake-up を落とさず（#4738）、起動に失敗したエンジンの process を別の thread が閉じても落ちず（#4792）、断った batch の admission は error の行になり、エンジンの出力の UTF-8 でないバイトも読みます（#5044）。終わりの event なしに終わった要求は、同じ process で誰も turn を持たないときだけエンジンを終え、「次の要求で起動し直す」と言うのは本当に終えたときだけです（#3961）。ConvCacheLog.poll は lock の下で動きます（#3443）。長い会話の分岐の follow-up は、その会話の slot に行きます（#2518）。閉じタグを並べた tool の引数は、閉じタグが届く間は保留します（#5040）。1024 未満のポートを断る文は、Linux と macOS の理由を言います。
+- serve の安全: Pillow を 13.0.0 にし（GHSA-78g4-xqwv-q3g8、JPEG 2000 のデコーダーのメモリの書き込みの不具合）、開く画像の形式を JPEG、PNG、GIF、BMP、WEBP、TIFF、AVIF に限ります。requirements.txt も同じ pin です。rpm と Podman は Fedora の python3-pillow を使います。
+- web: `/?q=` は質問を入れて focus し、Send を押すまで送りません（#4221）。
+
+入れていないものは次のとおりです。
+
+- Strix Halo で 16384 トークン超の塊を起動時に断る probe。HIP の runtime の API で書かれていて、890M の setup は塊 2048 を書き、エンジンは MemAvailable からキャッシュの大きさを決めます。
+- low-RAM モードの写し先のディスクの空きの検査。この fork の low-RAM は RAM に写し、packs フォルダーへは写しません。
+- `--batch` の slot ごとの DFlash2 の下書き、名前で選んだ DFlash2 が要求の数を保つ規則、layer split の起動の retry。この fork にその経路がありません。
+- gfx12 の prompt の staging ring と、NVIDIA と gfx12 の既定。この fork の prefill は自身の WMMA の経路です。
+
+エンジンの decode と prefill の経路は変えていません（エンジンの変更は parity 試験だけです）。CTest は 164 件中 162 件が通り、落ちた 2 件（expert_parity、pool_test）は Strata 形式の pack がこの PC にないためのものです。serve の試験 1,113 件と tools の試験 454 件が通ります。
 
 ## Strata 0.1.56 の取り込み
 

@@ -38,7 +38,7 @@ XeStrata's as they are.
 
 The build is the free build only, of free software only (ROCm is free software). oneMKL and CUDA are not used.
 The fork carries in the original XeStrata's changes up to xe0.2.8-1 (its main of 2026-10-30) and the engine, serve and
-setup changes of upstream Strata 0.2.10 (engine 0.1.56) ([docs/XE.md](docs/XE.md)).
+setup changes of upstream Strata 0.2.11 (engine 0.1.57) ([docs/XE.md](docs/XE.md)).
 
 **What an 890M is, and how to use this fork**
 
@@ -237,7 +237,7 @@ In each, setup looks at the GPU and writes [the settings for the 890M](#the-sett
 1. Install it. The ROCm libraries (HIP, rocBLAS, hipBLASLt) come with it as recommended dependencies.
 
    ```bash
-   sudo dnf install ./xestrata-free-0.2.10-1.x86_64.rpm
+   sudo dnf install ./xestrata-free-0.2.11-1.x86_64.rpm
    sudo usermod -aG render,video $USER    # to open /dev/kfd and /dev/dri/renderD*; log out and back in
    ```
 

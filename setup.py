@@ -191,7 +191,10 @@ def file_pin(url: str):
     m = HF_FILE.match(url)
     if m is None:
         return None
-    return REPO_PINS.get(m.group("repo"), {}).get(m.group("path").rsplit("/", 1)[-1])
+    name = m.group("path").rsplit("/", 1)[-1]
+    # a repository with files at more than one commit (UNSLOTH_V31_REVISION): the commit the URL names comes first
+    by_commit = REV_PINS.get((m.group("repo"), m.group("rev")), {})
+    return by_commit[name] if name in by_commit else REPO_PINS.get(m.group("repo"), {}).get(name)
 
 
 # ModelScope (www.modelscope.cn) hosts every repository above under the same name, with the same file paths and
@@ -202,7 +205,7 @@ def file_pin(url: str):
 # serving current files, not our pinned revision: setup never switches to it by itself, it recommends it, #908).
 MS_DEFAULT = "https://www.modelscope.cn"
 SOURCES = ("auto", "modelscope", "huggingface")
-HF_FILE = re.compile(r"^https?://[^/]+/(?P<repo>[^/]+/[^/]+)/resolve/[^/]+/(?P<path>.+)$")
+HF_FILE = re.compile(r"^https?://[^/]+/(?P<repo>[^/]+/[^/]+)/resolve/(?P<rev>[^/]+)/(?P<path>.+)$")
 _sources: dict = {}                                # model_source()'s answer per (STRATA_SOURCE, HF_ENDPOINT, host)
 _ms_files: dict = {}
 
@@ -316,6 +319,22 @@ GYRO_CODER_FILES = {
         (75796732256, "2ecaf3ba6ed7f142ce00bc4a3172052f01bcf4e10d3ff617d8ab4755f4f2d4c4"),
 }
 
+# upstream 9ed3c7789 (0.2.11): Unsloth re-published the repository on 2026-11-04 (commit d9620119, "Dynamic v3.1").  The
+# files of UD-Q4_K_XL, UD-IQ4_XS (three shards), UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 stay at the commit in HF_REVISIONS
+# (38bb39ee); the sets that are new there (UNSLOTH_V31_SHARDS) name this commit in their MODELS entry ("revision"), so a
+# repository has more than one revision and the pin of a file is found by the commit its URL names (file_pin).
+UNSLOTH_REPO = "unsloth/Qwen3.8-Flash-Next-GGUF"
+UNSLOTH_V31_REVISION = "d96201194f103c906994f283f504209dc8d2a10c"          # 2026-11-04
+# the catalog name of the new UD-IQ4_XS (its files on the Hub have the pinned one's names, with four shards instead of
+# three)
+UNSLOTH_V31_IQ4_XS = "UD-IQ4_XS-v31"
+# the v3.1 sets' shard pattern and what every one of them says: i-quant / Q2_0 experts with Q2_0 / IQ4_NL / Q5_0 downs
+# (the kernels read them), the n-gram table (IQ4_NL, 28.8 GB) in the last shard; offered as upstream has them, not run
+# in XeStrata (the user's decision of 2026-10-14 for Unsloth's bigger files holds for these too), so experimental and
+# after the fork's own choices in the menu; "uma_pool_auto": upstream 86ffdbeb1, see uma_holds_experts
+_V31 = {"ram_gb": 48, "families": ("unsloth",), "budget": True, "experimental": True, "revision": UNSLOTH_V31_REVISION,
+        "vision": True, "vision_untested": True, "uma_pool_auto": True}
+
 MODELS: dict[str, dict[str, Any]] = {
     "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0},
     "IQ2_XS": {"about": "2-bit i-quant, a little better quality, close in speed", "download_gb": 68.0, "ram_gb": 48,
@@ -360,6 +379,32 @@ MODELS: dict[str, dict[str, Any]] = {
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth", "huihui-unsloth"),
              "budget": True, "experimental": True, "shards": 6, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf",
              "vision": True, "vision_untested": True},
+    # upstream 9ed3c7789: Unsloth's v3.1 sets (revision UNSLOTH_V31_REVISION, pins UNSLOTH_V31_SHARDS; _V31 above).
+    # "quant" is the name on the Hub (folder and file names).  download_gb / arena_gb: the pinned shard sizes and the
+    # routed experts' bytes (upstream's tests/fixtures/unsloth_v31); ram_gb: the RAM-budget floor of UD-Q4_K_XL.
+    "UD-IQ1_M": {"about": "~1-bit (Unsloth Dynamic v3.1), the smallest download; not tested in XeStrata",
+                 "download_gb": 68.0, "arena_gb": 34.8, "shards": 3,
+                 "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "quant": "UD-IQ1_M", **_V31},
+    "UD-Q2_0": {"about": "2-bit (Unsloth Dynamic v3.1); not tested in XeStrata", "download_gb": 70.5, "arena_gb": 37.4,
+                "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "quant": "UD-Q2_0", **_V31},
+    "UD-IQ2_XS": {"about": "2-bit i-quant (Unsloth Dynamic v3.1); not tested in XeStrata", "download_gb": 75.8,
+                  "arena_gb": 42.3, "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf",
+                  "quant": "UD-IQ2_XS", **_V31},
+    "UD-Q2_K_XL": {"about": "2-bit (Unsloth Dynamic v3.1) with some 3-bit experts; not tested in XeStrata",
+                   "download_gb": 79.6, "arena_gb": 46.0, "shards": 4,
+                   "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf", "quant": "UD-Q2_K_XL", **_V31},
+    "UD-IQ3_XXS": {"about": "3-bit i-quant (Unsloth Dynamic v3.1); not tested in XeStrata", "download_gb": 83.6,
+                   "arena_gb": 50.3, "shards": 4, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf",
+                   "quant": "UD-IQ3_XXS", **_V31},
+    "UD-Q3_K_XL": {"about": "3-bit (Unsloth Dynamic v3.1) with some 4-bit experts; not tested in XeStrata",
+                   "download_gb": 89.5, "arena_gb": 56.2, "shards": 4,
+                   "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf", "quant": "UD-Q3_K_XL", **_V31},
+    # the v3.1 UD-IQ4_XS is another file from the pinned UD-IQ4_XS (345 of 1224 tensors changed type; four shards): its
+    # own name
+    UNSLOTH_V31_IQ4_XS: {"about": "~4-bit i-quant (Unsloth Dynamic v3.1), a newer file than UD-IQ4_XS with other "
+                                  "tensor types; not tested in XeStrata", "download_gb": 93.7, "arena_gb": 60.4,
+                         "shards": 4, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf", "quant": "UD-IQ4_XS",
+                         **_V31},
     # Gyro (agentionai): "ram_gb" is the RAM that holds every expert with the usual room beside them ("arena_gb" +
     # LOW_RAM_HEADROOM_GB); with less, the low-RAM mode needs RAM and VRAM together of "arena_gb" + 12 (low_ram_fits:
     # 6 GB of each for the rest).  The rest of the download is the n-gram table, read from the SSD.  Neither is anyone's
@@ -446,6 +491,76 @@ UNSLOTH_BIG_SHARDS = {
         (49668930400, "232a8f14cc0fa4262e7efe8593774b136fe40909e39c7a020342ddaa27259a97"),
     "Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf":
         (34015618784, "538a93bca918064983409a41187ad4c68640f9aced6f29564da8f551bf86d7a5"),
+}
+# upstream 9ed3c7789: the sets that are new at UNSLOTH_V31_REVISION (UD-IQ1_M, UD-Q2_0, UD-IQ2_XS, UD-Q2_K_XL,
+# UD-IQ3_XXS, UD-Q3_K_XL and the v3.1 UD-IQ4_XS), name -> (bytes, sha256): the Hub's LFS pointers.  The last shard of
+# each is the n-gram table.  No name is in UNSLOTH_SHARDS, UNSLOTH_IQ4_XS_SHARDS or UNSLOTH_BIG_SHARDS (the v3.1
+# UD-IQ4_XS has four shards, the pinned one three).
+UNSLOTH_V31_SHARDS = {
+    "Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf":
+        (10946618, "b0d883bb9464021f31074145af74bfc2aa2d4bf0cf506f26f6f5107f4ca6ce17"),
+    "Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf":
+        (39196009888, "bddcd79634ccddbb2e0951345c73c6ae8bd7b12594f55a2a529474701757391e"),
+    "Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf":
+        (28800138432, "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6"),
+    "Qwen3.8-Flash-Next-UD-Q2_0-00001-of-00003.gguf":
+        (10946618, "38803c4e8d13077165aa9854502b3d4e7fef750e72a21d27a38ee42089f96ad6"),
+    "Qwen3.8-Flash-Next-UD-Q2_0-00002-of-00003.gguf":
+        (41738806688, "57af20207d5f18fa72fba503806d98d65f58ba3982fe55c89c6ed6e691471acc"),
+    "Qwen3.8-Flash-Next-UD-Q2_0-00003-of-00003.gguf":
+        (28800138432, "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6"),
+    "Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf":
+        (10946618, "91e8dc8f1428ce25d48fd1f711e4bf1f42215c5bac0f32eeb5608e6ec7ae91e9"),
+    "Qwen3.8-Flash-Next-UD-IQ2_XS-00002-of-00003.gguf":
+        (47021008288, "11a67c82f54a9edf683d6b708062de78d803921a18a6cb2bf1dd55949b4ef9bd"),
+    "Qwen3.8-Flash-Next-UD-IQ2_XS-00003-of-00003.gguf":
+        (28800138432, "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6"),
+    "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00004.gguf":
+        (10946618, "297e174dc185f2bf3ab1856461059cb8a05aa741bc27edf42461cde87e5420af"),
+    "Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00004.gguf":
+        (49732486272, "a4782511810bb61bd6b3236607a0aad05b1bfa04b90356defd202bb17e7db16d"),
+    "Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00004.gguf":
+        (1037181344, "4dffc4a1cea7ad484f2d5c711b747840e459b040b636cc8ddaa524d01e60662e"),
+    "Qwen3.8-Flash-Next-UD-Q2_K_XL-00004-of-00004.gguf":
+        (28800138432, "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"),
+    "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf":
+        (10946618, "9d5644b371ffac921427c8021cc7242dab8e3ba37d7b48d1e79fe3770fbf9915"),
+    "Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00004.gguf":
+        (49946027488, "aacaff3bdb9032c2c3be428167930809735f65d3cfb204eba07d85e421e7ddf4"),
+    "Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00004.gguf":
+        (4869325888, "ef8f14e790ab471b363f146d5e8664eefbaf03e5776f317a1fb96a2bc7707b07"),
+    "Qwen3.8-Flash-Next-UD-IQ3_XXS-00004-of-00004.gguf":
+        (28800138432, "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"),
+    "Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00004.gguf":
+        (10946618, "7666000ba91eb5527f8e12e0414de36766dc82a082876337f7827c2caa859143"),
+    "Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00004.gguf":
+        (49742117248, "e954cb3044ae087a003ce8cc1631c9d40fe15ae64a8befcf4aa06457848c647c"),
+    "Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00004.gguf":
+        (10911746208, "fcce26b1e5e6e54559a7e7c2f8d6e37067ec695ff1f14bce662810bde78abe1f"),
+    "Qwen3.8-Flash-Next-UD-Q3_K_XL-00004-of-00004.gguf":
+        (28800138432, "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"),
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf":
+        (10946618, "93ff23a08e5cd7501f24fa16f5b415d5807d0175e04edd3ed6a7a41b601a4eef"),
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00004.gguf":
+        (49604491008, "13d5dc8b93d039e4cfade5a9af7037f10c97f7ec4e53f75bd2e9ae34aae54aeb"),
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00004.gguf":
+        (15256783680, "f6b9b5934908a2043732269dd740155d0f921d0763a1dcdd3452246311651f87"),
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00004-of-00004.gguf":
+        (28800138432, "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"),
+}
+# UD-Q4_K_XL as re-sharded at UNSLOTH_V31_REVISION: the same 1224 tensors, the n-gram table in a shard of its own.  The
+# file names are the pinned UD-Q4_K_XL's, so these are NOT downloaded: setup keeps fetching the pinned files, and takes
+# this layout from files already here (--gguf-dir) by size and SHA-256 (fam_pin).  One set or the other: the shard
+# boundaries differ, so the shards of the two cannot be mixed.
+UNSLOTH_Q4_V31_SHARDS = {
+    "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf":
+        (10946618, "acc44040f74d0e55fb89c3967056cce5dbda1bcc52e909c3ba6fc72b5e9c0858"),
+    "Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf":
+        (49720539552, "45792ae869072d8229384c51c7c73dd959e191505252b41dd71852d9746f5ce4"),
+    "Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf":
+        (32803030176, "8c76e79d444b16a663d9c8db54e585ed3b1da13eebd2619c37b0c355da803c82"),
+    "Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf":
+        (28800138432, "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"),
 }
 
 # ISTA-DASLab's Qwen3.8-Flash-Next shards (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S) and the picture reader at the
@@ -580,15 +695,17 @@ FAMILIES: dict[str, dict[str, Any]] = {
               "profile": "expert-profile-coder.bin"},
     # Unsloth's UD-IQ4_XS (three shards, upstream #621) and the EXPERIMENTAL UD-Q4_K_XL (four) of the original model;
     # "experimental" and "vision" are per model (MODELS)
-    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's ~4-bit quantizations",
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's 1- to 8-bit quantizations",
                 "about": "UD-IQ4_XS: a 94 GB download; with less than ~80 GB of RAM part of its experts are read from "
-                         "the SSD (UD-Q4_K_XL, 111 GB: experimental)",
-                "hf": hf("unsloth/Qwen3.8-Flash-Next-GGUF") + "{q}/",
+                         "the SSD (UD-Q4_K_XL, 111 GB, and the v3.1 sets UD-IQ1_M to UD-Q3_K_XL, 68 to 90 GB: "
+                         "experimental)",
+                "hf": hf(UNSLOTH_REPO) + "{q}/",
                 "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf", "shards": 4, "tag": "unsloth-",
                 "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "vision": False, "pack_args": ["--compat-bf16"],
-                "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS}},
+                "sha256": {**UNSLOTH_V31_SHARDS, **UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
+                "sha256_alt": {n: (pin,) for n, pin in UNSLOTH_Q4_V31_SHARDS.items()}},
     # agentionai's Gyro quantizations (see GYRO_FILES): after the regular families, never the default
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)", "by": "Gyro quantizations by agentionai",
              "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together), Gyro-M (43 or 45 GB) and Gyro-L "
@@ -813,7 +930,7 @@ REPO_PINS: dict[str, dict[str, tuple[int, str]]] = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": ISTA_FILES,
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": SWIFT_FILES,
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": CODER_FILES,
-    "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
+    UNSLOTH_REPO: {**UNSLOTH_V31_SHARDS, **UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
     "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": GYRO_CODER_FILES,
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": HUIHUI_FILES,
@@ -826,6 +943,10 @@ for _fam in PLAIN_FAMILIES.values():            # the plain families' files carr
     if _fam.get("mmproj"):
         _m = _fam["mmproj"]
         REPO_PINS.setdefault(_m["repo"], {})[_m["path"].rsplit("/", 1)[-1]] = (_m["size"], _m["sha256"])
+# the files of a repository at a commit other than HF_REVISIONS' (UNSLOTH_V31_REVISION): (repository, commit) -> name ->
+# (bytes, sha256); file_pin looks here first
+REV_PINS: dict[tuple[str, str], dict[str, tuple[int, str]]] = {
+    (UNSLOTH_REPO, UNSLOTH_V31_REVISION): {**UNSLOTH_V31_SHARDS, **UNSLOTH_Q4_V31_SHARDS}}
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
 # under the Qwen Community License, so in third_party/nonfree (XeStrata runs without that folder)
@@ -3211,6 +3332,29 @@ def whole_shard(s: Path) -> bool:
         return False
 
 
+def mark_whole_unless_pinned(shards, hf: str | None, own: bool) -> None:
+    """upstream #173's finish mark for a file copied in by hand (it has the length its own tensor directory says),
+    except a file with a pinned SHA-256 (upstream #4088, c3109534d).
+
+    A run that stopped between the rename of a finished .part and the end of verify_sha256 leaves a full-length shard
+    with no mark.  Marking it "whole" made done() true, download() skipped it and the pinned hash was never looked at,
+    so a shard damaged by that crash stayed in place (a deleted mark was written again by the next run).  For a file the
+    pin table names, leave it unmarked: download() takes its "finished by an older setup (no mark yet), or stopped
+    before the check" path, hashes it, repairs the damaged parts and writes the finish mark itself.  `own` is
+    --gguf-dir: a person's own file is not a download and is not hash-checked here either way, so it keeps the mark;
+    so does a file the pin table does not name, and every file of a family with no Hugging Face folder of its own
+    (`hf` None)."""
+    for s in shards:
+        if not (s.exists() and not done(s) and whole_shard(s)):
+            continue
+        if not own and hf is not None and file_pin(hf + s.name) is not None:
+            continue
+        try:
+            mark(s, "whole (checked against its own tensor directory)")
+        except OSError as e:                           # a read-only folder (--gguf-dir on a share): still whole
+            warn(f"{s.name} is whole but its finish mark cannot be written ({e})")
+
+
 SHARD_NAME = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
@@ -3222,7 +3366,12 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
     first = folder / model_file(fam, model, 1)
     if not first.exists():
         found = sorted(p for p in folder.glob("*-00001-of-*.gguf") if SHARD_NAME.search(p.name))
-        mine = [p for p in found if model.lower() in p.name.lower()]
+        # (not the files of a catalog choice with the same quant name but another layout: the v3.1 UD-IQ4_XS (four
+        # shards) is not the pinned UD-IQ4_XS (three))
+        other = lambda p: ((c := gguf_choice(p.name)) is not None and c[1] != model   # noqa: E731
+                           and model_quant(c[1]).lower() == model_quant(model).lower())
+        found = [p for p in found if not other(p)]
+        mine = [p for p in found if model.lower() in p.name.lower() or model_quant(model).lower() in p.name.lower()]
         pick = mine if mine else found
         if len(pick) == 1:
             first = pick[0]
@@ -3239,8 +3388,12 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
 GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32))"
                         r"(?=-\d{5}-of-\d{5}\.gguf$|\.gguf$)", re.I)
 SUPPORTED_GGUFS = ("XeStrata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
-                   "1.5's; the Coder's IQ1_M) and Unsloth's UD-IQ4_XS and UD-Q4_K_XL only: other GGUFs (Unsloth's "
-                   "UD-IQ3_XXS or UD-Q2_K_XL, K-quants) cannot be used")
+                   "1.5's; the Coder's IQ1_M) and Unsloth's UD-IQ1_M, UD-Q2_0, UD-IQ2_XS, UD-Q2_K_XL, UD-IQ3_XXS, "
+                   "UD-Q3_K_XL, UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 only: other GGUFs (Unsloth's "
+                   "UD-IQ1_S, other K-quant files) cannot be used")
+# why a GGUF of a name XeStrata knows is still refused (said beside SUPPORTED_GGUFS)
+UNSUPPORTED_WHY = {"UD-IQ1_S": "UD-IQ1_S mixes two expert formats in one layer, which XeStrata cannot load; "
+                               "UD-IQ1_M is the 1-bit choice"}
 
 
 def gguf_unsupported(name: str) -> str | None:
@@ -3266,7 +3419,9 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
     folder without GGUFs stays check_shards' "missing")."""
     bad = gguf_unsupported(first.name) if first.exists() else None
     if bad:
-        return f"{first.name} is {bad}, a GGUF XeStrata cannot run", SUPPORTED_GGUFS
+        why = UNSUPPORTED_WHY.get(bad.upper())
+        return (f"{first.name} is {bad}, a GGUF XeStrata cannot run",
+                SUPPORTED_GGUFS + (".\n       " + why if why else ""))
     if first.exists():
         return None
 
@@ -3282,6 +3437,9 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
     hint = SUPPORTED_GGUFS
     if unusable:
         hint += ".\n       Not usable here: " + ", ".join(unusable)
+        for q in dict.fromkeys(gguf_unsupported(n) for n in unusable):
+            if q and q.upper() in UNSUPPORTED_WHY:
+                hint += ".\n       " + UNSUPPORTED_WHY[q.upper()]
     if usable:
         hint += ".\n       Usable here: " + ", ".join(f"--family {f} --model {m}" for f, m in usable)
     return f"{folder} has no {fam['title']} {model} file", hint
@@ -4583,8 +4741,37 @@ def low_ram_fits(model, ram, vram_gb) -> bool:
 
 
 def model_file(fam: dict, model: str, i: int) -> str:
-    """Shard i's file name: the family's pattern, or the model's own (UD-IQ4_XS has three shards, not four)."""
-    return MODELS.get(model, {}).get("file", fam["file"]).format(q=model, i=i)
+    """Shard i's file name: the family's pattern, or the model's own (UD-IQ4_XS has three shards, not four).  {q} is the
+    name on the Hub ("quant"; the catalog name of the v3.1 UD-IQ4_XS is another)."""
+    return MODELS.get(model, {}).get("file", fam["file"]).format(q=model_quant(model), i=i)
+
+
+def model_quant(model: str) -> str:
+    """The name of the model's files and folder on the Hub: the catalog name, except where a catalog name had to differ
+    (UNSLOTH_V31_IQ4_XS)."""
+    return MODELS.get(model, {}).get("quant", model)
+
+
+def model_hf(fam: dict, model: str) -> str:
+    """The Hugging Face folder the model's shards are fetched from: the family's (huihui-ai's "dirs": the folder of each
+    size), at the commit the model names ("revision") when it is not the repository's pinned one (HF_REVISIONS)."""
+    base = fam["hf"].format(q=model_quant(model), d=fam.get("dirs", {}).get(model, model))
+    rev = MODELS.get(model, {}).get("revision")
+    return re.sub(r"(/resolve/)[0-9a-f]{40}(?=/)", r"\g<1>" + rev, base, count=1) if rev else base
+
+
+def fam_pin(fam: dict, s: Path) -> tuple[int, str]:
+    """(bytes, sha256) the family pins for the shard `s`: its entry in fam["sha256"], or, where the family also knows
+    the same file name in another layout ("sha256_alt": UD-Q4_K_XL's four shards at UNSLOTH_V31_REVISION), the one of
+    those with the size the file on the disk has."""
+    pin: tuple[int, str] = fam["sha256"][s.name]
+    if s.exists() and s.name in fam.get("sha256_alt", {}):
+        have = s.stat().st_size
+        if have != pin[0]:
+            for alt in fam["sha256_alt"][s.name]:
+                if alt[0] == have:
+                    return alt
+    return pin
 
 
 def model_shards(fam: dict, model: str) -> int:
@@ -4630,6 +4817,35 @@ def uma_host_cache(gpu: dict, model: str, low_ram: bool, budget, multi: bool) ->
     hold the experts, and then the default path is kept."""
     return (bool(gpu.get("integrated")) and gpu.get("vendor") == "amd" and not low_ram and budget is None
             and not multi and gpu.get("carve_gb", 0.0) < MODELS[model]["arena_gb"])
+
+
+UNSLOTH_RESIDENT_BESIDE_GB = 16     # upstream: RAM (GiB) beside every expert of an Unsloth file kept whole in RAM
+# upstream strata_control/uma_pool.py: what the GPU's pool holds besides the experts on a unified-memory APU, measured
+# on a 128 GB Strix Halo (UD-Q4_K_XL, chunk 16384): the dense weights, session, draft layer and prompt buffers, and a
+# margin; setup's GB of graphics memory in GiB
+UMA_POOL_FIXED_GIB, UMA_POOL_MARGIN_GIB, UMA_POOL_GIB_PER_GB = 16.5, 1.0, 0.9313
+
+
+def uma_holds_experts(model, ram, gpu) -> bool:
+    """upstream 86ffdbeb1: on a unified-memory APU an Unsloth set that asks ("uma_pool_auto": the v3.1 sets) whose
+    experts fit the memory the GPU reaches, whole, gets no RAM budget: every expert is in the pool, nothing is pinned
+    (the fixed cache and the pinned RAM part the budget mode wrote failed the first launch of UD-IQ2_XS three times of
+    three on a 64 GB Strix Halo; `--expert-cache auto` with nothing pinned passed).  The sets measured under the budget
+    mode (UD-IQ4_XS, UD-Q4_K_XL, ...) keep their plans.
+    XeStrata-890M: where the carve-out does not hold the experts, the experts go into the RAM the GPU shares (the expert
+    cache in host USM, uma_host_cache), so the room is the RAM's: the experts and UNSLOTH_RESIDENT_BESIDE_GB more (the
+    engine cuts the cache to what the RAM has free).  Where the carve-out holds them (a Strix Halo with a large one),
+    the pool, the carve-out and the shared memory together, holds them beside the fixed part, as upstream reads it."""
+    d = MODELS.get(model, {})
+    if not d.get("uma_pool_auto") or not gpu or not gpu.get("integrated") or gpu.get("vendor") != "amd":
+        return False
+    arena_gib = d["arena_gb"] / 1.073741824
+    if ram < arena_gib + UNSLOTH_RESIDENT_BESIDE_GB:
+        return False
+    if gpu.get("carve_gb", 0.0) < d["arena_gb"]:    # the host cache's room is the RAM (uma_host_cache)
+        return True
+    pool = float(gpu.get("uma_gb") or 0.0) * UMA_POOL_GIB_PER_GB
+    return pool > 0 and UMA_POOL_FIXED_GIB + arena_gib + UMA_POOL_MARGIN_GIB <= pool
 
 
 def budget_choice(model, ram, asked) -> float:
@@ -4940,6 +5156,7 @@ def choices_from_config(cfg_path: Path) -> dict:
     tag = cfg_path.stem[len("xestrata-"):]
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
     model = tag[len(FAMILIES[family]["tag"]):].upper()     # unsloth-ud-iq4_xs: UD-IQ4_XS
+    model = next((m for m in MODELS if m.upper() == model), model)   # (the catalog's spelling: UD-IQ4_XS-v31's v)
     a = cfg.get("args", [])
     val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731
     vis = cfg.get("vision")
@@ -6967,6 +7184,8 @@ def main() -> int:
             vram = gpu_expert_vram(gpu) + sum(max(0.0, gpu_expert_vram(gpu_info(i)) - 5) for i in sel[1:])
             if d.get("budget"):
                 fits = f"fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest read from the SSD"
+                if uma_holds_experts(m, ram, gpu):     # upstream 86ffdbeb1: every expert in the RAM the GPU shares
+                    fits = f"fits with all of its {d['arena_gb']:.0f} GB of experts in the RAM the GPU shares"
                 verdict = ("EXPERIMENTAL, " if d.get("experimental") else "") + fits if ram >= d["ram_gb"] \
                     else "does not fit"
             elif low_ram_needed(m, ram) and low_ram_fits(m, ram, vram) and a.low_ram != "off":
@@ -7043,7 +7262,7 @@ def main() -> int:
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
         if m == have_size:
             fit += "   (installed)"
-        if d.get("budget"):
+        if d.get("budget") and not uma_holds_experts(m, ram, gpu):
             say(f"  {i}) {m} {d['about']}; download {d['download_gb']:.0f} GB, keeps ~"
                 f"{resident_budget_gib(m, ram)} GB of its {d['arena_gb']:.0f} GB of experts in RAM{fit}")
             continue
@@ -7058,7 +7277,16 @@ def main() -> int:
         rec = str(names.index(have_size) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget = None
-    if MODELS[model].get("budget"):
+    # upstream 86ffdbeb1: a v3.1 Unsloth set whose experts the unified memory holds whole gets no RAM budget (asked for
+    # with --resident-budget-gib N, it is kept): every expert in the RAM the GPU shares, as for ISTA's files
+    pool_auto = (bool(MODELS[model].get("budget")) and a.resident_budget_gib is None
+                 and uma_holds_experts(model, ram, gpu))
+    if pool_auto:
+        if MODELS[model].get("experimental"):
+            warn(f"{model} is EXPERIMENTAL: not run in XeStrata yet")
+        ok(f"{model}: this GPU shares the RAM and it holds all of the {MODELS[model]['arena_gb']:.0f} GB of experts: "
+           "no RAM budget, every expert in RAM (--resident-budget-gib N in the config's args sets a budget instead)")
+    elif MODELS[model].get("budget"):
         # Unsloth's UD-Q4_K_XL and UD-IQ4_XS: a RAM budget of their experts, the rest read from the GGUF files in place
         # (not the low-RAM mode's choice: the budget is set by the RAM, whatever the GPU holds)
         if MODELS[model].get("experimental"):
@@ -7245,12 +7473,8 @@ def main() -> int:
                 models_dir, shards = cand[0].parent, cand
                 ok(f"model files found in {models_dir}")
                 break
-    for s in shards:   # upstream #173: a whole file copied in by hand has no finish mark (75e6efeb7, 762e58b5b)
-        if s.exists() and not done(s) and whole_shard(s):
-            try:
-                mark(s, "whole (checked against its own tensor directory)")
-            except OSError as e:                       # a read-only folder (--gguf-dir on a share): still whole
-                warn(f"{s.name} is whole but its finish mark cannot be written ({e})")
+    # upstream #173: a whole file copied in by hand has no finish mark (75e6efeb7, 762e58b5b); a pinned one is hashed
+    mark_whole_unless_pinned(shards, model_hf(fam, model) if fam.get("hf") else None, bool(a.gguf_dir))
     have_model = all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
     # upstream #425: a download that resumes needs room only for what is still missing - the finished shards and the
     # .part files already on the disk count
@@ -7313,12 +7537,11 @@ def main() -> int:
                     continue
                 except OSError:
                     pass
-            download(fam["hf"].format(q=model, d=fam.get("dirs", {}).get(model, model)) + s.name, s)
+            download(model_hf(fam, model) + s.name, s)
     check_shards(shards)
-    for s in shards:                                   # the experimental Unsloth file: pinned sizes and SHA-256
+    for s in shards:                                   # the Unsloth files: pinned sizes and SHA-256
         if s.name in fam.get("sha256", {}):
-            size, sha = fam["sha256"][s.name]
-            verify_sha256(s, size, sha, own=bool(a.gguf_dir))
+            verify_sha256(s, *fam_pin(fam, s), own=bool(a.gguf_dir))
     ok("model files present")
     mmproj = Path(a.models_dir) / fam["mmproj"]
     if not mmproj.exists():

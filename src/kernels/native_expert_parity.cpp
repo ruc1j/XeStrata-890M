@@ -453,7 +453,8 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
         }
     }
     const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
-    const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
+    const double gpu_limit = f.d_type == 6 ? 1.8e-2 : 3e-2;   // Q5_0 down: the quantized-sum offset makes it as accurate as the rest (upstream aa678f10d)
+    const bool ok = ec < 3e-2 && eg < gpu_limit && std::isfinite(ec) && std::isfinite(eg);
     std::printf("%s %2d  %-8s/%-7s blob %8zu  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", label, l,
                 ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec, eg, ecg,
                 ok ? "ok" : "FAIL");
@@ -525,13 +526,17 @@ static int check_synthetic(const std::string& arg, void* s, bool had = false) {
     std::normal_distribution<float> nd(0.f, 0.05f);
     std::vector<float> w((size_t) FF * H);
     std::vector<uint8_t> blob(f.bytes);
+    // the types quantized with an importance matrix (IQ2_XXS, IQ2_XS, IQ1_M: Unsloth's v3.1 gate/up) take a flat one
+    // (every column as important as the next); ggml aborts without it
+    const std::vector<float> imatrix((size_t) std::max(H, FF), 1.0f);
+    auto imatrix_for = [&](int type) { return ggml_quantize_requires_imatrix((ggml_type) type) ? imatrix.data() : nullptr; };
     for (int part = 0; part < 2; ++part) {   // gate, up
         for (auto& v : w) v = nd(rng);
-        ggml_quantize_chunk((ggml_type) gu, w.data(), blob.data() + (size_t) part * f.up_off, 0, FF, H, nullptr);
+        ggml_quantize_chunk((ggml_type) gu, w.data(), blob.data() + (size_t) part * f.up_off, 0, FF, H, imatrix_for(gu));
     }
     std::vector<float> wd((size_t) H * FF);
     for (auto& v : wd) v = nd(rng);
-    ggml_quantize_chunk((ggml_type) dt, wd.data(), blob.data() + f.down_off, 0, H, FF, nullptr);
+    ggml_quantize_chunk((ggml_type) dt, wd.data(), blob.data() + f.down_off, 0, H, FF, imatrix_for(dt));
     int failures = check_blob(had ? "hadamard" : "synthetic", 0, blob, f, s);
     // the GPU dequantizers against ggml's to_float, every bit
     namespace par = strata::parity;
