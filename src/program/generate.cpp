@@ -83,6 +83,7 @@
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_vocab.hpp"
 #include "strata/spec/window_rule.hpp"
+#include "strata/program/adaptive_range.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
@@ -8924,7 +8925,7 @@ int main(int argc, char** argv) {
         Clock::time_point a_t0;
         std::atomic<bool> a_err{false};
         double a_pick_ms = 0;             // the arena's inline choice, summed (the stats line)
-        size_t a_lo = 0, a_hi = 0, a_bi = 0;   // the batch being copied in (a_copy_in), and where the next one starts
+        strata::program::AdaptiveCopyRange a_rng;   // the batch being copied in (a_copy_in), and where the next one starts
         // LAYER SPLIT, same process only: one tier swaps every stage's cache from the shared residency table
         std::vector<AHome> ahomes;   // [0] = CUDA0's cache, [k] = layer split stage k's
         std::unique_ptr<JobThread> ajob;
@@ -9061,7 +9062,7 @@ int main(int argc, char** argv) {
         };
         auto a_copy_in = [&]() {   // step 2 on the job thread (the serial loop): each source read, then copied in
             std::vector<uint8_t> used(ahomes.size(), 0);
-            for (size_t i = a_lo; i < a_hi; ++i) {   // (the batch: all the round's swaps unless the arena caps it)
+            for (size_t i = a_rng.lo; i < a_rng.hi; ++i) {   // (the batch: all the round's swaps unless the arena caps it)
                 const ASwap& w = aswaps[i];
                 if (const uint8_t* b = a_from(w)) {
                     a_in_one(w, b);
@@ -9072,9 +9073,7 @@ int main(int argc, char** argv) {
                 if (used[hi]) a_mark(ahomes[hi]);
         };
         auto a_post_batch = [&]() {   // step 2: the next batch of copies in to the job thread
-            a_lo = a_bi;
-            a_hi = a_batch > 0 ? std::min(aswaps.size(), a_bi + a_batch) : aswaps.size();
-            a_bi = a_hi;
+            a_rng.next_batch(aswaps.size(), a_batch);
             ajob->post(a_copy_in);
         };
         auto a_stage_in = [&]() {   // step 2's host part on the job thread (the pipelined loop: a_in queues the copies)
@@ -9193,10 +9192,14 @@ int main(int argc, char** argv) {
                     if (pl) {   // the copies in at each card's next gap: after this step, so fenced (see above)
                         a_res_dirty = true;
                         for (const ASwap& w : aswaps) a_in_due[(size_t) w.home] = 1;
+                        // the whole round is one batch: when the pipelined loop drains before step 3, the next tick
+                        // takes step 3 on the serial rule and marks [lo, hi), which an earlier round left otherwise
+                        // (upstream 40849df0a, PR #4844)
+                        a_rng.whole_round(aswaps.size());
                         ajob->post(a_stage_in);
                     } else {
                         res_upload();
-                        a_lo = a_hi = a_bi = 0;
+                        a_rng.clear();
                         a_post_batch();
                     }
                     astate = AState::SwapIn;
@@ -9207,15 +9210,15 @@ int main(int argc, char** argv) {
                     if (a_due(a_in_due)) return true;   // (pipelined) a card not seen idle since step 2
                     if (!a_ready(drain || a_wait)) return true;
                     if (a_err.load()) return false;
-                    for (size_t i = pl ? 0 : a_lo; i < (pl ? aswaps.size() : a_hi); ++i) {   // (the batch just landed)
+                    for (size_t i = a_rng.landed_begin(pl); i < a_rng.landed_end(pl, aswaps.size()); ++i) {   // (the batch just landed)
                         const ASwap& w = aswaps[i];
                         host_res[(size_t) w.layer * g.n_expert + w.in] = w.slot;
                         srcp->release(w.layer, w.in);
                     }
                     if (pl) a_res_dirty = true;
                     else res_upload();
-                    a_swapped += pl ? (int64_t) aswaps.size() : (int64_t) (a_hi - a_lo);
-                    if (!pl && a_bi < aswaps.size()) {   // the arena's cap: the next batch goes now
+                    a_swapped += (int64_t) (a_rng.landed_end(pl, aswaps.size()) - a_rng.landed_begin(pl));
+                    if (!pl && a_rng.more(aswaps.size())) {   // the arena's cap: the next batch goes now
                         for (AHome& h : ahomes) h.used = false;
                         a_post_batch();
                         if (!drain) return true;
@@ -12282,6 +12285,8 @@ int main(int argc, char** argv) {
             std::vector<int32_t> drafts(DS, 0), window((size_t) S), outv((size_t) S);
             std::vector<float> dprob(DS, 0.0f);
             std::array<float, 8> dwin_s{};   // the probabilities the current window was chosen from (STRATA_SPEC_COST)
+            strata::spec::AdaptiveGate df2_gate;   // STRATA_DF2_GATE=1: this request's calibrated DFlash2 window (spec/window_rule.hpp)
+            df2_gate.row_ms = strata::spec::df2_gate_row_ms();
             std::vector<int32_t> sbuf((size_t) S, 0);
             const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
             if (sfx_on) {
@@ -12991,6 +12996,8 @@ int main(int argc, char** argv) {
                     T = 1;
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
+                // STRATA_DF2_GATE=1 (upstream b97433df0, opt-in): DFlash2's window from this request's calibrated survival
+                if (use_df2 && draft_on && !first_window && strata::spec::df2_gate_on()) T = df2_gate.choose(dprob.data(), S_mtp);
                 // XeStrata-890M: no row after a draft that ends the turn - the reply stops there if it is accepted, and
                 // a row after it could only be verified for nothing (halogen-flash-server 0.18 does the same)
                 if (use_mtp)
@@ -13330,6 +13337,10 @@ int main(int argc, char** argv) {
                     source_policy.defer_cost(std::max<int64_t>(p + T - 1, p + a + 1 + S_mtp), T,
                                              std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (spec_cost && use_mtp && timed_round && !from_sfx) policy.observe_probs(dwin_s.data(), T_mtp - 1, a);
+                if (use_df2 && timed_round && strata::spec::df2_gate_on()) {   // STRATA_DF2_GATE=1: what this round showed about the survival of its drafts, and what a token cost
+                    if (!from_sfx) df2_gate.observe(dwin_s.data(), T, a);
+                    df2_gate.observe_round(std::chrono::duration<double, std::milli>(Clock::now() - round0).count(), a + 1);
+                }
                 if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());

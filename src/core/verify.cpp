@@ -2244,6 +2244,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             *flag = UINT32_MAX;
             strata::gpu::stream_sync(cs_);
             strata::gpu::stream_sync(copy_);
+            copy_used_ = false;
             return false;
         }
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2302,7 +2303,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         *flag = want;
         if (segmented_) {   // the PCIe share's copies too, then the next segment
@@ -2310,6 +2311,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 err = "verify: the PCIe share of layer " + std::to_string(l) + " did not land";
                 return false;
             }
+            copy_used_ = false;
             if (!strata::gpu::graph_launch(segs_[T][(size_t) k + 1], cs_)) {
                 err = std::string("verify: launch segment: ") + strata::gpu::last_error();
                 return false;
@@ -2323,6 +2325,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (!se) { err = std::string("verify: ") + strata::gpu::last_error(); return false; }
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     strata::gpu::stream_sync(copy_);   // no host function of this window may raise flag B in the next one
+    copy_used_ = false;
     if (rt_dump_) route_trace().write(rt_req_, pos0, T, lb_, le_, ss.k, max_t_, h_route_, h_rw_);
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
         strata::gpu::copy(prof_h_.data(), prof_, prof_h_.size() * 8);
@@ -2526,14 +2529,32 @@ void Verifier::raise_flag(uint32_t* flag, uint32_t value) {
 void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     Verifier* v = (Verifier*) ctx;
     const uint32_t want = v->cur_layer_ + 1;
-    if (n <= 0) { raise_flag(v->h_flagB_, want); return; }
+    if (n <= 0) { v->raise_flag_b_ordered(want); return; }   // an empty plan stays behind the copies already queued
+    v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
     for (int i = 0; i < n; ++i) strata::gpu::copy_async(stage + (size_t) i * bytes, src[i], bytes, v->copy_);
-    FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
-    fs.flag = v->h_flagB_;
+    v->raise_flag_b_ordered(want);   // copy_used_ is set: the host function runs after this group's uploads
+}
+
+// Flag B for layer `want - 1`, behind every copy queued on the copy stream (upstream 40849df0a, PR #5096).  The counter
+// only rises and the graph waits for "flag B >= layer + 1", so raising it on the spot for a layer with nothing to copy
+// would release an earlier layer (or the other token group of a split window) whose uploads are still in flight.  With
+// nothing queued since the stream was last drained there is nothing to wait for, and it rises at once.
+void Verifier::raise_flag_b_ordered(uint32_t want) {
+    if (!copy_used_ || copy_ == nullptr) {
+        raise_flag(h_flagB_, want);
+        return;
+    }
+    FlagSet& fs = flag_sets_[(want - 1) % (sizeof flag_sets_ / sizeof flag_sets_[0])];
+    fs.flag = h_flagB_;
     fs.value = want;
     FlagSet* set = &fs;
-    strata::gpu::launch_host(v->copy_, [set] { raise_flag(set->flag, set->value); });
+    if (!strata::gpu::launch_host(copy_, [set] { raise_flag(set->flag, set->value); })) {
+        // the flag was not raised: the consumers must not be released to staging that is still being written
+        std::fprintf(stderr, "strata DMA: ordered flag B completion failed: %s\n", strata::gpu::last_error());
+        std::fflush(stderr);
+        std::abort();
+    }
 }
 
 void Verifier::publish_plan(void* ctx) {
@@ -2886,7 +2907,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
@@ -2894,6 +2915,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     }
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("verify batch: ") + strata::gpu::last_error(); return false; }
     strata::gpu::stream_sync(copy_);   // no host function of this window may raise flag B in the next one
+    copy_used_ = false;
     ++windows;
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the rows go on to the next stage, as in run()
         if (next_ == nullptr) return true;
@@ -3257,7 +3279,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         *(volatile uint32_t*) h_flag_ = want;
         ms_pool += ms_since(b);
@@ -3266,7 +3288,8 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     }
     strata::gpu::Status st = strata::gpu::stream_status(cs_);
     if (st == strata::gpu::Status::Done) st = strata::gpu::stream_status(copy_);   // (copy_: no host function of this
-    if (st == strata::gpu::Status::Failed) {                                         // window may raise flag B in the next)
+    if (st == strata::gpu::Status::Done) copy_used_ = false;                         //  window may raise flag B in the
+    if (st == strata::gpu::Status::Failed) {                                         //  next)
         err = std::string("verify batch: the window's commit: ") + strata::gpu::last_error();
         b_running_ = false;
         return -1;
@@ -3671,7 +3694,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
             sink_.start2[0] = 0;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
+            raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         *(volatile uint32_t*) h_flag_ = want;
         ++fl_k_;
@@ -3691,6 +3714,7 @@ bool Verifier::done(std::string& err) {
     }
     // no host function of this window may raise flag B in the next one
     if (st == strata::gpu::Status::Done) st = strata::gpu::stream_status(copy_);
+    if (st == strata::gpu::Status::Done) copy_used_ = false;
     if (st == strata::gpu::Status::Failed) err = std::string("verify: the window: ") + strata::gpu::last_error();
     return st == strata::gpu::Status::Done;
 }

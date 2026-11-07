@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.2.11-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+XeStrata xe0.2.12-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
@@ -76,6 +76,31 @@ upstream の Strata 0.2.10 の既定の drafter、DFlash2（incoai/Qwen3.8-Flash
 交互 3 周（枠 24,576、冷却つき）: MTP 31.6 / 31.7 / 32.0 tok/s、DFlash2（confidence 0.6）29.6 / 29.6 / 29.8 tok/s で、中央値で 6.7% 遅いです。drafter は 7.7 ms/round、2,191 トークンに 942 round（1 round 2.3 トークン。MTP は 874 round、2.5 トークン）。6 チャットの greedy の答えは 3 周とも MTP と同じでした。チャットごとに見ると、コードと英語の 3 つ（クイックソート 37.2 対 36.5、transformer 33.2 対 32.4、bash 42.6 対 40.5）では DFlash2 が 2〜5% 速く、日本語の文章の 2 つ（四季 21.5 対 25.6、光合成 25.0 対 28.8）で 13〜16%、TCP/UDP（32.9 対 34.0）で 3% 遅いです。
 
 1 round に受け入れるトークンの数は MTP と同じほど（約 2.5）ですが、drafter 自身が 1 round に 7.8 ms かかり（5 層の Q4_0 の重み 0.5 GB を 890M の帯域で読む時間が大半）、MTP の約 4 ms より長いので、decode は 6〜7% 遅くなります。upstream が AMD の HIP で MTP より 4〜12% 速かったのは、帯域が 2.5〜6 倍のカード（Strix Halo、R9700）です。Issue #23（2026-10-24）の見積もり（drafter の重みの読みが MTP の 4 ms を超え、+2〜3% が上限）のとおりでした。drafter は下書きを変えるだけで、答えは verify が決めます。
+
+## Strata 0.1.58 の取り込み
+
+upstream の Strata 0.2.11 から 0.2.12（エンジンの版は 0.1.58、2026-11-07）までの 84 コミット（merge を除く）のうち、エンジン・serve・setup の層に当たるものを XeStrata-890M に移しました。前回と同じく Strata のコミットを `patch -F3` で当て、ずれた hunk は手で置き直しました。一覧は `.upstream-0158.md`（リポジトリの根、git の外）です。
+0.2.12 の upstream の変更の多くは、Windows の Strix Halo（gfx1151）の CUDA/HIP のカーネルと既定の表、gfx12、NVIDIA、CPU のエキスパートの AVX-512 の行、peer GPU、Metal、app と Terminal と Control のもので、この fork には当たりません。Strix Halo の変更は 890M と同じ RDNA3.5 向けですが、UD-Q4_K_XL と UD-IQ4_XS-v31 の K-quant と Q5_0 のエキスパートの .cu のカーネルで、この fork の SYCL のカーネルには同じ切り替えがありません。
+
+移したものは次のとおりです。
+
+- エンジン: verify の flag B を copy stream に積んだコピーの後ろで上げます（upstream PR #5096）。空の計画の層が、前の層のコピーが終わる前に flag B を上げてしまう不具合を直しました。この窓でコピーを積んでいないときは、これまでどおりその場で上げます。adaptive tier の 1 回分のコピーの範囲は、pipelined の回をまるごと指すようにしました（PR #4844、adaptive_range.hpp と adaptive_range_test）。
+- エンジン: PLE の読み手の issue() は 64 行以下の要求を stack の配列でまとめ、hash table と job の vector を作りません（890M の decode は PLE の行をファイルから読みます）。
+- エンジン: `STRATA_PREFILL_TIMING` は同じ段階の印を続けて記録しません（PR #4006）。合計は同じで、event の記録が減ります。
+- エンジン: `STRATA_DF2_GATE=1`（opt-in）は DFlash2 の窓を要求ごとに見積もった下書きの生き残りから決めます。window_rule_test を CTest に入れました。
+- serve: ツール呼び出しの読み方を直しました。`<function=tools NAME>` と `<function=tools>`（#5409）、綴りの違う opener の `<toolcall>` と `<tool-call>`（#5276）、MCP のツールを名前の最後の段で書いた呼び出し（#5281）を、宣言したツールの呼び出しとして読みます。tool_choice が required でツールが 2 つ以上なら、`<tool_call>` だけを書きます。宣言していないツールの呼び出しを返す設定 `undeclared_tool_calls`（`STRATA_UNDECLARED_TOOL_CALLS`、既定は text）を足しました（#4622）。これらの検査は buffer の末尾だけを見ます。
+- serve: 要求の計数。譲った（BYIELD）prompt の読みの時間とトークンを 1 回だけ足し、admission の時間を二重に数えず、エンジンが報告しなかった数は 0 ではなく不明（None）のままにします。
+- setup: SHA-256 が合わないダウンロードは消さずに `<name>.bad` として残します。次の実行でもう一度 hash を確かめ、合えばそれを使います。新しいダウンロードが合うか、空きが足りなければ消します。
+- 試験: Anthropic の tool_result を tool_use_id の順に並べる試験（並べる処理はこの fork に前からあります）、Anthropic の route がどのモデル名でも読み込んだモデルで答える試験。
+
+入れていないものは次のとおりです。
+
+- 統合 GPU で起動時の空きメモリーが少ないときの文（530a29ea2）。upstream は Strix Halo の resident RAM モードのときだけ「--vram-reserve-mib を足せ」と言わなくなります。890M でもこの文が出ますが、予約を増やして数字が上がるかをまだ確かめていません。
+- 統合 GPU で RAM の予算がエキスパートのキャッシュに残らないときの文（1d342f083）。Windows の Strix Halo ではキャッシュをグラフィックスのメモリーから取りますが、890M の Linux では GTT がシステムの RAM なので当たりません。
+- ファイル層の Linux の既定を全エキスパート常駐のとき止める変更（994029b02）と、ファイル層の再検査（0a0e4463e）。890M の構成はこの経路を通りません。
+- CPU のエキスパートの AVX-512 の行と道具、STRATA_MANIFEST、STRATA_PF_ALLOC_TRACE、token forcing の道具（force_check.py）。
+
+decode と prefill の計算は変えていません。CTest は 167 件中 165 件が通り、落ちた 2 件（expert_parity、pool_test）は Strata 形式の pack がこの PC にないためのものです。serve の試験 1,173 件は、前から落ちている test_structured の 10 件を除いて通り、tools の試験 458 件が通ります。
 
 ## Strata 0.1.57 の取り込み
 

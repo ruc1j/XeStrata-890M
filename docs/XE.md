@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.2.11-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+XeStrata xe0.2.12-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -75,6 +75,31 @@ Measured (the 890M, the abliterated IQ2_XS, the bench's 6 chats, greedy, `--spec
 Three interleaved rounds (24,576 slots, cooled between runs): the MTP 31.6 / 31.7 / 32.0 tok/s, DFlash2 (confidence 0.6) 29.6 / 29.6 / 29.8 tok/s, 6.7% slower by the medians. The drafter took 7.7 ms a round, 942 rounds for 2,191 tokens (2.3 tokens a round; the MTP 874 rounds, 2.5). The six chats' greedy answers were the MTP's in all three rounds. By chat, DFlash2 was 2 to 5% faster on the three code and English chats (quicksort 37.2 against 36.5, the transformer 33.2 against 32.4, bash 42.6 against 40.5), 13 to 16% slower on the two Japanese prose chats (the seasons 21.5 against 25.6, photosynthesis 25.0 against 28.8) and 3% slower on TCP/UDP (32.9 against 34.0).
 
 The tokens accepted a round are about the MTP's (about 2.5), but the drafter itself takes 7.8 ms a round (mostly the time the 890M's bandwidth needs to read the 5 layers' 0.5 GB of Q4_0 weights), longer than the MTP's about 4 ms, so decode is 6 to 7% slower. Where upstream measured DFlash2 4 to 12% faster than the MTP on AMD HIP, the cards (Strix Halo, the R9700) have 2.5 to 6 times the bandwidth. Issue #23's estimate (2026-10-24: the drafter's weight reads exceed the MTP's 4 ms, +2 to 3% at best) held. The drafter changes only the drafts; the verify decides the answers.
+
+## Integration through Strata 0.1.58
+
+Of the 84 upstream Strata commits (merges aside) from 0.2.11 to 0.2.12 (engine version 0.1.58, 2026-11-07), the ones that touch the engine, serve and setup layers came into XeStrata-890M. As last time, Strata's commits were applied with `patch -F3` and the hunks that missed were placed by hand. The list is `.upstream-0158.md` (the repository root, outside git).
+Most of upstream's changes in this version are the CUDA/HIP kernels and the default table of the Strix Halo (gfx1151) on Windows, gfx12, NVIDIA, the AVX-512 rows of the CPU experts, the peer GPU, Metal, and the app, the Terminal and Control: none of them applies to this fork. The Strix Halo changes are for RDNA3.5, as the 890M is, but they are .cu kernels for the K-quant and Q5_0 experts of UD-Q4_K_XL and UD-IQ4_XS-v31, and this fork's SYCL kernels have no such switches.
+
+What came in:
+
+- engine: verify raises flag B behind the copies queued on the copy stream (upstream PR #5096). A layer with an empty plan raised it before an earlier layer's copies had landed. With no copy queued in the window it rises at once, as before. A pipelined round of the adaptive tier now names the whole round as its copy range (PR #4844, adaptive_range.hpp and adaptive_range_test).
+- engine: the PLE reader's issue() folds a request of up to 64 rows in a stack array, with no hash table and no job vector (on the 890M decode reads the PLE rows from the file).
+- engine: `STRATA_PREFILL_TIMING` does not record a mark in the phase already running (PR #4006): the same totals, fewer event records.
+- engine: `STRATA_DF2_GATE=1` (opt-in) chooses DFlash2's window from the drafts' survival estimated per request. window_rule_test is in CTest.
+- serve: tool-call reading. `<function=tools NAME>` and `<function=tools>` (#5409), the misspelt openers `<toolcall>` and `<tool-call>` (#5276), and an MCP tool written by the last segment of its name (#5281) are read as calls of the declared tool. tool_choice "required" with two or more tools writes only `<tool_call>`. The setting `undeclared_tool_calls` (`STRATA_UNDECLARED_TOOL_CALLS`, default text) returns a call of an undeclared tool as a call (#4622). These checks look only at the end of the buffer.
+- serve: request accounting. A prompt read that gave way (BYIELD) adds its time and tokens once, the admission's time is not counted twice, and a figure the engine did not report stays unknown (None) instead of 0.
+- setup: a download with the wrong SHA-256 is kept as `<name>.bad` instead of deleted. The next run hashes it again and takes it if it matches; a good new download or too little room removes it.
+- tests: Anthropic tool_result blocks follow tool_use_id (the ordering has been in this fork before), and the Anthropic route answers with the loaded model whatever model name a request carries.
+
+Not taken:
+
+- The line about the free memory at the start on an integrated GPU (530a29ea2). Upstream stops advising a larger --vram-reserve-mib only in the Strix Halo's resident RAM mode. The 890M prints that advice too, but whether a larger reserve raises the figure has not been checked.
+- The line about an integrated GPU whose RAM budget leaves no room for the expert cache (1d342f083). On a Windows Strix Halo the cache comes from the graphics memory; on the 890M under Linux the GTT is the system RAM, so it does not apply.
+- Turning the file tier's Linux defaults off while every expert is resident (994029b02), and the file tier's re-check (0a0e4463e). The 890M's configuration does not take that path.
+- The AVX-512 rows and tools of the CPU experts, STRATA_MANIFEST, STRATA_PF_ALLOC_TRACE, and the token-forcing tools (force_check.py).
+
+The decode and prefill arithmetic is unchanged. CTest passes 165 of 167; the two that fail (expert_parity, pool_test) need a Strata-format pack this PC does not have. The 1,173 serve tests pass but for the 10 of test_structured that failed before, and the 458 tools tests pass.
 
 ## Integration through Strata 0.1.57
 

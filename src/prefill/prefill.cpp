@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#include "strata/prefill/timer_marks.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the approximate late-layer prompt read (opt-in, upstream 0.2.7)
 #include "strata/core/expert_tier.hpp"
@@ -2009,6 +2010,10 @@ struct PfTimer {
     double ms[kPfCount] = {};
     void mark(int phase, strata::gpu::Stream s) {
         if (!on) return;
+        // a mark in the phase already running adds nothing to the totals (the gap is charged to the earlier mark's
+        // phase either way), but each record is an event on the stream: compute() marks "dequant" once per expert
+        // (upstream a5b820a41, PR #4006).  The same totals, a fraction of the records.
+        if (strata::prefill::timer_mark_repeats(ph.data(), used, phase)) return;
         if (used == ev.size()) {
             strata::gpu::Event* e = nullptr;
             strata::gpu::event_create(&e, true);
