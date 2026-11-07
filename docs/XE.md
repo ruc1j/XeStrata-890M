@@ -86,6 +86,7 @@ What came in:
 - engine: verify raises flag B behind the copies queued on the copy stream (upstream PR #5096). A layer with an empty plan raised it before an earlier layer's copies had landed. With no copy queued in the window it rises at once, as before. A pipelined round of the adaptive tier now names the whole round as its copy range (PR #4844, adaptive_range.hpp and adaptive_range_test).
 - engine: the PLE reader's issue() folds a request of up to 64 rows in a stack array, with no hash table and no job vector (on the 890M decode reads the PLE rows from the file).
 - engine: `STRATA_PREFILL_TIMING` does not record a mark in the phase already running (PR #4006): the same totals, fewer event records.
+- engine: of the Strix Halo prefill changes, writing the down rows as FP16 (6e31946cb) came in as an idea only. The int8 down products (iq_mmq) write their rows as FP16 and the combine reads them, halving the rows a layer writes and reads back. It is on by default on an integrated GPU on the HIP backend and `STRATA_PF_DM16=0` turns it off; `=1` turns it on elsewhere. A layer with a CPU share or a helper GPU keeps FP32. On the 890M with IQ2_XS, a 15,251-token prompt's prefill went from 313.3 to 316.5 tok/s (+1.0%). The answer differs by the FP16 rounding.
 - engine: `STRATA_DF2_GATE=1` (opt-in) chooses DFlash2's window from the drafts' survival estimated per request. window_rule_test is in CTest.
 - serve: tool-call reading. `<function=tools NAME>` and `<function=tools>` (#5409), the misspelt openers `<toolcall>` and `<tool-call>` (#5276), and an MCP tool written by the last segment of its name (#5281) are read as calls of the declared tool. tool_choice "required" with two or more tools writes only `<tool_call>`. The setting `undeclared_tool_calls` (`STRATA_UNDECLARED_TOOL_CALLS`, default text) returns a call of an undeclared tool as a call (#4622). These checks look only at the end of the buffer.
 - serve: request accounting. A prompt read that gave way (BYIELD) adds its time and tokens once, the admission's time is not counted twice, and a figure the engine did not report stays unknown (None) instead of 0.
@@ -99,7 +100,7 @@ Not taken:
 - Turning the file tier's Linux defaults off while every expert is resident (994029b02), and the file tier's re-check (0a0e4463e). The 890M's configuration does not take that path.
 - The AVX-512 rows and tools of the CPU experts, STRATA_MANIFEST, STRATA_PF_ALLOC_TRACE, and the token-forcing tools (force_check.py).
 
-The decode and prefill arithmetic is unchanged. CTest passes 165 of 167; the two that fail (expert_parity, pool_test) need a Strata-format pack this PC does not have. The 1,173 serve tests pass but for the 10 of test_structured that failed before, and the 458 tools tests pass.
+The decode arithmetic is unchanged; the prefill arithmetic differs only where the down rows are FP16, on an integrated GPU on the HIP backend. CTest passes 165 of 167; the two that fail (expert_parity, pool_test) need a Strata-format pack this PC does not have. The 1,173 serve tests and the 458 tools tests pass.
 
 ## Integration through Strata 0.1.57
 

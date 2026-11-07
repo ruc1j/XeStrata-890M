@@ -642,6 +642,12 @@ struct Kernel {
     float* dst;
     int64_t ld_dst, tiles_m, tiles_n;
     sycl::local_accessor<uint8_t, 1> lm;
+    bool hdst = false;   // the rows go out as FP16 (dst then holds halves, ld_dst halves apart): STRATA_PF_DM16
+
+    void put(int64_t i, float v) const {
+        if (hdst) reinterpret_cast<sycl::half*>(dst)[i] = sycl::half(v);
+        else dst[i] = v;
+    }
 
     void dp4a_body(sycl::nd_item<1> it) const {
         constexpr int lanes = NSG * SG, RSTEP = lanes / WN, RPT = WM / RSTEP;
@@ -707,7 +713,7 @@ struct Kernel {
         }
         for (int i = 0; i < RPT; ++i) {
             const int64_t row = m0 + rbase + (int64_t) i * RSTEP;
-            if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + n0 + n] = acc[i];
+            if (row < rows) put((int64_t) ids[row0 + row] * ld_dst + n0 + n, acc[i]);
         }
     }
 
@@ -818,7 +824,7 @@ struct Kernel {
         for (int t = 0; t < TPS; ++t)
             for (int i = 0; i < IM; ++i) {
                 const int64_t row = m0 + rs + (int64_t) t * IM + i;
-                if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + n0 + cs + lane] = acc[t][i];
+                if (row < rows) put((int64_t) ids[row0 + row] * ld_dst + n0 + cs + lane, acc[t][i]);
             }
 #else
         (void) it;
@@ -944,7 +950,7 @@ struct Kernel {
                     const int64_t rb = m0 + ms + (int64_t) i * TM, cb = n0 + ns + (int64_t) j * TN;
                     for (int q = lane; q < TM * TN; q += SG) {
                         const int64_t row = rb + q / TN;
-                        if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + cb + q % TN] = stp[q];
+                        if (row < rows) put((int64_t) ids[row0 + row] * ld_dst + cb + q % TN, stp[q]);
                     }
                     sycl::group_barrier(sg);
                 }
@@ -1129,7 +1135,7 @@ struct Kernel {
                     const int64_t cb = n0 + ns + (int64_t) j * TN + lo;
                     for (int el = 0; el < 8; ++el) {
                         const int64_t row = m0 + ms + (int64_t) i * TM + row_of(el);
-                        if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + cb] = acc[i][j][el];
+                        if (row < rows) put((int64_t) ids[row0 + row] * ld_dst + cb, acc[i][j][el]);
                     }
                 }
 #endif
@@ -1158,7 +1164,7 @@ struct Kernel {
 template<int TY, int SGM, int NSGM, bool DP4A, bool TAIL, int IS>
 sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                    int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
-                   int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst) {
+                   int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst, bool half_dst) {
     using KT = Kernel<TY, SGM, NSGM, DP4A, TAIL, IS>;
     const int64_t tiles_m = (max_rows + KT::WM - 1) / KT::WM, tiles_n = w_rows / KT::WN;
     const size_t row_bytes = (size_t) (w_cols / Dec<TY>::QK) * (size_t) Dec<TY>::BSZ;
@@ -1172,7 +1178,7 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
         const size_t wg = (size_t) KT::NSG * SG;
         h.parallel_for(sycl::nd_range<1>((size_t) n * (size_t) (tiles_m * tiles_n) * wg, wg),
                        KT{static_cast<const uint8_t*>(w), wtab, woff, expert_bytes, row_bytes, x8, xs, xu, w_cols, bounds, ids, dst,
-                          ld_dst, tiles_m, tiles_n, lm});
+                          ld_dst, tiles_m, tiles_n, lm, half_dst});
     });
 }
 
@@ -1291,10 +1297,10 @@ bool takes_work_group(sycl::queue& q) {
 template<int TY>
 sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                     int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
-                    int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst, int64_t rows) {
+                    int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst, int64_t rows, bool half_dst) {
 #define STRATA_MMQ_LAUNCH(SGM, NSGM, DP4A, TAIL, IS)                                                                 \
     launch<TY, SGM, NSGM, DP4A, TAIL, IS>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, \
-                                          max_rows, ids, dst, ld_dst)
+                                          max_rows, ids, dst, ld_dst, half_dst)
 #define STRATA_MMQ_ROWS(DP4A, TAIL, IS)                                                        \
     do {                                                                                        \
         if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, DP4A, TAIL, IS);                     \
@@ -1590,11 +1596,11 @@ sycl::event iq_mmq_quantize_scatter(sycl::queue& q, const float* x, const int32_
 sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_bytes, int64_t w_rows, int64_t w_cols,
                            int n, const void* xq, int64_t total_rows, const int32_t* bounds, int64_t max_rows,
                            const int32_t* ids, float* dst, int64_t ld_dst, const uint8_t* const* wtab, size_t woff,
-                           int64_t rows) {
+                           int64_t rows, bool half_dst) {
 #define STRATA_MMQ_CASE(TY)                                                                                           \
     case TY:                                                                                                          \
         return by_rows<TY>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, \
-                           dst, ld_dst, rows > 0 ? rows : total_rows)
+                           dst, ld_dst, rows > 0 ? rows : total_rows, half_dst)
     switch (t) {
         STRATA_MMQ_CASE(6);
         STRATA_MMQ_CASE(7);

@@ -86,6 +86,9 @@ void scatter_rows(const float* src, const int32_t* dst_row, float* dst, int64_t 
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
+/// moe_combine with D's rows held as FP16 (STRATA_PF_DM16: the down product wrote them as halves).
+void moe_combine_h(const uint16_t* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                   float* bo, int64_t T, void* stream);
 /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): acc[t, :] = shared[t, :] * sigmoid(sg[t]) - the shared expert's
 /// part of moe_combine, written before the routed experts are known.
 void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream);

@@ -58,9 +58,11 @@ sycl::event iq_mmq_quantize_scatter(sycl::queue& q, const float* x, const int32_
 /// (and of the type's block).
 /// wtab (on the device, n entries): expert e's weights at wtab[e] + woff instead, wherever each lies.
 /// rows: the n experts' rows together (0: total_rows), which with max_rows picks the tile's shape.
+/// half_dst: the rows go out as FP16 (dst then holds halves and ld_dst counts halves; STRATA_PF_DM16).
 sycl::event iq_mmq_grouped(sycl::queue& q, int ggml_type, const void* w, size_t expert_bytes, int64_t w_rows,
                            int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
                            int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst,
-                           const uint8_t* const* wtab = nullptr, size_t woff = 0, int64_t rows = 0);
+                           const uint8_t* const* wtab = nullptr, size_t woff = 0, int64_t rows = 0,
+                           bool half_dst = false);
 
 }  // namespace strata::kernels

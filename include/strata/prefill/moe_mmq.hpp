@@ -70,6 +70,7 @@ struct Product {
     int64_t ld_dst = 0;
     const uint8_t* const* wtab = nullptr;   ///< on the device: expert e's weights at wtab[e] + woff instead of w's
     size_t woff = 0;
+    bool half_dst = false;   ///< dst holds FP16 rows, ld_dst halves apart (STRATA_PF_DM16)
 };
 
 /// The launch context.  One per prompt path.

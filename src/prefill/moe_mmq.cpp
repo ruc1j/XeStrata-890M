@@ -67,7 +67,7 @@ void Context::run(const Product& p, void* stream) {
     const int64_t cols = kernels::iq_mmq_type_dup(p.type) ? 2 * p.w_cols : p.w_cols;
     kernels::iq_mmq_grouped(Q(stream), p.type, p.w, p.expert_bytes, p.w_rows, cols, p.n, p.xq, p.total_rows,
                             p.bounds, p.max_rows, p.ids, p.dst, p.ld_dst, p.wtab, p.woff,
-                            p.rows > 0 ? p.rows : p.total_rows);
+                            p.rows > 0 ? p.rows : p.total_rows, p.half_dst);
 }
 
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,

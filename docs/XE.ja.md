@@ -87,6 +87,7 @@ upstream の Strata 0.2.11 から 0.2.12（エンジンの版は 0.1.58、2026-1
 - エンジン: verify の flag B を copy stream に積んだコピーの後ろで上げます（upstream PR #5096）。空の計画の層が、前の層のコピーが終わる前に flag B を上げてしまう不具合を直しました。この窓でコピーを積んでいないときは、これまでどおりその場で上げます。adaptive tier の 1 回分のコピーの範囲は、pipelined の回をまるごと指すようにしました（PR #4844、adaptive_range.hpp と adaptive_range_test）。
 - エンジン: PLE の読み手の issue() は 64 行以下の要求を stack の配列でまとめ、hash table と job の vector を作りません（890M の decode は PLE の行をファイルから読みます）。
 - エンジン: `STRATA_PREFILL_TIMING` は同じ段階の印を続けて記録しません（PR #4006）。合計は同じで、event の記録が減ります。
+- エンジン: Strix Halo の prefill の変更のうち、down の行を FP16 で書くもの（6e31946cb）は、考え方だけを移しました。int8 の down の積（iq_mmq）が行を FP16 で書き、combine がそれを読むので、1 層が書いて読み戻す行の量が半分になります。HIP の統合 GPU では既定で入り（`STRATA_PF_DM16=0` で止まります）、ほかの GPU では `=1` で入ります。CPU の分担や helper GPU のある層は FP32 のままです。890M の IQ2_XS で、15,251 トークンの prompt の prefill は 313.3 tok/s から 316.5 tok/s（+1.0%）になりました。FP16 の丸めのぶん、答えは変わります。
 - エンジン: `STRATA_DF2_GATE=1`（opt-in）は DFlash2 の窓を要求ごとに見積もった下書きの生き残りから決めます。window_rule_test を CTest に入れました。
 - serve: ツール呼び出しの読み方を直しました。`<function=tools NAME>` と `<function=tools>`（#5409）、綴りの違う opener の `<toolcall>` と `<tool-call>`（#5276）、MCP のツールを名前の最後の段で書いた呼び出し（#5281）を、宣言したツールの呼び出しとして読みます。tool_choice が required でツールが 2 つ以上なら、`<tool_call>` だけを書きます。宣言していないツールの呼び出しを返す設定 `undeclared_tool_calls`（`STRATA_UNDECLARED_TOOL_CALLS`、既定は text）を足しました（#4622）。これらの検査は buffer の末尾だけを見ます。
 - serve: 要求の計数。譲った（BYIELD）prompt の読みの時間とトークンを 1 回だけ足し、admission の時間を二重に数えず、エンジンが報告しなかった数は 0 ではなく不明（None）のままにします。
@@ -100,7 +101,7 @@ upstream の Strata 0.2.11 から 0.2.12（エンジンの版は 0.1.58、2026-1
 - ファイル層の Linux の既定を全エキスパート常駐のとき止める変更（994029b02）と、ファイル層の再検査（0a0e4463e）。890M の構成はこの経路を通りません。
 - CPU のエキスパートの AVX-512 の行と道具、STRATA_MANIFEST、STRATA_PF_ALLOC_TRACE、token forcing の道具（force_check.py）。
 
-decode と prefill の計算は変えていません。CTest は 167 件中 165 件が通り、落ちた 2 件（expert_parity、pool_test）は Strata 形式の pack がこの PC にないためのものです。serve の試験 1,173 件は、前から落ちている test_structured の 10 件を除いて通り、tools の試験 458 件が通ります。
+decode の計算は変えていません。prefill の計算は、HIP の統合 GPU で down の行が FP16 になったところだけが変わります。CTest は 167 件中 165 件が通り、落ちた 2 件（expert_parity、pool_test）は Strata 形式の pack がこの PC にないためのものです。serve の試験 1,173 件と tools の試験 458 件が通ります。
 
 ## Strata 0.1.57 の取り込み
 

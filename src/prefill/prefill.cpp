@@ -1869,6 +1869,22 @@ namespace {
 // ms (gdn's projections in 371 -> 227, qsa proj 180 -> 120, gdn out proj 155 -> 118, router+shared 91 -> 73), the
 // 3,481-token one 13,386 -> 12,810 ms; the short answer the same, the long one two words apart (the int8 rounding,
 // as the experts').  STRATA_PREFILL_DENSE_MMQ=0 turns it off, =1 forces it where the experts keep the FP16 form.
+// STRATA_PF_DM16: the int8 down products write their rows as FP16 and the combine reads them, halving the bytes of
+// the T x 10 rows of 2560 a layer writes and reads back (upstream 6e31946cb's idea for Strix Halo's F16 kernels, +1-3%
+// at 8K there).  On by default on an integrated GPU on the HIP backend, whose memory is the system RAM's bandwidth
+// (890M, IQ2_XS, a 15,251-token prompt, greedy, 3 interleaved rounds: 313.3 -> 316.5 tok/s, +1.0%; the answer differs
+// from its 41st character, the FP16 rounding); =0 turns it off there, =1 on elsewhere.  Only on a layer whose every row
+// comes from the int8 products on this GPU (no CPU share, no helper GPU): those others write FP32 rows into Dm.
+bool pf_dm16_on() {
+    static const int env = [] {
+        const char* e = std::getenv("STRATA_PF_DM16");
+        return e != nullptr && e[0] != '\0' ? (int) std::strtol(e, nullptr, 10) : -1;
+    }();
+    if (env >= 0) return env > 0;
+    static core::PerDevice<bool> on;
+    const sycl::device d = core::Runtime::get().device();
+    return on.get(d, [&d] { return d.get_backend() == sycl::backend::ext_oneapi_hip && core::integrated_gpu(d); });
+}
 bool dense_mmq_on() {
     static const int v = [] {
         const char* e = std::getenv("STRATA_PREFILL_DENSE_MMQ");
@@ -3380,6 +3396,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const float* had_sh = had_d ? strata::kernels::hadamard_device_signs(lay.fmt[(size_t) l].d_signs,
                                                                                          (int) lay.fmt[(size_t) l].n_ff)
                                                 : nullptr;
+                    const bool dm16 = pf_dm16_on() && use_mmq && rows_cpu == 0 && rows_help == 0;
                     const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                     const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                     host_group_ms += ms_since(t_group);
@@ -3722,6 +3739,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * ((size_t) GRP + 1);
                             dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                             dn.ld_dst = N;
+                            if (dm16) {   // STRATA_PF_DM16: halves, the same row order
+                                dn.dst = reinterpret_cast<float*>(reinterpret_cast<uint16_t*>(m.Dm) + r0 * N);
+                                dn.half_dst = true;
+                            }
                             if (in_place) { dn.w = nullptr; dn.expert_bytes = 0; dn.wtab = m.wtab_dev + j0; dn.woff = f.down_off; }
                             else if (mtab) { dn.wtab = tabs + n + j0; dn.woff = 0; }
                             m.mmq_ctx->run(dn, m.cs);
@@ -3884,7 +3905,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         m.pend_l = (int) l;
                         m.pend_wall_n = n_stream;
                     }
-                    moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    if (dm16)
+                        moe_combine_h(reinterpret_cast<const uint16_t*>(m.Dm), m.slot_dev, m.w, m.shared, m.sg, m.bo, T,
+                                      m.cs);
+                    else moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         strata::gpu::stream_sync(m.cs);
@@ -3897,7 +3921,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         };
                         // (the CPU's rows of GU and H are never written by the GPU: not counted, upstream 4322e241)
                         // (the int8 path's GU and H hold the last group's rows only)
-                        const int64_t bgu = bad(m.GU, (use_mmq ? grp_rows_last : rows_gpu) * 1280), bdm = bad(m.Dm, T * K * N),
+                        const int64_t bgu = bad(m.GU, (use_mmq ? grp_rows_last : rows_gpu) * 1280),
+                                      bdm = dm16 ? 0 : bad(m.Dm, T * K * N),
                                       bbo = bad(m.bo, T * N);
                         const int64_t bh = use_mmq && m.H ? bad(m.H, grp_rows_last * 640) : -1;
                         static int64_t reported = -1;

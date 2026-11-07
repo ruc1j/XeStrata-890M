@@ -1534,6 +1534,16 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
         bo[i] = s + shared[i] * sigm(sg[t]);
     });
 }
+void moe_combine_h(const uint16_t* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                   float* bo, int64_t T, void* stream) {
+    const sycl::half* D = reinterpret_cast<const sycl::half*>(Dm);
+    Q(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], t = i / N, d = i % N;
+        float s = 0.0f;
+        for (int k = 0; k < 10; ++k) s = sycl::fma(w[t * 10 + k], (float) D[(int64_t) slot[t * 10 + k] * N + d], s);
+        bo[i] = s + shared[i] * sigm(sg[t]);
+    });
+}
 void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream) {
     if (T <= 0) return;
     Q(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
