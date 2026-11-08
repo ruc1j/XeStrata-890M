@@ -96,7 +96,7 @@ upstream の Strata 0.2.11 から 0.2.12（エンジンの版は 0.1.58、2026-1
 
 入れていないものは次のとおりです。
 
-- 統合 GPU で起動時の空きメモリーが少ないときの文（530a29ea2）。upstream は Strix Halo の resident RAM モードのときだけ「--vram-reserve-mib を足せ」と言わなくなります。890M でもこの文が出ますが、予約を増やして数字が上がるかをまだ確かめていません。
+- 統合 GPU で起動時の空きメモリーが少ないときの文（530a29ea2）。upstream は Strix Halo の resident RAM モードのときだけ「--vram-reserve-mib を足せ」と言わなくなります。890M では案内のとおりに予約を増やすと数字が上がるので、この文は残します。890M の host USM のエキスパートのキャッシュは、空いている RAM から予約を引いた分だけを取るからです。ほかのプログラムが RAM を 13 GiB 使っている状態で、予約が 1,624 MiB のときの空きは 0 MiB、案内どおりの 3,760 MiB のときは 1,948 MiB でした。
 - 統合 GPU で RAM の予算がエキスパートのキャッシュに残らないときの文（1d342f083）。Windows の Strix Halo ではキャッシュをグラフィックスのメモリーから取りますが、890M の Linux では GTT がシステムの RAM なので当たりません。
 - ファイル層の Linux の既定を全エキスパート常駐のとき止める変更（994029b02）と、ファイル層の再検査（0a0e4463e）。890M の構成はこの経路を通りません。
 - CPU のエキスパートの AVX-512 の行と道具、STRATA_MANIFEST、STRATA_PF_ALLOC_TRACE、token forcing の道具（force_check.py）。

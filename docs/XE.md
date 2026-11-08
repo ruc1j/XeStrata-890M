@@ -95,7 +95,7 @@ What came in:
 
 Not taken:
 
-- The line about the free memory at the start on an integrated GPU (530a29ea2). Upstream stops advising a larger --vram-reserve-mib only in the Strix Halo's resident RAM mode. The 890M prints that advice too, but whether a larger reserve raises the figure has not been checked.
+- The line about the free memory at the start on an integrated GPU (530a29ea2). Upstream stops advising a larger --vram-reserve-mib only in the Strix Halo's resident RAM mode. On the 890M a larger reserve does raise the figure, so the line stays: the expert cache in host USM takes the free RAM less the reserve. With 13 GiB of RAM held by another program, the figure was 0 MiB at a reserve of 1,624 MiB and 1,948 MiB at the advised 3,760 MiB.
 - The line about an integrated GPU whose RAM budget leaves no room for the expert cache (1d342f083). On a Windows Strix Halo the cache comes from the graphics memory; on the 890M under Linux the GTT is the system RAM, so it does not apply.
 - Turning the file tier's Linux defaults off while every expert is resident (994029b02), and the file tier's re-check (0a0e4463e). The 890M's configuration does not take that path.
 - The AVX-512 rows and tools of the CPU experts, STRATA_MANIFEST, STRATA_PF_ALLOC_TRACE, and the token-forcing tools (force_check.py).
