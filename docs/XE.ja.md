@@ -77,6 +77,20 @@ upstream の Strata 0.2.10 の既定の drafter、DFlash2（incoai/Qwen3.8-Flash
 
 1 round に受け入れるトークンの数は MTP と同じほど（約 2.5）ですが、drafter 自身が 1 round に 7.8 ms かかり（5 層の Q4_0 の重み 0.5 GB を 890M の帯域で読む時間が大半）、MTP の約 4 ms より長いので、decode は 6〜7% 遅くなります。upstream が AMD の HIP で MTP より 4〜12% 速かったのは、帯域が 2.5〜6 倍のカード（Strix Halo、R9700）です。Issue #23（2026-10-24）の見積もり（drafter の重みの読みが MTP の 4 ms を超え、+2〜3% が上限）のとおりでした。drafter は下書きを変えるだけで、答えは verify が決めます。
 
+## Strata 0.1.59 の取り込み（Qwen 4 の形状）
+
+upstream の Strata 0.2.12 から 0.2.13.1（エンジンの版は 0.1.59、2026-11-09）までの 219 コミットを調べ、Qwen 4 系の形状に対応する作業の最初の部分だけを入れました。一覧は `.upstream-0159.md`（リポジトリの根、git の外）です。版は xe0.2.12-1 のままです。
+この fork は、upstream が 2026-10-12 から持つ geometry（モデルの形状を GGUF から読み、カーネルのコンパイルした形状と照らす仕組み）を取り込んでおらず、形状は `core/layout.hpp` と `artifact/model_spec.hpp` で読んでいました。fork の SYCL のカーネルは `src/kernels/xe/` にある独自の移植なので、upstream の `sycl/` の差分は `patch` では当たらず、行ごとの置き換えで入れました。
+
+入れたものは次のとおりです。
+
+- コンパイルするモデルの形状をヘッダで選びます。`-DSTRATA_GEOMETRY=<名前>`（`flash_next`（既定）、`q4_lite`、`q4_mid`、`q4_big`、`q4_deep`）か、`-DSTRATA_GEOMETRY_FILE=<パス>`（まだ木にない形状のヘッダ）で指定します。指定しなければ、これまでのビルドと同じです。形状は `include/strata/core/geometry.hpp` の `ModelGeometry` と `kCompiledGeometry` で、どの形状も満たすべき条件は `geometry_checks.hpp` の `static_assert` が検査します。`geometry_from_spec` は、GGUF の値を既定値ではなくこの形状と比べます。
+- `prefill.cpp`、prefill のカーネル、`fused_gr`、`s2_expert_grouped`、`native_ple_postops`、`qsa_prompt_attn`、`ngram`、CPU のエキスパートの定数は、`kCompiledGeometry` から取ります。Flash-Next の値は変わりません。890M の IQ2_XS で、設置済みのエンジン（xe0.2.10-1）と 6 チャットの greedy の答えが同じで、slots も同じ 24,576、decode は 36.03 対 36.05 tok/s でした。
+- `tools/q4geo_synth.py`（任意の形状の合成 GGUF と、その形状のヘッダ）、`tools/qwen4_intake.py`（GGUF のヘッダを読み、新しいモデルを動かすのに何が要るかを言う道具）、`strata_tokenizer.pre_tokenizer_kind`、`serve/toolformat.py` を入れました。
+
+Flash-Next 以外の形状のビルドは、まだ通りません。`fused_gr` の up の読みが hc_lr 320 を前提にしているため（`gr_up_fast` の 40 行 × 8 の分け方）、`q4_lite`（hc_lr 256）では `static_assert` で止まります。そのほかの `prefill`、attention、PLE、`generate` は、`q4_lite` でもホスト側のコンパイルが通ります。
+入れていないものは、新しい形状のモデルを feed で配る仕組み（`strata_control` と setup の shape engine）、CUDA と HIP の geometry、Metal、Windows の Strix Halo の変更です。この fork にその層がなく、SYCL のカーネルに同じ切り替えもありません。SYCL の Q5_K と Q6_K の down は、fork の `native_expert_supported` が前から受けています。
+
 ## Strata 0.1.58 の取り込み
 
 upstream の Strata 0.2.11 から 0.2.12（エンジンの版は 0.1.58、2026-11-07）までの 84 コミット（merge を除く）のうち、エンジン・serve・setup の層に当たるものを XeStrata-890M に移しました。前回と同じく Strata のコミットを `patch -F3` で当て、ずれた hunk は手で置き直しました。一覧は `.upstream-0158.md`（リポジトリの根、git の外）です。

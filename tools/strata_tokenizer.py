@@ -111,6 +111,14 @@ PRE_TYPES = {
     HUNYUANIMAGE3_PRE: (QWEN2_PATTERN, True, "tencent/HunyuanImage-3.0*'s tokenizer.json, 2026-10-24"),
 }
 
+def pre_tokenizer_kind(pre) -> str | None:
+    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: its PRE_TYPES key, or
+    None for a type this file has no rule for.  An empty or missing value is the qwen35 default.  (tools/qwen4_intake.py asks this
+    of a model's tokenizer before the engine is run on it.)"""
+    p = "qwen35" if pre is None or pre == "" else str(pre)
+    return p if p in PRE_TYPES else None
+
+
 # The strings a file's pre-tokenizer regex is compared against another shape's on: enough of the classes
 # (contractions, letters, digits, punctuation runs, every kind of whitespace run, CJK, marks, emoji) that two
 # regexes which agree here agree on the shapes that differ.  The comparison is by what they split, not by their

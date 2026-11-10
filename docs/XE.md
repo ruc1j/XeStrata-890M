@@ -76,6 +76,20 @@ Three interleaved rounds (24,576 slots, cooled between runs): the MTP 31.6 / 31.
 
 The tokens accepted a round are about the MTP's (about 2.5), but the drafter itself takes 7.8 ms a round (mostly the time the 890M's bandwidth needs to read the 5 layers' 0.5 GB of Q4_0 weights), longer than the MTP's about 4 ms, so decode is 6 to 7% slower. Where upstream measured DFlash2 4 to 12% faster than the MTP on AMD HIP, the cards (Strix Halo, the R9700) have 2.5 to 6 times the bandwidth. Issue #23's estimate (2026-10-24: the drafter's weight reads exceed the MTP's 4 ms, +2 to 3% at best) held. The drafter changes only the drafts; the verify decides the answers.
 
+## Integration through Strata 0.1.59 (the Qwen 4 shapes)
+
+Strata 0.2.12 to 0.2.13.1 (engine version 0.1.59, 2026-11-09) is 219 commits; XeStrata-890M took only the groundwork for Qwen 4 shapes from them. The list is `.upstream-0159.md` (the repository root, outside git). The version stays xe0.2.12-1.
+The fork never took upstream's geometry (the model's shape read from the GGUF and checked against the shape the kernels are compiled for, in upstream since 2026-10-12): it read the shape through `core/layout.hpp` and `artifact/model_spec.hpp`. The fork's SYCL kernels are their own port in `src/kernels/xe/`, so upstream's `sycl/` diffs do not apply with `patch`; they went in by line replacement.
+
+What went in:
+
+- The shape the kernels are compiled for is chosen by a header. `-DSTRATA_GEOMETRY=<name>` (`flash_next`, the default, `q4_lite`, `q4_mid`, `q4_big`, `q4_deep`) or `-DSTRATA_GEOMETRY_FILE=<path>` (a header for a shape not in the tree yet) selects it; with neither, the build is the one it was. The shape is `ModelGeometry` and `kCompiledGeometry` in `include/strata/core/geometry.hpp`, and `geometry_checks.hpp` checks with `static_assert` what every shape must meet. `geometry_from_spec` compares a GGUF's values with this shape, not with defaults.
+- `prefill.cpp`, the prefill kernels, `fused_gr`, `s2_expert_grouped`, `native_ple_postops`, `qsa_prompt_attn`, `ngram` and the CPU experts' constants come from `kCompiledGeometry`. Flash-Next's values do not change. On the 890M with IQ2_XS, the installed engine (xe0.2.10-1) and the new build gave the same greedy answers on 6 chats, the same slots (24,576), and decode of 36.03 against 36.05 tok/s.
+- `tools/q4geo_synth.py` (a synthetic GGUF of any shape, and that shape's header), `tools/qwen4_intake.py` (reads a GGUF's header and says what it takes to run a new model), `strata_tokenizer.pre_tokenizer_kind` and `serve/toolformat.py`.
+
+A build for a shape other than Flash-Next does not pass yet. `fused_gr`'s up read assumes hc_lr 320 (`gr_up_fast`'s 40 rows of 8), so `q4_lite` (hc_lr 256) stops at a `static_assert`. The rest (`prefill`, attention, PLE, `generate`) compile on the host side for `q4_lite` too.
+Not taken: the feed that ships models of a new shape (`strata_control` and setup's shape engine), the CUDA and HIP geometry, Metal, and the Windows Strix Halo changes. The fork has no such layer and its SYCL kernels have no matching switch. SYCL's Q5_K and Q6_K downs have been accepted by the fork's `native_expert_supported` all along.
+
 ## Integration through Strata 0.1.58
 
 Of the 84 upstream Strata commits (merges aside) from 0.2.11 to 0.2.12 (engine version 0.1.58, 2026-11-07), the ones that touch the engine, serve and setup layers came into XeStrata-890M. As last time, Strata's commits were applied with `patch -F3` and the hunks that missed were placed by hand. The list is `.upstream-0158.md` (the repository root, outside git).

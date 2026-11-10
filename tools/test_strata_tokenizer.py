@@ -400,3 +400,16 @@ class ByteCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreTokenizerKind(unittest.TestCase):
+    """The rule a tokenizer.ggml.pre stands for (tools/qwen4_intake.py reads it); a type with no rule is None."""
+
+    def test_known_and_unknown_types(self):
+        self.assertEqual(ST.pre_tokenizer_kind("qwen35"), "qwen35")
+        self.assertEqual(ST.pre_tokenizer_kind(None), "qwen35")
+        self.assertEqual(ST.pre_tokenizer_kind(""), "qwen35")
+        for p in ST.PRE_TYPES:
+            self.assertEqual(ST.pre_tokenizer_kind(p), p)
+        for p in ("qwen4", "default", "gpt2", "llama-bpe", "Qwen35", " qwen35"):
+            self.assertIsNone(ST.pre_tokenizer_kind(p), p)
