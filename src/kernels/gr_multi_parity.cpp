@@ -7,6 +7,7 @@
 // Real geometry (n_embd 2560, hc 4), the pinned native MMVF path, every T = 1..8, the write both out of place and in
 // place (R_out == R).  Each output of the multi call must equal the token-by-token one bit for bit.  GPU, synthetic,
 // no model.  (Upstream's gr_read_multi half is not here: on Xe the window's reads are fused_gr_read_multi.)
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/gr.hpp"
 
 #include "parity_device.hpp"
@@ -36,7 +37,7 @@ template <typename T> std::vector<T> down(const T* d, size_t n) {
 }  // namespace
 
 int main() {
-    const long long n_embd = 2560, hc = 4, hc_lr = 320, hc_dim = hc * n_embd;
+    const long long n_embd = strata::core::kCompiledGeometry.n_embd, hc = strata::core::kCompiledGeometry.hc, hc_lr = strata::core::kCompiledGeometry.hc_lr, hc_dim = hc * n_embd;   // the compiled shape (Q4-SYCL)
     std::mt19937 rng(783);  // NOLINT(bugprone-random-generator-seed): reproducible rows.
     std::normal_distribution<float> gauss(0.f, 1.f);
     k::gr_set_native_mmvf(true);

@@ -6,6 +6,7 @@
 //
 // Work-group shapes and reduction orders are the CUDA kernels'; a warp is a sub-group of 32.  CUDA's __expf and
 // rsqrtf become the precise exp and SYCL's rsqrt; explicit fmaf calls stay fused.
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "xe_shuffle.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -30,10 +31,10 @@
 namespace strata::kernels {
 namespace {
 
-constexpr int N = 2560;         // n_embd
-constexpr int HC = 4;           // streams
-constexpr int D = N * HC;       // 10240
-constexpr int LR = 320;         // hc_lr
+constexpr int N = strata::core::kCompiledGeometry.n_embd;       // n_embd (2560 for Flash-Next)
+constexpr int HC = strata::core::kCompiledGeometry.hc;          // streams
+constexpr int D = N * HC;                                       // 10240
+constexpr int LR = strata::core::kCompiledGeometry.hc_lr;       // hc_lr (320)
 constexpr int THREADS = 256;
 constexpr int WARPS = THREADS / 32;
 constexpr int WARP = 32;

@@ -8,6 +8,7 @@
 // the kernel walks the chunk's tokens in order inside one launch.
 #pragma once
 
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 
@@ -76,7 +77,7 @@ void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* s
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream);
 /// h16[n, r] = fp16(silu(g[n, r]) * u[n, r])   (the shared expert, gate and up separate, n rows of `width`: Qwen3.8's
 /// 640, qwen35moe's 512)
-void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width = 640);
+void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width = strata::core::kCompiledGeometry.n_ff);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// Gather rows: dst[i, :] = x[src[i], :] (n rows of `width` floats).

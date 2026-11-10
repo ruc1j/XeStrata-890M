@@ -21,6 +21,7 @@
 // It also checks the STATE LAYOUT, which is the one place these kernels intentionally differ from the
 // reference: (S, h_v, S) with j fastest instead of (S, S, h_v).  A layout mix-up is silent, so the state is
 // filled with a value that encodes its own coordinates.
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/gdn.hpp"
 
 #include "parity_device.hpp"
@@ -97,7 +98,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: gdn_parity [--selftest]\n"); return 2; }
     }
 
-    const int S = 128, h_k = 16, h_v = 48;      // the artifact's real geometry
+    const int S = strata::core::kCompiledGeometry.ssm_state_size, h_k = strata::core::kCompiledGeometry.ssm_k_heads, h_v = strata::core::kCompiledGeometry.ssm_v_heads;      // the compiled shape (Flash-Next: the artifact's 128 / 16 / 48)
     std::mt19937 rng(2024);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     int bad = 0;

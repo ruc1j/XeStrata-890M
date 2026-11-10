@@ -16,6 +16,7 @@
 //   * q stays in registers as joint_matrix tiles, and so does the output: each chunk scales its rows by the
 //     softmax's correction and the change of V scale, then adds the chunk's p.v.
 // Not bitwise equal to `qsa_decode_attn_batch`; qsa_prompt_attn_parity bounds the difference.
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "xe_shuffle.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -47,7 +48,8 @@ namespace syclex = sycl::ext::oneapi::experimental;
 using sycl::half;
 
 constexpr int HD = 256;           // head_dim
-constexpr int G = 12;             // query heads per KV head (+ 4 zero rows: two 8-row tiles)
+constexpr int G = strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv;   // query heads per KV head (12 for Flash-Next; the tiles pad the rows to 16)
+static_assert(G >= 1 && G <= 16, "qsa_prompt_attn: query heads per KV head must be 1..16 (one M16 tile)");
 constexpr int R = 16;             // rows of q, p and the output
 constexpr int NG = 4;             // 64-dim groups
 constexpr int SGS = 16;           // sub-group size

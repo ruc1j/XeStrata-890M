@@ -5,6 +5,7 @@
 // shapes, explicit fmaf and summation orders are the CUDA kernels'; a warp is a sub-group of 32 and a 2-D CUDA block
 // is linearised the way CUDA numbers its threads (x fastest).  __expf, rsqrtf, powf, cosf, sinf and log1pf are the
 // precise SYCL functions.
+#include "strata/core/geometry.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "../kernels/xe/amd_wmma.hpp"
 #include "../kernels/xe/device_target.hpp"
@@ -32,8 +33,11 @@
 namespace strata::prefill {
 namespace {
 
-constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
-constexpr int S = 128;   // a GDN head's width (the shapes: struct Gdn below)
+constexpr int N = strata::core::kCompiledGeometry.n_embd, HC = strata::core::kCompiledGeometry.hc, D = N * HC, LR = strata::core::kCompiledGeometry.hc_lr;
+constexpr int KU = strata::core::kCompiledGeometry.n_expert_used;   // routed experts per token (10 for Flash-Next)
+constexpr int64_t FFC = strata::core::kCompiledGeometry.n_ff;       // the routed (and shared) expert width: 640 for Flash-Next
+constexpr int NHQ = strata::core::kCompiledGeometry.n_head, NKVH = strata::core::kCompiledGeometry.n_head_kv;   // query heads (24) and KV heads (2), head width 256
+constexpr int S = strata::core::kCompiledGeometry.ssm_state_size;   // a GDN head's width (the shapes: struct Gdn below)
 constexpr int WARP = 32;
 
 sycl::queue& Q(void* stream) { return core::Runtime::get().stream(stream); }
@@ -102,7 +106,7 @@ void route_launch(sycl::queue& q, const float* logits, int32_t* ids, float* wout
         const float rcp = 1.0f / warp_sum(sg, sum);
         for (int i = 0; i < REG; ++i) { v[i] *= rcp; if (sycl::isnan(v[i])) v[i] = -FLT_MAX; }
         float selected = 0.0f, selected_sum = 0.0f;
-        for (int rank = 0; rank < 10; ++rank) {
+        for (int rank = 0; rank < KU; ++rank) {
             float best = v[0];
             int ex = lane;
             for (int i = 1; i < REG; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
@@ -112,37 +116,38 @@ void route_launch(sycl::queue& q, const float* logits, int32_t* ids, float* wout
                 if (ob > best || (ob == best && oi < ex)) { best = ob; ex = oi; }
             }
             if ((ex & 31) == lane) { v[ex / 32] = -INFINITY; selected_sum += best; }
-            if (lane == 0) ids[t * 10 + rank] = ex;
+            if (lane == 0) ids[t * KU + rank] = ex;
             if (rank == lane) selected = best;
         }
         selected_sum = sycl::fmax(warp_sum(sg, selected_sum), 6.103515625e-5f);
-        if (lane < 10) wout[t * 10 + lane] = selected / selected_sum;
+        if (lane < KU) wout[t * KU + lane] = selected / selected_sum;
     });
 }
 
-// Strata blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales
-// [2560][10] f16
+// Strata blob: gate/up codes [2 FF][N/4 B], down codes [N][FF/4 B], gate/up scales [2 FF][N/64] f16, down scales
+// [N][FF/64] f16 (FF = 640, N = 2560 for Flash-Next: 1280 x 640 B, 2560 x 160 B, 1280 x 40, 2560 x 10)
 template <bool HALF>
 void blob_dequant_launch(sycl::queue& q, const uint8_t* blob, uint16_t* gu16, uint16_t* d16) {
-    constexpr size_t O_D_CODES = (size_t) 1280 * 640, O_GU_SC = O_D_CODES + (size_t) 2560 * 160,
-                     O_D_SC = O_GU_SC + (size_t) 1280 * 40 * 2;
-    const int64_t n_gu = 1280LL * 640, n_d = 2560LL * 160;
+    constexpr int64_t GU_B = N / 4, D_B = FFC / 4, GU_S = N / 64, D_S = FFC / 64;   // code bytes and scales per row
+    constexpr size_t O_D_CODES = (size_t) (2 * FFC) * GU_B, O_GU_SC = O_D_CODES + (size_t) N * D_B,
+                     O_D_SC = O_GU_SC + (size_t) (2 * FFC) * GU_S * 2;
+    constexpr int64_t n_gu = (2 * FFC) * GU_B, n_d = (int64_t) N * D_B;
     q.parallel_for(sycl::range<1>((size_t) (n_gu + n_d)), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0];   // one work-item per 4 weights (one code byte)
         auto out = [](float v) -> uint16_t { return HALF ? hf(v) : bf(v); };
         if (i < n_gu) {
-            const int64_t row = i / 640, byte = i % 640;
-            const uint8_t c = blob[row * 640 + byte];
-            const uint8_t* sp = blob + O_GU_SC + (size_t) (row * 40 + (byte * 4) / 64) * 2;
+            const int64_t row = i / GU_B, byte = i % GU_B;
+            const uint8_t c = blob[row * GU_B + byte];
+            const uint8_t* sp = blob + O_GU_SC + (size_t) (row * GU_S + (byte * 4) / 64) * 2;
             const float d = kernels::f32_from_f16((uint16_t) (sp[0] | (sp[1] << 8)));
-            uint16_t* o = gu16 + row * 2560 + byte * 4;
+            uint16_t* o = gu16 + row * N + byte * 4;
             for (int k = 0; k < 4; ++k) o[k] = out((float) (((c >> (2 * k)) & 3) - 1) * d);
         } else {
-            const int64_t j = i - n_gu, row = j / 160, byte = j % 160;
-            const uint8_t c = blob[O_D_CODES + row * 160 + byte];
-            const uint8_t* sp = blob + O_D_SC + (size_t) (row * 10 + (byte * 4) / 64) * 2;
+            const int64_t j = i - n_gu, row = j / D_B, byte = j % D_B;
+            const uint8_t c = blob[O_D_CODES + row * D_B + byte];
+            const uint8_t* sp = blob + O_D_SC + (size_t) (row * D_S + (byte * 4) / 64) * 2;
             const float d = kernels::f32_from_f16((uint16_t) (sp[0] | (sp[1] << 8)));
-            uint16_t* o = d16 + row * 640 + byte * 4;
+            uint16_t* o = d16 + row * FFC + byte * 4;
             for (int k = 0; k < 4; ++k) o[k] = out((float) (((c >> (2 * k)) & 3) - 1) * d);
         }
     });
@@ -177,7 +182,7 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
             const bool is_v = (z & 1) != 0;
             const int tid = (int) it.get_local_id(2);
             const int d = g * 64 + tid;
-            const float x = (is_v ? V : K)[t * 512 + kvh * 256 + d];
+            const float x = (is_v ? V : K)[t * (NKVH * 256) + kvh * 256 + d];
             const int64_t pos = pos0 + t;
             const int64_t page = table[pos / page_size];
             const int64_t row = (page * 2 + kvh) * page_size + pos % page_size;
@@ -1478,7 +1483,7 @@ void gdn_recurrence_state_only(float* state, const float* h, const float* gate, 
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512) route_launch<16>(Q(stream), logits, ids, weights, T);
     else if (n_expert == 256) route_launch<8>(Q(stream), logits, ids, weights, T);
-    else strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
+    else strata::kernels::router_top10(logits, (int) T, (int) n_expert, KU, ids, weights, stream);
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
     blob_dequant_launch<false>(Q(stream), blob, gu16, down16);
@@ -1488,9 +1493,9 @@ void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, voi
 }
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream) {
     if (n <= 0) return;
-    Q(stream).parallel_for(sycl::range<1>((size_t) (n * 640)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], r = i / 640, k = i % 640;
-        const float g = gu[r * 1280 + 2 * k], u = gu[r * 1280 + 2 * k + 1];
+    Q(stream).parallel_for(sycl::range<1>((size_t) (n * FFC)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], r = i / FFC, k = i % FFC;
+        const float g = gu[r * (2 * FFC) + 2 * k], u = gu[r * (2 * FFC) + 2 * k + 1];
         h16[i] = hf_sat(g / (1.0f + sycl::exp(-g)) * u);
     });
 }
@@ -1530,7 +1535,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
     Q(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0], t = i / N, d = i % N;
         float s = 0.0f;
-        for (int k = 0; k < 10; ++k) s = sycl::fma(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+        for (int k = 0; k < KU; ++k) s = sycl::fma(w[t * KU + k], Dm[(int64_t) slot[t * KU + k] * N + d], s);
         bo[i] = s + shared[i] * sigm(sg[t]);
     });
 }
@@ -1540,7 +1545,7 @@ void moe_combine_h(const uint16_t* Dm, const int32_t* slot, const float* w, cons
     Q(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0], t = i / N, d = i % N;
         float s = 0.0f;
-        for (int k = 0; k < 10; ++k) s = sycl::fma(w[t * 10 + k], (float) D[(int64_t) slot[t * 10 + k] * N + d], s);
+        for (int k = 0; k < KU; ++k) s = sycl::fma(w[t * KU + k], (float) D[(int64_t) slot[t * KU + k] * N + d], s);
         bo[i] = s + shared[i] * sigm(sg[t]);
     });
 }
@@ -1600,15 +1605,15 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
     });
 }
 void split_q(const float* qf, float* q, int64_t T, void* stream) {
-    Q(stream).parallel_for(sycl::range<1>((size_t) (T * 24 * 256)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
-        q[i] = qf[t * 24 * 512 + h * 512 + d];
+    Q(stream).parallel_for(sycl::range<1>((size_t) (T * NHQ * 256)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], t = i / (NHQ * 256), h = (i / 256) % NHQ, d = i % 256;
+        q[i] = qf[t * NHQ * 512 + h * 512 + d];
     });
 }
 void gate_attn(const float* a, const float* qf, uint16_t* o16, int64_t T, void* stream) {
-    Q(stream).parallel_for(sycl::range<1>((size_t) (T * 24 * 256)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
-        o16[i] = hf(a[i] * (1.0f / (1.0f + sycl::exp(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
+    Q(stream).parallel_for(sycl::range<1>((size_t) (T * NHQ * 256)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], t = i / (NHQ * 256), h = (i / 256) % NHQ, d = i % 256;
+        o16[i] = hf(a[i] * (1.0f / (1.0f + sycl::exp(-qf[t * NHQ * 512 + h * 512 + 256 + d]))));
     });
 }
 

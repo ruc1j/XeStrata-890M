@@ -7,6 +7,7 @@
 //
 // CUDA's explicit round-to-nearest operations are plain operations here, since the library does not contract; the
 // fma with a zero addend (ggml SCALE's zero bias) stays an fma.  expf and sqrtf are the precise ones.
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "xe_shuffle.hpp"
 #include "strata/kernels/native_gr_norm.hpp"
@@ -30,7 +31,7 @@ template <int BlockSize> class RmsRepKernel;   // asked for its work-group (work
 
 namespace {
 
-constexpr int N = 2560, H = 4, D = N * H, HISTORY = 9;
+constexpr int N = strata::core::kCompiledGeometry.n_embd, H = strata::core::kCompiledGeometry.hc, D = N * H, HISTORY = 9;
 constexpr int WARP = 32;
 
 inline float warp_sum(const sycl::sub_group& sg, float x) {

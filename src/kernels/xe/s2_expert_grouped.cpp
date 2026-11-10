@@ -10,6 +10,7 @@
 // reduction over eight lanes (offsets 4, 1, 2).  The ballot/popc compactions are integer group scans, which place
 // every hit where CUDA placed it.  Work-items past the last row keep computing (on row 0) and do not write, because
 // a sub-group permute needs every lane.
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "xe_shuffle.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -28,8 +29,8 @@ namespace {
 
 using xe::dp4a;
 
-constexpr int H = 2560;
-constexpr int FF = 640;
+constexpr int H = strata::core::kCompiledGeometry.n_embd;
+constexpr int FF = strata::core::kCompiledGeometry.n_ff;
 static_assert(FF % 32 == 0, "swiglu_q8_launch works in whole 32-value blocks");
 constexpr int QK = 64;                       // Q2_0's group: one fp16 scale per 64 weights
 constexpr int ROW_GU = H / 4;                // 640 B of codes per gate/up row (2 bits per element)
