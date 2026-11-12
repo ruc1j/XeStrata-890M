@@ -1156,6 +1156,8 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(gdn_bench PRIVATE strata_kernels)
     add_executable(gr_bench src/kernels/gr_bench.cpp)
     target_link_libraries(gr_bench PRIVATE strata_kernels)
+    # the Q8_0 hyper-connection read against a CPU reference in double, at the compiled shape (-DSTRATA_GEOMETRY): GPU, synthetic
+    add_test(NAME gr_read_ref COMMAND gr_bench --ref --q8-mixed --layers 2)
     add_executable(gemm_bench src/kernels/gemm_bench.cpp)
     target_link_libraries(gemm_bench PRIVATE strata_kernels)
     # #783 PR-c: the multi-token router against the single one, the combine against its contract's host replay

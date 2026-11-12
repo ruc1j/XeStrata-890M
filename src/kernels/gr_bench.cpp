@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/gr_bench.cpp - the hyper-connection read's time on this GPU (XeStrata-890M): fused_gr_read_multi with the
 // Q8_0 down and up projections (STRATA_HC_Q8's) for T = 1..6 tokens, as a verify window calls it for every layer.
-// Random values from a fixed seed: `--save F` writes the outputs (mixed, R, inject), `--check F` compares to them.
-//     gr_bench [--save F | --check F] [--layers N]   (N matrices round robin, default 8, so the L2 does not hold them)
+// Random values from a fixed seed: `--save F` writes the outputs (mixed, R, inject), `--check F` compares to them;
+// `--ref` compares them with a CPU reference in double (the read's arithmetic from the same Q8_0 rows), at the shape the
+// build is compiled for (core/geometry.hpp: -DSTRATA_GEOMETRY), so a new shape's read is checked against something
+// other than itself.
+//     gr_bench [--save F | --check F] [--ref] [--q8-mixed] [--layers N]   (N matrices round robin, default 8, so the L2 does not hold them)
+#include "strata/core/geometry.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/kernels/fused_gr.hpp"
 
@@ -20,7 +24,65 @@
 #include <thread>
 
 namespace {
-constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
+// the shape the build is compiled for (2560 / 4 / 320 for Flash-Next)
+constexpr int N = (int) strata::core::kCompiledGeometry.n_embd, HC = (int) strata::core::kCompiledGeometry.hc, D = N * HC,
+              LR = (int) strata::core::kCompiledGeometry.hc_lr;
+float f16_value(uint16_t h) {
+    const uint32_t u = h, s = u >> 15U, e = (u >> 10U) & 0x1fU, m = u & 0x3ffU;
+    const float v = e == 0 ? std::ldexp((float) m, -24) : std::ldexp((float) (m | 0x400U), (int) e - 25);
+    return s != 0 ? -v : v;
+}
+// a kNativeQ8Rows row's value c
+double q8_at(const std::vector<uint8_t>& m, int cols, int r, int c) {
+    const uint8_t* p = m.data() + (size_t) r * ((size_t) cols / 32 * 34);
+    uint16_t d;
+    std::memcpy(&d, p + (size_t) cols + (size_t) 2 * (size_t) (c / 32), 2);
+    return (double) (int8_t) p[c] * (double) f16_value(d);
+}
+double bf16_value(uint16_t b) {
+    const uint32_t u = (uint32_t) b << 16U;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+// the read of one token without a previous write to fold (apply false): mixed (N), then inject (HC)
+std::vector<double> read_ref(const std::vector<float>& R, const std::vector<float>& wn, const std::vector<uint8_t>& qd,
+                             const std::vector<uint8_t>& qu, const std::vector<uint16_t>& wi, float eps) {
+    std::vector<double> rs(HC), x(D), lo(LR), out((size_t) N + HC, 0.0);
+    for (int c = 0; c < HC; ++c) {
+        double ss = 0.0;
+        for (int i = 0; i < N; ++i) ss += (double) R[(size_t) c * N + i] * R[(size_t) c * N + i];
+        rs[c] = 1.0 / std::sqrt(ss / N + eps);
+    }
+    for (int i = 0; i < D; ++i) x[i] = (double) R[i] * wn[i];
+    for (int r = 0; r < LR; ++r) {
+        double sum = 0.0;
+        for (int c = 0; c < HC; ++c) {
+            double p = 0.0;
+            for (int i = 0; i < N; ++i) p += q8_at(qd, D, r, c * N + i) * x[(size_t) c * N + i];
+            sum += rs[c] * p;
+        }
+        const double v = sum / HC;
+        lo[r] = v / (1.0 + std::exp(-v));
+    }
+    for (int h = 0; h < HC; ++h) {
+        double sum = 0.0;
+        for (int c = 0; c < HC; ++c) {
+            double p = 0.0;
+            for (int i = 0; i < N; ++i) p += bf16_value(wi[(size_t) h * D + (size_t) c * N + i]) * x[(size_t) c * N + i];
+            sum += rs[c] * p;
+        }
+        out[(size_t) N + h] = sum;
+    }
+    for (int c = 0; c < HC; ++c)
+        for (int d = 0; d < N; ++d) {
+            const int i = c * N + d;
+            double mine = 0.0;
+            for (int r = 0; r < LR; ++r) mine += q8_at(qu, LR, i, r) * lo[r];
+            out[d] += x[i] * rs[c] / (1.0 + std::exp(-mine)) / HC;
+        }
+    return out;
+}
 uint16_t f16_bits(float f) {
     uint32_t u;
     std::memcpy(&u, &f, 4);
@@ -52,19 +114,28 @@ template<class T> T* up(const std::vector<T>& v) {
 int main(int argc, char** argv) {
     std::string save, check;
     int layers = 8;
+    bool ref = false, q8m = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--save") && i + 1 < argc) save = argv[++i];
         else if (!std::strcmp(argv[i], "--check") && i + 1 < argc) check = argv[++i];
         else if (!std::strcmp(argv[i], "--layers") && i + 1 < argc) layers = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--ref")) ref = true;
+        else if (!std::strcmp(argv[i], "--q8-mixed")) q8m = true;   // the 32-column up that also writes mixed as q8_1
     }
+    std::printf("shape: n_embd %d, hc %d, hc_lr %d\n", N, HC, LR);
     std::mt19937 rng(5);
     std::uniform_real_distribution<float> uni(-1.0f, 1.0f);
     std::vector<uint8_t*> qd(layers), qu(layers);
     std::vector<uint16_t*> wd(layers), wu(layers), wi(layers);
     std::vector<float*> wn(layers);
+    std::vector<uint8_t> qd0, qu0;   // layer 0's, for --ref
+    std::vector<uint16_t> wi0;
+    std::vector<float> wn0;
     for (int l = 0; l < layers; ++l) {
-        qd[l] = up(q8_rows(LR, D, rng));
-        qu[l] = up(q8_rows(D, LR, rng));
+        const std::vector<uint8_t> hd = q8_rows(LR, D, rng), hu = q8_rows(D, LR, rng);
+        qd[l] = up(hd);
+        qu[l] = up(hu);
+        if (l == 0) { qd0 = hd; qu0 = hu; }
         std::vector<uint16_t> bf((size_t) LR * D);
         for (auto& x : bf) x = (uint16_t) (0x3c00 | (rng() & 0x7f));   // small BF16 values
         wd[l] = up(bf);
@@ -75,26 +146,39 @@ int main(int argc, char** argv) {
         std::vector<float> norm(D);
         for (auto& x : norm) x = 1.0f + 0.1f * uni(rng);
         wn[l] = up(norm);
+        if (l == 0) { wi0 = inj; wn0 = norm; }
     }
     constexpr int TMAX = 6;
     std::vector<float*> R(TMAX), bo(TMAX), ip(TMAX), lo(TMAX), rs(TMAX), injo(TMAX), mixed(TMAX);
+    std::vector<std::vector<float>> Rh(TMAX);
+    std::vector<void*> q8mx(TMAX, nullptr);
     for (int t = 0; t < TMAX; ++t) {
         std::vector<float> r(D), b(N), i(HC);
         for (auto& x : r) x = uni(rng);
         for (auto& x : b) x = 0.1f * uni(rng);
         for (auto& x : i) x = uni(rng);
         R[t] = up(r);
+        Rh[t] = r;
         bo[t] = up(b);
         ip[t] = up(i);
         strata::gpu::alloc_device(&lo[t], LR * 4);
         strata::gpu::alloc_device(&rs[t], HC * 4);
         strata::gpu::alloc_device(&injo[t], HC * 4);
         strata::gpu::alloc_device(&mixed[t], N * 4);
+        if (q8m) {
+            uint8_t* b = nullptr;
+            strata::gpu::alloc_device(&b, (size_t) N / 32 * 36);
+            q8mx[t] = b;
+        }
     }
     float* scratch = nullptr;
     strata::gpu::alloc_device(&scratch, (size_t) strata::kernels::kFusedGrMaxT * D * 4);
     void* s = strata::gpu::stream_create();
     std::vector<float> all;
+    std::vector<std::vector<double>> want;   // --ref: each token's, computed once
+    if (ref)
+        for (int t = 0; t < TMAX; ++t) want.push_back(read_ref(Rh[t], wn0, qd0, qu0, wi0, 1e-6f));
+    double ref_worst = 0.0;
     for (int T = 1; T <= TMAX; ++T) {
         auto args = [&](int l) {
             std::vector<strata::kernels::FusedGrArgs> a(T);
@@ -103,7 +187,7 @@ int main(int argc, char** argv) {
                 x.R = R[t]; x.R_out = nullptr; x.apply = false; x.bo_prev = bo[t]; x.inj_prev = ip[t];
                 x.w_norm = wn[l]; x.w_down = wd[l]; x.w_up = wu[l]; x.w_inject = wi[l];
                 x.lo = lo[t]; x.rs = rs[t]; x.inject_out = injo[t]; x.mixed = mixed[t];
-                x.q8_down = qd[l]; x.q8_up = qu[l];
+                x.q8_down = qd[l]; x.q8_up = qu[l]; x.q8_mixed = q8mx[t];
             }
             return a;
         };
@@ -116,6 +200,14 @@ int main(int argc, char** argv) {
             strata::gpu::copy(inj.data(), injo[t], HC * 4);
             all.insert(all.end(), y.begin(), y.end());
             all.insert(all.end(), inj.begin(), inj.end());
+            if (ref) {   // the largest difference against the outputs' rms, mixed and inject apart
+                double dm = 0, sm = 0, di = 0, si = 0;
+                for (int d = 0; d < N; ++d) { dm = std::max(dm, std::fabs(y[d] - want[t][d])); sm += want[t][d] * want[t][d]; }
+                for (int h = 0; h < HC; ++h) { di = std::max(di, std::fabs(inj[h] - want[t][(size_t) N + h])); si += want[t][(size_t) N + h] * want[t][(size_t) N + h]; }
+                const double rm = dm / std::sqrt(sm / N), ri = di / std::sqrt(si / HC);
+                ref_worst = std::max({ref_worst, rm, ri});
+                if (t == T - 1) std::printf("ref T %d token %d: mixed %.3g, inject %.3g of the rms\n", T, t, rm, ri);
+            }
         }
         std::vector<std::vector<strata::kernels::FusedGrArgs>> per(layers);
         for (int l = 0; l < layers; ++l) per[l] = args(l);
@@ -126,6 +218,12 @@ int main(int argc, char** argv) {
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
         const double bytes = 2.0 * LR * D / 32 * 34;
         std::printf("T %d  %7.1f us  %5.1f GB/s (the two Q8_0 matrices)\n", T, us, bytes / us / 1e3);
+    }
+    if (ref) {
+        // float32 sums of a few thousand terms against double: 1e-3 of the rms leaves room for the order, not for a wrong row
+        const bool ok = ref_worst < 1e-3;
+        std::printf("ref: worst %.3g of the rms: %s\n", ref_worst, ok ? "pass" : "FAIL");
+        if (!ok) return 3;
     }
     if (std::getenv("BENCH_LINGER") != nullptr) std::this_thread::sleep_for(std::chrono::seconds(3));   // a tracer's flush
     if (!save.empty()) {

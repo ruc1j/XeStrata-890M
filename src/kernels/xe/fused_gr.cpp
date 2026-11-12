@@ -51,7 +51,7 @@ constexpr int UPM_BLOCKS = N / UPM_COLS;         // 160
 #define STRATA_Q8_RPW 2
 #endif
 #ifndef STRATA_Q8_KC
-#define STRATA_Q8_KC 640
+#define STRATA_Q8_KC (N / 4)   // a stream in 4 chunks: 640 for Flash-Next's 2560 (upstream d10a8cd7e: from n_embd)
 #endif
 #ifndef STRATA_HC_UP8
 #define STRATA_HC_UP8 1
@@ -64,6 +64,13 @@ constexpr int Q8_SPB = Q8_KC / 128;                // 5 steps of 4 Q8_0 blocks (
 constexpr int PR = LR + HC;                        // partial rows: the down rows, then the inject rows
 constexpr size_t Q8_ROW_D = (size_t) D / 32 * 34;  // a down row: D int8, then D / 32 scales
 constexpr size_t Q8_ROW_U = (size_t) LR / 32 * 34; // an up row: LR int8, then LR / 32 scales
+// the up rows' 128-value steps: 3 for Flash-Next's 320 (the third: lanes 0-15), 2 to 4 for 256..512 (upstream fc1c4e429)
+constexpr int UP_ST = (LR + 127) / 128;
+// the shapes these kernels are written for (core/geometry_checks.hpp holds the model-wide limits): hc_lr 256..512 in steps of
+// 64 (a row group's 8 rows a sub-group, gr_up_fast's 8-value chunks: LR / 8 of them, 32..64), n_embd in Q8_0 chunks of
+// 128 values whole in a stream
+static_assert(LR % 64 == 0 && LR >= 256 && LR <= 512, "fused_gr: hc_lr must be one of 256..512 in steps of 64");
+static_assert(Q8_KC % 128 == 0 && N % Q8_KC == 0 && LR % (WARPS * Q8_RPW) == 0, "fused_gr: the Q8_0 read's chunks and row groups");
 
 using float4 = sycl::float4;
 using uint4 = sycl::uint4;
@@ -251,9 +258,9 @@ sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const 
                 const int c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
                 const uint8_t* qrow = m.a[0].q8_up + (size_t) i * Q8_ROW_U;
                 const uint16_t* drow = reinterpret_cast<const uint16_t*>(qrow + LR);
-                float4 w[3];
+                float4 w[UP_ST];
 #pragma unroll
-                for (int st = 0; st < 3; ++st) {   // lane: values 4 lane + 128 st (the third step: lanes 0-15)
+                for (int st = 0; st < UP_ST; ++st) {   // lane: values 4 lane + 128 st (Flash-Next's third step: lanes 0-15)
                     const int v = 4 * lane + 128 * st;
                     w[st] = v < LR ? q8_four(*reinterpret_cast<const uint32_t*>(qrow + v), drow[v / 32]) : float4(0.0f);
                 }
@@ -270,7 +277,7 @@ sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const 
                 for (int k = 0; k < T; ++k) {
                     float acc = 0.0f;
 #pragma unroll
-                    for (int st = 0; st < 3; ++st) {
+                    for (int st = 0; st < UP_ST; ++st) {
                         const int v = 4 * lane + 128 * st;
                         if (v < LR) {
                             const float4 x = lo[k * LR / 4 + v / 4];
@@ -484,12 +491,12 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
                     const int r = g8 + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
                     const uint8_t* qrow = m.a[0].q8_up + (size_t) i * Q8_ROW_U;
                     const uint16_t* drow = reinterpret_cast<const uint16_t*>(qrow + LR);
-                    uint32_t wq[4][3];
-                    uint16_t wd[4][3];
+                    uint32_t wq[4][UP_ST];
+                    uint16_t wd[4][UP_ST];
 #pragma unroll
                     for (int qq = 0; qq < 4; ++qq)
 #pragma unroll
-                        for (int st = 0; st < 3; ++st) {
+                        for (int st = 0; st < UP_ST; ++st) {
                             const int v = 4 * (j + 8 * qq) + 128 * st;
                             wq[qq][st] = v < LR ? *reinterpret_cast<const uint32_t*>(qrow + v) : 0u;
                             wd[qq][st] = v < LR ? drow[v / 32] : (uint16_t) 0;
@@ -510,7 +517,7 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
                         for (int qq = 0; qq < 4; ++qq) {
                             float acc = 0.0f;
 #pragma unroll
-                            for (int st = 0; st < 3; ++st) {
+                            for (int st = 0; st < UP_ST; ++st) {
                                 const int v = 4 * (j + 8 * qq) + 128 * st;
                                 if (v < LR) {
                                     const float4 w = q8_four(wq[qq][st], wd[qq][st]);
@@ -541,9 +548,9 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
                 const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
                 const uint8_t* qrow = m.a[0].q8_up + (size_t) i * Q8_ROW_U;
                 const uint16_t* drow = reinterpret_cast<const uint16_t*>(qrow + LR);
-                float4 w[3];
+                float4 w[UP_ST];
 #pragma unroll
-                for (int st = 0; st < 3; ++st) {   // lane: values 4 lane + 128 st (the third step: lanes 0-15)
+                for (int st = 0; st < UP_ST; ++st) {   // lane: values 4 lane + 128 st (Flash-Next's third step: lanes 0-15)
                     const int v = 4 * lane + 128 * st;
                     w[st] = v < LR ? q8_four(*reinterpret_cast<const uint32_t*>(qrow + v), drow[v / 32]) : float4(0.0f);
                 }
@@ -560,7 +567,7 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
                 for (int k = 0; k < T; ++k) {
                     float acc = 0.0f;
 #pragma unroll
-                    for (int st = 0; st < 3; ++st) {
+                    for (int st = 0; st < UP_ST; ++st) {
                         const int v = 4 * lane + 128 * st;
                         if (v < LR) {
                             const float4 x = lo[k * LR / 4 + v / 4];
@@ -593,11 +600,13 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
 }
 
 // Upstream's latency-hidden up projection (gr_fast): 8 lanes a row instead of a sub-group.  Lane j holds the default
-// kernel's lanes j, j + 8, j + 16 and j + 24 (and chunk 32 + j, lane j's second): the xor tree's stages 16 and 8 are
+// kernel's lanes j, j + 8, j + 16 and j + 24 (and their second chunks 32 + j + 8 qq where LR / 8 has them: Flash-Next's 40
+// chunks give lane j's alone, 512's 64 give all four): the xor tree's stages 16 and 8 are
 // its own adds in the tree's order, stages 4, 2 and 1 are shuffles inside the 8 - bitwise the same sum.  A
 // work-group's 64 rows are 2 passes of 32 groups of 8, their weights and epilogue inputs loaded before the dots.
 sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
-    static_assert(LR == 40 * 8 && HC * UPM_COLS == 64 && THREADS == 256, "the kernel's geometry");
+    static_assert(LR % 64 == 0 && LR / 8 >= 32 && LR / 8 <= 64 && HC * UPM_COLS == 64 && THREADS == 256, "the kernel's geometry");
+    constexpr int NCH = LR / 8;   // 8-value chunks of an up row: 40 for Flash-Next
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<sycl::float4, 1> lo(sycl::range<1>(kFusedGrMaxT * LR / 4), h);
         sycl::local_accessor<float, 1> g(sycl::range<1>(kFusedGrMaxT * HC * UPM_COLS), h);
@@ -610,7 +619,7 @@ sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
             const int d0 = (int) it.get_group(0) * UPM_COLS;
             const auto& my = tok(m, j < T ? j : 0);   // this lane's token, for its epilogue
             const bool apply = j < T && my.apply;
-            uint4 w[2][5];
+            uint4 w[2][8];   // [0..3]: the default kernel's lanes j + 8 qq; [4 + qq]: their second chunks, where there are
             float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, rsc[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f};
             float ip[2] = {0.0f, 0.0f};
 #pragma unroll
@@ -618,8 +627,10 @@ sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
                 const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
                 const uint16_t* wrow = m.a[0].w_up + (size_t) i * LR;
 #pragma unroll
-                for (int qq = 0; qq < 4; ++qq) w[p][qq] = load_u4(wrow, (size_t) (j + 8 * qq));
-                w[p][4] = load_u4(wrow, (size_t) (32 + j));
+                for (int qq = 0; qq < 4; ++qq) {
+                    w[p][qq] = load_u4(wrow, (size_t) (j + 8 * qq));
+                    if (32 + 8 * qq < NCH) w[p][4 + qq] = load_u4(wrow, (size_t) (32 + j + 8 * qq));   // j < 8, NCH % 8 == 0
+                }
                 if (j < T) {
                     rv[p] = my.R[i];
                     wn[p] = my.w_norm[i];
@@ -648,10 +659,15 @@ sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
 #pragma unroll
                 for (int k = 0; k < kFusedGrMaxT; ++k) {
                     if (k >= T) break;
-                    const float p0 = dot(w[p][0], k, j) + dot(w[p][4], k, 32 + j);
-                    const float p1 = dot(w[p][1], k, j + 8);
-                    const float p2 = dot(w[p][2], k, j + 16);
-                    const float p3 = dot(w[p][3], k, j + 24);
+                    // each default lane's sum: its chunk, then its second (Flash-Next: lane j's only)
+                    const auto lane_sum = [&](int qq) {
+                        const float a = dot(w[p][qq], k, j + 8 * qq);
+                        return 32 + 8 * qq < NCH ? a + dot(w[p][4 + qq], k, 32 + j + 8 * qq) : a;
+                    };
+                    const float p0 = lane_sum(0);
+                    const float p1 = lane_sum(1);
+                    const float p2 = lane_sum(2);
+                    const float p3 = lane_sum(3);
                     float s = (p0 + p2) + (p1 + p3);
                     for (int o = 4; o > 0; o >>= 1) s += strata_shfl_xor(sg, s, o);
                     if (j == k) mine = s;
@@ -701,7 +717,10 @@ constexpr int V2_RG_MAX = LR / (WARPS * 2);
 template <int T> constexpr int v2_gps() { return 2; }
 template <int T> constexpr int v2_nb() { return v2_rg<T>() / v2_gps<T>(); }   // blocks (+1: the inject rows)
 static_assert(v2_rg<1>() % v2_gps<1>() == 0 && v2_rg<8>() % v2_gps<8>() == 0, "whole blocks");
-static_assert((size_t) kFusedGrMaxT * V2_NKC * PR + V2_RG_MAX + 1 <= (size_t) kFusedGrMaxT * D, "v2's scratch");
+// v2's partials and tickets in the caller's scratch (kFusedGrMaxT * D floats): Flash-Next's take 51,861 of 81,920; a shape
+// whose do not fit (hc_lr 512 at hidden 4096: 132,129 of 131,072) reads with gr_read_q8 (STRATA_HC_V2=0's form) instead of
+// growing every caller's scratch
+constexpr bool V2_FITS = (size_t) kFusedGrMaxT * V2_NKC * PR + V2_RG_MAX + 1 <= (size_t) kFusedGrMaxT * D;
 constexpr size_t V2_WS_LO = (size_t) kFusedGrMaxT * D;              // the work buffer: x, then lo | inject
 constexpr size_t V2_WS = V2_WS_LO + (size_t) kFusedGrMaxT * PR;
 
@@ -710,7 +729,7 @@ bool hc_v2_on() {
         const char* v = std::getenv("STRATA_HC_V2");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    return on;
+    return on && V2_FITS;
 }
 
 // the queue's work buffer (each stream its own: a draft and a verify window may read at once), never freed; after it
@@ -941,8 +960,8 @@ inline void v2_up(const sycl::nd_item<1>& it, int grp, const TokArgs& tok, const
     const int t = (int) it.get_local_id(0);
     const int d0 = grp * UPM_COLS;
     const int j = t & 7, g8 = t >> 3;
-    uint32_t wq[2][4][3];
-    uint16_t wd[2][4][3];
+    uint32_t wq[2][4][UP_ST];
+    uint16_t wd[2][4][UP_ST];
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
         const int r = g8 + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
@@ -951,7 +970,7 @@ inline void v2_up(const sycl::nd_item<1>& it, int grp, const TokArgs& tok, const
 #pragma unroll
         for (int qq = 0; qq < 4; ++qq)
 #pragma unroll
-            for (int st = 0; st < 3; ++st) {
+            for (int st = 0; st < UP_ST; ++st) {
                 const int v = 4 * (j + 8 * qq) + 128 * st;
                 wq[p][qq][st] = v < LR ? *reinterpret_cast<const uint32_t*>(qrow + v) : 0u;
                 wd[p][qq][st] = v < LR ? drow[v / 32] : (uint16_t) 0;
@@ -977,7 +996,7 @@ inline void v2_up(const sycl::nd_item<1>& it, int grp, const TokArgs& tok, const
             for (int qq = 0; qq < 4; ++qq) {
                 float acc = 0.0f;
 #pragma unroll
-                for (int st = 0; st < 3; ++st) {
+                for (int st = 0; st < UP_ST; ++st) {
                     const int v = 4 * (j + 8 * qq) + 128 * st;
                     if (v < LR) {
                         const float4 w = q8_four(wq[p][qq][st], wd[p][qq][st]);
@@ -1503,6 +1522,31 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
         (a.apply && a.inj_prev == a.inject_out))
         throw core::DeviceError("fused_gr_read: invalid arguments");
     auto& q = queue_for(stream);
+    // The down kernel below holds the whole normalised row (D floats) in a work-group's local memory: Flash-Next's 40 KB.
+    // A shape whose row does not fit what the device gives a work-group (hidden 4096: 64 KB) takes the multi-token read of
+    // one token, bitwise the same read (fused_gr.hpp), with a device scratch of D floats kept for the process.
+    {
+        static std::mutex mu;
+        static std::map<const void*, std::pair<bool, float*>> per_q;   // by queue (they live for the process): fits / scratch
+        std::pair<bool, float*> e;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            const void* key = (const void*) &q;
+            auto it = per_q.find(key);
+            if (it == per_q.end()) {
+                const size_t need = (size_t) (D + WARPS * HC + HC) * sizeof(float);
+                const bool fits = q.get_device().get_info<sycl::info::device::local_mem_size>() >= need;
+                float* scratch = fits ? nullptr : sycl::malloc_device<float>((size_t) D, q);
+                if (!fits && scratch == nullptr) throw core::DeviceError("fused_gr_read: no device memory for the scratch row");
+                it = per_q.emplace(key, std::make_pair(fits, scratch)).first;
+            }
+            e = it->second;
+        }
+        if (!e.first) {
+            fused_gr_read_multi(&a, 1, e.second, stream);
+            return;
+        }
+    }
     const FusedGrArgs args = a;
     // the down projection (and the inject rows in one extra group), with the norm computed into local memory
     q.submit([&](sycl::handler& h) {
