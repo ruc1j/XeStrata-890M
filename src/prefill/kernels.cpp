@@ -538,7 +538,7 @@ inline void lds_barrier() {
 }  // namespace gw
 
 // The kernels of one GDN shape: HK key heads and HV value heads of S, conv channels C = 2 HK S + HV S.  Qwen3.8 is
-// <16, 48>, Ornith-1.5 (qwen35moe) <16, 32>; the public functions below dispatch on the shape.
+// <16, 48>, Ornith-1.5 (qwen35moe) <16, 32>, and the compiled shape's (kCompiledGeometry); the public functions below dispatch on the shape.
 template <int HK, int HV>
 struct Gdn {
     static constexpr int C = 2 * HK * S + HV * S;
@@ -1449,6 +1449,9 @@ namespace {
 template <class F> void gdn_dispatch(int64_t h_k, int64_t h_v, const char* what, F&& f) {
     if (h_k == 16 && h_v == 48) f(Gdn<16, 48>{});
     else if (h_k == 16 && h_v == 32) f(Gdn<16, 32>{});
+    // the shape the engine is compiled for (core/geometry.hpp: -DSTRATA_GEOMETRY), whatever its heads
+    else if (h_k == strata::core::kCompiledGeometry.ssm_k_heads && h_v == strata::core::kCompiledGeometry.ssm_v_heads)
+        f(Gdn<(int) strata::core::kCompiledGeometry.ssm_k_heads, (int) strata::core::kCompiledGeometry.ssm_v_heads>{});
     else throw core::DeviceError(std::string(what) + ": no kernels for " + std::to_string(h_k) + " key and " +
                                  std::to_string(h_v) + " value heads");
 }

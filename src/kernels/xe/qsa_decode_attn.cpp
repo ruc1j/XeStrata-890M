@@ -11,6 +11,7 @@
 //
 // A warp is a sub-group of 32.  CUDA used the __expf intrinsic here; this uses the precise exp.  Explicit fmaf calls
 // stay fused (sycl::fma), and the library's -ffp-contract=off leaves every other multiply-add as written.
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "xe_shuffle.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -458,10 +459,16 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
 
 // The shapes this file is built for: (head_dim, query heads per KV head).  A model with another shape needs its line
 // here; the kernels' local arrays are sized by G and HD.
+// the shape the engine is compiled for (core/geometry.hpp: -DSTRATA_GEOMETRY): its head width and query heads a KV head
+// (Flash-Next's 256 and 12, also in the list below; the Qwen 4 shapes' 16)
+constexpr int kCHD = (int) strata::core::kCompiledGeometry.head_dim;
+constexpr int kCG = (int) (strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv);
+
 bool shape_ok(const QsaShapes& s) {
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv) return false;
     const int64_t g = s.n_head / s.n_head_kv;
-    return (s.head_dim == 256 && (g == 12 || g == 8 || g == 4)) || (s.head_dim == 128 && g == 10);
+    return (s.head_dim == 256 && (g == 12 || g == 8 || g == 4)) || (s.head_dim == 128 && g == 10) ||
+           (s.head_dim == kCHD && g == kCG);   // the compiled shape (core/geometry.hpp)
 }
 
 void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
@@ -470,6 +477,7 @@ void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const in
     if (s.head_dim == 256 && g == 12) run_shape<256, 12>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
     else if (s.head_dim == 256 && g == 8) run_shape<256, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
     else if (s.head_dim == 256 && g == 4) run_shape<256, 4>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
+    else if (s.head_dim == kCHD && g == kCG) run_shape<kCHD, kCG>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
     else run_shape<128, 10>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
 }
 
@@ -607,6 +615,7 @@ void qsa_dense_attn_tune(const QsaShapes& s, int64_t max_cells, void* stream) {
     if (s.head_dim == 256 && g == 12) tune_shape<256, 12>(q, s, cells);
     else if (s.head_dim == 256 && g == 8) tune_shape<256, 8>(q, s, cells);
     else if (s.head_dim == 256 && g == 4) tune_shape<256, 4>(q, s, cells);
+    else if (s.head_dim == kCHD && g == kCG) tune_shape<kCHD, kCG>(q, s, cells);
     else tune_shape<128, 10>(q, s, cells);
 }
 

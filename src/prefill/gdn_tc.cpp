@@ -30,6 +30,8 @@
 // A GPU with none of them, or STRATA_NO_XMX=1, keeps kernels.cpp's kernels (gdn_rec_tc returns false).
 #include "gdn_tc.hpp"
 
+#include "strata/core/geometry.hpp"
+
 #include "strata/core/per_device.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/matrix_report.hpp"
@@ -197,7 +199,9 @@ struct GdnTcPrep {
     static constexpr int KF = S + 1, GP = GCH + 1;   // the FP32 rows in local memory: lanes' rows in distinct banks
     static constexpr int QO = GCH * KF, KKO = 2 * GCH * KF, QKO = KKO + GCH * GP;
     static constexpr size_t LOCAL = (size_t) 2 * GCH * KF + (size_t) 2 * GCH * GP;   // floats
-    static_assert(2 * VPK <= NT / 32 && VPK * GCH * GP <= GCH * KF, "the prep's sub-groups and A over the k rows");
+    // A is written after the second barrier, when nothing reads the k and q rows any more: VPK of them fit over both
+    // (Flash-Next's 3 fit over the k rows alone; 64 value heads' 4 need the q rows too)
+    static_assert(2 * VPK <= NT / 32 && VPK * GCH * GP <= 2 * GCH * KF, "the prep's sub-groups and A over the k and q rows");
     const float* h;
     const float* gate;
     const float* beta;
@@ -263,7 +267,7 @@ struct GdnTcPrep {
             sc.sc[cv * GCH + i] = sycl::float4(bi, sycl::exp(gam), sycl::exp(gL - gam), gam);
             return;
         }
-        // A over the k rows (read by now): lane i writes column i
+        // A over the k and q rows (read by now): lane i writes column i
         const int ao = j * GCH * GP;
         for (int t = 0; t < GCH; ++t) {
             const float bt = sycl::select_from_group(sg, bi, t), gt = sycl::select_from_group(sg, gam, t);
@@ -657,6 +661,9 @@ bool gdn_rec_tc(sycl::queue& q, int64_t h_k, int64_t h_v, float* state, const fl
     if (T <= 0) return false;
     if (h_k == 16 && h_v == 48) return tc<16, 48>(q, state, h, gate, beta, y, T);
     if (h_k == 16 && h_v == 32) return tc<16, 32>(q, state, h, gate, beta, y, T);
+    // the shape the engine is compiled for (core/geometry.hpp: -DSTRATA_GEOMETRY), whatever its heads
+    constexpr int CHK = (int) strata::core::kCompiledGeometry.ssm_k_heads, CHV = (int) strata::core::kCompiledGeometry.ssm_v_heads;
+    if (h_k == CHK && h_v == CHV) return tc<CHK, CHV>(q, state, h, gate, beta, y, T);
     return false;
 }
 

@@ -10,6 +10,8 @@
 // controls whether grouping tokens may change the selected row arithmetic.
 #pragma once
 
+#include "strata/kernels/cpu/expert.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -17,8 +19,9 @@
 namespace strata::kernels::cpu {
 
 /// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292; a BF16 layer's
-/// activation is BF16, llm-jp-4.1's 2560 values 5120 bytes).
-inline constexpr size_t kNativeActBytes = 8192;
+/// activation is BF16, llm-jp-4.1's 2560 values 5120 bytes): 8192, or a Q2_0 layer's ActQ where the compiled hidden
+/// size makes it larger (the Qwen 4 shapes from 3072 up; core/geometry.hpp).
+inline constexpr size_t kNativeActBytes = (sizeof(ActQ) + 63) / 64 * 64 > 8192 ? (sizeof(ActQ) + 63) / 64 * 64 : 8192;
 /// One token's gate/up activation, as native_quant_act writes it for the layer.  Aligned for the Q2_0 rows' ActQ.
 struct alignas(64) NativeAct {
     uint8_t bytes[kNativeActBytes];
