@@ -3307,7 +3307,7 @@ int main(int argc, char** argv) {
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
     {
-        const strata::core::ModelGeometry g0;
+        const strata::core::ModelGeometry& g0 = strata::core::kCompiledGeometry;   // the shape the kernels are built for
         if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -3506,9 +3506,16 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
+        const strata::core::ModelGeometry& g0 = strata::core::kCompiledGeometry;
+        // the vocabulary is the model file's (its tokenizer.ggml.tokens; Flash-Next's 248,320 when it carries none)
+        int64_t n_vocab = g0.n_vocab;
+        try {
+            strata::GgufFile vg(o.native_preset);
+            if (const strata::MetaValue* v = vg.get("tokenizer.ggml.tokens"); v != nullptr && v->count > 0) n_vocab = (int64_t) v->count;
+        } catch (const std::exception&) {
+        }
         const auto embed_t0 = std::chrono::steady_clock::now();
-        if (!native_embed.load(o.embd_gguf.empty() ? o.native_preset : o.embd_gguf, g0.n_embd, 248320, err)) {
+        if (!native_embed.load(o.embd_gguf.empty() ? o.native_preset : o.embd_gguf, g0.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -3552,8 +3559,8 @@ int main(int argc, char** argv) {
     //   STRATA_SPLIT_ROWS, default 3, the average verify window with MTP drafts).
     if (multi_gpu && split_auto) {
         // the geometry, as set up below (the canonical one, the model file's MoE shape)
-        strata::core::ModelGeometry ga;
-        int64_t Ka = 10;
+        strata::core::ModelGeometry ga = strata::core::kCompiledGeometry;
+        int64_t Ka = strata::core::kCompiledGeometry.n_expert_used;
         if (!o.native_preset.empty()) {
             try {
                 strata::GgufFile model_gguf(o.native_preset);
@@ -4347,8 +4354,8 @@ int main(int argc, char** argv) {
         strata::kernels::mrope_table_set(d_mrope);
     }
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
-    strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
-    int64_t K = 10;
+    strata::core::ModelGeometry g = strata::core::kCompiledGeometry;   // the compiled shape; the model file overrides the MoE shape below
+    int64_t K = strata::core::kCompiledGeometry.n_expert_used;
     // the model file's rope keys (llama.cpp's names; the artifact ships none today)
     std::string gguf_rope_type;
     double gguf_rope_base = 0, gguf_rope_factor = 0, gguf_rope_orig_ctx = 0;

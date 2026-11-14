@@ -30,6 +30,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include "strata/core/geometry.hpp"
 #include "strata/artifact/gguf_split.hpp"
 #include <stdexcept>
 #include <algorithm>
@@ -551,10 +552,12 @@ private:
 
 // ---- architecture guard (P1.S2). The engine is specialised to ONE model; anything else must be
 // refused with a precise error rather than silently mis-run.
+// the shape the engine is compiled for (core/geometry.hpp: 48 / 2560 / 24 / 2 for Flash-Next)
 struct Qwen4ExpGuard {
-    uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 0, head_count = 24,
-             head_count_kv = 2;   // 0 = presence-only: pruned variants (GSQ-RCO Coder) legitimately ship
-                                  // fewer experts than the canonical 512; the graph reads the true value
+    uint32_t block_count = (uint32_t) core::kCompiledGeometry.n_layers, hidden = (uint32_t) core::kCompiledGeometry.n_embd,
+             experts = 0, experts_used = 0, head_count = (uint32_t) core::kCompiledGeometry.n_head,
+             head_count_kv = (uint32_t) core::kCompiledGeometry.n_head_kv;   // 0 = presence-only: pruned variants (GSQ-RCO
+                                  // Coder) legitimately ship fewer experts than the canonical 512; the graph reads the true value
 };
 
 inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& want = {}) {
