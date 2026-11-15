@@ -88,7 +88,27 @@ upstream の Strata 0.2.12 から 0.2.13.1（エンジンの版は 0.1.59、2026
 - `prefill.cpp`、prefill のカーネル、`fused_gr`、`s2_expert_grouped`、`native_ple_postops`、`qsa_prompt_attn`、`ngram`、CPU のエキスパートの定数は、`kCompiledGeometry` から取ります。Flash-Next の値は変わりません。890M の IQ2_XS で、設置済みのエンジン（xe0.2.10-1）と 6 チャットの greedy の答えが同じで、slots も同じ 24,576、decode は 36.03 対 36.05 tok/s でした。
 - `tools/q4geo_synth.py`（任意の形状の合成 GGUF と、その形状のヘッダ）、`tools/qwen4_intake.py`（GGUF のヘッダを読み、新しいモデルを動かすのに何が要るかを言う道具）、`strata_tokenizer.pre_tokenizer_kind`、`serve/toolformat.py` を入れました。
 
-`q4_lite` の形状では、エンジン全体（`strata` と試験）がビルドできます。hyper-connection の読み（`fused_gr`）は、hc_lr 256〜512（64 刻み）と n_embd 4096 までの形状で動きます。Q8_0 の塊の幅は n_embd から、up の行の段の数は hc_lr から取ります。1 トークンの読みは、正規化した行がデバイスのローカルメモリーに収まらなければ、複数トークンの読みに回します。`gr_bench --ref`（CTest の `gr_read_ref`）は、読みを double で計算した CPU の参照と比べます。`q4_lite`、`q4_mid`、`q4_big` のどの経路も、差は rms の 1e-6 未満でした。Flash-Next の読みは、変更の前とビットまで同じです。別の形状のビルドで落ちる試験（`expert_layout_test`、`file_expert_source_test`、`q2_bitplane_parity`、`native_expert_parity_v31_*`）は、Flash-Next の形状で作ったデータを読むものです。q4_lite、q4_mid、q4_big の 4 層の合成モデル（`tools/q4geo_synth.py --small-ple` の GGUF、`tools/iq_pack.py --compat-bf16` の pack、`tools/make_profile.py --no-base` の expert profile、`-DSTRATA_GEOMETRY_FILE` で渡した 4 層のヘッダ）は、890M のエンジンで動きます。prompt の GDN と、decode と prompt の attention は、コンパイルした形状の head 数で実体化します。matrix-engine の GDN の scan（`STRATA_GDN_TC`）は、key head 1 つあたり 4 つの value head（64）まで受けます。CTest の `gdn_tc_parity` が、この scan を FP32 の kernel と比べます。重みは乱数なので、確かめたのは、推測デコードの窓の大きさ（`--spec` 2 と 6）を変えても greedy の出力が同じことまでです。
+`q4_lite`、`q4_mid`、`q4_big`、`q4_deep` のどの形状のビルドでも、エンジン全体（`strata` と試験）がビルドでき、その形状の合成モデルが 890M のエンジンで動きます。形状ごとの分岐は足さず、head の数や幅は `kCompiledGeometry` から取ります。
+
+- hyper-connection の読み（`fused_gr`）は、hc_lr 256〜512（64 刻み）と n_embd 4096 までの形状で動きます。Q8_0 の塊の幅は n_embd から、up の行の段の数は hc_lr から取ります。1 トークンの読みは、正規化した行がデバイスのローカルメモリーに収まらなければ、複数トークンの読みに回します。`gr_bench --ref`（CTest の `gr_read_ref`）は、読みを double で計算した CPU の参照と比べます。`q4_lite`、`q4_mid`、`q4_big` のどの経路も、差は rms の 1e-6 未満でした。Flash-Next の読みは、変更の前とビットまで同じです。
+- prefill の GDN の kernel は、コンパイルした形状の head の数（ssm_k_heads と ssm_v_heads）で実体化します。head の数に既定値はなく、呼ぶ側が渡します。plain のモデル（head の数を GGUF から読む経路。key head 16、value head 32）の kernel は、コンパイルした形状と head の数が違うビルドだけが追加で持ちます。plain のモデルの head の数がどちらとも違えば、読み込みの時点で断り、`--prompt-chunk 0` を案内します。matrix-engine の scan（`STRATA_GDN_TC`）は、key head 1 つあたり 4 つの value head（64）まで受けます。
+- CTest の `gdn_prompt_parity` は、prefill の GDN の gates、conv、recurrence を、double で計算した CPU の参照と比べます。recurrence は、FP32 の kernel、chunked、scan の 3 つの経路を比べ、出力の gate は sigmoid と SiLU の両方で比べます。890M では、head が 16×32、16×48、16×64 のどれでも、FP32 の kernel と scan の差が rms の 1e-4 未満、FP16 を使う chunked の差が rms の 2% 未満でした。decode の 1 トークンの kernel は、`gdn_parity --heads K,V` で head の数を変えて比べられます。
+- decode の attention の kernel は、コンパイルした形状の head の数で実体化します。890M では、prefill の attention もこの kernel です。`qsa_dense_attn_parity` は、コンパイルした形状でも CPU の参照と比べます。
+- Flash-Next の幅でデータを作っていた試験（`expert_layout_test`、`file_expert_source_test`、`q2_bitplane_parity`、`native_expert_parity --synthetic`、`native_dense_ple_key_test`）は、コンパイルした形状の幅でデータを作ります。`expert_layout_test` のうち、`tests/data` にある Flash-Next の pack を読む部分は、幅の違うビルドでは理由を出して飛ばします。
+- `--mtp` と `--draft dflash2` は Flash-Next の drafter を読むので、幅の違う形状のビルドでは起動時に断ります。エキスパートのキャッシュの大きさを決めるときに prefill のバッファのために残すメモリーは、形状の幅に合わせて増やします。Flash-Next では変わりません。
+
+合成モデルは、`tools/q4geo_synth.py --small-ple` の GGUF、`tools/iq_pack.py --compat-bf16` の pack、`tools/make_profile.py --no-base` の expert profile で作ります。q4_lite、q4_mid、q4_big は 4 層にしました（ヘッダは `-DSTRATA_GEOMETRY_FILE` で渡します）。q4_deep は、形状どおりの 64 層、512 エキスパートで作りました（98 GiB）。890M で、299 トークンを prefill で読み、84 トークンを greedy で生成した結果は次のとおりです。
+
+| 形状 | 合成モデル | prefill | decode（`--spec` 2、4、6） |
+| --- | --- | --- | --- |
+| q4_lite | 4 層 | 2,671 tok/s | 178、156、141 tok/s |
+| q4_mid | 4 層 | 1,128 tok/s | 79.3、60.9、53.9 tok/s |
+| q4_big | 4 層 | 559 tok/s | 54.4、49.1、42.0 tok/s |
+| q4_deep | 64 層、512 エキスパート | 2.9 tok/s | 0.92、1.03、1.00 tok/s |
+
+q4_deep の合成モデルは、エキスパートが RAM に入りきりません。ファイルから読みながら動くので、この速さになります。
+重みは乱数なので、答えの中身は確かめられません。確かめたのは、推測デコードの窓（`--spec` 2、4、6）を変えても、2 回実行しても、greedy の出力が同じことです。Flash-Next は、変更の前と 6 チャットの greedy の答えが同じで、decode は、3 回ずつ交互に測って、変更の前が 35.0〜36.5 tok/s、後が 36.4〜36.5 tok/s でした。
+
 入れていないものは、新しい形状のモデルを feed で配る仕組み（`strata_control` と setup の shape engine）、CUDA と HIP の geometry、Metal、Windows の Strix Halo の変更です。この fork にその層がなく、SYCL のカーネルに同じ切り替えもありません。SYCL の Q5_K と Q6_K の down は、fork の `native_expert_supported` が前から受けています。
 
 ## Strata 0.1.58 の取り込み
