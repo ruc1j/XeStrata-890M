@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/expert_source.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -134,8 +135,9 @@ void test_native_variable_layout() {
     using namespace strata::kernels::cpu;
     constexpr int64_t layers = 2;
     constexpr int64_t experts = 3;
-    constexpr int64_t embedding = 2560;
-    constexpr int64_t feed_forward = 640;
+    // the widths the reader takes a blob's size from: the compiled shape's (core/geometry.hpp: -DSTRATA_GEOMETRY)
+    constexpr int64_t embedding = strata::core::kCompiledGeometry.n_embd;
+    constexpr int64_t feed_forward = strata::core::kCompiledGeometry.n_ff;
     TempDirectory dir;
 
     NativeFmt first_fmt, second_fmt;

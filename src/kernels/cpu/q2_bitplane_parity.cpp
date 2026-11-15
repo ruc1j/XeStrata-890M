@@ -9,6 +9,7 @@
 //      (the engine's pool splits rows between workers, a verify window changes the width);
 //   3. the legacy path is untouched when the switch is off (this test only runs with the switch on, the default).
 // Synthetic data, CPU only; skipped (pass) on a CPU without AVX2.
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 
 #include <cmath>
@@ -29,7 +30,9 @@ int main() {
     std::mt19937 rng(706);  // NOLINT(bugprone-random-generator-seed): reproducible rows.
     std::normal_distribution<float> nd(0.f, 1.f);
     int fail = 0;
-    for (const int n : {128, 256, 1024, 2560}) {   // 2560 = 40 blocks: an even count of pairs; 128 = one pair
+    // the widths: 128 = one pair of blocks; the last is the compiled shape's n_embd (core/geometry.hpp), the widest an
+    // ActQ holds (Flash-Next's 2560 = 40 blocks; a multiple of 256, so an even count of pairs)
+    for (const int n : {128, 256, 1024, (int) strata::core::kCompiledGeometry.n_embd}) {
         const int nblocks = n / 64;
         const size_t row_bytes = (size_t) nblocks * 18;
         const int rows = 37;   // not a multiple of 4: the 4-row path and the tail

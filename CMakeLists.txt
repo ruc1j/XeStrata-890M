@@ -1440,8 +1440,8 @@ if(STRATA_NATIVE_EXPERTS)
     # the BF16 token embedding (--embd-gguf) gathered and dequantized bit for bit: synthetic, so in CTest
     add_test(NAME native_expert_parity_bf16_embd COMMAND native_expert_parity --bf16-embd)
     # UD-Q4_K_XL's expert pairs (and Q8_0 alone) and OrcaRouter Q4_K_S's q4_K/q5_0 on synthetic ggml-quantized
-    # weights at 2560/640 (upstream efeffd8, d652cd6): GPU and CPU experts against the float reference, GPU
-    # dequantizers against to_float
+    # weights at the compiled shape's n_embd and n_ff (-DSTRATA_GEOMETRY; Flash-Next: 2560/640; upstream efeffd8,
+    # d652cd6): GPU and CPU experts against the float reference, GPU dequantizers against to_float
     # q5_0/q8_0 (Q5_0 gate/up, a llama-quantize "_M" file), q4_0/q4_0 and q4_0/q4_1 (a plain llama-quantize Q4_0 file:
     # gate/up Q4_0, down Q4_0 on 42 layers and Q4_1 on 6; upstream 16bdc707)
     # q6_K/q8_0: Unsloth's UD-Q6_K_XL experts (upstream 87659162)
@@ -1456,7 +1456,8 @@ if(STRATA_NATIVE_EXPERTS)
       set_tests_properties(native_expert_parity_${pair_name} PROPERTIES TIMEOUT 120)
     endforeach()
     # Unsloth's v3.1 Qwen3.8-Flash-Next sets (UD-IQ1_M .. UD-IQ4_XS-v31, upstream Strata 0.2.11, c1d5e4d5e): every gate/up x
-    # down pair their layers use at the model's shape (2560/640): gate/up IQ1_M IQ2_XXS IQ2_XS IQ2_S Q2_0 IQ3_XXS IQ4_XS, down
+    # down pair their layers use at the compiled shape (Flash-Next's 2560/640, the model's): gate/up IQ1_M IQ2_XXS
+    # IQ2_XS IQ2_S Q2_0 IQ3_XXS IQ4_XS, down
     # Q2_0 IQ4_NL Q5_0 Q8_0 (IQ4_XS is 256-wide, so n_ff 640 needs a 32- or 64-block down).  Q5_0 down (UD-IQ4_XS-v31's 33 layers,
     # UD-Q3_K_XL's 20) is held to 1.8e-2 against the float reference, the other down types to 3e-2.
     foreach(_gu iq1_m iq2_xxs iq2_xs iq2_s q2_0 iq3_xxs iq4_xs)

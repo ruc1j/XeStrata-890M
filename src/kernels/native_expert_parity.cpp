@@ -5,7 +5,8 @@
 //
 //     build/native_expert_parity <shard.gguf> [layer ...]     real rows (a split model's shards are found by name)
 //     build/native_expert_parity --synthetic GU/DOWN[@HxFF]   random weights quantized by ggml (e.g. q4_K/q5_1,
-//                                                             q6_K/q6_K@2048x512); 2560x640 when no shape is given
+//                                                             q6_K/q6_K@2048x512); the compiled shape's n_embd x n_ff
+//                                                             (core/geometry.hpp; Flash-Next: 2560x640) when none is given
 //     build/native_expert_parity --q5_1-min                   the Q5_1 min term on crafted activations
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
@@ -17,6 +18,7 @@
 //
 // The BF16 token embedding (--embd-gguf) on a random table, no model needed (in CTest).
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -482,12 +484,12 @@ static uint32_t float_bits(float f) {
 }
 
 // --synthetic GU/DOWN[@HxFF] (e.g. q4_K/q5_1, upstream efeffd8): one expert of random weights quantized by ggml into
-// those formats at n_embd H and width FF (2560/640 unless given), three ways as above; then the GPU's f32 dequantizer against ggml's to_float, bit for bit, on
-// the gate rows and the down rows.  A pair the GPU has no kernels for is refused (native_expert_supported): 1.
+// those formats at n_embd H and width FF (the compiled shape's unless given), three ways as above; then the GPU's f32
+// dequantizer against ggml's to_float, bit for bit, on the gate rows and the down rows.  A pair the GPU has no kernels for is refused (native_expert_supported): 1.
 static int check_synthetic(const std::string& arg, void* s, bool had = false) {
     const size_t at = arg.find('@');
     const std::string pair = arg.substr(0, at);
-    int64_t H = 2560, FF = 640;
+    int64_t H = strata::core::kCompiledGeometry.n_embd, FF = strata::core::kCompiledGeometry.n_ff;
     if (at != std::string::npos) {
         const size_t x = arg.find('x', at);
         H = std::strtoll(arg.c_str() + at + 1, nullptr, 10);

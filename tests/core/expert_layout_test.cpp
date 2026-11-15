@@ -10,13 +10,15 @@
 //      field, and the totals with the header's.
 //   2. The v4 shard column `gate,up,down` (an empty field = the --native shard); v5, four names, two names and a
 //      trailing column are refused.
-//   3. check_experts_gguf + load_experts_gguf on a synthetic arena at the real dimensions 2560/640 with Unsloth's
-//      format pairs (Q4_K/Q5_1, Q5_K/Q8_0): layer 1's gate/up in another file than its down.  Every byte of the
-//      arena is compared with the source tensors.  Then the refusals: an offset that is not the tensor's, a
-//      truncated file, a role named in the wrong file, a type or a shape the pack does not say, a missing file.
+//   3. check_experts_gguf + load_experts_gguf on a synthetic arena at the compiled shape's dimensions
+//      (Qwen3.8-Flash-Next's: 2560/640) with Unsloth's format pairs (Q4_K/Q5_1, Q5_K/Q8_0): layer 1's gate/up in
+//      another file than its down.  Every byte of the arena is compared with the source tensors.  Then the refusals:
+//      an offset that is not the tensor's, a truncated file, a role named in the wrong file, a type or a shape the
+//      pack does not say, a missing file.
 #include "gguf_fixture.hpp"
 
 #include "strata/core/expert_source.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -60,8 +62,17 @@ bool load(const fs::path& dir, int64_t n_layers, int64_t n_expert, std::string& 
     return strata::kernels::cpu::expert_layout_load(dir.string(), n_layers, n_expert, err);
 }
 
-// ---- 1. the real packs' files
+// the widths the reader takes a blob's size from: the compiled shape's (core/geometry.hpp: -DSTRATA_GEOMETRY)
+constexpr int64_t kH = strata::core::kCompiledGeometry.n_embd, kFF = strata::core::kCompiledGeometry.n_ff;
+
+// ---- 1. the real packs' files: Qwen3.8-Flash-Next's, 48 layers of 512 experts at 2560 and 640
 void real_packs(const fs::path& data) {
+    if (kH != 2560 || kFF != 640) {
+        std::printf("  the real packs' files: skipped, they are Qwen3.8-Flash-Next's (expert blobs of n_embd 2560, n_ff 640) "
+                    "and this build reads n_embd %lld, n_ff %lld (%s)\n", (long long) kH, (long long) kFF,
+                    strata::core::kGeometryName);
+        return;
+    }
     for (const char* pack : {"q2_0", "iq2_xs", "iq3_xxs", "iq3_s", "coder-iq1_m", "swift-iq2_xs"}) {
         TempDir d;
         fs::copy_file(data / (std::string(pack) + ".txt"), d.path / "native_experts.txt");
@@ -121,7 +132,7 @@ std::string manifest(int version, const std::string& col1, int64_t blob, int n_e
 void columns() {
     strata::kernels::cpu::NativeFmt f;
     std::string err;
-    if (!strata::kernels::cpu::native_fmt(12, 7, 2560, 640, f, err)) {
+    if (!strata::kernels::cpu::native_fmt(12, 7, kH, kFF, f, err)) {
         check(false, "Q4_K/Q5_1 native format: " + err);
         return;
     }
@@ -152,7 +163,7 @@ void columns() {
 // ---- 3. the arena from synthetic shards
 void arena() {
     using fixture::Tensor;
-    constexpr int64_t H = 2560, FF = 640, NE = 2;
+    constexpr int64_t H = kH, FF = kFF, NE = 2;
     const uint32_t Q4_K = 12, Q5_1 = 7, Q5_K = 13, Q8_0 = 8, Q3_K = 11, IQ3_S = 21;
     strata::kernels::cpu::NativeFmt f0, f1;
     std::string err;
@@ -324,7 +335,8 @@ void arena() {
                            {"blk.0.ffn_down_exps.weight", {FF, H, NE + 1}, Q5_1, 33}});
     ok = load(d2.path / "pack", 1, 512, err) && !strata::core::check_experts_gguf(C.string(),
                                                                                   strata::kernels::cpu::expert_layout(), err);
-    check(ok && err.find("is not [640, 2560, 2]") != std::string::npos, "a down tensor of another shape is refused");
+    check(ok && err.find("is not [" + std::to_string(FF) + ", " + std::to_string(H) + ", 2]") != std::string::npos,
+          "a down tensor of another shape is refused");
 }
 }  // namespace
 
