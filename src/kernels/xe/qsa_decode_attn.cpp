@@ -172,6 +172,9 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
     constexpr int WARPS = THREADS / WARP;
     constexpr int N = HD / WARP;          // dimensions a lane holds in the score loop
     constexpr int GP = (G + 3) / 4 * 4;   // a cell's weights padded to whole float4s
+    // the local arrays below: 25 KiB at 16 heads of 256 (the largest shape the asserts above take), 19 at Flash-Next's
+    // 12; every GPU this runs on gives 32 KiB and more
+    static_assert((G * HD + G * CHUNK + CHUNK * GP + 2 * G) * 4 + CHUNK * 8 <= 32 * 1024, "a work-group's local memory");
     // ids_all null: every cell, slot c of the chunk is cell c0 + c, and the count is the cache's (step[kStepNKv])
     const bool dense = ids_all == nullptr;
     return queue.submit([&](sycl::handler& hd) {
@@ -457,28 +460,38 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     if (!stream) core::Runtime::get().wait(e, "qsa_decode_attn");
 }
 
-// The shapes this file is built for: (head_dim, query heads per KV head).  A model with another shape needs its line
-// here; the kernels' local arrays are sized by G and HD.
-// the shape the engine is compiled for (core/geometry.hpp: -DSTRATA_GEOMETRY): its head width and query heads a KV head
-// (Flash-Next's 256 and 12, also in the list below; the Qwen 4 shapes' 16)
+// The shapes this file is built for, (head_dim, query heads per KV head): the one the engine is compiled for
+// (core/geometry.hpp: -DSTRATA_GEOMETRY; Flash-Next's 256 and 12), whatever its heads, and the plain models' (Ornith-1.5's
+// 256 and 8, Qwen3.5-9B's 256 and 4, llm-jp-4.1's 128 and 10, and 256 and 12).  A model of another shape needs its line
+// in with_shape; the kernels' local arrays are sized by G and HD.
 constexpr int kCHD = (int) strata::core::kCompiledGeometry.head_dim;
 constexpr int kCG = (int) (strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv);
+template <int HD, int G> struct AttnShape {
+    static constexpr int hd = HD, g = G;
+};
 
-bool shape_ok(const QsaShapes& s) {
+// f(AttnShape<HD, G>{}) for s's shape; false, and no call, where this file has no kernels for it
+template <class F> bool with_shape(const QsaShapes& s, F&& f) {
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv) return false;
     const int64_t g = s.n_head / s.n_head_kv;
-    return (s.head_dim == 256 && (g == 12 || g == 8 || g == 4)) || (s.head_dim == 128 && g == 10) ||
-           (s.head_dim == kCHD && g == kCG);   // the compiled shape (core/geometry.hpp)
+    if (s.head_dim == kCHD && g == kCG) f(AttnShape<kCHD, kCG>{});
+    else if (s.head_dim == 256 && g == 12) f(AttnShape<256, 12>{});
+    else if (s.head_dim == 256 && g == 8) f(AttnShape<256, 8>{});
+    else if (s.head_dim == 256 && g == 4) f(AttnShape<256, 4>{});
+    else if (s.head_dim == 128 && g == 10) f(AttnShape<128, 10>{});
+    else return false;
+    return true;
+}
+
+bool shape_ok(const QsaShapes& s) {
+    return with_shape(s, [](auto) {});
 }
 
 void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
          const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream) {
-    const int64_t g = s.n_head / s.n_head_kv;
-    if (s.head_dim == 256 && g == 12) run_shape<256, 12>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
-    else if (s.head_dim == 256 && g == 8) run_shape<256, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
-    else if (s.head_dim == 256 && g == 4) run_shape<256, 4>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
-    else if (s.head_dim == kCHD && g == kCG) run_shape<kCHD, kCG>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
-    else run_shape<128, 10>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
+    with_shape(s, [&](auto sh) {
+        run_shape<decltype(sh)::hd, decltype(sh)::g>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
+    });
 }
 
 // qsa_dense_attn_tune's timing: the fp16 score loop's NC = 2, 4 and 8 over `cells` cells of a dummy cache, as the
@@ -611,12 +624,8 @@ void qsa_dense_attn_step(const float* q, const QsaAttnPools& pools, const int32_
 void qsa_dense_attn_tune(const QsaShapes& s, int64_t max_cells, void* stream) {
     if (!shape_ok(s) || max_cells < CHUNK || s.page_size <= 0) return;
     auto& q = queue_for(stream);
-    const int64_t cells = std::min<int64_t>(max_cells, 16384), g = s.n_head / s.n_head_kv;
-    if (s.head_dim == 256 && g == 12) tune_shape<256, 12>(q, s, cells);
-    else if (s.head_dim == 256 && g == 8) tune_shape<256, 8>(q, s, cells);
-    else if (s.head_dim == 256 && g == 4) tune_shape<256, 4>(q, s, cells);
-    else if (s.head_dim == kCHD && g == kCG) tune_shape<kCHD, kCG>(q, s, cells);
-    else tune_shape<128, 10>(q, s, cells);
+    const int64_t cells = std::min<int64_t>(max_cells, 16384);
+    with_shape(s, [&](auto sh) { tune_shape<decltype(sh)::hd, decltype(sh)::g>(q, s, cells); });
 }
 
 void qsa_dense_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* steps, int64_t max_cells,

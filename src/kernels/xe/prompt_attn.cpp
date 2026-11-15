@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/prompt_attn.cpp - see include/strata/kernels/prompt_attn.hpp.
-#include "strata/core/geometry.hpp"
 #include "strata/kernels/prompt_attn.hpp"
 #include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
@@ -28,13 +27,6 @@ constexpr int NT = 256;   // work-items a work-group
 // the probabilities as float4, K as 4 halves), the rows padded to keep those reads aligned and K's rows off one bank.
 // Scores: work-item t takes cell t % BK of rows t / BK, + NT / BK, ...: neighbouring work-items read neighbouring K
 // rows and the same Q row.  Output: work-item t owns column d = t % HD of rows t / HD, + NT / HD, ... in registers.
-// the shape the engine is compiled for (core/geometry.hpp: -DSTRATA_GEOMETRY): head width, query heads a KV head, and the
-// queries a work-group of each kernel takes (Flash-Next: 256, 12; taken by the branches for 12 before these)
-constexpr int kCHD = (int) strata::core::kCompiledGeometry.head_dim;
-constexpr int kCG = (int) (strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv);
-constexpr int kCBQ = (64 / kCG) * kCG % 16 == 0 && 64 / kCG >= 1 ? 64 / kCG : 16;   // WMMA: BQ x G whole 16-row tiles
-constexpr int kCBQF = 16 / kCG >= 1 ? 16 / kCG : 1;                                 // FMA: about 16 rows
-
 template <int HD, int G, int BQ, int BK>
 struct Kernel {
     static constexpr int R = BQ * G, RS = NT / HD, OPT = R / RS, QS = HD + 4, KS = HD + 4;
@@ -370,10 +362,6 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
                 launch_wmma<256, 4, 32>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
             else launch_wmma<256, 4, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         }
-        // the compiled shape (core/geometry.hpp), whatever its query heads a KV head: queries enough for 64 rows (whole
-        // 16-row tiles), fewer where the device's local memory or work-group size do not take them
-        else if (s.head_dim == kCHD && g == kCG && wmma_fits<kCHD, kCG, kCBQ>(queue.get_device()))
-            launch_wmma<kCHD, kCG, kCBQ>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         else mma = false;
     }
     // local memory: BQ x G rows of FP32 Q and BK cells of K and V, 37 to 42 KiB: within the 48 KiB every GPU gives
@@ -383,8 +371,6 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
         else if (s.head_dim == 256 && g == 12) launch<256, 12, 2, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         // (4 queries of 4 heads: the 16 rows and the local memory of 2 queries of 8)
         else if (s.head_dim == 256 && g == 4) launch<256, 4, 4, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
-        // the compiled shape: queries enough for 16 rows (1 at 16 heads a KV head)
-        else if (s.head_dim == kCHD && g == kCG) launch<kCHD, kCG, kCBQF, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         else return false;
     }
     if (stream == nullptr) queue.wait_and_throw();

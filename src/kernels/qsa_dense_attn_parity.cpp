@@ -3,14 +3,16 @@
 // src/kernels/qsa_dense_attn_parity.cpp - the decode attention over every cell (`qsa_dense_attn_step`) for the shapes it
 // is built for, against an FP64 host reference (GPU, synthetic, no model):
 //
-//   Qwen3.8's 24/2 heads of 256, Ornith-1.5's 16/2 of 256, Qwen3.5-9B's 16/4 of 256 and llm-jp-4.1's 40/4 of 128, on
-//   FP16 pools behind a shuffled page table, with a context that ends inside a chunk;
+//   Qwen3.8's 24/2 heads of 256, Ornith-1.5's 16/2 of 256, Qwen3.5-9B's 16/4 of 256, llm-jp-4.1's 40/4 of 128 and the
+//   compiled shape's (core/geometry.hpp) where it is none of these, on FP16 pools behind a shuffled page table, with a
+//   context that ends inside a chunk;
 //   1. the output agrees with FP64 to 1e-4 of the output's scale;
 //   2. it is bit for bit `qsa_decode_attn_step` given the selection 0, 1, ..., n-1 (the same kernels, cell c in slot c);
 // each with the fp16 score loop's every form (STRATA_QSA_NC 2, 4 and 8: the cells a step, qsa_dense_attn_tune's choice).
 //
 //   qsa_dense_attn_parity --bench CELLS   Qwen3.5-9B's decode attention over CELLS cells, each form's time a call (no
 //                                         graph: a profiler such as rocprofv3 can wrap it)
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -170,6 +172,15 @@ int main(int argc, char** argv) {
     bad += check("Ornith-1.5 (16/2 x 256)", 16, 2, 256);
     bad += check("Qwen3.5-9B (16/4 x 256)", 16, 4, 256);
     bad += check("llm-jp-4.1 (40/4 x 128)", 40, 4, 128);
+    // the shape the engine is compiled for (core/geometry.hpp: -DSTRATA_GEOMETRY), where it is none of the above
+    const auto& cg = strata::core::kCompiledGeometry;
+    const int64_t cnh = cg.n_head, cnkv = cg.n_head_kv, chd = cg.head_dim, cgq = cnh / cnkv;
+    if (!((chd == 256 && (cgq == 12 || cgq == 8 || cgq == 4)) || (chd == 128 && cgq == 10))) {
+        char name[64];
+        std::snprintf(name, sizeof name, "%s (%lld/%lld x %lld)", strata::core::kGeometryName, (long long) cnh,
+                      (long long) cnkv, (long long) chd);
+        bad += check(name, cnh, cnkv, chd);
+    }
     std::printf("qsa_dense_attn: %d failures\n", bad);
     return bad ? 1 : 0;
 }
