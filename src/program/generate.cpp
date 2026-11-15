@@ -156,6 +156,18 @@
 #include <vector>
 
 namespace {
+// The prompt path's chunk buffers a token, for the room kept out of an expert cache sized here: 680 KiB at
+// Qwen3.8-Flash-Next's shape (what its buffers come to).  Another shape's are not counted buffer by buffer: the figure
+// grows by the widest of the compiled shape's widths (core/geometry.hpp) over Qwen3.8-Flash-Next's - the residual
+// streams (n_embd), the attention rows (n_head head_dim), the DeltaNet's value rows and the experts' inner width - so
+// it errs to the roomy side there, and is 680 at Qwen3.8-Flash-Next's own.
+constexpr int64_t prefill_kib_per_token(const strata::core::ModelGeometry& g, const strata::core::ModelGeometry& base) {
+    const int64_t kib = 680;
+    return std::max({kib * g.n_embd / base.n_embd, kib * (g.n_head * g.head_dim) / (base.n_head * base.head_dim),
+                     kib * g.ssm_value_dim / base.ssm_value_dim, kib * g.n_ff / base.n_ff});
+}
+constexpr int64_t kPrefillKibPerToken = prefill_kib_per_token(strata::core::kCompiledGeometry, strata::core::ModelGeometry{});
+static_assert(prefill_kib_per_token(strata::core::ModelGeometry{}, strata::core::ModelGeometry{}) == 680);
 
 // A dump file closed on whichever return leaves the function that opened it.
 struct CloseFile {
@@ -913,7 +925,8 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
         // anything keyed on the layer index, which is exactly what a cache profile is, would have been wrong.
         const int32_t layer_idx = (int32_t) (t->d.layers - 1);
         if (layer_idx < 0 || layer_idx >= strata::core::kCompiledGeometry.n_layers) {
-            std::fprintf(stderr, "strata generate: the routing trace saw layer %d, outside 0..47\n", layer_idx);
+            std::fprintf(stderr, "strata generate: the routing trace saw layer %d, outside 0..%lld\n", layer_idx,
+                         (long long) strata::core::kCompiledGeometry.n_layers - 1);
             return;
         }
         const int32_t rec[2] = {layer_idx, (int32_t) k};
@@ -4955,6 +4968,23 @@ int main(int argc, char** argv) {
     // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned, so it always sees
     // the canonical geometry; `static` because MtpDrafter keeps a reference (the batch slots' draft K/V copies too)
     static const strata::core::ModelGeometry draft_geometry{};
+    // The drafters (--mtp's layer and --draft dflash2) are Qwen3.8-Flash-Next's: they read the trunk's hidden state at
+    // its width, and their kernels are compiled at kCompiledGeometry's.  A build for other widths (-DSTRATA_GEOMETRY)
+    // would run them on rows of another size, so it refuses them; the layer count alone does not matter to them.
+    {
+        constexpr auto& cg = strata::core::kCompiledGeometry;
+        constexpr strata::core::ModelGeometry fn{};
+        constexpr bool widths_ok = cg.n_embd == fn.n_embd && cg.n_head == fn.n_head && cg.n_head_kv == fn.n_head_kv &&
+                                   cg.head_dim == fn.head_dim && cg.ssm_k_heads == fn.ssm_k_heads &&
+                                   cg.ssm_v_heads == fn.ssm_v_heads && cg.hc == fn.hc && cg.hc_lr == fn.hc_lr &&
+                                   cg.n_expert == fn.n_expert && cg.n_expert_used == fn.n_expert_used && cg.n_ff == fn.n_ff;
+        if (!widths_ok && (!o.mtp.empty() || o.draft == "dflash2")) {
+            std::fprintf(stderr, "strata generate: %s takes Qwen3.8-Flash-Next's drafter, and this engine is built for "
+                                 "another shape (%s: n_embd %lld): run without it\n",
+                         o.draft == "dflash2" ? "--draft dflash2" : "--mtp", strata::core::kGeometryName, (long long) cg.n_embd);
+            return 2;
+        }
+    }
     // KVA (opt-in, STRATA_KVA=1; unset is the exact prompt read): what only the engine knows.  A layer split across GPUs
     // and the batch slots read their prompts in stages and in pieces, which the one-GPU, one-cold-read rule of the
     // approximate prompt read cannot follow, so they stay on the exact path (and say so here, once).  The draft layer
@@ -5630,7 +5660,7 @@ int main(int argc, char** argv) {
         const int64_t prefill_mib =
             (o.prefill_chunk > 0 && !borrow)
                 ? (multi_gpu ? (int64_t) (strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk) >> 20) + 1
-                             : 160 + (o.prefill_chunk * 680) / 1024)
+                             : 160 + (o.prefill_chunk * kPrefillKibPerToken) / 1024)
                 : 0;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         // on a GPU that shares the host's RAM the parked conversations are host allocations made after the cache is
@@ -5756,7 +5786,7 @@ int main(int argc, char** argv) {
         // room for them and the reserve, or the first prompt fails with "device buffers ... do not fit"
         size_t free_b = 0, total_b = 0;
         cache_mem_info(&free_b, &total_b);
-        const int64_t prefill_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        const int64_t prefill_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * kPrefillKibPerToken) / 1024 : 0;
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + pipe_first;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
