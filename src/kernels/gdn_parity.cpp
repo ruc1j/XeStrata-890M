@@ -93,12 +93,25 @@ double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
 
 int main(int argc, char** argv) {
     bool selftest = false;
+    // the recurrence's heads: the compiled shape's (core/geometry.hpp), or --heads K,V (gdn_step takes any, so one build
+    // checks another shape's)
+    int h_k = strata::core::kCompiledGeometry.ssm_k_heads, h_v = strata::core::kCompiledGeometry.ssm_v_heads;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
-        else { std::fprintf(stderr, "usage: gdn_parity [--selftest]\n"); return 2; }
+        else if (std::string(argv[i]) == "--heads" && i + 1 < argc) {
+            char* end = nullptr;
+            const long k = std::strtol(argv[++i], &end, 10);
+            const long v = *end == ',' ? std::strtol(end + 1, &end, 10) : 0;
+            if (*end != '\0' || k <= 0 || v < k || v % k != 0 || v > 4096) {
+                std::fprintf(stderr, "gdn_parity: --heads takes K,V with V a multiple of K\n");
+                return 2;
+            }
+            h_k = (int) k, h_v = (int) v;
+        }
+        else { std::fprintf(stderr, "usage: gdn_parity [--selftest] [--heads K,V]  (V a multiple of K)\n"); return 2; }
     }
 
-    const int S = strata::core::kCompiledGeometry.ssm_state_size, h_k = strata::core::kCompiledGeometry.ssm_k_heads, h_v = strata::core::kCompiledGeometry.ssm_v_heads;      // the compiled shape (Flash-Next: the artifact's 128 / 16 / 48)
+    const int S = strata::core::kCompiledGeometry.ssm_state_size;
     std::mt19937 rng(2024);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     int bad = 0;
@@ -130,7 +143,8 @@ int main(int argc, char** argv) {
         ref_step(st_mod, q, k, v, gate, beta, S, h_k, h_v, want_o, true, true);
 
         // the traps
-        {
+        std::printf("  the recurrence: %d key x %d value heads\n", h_k, h_v);
+        if (h_v > h_k) {   // one value head a key head: the two pairings are the same
             std::vector<double> a = st_ref;
             std::vector<float> oo;
             ref_step(a, q, k, v, gate, beta, S, h_k, h_v, oo, false, true);

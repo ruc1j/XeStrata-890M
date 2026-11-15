@@ -48,6 +48,7 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/draft_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/prefill/kernels.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/platform/memory.hpp"
@@ -543,6 +544,14 @@ bool PlainModel::load_qwen(std::string& err) {
                    (dense_ ? s.n_ff > 0 : s.n_ff_shexp > 0);
     if (!shape_ok) {
         err = "plain model: a shape this engine's kernels are not built for";
+        return false;
+    }
+    // the prompt path's DeltaNet kernels are built for the compiled shape's heads and the plain models' own
+    // (prefill/kernels.hpp); the decode windows' kernels take the heads at run time
+    if (q35 && opt_.prompt_chunk > 0 && !strata::prefill::gdn_heads_built(s.ssm_n_group, s.ssm_dt_rank)) {
+        err = "plain model: the prompt path's DeltaNet kernels are not built for " + std::to_string(s.ssm_n_group) +
+              " key and " + std::to_string(s.ssm_dt_rank) + " value heads: run with --prompt-chunk 0 (prompts are then "
+              "read through the decode windows)";
         return false;
     }
     cs_ = strata::gpu::stream_create();

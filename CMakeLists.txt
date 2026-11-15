@@ -1158,12 +1158,15 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(gr_bench PRIVATE strata_kernels)
     # the Q8_0 hyper-connection read against a CPU reference in double, at the compiled shape (-DSTRATA_GEOMETRY): GPU, synthetic
     add_test(NAME gr_read_ref COMMAND gr_bench --ref --q8-mixed --layers 2)
-    # the matrix-engine DeltaNet scan of a prompt chunk (STRATA_GDN_TC) against the FP32 recurrence kernels, for 32, 48 and
-    # the compiled shape's value heads (-DSTRATA_GEOMETRY): GPU, synthetic; a GPU without the scan skips
-    add_executable(gdn_tc_parity src/prefill/gdn_tc_parity.cpp)
-    target_include_directories(gdn_tc_parity PRIVATE src/prefill)
-    target_link_libraries(gdn_tc_parity PRIVATE strata_prefill)
-    add_test(NAME gdn_tc_parity COMMAND gdn_tc_parity)
+    # the prompt path's DeltaNet kernels (gates, conv, the recurrence in its FP32, chunked and matrix-engine scan forms)
+    # against a CPU reference in double, for the compiled shape's heads (-DSTRATA_GEOMETRY) and the plain models': GPU,
+    # synthetic; the scan skips on a GPU without it.  _fp32: the FP32 kernels with the output, D-2 instead of the timed
+    # pick
+    add_executable(gdn_prompt_parity src/prefill/gdn_prompt_parity.cpp)
+    target_include_directories(gdn_prompt_parity PRIVATE src/prefill)
+    target_link_libraries(gdn_prompt_parity PRIVATE strata_prefill)
+    add_test(NAME gdn_prompt_parity COMMAND gdn_prompt_parity)
+    add_test(NAME gdn_prompt_parity_fp32 COMMAND gdn_prompt_parity --chunked 0 --keyhead 0)
     add_executable(gemm_bench src/kernels/gemm_bench.cpp)
     target_link_libraries(gemm_bench PRIVATE strata_kernels)
     # #783 PR-c: the multi-token router against the single one, the combine against its contract's host replay

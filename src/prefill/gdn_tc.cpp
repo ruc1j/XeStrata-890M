@@ -33,6 +33,7 @@
 #include "strata/core/geometry.hpp"
 
 #include "strata/core/per_device.hpp"
+#include "strata/prefill/kernels.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "../kernels/xe/amd_wmma.hpp"
@@ -659,11 +660,12 @@ bool tc(sycl::queue& q, float* state, const float* h, const float* gate, const f
 bool gdn_rec_tc(sycl::queue& q, int64_t h_k, int64_t h_v, float* state, const float* h, const float* gate,
                 const float* beta, float* y, int64_t T) {
     if (T <= 0) return false;
-    if (h_k == 16 && h_v == 48) return tc<16, 48>(q, state, h, gate, beta, y, T);
-    if (h_k == 16 && h_v == 32) return tc<16, 32>(q, state, h, gate, beta, y, T);
-    // the shape the engine is compiled for (core/geometry.hpp: -DSTRATA_GEOMETRY), whatever its heads
+    // the shapes of kernels.cpp's gdn_dispatch: the one the engine is compiled for (core/geometry.hpp:
+    // -DSTRATA_GEOMETRY), whatever its heads, and the plain models' (kernels.hpp)
     constexpr int CHK = (int) strata::core::kCompiledGeometry.ssm_k_heads, CHV = (int) strata::core::kCompiledGeometry.ssm_v_heads;
     if (h_k == CHK && h_v == CHV) return tc<CHK, CHV>(q, state, h, gate, beta, y, T);
+    if (h_k == kGdnPlainKeyHeads && h_v == kGdnPlainValueHeads)
+        return tc<kGdnPlainKeyHeads, kGdnPlainValueHeads>(q, state, h, gate, beta, y, T);
     return false;
 }
 

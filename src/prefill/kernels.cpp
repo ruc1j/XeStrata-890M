@@ -537,8 +537,9 @@ inline void lds_barrier() {
 #endif
 }  // namespace gw
 
-// The kernels of one GDN shape: HK key heads and HV value heads of S, conv channels C = 2 HK S + HV S.  Qwen3.8 is
-// <16, 48>, Ornith-1.5 (qwen35moe) <16, 32>, and the compiled shape's (kCompiledGeometry); the public functions below dispatch on the shape.
+// The kernels of one GDN shape: HK key heads and HV value heads of S, conv channels C = 2 HK S + HV S.  The engine's
+// is the compiled shape's (kCompiledGeometry: Qwen3.8-Flash-Next <16, 48>), the plain models' Ornith-1.5's (qwen35moe)
+// <16, 32>; the public functions below dispatch on the shape.
 template <int HK, int HV>
 struct Gdn {
     static constexpr int C = 2 * HK * S + HV * S;
@@ -1446,12 +1447,12 @@ struct Gdn {
 };
 
 namespace {
+// the two shapes with kernels: the one the engine is compiled for (core/geometry.hpp: -DSTRATA_GEOMETRY), whatever its
+// heads, and the plain models' (kernels.hpp), which is no second set where the two are the same
+constexpr int kGdnHK = (int) strata::core::kCompiledGeometry.ssm_k_heads, kGdnHV = (int) strata::core::kCompiledGeometry.ssm_v_heads;
 template <class F> void gdn_dispatch(int64_t h_k, int64_t h_v, const char* what, F&& f) {
-    if (h_k == 16 && h_v == 48) f(Gdn<16, 48>{});
-    else if (h_k == 16 && h_v == 32) f(Gdn<16, 32>{});
-    // the shape the engine is compiled for (core/geometry.hpp: -DSTRATA_GEOMETRY), whatever its heads
-    else if (h_k == strata::core::kCompiledGeometry.ssm_k_heads && h_v == strata::core::kCompiledGeometry.ssm_v_heads)
-        f(Gdn<(int) strata::core::kCompiledGeometry.ssm_k_heads, (int) strata::core::kCompiledGeometry.ssm_v_heads>{});
+    if (h_k == kGdnHK && h_v == kGdnHV) f(Gdn<kGdnHK, kGdnHV>{});
+    else if (h_k == kGdnPlainKeyHeads && h_v == kGdnPlainValueHeads) f(Gdn<kGdnPlainKeyHeads, kGdnPlainValueHeads>{});
     else throw core::DeviceError(std::string(what) + ": no kernels for " + std::to_string(h_k) + " key and " +
                                  std::to_string(h_v) + " value heads");
 }

@@ -75,7 +75,7 @@ constexpr float EPS = 1e-6f;
 // the shape the engine is compiled for (include/strata/core/geometry.hpp; -DSTRATA_GEOMETRY picks it)
 constexpr int64_t N = strata::core::kCompiledGeometry.n_embd, HC = strata::core::kCompiledGeometry.hc, D = N * HC, LR = strata::core::kCompiledGeometry.hc_lr, K = strata::core::kCompiledGeometry.n_expert_used;
 constexpr int64_t C = strata::core::kCompiledGeometry.ssm_conv_channels, ZV = strata::core::kCompiledGeometry.ssm_value_dim, HV = strata::core::kCompiledGeometry.ssm_v_heads,
-                  HK = strata::core::kCompiledGeometry.ssm_k_heads;   // the GDN kernels take the heads (kernels.hpp's defaults are Flash-Next's)
+                  HK = strata::core::kCompiledGeometry.ssm_k_heads;   // the GDN kernels take the heads (kernels.hpp)
 // widths the buffers and kernel arguments below are written in (int, as the literals they replace were)
 constexpr int kFF = (int) strata::core::kCompiledGeometry.n_ff, kFF2 = 2 * kFF;
 constexpr int kNHead = (int) strata::core::kCompiledGeometry.n_head, kNKv = (int) strata::core::kCompiledGeometry.n_head_kv, kHeadDim = (int) strata::core::kCompiledGeometry.head_dim;
