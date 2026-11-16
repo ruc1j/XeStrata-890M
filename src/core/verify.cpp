@@ -1636,7 +1636,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         }
         grouped(p_ptr, p_start, p_counts, cap);
         stamp(l, 20, grp);
-        if (recording_res_) {   // no PCIe share and no CPU share: the CPU's rows are zeros
+        const bool multi_combine = dec_batch && n > 1 && native_moe_combine_enabled();
+        const bool fold_hits = multi_combine && native_moe_fuse_hits();   // the hit rows added inside the combine
+        // the resident graph has no CPU share: its combine reads the hit rows alone, and the rows of zeros it would
+        // add them to are neither written nor read (a layer's launch and K rows a token less)
+        const bool no_parts = recording_res_ && fold_hits;
+        if (no_parts) {
+        } else if (recording_res_) {   // no PCIe share and no CPU share: the CPU's rows are zeros
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                      skip_ + grp, ring, cs);
         } else {
@@ -1666,13 +1672,11 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             sh_side_[grp] = false;
             if (!join(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
         }
-        const bool multi_combine = dec_batch && n > 1 && native_moe_combine_enabled();
-        const bool fold_hits = multi_combine && native_moe_fuse_hits();   // the hit rows added inside the combine
         if (!fold_hits) moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         if (multi_combine) {   // one launch for the window's rows
             try {
                 if (fold_hits)
-                    native_moe_combine_multi_hits(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+                    native_moe_combine_multi_hits(no_parts ? nullptr : parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
                                                   shared_ + tb * N, bo_ + tb * N, N, K, n, cs,
                                                   gate_later_[grp] ? sh_g_ + tb : nullptr);
                 else
