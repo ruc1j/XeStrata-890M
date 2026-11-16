@@ -44,6 +44,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -267,9 +268,54 @@ static void sycl_code_cache() {
 #endif
 }
 
+// XeStrata-890M: whether every GPU the kernel's KFD (amdgpu's compute part) lists is a processor's own graphics, by the
+// node's properties (setup's kfd_integrated, the same signs): it has CPU cores as well, or it has no local memory of
+// its own (an APU's memory is the host's RAM).  Asked of sysfs because the answer is needed before the HIP runtime
+// loads.  False without KFD, without a GPU node, or with a card beside the processor's graphics.
+#if defined(__linux__)
+static bool kfd_gpus_all_integrated() {
+    bool any = false;
+    try {
+        std::error_code ec;
+        for (const auto& node : std::filesystem::directory_iterator("/sys/class/kfd/kfd/topology/nodes", ec)) {
+            std::ifstream f(node.path() / "properties");
+            std::string key;
+            long long value = 0, gfx = 0, cores = 0, local_mem = -1;
+            while (f >> key >> value) {
+                if (key == "gfx_target_version") gfx = value;
+                else if (key == "cpu_cores_count") cores = value;
+                else if (key == "local_mem_size") local_mem = value;
+            }
+            if (gfx == 0) continue;   // a node of CPU cores only
+            if (cores <= 0 && local_mem != 0) return false;
+            any = true;
+        }
+    } catch (const std::exception&) {
+        return false;   // the listing failed midway: ROCm's default stays
+    }
+    return any;
+}
+#endif
+
+// XeStrata-890M: where the only AMD GPUs are processors' own graphics, ROCm's runtime waits on the CPU for the signals
+// a command depends on (ROC_CPU_WAIT_FOR_SIGNAL=1, off in ROCm by default) instead of queueing a barrier packet that
+// waits on the GPU: the window graph's side branches fork and join three queues in every layer, and each join is such
+// a dependency.  The 890M with ROCm 7.2.2, greedy 6 chats, on top of the resident graph with its side branches:
+// 37.72 -> 38.10 tok/s (three interleaved rounds, each above; the same answers; a 2,669-token prompt's prefill
+// 329.8 -> 329.1 tok/s; 2026-11-16).  Unless the user set the
+// variable; the runtime reads it once, when it loads, so it is set before the devices are listed.  A card's runtime
+// keeps ROCm's default (not measured).
+static void hip_runtime_defaults() {
+#if defined(__linux__)
+    if (std::getenv("ROC_CPU_WAIT_FOR_SIGNAL") != nullptr || !kfd_gpus_all_integrated()) return;
+    setenv("ROC_CPU_WAIT_FOR_SIGNAL", "1", 0);
+#endif
+}
+
 const std::vector<sycl::device>& engine_devices() {
     static const std::vector<sycl::device> devices = [] {
         sycl_code_cache();
+        hip_runtime_defaults();
         const CompilerWorkaround w = intel_compiler_workaround();
         std::vector<sycl::device> found = find_devices();
         if (w.set && std::any_of(found.begin(), found.end(), [](const sycl::device& d) {
