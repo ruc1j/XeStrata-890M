@@ -31,6 +31,65 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
 
+## A review of the 890M's decode
+
+One window of Qwen3.8-Flash-Next's decode was timed stage by stage, candidates for a faster window were listed for each stage, and they were implemented and measured one at a time, the largest expected gain first (2026-11-16).
+Eight changes went in. The 890M's decode of the greedy six chats (IQ2_XS, `--spec 4`, `--max-context 32768`, three interleaved rounds) went from 35.54, 36.50 and 36.54 tok/s to 38.78, 38.81 and 38.72 tok/s (36.19 to 38.77 on average). The answers are the same as before.
+Each change is either chosen from what the device reports (an integrated GPU, the HIP backend) or gives the same bits on every GPU.
+
+### One window's time by stage
+
+Before the changes one window took 76.4 ms and gave 2.64 tokens on average (the mean of the six chats' 433 windows, measured with the per-stage clocks).
+
+| Stage | Time in a window | Share | Mainly |
+| --- | --- | --- | --- |
+| Experts | 22.3 ms | 29.2% | the experts' products 18.8, the shared expert and the quantization 2.9 |
+| GDN (36 layers) | 18.9 ms | 24.7% | the qkv GEMV 6.0, out-proj 4.1, z 4.1, the recurrence 3.9 |
+| Hyper-connection reads | 18.6 ms | 24.3% | the second read and the router 10.0, the first read 8.5 |
+| QSA attention (12 layers) | 5.9 ms | 7.7% | the GEMVs of q and the indexer's query 2.8, out-proj 1.4 |
+| Speculative decoding's drafts | 5.6 ms | 7.4% | the MTP drafts |
+| Output head | 3.9 ms | 5.0% | the product over 338 MB of IQ4_XS |
+| Waiting on the GPU | 1.7 ms | 2.2% | the kernels that wait for the host, and empty launches |
+| Host | 0.4 ms | 0.5% | the per-layer plan, the commit and the output |
+
+The per-stage clocks slow a window down: without them one window takes about 72 ms.
+The gaps between kernel launches are inside the stages' times; from the start-up measurement they come to an estimated 4 to 4.5 ms a window.
+
+### What went in
+
+The numbers are the 890M's decode of the greedy six chats, the mean of three interleaved rounds before and after that change (four where it says so). The answers are the same before and after each.
+
+- The window graph when every expert is in the cache: since `STRATA_ADAPT_LAG` became 2 by default (the merge of 2026-10-25), a window ran the graph the host plans layer by layer even with every expert in the cache.
+  What a setting that does not wait for a swap's copy has to stop is only the plan in which the device reads the residency table layer by layer (`STRATA_VERIFY_DEVICE_PLAN`). The window graph that does not ask the host is chosen window by window from the host's table, so it is now used with that setting as well.
+  The per-layer round trips between the GPU and the host go, and so do the kernels that wait for the host. 36.01 → 36.58 tok/s (+1.6%).
+- Side branches: whether the window graph takes its side branches (the GDN layer's ab and z, and the shared expert, beside the other kernels) is decided at start-up by timing a graph of small kernels. With ROCm 7.2 the difference it measures became 1 to 4%, short of its 5% line, and the branches were not used.
+  On an integrated GPU on the HIP backend, the window graph that does not ask the host now takes the branches whatever that measurement says (`STRATA_DF_BRANCH=0` turns them off): what the branches give a window is their overlap with the experts' memory-bound kernels, and the start-up graph has none of those.
+  The graph the host plans is still decided by the measurement (on the 890M the branches take it from 36.44 down to 36.22 tok/s). 36.78 → 37.72 tok/s (+2.6%).
+- How the ROCm runtime waits: on a machine whose AMD GPUs are all integrated, the engine puts `ROC_CPU_WAIT_FOR_SIGNAL=1` into its environment before it lists the devices (a value the user set stays as it is; Linux only).
+  When a command waits for one on another queue, the ROCm runtime by default queues a barrier that waits on the GPU; with this setting it waits on the CPU. The side branches split each layer over queues and join them, so every join takes this wait.
+  37.72 → 38.10 tok/s (+1.0%). The prefill of a 2,669-token prompt is 329.8 → 329.1 tok/s, within the noise.
+- Speculative decoding's cost table: the round time `STRATA_SPEC_COST` keeps for each window width could go wrong and stay wrong, and the windows then stayed too narrow or too wide to the end of the process (34.0 to 35.6 tok/s, 4 of about 60 starts).
+  A width's first three times now count by their least, not their mean. After that a time shorter than the mean is followed with a weight of 0.25 and a longer one with 0.1, and a longer one is cut at 1.25 times the mean. The MTP chain tries a width again that has not been timed for more than 128 rounds, when its drafts are at least 0.5 likely to hold.
+  None of the 14 starts after the change had a table gone wrong. `STRATA_DECODE_TIMING=1` also prints, for each request, a line with how many windows took each width and the cost table.
+- `--lookup-chain 2`: where the cost rule is the default (an integrated GPU on the HIP backend), `--lookup-chain 2` is now the default, with `--mtp` and the suffix drafts and none of `--batch`, pipelined windows and `--draft dflash2` (`--lookup-chain 0` turns it off).
+  The cost of an added row is estimated from the times DraftPolicy measured, and a row is added only where it pays. The window's limit goes from 6 rows to 8, and verify's device buffers from 72.5 MiB to 86.6 MiB. 38.03 → 38.31 tok/s (+0.7%, four rounds).
+- The rows of zeros the combine read: the window graph that does not ask the host has no share computed by the CPU. The CPU's rows it filled with zeros in every layer (10 rows a token) are no longer written, and the combine reads only the rows the GPU computed. The result is bit-identical (`native_multi_parity`).
+- The grid of the QSA indexer's scores: the score kernels launched a grid sized from `--max-context` (1,025 work-groups a layer at 32768), and the work-groups past the context returned at once.
+  The grid is now a fixed one sized from the number of compute units (64 work-groups on the 890M), and each sub-group steps to the blocks a grid's width further on. The scores are bit-identical (`qsa_score_parity`).
+- The indexer while the context is shorter than the selection's width: while the context is 2,051 cells or fewer, the selection is every cell and reads no score. For that long the indexer's query product (2.6 MB of weights a layer) and the scores are skipped (`STRATA_QSA_SKIP_IDENTITY=0` for the former behaviour).
+
+The last three together give 38.20 → 38.66 tok/s (+1.2%).
+
+### What did not go in
+
+- Reading the PLE rows after the launch in the window graph that does not ask the host was slower, 37.25 → 37.01 tok/s.
+- Splitting off the z GEMV after qkv to overlap it with the GDN recurrence gave 37.79 → 37.29 tok/s (-1.3%).
+- Reading the experts' weights with wide 32-bit and 64-bit loads did not change the number of load instructions: the compiler already merges the 16-bit reads. Only the non-temporal hint changed, and it gave 37.29 → 36.89 tok/s (-1.1%).
+- Computing the GDN recurrence lane by lane was slower as a kernel on its own, a three-row step 74.5 → 110.4 us, and the choice at start-up never picked it.
+- The candidates that lower the precision (a two-stage output head, hyper-connection weights below 8 bits, the router in Q8_0 and others, seven in all) were not tried: the check that a kernel matches the CPU reference does not apply to them.
+
+What was checked: the free and contrib-llvm builds, CTest (in both, all but the two tests that have no pack pass), and that `tools/lint/run.sh` gives no new findings.
+
 ## Integration of upstream XeStrata through xe0.2.8-1
 
 Upstream XeStrata's main (MistVVK/XeStrata) was merged from the commit after xe0.2.2-1 up to 721afe51f of 2026-10-30 (xe0.2.8-1) on 2026-11-02.
@@ -678,7 +737,7 @@ The main things carried:
 - `STRATA_PREFILL_CPU_SHARE=auto` (the default): a short chunk's least-routed experts are computed by the idle CPU pool.
 - `--kv-grow`: the K/V takes VRAM only for the cells a request has reached, and the expert cache uses the rest.
   It is on by default where the device's virtual memory mapping granularity is 2 MiB or more (on for the RTX 4070; the B70's is 64 KiB, off).
-- `--adapt-async` (the resident mode's default), `--batch-mtp` (the default with `--batch` and `--mtp`), `--pipeline-windows` (the default on a split of two Xe2 GPUs, opt-in otherwise, [MULTIGPU](MULTIGPU.md)) and `--lookup-chain` (opt-in).
+- `--adapt-async` (the resident mode's default), `--batch-mtp` (the default with `--batch` and `--mtp`), `--pipeline-windows` (the default on a split of two Xe2 GPUs, opt-in otherwise, [MULTIGPU](MULTIGPU.md)) and `--lookup-chain` (opt-in; 2 by default on an integrated GPU on the HIP backend since 2026-11-16, [A review of the 890M's decode](#a-review-of-the-890ms-decode)).
 - Setup's additions (`--inspect`, `--source modelscope`, a 200K context and more) and the server's changes.
 
 Of the paths meant to be faster, those faster on the B70 or the RTX 4070 without being slower on the other are carried.

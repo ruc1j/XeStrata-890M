@@ -96,6 +96,15 @@ setup changes of upstream Strata 0.2.12 (engine 0.1.58) ([docs/XE.md](docs/XE.md
     experts' stage (`STRATA_SH_BRANCH`, default on GPUs where a side branch pays off; upstream's counterpart is
     SH_STREAM); the same kernels in the same order, joined before combine, so the answers are bit-identical. 890M
     decode is +2.5-3.0% (35.5 → 36.5 tok/s). `STRATA_SH_BRANCH=0` for the original order.
+  - a window with every expert in the cache runs one graph that does not ask the host, also with the default that
+    does not wait for a swap's copy. On an integrated GPU on the HIP backend that graph takes the side branches
+    whatever the start-up measurement says (`STRATA_DF_BRANCH=0` turns them off). On a machine whose AMD GPUs are all
+    integrated, the ROCm runtime waits on the CPU where it waits for another queue (the engine sets
+    `ROC_CPU_WAIT_FOR_SIGNAL=1`; a value the user set stays). The cost table of speculative decoding no longer stays
+    wrong after one disturbed round, and `--lookup-chain 2` is the default. The QSA indexer's score kernels take a
+    fixed grid, and while the context is within the selection's width (2,051 cells) the query product and the
+    scores are not computed. Together the 890M's decode is 36.2 → 38.8 tok/s, with the same answers
+    ([XE](docs/XE.md#a-review-of-the-890ms-decode)).
   - the draft chain and the window length are cut by the product of the drafts' probabilities so far
     (`STRATA_SPEC_CUM=c`, default 0.5 on HIP's integrated GPU, 0 elsewhere for the old rule; not used when
     `--spec-min-p` is 0; on HIP's integrated GPU the cost-aware window `STRATA_SPEC_COST` is the default since

@@ -70,11 +70,14 @@ Decode speed depends on the text as well.
 Speculative decoding runs faster when more of the drafted tokens are accepted, so a difference of a few percent between neighbouring cells means nothing
 (IQ2_XS is faster at 128K than at 64K because it accepted 0.768 of its drafts there against 0.683).
 
-`--lookup-chain K` (default 0, off) checks, after the draft layer's guesses, up to K more tokens that followed the same
+`--lookup-chain K` (default 0, off; 2 on an integrated GPU on the HIP backend) checks, after the draft layer's guesses, up to K more tokens that followed the same
 text earlier in the conversation (upstream 2312c83b).
 It speeds up handing back a given text nearly as it was, and slows ordinary chat a little
 (B70, IQ2_XS, K=3: rewriting a document 109.6 → 129.2, ordinary chat 71.1 → 68.3 tokens/s).
 `--lookup-chain-min M` is the match it needs before adding any (default 3 tokens).
+On an integrated GPU on the HIP backend the rule that sizes the window by its cost (`STRATA_SPEC_COST`) prices the added
+rows as well and adds one only where it pays, so K=2 is the default there
+(890M, IQ2_XS, six chats of ordinary text: 38.03 → 38.31 tok/s; `--lookup-chain 0` turns it off).
 
 In the server's decode, a missed expert (not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the
 top 10, the smallest weights) contributes zero to that token, and one that every token of a verify window routes that
