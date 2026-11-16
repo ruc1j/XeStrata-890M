@@ -552,6 +552,7 @@ struct Options {
     /// the context followed by the MTP's drafts and appends up to K of the tokens that followed that match to the same
     /// verify window (the window grows to at most 8).  Greedy verification keeps the output; its own counts are kept.
     int lookup_chain = 0;
+    bool lookup_chain_given = false;   ///< --lookup-chain was on the command line (the integrated GPU's default does not override it)
     int lookup_chain_min = 3;   ///< --lookup-chain-min M: the shortest match (in tokens, drafts included) it extends on
     /// --mtp-hnorm stream (opt-in): the draft layer's pre_fc_norm_hidden normalizes each hyper-connection stream on
     /// its own (llama.cpp's qwen4exp MTP graph) instead of one RMS over all four (the default, tools/mtp_probe.py).
@@ -698,8 +699,9 @@ void usage() {
                  "  --spec-min-p P       --spec-window min-p: how sure the draft layer must be to extend a verify window\n"
                  "                       by another guess (setup writes 0.5; --calibrate measures it on this PC, see\n"
                  "                       docs/DETAILS.md)\n"
-                 "  --lookup-chain K     opt-in: after the MTP's drafts, add up to K prompt-lookup drafts that continue\n"
-                 "                       them (the window grows to at most 8; default 0 = off)\n"
+                 "  --lookup-chain K     after the MTP's drafts, add up to K prompt-lookup drafts that continue them\n"
+                 "                       (the window grows to at most 8; default 0 = off, 2 on an integrated GPU on\n"
+                 "                       the HIP backend)\n"
                  "  --lookup-chain-min M  the shortest context match --lookup-chain extends on (default 3)\n"
                  "  --mtp-hnorm pooled|stream  the draft layer's hidden-input norm: one RMS over all four streams\n"
                  "                       (default) or one per stream (llama.cpp's MTP graph)\n"
@@ -2785,7 +2787,10 @@ int main(int argc, char** argv) {
         }
         else if (a == "--draft-conf") o.draft_conf = std::clamp(std::strtod(next("--draft-conf"), nullptr), 0.0, 1.0);
         else if (a == "--draft-cap") o.draft_cap = std::max(0, (int) std::strtol(next("--draft-cap"), nullptr, 10));
-        else if (a == "--lookup-chain") o.lookup_chain = std::clamp((int) std::strtol(next("--lookup-chain"), nullptr, 10), 0, 7);
+        else if (a == "--lookup-chain") {
+            o.lookup_chain = std::clamp((int) std::strtol(next("--lookup-chain"), nullptr, 10), 0, 7);
+            o.lookup_chain_given = true;
+        }
         else if (a == "--lookup-chain-min") o.lookup_chain_min = std::max(3, (int) std::strtol(next("--lookup-chain-min"), nullptr, 10));
         else if (a == "--mtp-hnorm") {
             const std::string v = next("--mtp-hnorm");
@@ -3135,6 +3140,17 @@ int main(int argc, char** argv) {
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
+    }
+    // XeStrata-890M: --lookup-chain 2 by default where the MTP's window is scheduled by its cost (STRATA_SPEC_COST, the
+    // integrated GPU on the HIP backend's default): the policy prices a chained row at the round times it measured and
+    // adds one only where it pays, and a row costs this GPU little beside a round's fixed part (about 8.5 ms of 52).
+    // The 890M's greedy 6 chats, four interleaved rounds: 38.03 -> 38.31 tok/s, each round above; the same answers.
+    // --lookup-chain 0 turns it off.  Not with --batch slots, pipelined windows or another drafter (they decode
+    // without the chain).
+    if (!o.lookup_chain_given && !o.mtp.empty() && o.spec >= 2 && o.suffix_draft > 0 && o.batch == 0 &&
+        o.pipeline_windows < 2 && o.draft != "dflash2" && strata::core::spec_cost_default()) {
+        o.lookup_chain = 2;
+        std::fprintf(stderr, "strata: --lookup-chain 2 (the integrated GPU's default; --lookup-chain 0 turns it off)\n");
     }
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
     // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
