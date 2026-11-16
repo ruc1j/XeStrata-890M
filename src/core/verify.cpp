@@ -764,17 +764,32 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     {   // the mixer's side branches (upstream 2e4ddf6e) where they pay on this device: measured once (the RTX 4070
         // +0.7%; the B70 lost 4%, its graphs' forks and joins cost more than the overlap gave).  STRATA_DF_BRANCH=0|1
         // fixes the choice.
+        //
+        // XeStrata-890M: the window graph that never asks the host (every expert resident) takes the branches on an
+        // integrated GPU on the HIP backend whatever the probe says.  The probe is small kernels only, and what the
+        // branches give a window is their overlap with the experts' memory-bound kernels, which the probe has none
+        // of: on the 890M with ROCm 7.2 it reads the branched graph 1-4% faster, short of its 5% line in every start,
+        // and 8-16% slower once the runtime waits on the CPU for the joins (ROC_CPU_WAIT_FOR_SIGNAL=1, which the
+        // engine sets there: device.cpp), while the branches give that graph's decode 36.78 -> 37.72 tok/s, and
+        // 36.7 -> 38.1 with the CPU wait (greedy 6 chats, 2026-11-16).  The host-planned graph keeps the probe's
+        // answer (the branches cost it 0.6% there, 36.44 -> 36.22 tok/s), and so does every other device's resident
+        // graph (not measured).
         const char* v = std::getenv("STRATA_DF_BRANCH");
         for (int i = 0; i < 2; ++i)
             if (!df_side_[i]) df_side_[i] = strata::gpu::stream_create();
-        if (!df_side_[0] || !df_side_[1]) df_branch_ = false;
-        else if (v != nullptr) df_branch_ = std::strtol(v, nullptr, 10) != 0;
+        if (!df_side_[0] || !df_side_[1]) df_branch_ = df_branch_res_ = false;
+        else if (v != nullptr) df_branch_ = df_branch_res_ = std::strtol(v, nullptr, 10) != 0;
         else {
             try {
                 df_branch_ = strata::kernels::graph_branch_pays(cs_, df_side_[0], df_side_[1]);
             } catch (const std::exception&) {
                 df_branch_ = false;   // a device that cannot record such a graph keeps one queue
             }
+            const sycl::device& d = Runtime::get().device();
+            df_branch_res_ = df_branch_ || (d.get_backend() == sycl::backend::ext_oneapi_hip && integrated_gpu(d));
+            if (df_branch_res_ && !df_branch_)
+                std::fprintf(stderr, "strata verify: graph side branches: used in the windows that do not ask the host "
+                                     "(the integrated GPU's default; STRATA_DF_BRANCH=0 turns them off)\n");
         }
         // the PCIe share's fetch on a side branch of the window graph, beside the VRAM hits (post()): the fetch waits
         // on the link, the hits on the GPU, so side by side the hits' time hides under the fetch.  Where the graph's
@@ -853,7 +868,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     // STRATA_DF_BRANCH: mixer work that reads only the layer's input on a side branch of the graph.  fork(i): side i
     // after everything on cs so far; join(i): cs after everything on side i - a branch never races with what came
     // before its fork or after its join.  Not in a split or batch window, nor under the profiler (its stamps are on cs).
-    const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_;
+    const bool br = (recording_res_ ? df_branch_res_ : df_branch_) && G == 1 && !batch_rec_ && !prof_on_;
     auto fork = [&](int i) { return strata::gpu::stream_fork(cs, df_side_[i]); };
     auto join = [&](int i) { return strata::gpu::stream_join(cs, df_side_[i]); };
     // see Verifier::commit; not in a pipelined window (always_publish_), which a misprediction rolls back

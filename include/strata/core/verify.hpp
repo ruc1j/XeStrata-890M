@@ -619,6 +619,7 @@ private:
     strata::gpu::Stream cs_ = nullptr;
     strata::gpu::Stream df_side_[2] = {};   ///< STRATA_DF_BRANCH: the mixer's side branches of the window graph
     bool df_branch_ = false;
+    bool df_branch_res_ = false;            ///< the same choice for the all-resident window graph (see init)
     strata::gpu::Stream fetch_side_ = nullptr;   ///< STRATA_FETCH_BRANCH: the PCIe share's fetch beside the VRAM hits
     bool fetch_branch_ = false;
     strata::gpu::Graph* exec_[9] = {};
