@@ -1119,6 +1119,11 @@ if(STRATA_ENABLE_XE)
     add_executable(qsa_parity src/kernels/qsa_parity.cpp)
     target_link_libraries(qsa_parity PRIVATE strata_kernels)
     add_test(NAME qsa_parity COMMAND qsa_parity --selftest)
+    # the indexer's block scores (the window graph's kernels) against a host reference, and the rows form against the
+    # per-row one, memcmp
+    add_executable(qsa_score_parity src/kernels/qsa_score_parity.cpp)
+    target_link_libraries(qsa_score_parity PRIVATE strata_kernels)
+    add_test(NAME qsa_score_parity COMMAND qsa_score_parity)
     # perf-review D-1: the prompt attention against the FP32 kernel and FP64 (a benchmark too: not a CTest case,
     # as in the CUDA build)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
