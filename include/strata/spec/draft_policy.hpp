@@ -80,8 +80,9 @@ public:
     void set_context(long long pos);
     /// The measured round cost of every window size seen: "T1:39.8(n=120) T2:..." for the log / the next process's table.
     std::string cost_table_text() const;
-    /// STRATA_SPEC_COST: a round time far above what is known for that width (the first use of a width captures its graph; a stalled
-    /// round) counts as a tenth of a sample, so one capture cannot price a width out of use.  Off: the cost EMA as it always was.
+    /// STRATA_SPEC_COST: a width's first three round times count by their least, later ones move its cost down faster than up
+    /// and are cut a quarter above it, and the MTP chain tries a width again whose time has grown old - so one disturbed round
+    /// cannot price a width out of use (draft_policy.cpp).  Off: the cost EMA as it always was.
     void set_robust(bool on) { robust_ = on; }
 
     /// COST-AWARE MTP WINDOW (STRATA_SPEC_COST=1): the MTP chain is drafted one step at a time; after draft j (probability p_j)
@@ -150,6 +151,8 @@ private:
     double rounds_ = 0;                                    // rounds observed so far
     bool robust_ = false;
     double clamp_sample(int t, double ms, bool lookup = false) const;
+    void update_cost(double& mean, double& n, double ms) const;   // one round's time into a size's cost
+    bool stale_chain(int t) const;                                // keep_draft: a size's time is old enough to try again
     static constexpr int kPBuckets = 8;
     std::array<double, kPBuckets> pa_ok_{}, pa_n_{};       // MTP drafts reached / accepted by probability bucket (decayed)
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> last_{};   // the round at which each size was last measured

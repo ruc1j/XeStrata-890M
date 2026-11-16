@@ -30,6 +30,19 @@ constexpr double kStaleRounds = 300.0;
 // drafts must have of holding for a size whose cost is only guessed to be tried (as chain()'s 0.6 for a lookup)
 constexpr double kDraftPrior = 0.7;
 constexpr double kProbeHeld = 0.5;
+// STRATA_SPEC_COST (set_robust), XeStrata-890M.  A round's time has a floor, the work of its rows, and what disturbs a
+// round (another process, a clock step, a capture in the draft that follows) only adds to it.  So a size's first
+// kProbes times count by their least, and after them a time below the mean moves it faster (kCostAlphaDown) than one
+// above (kCostAlpha), which is also cut at kHiccup times the mean.  With the running mean of before, one disturbed
+// round among a size's three probes left it priced a third of the disturbance too high, and a size priced out is
+// not measured again.  The 890M's greedy 6 chats (--spec 4) showed starts whose windows stayed too narrow or too
+// wide to the end of the process: 34.0-35.6 tok/s against 36.4-38.1, 4 of about 60 starts, and none in the
+// 14 starts with this (2026-11-16; which round set the wrong time was not seen).  The MTP chain
+// also tries a size again whose time is kStaleChain rounds old, when its drafts are likely to hold (kProbeHeld):
+// a time that is wrong for another reason is then corrected within a few hundred rounds.
+constexpr double kCostAlphaDown = 0.25;
+constexpr double kHiccup = 1.25;
+constexpr double kStaleChain = 128.0;
 
 }  // namespace
 
@@ -67,14 +80,25 @@ double DraftPolicy::cost_ms(int t, bool lookup) const {
 
 double DraftPolicy::clamp_sample(int t, double ms, bool lookup) const {
     if (!robust_) return ms;
-    const double known = cost_ms(t, lookup);   // the measured value, or the scaled guess from the other widths
-    if ((source_costs_ && lookup ? lookup_cost_n_ : cost_n_)[bk_][t] == 0) {
-        // the first use of a width captures its graph: that round says nothing about its cost, the guess from the other widths stands in
-        for (int u = 1; u <= kMaxT; ++u)
-            if (cost_n_[bk_][u] > 0) return known;
-        return ms;
+    // a size's first times are taken as they are (update_cost keeps their least; the caller leaves out the round that
+    // captured the size's graph); later ones are cut at kHiccup times what is known
+    if ((source_costs_ && lookup ? lookup_cost_n_ : cost_n_)[bk_][t] < kProbes) return ms;
+    return std::min(ms, kHiccup * cost_ms(t, lookup));
+}
+
+void DraftPolicy::update_cost(double& mean, double& n, double ms) const {
+    if (!robust_) {
+        mean = n > 0 ? (1.0 - kCostAlpha) * mean + kCostAlpha * ms : ms;
+    } else if (n < 1.0) {
+        mean = ms;   // the first time, or the first after another context's value stood in (set_context)
+        n = 0.0;
+    } else if (n < kProbes) {
+        mean = std::min(mean, ms);
+    } else {
+        const double alpha = ms < mean ? kCostAlphaDown : kCostAlpha;
+        mean = (1.0 - alpha) * mean + alpha * ms;
     }
-    return std::min(ms, 2.0 * known);
+    n += 1.0;
 }
 
 void DraftPolicy::seed_costs(const double* ms, int n, double weight, int bucket) {
@@ -99,7 +123,7 @@ void DraftPolicy::set_context(long long pos) {
                 for (int t = 1; t <= kMaxT; ++t)
                     if (cost_n_[src][t] > 0) {
                         cost_[nb][t] = cost_[src][t];
-                        cost_n_[nb][t] = 1.0;
+                        cost_n_[nb][t] = 0.5;   // a stand-in: this length's first time replaces it (update_cost)
                         last_[nb][t] = rounds_;
                         has = true;
                     }
@@ -124,6 +148,10 @@ std::string DraftPolicy::cost_table_text() const {
             }
     }
     return out;
+}
+
+bool DraftPolicy::stale_chain(int t) const {
+    return robust_ && t <= kMaxT && cost_n_[bk_][t] > 0 && rounds_ - last_[bk_][t] > kStaleChain;
 }
 
 bool DraftPolicy::stale(int t, bool lookup) const {
@@ -174,9 +202,7 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
         // source_costs: a lookup window's time goes into the lookup table, so neither source prices the other's rounds
         auto& ms = source_costs_ && lookup ? lookup_cost_ : cost_;
         auto& n = source_costs_ && lookup ? lookup_cost_n_ : cost_n_;
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (n[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
-        ms[bk_][t] = n[bk_][t] > 0 ? (1.0 - alpha) * ms[bk_][t] + alpha * round_ms : round_ms;
-        n[bk_][t] += 1.0;
+        update_cost(ms[bk_][t], n[bk_][t], round_ms);
         last_[bk_][t] = rounds_;
     }
     rounds_ += 1.0;
@@ -217,10 +243,7 @@ void DraftPolicy::apply_costs(int64_t committed) {
     for (; n < held_.size() && held_[n].end < committed; ++n) {
         const HeldCost& h = held_[n];
         bk_ = h.bucket;   // observe()'s update, in the bucket the round ran in
-        const double ms = clamp_sample(h.t, h.ms);
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][h.t] + 1.0)) : kCostAlpha;
-        cost_[bk_][h.t] = cost_n_[bk_][h.t] > 0 ? (1.0 - alpha) * cost_[bk_][h.t] + alpha * ms : ms;
-        cost_n_[bk_][h.t] += 1.0;
+        update_cost(cost_[bk_][h.t], cost_n_[bk_][h.t], clamp_sample(h.t, h.ms));
         delayed_n_[bk_][h.t] += 1.0;   // a round already counted by observe_committed
         last_[bk_][h.t] = rounds_;
     }
@@ -268,15 +291,17 @@ bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
             st.best_v = v;
             st.best_rows = rows;
         }
-        // a width not measured yet is tried a few times when the chain is likely to hold that far
-        if (cost_n_[bk_][rows] < kProbes && st.q >= 0.15) st.best_rows = rows;
+        // a width not measured yet is tried a few times when the chain is likely to hold that far, and one whose time
+        // has grown old once in a while, when its drafts are likely to hold (kStaleChain)
+        if ((cost_n_[bk_][rows] < kProbes && st.q >= 0.15) || (stale_chain(rows) && st.q >= kProbeHeld)) st.best_rows = rows;
     }
     st.kept = st.best_rows - 1;
     if (rows + 1 > cap) return false;                       // no row left for another draft
     // one or two more drafts, each as likely to hold as this one did, could they beat the best width so far?
     const double v1 = (st.e + st.q * a) / cost_ms(rows + 1);
     const double v2 = rows + 2 <= cap ? (st.e + st.q * a + st.q * a * a) / cost_ms(rows + 2) : 0.0;
-    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (cost_n_[bk_][rows + 1] < kProbes && st.q * a >= 0.15);
+    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (cost_n_[bk_][rows + 1] < kProbes && st.q * a >= 0.15) ||
+           (stale_chain(rows + 1) && st.q * a >= kProbeHeld);
 }
 
 // The draft layer's probability is not the model's: the calibration is the accepted drafts over the probabilities
@@ -373,10 +398,7 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
     if (round_ms > 0) {
-        round_ms = clamp_sample(t, round_ms);
-        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
-        cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
-        cost_n_[bk_][t] += 1.0;
+        update_cost(cost_[bk_][t], cost_n_[bk_][t], clamp_sample(t, round_ms));
         last_[bk_][t] = rounds_;
     }
     rounds_ += 1.0;

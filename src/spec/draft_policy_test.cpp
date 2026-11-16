@@ -180,6 +180,68 @@ int main() {
         check(fresh.choose(4, 5, 40).lookup && fresh.choose(4, 5, 40).t == 6,
               "delayed: a held time does not count as another probe");
     }
+    {
+        // STRATA_SPEC_COST (set_robust): the 890M's round times, about 8.5 ms a row.  A disturbed round among a width's
+        // first times must not price the width out, and a width whose time has grown old is tried again by the chain.
+        auto ms = [](int t) { return 43.5 + 8.5 * t; };
+        {
+            DraftPolicy p(4);
+            p.set_robust(true);
+            p.observe(false, 4, 3, 0, ms(4));
+            p.observe(false, 4, 3, 0, 2.0 * ms(4));   // a round that was disturbed
+            p.observe(false, 4, 3, 0, ms(4));
+            check(std::fabs(p.cost_ms(4) - ms(4)) < 1e-9, "robust: the first times count by their least");
+            DraftPolicy first(4);
+            first.set_robust(true);
+            for (int t = 1; t <= 3; ++t)
+                for (int i = 0; i < 4; ++i) first.observe(false, t, t - 1, 0, ms(t));
+            first.observe(false, 4, 3, 0, ms(4));
+            check(std::fabs(first.cost_ms(4) - ms(4)) < 1e-9, "robust: a width's first time is its own, not a guess from the others");
+            first.observe(false, 4, 3, 0, 0.0);
+            check(std::fabs(first.cost_ms(4) - ms(4)) < 1e-9, "robust: a round without a time (a capture) leaves the cost alone");
+        }
+        {
+            DraftPolicy p(4);
+            p.set_robust(true);
+            for (int i = 0; i < 12; ++i) p.observe(false, 4, 3, 0, ms(4));
+            p.observe(false, 4, 3, 0, 3.0 * ms(4));   // cut at a quarter above the cost, and a tenth of that counts
+            check(p.cost_ms(4) > ms(4) && p.cost_ms(4) < 1.03 * ms(4), "robust: a later disturbed round moves the cost by under 3%");
+            for (int i = 0; i < 8; ++i) p.observe(false, 4, 3, 0, ms(4));
+            check(p.cost_ms(4) < 1.003 * ms(4), "robust: and eight ordinary rounds bring it back");
+            for (int i = 0; i < 40; ++i) p.observe(false, 4, 3, 0, 1.1 * ms(4));   // the GPU's clock went down for good
+            check(p.cost_ms(4) > 1.09 * ms(4), "robust: a lasting change is followed");
+        }
+        {
+            // the chain: widths 1..3 at their times, width 4 priced half again too high by a slow stretch
+            DraftPolicy p(4);
+            p.set_robust(true);
+            for (int t = 1; t <= 3; ++t)
+                for (int i = 0; i < 20; ++i) p.observe(false, t, t - 1, 0, ms(t));
+            for (int i = 0; i < 20; ++i) p.observe(false, 4, 3, 0, 1.5 * ms(4));
+            auto chain_rows = [&p](float prob) {   // three drafts of probability prob, as the drafter asks keep_draft
+                DraftPolicy::ChainState st;
+                for (int idx = 0; idx < 3; ++idx)
+                    if (!p.keep_draft(st, idx, prob, 4)) break;
+                return st.best_rows;
+            };
+            check(chain_rows(0.95f) == 3, "robust chain: a width priced out is not taken");
+            int rounds = 0;
+            while (rounds < 400 && chain_rows(0.95f) != 4) {
+                p.observe(false, 3, 2, 0, ms(3));
+                ++rounds;
+            }
+            check(rounds > 100 && rounds < 200, "robust chain: once its time is old, it is tried again");
+            check(chain_rows(0.5f) != 4, "robust chain: but not for drafts unlikely to hold");
+            int probes = 0;
+            for (int i = 0; i < 2000 && p.cost_ms(4) > 1.02 * ms(4); ++i) {
+                const int rows = chain_rows(0.95f);
+                if (rows == 4) ++probes;
+                p.observe(false, rows, rows - 1, 0, ms(rows));
+            }
+            check(p.cost_ms(4) <= 1.02 * ms(4) && probes <= 16, "robust chain: and its true time brings it back into use");
+            check(chain_rows(0.95f) == 4, "robust chain: the width is taken again");
+        }
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

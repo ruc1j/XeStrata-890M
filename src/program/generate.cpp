@@ -12347,6 +12347,7 @@ int main(int argc, char** argv) {
             double dt_run = 0, dt_commit = 0, dt_draft = 0, dt_pre = 0, dt_join = 0, dt_adapt = 0;
             const int64_t adapt_swaps0 = adapt_swaps_n, adapt_sync0 = adapt_sync_n;
             int64_t dec_windows = 0, dec_T = 0;
+            std::array<int64_t, 9> dec_hist{};   // STRATA_DECODE_TIMING: the windows of each size (kVerifyMaxT + 1)
             const int64_t decode_hits0 = drive.d.cache_hits;
             // the expert tiers this request read from (DONE's RAM / file blobs and file MB)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
@@ -13324,6 +13325,7 @@ int main(int argc, char** argv) {
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
                     ++dec_windows; dec_T += T;
+                    ++dec_hist[(size_t) std::clamp(T, 0, 8)];
                 }
                 const Clock::time_point tj0 = Clock::now();
                 if (adapt_thr.joinable()) adapt_thr.join();
@@ -13347,12 +13349,14 @@ int main(int argc, char** argv) {
                     if (!from_sfx) df2_gate.observe(dwin_s.data(), T, a);
                     df2_gate.observe_round(std::chrono::duration<double, std::milli>(Clock::now() - round0).count(), a + 1);
                 }
+                // (a round whose window captured its graph gives no time, as in generate mode: observe() then counts its
+                // drafts only)
+                const double round_ms = ver.captured_last() ? 0.0
+                                      : std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
                 if (timed_round && !eos && chain_n == 0)
-                    policy.observe(from_sfx, T, a, sfx_match,
-                                   std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                    policy.observe(from_sfx, T, a, sfx_match, round_ms);
                 else if (timed_round && !eos)   // a chained window: its MTP part, its chain, its cost
-                    policy.observe_chain(T_mtp, chain_n, a, cm,
-                                         std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                    policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
@@ -13382,6 +13386,13 @@ int main(int argc, char** argv) {
                              (double) (d1.misses - ds0.misses) / (w * L), (double) (d1.entries - ds0.entries) / (w * L),
                              (double) (d1.hits - ds0.hits) / (w * L), (double) (d1.pcie - ds0.pcie) / (w * L),
                              dt_adapt / w, (long long) (adapt_swaps_n - adapt_swaps0), (long long) (adapt_sync_n - adapt_sync0));
+                {   // which sizes the windows took, and the round costs the policy has measured so far (the whole process)
+                    std::string sizes;
+                    for (size_t t = 1; t < dec_hist.size(); ++t)
+                        if (dec_hist[t] > 0) sizes += " T" + std::to_string(t) + ":" + std::to_string(dec_hist[t]);
+                    std::fprintf(stderr, "strata decode windows:%s; round costs %s\n", sizes.c_str(),
+                                 policy.cost_table_text().c_str());
+                }
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile (upstream fe9c10ca, b4405a0e)
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;
