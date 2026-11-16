@@ -1191,6 +1191,17 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 // indexer query on side 1, beside the K/V side; side 1 joins before the block scores, side 0 before
                 // attention (xq_ and mixed_ are not rewritten before then)
                 const bool qbr = br && qb;
+                // While the window's last row selects every cell of the cache (a context up to the selection's width,
+                // 2,051 cells), every row's top-k is the identity and reads no score: the indexer's query product
+                // (its 2.6 MB of weights a layer) and the scores return at once.  The rows form of the scores only
+                // (qsa_rows below); the query's norm and RoPE still run, on rows nothing reads.
+                static const bool sel_skip = [] {
+                    const char* e = std::getenv("STRATA_QSA_SKIP_IDENTITY");
+                    return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+                }();
+                const int32_t* sel_last = step_ + (ptrdiff_t) (te - 1) * kStepCount;
+                const int32_t* sel_all_a = sel_skip && qb && !batch_rec_ ? sel_last + kStepNKv : nullptr;
+                const int32_t* sel_all_b = sel_all_a != nullptr ? sel_last + kStepWidth : nullptr;
                 // q out of the q|gate rows, normed and rotated: one launch where the fused kernel applies, else the
                 // split copy and norm_rope (the batched rows only: native QSA and native RoPE are on)
                 auto q_split_norm_rope = [&](strata::gpu::Stream on) -> bool {
@@ -1216,7 +1227,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, df_side_[0]);
                     if (!fork(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
-                                              N, IQ * ID, n, df_side_[1]);
+                                              N, IQ * ID, n, df_side_[1], sel_all_a, sel_all_b);
                     norm_rope_on(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, df_side_[1]);
                 }
                 if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
@@ -1315,7 +1326,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     if (!q_split_norm_rope(cs)) return false;
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
-                                              N, IQ * ID, n, cs);
+                                              N, IQ * ID, n, cs, sel_all_a, sel_all_b);
                     norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
                 } else {
                 for (int t = tb; t < te; ++t) {

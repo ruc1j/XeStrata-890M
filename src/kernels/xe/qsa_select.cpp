@@ -316,6 +316,9 @@ void qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
             const sycl::sub_group sg = it.get_sub_group();
             const int64_t first = int64_t(it.get_group(0)) * SCORE_WARPS + int64_t(sg.get_group_linear_id());
             const int64_t top = steps[(nq - 1) * kStepCount + kStepNBid];   // the last row's: the largest
+            // the last row selects every cell, so every row does (the width is the cells up to a fixed count, and the
+            // rows' cells rise): qsa_block_topk writes the identity without reading a score
+            if (steps[(nq - 1) * kStepCount + kStepNKv] <= steps[(nq - 1) * kStepCount + kStepWidth]) return;
             const int lane = int(sg.get_local_linear_id());
             const bool hi16 = (lane & 16) != 0, hi8 = (lane & 8) != 0;
             for (int64_t b = first; b <= top && b < max_blocks; b += stride) {   // uniform over the sub-group

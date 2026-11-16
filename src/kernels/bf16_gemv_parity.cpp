@@ -19,9 +19,12 @@
 
 #include "parity_device.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -131,6 +134,75 @@ int main(int argc, char** argv) {
                         visible ? "yes" : "*** NO ***", r * 100);
             if (!visible) ++bad;
         }
+    }
+
+    // ---- 4. THE WINDOW'S ROWS IN ONE LAUNCH (bf16_gemv_fp32_mmvf_multi, the decode window's form): F32 activations,
+    // 2..8 rows.  Against the host's FP64 reference over the same values, against the single-row call (the header says
+    // every output is that call's bits: memcmp), and the run-time skip: while *skip_a <= *skip_b the launch writes
+    // nothing, and otherwise what the launch without the pointers writes.
+    for (const Shape& s : {shapes[1], shapes[2]}) {
+        std::mt19937 rng(2051);  // NOLINT(bugprone-random-generator-seed): reproducible fixtures.
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        const int max_rows = 8;
+        std::vector<float> fx((size_t) (max_rows * s.n_in));
+        std::vector<uint16_t> w((size_t) (s.n_in * s.n_out));
+        for (auto& v : fx) v = g(rng);
+        for (auto& v : w) v = bf16_from_f32(g(rng) * 0.05f);
+        strata::parity::Device dev;
+        float* d_x = dev.upload(fx);
+        uint16_t* d_w = dev.upload(w);
+        float* d_y = dev.alloc<float>((size_t) (max_rows * s.n_out));
+        float* d_one = dev.alloc<float>((size_t) s.n_out);
+        int32_t* d_flag = dev.alloc<int32_t>(2);
+        int shape_bad = 0;
+        double worst = 0.0;
+        for (int n = 2; n <= max_rows; ++n) {
+            const size_t count = (size_t) (n * s.n_out);
+            std::vector<float> got(count), single(count), want(count);
+            strata::kernels::bf16_gemv_fp32_mmvf_multi(d_x, s.n_in, d_w, d_y, s.n_out, s.n_in, s.n_out, n, nullptr);
+            strata::parity::copy_out(got.data(), d_y, count);
+            for (int t = 0; t < n; ++t) {
+                strata::kernels::bf16_gemv_fp32_mmvf(d_x + (size_t) (t * s.n_in), d_w, d_one, (int) s.n_in, (int) s.n_out, nullptr);
+                strata::parity::copy_out(single.data() + (size_t) (t * s.n_out), d_one, (size_t) s.n_out);
+                for (long long o = 0; o < s.n_out; ++o) {
+                    double sum = 0.0;
+                    for (long long i = 0; i < s.n_in; ++i)
+                        sum += (double) strata::kernels::f32_from_bf16(w[(size_t) (o * s.n_in + i)]) *
+                               (double) fx[(size_t) (t * s.n_in + i)];
+                    want[(size_t) (t * s.n_out + o)] = (float) sum;
+                }
+            }
+            worst = std::max(worst, rel_l1(want, got));
+            if (std::memcmp(got.data(), single.data(), count * sizeof(float)) != 0) {
+                std::printf("    *** %d rows: not the single-row call's bits ***\n", n);
+                ++shape_bad;
+            }
+            // the skip: taken (5 <= 5), then not taken (6 <= 5 is false)
+            const std::vector<float> mark(count, -12345.0f);
+            const int32_t taken[2] = {5, 5}, not_taken[2] = {6, 5};
+            std::vector<float> kept(count), ran(count);
+            strata::parity::copy_in(d_y, mark.data(), count);
+            strata::parity::copy_in(d_flag, taken, 2);
+            strata::kernels::bf16_gemv_fp32_mmvf_multi(d_x, s.n_in, d_w, d_y, s.n_out, s.n_in, s.n_out, n, nullptr, d_flag,
+                                                       d_flag + 1);
+            strata::parity::copy_out(kept.data(), d_y, count);
+            strata::parity::copy_in(d_flag, not_taken, 2);
+            strata::kernels::bf16_gemv_fp32_mmvf_multi(d_x, s.n_in, d_w, d_y, s.n_out, s.n_in, s.n_out, n, nullptr, d_flag,
+                                                       d_flag + 1);
+            strata::parity::copy_out(ran.data(), d_y, count);
+            if (std::memcmp(kept.data(), mark.data(), count * sizeof(float)) != 0) {
+                std::printf("    *** %d rows: the skipped launch wrote ***\n", n);
+                ++shape_bad;
+            }
+            if (std::memcmp(ran.data(), got.data(), count * sizeof(float)) != 0) {
+                std::printf("    *** %d rows: the launch with the skip pointers differs ***\n", n);
+                ++shape_bad;
+            }
+        }
+        std::printf("  %-34s rows 2..8 %.2e, the single row's bits and the skip %s\n", s.what, worst,
+                    shape_bad ? "*** NO ***" : "yes");
+        if (!(worst <= 1e-5)) { std::printf("    *** over 1e-5 ***\n"); ++shape_bad; }
+        bad += shape_bad;
     }
 
     std::printf("\nbf16_gemv: %d failures\n", bad);

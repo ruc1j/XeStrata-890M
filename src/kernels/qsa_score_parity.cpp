@@ -7,7 +7,8 @@
 //     sum over the indexer's heads of relu(<key b, q head>), block n_bid scores the dead key the same way, plus 1e9
 //     when the row has cells in it (n_kv % 4 != 0).  Within a relative 1e-4 (the kernels sum in FP32, by lanes).
 //   * the rows form against the per-row form, memcmp (the same pairings, so the same bits);
-//   * a block past a row's n_bid is not written.
+//   * a block past a row's n_bid is not written;
+//   * the rows form writes nothing while the last row selects every cell (n_kv <= width).
 // The launches take the grid a window graph takes (no reach given): contexts below, at and above one sub-group a
 // block, and max_blocks far above the context.
 #include "strata/kernels/qsa.hpp"
@@ -62,7 +63,9 @@ int main() {
                     steps[(size_t) qi * kStepCount + kStepPos] = (int32_t) (n_kv - 1);
                     steps[(size_t) qi * kStepCount + kStepNKv] = (int32_t) n_kv;
                     steps[(size_t) qi * kStepCount + kStepNBid] = (int32_t) (n_kv / R);
-                    steps[(size_t) qi * kStepCount + kStepWidth] = (int32_t) std::min<int64_t>(n_kv, s.idx_top_k);
+                    // a width below the cells: the selection is not every cell, so the rows form scores (the real
+                    // width is every cell up to 2,051; that case is checked apart, below)
+                    steps[(size_t) qi * kStepCount + kStepWidth] = (int32_t) (n_kv - 1);
                 }
                 std::vector<float> q((size_t) (nq * H * D));
                 for (auto& v : q) v = gauss(rng);
@@ -117,6 +120,22 @@ int main() {
                             ++case_bad;
                             break;
                         }
+                    }
+                }
+                // the last row selects every cell (n_kv <= width): the rows form writes nothing
+                if (case_bad == 0) {
+                    std::vector<int32_t> all = steps;
+                    for (int qi = 0; qi < nq; ++qi)
+                        all[(size_t) qi * kStepCount + kStepWidth] = all[(size_t) qi * kStepCount + kStepNKv];
+                    const int32_t* d_all = up(all);
+                    float* d_skip = up(fill);
+                    qsa_block_scores_rows(d_pooled, d_dead, d_q, d_all, nq, max_blocks, s, d_skip, st);
+                    P::sync();
+                    std::vector<float> skipped(fill.size());
+                    P::copy_bytes_out(skipped.data(), d_skip, skipped.size() * sizeof(float));
+                    if (std::memcmp(skipped.data(), fill.data(), fill.size() * sizeof(float)) != 0) {
+                        std::printf("    *** the rows form wrote scores although every cell is selected ***\n");
+                        ++case_bad;
                     }
                 }
                 ++cases;
