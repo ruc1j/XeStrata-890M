@@ -1300,9 +1300,15 @@ private:
 int adapt_lag() { return strata::core::adapt_lag(); }
 
 /// A window that may start before the adaptive tier's swaps reach the device's residency table (STRATA_ADAPT_NOWAIT=1,
-/// STRATA_ADAPT_LAG > 1) plans every layer on the host: the device-side plan and the resident graph read that table and
-/// would take an expert the host already evicted as resident (upstream 3f2db5e2's case: the evicted expert computed on
-/// the CPU from no activation, or read from a slot being refilled).  set_always_publish turns both off.
+/// STRATA_ADAPT_LAG > 1, the default) does not plan a layer from that table: the device-side plan (E-6) reads it layer
+/// by layer and would take an expert the host already evicted as resident (upstream 3f2db5e2's case: the evicted
+/// expert computed on the CPU from no activation, or read from a slot being refilled).  set_device_table_lags turns
+/// it off.  The resident window graph stays on: the verifier takes it only for a window whose experts are all
+/// resident in the host's table, and a swap leaves a hole there from when it is issued (`adapt`) until its copy has
+/// landed and the table is uploaded (`apply_pending`); every other change of the host's table (the K/V's growth, the
+/// prompt path's borrowed slots, the VRAM reserve) uploads it before the next window.  With every expert in the cache
+/// there is nothing to swap, and the windows run without the host (the 890M, greedy 6 chats: 36.01 -> 36.58 tok/s,
+/// the same answers, 2026-11-16).
 bool adapt_device_table_lags() { return adapt_nowait() || adapt_lag() > 1; }
 
 /// Whether a decode window ends at the adaptive tier's next position (#152).  A swap moves experts between the CPU and
@@ -7729,7 +7735,7 @@ int main(int argc, char** argv) {
                     // --batch-mtp: every stage runs the first one's windows of two rows a slot (up to kVerifyMaxT rows,
                     // the hand-off's size) and bounds its captured batch layouts like it (upstream 48f2c47d)
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
-                    if (adapt_device_table_lags()) gs.ver.set_always_publish(true);
+                    if (adapt_device_table_lags()) gs.ver.set_device_table_lags(true);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
                                        batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
@@ -7836,7 +7842,7 @@ int main(int argc, char** argv) {
                 stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp: slot rotation makes many layouts (LRU)
-        if (adapt_device_table_lags()) ver.set_always_publish(true);
+        if (adapt_device_table_lags()) ver.set_device_table_lags(true);
         if (use_df2) ver.set_taps(df2.tap_layers());
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
@@ -14103,7 +14109,7 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
         vh.h_res = host_res.empty() ? nullptr : host_res.data();   // every expert resident: windows without the host
-        if (adapt_device_table_lags()) ver.set_always_publish(true);
+        if (adapt_device_table_lags()) ver.set_device_table_lags(true);
         if (use_df2) ver.set_taps(df2.tap_layers());
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());

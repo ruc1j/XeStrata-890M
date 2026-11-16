@@ -798,11 +798,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-        // (not with set_always_publish: the device table may lag the host's while windows are in flight)
-        device_plan_ = !always_publish_ && v != nullptr && (int) std::strtol(v, nullptr, 10) != 0;
+        // (not with set_always_publish or set_device_table_lags: the device table may lag the host's while windows
+        // are in flight or a swap's copy has not landed)
+        device_plan_ = !always_publish_ && !table_lags_ && v != nullptr && (int) std::strtol(v, nullptr, 10) != 0;
     }
     {
         const char* v = std::getenv("STRATA_VERIFY_RESIDENT_GRAPH");
+        // (kept with set_device_table_lags: run() asks the host's table, which a swap in flight leaves with a hole)
         res_graph_ = !always_publish_ && hits.h_res != nullptr && hits.d_res != nullptr &&
                      (v == nullptr || std::strtol(v, nullptr, 10) != 0);
     }

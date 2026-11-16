@@ -322,6 +322,12 @@ public:
     /// Turns the device-planned layers and the all-resident window graph off: with windows in flight the adaptive
     /// tier marks an expert evicted on the host before the device's residency table follows.  Before `init`.
     void set_always_publish(bool on) { always_publish_ = on; }
+    /// The device's residency table may be a window behind the host's (STRATA_ADAPT_LAG > 1, STRATA_ADAPT_NOWAIT): turns
+    /// the device-planned layers (E-6) off, which read that table layer by layer.  The all-resident window graph and
+    /// the one-token window's own commit stay: `run` takes that graph only when the host's table holds every expert,
+    /// and the host's table has a hole from the moment a swap is issued until its copy has landed and the table is
+    /// uploaded (every other change of the host's table is uploaded before the next window).  Before `init`.
+    void set_device_table_lags(bool on) { table_lags_ = on; }
     strata::gpu::Stream stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
@@ -581,6 +587,7 @@ private:
     strata::gpu::Stream ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
     bool spec_measure_ = false;   ///< explicit per-call measure borrow
     bool always_publish_ = false;
+    bool table_lags_ = false;             ///< set_device_table_lags
     bool pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
     strata::gpu::Event *ev_done_ = nullptr, *ev_commit_ = nullptr;
     unsigned long long* prof_pin_ = nullptr;   ///< host copy of the stamps (pipelined windows)
