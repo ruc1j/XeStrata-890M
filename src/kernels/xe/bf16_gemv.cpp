@@ -108,10 +108,11 @@ sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const W* w,
             const W* row = w + rowi * n_in;
             if constexpr (std::is_same_v<W, uint16_t>)
                 if (is_aux && aux.w != nullptr) row = aux.w;   // the extra row exists only with aux.w
-            if constexpr (BLOCK_SIZE > 32) {
-                if (t < 32)
+            // the partials' slots past the group's sub-groups are zero for the last sum; the sub-groups write the
+            // others, so the zeros need no barrier of their own before the products (the one below covers both)
+            if constexpr (BLOCK_SIZE > 32 && BLOCK_SIZE < 32 * 32) {
+                if (t >= BLOCK_SIZE / 32 && t < 32)
                     for (int k = 0; k < NT; ++k) partials[k * 32 + t] = 0.0f;
-                sycl::group_barrier(it.get_group());
             }
             float acc[NT];
             for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
@@ -168,11 +169,11 @@ sycl::event launch_mmvf_rows(sycl::queue& q, const float* x, int64_t ldx, const 
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_local_id(0);
             const int64_t o0 = (int64_t) it.get_group(0) * RPB;
-            if constexpr (BLOCK_SIZE > 32) {
-                if (t < 32)
+            // (the zeros of the partials' unused slots without a barrier of their own, as in launch_mmvf)
+            if constexpr (BLOCK_SIZE > 32 && BLOCK_SIZE < 32 * 32) {
+                if (t >= BLOCK_SIZE / 32 && t < 32)
                     for (int r = 0; r < RPB; ++r)
                         for (int k = 0; k < NT; ++k) partials[(r * NT + k) * 32 + t] = 0.0f;
-                sycl::group_barrier(it.get_group());
             }
             float acc[RPB][NT];
             for (int r = 0; r < RPB; ++r)

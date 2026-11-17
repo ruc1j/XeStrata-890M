@@ -154,7 +154,8 @@ int main(int argc, char** argv) {
         float* d_y = dev.alloc<float>((size_t) (max_rows * s.n_out));
         float* d_one = dev.alloc<float>((size_t) s.n_out);
         int32_t* d_flag = dev.alloc<int32_t>(2);
-        int shape_bad = 0;
+        float* d_aux_y = dev.alloc<float>((size_t) max_rows);
+        int shape_bad = 0, aux_ran = 0;
         double worst = 0.0;
         for (int n = 2; n <= max_rows; ++n) {
             const size_t count = (size_t) (n * s.n_out);
@@ -198,9 +199,27 @@ int main(int argc, char** argv) {
                 std::printf("    *** %d rows: the launch with the skip pointers differs ***\n", n);
                 ++shape_bad;
             }
+            // the product and one more row in the same launch (bf16_gemv_fp32_mmvf_multi_aux: the router and the
+            // shared expert's scalar gate), here the matrix's last row again: the product's bits, and for the extra
+            // row the bits the product has for that row.  It launches nothing where the product takes the 4-rows form.
+            strata::parity::copy_in(d_y, mark.data(), count);
+            if (strata::kernels::bf16_gemv_fp32_mmvf_multi_aux(d_x, s.n_in, d_w, d_y, s.n_out, s.n_in, s.n_out, n,
+                                                               d_w + (size_t) ((s.n_out - 1) * s.n_in), d_aux_y, 1,
+                                                               nullptr)) {
+                std::vector<float> with_aux(count), aux_got((size_t) n), aux_want((size_t) n);
+                strata::parity::copy_out(with_aux.data(), d_y, count);
+                strata::parity::copy_out(aux_got.data(), d_aux_y, (size_t) n);
+                for (int t = 0; t < n; ++t) aux_want[(size_t) t] = got[(size_t) (t * s.n_out + s.n_out - 1)];
+                if (std::memcmp(with_aux.data(), got.data(), count * sizeof(float)) != 0 ||
+                    std::memcmp(aux_got.data(), aux_want.data(), (size_t) n * sizeof(float)) != 0) {
+                    std::printf("    *** %d rows: the launch with the extra row differs ***\n", n);
+                    ++shape_bad;
+                }
+                ++aux_ran;
+            }
         }
-        std::printf("  %-34s rows 2..8 %.2e, the single row's bits and the skip %s\n", s.what, worst,
-                    shape_bad ? "*** NO ***" : "yes");
+        std::printf("  %-34s rows 2..8 %.2e, the single row's bits, the skip and the extra row (%d widths) %s\n",
+                    s.what, worst, aux_ran, shape_bad ? "*** NO ***" : "yes");
         if (!(worst <= 1e-5)) { std::printf("    *** over 1e-5 ***\n"); ++shape_bad; }
         bad += shape_bad;
     }
