@@ -964,13 +964,29 @@ inline void v2_up(const sycl::nd_item<1>& it, int grp, const TokArgs& tok, const
     if (grp == 0 && t < T * HC && m.a[0].w_inject != nullptr)
         tok(m, t / HC).inject_out[t % HC] = low[(size_t) (t / HC) * PR + LR + t % HC];
     sycl::group_barrier(it.get_group());
+    // a token's lo comes out of local memory once for the lane's two rows (the store to g used to sit between the
+    // rows' passes, so the reads were made again for the second); each row's products and sums are the ones above
+    float xv[2], mine[2];
+    int gi[2];
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
         const int r = g8 + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
-        const float xv = j < T ? xw[(size_t) j * D + i] : 0.0f;
-        float mine = 0.0f;
+        xv[p] = j < T ? xw[(size_t) j * D + i] : 0.0f;
+        mine[p] = 0.0f;
+        gi[p] = (j * HC + c) * UPM_COLS + dd;
+    }
 #pragma unroll
-        for (int k = 0; k < T; ++k) {
+    for (int k = 0; k < T; ++k) {
+        float4 xl[4][3];
+#pragma unroll
+        for (int qq = 0; qq < 4; ++qq)
+#pragma unroll
+            for (int st = 0; st < 3; ++st) {
+                const int v = 4 * (j + 8 * qq) + 128 * st;
+                if (v < LR) xl[qq][st] = lo[k * LR / 4 + v / 4];
+            }
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
             float aq[4];
 #pragma unroll
             for (int qq = 0; qq < 4; ++qq) {
@@ -980,7 +996,7 @@ inline void v2_up(const sycl::nd_item<1>& it, int grp, const TokArgs& tok, const
                     const int v = 4 * (j + 8 * qq) + 128 * st;
                     if (v < LR) {
                         const float4 w = q8_four(wq[p][qq][st], wd[p][qq][st]);
-                        const float4 x = lo[k * LR / 4 + v / 4];
+                        const float4 x = xl[qq][st];
                         acc = sycl::fma(w.x(), x.x(), acc); acc = sycl::fma(w.y(), x.y(), acc);
                         acc = sycl::fma(w.z(), x.z(), acc); acc = sycl::fma(w.w(), x.w(), acc);
                     }
@@ -989,9 +1005,12 @@ inline void v2_up(const sycl::nd_item<1>& it, int grp, const TokArgs& tok, const
             }
             float sum = (aq[0] + aq[2]) + (aq[1] + aq[3]);
             for (int o = 4; o > 0; o >>= 1) sum += strata_shfl_xor(sg, sum, o);
-            if (j == k) mine = sum;
+            if (j == k) mine[p] = sum;
         }
-        if (j < T) g[(j * HC + c) * UPM_COLS + dd] = xv * sigmoidf_(mine);
+    }
+    if (j < T) {
+        g[gi[0]] = xv[0] * sigmoidf_(mine[0]);
+        g[gi[1]] = xv[1] * sigmoidf_(mine[1]);
     }
     sycl::group_barrier(it.get_group());
     for (int i = t; i < T * UPM_COLS; i += THREADS) {
