@@ -180,6 +180,15 @@ public:
         (void) m; (void) it;
 #endif
     }
+    // stage() without its barrier, for a kernel that takes a barrier of its own before its first read of the table
+    template <int D, int NT = kFusedGrMaxT>
+    void fill(const GrMulti& m, const sycl::nd_item<D>& it) const {
+#if STRATA_DEVICE_NOT_INTEL
+        if (it.get_local_linear_id() == 0) copy(m, std::make_integer_sequence<int, NT>{});
+#else
+        (void) m; (void) it;
+#endif
+    }
     const FusedGrArgs& operator()(const GrMulti& m, int k) const {
 #if STRATA_DEVICE_NOT_INTEL
         (void) m;
@@ -1089,15 +1098,25 @@ sycl::event gr_read_v2(sycl::queue& q, const GrMulti& m, float* scratch) {
                     v2_down<T>(it, dg / V2_NKC, dg % V2_NKC, xs, last, qd, wi, xw, part, tickets, low,
                                [&] { wait(sync, (uint32_t) NNORM); }, [&] { signal(sync + 1); });
                 } else {
-                    tok.template stage<1, T>(m, it);
+                    // An up group reads the table only after its wait's barrier, so the table is filled inside the
+                    // wait, behind the rows' loads, without stage()'s barrier ahead of them.  The count of the up
+                    // groups past their wait is taken before that barrier too (only a group's lane 0 reads the
+                    // counters, in its spin, so "past the spin" is "past the wait"): the barrier's wait for the
+                    // rows covers the atomic's return, which used to stand before lane 0's lo load.
                     v2_up<T>(it, grp - NNORM - NDOWN, tok, m, lo, g, low, xw, [&] {
-                        wait(sync + 1, (uint32_t) (v2_nb<T>() + 1));
-                        // the last up group past its wait: every group's waits are over, the counters back to 0
-                        if (t == 0 && Counter(sync[2]).fetch_add(1u) == (uint32_t) (NUP - 1)) {
-                            Counter(sync[0]).store(0u);
-                            Counter(sync[1]).store(0u);
-                            Counter(sync[2]).store(0u);
+                        tok.template fill<1, T>(m, it);
+                        if (t == 0) {
+                            Counter cn(sync[1]);
+                            while (cn.load() < (uint32_t) (v2_nb<T>() + 1)) v2_pause();
+                            // the last up group past its spin: every group's waits are over, the counters back to 0
+                            if (Counter(sync[2]).fetch_add(1u) == (uint32_t) (NUP - 1)) {
+                                Counter(sync[0]).store(0u);
+                                Counter(sync[1]).store(0u);
+                                Counter(sync[2]).store(0u);
+                            }
                         }
+                        sycl::group_barrier(it.get_group());
+                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
                     });
                 }
             });
