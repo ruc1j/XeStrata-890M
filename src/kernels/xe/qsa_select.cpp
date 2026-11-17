@@ -13,9 +13,13 @@
 #include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#include "device_target.hpp"
+#include "amd_wmma.hpp"
+#include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_select
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <unordered_map>
@@ -407,6 +411,142 @@ sycl::event block_scores_simt(sycl::queue& q, const float* pooled, const float* 
         });
     });
 }
+// STRATA_SELECT_WMMA=1 (opt-in, gfx1150 only): the block scores on WMMA, after Strata-rdna3's gfx11 / gfx12 scorer
+// (nicejunjie/Strata-rdna3 src/kernels/cuda/qsa_select.cu, block_scores_wmma_kernel; xyzzing/Strata's RDNA ports).
+// The same GEMM as block_scores_simt - for 16 queries, every block's score is the sum over the 4 indexer heads of
+// relu(q_h . k), K = 128 - on v_wmma_f32_16x16x16_bf16 with FP32-level accuracy: both operands split exactly into three
+// bf16 pieces (x = hi + mid + lo: the top 8, next 8 and last 8 bits of the FP32 mantissa; bf16's exponent is FP32's, so
+// nothing is scaled), and the six products of order 2 or less, smallest first, the five small ones in an accumulator
+// of their own (added into the hi * hi one at every step, they were rounded to its ulp 48 times).  Another summation
+// order than the other scorers: not their bits.  A = 16 key blocks (lane l: row l % 16, all 16 k of its step; lanes
+// 16-31 repeat 0-15), B = 16 queries (column l % 16); the accumulator gives lane l query l % 16 and blocks 2e + l / 16.
+// A work-group of 4 sub-groups splits its 16 queries into bf16 pieces once, in local memory, and takes 4 x WITER x 16
+// blocks; the keys are read from global memory (the query tiles of a launch re-read them through L2).
+constexpr int WQT = 16, WITER = 4, WQS = IDX_DIM + 8, WWG = 128;
+#if STRATA_AMD_GFX1150
+// x's bf16 pieces as FP32 bit patterns whose upper 16 bits are the bf16 (the lower 16 zero)
+inline void split3(float x, uint32_t& hi, uint32_t& mid, uint32_t& lo) {
+    hi = sycl::bit_cast<uint32_t>(x) & 0xffff0000u;
+    const float r1 = x - sycl::bit_cast<float>(hi);   // exact
+    mid = sycl::bit_cast<uint32_t>(r1) & 0xffff0000u;
+    lo = sycl::bit_cast<uint32_t>(r1 - sycl::bit_cast<float>(mid)) & 0xffff0000u;   // exact: 8 significant bits at most
+}
+#endif
+// P = 3: Strata-rdna3's three pieces and six products; P = 2 (the default here): hi and mid only (16 bits of each
+// operand's mantissa) and the three products hi*hi, hi*mid, mid*hi, about 2^-15 of the absolute product sum - far inside
+// the bound qsa_select_wmma_parity holds the scorer to, and on the 890M the six products ran slower than the FP32 tiled
+// scorer (32K context, 2,048 queries: 12.8 against 10.1 ms)
+template<int P>
+struct BlockScoresWmma {
+    const float* pooled;
+    const float* q_idx;
+    const int32_t* steps;
+    int64_t nq, max_blocks, reach;
+    float* out;
+    sycl::local_accessor<uint16_t, 1> sq;   // [P][IDX_HEADS][WQT][WQS]: hi / mid (/ lo), head, query, dim
+    sycl::local_accessor<int, 1> s_nbid;
+    STRATA_AMD_REQD_WG(1, WWG)
+    [[sycl::reqd_sub_group_size(WARP)]] void operator()(sycl::nd_item<2> it) const {
+#if !STRATA_AMD_GFX1150
+        (void) it;   // launched only on gfx1150 (qsa_block_scores_tc)
+#else
+        namespace J = xe::wmma;
+        using MA = J::A<uint16_t>;
+        using MB = J::Bc<uint16_t>;
+        const auto sg = it.get_sub_group();
+        const int t = (int) it.get_local_id(1), lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
+        const int l16 = lane & 15, g = lane >> 4;
+        const int64_t q0 = (int64_t) it.get_group(0) * WQT;
+        auto at = [](int p, int h, int qr, int d) { return (((size_t) p * IDX_HEADS + h) * WQT + qr) * WQS + d; };
+        for (int i = t; i < WQT * IDX_HEADS * IDX_DIM / 4; i += WWG) {
+            const int row = i / (IDX_DIM / 4), c = i % (IDX_DIM / 4);
+            const int qr = row / IDX_HEADS, h = row % IDX_HEADS;
+            sycl::float4 v(0.0f);
+            if (q0 + qr < nq)
+                v = *reinterpret_cast<const sycl::float4*>(q_idx + ((q0 + qr) * IDX_HEADS + h) * IDX_DIM + c * 4);
+            const float x[4] = {v.x(), v.y(), v.z(), v.w()};
+            for (int j = 0; j < 4; ++j) {
+                uint32_t hb, mb, lb;
+                split3(x[j], hb, mb, lb);
+                sq[at(0, h, qr, c * 4 + j)] = (uint16_t) (hb >> 16);
+                sq[at(1, h, qr, c * 4 + j)] = (uint16_t) (mb >> 16);
+                if constexpr (P == 3) sq[at(2, h, qr, c * 4 + j)] = (uint16_t) (lb >> 16);
+            }
+        }
+        if (t < WQT) s_nbid[t] = q0 + t < nq ? steps[(q0 + t) * kStepCount + kStepNBid] : 0;
+        sycl::group_barrier(it.get_group());
+        int hi_nbid = 0;
+        for (int i = 0; i < WQT; ++i) hi_nbid = sycl::max(hi_nbid, s_nbid[i]);
+        const int64_t qi = q0 + l16;
+        const int nb_q = s_nbid[l16];
+        for (int itr = 0; itr < WITER; ++itr) {
+            const int64_t b0 = (((int64_t) it.get_group(1) * WITER + itr) * 4 + warp) * 16;
+            if (b0 >= reach || b0 >= hi_nbid) break;   // uniform over the sub-group; later tiles start higher
+            const int64_t row = b0 + l16;
+            const bool rv = row < hi_nbid && row < max_blocks;
+            const float* kp = pooled + (rv ? row : 0) * IDX_DIM;
+            J::C acc[IDX_HEADS], cor[IDX_HEADS];
+            for (int h = 0; h < IDX_HEADS; ++h) { J::fill(sg, acc[h], 0.0f); J::fill(sg, cor[h], 0.0f); }
+#pragma unroll 2
+            for (int kk = 0; kk < IDX_DIM / 16; ++kk) {
+                MA ah, am, al;
+                for (int j = 0; j < 16; j += 4) {
+                    sycl::float4 kv(0.0f);
+                    if (rv) kv = *reinterpret_cast<const sycl::float4*>(kp + kk * 16 + j);
+                    const float x[4] = {kv.x(), kv.y(), kv.z(), kv.w()};
+                    for (int e = 0; e < 4; ++e) {
+                        uint32_t hb, mb, lb;
+                        split3(x[e], hb, mb, lb);
+                        ah.v[j + e] = (short) (hb >> 16);
+                        am.v[j + e] = (short) (mb >> 16);
+                        if constexpr (P == 3) al.v[j + e] = (short) (lb >> 16);
+                    }
+                }
+                for (int h = 0; h < IDX_HEADS; ++h) {
+                    MB bh, bm, bl;
+                    for (int e = 0; e < 16; ++e) {
+                        bh.v[e] = (short) sq[at(0, h, l16, kk * 16 + e)];
+                        bm.v[e] = (short) sq[at(1, h, l16, kk * 16 + e)];
+                        if constexpr (P == 3) bl.v[e] = (short) sq[at(2, h, l16, kk * 16 + e)];
+                    }
+                    if constexpr (P == 3) {
+                        J::mad(sg, cor[h], al, bh, cor[h]);
+                        J::mad(sg, cor[h], ah, bl, cor[h]);
+                        J::mad(sg, cor[h], am, bm, cor[h]);
+                    }
+                    J::mad(sg, cor[h], ah, bm, cor[h]);
+                    J::mad(sg, cor[h], am, bh, cor[h]);
+                    J::mad(sg, acc[h], ah, bh, acc[h]);
+                }
+            }
+            // relu per head, the heads added in order; this lane: query qi, blocks b0 + row_of(g, e)
+            if (qi < nq)
+                for (int e = 0; e < 8; ++e) {
+                    const int64_t b = b0 + J::row_of(g, e);
+                    if (b >= nb_q || b >= max_blocks) continue;
+                    float score = 0.0f;
+                    for (int h = 0; h < IDX_HEADS; ++h) {
+                        const float d = acc[h].v[e] + cor[h].v[e];
+                        score += d > 0.0f ? d : 0.0f;
+                    }
+                    out[qi * max_blocks + b] = score;
+                }
+        }
+#endif
+    }
+};
+template<int P>
+sycl::event block_scores_wmma(sycl::queue& q, const float* pooled, const float* q_idx, const int32_t* steps, int64_t nq,
+                              int64_t max_blocks, int64_t reach, float* out) {
+    const int64_t per = (int64_t) 4 * WITER * 16;
+    const size_t gb = (size_t) ((reach + per - 1) / per), gq = (size_t) ((nq + WQT - 1) / WQT);
+    return q.submit([&](sycl::handler& h) {
+        BlockScoresWmma<P> k{pooled, q_idx, steps, nq, max_blocks, reach, out,
+                             sycl::local_accessor<uint16_t, 1>(sycl::range<1>((size_t) P * IDX_HEADS * WQT * WQS), h),
+                             sycl::local_accessor<int, 1>(sycl::range<1>(WQT), h)};
+        h.parallel_for(sycl::nd_range<2>({gq, gb * WWG}, {1, (size_t) WWG}), k);
+    });
+}
 // the tail block (b == n_bid, the dead key) of every query, as the warp kernel computes it
 sycl::event block_scores_tail(sycl::queue& q, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                               int64_t max_blocks, float* scores) {
@@ -437,6 +577,12 @@ sycl::event block_scores_tail(sycl::queue& q, const float* dead, const float* q_
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
     if (nq <= 0) return true;
+    static const bool wmma_on = [] {   // STRATA_SELECT_WMMA=1 (opt-in): the WMMA scorer where it runs (gfx1150)
+        const char* v = std::getenv("STRATA_SELECT_WMMA");
+        return v != nullptr && (v[0] == '1' || v[0] == '3');
+    }();
+    if (wmma_on && qsa_block_scores_wmma(pooled, dead, q_idx, steps, nq, max_blocks, s, scores, stream, active_blocks))
+        return true;
     // no TF32 matrix scorer here (CUDA's mma.sync): the FP32 tiled one (a 38,738-token prompt on the B70 1,451 -> 1,536
     // tok/s, the RTX 4070 1,013 -> 1,057); STRATA_SELECT_SIMT=0: refused, and the caller runs qsa_block_scores
     static const bool simt = [] {
@@ -448,6 +594,31 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
     block_scores_simt(q, pooled, q_idx, steps, nq, max_blocks, reach, scores);
     finish(stream, block_scores_tail(q, dead, q_idx, steps, nq, max_blocks, scores), "qsa_block_scores (simt)");
+    return true;
+}
+
+bool qsa_block_scores_wmma(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                           int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream,
+                           int64_t active_blocks) {
+    if (nq <= 0 || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) return false;
+    auto& q = queue_for(stream);
+    static core::PerDevice<bool> per_device;
+    const bool dev_ok = per_device.get(q.get_device(), [&q] {
+        const bool ok = xe::amd_gfx1150(q.get_device()) && xe::max_work_group(q) >= (size_t) WWG &&
+                        q.get_device().get_info<sycl::info::device::local_mem_size>() >=
+                            (size_t) 3 * IDX_HEADS * WQT * WQS * 2 + 64;
+        if (ok) std::fprintf(stderr, "qsa select: block scores on WMMA (bf16 pieces)\n");
+        return ok;
+    });
+    if (!dev_ok) return false;
+    const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+    static const bool three = [] {   // STRATA_SELECT_WMMA=3: Strata-rdna3's three pieces (six products)
+        const char* v = std::getenv("STRATA_SELECT_WMMA");
+        return v != nullptr && v[0] == '3';
+    }();
+    if (three) block_scores_wmma<3>(q, pooled, q_idx, steps, nq, max_blocks, reach, scores);
+    else block_scores_wmma<2>(q, pooled, q_idx, steps, nq, max_blocks, reach, scores);
+    finish(stream, block_scores_tail(q, dead, q_idx, steps, nq, max_blocks, scores), "qsa_block_scores (wmma)");
     return true;
 }
 

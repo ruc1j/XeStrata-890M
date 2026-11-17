@@ -42,6 +42,13 @@ void qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
 
+/// The same scores on WMMA on a gfx1150 GPU (after Strata-rdna3: each operand split into bf16 pieces, not
+/// bitwise any other scorer's).  False (nothing launched) on another device or for another geometry.  With
+/// STRATA_SELECT_WMMA=1 (opt-in) qsa_block_scores_tc tries it first.
+bool qsa_block_scores_wmma(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                           int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream,
+                           int64_t active_blocks = 0);
+
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream);
