@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 # cmake/strata_geometry.cmake - choose the model shape the kernels are compiled for (include/strata/core/geometry.hpp).
 #
 #   -DSTRATA_GEOMETRY=<name>        include/strata/core/geometries/<name>.hpp   (default: flash_next)

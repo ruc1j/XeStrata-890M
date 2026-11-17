@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-License-Identifier: MIT
 // include/strata/core/geometries/q4_deep.hpp - Flash-Next with 64 layers (G4): only the layer count differs
 // A synthetic target (phaseA-tests/qwen4/GEOMETRY-MAP.md section 5), not a published model.
 #pragma once

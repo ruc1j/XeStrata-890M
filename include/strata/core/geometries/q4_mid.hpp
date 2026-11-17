@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-License-Identifier: MIT
 // include/strata/core/geometries/q4_mid.hpp - G2, the 122B-A10B class: hidden 3072, 48 layers, 32:2 heads, 64 GDN value heads, 256 experts top-8, ff 1024, hc low rank 384
 // A synthetic target (phaseA-tests/qwen4/GEOMETRY-MAP.md section 5), not a published model.
 #pragma once

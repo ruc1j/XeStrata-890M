@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/qwen4_intake.py against the headers of every model we have, and against synthetic variants of them.
 
 The headers are recorded from Hugging Face by HTTP range reads (tools/qwen4_intake_fixtures/*.json.gz: metadata without the big

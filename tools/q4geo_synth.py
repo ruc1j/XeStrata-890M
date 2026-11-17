@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """Synthetic qwen4exp GGUF files with random weights, at any shape, in the per-tensor type mix of an Unsloth UD file.
 
 Why: the engine is compiled for one model shape (include/strata/core/geometry.hpp).  To check that a build for another shape

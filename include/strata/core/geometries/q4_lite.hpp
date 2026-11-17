@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-License-Identifier: MIT
 // include/strata/core/geometries/q4_lite.hpp - G1, the 35B-A3B class scaled onto Flash-Next's layer set: hidden 2048, 40 layers, 16:2 heads, 32 GDN value heads, 256 experts top-8, ff 512, hc low rank 256
 // A synthetic target (phaseA-tests/qwen4/GEOMETRY-MAP.md section 5), not a published model.
 #pragma once

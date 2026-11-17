@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-License-Identifier: MIT
 // include/strata/core/geometry.hpp - the model's geometry: one struct for the shape a model file declares and
 // the shape the kernels are compiled for.
 //

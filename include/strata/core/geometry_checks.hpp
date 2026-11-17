@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-License-Identifier: MIT
 // include/strata/core/geometry_checks.hpp - what every compiled shape must satisfy.
 //
 // The kernels are written for a family of shapes, not for one number each: some values are the same in every Qwen

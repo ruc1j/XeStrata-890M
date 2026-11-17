@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """Which tool-call spelling a chat template documents, read from the template's text.
 
 No imports from the rest of the server: tools/qwen4_intake.py and serve/frontend.py share this one function, so the report
