@@ -1080,17 +1080,27 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
         // The words are the ones Split<42>::load reads and the sums are added in the same order: bitwise the same.
         constexpr int C = 6;
         const int K = nb * F::ipb;
+        // LPR a multiple of a block's steps (4 and 2): the lane's sub-block and its first block's offset computed
+        // once, a step a constant further on (as the IQ2_S rows below; a step past the row reads the last block)
+        constexpr bool kLaneSub = LPR % F::ipb == 0;
         for (int k0 = seg_lane; k0 < K; k0 += C * LPR) {
             uint16_t q[C][4];
             sycl::half dh[C];
+            const uint32_t sub = (uint32_t) seg_lane % (uint32_t) F::ipb;
+            const uint32_t kb0 = (uint32_t) k0 / (uint32_t) F::ipb;
+            const uint32_t boff = kb0 * (uint32_t) F::bsz, blast = (uint32_t) (nb - 1) * (uint32_t) F::bsz;
 #pragma unroll
             for (int u = 0; u < C; ++u) {
                 const int k = sycl::min(k0 + u * LPR, K - 1);
-                const block_q2_0* b = (const block_q2_0*) block_at<F>(row, k / F::ipb);
-                const uint16_t* qs = (const uint16_t*) b->qs + (ptrdiff_t) (k % F::ipb) * 4;
+                const block_q2_0* b = kLaneSub
+                    ? (const block_q2_0*) (row + (size_t) sycl::min(boff + (uint32_t) (u * (LPR / F::ipb) * F::bsz), blast))
+                    : (const block_q2_0*) block_at<F>(row, k / F::ipb);
+                const uint16_t* qs = (const uint16_t*) b->qs + (kLaneSub ? (ptrdiff_t) sub : (ptrdiff_t) (k % F::ipb)) * 4;
                 for (int j = 0; j < 4; ++j) q[u][j] = iq_bits::load_u16_nt(qs + j);
                 dh[u] = b->d;
             }
+            const block_q8_1* xk[NE];
+            for (int e = 0; e < NE; ++e) xk[e] = x[e] + (size_t) (kb0 * (uint32_t) (F::qk / 32));
 #pragma unroll
             for (int u = 0; u < C; ++u) {
                 const int k = k0 + u * LPR;
@@ -1101,10 +1111,15 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
                     w.qy[j] = (int) q2_0_bytes((uint32_t) q[u][j] >> 8);
                 }
                 w.d = (float) dh[u];
-                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-                const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
-                for (int e = 0; e < NE; ++e)
-                    if (e < n) s[e] += F::S::apply(w, x[e] + xo, iqs);
+                if constexpr (kLaneSub) {
+                    for (int e = 0; e < NE; ++e)
+                        if (e < n) s[e] += F::S::apply(w, xk[e] + u * (LPR / F::ipb) * (F::qk / 32), (int) (F::step * sub));
+                } else {
+                    const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                    const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+                    for (int e = 0; e < NE; ++e)
+                        if (e < n) s[e] += F::S::apply(w, x[e] + xo, iqs);
+                }
             }
         }
         for (int e = 0; e < NE; ++e) {
@@ -1172,24 +1187,38 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
         for (int k0 = seg_lane; k0 < K; k0 += C * LPR) {
             uint32_t ra[C], rb[C], rc[C];
             sycl::half dh[C];
+            // LPR a multiple of a block's steps (8 and 8 here): every step of the lane is the same sub-block of its
+            // block, and the blocks go up by LPR / ipb.  The sub-block and the first block's offset are then the
+            // lane's, computed once, and a step is that offset plus a constant (the gfx1150 ISA had a signed divide,
+            // a modulo and a 32-bit multiply for every step; 2026-11-17).  A step past the row reads the last block's
+            // (the lane's sub-block of it) and is not used.
+            const uint32_t sub = (uint32_t) seg_lane % (uint32_t) F::ipb;
+            const uint32_t kb0 = (uint32_t) k0 / (uint32_t) F::ipb;
+            const uint32_t boff = kb0 * (uint32_t) F::bsz, blast = (uint32_t) (nb - 1) * (uint32_t) F::bsz;
+            constexpr bool kLaneSub = LPR % F::ipb == 0;
 #pragma unroll
             for (int u = 0; u < C; ++u) {
                 const int k = sycl::min(k0 + u * LPR, K - 1);
-                const int iqs = F::step * (k % F::ipb);
+                const int iqs = kLaneSub ? (int) (F::step * sub) : F::step * (k % F::ipb);
+                const void* blk = kLaneSub ? (const void*) (row + (size_t) sycl::min(boff + (uint32_t) (u * (LPR / F::ipb) * F::bsz), blast))
+                                           : block_at<F>(row, k / F::ipb);
                 if constexpr (TY == 22) {
-                    const block_iq2_s* b = (const block_iq2_s*) block_at<F>(row, k / F::ipb);
+                    const block_iq2_s* b = (const block_iq2_s*) blk;
                     ra[u] = (uint32_t) get_int_b2(b->qs, iqs / 2);
                     rb[u] = (uint32_t) get_int_b2(b->qs, QK_K / 32 + iqs / 2);
                     rc[u] = (uint32_t) b->qh[iqs / 2] | ((uint32_t) b->scales[iqs / 2] << 8);
                     dh[u] = b->d;
                 } else {
-                    const block_iq2_xxs* b = (const block_iq2_xxs*) block_at<F>(row, k / F::ipb);
+                    const block_iq2_xxs* b = (const block_iq2_xxs*) blk;
                     ra[u] = (uint32_t) get_int_b2(b->qs, iqs);
                     rb[u] = (uint32_t) get_int_b2(b->qs, iqs + 1);
                     rc[u] = 0;
                     dh[u] = b->d;
                 }
             }
+            // the entries' activation blocks of the lane's first block: a step's are a constant further on
+            const block_q8_1* xk[NE];
+            for (int e = 0; e < NE; ++e) xk[e] = x[e] + (size_t) (kb0 * (uint32_t) (F::qk / 32));
 #pragma unroll
             for (int u = 0; u < C; ++u) {
                 const int k = k0 + u * LPR;
@@ -1217,10 +1246,15 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
                     w.ls = (int) (rb[u] >> 27 | 1);
                 }
                 w.d = (float) dh[u];
-                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-                const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
-                for (int e = 0; e < NE; ++e)
-                    if (e < n) s[e] += F::S::apply(w, x[e] + xo, iqs);
+                if constexpr (kLaneSub) {
+                    for (int e = 0; e < NE; ++e)
+                        if (e < n) s[e] += F::S::apply(w, xk[e] + u * (LPR / F::ipb) * (F::qk / 32), (int) (F::step * sub));
+                } else {
+                    const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                    const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+                    for (int e = 0; e < NE; ++e)
+                        if (e < n) s[e] += F::S::apply(w, x[e] + xo, iqs);
+                }
             }
         }
         for (int e = 0; e < NE; ++e) {
