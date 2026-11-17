@@ -96,6 +96,7 @@ public:
         double best_v = 0.0;
         int best_rows = 1;                ///< the window to verify: 1 + the drafts kept
         int kept = 0;                     ///< best_rows - 1
+        double best_e = 1.0, best_c = 0.0;   ///< the best width's expected tokens and round ms (the rate rule)
     };
     /// Draft `idx` (0-based, probability p) was just computed: update `st` and say whether to compute draft idx + 1.
     /// idx == 0 starts a new chain.  `cap` = the widest window (rows).
@@ -150,6 +151,9 @@ private:
     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
     double rounds_ = 0;                                    // rounds observed so far
     bool robust_ = false;
+    double rate_tok_ = 0, rate_ms_ = 0, rate_n_ = 0;       // tokens committed and round ms of the rounds timed (decayed)
+    void observe_rate(double tokens, double ms);
+    bool rate_rule() const;                                // keep_draft compares by the long-run rate (set_robust)
     double clamp_sample(int t, double ms, bool lookup = false) const;
     void update_cost(double& mean, double& n, double ms) const;   // one round's time into a size's cost
     bool stale_chain(int t) const;                                // keep_draft: a size's time is old enough to try again

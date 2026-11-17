@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::spec {
 namespace {
@@ -43,6 +44,16 @@ constexpr double kProbeHeld = 0.5;
 constexpr double kCostAlphaDown = 0.25;
 constexpr double kHiccup = 1.25;
 constexpr double kStaleChain = 128.0;
+// The rate rule (STRATA_SPEC_COST, XeStrata-890M): the MTP chain's width is the one with the most expected tokens less
+// the long-run rate times its round time, E - lambda * cost, and not the one with the best E / cost of its own.  Over
+// a stream of windows that differ, tokens per ms is the largest when every window maximizes E - lambda* cost with
+// lambda* the stream's own rate (a ratio of sums: Dinkelbach's transform): a window of unsure drafts is then kept
+// narrower than its own ratio asks (a row has to bring lambda times its ms, and the ratio of a poor window is below
+// lambda), a window of sure drafts wider.  lambda is the tokens committed over the round times of the last few
+// hundred timed rounds; until kRateMin rounds were timed the window's own ratio decides, as before.
+// STRATA_SPEC_RATE=0: the ratio always.
+constexpr double kRateDecay = 0.995;
+constexpr double kRateMin = 16.0;
 
 }  // namespace
 
@@ -204,6 +215,7 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
         auto& n = source_costs_ && lookup ? lookup_cost_n_ : cost_n_;
         update_cost(ms[bk_][t], n[bk_][t], round_ms);
         last_[bk_][t] = rounds_;
+        observe_rate(accepted + 1.0, round_ms);
     }
     rounds_ += 1.0;
     if (lookup) {
@@ -275,20 +287,41 @@ void DraftPolicy::observe_probs(const float* p, int n, int accepted) {
     }
 }
 
+void DraftPolicy::observe_rate(double tokens, double ms) {
+    rate_tok_ = kRateDecay * rate_tok_ + tokens;
+    rate_ms_ = kRateDecay * rate_ms_ + ms;
+    rate_n_ = kRateDecay * rate_n_ + 1.0;
+}
+
+bool DraftPolicy::rate_rule() const {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_SPEC_RATE");
+        return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+    }();
+    return on && robust_ && rate_n_ >= kRateMin && rate_ms_ > 0.0;
+}
+
 bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
     cap = std::clamp(cap, 1, max_t_);
     if (idx == 0) {
         st = ChainState{};
         st.best_v = 1.0 / cost_ms(1);
+        st.best_c = cost_ms(1);
     }
     const double a = draft_rate(p);
     st.q *= a;
     st.e += st.q;
     const int rows = idx + 2;
+    // the rate rule: a wider window is better when its added tokens beat the long-run rate times its added time
+    const bool by_rate = rate_rule();
+    const double lam = by_rate ? rate_tok_ / rate_ms_ * (1.0 + margin_ / 3.0) : 0.0;
+    const auto beats = [&](double e, double c) { return e - st.best_e > lam * (c - st.best_c); };
     if (rows <= cap) {
-        const double v = st.e / cost_ms(rows);
-        if (v > st.best_v * (1.0 + margin_ / 3.0)) {
+        const double c = cost_ms(rows), v = st.e / c;
+        if (by_rate ? beats(st.e, c) : v > st.best_v * (1.0 + margin_ / 3.0)) {
             st.best_v = v;
+            st.best_e = st.e;
+            st.best_c = c;
             st.best_rows = rows;
         }
         // a width not measured yet is tried a few times when the chain is likely to hold that far, and one whose time
@@ -298,9 +331,12 @@ bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
     st.kept = st.best_rows - 1;
     if (rows + 1 > cap) return false;                       // no row left for another draft
     // one or two more drafts, each as likely to hold as this one did, could they beat the best width so far?
-    const double v1 = (st.e + st.q * a) / cost_ms(rows + 1);
-    const double v2 = rows + 2 <= cap ? (st.e + st.q * a + st.q * a * a) / cost_ms(rows + 2) : 0.0;
-    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (cost_n_[bk_][rows + 1] < kProbes && st.q * a >= 0.15) ||
+    const double e1 = st.e + st.q * a, e2 = e1 + st.q * a * a;
+    const double v1 = e1 / cost_ms(rows + 1);
+    const double v2 = rows + 2 <= cap ? e2 / cost_ms(rows + 2) : 0.0;
+    const bool pays = by_rate ? beats(e1, cost_ms(rows + 1)) || (rows + 2 <= cap && beats(e2, cost_ms(rows + 2)))
+                              : std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0);
+    return pays || (cost_n_[bk_][rows + 1] < kProbes && st.q * a >= 0.15) ||
            (stale_chain(rows + 1) && st.q * a >= kProbeHeld);
 }
 
@@ -398,8 +434,10 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
     if (round_ms > 0) {
-        update_cost(cost_[bk_][t], cost_n_[bk_][t], clamp_sample(t, round_ms));
+        const double ms = clamp_sample(t, round_ms);
+        update_cost(cost_[bk_][t], cost_n_[bk_][t], ms);
         last_[bk_][t] = rounds_;
+        observe_rate(accepted + 1.0, ms);
     }
     rounds_ += 1.0;
     // the MTP part is an ordinary MTP window as far as its own drafts go
