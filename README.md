@@ -17,13 +17,14 @@ Speed on the 890M (Ryzen AI 9 HX 370, 64 GB RAM, Fedora 44, Qwen3.8-Flash-Next I
 
 | | original XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
-| decode (average of 6 short chats) | 15-22 tok/s | about 31 tok/s |
+| decode (average of 6 short chats) | 15-22 tok/s | about 38 tok/s |
 | prefill 523 tokens | 5.4 s (98 tok/s) | 2.55 s (205 tok/s) |
 | prefill 3,481 tokens | 29.1 s (119 tok/s) | 13.1 s (265 tok/s) |
 | prefill 2,669 tokens (the same sentence repeated) | 22.0 s (121 tok/s) | 10.0 s (267 tok/s) |
 
 The "original XeStrata" prefill column was measured on this 890M along the original XeStrata's prefill path; the
 answers are the same apart from rounding differences.
+The decode row is at temperature 0.7 with 400 tokens a chat; greedy, with 200 tokens a chat, it is about 42 tok/s.
 
 > **Contents:** [About XeStrata-890M](#about-xestrata-890m) · [What you need](#what-you-need) · [The model](#the-model) ·
 > [Install](#install) ([Releases](https://github.com/ruc1j/XeStrata-890M/releases)) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
@@ -252,7 +253,7 @@ In each, setup looks at the GPU and writes [the settings for the 890M](#the-sett
 1. Install it. The ROCm libraries (HIP, rocBLAS, hipBLASLt) come with it as recommended dependencies.
 
    ```bash
-   sudo dnf install ./xestrata-free-0.2.12-1.x86_64.rpm
+   sudo dnf install ./xestrata-free-0.2.12-2.x86_64.rpm
    sudo usermod -aG render,video $USER    # to open /dev/kfd and /dev/dri/renderD*; log out and back in
    ```
 

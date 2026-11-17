@@ -16,12 +16,13 @@ Radeon 890M と 64 GB の RAM を積んだノート PC 1 台で動かします�
 
 | | 元の XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
-| decode（短い会話 6 つの平均） | 15〜22 tok/s | 約 31 tok/s |
+| decode（短い会話 6 つの平均） | 15〜22 tok/s | 約 38 tok/s |
 | prefill 523 トークン | 5.4 s（98 tok/s） | 2.55 s（205 tok/s） |
 | prefill 3,481 トークン | 29.1 s（119 tok/s） | 13.1 s（265 tok/s） |
 | prefill 2,669 トークン（同じ文の繰り返し） | 22.0 s（121 tok/s） | 10.0 s（267 tok/s） |
 
 prefill の「元の XeStrata」の列は、この 890M で元の XeStrata の prefill の経路を測った値です。答えは丸めの差を除いて同じです。
+decode の行は、temperature 0.7 で 1 つの会話に 400 トークンを出した値です。greedy で 200 トークンずつ出すと、約 42 tok/s です。
 
 > **目次:** [XeStrata-890M とは](#xestrata-890m-とは) · [必要なもの](#必要なもの) · [モデル](#モデル) ·
 > [インストール](#インストール)（[Releases](https://github.com/ruc1j/XeStrata-890M/releases)） · [使い方](#使い方) · [困ったとき](#困ったとき) · [しくみ](#しくみ) ·
@@ -200,7 +201,7 @@ Fedora 44 で、次の 3 つのどれかで入れます。rpm がいちばん簡
 1. 入れます。ROCm のライブラリ（HIP、rocBLAS、hipBLASLt）は rpm が推奨の依存として一緒に入ります。
 
    ```bash
-   sudo dnf install ./xestrata-free-0.2.12-1.x86_64.rpm
+   sudo dnf install ./xestrata-free-0.2.12-2.x86_64.rpm
    sudo usermod -aG render,video $USER    # /dev/kfd と /dev/dri/renderD* を開けるように。ログインし直します
    ```
 

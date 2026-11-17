@@ -13,7 +13,7 @@ set(STRATA_UPSTREAM_COMMIT "ffa80d7")
 # version is <upstream>-<revision> everywhere: the version name (the tag, what the engine says) xe<upstream>-<revision>
 # (xe0.1.43.1-1), the packages <upstream>-<revision> (rpm: Version and Release).  Before 2026-10-13 a later release
 # took a fifth number instead (xe0.1.43.1 was 0.1.43's second), which upstream's own 0.1.43.1 then collided with.
-set(XESTRATA_REVISION 1)
+set(XESTRATA_REVISION 2)
 set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}-${XESTRATA_REVISION}")
 set(STRATA_VERSION_NAME "xe${XESTRATA_VERSION}")
 # The packages' version: an upstream pre-release (0.2.0-beta) with "~" for its "-" (0.2.0~beta), which deb and rpm
