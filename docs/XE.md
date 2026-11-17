@@ -33,8 +33,8 @@ The processor's own graphics (a UHD 770 on the development machine) is a second,
 
 ## A review of the 890M's decode
 
-One window of Qwen3.8-Flash-Next's decode was timed stage by stage, candidates for a faster window were listed for each stage, and they were implemented and measured one at a time, the largest expected gain first (2026-11-16).
-Eight changes went in. The 890M's decode of the greedy six chats (IQ2_XS, `--spec 4`, `--max-context 32768`, three interleaved rounds) went from 35.54, 36.50 and 36.54 tok/s to 38.78, 38.81 and 38.72 tok/s (36.19 to 38.77 on average). The answers are the same as before.
+One window of Qwen3.8-Flash-Next's decode was timed stage by stage, candidates for a faster window were listed for each stage, and they were implemented and measured one at a time, the largest expected gain first (2026-11-16 and 17).
+Sixteen changes went in. The 890M's decode of the greedy six chats (IQ2_XS, `--spec 4`, `--max-context 32768`, three interleaved rounds) went from 35.33, 36.49 and 36.43 tok/s to 41.06, 40.93 and 41.04 tok/s (36.08 to 41.01 on average, +13.7%). The answers are the same as before.
 Each change is either chosen from what the device reports (an integrated GPU, the HIP backend) or gives the same bits on every GPU.
 
 ### One window's time by stage
@@ -53,7 +53,7 @@ Before the changes one window took 76.4 ms and gave 2.64 tokens on average (the 
 | Host | 0.4 ms | 0.5% | the per-layer plan, the commit and the output |
 
 The per-stage clocks slow a window down: without them one window takes about 72 ms.
-The gaps between kernel launches are inside the stages' times; from the start-up measurement they come to an estimated 4 to 4.5 ms a window.
+The gaps between kernel launches are inside the stages' times. Measured by adding empty launches to every layer, one launch costs about 2 us (576 more launches a window: -1.5%).
 
 ### What went in
 
@@ -80,12 +80,37 @@ The numbers are the 890M's decode of the greedy six chats, the mean of three int
 
 The last three together give 38.20 → 38.66 tok/s (+1.2%).
 
+With these eight in, the stages were timed again and the candidates searched twice more; eight more changes went in.
+
+- Where the shared expert's side branch forks: it forked after the router, the top-10 and the plan. The shared expert reads only the layer's input, so it now forks ahead of the router (`STRATA_SH_EARLY=0` for the former place).
+  The router's GEMV, the top-10 and the plan leave the memory bandwidth free, and the shared expert's weights (about 2.7 MB a layer) are read meanwhile. Only the order of the launches changes. 38.82 → 38.92 tok/s (+0.3%, two rounds; a third started from a cold GPU and is left out).
+- The PLE rows of drafts the window does not verify: the draft layer reads each draft's PLE row ahead. When the cost rule left the last draft out of the window, its row is not read (`STRATA_PLE_SKIP_DROPPED=0` for the former behaviour).
+  A window's launch waits for every read in flight, so the wait before the launch goes from 0.21 ms a window to 0.16 ms.
+- The PLE projections: layer 1's key and value projections (65.5 MB of BF16 weights) ran in a row at the start of layer 1. In the window graph that does not ask the host they are launched at the window's start on a third queue and joined at layer 1 (`STRATA_PLE_BRANCH=0` for the former place).
+  The same kernels on the same inputs. The decode difference is within the noise; a window is 0.03 to 0.04 ms shorter.
+- The MTP window's cap: where the cost rule is the default, the MTP's windows go up to one row more than `--spec` when `--mtp-max-t` is not given (5 rows with `--spec 4`; `--mtp-max-t 4` for the former cap).
+  A window gives 2.72 tokens instead of 2.62, 38.78 → 38.97 tok/s (+0.5%). A cap of 6 rows was no faster (38.75 → 38.73 tok/s), so it is one row only.
+- The thread that reads the PLE table: on an integrated GPU on the HIP backend the token thread submits and reaps the table's direct reads (`--ple-io-thread` for the I/O thread). Through the I/O thread, the last read, which the window's launch waits for, takes two more thread hand-offs.
+  The wait before the launch goes from 0.21 ms a window to 0.12 ms, 38.81 → 38.87 tok/s. The SSD keep-alive goes on in this mode as well, on a thread of its own.
+- The draft layer's norm: on an integrated GPU on the HIP backend, `--mtp-hnorm stream` (the draft layer's hidden input normalized per hyper-connection stream) is now the engine's default (`--mtp-hnorm pooled` for the former norm).
+  Setup has written the flag into an integrated GPU's configuration since 2026-10-29, but a configuration made before that, or by hand, ran the pooled norm; so did the one these measurements used. A window gives 2.91 tokens instead of 2.70, 39.04 → 40.52 tok/s (+3.8%).
+- The GDN step's barriers: the window's GDN step had two barriers for every row of the window. Each row has its own slots for the sums, so the output sums now follow the row loop and a row has one barrier. The order of the additions is the same and the result is bit-identical (`gdn_step_parity`).
+  As a kernel on its own a three-row step goes 73.2 → 62.1 us; decode 40.60 → 40.79 tok/s (+0.5%).
+- How the window's width is chosen: the cost rule took the width with the most expected tokens per round time of the window itself. It now takes the width with the most expected tokens less lambda times the round time, lambda being the rate of the whole stream of windows (`STRATA_SPEC_RATE=0` for the former choice).
+  A window of unsure drafts gets narrower and one after sure drafts wider. As many drafts are accepted and fewer are verified, 40.51 → 40.64 tok/s (+0.3%, four rounds).
+
+With the later eight the decode is 38.82 → 41.01 tok/s (+5.6%) against the first eight alone, three interleaved rounds.
+
 ### What did not go in
 
 - Reading the PLE rows after the launch in the window graph that does not ask the host was slower, 37.25 → 37.01 tok/s.
 - Splitting off the z GEMV after qkv to overlap it with the GDN recurrence gave 37.79 → 37.29 tok/s (-1.3%).
 - Reading the experts' weights with wide 32-bit and 64-bit loads did not change the number of load instructions: the compiler already merges the 16-bit reads. Only the non-temporal hint changed, and it gave 37.29 → 36.89 tok/s (-1.1%).
 - Computing the GDN recurrence lane by lane was slower as a kernel on its own, a three-row step 74.5 → 110.4 us, and the choice at start-up never picked it.
+- A GDN step in which a lane keeps one column's state gave the existing forms' bits, but was slower as a kernel on its own, a three-row step 72.7 → 144.5 us: the compiler takes 256 VGPRs for it, and fewer waves run at once.
+- Writing the GDN state back after the pending rows under the window's rows made no difference as a kernel on its own (a three-row step with three pending rows 110.8 us and 114.8 us).
+- `GPU_MAX_HW_QUEUES=8` gave 38.75 → 37.12 tok/s (-4.2%), and `ROC_ACTIVE_WAIT_TIMEOUT=50` 38.75 → 38.80 tok/s, no difference; neither went in.
+- Dropping the non-temporal hint from the loads of the Q2_0 down rows made no difference, 39.07 → 39.05 tok/s.
 - The candidates that lower the precision (a two-stage output head, hyper-connection weights below 8 bits, the router in Q8_0 and others, seven in all) were not tried: the check that a kernel matches the CPU reference does not apply to them.
 
 What was checked: the free and contrib-llvm builds, CTest (in both, all but the two tests that have no pack pass), and that `tools/lint/run.sh` gives no new findings.
