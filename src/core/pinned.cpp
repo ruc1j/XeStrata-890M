@@ -152,7 +152,11 @@ uint64_t free_huge_bytes() {
 }
 
 std::string thp_request_skipped(uint64_t bytes) {
-    if (std::getenv("STRATA_NO_ARENA_THP") != nullptr) return "transparent huge pages skipped (STRATA_NO_ARENA_THP)";
+    // STRATA_NO_ARENA_THP (upstream 0a17fb99e): unset = the engine decides (none on an integrated GPU on the HIP backend,
+    // kfd_igpu_class; asked everywhere else, as before); 0 = ask for them there too (the checks below still apply); any other
+    // value skips the request on any GPU, as before
+    const char* no_thp = std::getenv("STRATA_NO_ARENA_THP");
+    if (no_thp != nullptr && no_thp[0] != '0') return "transparent huge pages skipped (STRATA_NO_ARENA_THP)";
     std::string mode;
     if (std::FILE* f = std::fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r")) {
         char line[128] = {0};
@@ -165,6 +169,8 @@ std::string thp_request_skipped(uint64_t bytes) {
     }
     if (mode == "always")
         return "transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested";
+    if (arena_skip_thp_request(no_thp, false, kfd_igpu_class()))
+        return "huge pages not requested on this graphics chip (STRATA_NO_ARENA_THP=0 requests them)";
     // upstream 6b395578 (#2126): with THP and defrag "madvise", every fault of a MADV_HUGEPAGE mapping reclaims and
     // compacts until it finds a 2 MiB block.  When the free 2 MiB blocks cover less than half of the arena (a 62 GB
     // machine holding 47 GB of anonymous memory: the load never ended, at 100% system time), that is minutes of kernel

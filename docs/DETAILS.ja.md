@@ -94,6 +94,12 @@ decode の速さは文章によっても変わります。
 既定では使いません。キャッシュの小さい GPU では `STRATA_ROUTE_PRIOR=1.5` で serve の decode が 2〜8 割速くなりますが、長いエージェントの作業で同じ文を繰り返し、結果も落ちます（upstream #4402）。多くが載る GPU では速くならないか遅くなります。
 どちらも答えが変わります。
 
+`--serve` は、最初の要求を読む前に、推測デコードの窓の幅（1 から `--spec` まで）を 1 回ずつ空で回し、それぞれのグラフを先に作ります（upstream 84e11a773）。
+その幅を初めて使う要求が、グラフを作る時間を払わずに済みます。
+890M では 6 つの幅で 0.6〜1.0 秒かかり、デバイスのメモリーを 835〜1,080 MiB 使いました（どれも要求が使えばいずれ作るグラフです）。
+6 つのチャットの最初の要求の decode は 37.1〜39.7 から 40.2〜41.4 tok/s になり、答えは同じでした（交互 3 周、2026-11-18）。
+層の分割と `--batch` では回しません。`STRATA_WINDOW_WARM=0` で切れます。
+
 ### 小さい GPU と XMX のない GPU
 
 B70 を小さい GPU に見せた設定（`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`、VRAM 8 GB、XMX なし）で、
@@ -124,6 +130,19 @@ setup はホストの設定を変えません。
 expert cache のページ（GTT、またはホストのメモリー）はドライバーのもので cgroup に課金されないので、エンジンは cache の大きさを cgroup の上限で丸めた値でなく Linux が返せる RAM（`MemAvailable`）から決めます（shoftee/Strata 48defc12e。MemoryMax を小さくした unit で「cache の余地なし」になっていました）。cgroup の値が小さいときはログに言います。ホストの確保は cgroup の値のままです。
 統合 GPU の `--serve` で `--conversation-cache-mib N` を書いたときは、置いた会話が同じ RAM を使うので、自動の expert cache の reserve にその N を足します（shoftee/Strata ff5809230）。空き RAM から後で決める会話キャッシュ（既定）ではそのままです。
 cache を満たしたあと全エキスパートが GPU の cache にあるときは、decode は file tier から何も読まないので、Linux の既定で入った io prefetch（と decode gate）を切り、routing-aware prefetch（層ごとに router の積を CPU で計算して次の層のエキスパートを予測する）を始めません（01xjw/Strata 735a40ec3。2× W7900D の層の分割で decode 57 → 80 tok/s、出力は同じ）。APU では CPU の仕事が package の電力を GPU と分け合います。`STRATA_IO_PREFETCH=1` で io prefetch を、`STRATA_LOOKAHEAD=1` で routing-aware prefetch を残せます。GPU が 1 つのときだけです。
+
+Linux で、エンジンの GPU がすべて HIP の backend の統合 GPU のときは、GPU のドライバー（KFD）がキューを止める操作（eviction）を要求の最中に起こしにくくするため、次のことをします（upstream 8f6393a37、f9932c6ae、6069c9d0c、0ee263992、0a17fb99e、03e687ace、f73fa7410。upstream の Radeon 780M では、読み込みの直後に GPU がリセットされていました）。
+統合 GPU かどうかは、KFD の topology（GPU の node のメモリーが 0）とデバイスの報告で決め、GPU の名前は見ません。
+
+- expert cache を確保したあと（満たす前）と READY の前に、KFD がキューを止めた時間の合計が 2 秒増えなくなるまで待ちます（1 回に最大 10 秒）。`STRATA_NO_KFD_SETTLE=1` で待ちません。
+- 読み込みのあと、pack の `dense.bin` と `embd.bin` のファイルのキャッシュを OS に返します。`STRATA_NO_ARENA_CACHE_DROP=1` で返しません。
+- エキスパートの領域に THP（`MADV_HUGEPAGE`）を頼みません。`STRATA_NO_ARENA_THP=0` で頼みます。
+- CPU の分担のバッファーを起動のときに作り、READY の前に、ページ固定していないメモリーとのコピーを行きと帰りで 1 回ずつして、HIP のランタイムの作業領域を先に作ります（`STRATA_KFD_QUIET_LOAD=0` で切れます）。
+- 1 MiB 以上の、ページ固定していないメモリーとのコピーは、ランタイムの作業領域を通します（`GPU_PINNED_MIN_XFER_SIZE`。`STRATA_KFD_QUIET_XFER=0` で切れます）。`STRATA_KFD_QUIET=0` は、この項と前の項の両方を切ります。
+
+890M でリセットが起きた記録はありませんが、冷えた起動では KFD がキューを止めた時間が合わせて 11 秒ありました。
+待ちは 2 回で 4〜6.6 秒で、起動から最初の答えまでは、これらと窓の下準備（上の decode の節）を切った起動より 2〜5 秒長くなりました（ファイルのキャッシュが冷えていた最初の 1 回は 21 秒）。
+decode と greedy の答えは変わりません（6 つのチャット、交互 3 周、2026-11-18）。
 
 Radeon 890M（Ryzen AI 9 HX 370、LPDDR5X-7500、理論値 120 GB/s）で GPU が読める帯域を 1 GiB の連続読み（16 バイトのロード）で測ると、
 hipMalloc 102 GB/s、hipHostMalloc 95 GB/s、NonCoherent の hipHostMalloc 101 GB/s、2 MB ページの hipHostRegister 100 GB/s、Managed 100 GB/s です。
@@ -939,7 +958,7 @@ print(r.choices[0].message.content)
 
 - **思考の厳密な上限（任意）**: 要求に `"reasoning_budget_tokens": N`（llama-server 向けのクライアントが送る llama.cpp の `"thinking_budget_tokens": N` でも。OpenAI でも Anthropic でも）を付けると、思考を N トークンで打ち切ります。
   そこに達すると、server は短い締めの行と `</think>` で思考を終え、モデルはそこから答えます。
-  エンジンは持っている状態から続けるので、何も読み直しません。
+  エンジンは思考が上限に達したトークンでちょうど止まり（upstream be101072b、`--batch` の枠は b92075d92）、締めのパスはエンジンがいま持っている状態から続けるので、思考を読み直しません。
   締めの行はクライアントから見える思考の一部で、出力のトークンに数えます。
   `xestrata-<model>.json` に `"reasoning_budget_tokens": N` を書くと、すべての要求に適用されます。
   要求自身の値が優先し、`0` は上限なしです。
@@ -1133,6 +1152,10 @@ print(r.choices[0].message.content)
 これは実際にはシステムプロンプトの終わりで、同じクライアントのどの会話も共有する部分です。
 ほかは使われた順に入れ替わるので、その先頭を共有する**新しい**会話も、トークン 0 からではなくそのあとから読み始めます。
 最初から読んだプロンプトも、システムプロンプトが 2,048 トークン以上なら、その終わりでチェックポイントを取ります（upstream PR #62 と #65）。
+
+停止文字列、クライアントの切断、繰り返しの打ち切りで server が返答を止めたときは、STOP のあとに終わった decode の窓をエンジンが捨てます（upstream 33648fef1）。
+会話の状態はクライアントに送ったトークンで終わるので、次の要求はチェックポイントに戻らずにそこから続けます。
+`STRATA_SERVE_STOP_SKIP=0` で、その窓も確定する前の形に戻ります。
 長いシステムプロンプトとツールの一覧を持つエージェントのクライアントにも、この起点ができます。
 エンジンの設定は `--prompt-cache N`（0 でオフ）、`--prompt-cache-every N`、`--prompt-cache-root N`（0 でシステムプロンプトのチェックポイントなし）、`--turn-token ID` です。
 `--prompt-cache-every` は、prompt を読む塊の大きさを決めません。N トークンごとのチェックポイントは prefill の塊の境目で取り、読みはそのまま続きます。
@@ -1180,7 +1203,7 @@ B70 の IQ2_XS で 1,791 トークンのプロンプトに 3 つの問いを続�
 - `--conversation-cache-mib` を指定しなければ、モデルを読み込んだ後の RAM の空きから決めます（upstream #3493）。`--conversation-cache-min-free-mib` を超える分の 40%（最大 8192、256 刻み）で、1024 に満たなければオフです。どちらにしたかは起動のログの 1 行に出ます。`--conversation-cache-mib 0` でオフ、`--prompt-cache 0` でもオフになります。Qwen3.8-Flash-Next では `--mtp` がないときもオフです。
   置いた会話は、[次の節](#置いた会話を再起動後も使う任意)の設定がなければ、再起動をまたいで残りません。
 - コピーの前に、`--conversation-cache-min-free-mib N`（既定 2560）の RAM が空いたままかを確かめます（使える RAM の読み方は下）。
-  足りなければ、古い会話から追い出しながら確かめ直します（upstream 940011da）。
+  足りなければ、古い会話から追い出しながら確かめ直します（upstream 940011da）。追い出した会話のメモリーは C ライブラリーのヒープに残さず、OS に返します（upstream 8c71c4927）。
   それでも足りないとき、またはコピーが予算に入らないときは、置かずにこれまでどおりプロンプトを読みます。
   予算に入れるためにも、いちばん古い会話から捨てます。
 - 新しい会話が、置いてある会話の途中のチェックポイント（同じシステムプロンプトと道具の一覧で始まるサブエージェント、まとめ直した履歴など）で始まるときは、そこまでの K/V とチェックポイントを借り、置いてある会話はそのまま残します（エンジンのログは `borrowed`、upstream c9e571e0・2b296987、#1164）。
@@ -1190,6 +1213,12 @@ B70 の IQ2_XS で 1,791 トークンのプロンプトに 3 つの問いを続�
   置いた会話は長さによらずスロットを 1 つ使うので、長い会話の合間に短い横の要求を挟むクライアントでは、短い要求がスロットを埋めて長い会話を追い出していました。
 - `--conversation-cache-park-gain N`（opt-in、既定 0 = 毎ターン置く）は、置き換える前のコピーから N トークン進んでから会話を置き直します（upstream d9cb22d2、#2265）。
   数百トークンしか伸びていないターンは古いコピーを残し、次のターンが捨てる丸ごとのスナップショットを書きません。古いコピーから再開すると、最大 N トークンを読み直します。
+- Linux では、置いた会話の K/V のバッファーを 1 つの領域（segment pool）から取ります（upstream e04c4c931、01e21ef20 ほか）。
+  要求のないあいだに裏で領域のページを触って常駐させておくので、会話を置くときに新しいページを初めて触る待ちがありません。
+  大きさは会話のキャッシュの 4 分の 1（最大 2 GiB、64 MiB 刻み、128 MiB に満たなければ作りません）で、会話のキャッシュの予算の中に数えます。
+  RAM を確かめて足りないときは、置いた会話を追い出す前と、追い出すたびに、領域の空いている分を OS に返します。
+  890M（RAM 62 GiB、expert cache 24 GiB を RAM に固定）では、会話のキャッシュが 3,584 MiB で、領域は 896 MiB でした。
+  `STRATA_PARK_SEGPOOL_MIB=N` で大きさを MiB で決め、`0` で切れます。
 - 戻すコピーに失敗したら、半分の状態から答えずに、エンジンを止めます。
 - 戻したあと、変わっていない K/V のページは次のコピーで使い回します（`STRATA_SNAPSHOT_FULL_CAPTURE=1` で使い回しを切ります）。
   新しいページには次のターンのための余白を、各バッファの 8 分の 1 まで（16 MiB まで）付け、予算はそれもコピーの一部として数えます（upstream 53f72571）。
@@ -1687,6 +1716,13 @@ AVX2 では 8 で割り切れますが、AVX-512 の 16 では割り切れず、
 `--flash-attn on|off|auto` で変えられます。
 upstream の測定（Ryzen 7 7700X、8 スレッド、1024x1024 の画像）では、AVX2 で入れて 8〜10 秒・切って 14〜15 秒、AVX-512 で入れて 44 秒・切って 13 秒でした。
 
+**CPU のエンコーダーの自前の読み手**（upstream 75ee0ea87 ほか 14 コミット）: CPU 版の `strata-vision` は、mmproj の塔に対応していれば、llama.cpp の mtmd ではなく XeStrata の自前の CPU の読み手（`tools/vision/own`）で画像を読みます。起動の行は `READY <幅> own` です。
+命令は CPU の報告に合わせて AVX-512、AVX2、AVX、SSE4.1 から選びます。
+Qwen3.8-Flash-Next の mmproj では、mtmd の埋め込みとのコサインが平均 0.9996 でした（Ryzen AI 9 HX 370、写真 1 枚）。upstream の測定では、時間は mtmd の CPU の 0.80〜0.95 倍です。
+deepstack のある塔（Mage-Flow の mmproj など）には対応しないので、mtmd で読みます。自前の読み手が読み込みに失敗したときも、同じプロセスで mtmd に戻ります（`READY <幅> mtmd fallback`）。
+Vulkan の GPU 版と `--gpu` では、いつも mtmd です。
+`strata-vision` の `--tower mtmd|own|auto`（既定 auto）か、環境変数 `STRATA_VISION_TOWER` で選べます。
+
 ### 画像を送る
 
 **端末の会話**: `/image <画像のパス>` と打って Enter を押し、続けて質問を打ちます。
@@ -1878,10 +1914,11 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | 起動時に `alloc_device: ... refused` | VRAM に空きがあっても確保を断るドライバーの状態です（Intel の [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916)。Linux 7.1 で直った xe カーネルのバグを、compute-runtime 26.22 が回避します。XeStrata の側では [#34](https://github.com/MistVVK/XeStrata/issues/34)。B70 では約 120 回の起動に 3 回起きました）。エンジンは確保を小分けにしてやり直し、確保できる分だけで起動します。カードがそのままのときは再起動でしか戻りません。Ubuntu 24.04/26.04 では [graphics PPA でドライバーを更新](BUILD.ja.md#パッケージ)してください（[XE.ja.md](XE.ja.md#出力ヘッドの-vram-の確保が断られる)）。 |
 | 起動のログに `IGC's GEP simplification is off` と出る | Intel Graphics Compiler（IGC）の 2.27〜2.30（Ubuntu 26.04 の 2.28.4 など）は、Xe2 以降の GPU（Arc B シリーズ、Lunar Lake、Panther Lake）向けに一部の読みを誤って訳し、GPU が範囲外を読んで止まるか、答えが狂います。Linux のエンジンは、入っている IGC がその版で、Xe2 以降の GPU があるとき、起動時に `IGC_EnableGEPSimplification=0` を設定してその最適化を切ります（B70 では 1K の decode が 5〜10% 遅くなり、32K は変わりません）。自分で `IGC_EnableGEPSimplification=1` を設定していれば、そちらが優先されます。元の速さで動かすには、Fedora 44 を使うか（IGC が 2.32 以降です）、[Podman で入れます](BUILD.ja.md#podman)（中は Fedora 44 です）。Ubuntu 24.04/26.04 では、HWE カーネルにして [Intel の graphics PPA](BUILD.ja.md#パッケージ) を入れる道もあります（IGC だけの更新はできません: PPA はドライバーも一緒に入れ、そのドライバーは HWE カーネル用です）。 |
 | Python やビルドの道具を入れられなかった | 示されたものを入れて、もう一度実行します。済んだことは残っていて、飛ばします。 |
+| エンジンや画像の読み手が ggml の abort で落ちたときのスタックを見たい | server と setup は、子のプロセスに `GGML_NO_BACKTRACE=1` を渡します。ggml が abort のときに gdb を起動し、そのまま止まったり、gdb の出力が READY の行に混ざったりしないためです（upstream 38ad0bcbd）。スタックが要るときは、`STRATA_BACKTRACE=1` を付けて server を起動します。 |
 | `port 8095 is already in use` | XeStrata がすでに動いている（そのウィンドウを探す）か、ほかのプログラムがそのポートを使っています: `./setup.sh --port 8081`。 |
 | 初回の起動に数分かかる | RAM に 23〜50 GB を読み込んでいます。ファイルが OS のキャッシュにある間は、2 回目の方が速くなります。 |
 | 起動の間、PC が数分固まる | とくに初回はよくあります（server のウィンドウに、そうなる時点が出ます）。エンジンがエキスパートを RAM に読み込み、GPU のためにその一部を登録し、エキスパートのキャッシュの大きさを決めています。ウィンドウを閉じずに待ちます。10 分たっても固まったままなら、PC を再起動し、ほかのプログラムを閉じてやり直すか、小さい大きさを選びます。 |
-| 起動に何分もかかり、その間カーネルがメモリーの圧縮（`kcompactd`）で忙しい | 透過的なヒュージページ（THP）が `madvise` のとき、エンジンはアリーナに `MADV_HUGEPAGE` を頼み、断片化した RAM では fault のたびに圧縮が走ることがあります（upstream #771）。`STRATA_NO_ARENA_THP=1` で頼まなくなります（THP が `always` のときは、エンジンは初めから頼みません）。 |
+| 起動に何分もかかり、その間カーネルがメモリーの圧縮（`kcompactd`）で忙しい | 透過的なヒュージページ（THP）が `madvise` のとき、エンジンはアリーナに `MADV_HUGEPAGE` を頼み、断片化した RAM では fault のたびに圧縮が走ることがあります（upstream #771）。`STRATA_NO_ARENA_THP=1` で頼まなくなります（THP が `always` のとき、Linux の HIP の統合 GPU のときは、エンジンは初めから頼みません。後者は `STRATA_NO_ARENA_THP=0` で頼みます）。 |
 | 起動のエラーに `the engine process ended: ...` とある | システムがエンジンのプロセスを終わらせました。エラーがその終わり方を示します（Linux では `killed by signal 4 (SIGILL, Illegal instruction)`、Windows では `exit code 0xC000001D: illegal instruction` など）。不正な命令（illegal instruction）は、CPU が実行できない命令をエンジンが使ったということで、Linux ではエラーが CPU に欠けている AVX・AVX2・FMA・F16C を挙げるか、すべてあるならエンジンのバグだと示します。CPU の型番を添えて issue を立ててください。 |
 | `the engine stopped unexpectedly (exit code ...)` | 答えの途中でエンジンのプロセスが終わりました。たいていは RAM 不足で、Linux がいちばん大きなプログラムを終わらせます（`journalctl -k \| grep -i -E 'killed process\|out of memory'`）。次の要求で、エンジンは自分で起動し直します。繰り返すなら、ほかのプログラムを閉じるか、小さい大きさを選びます。server は、モデルのエキスパートがほかのために約 6 GB の RAM を残さないとき、起動時に警告します。 |
 | Linux でエンジンが signal 9 で終わったのに、RAM は足りていた | デスクトップのセッションに実時間の CPU の制限（RLIMIT_RTTIME）があると、カーネルが signal 9 でプログラムを何も言わずに終わらせることがあります。rtkit がないとき、音声のシステム（PipeWire）がこの制限を 0 にし、デスクトップから始めたプログラムがそれを受け継ぎます。server は起動時と、エンジンが signal 9 で終わったときに、この制限を見つけると知らせます。`ulimit -R` で確かめ、rtkit を入れるか、セッションの制限の外で起動します（`systemd-run --user --collect -p LimitRTTIME=infinity -- xestrata`）。 |

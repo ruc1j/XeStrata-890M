@@ -1032,6 +1032,8 @@ public:
     void close();
 
     bool mapped() const { return base_ != nullptr; }
+    /// STRATA_ARENA_MMAP: the arena is a file mapped read-only, its experts read from the drive as they are used
+    bool file_mapped() const { return map_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     /// `blob` without the read counter: a pointer into the arena, safe from another thread (the asynchronous adaptive

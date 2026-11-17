@@ -48,6 +48,7 @@ import select
 import shutil
 import signal
 import socket
+import socketserver
 import struct
 import subprocess
 import sys
@@ -67,6 +68,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
+from serve.childenv import quiet_crash_env  # noqa: E402
 from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
                             OutputParser, ToolCall, allowed_tools, anthropic_format, anthropic_to_messages,
                             anthropic_tools,
@@ -224,6 +226,12 @@ ANSWER_RESERVE_MIN = 512
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# The thinking budget's pass to an engine that says "hold" in READY carries GEN hold=N:ID (upstream be101072b; N: the
+# reasoning tokens left, ID: the one token of </think>): the engine stops there with its session at exactly the tokens
+# it sent, so the next pass (+ the wrap-up) continues from the live session.  Without it the engine ran a window or two
+# past the cut, and the next pass read the whole reasoning again from the checkpoint before it.  The server's own key
+# in `sampling`, never a client's.
+HOLD_KEY = "_strata_hold"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
 # low-effort instruction in place of the xhigh one.  Both off by default.
@@ -1010,6 +1018,8 @@ class StrataEngine:
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.can_hold = False            # the engine takes GEN hold=N:ID (READY <ctx> ... hold; HOLD_KEY)
+        self.can_hold_batch = False      # ... and its --batch slots end at the hold too, BDONE hold (READY ... holdb)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
@@ -1101,6 +1111,8 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.can_hold = "hold" in f[2:]
+                self.can_hold_batch = "holdb" in f[2:]
                 break
         loading.set()
         if self.max_context <= 0:
@@ -1526,6 +1538,11 @@ class StrataEngine:
             ac = tune.get("aux_cpus")
             if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
                 keys += f" aux_cpus={int(ac)}"
+        # the thinking budget's hold (HOLD_KEY): set by the server for an engine that says "hold", never by a client
+        hold = sampling.get(HOLD_KEY)
+        if (isinstance(hold, tuple) and len(hold) == 2
+                and all(isinstance(x, int) and not isinstance(x, bool) for x in hold) and hold[0] > 0 and hold[1] >= 0):
+            keys += f" hold={hold[0]}:{hold[1]}"
         k = top_logprobs(sampling)
         if k is not None:
             keys += f" logprobs={k}"
@@ -1986,13 +2003,25 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
-        keys = self.sampling_keys(sampling or {})
+        # the thinking budget's hold (upstream b92075d92): the reasoning tokens left when this pass starts, and
+        # </think>'s id; its key goes on per leg (leg_keys below)
+        hold = (sampling or {}).get(HOLD_KEY)
+        keys = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY})
         # logprobs: only a request the server let through (max_tokens 1, see the handler) asks for them here; its LP
         # lines go to its own LPLines, made the engine's while it has the control lines (below)
         own_lp = self.own_lp_lines(sampling, cancel, make_current=False)
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
+
+        def leg_keys() -> str:
+            """The budget's hold counts what this pass still has: a leg that starts after `out` tokens of it holds the
+            rest (at least one); once </think> is in `out` the hold is over and no key goes."""
+            if (isinstance(hold, tuple) and len(hold) == 2 and all(isinstance(x, int) and not isinstance(x, bool)
+                                                                   for x in hold)
+                    and hold[0] > 0 and hold[1] >= 0 and hold[1] not in out):
+                return keys + f" hold={max(1, hold[0] - len(out))}:{hold[1]}"
+            return keys
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         carry = {}
@@ -2022,7 +2051,7 @@ class StrataEngine:
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
                 if alone and left > 1:
-                    head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                    head = f"GENI {left}{leg_keys()} {embeddings}" if embeddings else f"GEN {left}{leg_keys()}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     if own_lp is not None:
                         self.lp_lines = own_lp
@@ -2076,7 +2105,8 @@ class StrataEngine:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
                         stopped = bool(out) and out[-1] in self.eos_ids
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or stopped:
+                        # ("hold": the budget's cut: the caller wraps up or asks for more)
+                        if cancel.is_set() or left <= 0 or finish in ("stop", "length", "hold") or stopped:
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
@@ -2148,7 +2178,8 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not sq[slot].empty():
                         sq[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
+                    head = f"BGENI {slot} {left}{leg_keys()} {embeddings}" if embeddings else \
+                        f"BGEN {slot} {left}{leg_keys()}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
@@ -2564,10 +2595,14 @@ class StrataEngine:
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
-                if self.can_stop:
+                # the engine can be ended or restarted on another thread meanwhile (upstream bbf97633c): close() closes
+                # stdin (a write then raises ValueError) before it clears `proc` (None then) - the STOP has nobody to
+                # reach, and the request's own outcome must not be replaced by that error
+                proc = self.proc
+                if self.can_stop and proc is not None:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
+                        proc.stdin.write("STOP\n")
+                        proc.stdin.flush()
                     except (OSError, ValueError):
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
@@ -2891,17 +2926,20 @@ _VISION_ARCH_SIGNS = ("device kernel image is invalid", "no kernel image is avai
                       "unsupported gpu architecture", "invalid device function", "unknown gpu architecture")
 
 
-def vision_start_error(line: str, log=None, code: int | None = None, waited: float | None = None) -> str:
+def vision_start_error(line: str, log=None, code: int | None = None, waited: float | None = None,
+                       strays=()) -> str:
     """The message when the image encoder answered something other than READY.  #1445: a card in the Exclusive_Process
     compute mode (or one another process holds) refuses the encoder's CUDA context with "busy or unavailable"; that
     cause is named instead of leaving the user the first line of a traceback.  `log` is the encoder's stderr file, whose
     tail is searched too (the CUDA error is printed there).  An encoder that dies before it prints anything (#3645,
     # 3444, 3669, #3697) used to give a blank sentence: now the
     # last lines of its stderr, its exit status (`code`) and, for a
-    kernel-image error, the card/architecture hint come with it.  `waited`: it said nothing for that many seconds."""
+    kernel-image error, the card/architecture hint come with it.  `waited`: it said nothing for that many seconds.
+    `strays` (upstream 4cce1ee4d): lines it printed on its output before it ended that were not an answer (a
+    debugger's, a library's); they are searched for the causes below and named in the message."""
     text = line.strip()
     tail = vision_log_tail(log)
-    both = (text + chr(10) + tail).lower()
+    both = (text + chr(10) + chr(10).join(strays) + chr(10) + tail).lower()
     if "busy or unavailable" in both:
         return ("the vision encoder did not start: the GPU refused a second CUDA context (\"CUDA-capable device(s) "
                 "is/are busy or unavailable\"). This is usually the compute mode Exclusive_Process: only one process "
@@ -2926,6 +2964,8 @@ def vision_start_error(line: str, log=None, code: int | None = None, waited: flo
         words = engine_exit_words(code)
         if words:
             extra.append(words)
+    if strays:
+        extra.append("it also printed on its output: " + " | ".join(x[:120] for x in list(strays)[-3:]))
     shown = [x for x in lines[-3:] if x != text]
     if shown:
         extra.append("last lines of its log: " + " | ".join(x[:200] for x in shown))
@@ -3047,19 +3087,63 @@ class Vision:
                           env=env, cwd=self.dir)
         self.lines: queue.Queue = queue.Queue()    # its stdout, read on a thread so that a wait can time out
         threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
-        line = self._line(VISION_READY_S)
+        strays: list[str] = []
+        line = self._await_ready(VISION_READY_S, strays)
         if line is None or not line.startswith("READY"):
             why = ("no answer within %d s" % VISION_READY_S if line == "" else
                    "it exited" if line is None else line.strip())
             # upstream c40a03e6: the last lines of its stderr, its exit
             # status and the kernel-image hint come with the message
-            code = self.proc.poll() if line is None else None   # an encoder that died by itself has its status already
+            # an encoder that died by itself has its status already
+            code = self.proc.poll() if line is None and hasattr(self.proc, "poll") else None
             self._stop(why)
             if line is None and code is None:
                 code = getattr(self.proc, "returncode", None)
             raise RuntimeError(vision_start_error("" if line in (None, "") else line, log, code,
-                                                  waited=VISION_READY_S if line == "" else None))
+                                                  waited=VISION_READY_S if line == "" else None, strays=strays))
         self.stopped = False
+
+    #: how long a reader that has already ended may still hold its output pipe open (a debugger attached to it, a
+    #: child it started) before the start is judged: the pipe's end does not come, the process's end is what counts
+    READY_GRACE_S = 2.0
+    #: lines kept from a reader's output before its answer (and written to the log): enough to see what it said
+    STRAY_KEEP = 20
+
+    def _await_ready(self, timeout: float | None, strays: list) -> str | None:
+        """The reader's answer to its start (upstream 4cce1ee4d): "READY ..." or "ERR ..." (what strata-vision prints on
+        stdout; everything else it says goes to stderr), None when it has ended, "" when `timeout` s (None: for ever)
+        passed without an answer.  Any other line on stdout is a stray line - a debugger a crashing reader started, a
+        library's banner - and not an answer: it is kept in `strays` (the last STRAY_KEEP), written to the log, and the
+        wait goes on with the same one deadline, so a reader that is only printing is never ended for it.  A reader
+        whose process has ended while a debugger or a child still holds its pipe open counts as ended after
+        READY_GRACE_S.  The lines after the answer (the encode answers) stay in `self.lines`."""
+        proc = self.proc
+        deadline = None if timeout is None else time.monotonic() + timeout
+        ended_at = None
+        said = 0
+        while True:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                return ""
+            try:
+                line = self.lines.get(timeout=0.25 if deadline is None else max(0.01, min(0.25, deadline - now)))
+            except queue.Empty:
+                code = proc.poll() if proc is not None and hasattr(proc, "poll") else None
+                if code is not None:
+                    ended_at = now if ended_at is None else ended_at
+                    if now - ended_at >= self.READY_GRACE_S:
+                        return None
+                continue
+            if line is None or line.startswith(("READY", "ERR")):
+                return line
+            stray = line.strip()
+            if stray:
+                strays.append(stray[:300])
+                del strays[:-self.STRAY_KEEP]
+                said += 1
+                if said <= self.STRAY_KEEP:
+                    print(f"[strata] the image encoder printed on its output, not an answer: {stray[:200]}",
+                          flush=True)
 
     def alive(self) -> bool:
         """False after `unload` (and before a lazy encoder's first start): the next request starts it again.  An
@@ -3559,7 +3643,7 @@ def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
-    env = dict(os.environ)
+    env = quiet_crash_env(dict(os.environ))          # no debugger on a user's machine (serve/childenv.py)
     # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's own default order (fastest first) can number
     # the cards otherwise
     if gpu_list(cfg):
@@ -3826,6 +3910,9 @@ class Service:
         # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory,
         # so it is off unless the config's "api_monitor" (or --api-monitor) turns it on
         self.api_monitor = False
+        # upstream 3cf22f5ef (#6055): set when the server stops (begin_drain): a generation request that arrives while
+        # the engine closes is refused with 503 server_draining instead of being cut off with 0 tokens
+        self.draining = False
         # bounded I/O in memory; no headers or API keys
         self.api_requests: collections.deque[dict] = collections.deque(maxlen=100)
         self.request_trace = threading.local()
@@ -4520,6 +4607,11 @@ class Service:
         with self.status_lock:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
+
+    def begin_drain(self) -> None:
+        """The server stops: no new generation request is taken from here (a 503 server_draining, retry elsewhere);
+        the requests already running end as the engine closes, as before."""
+        self.draining = True
 
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
@@ -5324,6 +5416,14 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    # the engine stops at the budget itself (HOLD_KEY, upstream be101072b / b92075d92), when it can and
+                    # </think> is one token: a --batch engine only when its slots say they hold too (READY holdb)
+                    hold_end = None
+                    if (budget and getattr(self.engine, "can_hold", False) is True
+                            and (not getattr(self.engine, "batch", 0)
+                                 or getattr(self.engine, "can_hold_batch", False) is True)):
+                        te = self.tok.encode(THINK_END, parse_special=True)
+                        hold_end = te[0] if len(te) == 1 else None
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -5334,10 +5434,20 @@ class Service:
                             # thinking closed): the grammar goes on from what the reply holds so far
                             sampling = {**sampling, "strata_grammar": {
                                 **sampling["strata_grammar"], "prefix": written + self.tok.decode(raw_ids)}}
+                        held = hold_end is not None and budget is not None
+                        if hold_end is not None and budget is not None:
+                            # the reasoning tokens left before the budget (at least one: a cut not yet clean), in a
+                            # copy: the hold is this pass's own
+                            pass_sampling = {k: v for k, v in (sampling or {}).items() if k != HOLD_KEY}
+                            pass_sampling[HOLD_KEY] = (max(1, int(budget) - thought), int(hold_end))
+                        elif sampling and HOLD_KEY in sampling:   # (never a client's: strip it from a copy)
+                            pass_sampling = {k: v for k, v in sampling.items() if k != HOLD_KEY}
+                        else:
+                            pass_sampling = sampling   # no hold: the engine gets the caller's own sampler object
                         # the loop guard's short repetition penalty after a loop: an engine call of its own, which
                         # ends where it ends (the request's own sampling after it); else the request's sampling
-                        smp_call, n_call = guard.sampling(sampling, n, max_new - n) if guard is not None \
-                            else (sampling, max_new - n)
+                        smp_call, n_call = guard.sampling(pass_sampling, n, max_new - n) if guard is not None \
+                            else (pass_sampling, max_new - n)
                         n_pass = n
                         gen = self.engine.generate(prompt, n_call, smp_call, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, n_call, smp_call, cancel)
@@ -5567,6 +5677,13 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+                        if (held and not (wrap or opens) and not cancel.is_set() and finish != "stop" and not repeated
+                                and not looped and n < max_new and segments and segments[-1].get("finish") == "hold"
+                                and len(segments) > segments_before):
+                            # the engine stopped at the hold but the cut is not clean yet (a character split across
+                            # tokens, a tag held back) or the reasoning count is short: on from the live session
+                            prompt = prompt + seg
+                            continue
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -7525,6 +7642,15 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
                 return
+            if getattr(svc, "draining", False) and path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                # upstream 3cf22f5ef (#6055): the server is stopping and the engine closes: refused before the body is
+                # read, as an instance that drains (a 0-token 200 could not be told from a real reply)
+                msg = "this instance is stopping; retry against the next instance"
+                self._json(503, responses_error_body(msg, "server_error", code="server_draining")
+                           if path == "/v1/responses" else
+                           {"error": {"type": "server_error", "code": "server_draining", "message": msg}},
+                           headers={"Retry-After": 1})
+                return
             try:
                 if path == "/v1/images/edits":                # a form (OpenAI's multipart) or JSON: read there
                     self._images_edit()
@@ -8600,6 +8726,13 @@ class Server(ThreadingHTTPServer):
             self.address_family = socket.AF_INET6
         super().__init__(server_address, RequestHandlerClass, bind_and_activate)
 
+    def server_bind(self):
+        # upstream 3e1fcaaf6: http.server's own server_bind also asks socket.getfqdn(host) for a server_name nothing
+        # here reads; where the reverse lookup stalls (GitHub's macOS runner: 35 s on the first lookup of every new
+        # process) each start waited that long before it listened
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
             super().handle_error(request, client_address)
@@ -9391,6 +9524,7 @@ def main() -> int:
     """The server.  Its console output goes through a bounded queue (serve/nonblocking_out.py, #4479 / #2481): a console
     that stops taking output must not hold a request's turn, a cancel or an admission.  STRATA_BLOCKING_CONSOLE=1 turns
     it off (testers)."""
+    quiet_crash_env()                                  # every child inherits it: no gdb (serve/childenv.py)
     if os.environ.get("STRATA_BLOCKING_CONSOLE") == "1":
         return _main()
     from serve.nonblocking_out import decoupled_console
@@ -9835,6 +9969,9 @@ def _main() -> int:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+        # upstream 3cf22f5ef (#6055): a request that arrives while the engine closes (one accepted before the listening
+        # loop ended, or whose headers come in later) is refused (503 server_draining), not cut off with 0 tokens
+        svc.begin_drain()
         # the listening socket closes right after shutdown(), so the port stops answering at once; server_close()
         # (which also joins the handler threads, untimed) comes after the engine has ended (shoftee 2feece509)
         httpd.shutdown()

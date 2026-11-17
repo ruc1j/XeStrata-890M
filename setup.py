@@ -75,7 +75,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn
 
-from serve import places, release_check
+from serve import childenv, places, release_check
 
 ROOT = Path(__file__).resolve().parent
 WIN = places.WIN
@@ -1227,10 +1227,92 @@ def _memory_status():
 def ram_gb():
     if WIN:
         return _memory_status().ullTotalPhys / 2**30
-    for line in open("/proc/meminfo"):
-        if line.startswith("MemTotal"):
-            return int(line.split()[1]) * 1024 / 2**30
-    return 0.0
+    total = 0.0
+    try:
+        with open("/proc/meminfo") as stream:
+            for line in stream:
+                if line.startswith("MemTotal"):
+                    total = int(line.split()[1]) * 1024 / 2**30
+                    break
+    except (OSError, ValueError):
+        pass
+    if total <= 0.0:
+        return 0.0
+    # upstream 81ac7c8ef: in a container /proc/meminfo is the host's; the container's own limit is the RAM the engine
+    # gets (and amd_uma's shared pool, which is at most this RAM less what the OS keeps).
+    limit = _cgroup_memory_limit()
+    if limit is not None and limit / 2**30 < total:
+        return limit / 2**30
+    return total
+
+
+def _cgroup_levels(root, group):
+    """The cgroup directories from the mount `root` down to `group` ("/a/b"), cut at the first one that is not there
+    (a container without its own cgroup namespace sees its host path, but only its own subtree under the mount)."""
+    levels = [root]
+    at = root
+    for part in [p for p in group.split("/") if p]:
+        if part in (".", ".."):
+            return []
+        at = os.path.join(at, part)
+        if not os.path.isdir(at):
+            break
+        levels.append(at)
+    return levels if os.path.isdir(root) else []
+
+
+def _cgroup_number(path, v1=False):
+    """A cgroup limit file: its number of bytes, or None for "max", an absent or unreadable file, or v1's
+    "unlimited"."""
+    try:
+        with open(path) as stream:
+            text = stream.read().strip()
+    except OSError:
+        return None
+    if not text.isdigit():
+        return None
+    value = int(text)
+    if v1 and value >= 1 << 62:
+        return None
+    return value
+
+
+def _cgroup_memory_limit(self_cgroup="/proc/self/cgroup", root="/sys/fs/cgroup"):
+    """The smallest memory limit (bytes) on this process's cgroup and its ancestors, as the engine's memory guard reads
+    it (scan_cgroups in src/core/conversation_memory.cpp): cgroup v2 memory.max and memory.high, or cgroup v1
+    memory.limit_in_bytes when there is no v2 memory controller.  None when no level sets a limit or the files cannot
+    be read."""
+    try:
+        with open(self_cgroup) as stream:
+            lines = stream.read().splitlines()
+    except OSError:
+        lines = ["0::/"]
+    v2_group = v1_group = None
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        if parts[0] == "0" and parts[1] == "":
+            v2_group = parts[2]
+        elif "memory" in parts[1].split(","):
+            v1_group = parts[2]
+    limits = []
+    v2_files = False
+    if v2_group is not None:
+        for level in _cgroup_levels(root, v2_group):
+            if not os.path.exists(os.path.join(level, "memory.current")):
+                continue
+            v2_files = True
+            for name in ("memory.max", "memory.high"):
+                value = _cgroup_number(os.path.join(level, name))
+                if value is not None:
+                    limits.append(value)
+    if not v2_files and v1_group is not None:
+        for level in _cgroup_levels(os.path.join(root, "memory"), v1_group):
+            value = _cgroup_number(os.path.join(level, "memory.limit_in_bytes"), v1=True)
+            if value is not None:
+                limits.append(value)
+    return min(limits) if limits else None
 
 
 def cpu_info():
@@ -2940,15 +3022,51 @@ class StallNote:
                 "where it stopped")
 
 
+DL_PROBE_WAITS = (1.0, 3.0)                     # seconds before the 2nd and the 3rd range probe (upstream 95e9b7341)
+
+
+def _probe_retryable(exc: BaseException) -> bool:
+    """Is a failed range probe worth one more try?  A hiccup is (a timeout, a reset or dropped connection, a busy
+    server: 429/5xx); no internet is not (no DNS answer, no route, refused): that fails at once, with no wait and no
+    message."""
+    import errno
+    import socket
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in (429, 500, 502, 503, 504)
+    if isinstance(exc, urllib.error.URLError):
+        if not isinstance(exc.reason, BaseException):
+            return False
+        exc = exc.reason
+    if isinstance(exc, (socket.gaierror, ConnectionRefusedError)):
+        return False
+    if isinstance(exc, OSError) and exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN):
+        return False
+    return isinstance(exc, (TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                            http.client.HTTPException))
+
+
+def _probe_ranges(src: "_Source", waits=DL_PROBE_WAITS, sleep=time.sleep) -> bool:
+    """The first range request of a parallel download, tried up to len(waits)+1 times when it fails by a hiccup: one
+    failed probe used to make a 60-90 GB download a single stream.  False: the server does not do ranges, or the probe
+    failed (the caller then reads one stream)."""
+    for attempt in range(len(waits) + 1):
+        try:
+            src.resolve()
+            return True
+        except _NoRange:
+            return False
+        except (OSError, http.client.HTTPException) as exc:
+            if attempt >= len(waits) or not _probe_retryable(exc):
+                return False
+            sleep(waits[attempt])
+    return False
+
+
 def parallel_download(url: str, part: Path, total: int, label: str, conns: int, name: str) -> bool:
     """Fill `part` (total bytes) over `conns` ranged connections.  True when every byte is there; False when the server
     does not do ranges (the caller reads the file in one stream)."""
     src = _Source(url, total)
-    try:
-        src.resolve()
-    except _NoRange:
-        return False
-    except (OSError, http.client.HTTPException):
+    if not _probe_ranges(src):
         return False                                    # the one-stream path has its own retries and messages
     part.parent.mkdir(parents=True, exist_ok=True)
     _claim_part(part, url, src.etag)                    # a .part from another address or version is dropped here
@@ -4667,7 +4785,7 @@ def ram_ctx(model, ram, low_ram=False) -> int:
 # hold them all.  The engine reads the experts from the model files instead of copying them into RAM
 # (--mmap-experts: a native pack's from the GGUF files in place, the AVX-512 Q2_0 pack's from its experts.bin), and
 # with --resident-experts copies the ones the GPU does not hold into RAM once.
-LOW_RAM_HEADROOM_GB = 10   # RAM beside the experts: the OS, the engine's other buffers, the server
+LOW_RAM_HEADROOM_GB = 10   # RAM beside the experts (GiB, as ram_gb() counts): the OS, the engine's buffers, the server
 # low_ram_gpu_gb's room below which the engine finds no VRAM for its expert cache.  On an RX 9060 XT limited to 8 GB
 # (IQ3_XXS, the KV cache in VRAM) 128K with 8-bit KV (1.65 by that estimate) started with 178 slots and 262K with
 # 4-bit KV (1.28) was 267 MiB short: the estimate leaves out the engine's reserve, the draft head and the matrix
@@ -4745,7 +4863,13 @@ def gpu_expert_vram(gpu) -> float:
 
 def low_ram_needed(model, ram) -> bool:
     """The model's experts do not fit this PC's RAM with room left for the rest."""
-    return ram < MODELS[model]["arena_gb"] + LOW_RAM_HEADROOM_GB
+    return ram_short_of_arena(ram, MODELS[model]["arena_gb"])
+
+
+def ram_short_of_arena(ram_gib, arena_gb, headroom_gib=LOW_RAM_HEADROOM_GB) -> bool:
+    """True when `ram_gib` (GiB, as ram_gb() returns it) is less than an expert arena of `arena_gb` (GB of 10^9 bytes,
+    as MODELS gives it) plus the headroom (GiB): both sides counted in GiB (upstream 9a779fb40)."""
+    return ram_gib < arena_gb * 1e9 / 2**30 + headroom_gib
 
 
 def kv_streaming_ram_gb(ctx, kv) -> float:
@@ -6762,6 +6886,7 @@ def describe() -> dict:
 
 
 def main() -> int:
+    childenv.quiet_crash_env()                         # upstream 38ad0bcbd: the programs setup starts start no debugger
     # Windows: the 7z's prebuilt engine only (PACKAGED); this folder compiles one on Linux only
     if sys.platform != "linux" and not (WIN and PACKAGED):
         fail("XeStrata runs on Linux, and on Windows from its 7z" if WIN else "XeStrata runs on Linux and Windows")

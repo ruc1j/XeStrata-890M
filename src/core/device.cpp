@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/kfd_quiet.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_device
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/platform/memory.hpp"
@@ -267,9 +268,29 @@ static void sycl_code_cache() {
 #endif
 }
 
+// Upstream f73fa7410 (kfd_quiet.hpp, XFER): the HIP runtime copies a pageable source of 1 MiB or more by pinning its pages in
+// place (a GPU userptr) and keeps them; on upstream's Radeon 780M such a userptr is memory the kernel can move under a running
+// dispatch, and the GPU reset in the load with nothing of the engine's registered.  On an integrated AMD GPU under Linux the
+// runtime stages those copies through its own pinned buffers instead (GPU_PINNED_MIN_XFER_SIZE, in MiB).  The runtime reads it
+// when it starts, as the SYCL runtime lists the devices, so the class is read from the KFD topology here, before that: every
+// GPU node without memory of its own.  A value the caller set wins; STRATA_KFD_QUIET(_XFER)=0 sets nothing.  Linux only.
+static void hip_staged_copies() {
+#if defined(__linux__)
+    const bool cls = kfd_quiet::nodes_in_class(kfd_quiet::read_topology("/sys/class/kfd/kfd/topology/nodes"));
+    if (const char* v = kfd_quiet::xfer_value(cls, std::getenv("STRATA_KFD_QUIET"), std::getenv("STRATA_KFD_QUIET_XFER"),
+                                              std::getenv("GPU_PINNED_MIN_XFER_SIZE"))) {
+        setenv("GPU_PINNED_MIN_XFER_SIZE", v, 0);
+        if (std::getenv("STRATA_TRACE") != nullptr)
+            std::fprintf(stderr, "strata trace: kfd quiet: GPU_PINNED_MIN_XFER_SIZE=%s (pageable copies staged by the HIP "
+                                 "runtime)\n", v);
+    }
+#endif
+}
+
 const std::vector<sycl::device>& engine_devices() {
     static const std::vector<sycl::device> devices = [] {
         sycl_code_cache();
+        hip_staged_copies();
         const CompilerWorkaround w = intel_compiler_workaround();
         std::vector<sycl::device> found = find_devices();
         if (w.set && std::any_of(found.begin(), found.end(), [](const sycl::device& d) {
@@ -721,6 +742,29 @@ bool integrated_gpu(const sycl::device& d) {
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return d.get_info<sycl::info::device::host_unified_memory>();
 #pragma clang diagnostic pop
+}
+
+bool kfd_igpu_class() {
+#if defined(__linux__)
+    static const bool on = [] {
+        const std::vector<sycl::device>& all = engine_devices();
+        return !all.empty() && std::all_of(all.begin(), all.end(), [](const sycl::device& d) {
+                   return d.get_backend() == sycl::backend::ext_oneapi_hip && integrated_gpu(d);
+               });
+    }();
+    return on;
+#else
+    return false;
+#endif
+}
+
+bool hip_backend() {
+    static const bool on = [] {
+        const std::vector<sycl::device>& all = engine_devices();
+        return std::any_of(all.begin(), all.end(),
+                           [](const sycl::device& d) { return d.get_backend() == sycl::backend::ext_oneapi_hip; });
+    }();
+    return on;
 }
 
 // upstream 004b15cd (#409): an integrated GPU's memory is the system RAM, and what its runtime reports free need not

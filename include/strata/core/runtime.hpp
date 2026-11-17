@@ -17,6 +17,12 @@ namespace strata::core {
 
 /// Whether a GPU is the processor's own graphics (src/core/device.cpp).
 bool integrated_gpu(const sycl::device& d);
+/// Upstream's "integrated gfx11 under Linux" class, as XeStrata asks the device (src/core/device.cpp): every engine GPU an
+/// integrated one (its memory is the system RAM) on the HIP backend, under Linux.  The KFD measures of kfd_quiet.hpp,
+/// kfd_settle.hpp and the arena's huge-page rule (pinned.hpp) key on it.
+bool kfd_igpu_class();
+/// Whether an engine GPU runs on the HIP backend (AMD; the KFD counters of gpu_pause_time.hpp are read only then).
+bool hip_backend();
 /// The version of the Intel Graphics Compiler whose GEP simplification the runtime turned off for the engine's
 /// Level Zero GPU ("2.28.4"; "unknown" when the library carries none), empty when it did not (src/core/device.cpp).
 std::string compiler_workaround();

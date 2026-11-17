@@ -7,8 +7,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/strata_geometry.cmake)   # -DSTRATA_GE
 if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
   message(FATAL_ERROR "XeStrata builds for Linux and Windows")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.2.12")
-set(STRATA_UPSTREAM_COMMIT "ffa80d7")
+set(STRATA_UPSTREAM_VERSION "0.2.15")
+set(STRATA_UPSTREAM_COMMIT "c775728")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
 # XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does, and the
 # version is <upstream>-<revision> everywhere: the version name (the tag, what the engine says) xe<upstream>-<revision>
@@ -1274,6 +1274,15 @@ if(STRATA_BUILD_TESTS)
   add_executable(window_evict_test src/core/window_evict_test.cpp)
   target_include_directories(window_evict_test PRIVATE include)
   add_test(NAME window_evict_test COMMAND window_evict_test)
+  # an integrated GPU on the HIP backend under Linux (upstream 8f6393a37, f9932c6ae, f73fa7410, 0ee263992, 0a17fb99e, 03e687ace;
+  # header-only, no GPU): the wait before READY (a faked clock), the KFD measures' rules and topology reader, the driver's
+  # paused-GPU counter and its lines (fake KFD trees)
+  foreach(kfd_test kfd_settle_test kfd_quiet_test gpu_pause_time_test)
+    add_executable(${kfd_test} tests/core/${kfd_test}.cpp)
+    target_include_directories(${kfd_test} PRIVATE include)
+    target_compile_features(${kfd_test} PRIVATE cxx_std_17)
+    add_test(NAME ${kfd_test} COMMAND ${kfd_test})
+  endforeach()
   # STRATA_KVA's rule (which reads and layers it applies to) and the draft layer's cell floor (upstream 0.2.7; header-only, CPU)
   add_executable(kva_test src/prefill/kva_test.cpp)
   target_include_directories(kva_test PRIVATE include)
@@ -1290,6 +1299,20 @@ if(STRATA_BUILD_TESTS)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
+  # STRATA_PARK_SEGPOOL_MIB (upstream e04c4c931, b0c818ad7, 01e21ef20): the arena behind the conversation buffers'
+  # segments (header-only; a fake OS counts the calls), the buffers on it, and the park pools' sizes
+  foreach(pool_test conversation_segment_pool_test conversation_buffer_pool_test park_pool_policy_test)
+    add_executable(${pool_test} src/core/${pool_test}.cpp)
+    target_include_directories(${pool_test} PRIVATE include)
+    target_compile_features(${pool_test} PRIVATE cxx_std_17)
+    target_link_libraries(${pool_test} PRIVATE Threads::Threads)
+    add_test(NAME ${pool_test} COMMAND ${pool_test})
+  endforeach()
+  # #5697 (upstream 8c71c4927): an evicted parked conversation gives its RAM back to the system (glibc's heap; RSS before
+  # and after)
+  add_executable(conversation_heap_test src/core/conversation_heap_test.cpp)
+  target_include_directories(conversation_heap_test PRIVATE include)
+  add_test(NAME conversation_heap_test COMMAND conversation_heap_test)
   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)

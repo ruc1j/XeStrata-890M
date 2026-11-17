@@ -105,6 +105,12 @@ It is off by default. On a GPU whose expert cache is small `STRATA_ROUTE_PRIOR=1
 faster, but in long agent sessions it repeats itself and its results are weaker (upstream #4402); on a GPU that holds
 more of the experts it is no faster or slower. Both change the answers.
 
+Before it reads the first request, `--serve` runs every speculative-decoding window width (1 to `--spec`) once on nothing, so that each one's graph is made then (upstream 84e11a773).
+A request that is the first to use a width does not pay for making its graph.
+On the 890M the six widths took 0.6-1.0 s and 835-1,080 MiB of device memory (graphs the requests would make sooner or later).
+The first of the six chats decoded at 40.2-41.4 tok/s instead of 37.1-39.7, with the same answers (three interleaved rounds, 2026-11-18).
+Layer splits and `--batch` do not run it. `STRATA_WINDOW_WARM=0` turns it off.
+
 ### Small cards and GPUs without XMX
 
 With the B70 made to look like a small card (`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`: 8 GB of VRAM, no XMX),
@@ -137,6 +143,19 @@ The 890M's prompt chunk is 2,048 tokens with `--prefill auto` and `--no-prefill-
 The expert cache's pages (GTT, or host memory) are the driver's and never charged to the cgroup, so the engine sizes the cache from the RAM Linux has available (`MemAvailable`), not from the figure clamped by the cgroup's cap (shoftee/Strata 48defc12e: a unit with a low MemoryMax read as "no room for a cache"). The log says so when the cgroup's figure is lower. Host allocations keep the cgroup's figure.
 With `--conversation-cache-mib N` on an integrated GPU's `--serve`, the parked conversations spend the same RAM, so the auto expert cache's reserve grows by that N (shoftee/Strata ff5809230). A conversation cache sized later from the free RAM (the default) changes nothing.
 When every expert is in the GPU cache once it is filled, the decode reads nothing from the file tier, so the io prefetch (and the decode gate) the Linux defaults turned on go off, and the routing-aware prefetch (a router product a layer on the CPU, predicting the next layer's experts) does not start (01xjw/Strata 735a40ec3: a layer split on two W7900Ds decoded 57 -> 80 tok/s, the output the same). On an APU the CPU's work shares the package's power with the GPU. `STRATA_IO_PREFETCH=1` keeps io prefetch, `STRATA_LOOKAHEAD=1` the routing-aware prefetch. One GPU only.
+
+On Linux, when every GPU of the engine is an integrated GPU on the HIP backend, the engine keeps the GPU driver's (KFD's) queue evictions out of the requests' way (upstream 8f6393a37, f9932c6ae, 6069c9d0c, 0ee263992, 0a17fb99e, 03e687ace, f73fa7410; upstream's Radeon 780M was reset by its driver right after the load).
+Whether a GPU is integrated is read from the KFD topology (no memory on the GPU's node) and the device's report, never from its name.
+
+- After the expert cache is allocated (before it is filled) and before READY, it waits until the total time the KFD kept the queues stopped has not grown for 2 s (at most 10 s each). `STRATA_NO_KFD_SETTLE=1`: no wait.
+- After the load, the file cache of the pack's `dense.bin` and `embd.bin` goes back to the system. `STRATA_NO_ARENA_CACHE_DROP=1` keeps it.
+- It does not ask for THP (`MADV_HUGEPAGE`) on the expert arena. `STRATA_NO_ARENA_THP=0` asks.
+- It makes the CPU share's buffers at the start, and before READY it copies once each way between the device and pageable memory, so that the HIP runtime's staging buffer is made then (`STRATA_KFD_QUIET_LOAD=0` turns this off).
+- Copies of 1 MiB or more between the device and pageable memory go through the runtime's staging buffer (`GPU_PINNED_MIN_XFER_SIZE`; `STRATA_KFD_QUIET_XFER=0` turns this off). `STRATA_KFD_QUIET=0` turns off this item and the one before.
+
+There is no record of a reset on the 890M, but in a cold start the KFD kept the queues stopped for 11 s in all.
+The two waits took 4-6.6 s, and the time from the start to the first answer was 2-5 s longer than a start with these and the window warm-up (in the decode section above) off (21 s in the first run, with a cold file cache).
+Decode and the greedy answers did not change (six chats, three interleaved rounds, 2026-11-18).
 
 On a Radeon 890M (Ryzen AI 9 HX 370, LPDDR5X-7500, 120 GB/s in theory) the GPU reads a 1 GiB buffer sequentially (16-byte loads) at
 102 GB/s from hipMalloc, 95 GB/s from hipHostMalloc, 101 GB/s from NonCoherent hipHostMalloc, 100 GB/s from hipHostRegister on 2 MB pages
@@ -1026,7 +1045,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
 
 - **A hard thinking budget (opt-in).** `"reasoning_budget_tokens": N` (or llama.cpp's `"thinking_budget_tokens": N`, which clients written for llama-server send) in a request (OpenAI or Anthropic) caps the thinking at N tokens.
   When it gets there the server ends it with a short wrap-up line and `</think>`, and the model answers from there.
-  The engine continues from what it already holds, so nothing is read again.
+  The engine stops the thinking at exactly the token that reaches the budget (upstream be101072b; the same in a `--batch` slot, b92075d92), and the wrap-up pass continues from the state the engine holds, so the thinking is not read again.
   The wrap-up is part of the thinking the client sees and counts as output tokens.
   `"reasoning_budget_tokens": N` in `xestrata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget.
   Off by default; Anthropic's `"thinking": {"budget_tokens": N}` chooses the level, as above, and is also the budget (a `reasoning_budget_tokens` in the same request wins).
@@ -1225,6 +1244,9 @@ In practice it is the end of the system prompt, which every chat of the same cli
 The rest rotate by least recent use, so a **new** chat that shares that prefix starts reading after it instead of from token 0.
 A prompt read from the start is also checkpointed at the end of its system prompt when that is 2,048 tokens or more (upstream PR #62 and #65),
 so the root exists for agent clients with long system prompts and tool lists.
+When the server ends a reply (a stop string, a client that left, a repeat stop), the engine drops the decode window that finishes after the STOP (upstream 33648fef1).
+The conversation's state then ends at the tokens the client was sent, and its next request continues from there instead of from a checkpoint.
+`STRATA_SERVE_STOP_SKIP=0` commits that window as before.
 Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`, `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
 `--prompt-cache-every` does not set the size of the pieces a prompt is read in: the checkpoint every N tokens is taken at a chunk boundary of the prefill, and the read goes on.
 What splits a read is the end of the system prompt (`--prompt-cache-root`), the start of the last message, the `STRATA_CACHE_MESSAGE_BOUNDARY` boundary and the `"strata_prefix"` boundary (the chunk size is `--prefill`).
@@ -1271,7 +1293,7 @@ A chat and an agent's subagent can then alternate without re-reading each other.
 - Without `--conversation-cache-mib` the budget is sized from the RAM free once the model is loaded (upstream #3493): 40% of what is left above `--conversation-cache-min-free-mib`, at most 8192, in steps of 256, and off when that is under 1024; the start log says which in one line. `--conversation-cache-mib 0` turns it off, and so does `--prompt-cache 0`; with Qwen3.8-Flash-Next, so does running without `--mtp`.
   Parked conversations are not kept across restarts, unless [the next section](#keeping-parked-conversations-across-restarts-opt-in) is set up.
 - Before each copy the engine checks that `--conversation-cache-min-free-mib N` (default 2560) of RAM stays free (the figure is read as below).
-  If it does not, it evicts the oldest parked conversations and checks again (upstream 940011da).
+  If it does not, it evicts the oldest parked conversations and checks again (upstream 940011da). An evicted conversation's memory goes back to the system, not into the C library's heap (upstream 8c71c4927).
   If that is still not enough, or the copy does not fit the budget, it skips parking and reads the prompt as before.
   To fit the budget, too, the oldest parked conversation is dropped first.
 - A new conversation that starts with a checkpoint inside a parked one (subagents that share a system prompt and tool list, a compacted history) borrows the K/V up to there and the checkpoint, and the parked conversation stays where it is (the engine log says `borrowed`; upstream c9e571e0 and 2b296987, #1164).
@@ -1281,6 +1303,12 @@ A chat and an agent's subagent can then alternate without re-reading each other.
   A parked conversation takes one of the slots whatever its length, so a client that puts short side requests between the turns of a long conversation filled the slots with them and evicted the long one.
 - `--conversation-cache-park-gain N` (opt-in, default 0 = park every turn) parks a conversation again only after it advanced N tokens past the copy it would supersede (upstream d9cb22d2, #2265).
   A turn that grew by a few hundred tokens keeps the older copy instead of writing a whole snapshot that the next turn drops; a resume from the older copy then reads up to N tokens again.
+- On Linux the parked conversations' K/V buffers are taken from one arena (the segment pool; upstream e04c4c931, 01e21ef20 and others).
+  Its pages are touched in the background while no request runs, so parking a conversation does not wait for fresh pages to be touched the first time.
+  Its size is a quarter of the conversation cache (at most 2 GiB, in steps of 64 MiB, none under 128 MiB), counted in the conversation cache's budget.
+  When the RAM check falls short, its idle part goes back to the system before a parked conversation is evicted and after each eviction.
+  On the 890M (62 GiB of RAM, the 24 GiB expert cache locked in RAM) the conversation cache was 3,584 MiB and the arena 896 MiB.
+  `STRATA_PARK_SEGPOOL_MIB=N` sets its size in MiB; `0` turns it off.
 - A copy that fails to go back stops the engine instead of letting it answer from half a state.
 - After a restore, the K/V pages a conversation has not changed are reused for its next copy (`STRATA_SNAPSHOT_FULL_CAPTURE=1` turns that off).
   The new pages get room for the next turns of at most an eighth of each buffer (and at most 16 MiB), which the budget counts like the rest of the copy (upstream 53f72571).
@@ -1788,6 +1816,13 @@ It is with AVX2's 8 floats, not with AVX-512's 16, where ggml falls back to a ke
 `--flash-attn on|off|auto` overrides that.
 Upstream measured a 1024x1024 picture on a Ryzen 7 7700X with 8 threads: AVX2 8-10 s with it and 14-15 s without, AVX-512 44 s with it and 13 s without.
 
+**The CPU encoder's own reader** (upstream 75ee0ea87 and 14 more commits): the CPU build of `strata-vision` reads the picture with XeStrata's own CPU reader (`tools/vision/own`) instead of llama.cpp's mtmd when it supports the mmproj's tower; its start line is `READY <width> own`.
+It picks AVX-512, AVX2, AVX or SSE4.1 from what the CPU reports.
+With Qwen3.8-Flash-Next's mmproj its embeddings' cosine to mtmd's was 0.9996 on average (Ryzen AI 9 HX 370, one photo); upstream measured 0.80-0.95 times mtmd's CPU time.
+A tower with deepstack outputs (Mage-Flow's mmproj, for one) is not supported and is read by mtmd; when the own reader fails to load, the same process goes back to mtmd (`READY <width> mtmd fallback`).
+The Vulkan GPU build and `--gpu` always use mtmd.
+`strata-vision`'s `--tower mtmd|own|auto` (default auto) or the environment variable `STRATA_VISION_TOWER` chooses.
+
 ### Sending a picture
 
 **Terminal chat:** type `/image <path to a picture>`, press Enter, then type your question.
@@ -1977,10 +2012,11 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | `alloc_device: ... refused` at start | A driver state that refuses device allocations while the VRAM is free (Intel's [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916); compute-runtime 26.22 works around an xe kernel bug fixed in Linux 7.1 - on XeStrata's side, [#34](https://github.com/MistVVK/XeStrata/issues/34). On the B70 it happened 3 times in about 120 starts). The engine retries the allocation in pieces and starts with what it gets. While the card is in that state, only a reboot brings it back. On Ubuntu 24.04/26.04, update the driver from the [graphics PPA](BUILD.md#packages) ([XE.md](XE.md#the-output-heads-vram-refusal)). |
 | The start log says `IGC's GEP simplification is off` | Intel Graphics Compiler (IGC) 2.27 to 2.30 (Ubuntu 26.04's 2.28.4 among them) miscompile some reads for Xe2 and later GPUs (the Arc B-series, Lunar Lake, Panther Lake): the GPU reads past its buffer and stops, or the answers are wrong. On Linux, when the installed IGC is one of those and there is an Xe2 or later GPU, the engine sets `IGC_EnableGEPSimplification=0` when it starts, which turns that optimization off (on the B70 the decode of a 1K prompt is 5 to 10% slower, 32K the same). A value you set yourself, `IGC_EnableGEPSimplification=1`, is kept. For full speed, use Fedora 44 (its IGC is 2.32 or later), or [install with Podman](BUILD.md#podman) (Fedora 44 inside). On Ubuntu 24.04/26.04 there is also the way of moving to the HWE kernel with the [graphics PPA](BUILD.md#packages) (IGC alone cannot be updated: the PPA installs the driver with it, and that driver is for the HWE kernel). |
 | Python or the build tools could not be installed | Install what it names, then run it again. Everything already done is kept and skipped. |
+| You want the stack of an engine or picture reader that ggml aborted | The server and setup give their child processes `GGML_NO_BACKTRACE=1`, so that ggml does not start gdb at an abort and hang there or mix gdb's output into the READY line (upstream 38ad0bcbd). Start the server with `STRATA_BACKTRACE=1` when the stack is needed. |
 | `port 8095 is already in use` | XeStrata is already running (look for its window), or another program uses the port: `./setup.sh --port 8081`. |
 | The first start takes minutes | It is reading 23–50 GB into RAM; the second start is faster while the files are in the OS cache. |
 | The PC freezes for a few minutes at the start | Normal, most of all the first time (the server window says when it happens): the engine loads the experts into RAM, registers part of it for the GPU and sizes the expert cache. Wait; don't close the window. Still frozen after 10 minutes: restart the PC, close other programs, try again, or pick a smaller size. |
-| The start takes many minutes while the kernel is busy compacting memory (`kcompactd`) | With transparent huge pages on `madvise`, the engine asks for `MADV_HUGEPAGE` on its arena, and on fragmented RAM every fault can then compact memory (upstream #771). `STRATA_NO_ARENA_THP=1` stops the request (with THP on `always` the engine does not make it at all). |
+| The start takes many minutes while the kernel is busy compacting memory (`kcompactd`) | With transparent huge pages on `madvise`, the engine asks for `MADV_HUGEPAGE` on its arena, and on fragmented RAM every fault can then compact memory (upstream #771). `STRATA_NO_ARENA_THP=1` stops the request (with THP on `always`, and on an integrated GPU on the HIP backend under Linux, the engine does not make it at all; on the latter `STRATA_NO_ARENA_THP=0` makes it). |
 | The start error says `the engine process ended: ...` | The system ended the engine process, and the error says how: `killed by signal 4 (SIGILL, Illegal instruction)` on Linux, `exit code 0xC000001D: illegal instruction` on Windows, and so on. An illegal instruction means the engine ran an instruction the CPU cannot execute; on Linux the error lists which of AVX, AVX2, FMA and F16C the CPU lacks, or says the CPU has them all, which is a bug in the engine. Open an issue with the CPU model. |
 | `the engine stopped unexpectedly (exit code ...)` | The engine process ended mid-answer, usually out of RAM (Linux ends the biggest program: `journalctl -k \| grep -i -E 'killed process\|out of memory'`). The next request starts it again by itself. If it repeats, close other programs or pick a smaller size. The server also warns at start when the model's experts leave less than ~6 GB of RAM for everything else. |
 | On Linux the engine ended with signal 9, but RAM was enough | A real-time CPU limit (RLIMIT_RTTIME) on the desktop session lets the kernel end a program with signal 9 and no message. The audio system (PipeWire) sets it to 0 when rtkit is not installed, and every program started from the desktop inherits it. The server says so when it sees the limit, at start and when the engine ends with signal 9. Check with `ulimit -R`; install rtkit, or start outside the session's limits (`systemd-run --user --collect -p LimitRTTIME=infinity -- xestrata`). |

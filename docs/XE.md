@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.2.12-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+XeStrata xe0.2.15-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -75,6 +75,34 @@ Measured (the 890M, the abliterated IQ2_XS, the bench's 6 chats, greedy, `--spec
 Three interleaved rounds (24,576 slots, cooled between runs): the MTP 31.6 / 31.7 / 32.0 tok/s, DFlash2 (confidence 0.6) 29.6 / 29.6 / 29.8 tok/s, 6.7% slower by the medians. The drafter took 7.7 ms a round, 942 rounds for 2,191 tokens (2.3 tokens a round; the MTP 874 rounds, 2.5). The six chats' greedy answers were the MTP's in all three rounds. By chat, DFlash2 was 2 to 5% faster on the three code and English chats (quicksort 37.2 against 36.5, the transformer 33.2 against 32.4, bash 42.6 against 40.5), 13 to 16% slower on the two Japanese prose chats (the seasons 21.5 against 25.6, photosynthesis 25.0 against 28.8) and 3% slower on TCP/UDP (32.9 against 34.0).
 
 The tokens accepted a round are about the MTP's (about 2.5), but the drafter itself takes 7.8 ms a round (mostly the time the 890M's bandwidth needs to read the 5 layers' 0.5 GB of Q4_0 weights), longer than the MTP's about 4 ms, so decode is 6 to 7% slower. Where upstream measured DFlash2 4 to 12% faster than the MTP on AMD HIP, the cards (Strix Halo, the R9700) have 2.5 to 6 times the bandwidth. Issue #23's estimate (2026-10-24: the drafter's weight reads exceed the MTP's 4 ms, +2 to 3% at best) held. The drafter changes only the drafts; the verify decides the answers.
+
+## Integration through Strata 0.1.61
+
+Strata 0.2.13.1 to 0.2.15 (engine version 0.1.61, 2026-11-16) is 736 commits without the merges, 0.2.14 and 0.2.14.1 among them. Each was looked at, and what touches the engine, serve, setup and the picture reader went into XeStrata-890M. The list is `.upstream-0161.md` (the repository root, outside git).
+Most of them (570) are CUDA and gfx12 prompt kernels, Windows on Strix Halo, the removal of DeepSeek V4.1, and the app, Terminal and Control layers, none of which this fork has.
+The change that reads an integrated Radeon's long prompts with upstream's int8 kernels (69394994a) is not taken: this fork already reads them with its own SYCL kernels.
+
+What was ported:
+
+- Engine and serve: at the thinking budget the engine stops the thinking at exactly that token (GEN `hold=N:ID`, READY `hold` and `holdb`, DONE `hold`; upstream be101072b, 5aa7f1d88, b92075d92, 02020478b), and the wrap-up pass continues from the state the engine holds. On the 890M a request with a budget of 24 tokens stopped its thinking at 24, and the wrap-up pass read 19 of its 104 tokens and reused 85 (62 + 24 - 1).
+- Engine: a decode window that finishes after the server's STOP is dropped, not committed (upstream 33648fef1; `STRATA_SERVE_STOP_SKIP=0` turns it off). Rows this fork's deferred GDN write-back (`STRATA_GDN_ACC`) still holds are written back before the window is dropped (this fork's own addition, `Verifier::drop_window`).
+- Engine: an evicted conversation's memory goes back to the system, not into the C library's heap (upstream 8c71c4927).
+- Engine: before READY, every speculative-decoding window width runs once so that its graph is made then (upstream 84e11a773; `STRATA_WINDOW_WARM=0` turns it off). This fork's draft policy may pick any width from 1 to S, so every width runs; a width that fails does not stop the rest.
+- Engine: an arena for the parked conversations' K/V buffers (the segment pool; upstream e04c4c931, b0c818ad7, 6aba6d5fb, 8f4a2e0af, 07cf3f4af, 01e21ef20, ef371eba8; `STRATA_PARK_SEGPOOL_MIB`). Upstream's other pool, the checkpoint pool, is not in this fork and was not taken. When the RAM check evicts parked conversations, the arena's idle part goes back to the system after each eviction (upstream gives it back once, before the first: an evicted conversation's segments stayed in the arena, the RAM never grew, and every parked conversation could go).
+- Engine: on an integrated GPU on the HIP backend under Linux, the KFD's queue evictions are kept out of the requests' way (upstream 0a17fb99e, 8f6393a37, 0ee263992, 6d8e42886, f9932c6ae, 6069c9d0c, f73fa7410, 03e687ace, f55afa152). Upstream chose them by the names of gfx11 integrated GPUs; this fork chooses by the KFD topology and the device's report ([DETAILS](DETAILS.md#amd-apus)). 59375eb06 was already in this fork.
+- serve: STOP on a closed pipe raises nothing (bbf97633c). True and false written as strings in a boolean argument are read as booleans (1aabfb1ce). The listening bind does not call getfqdn (3e1fcaaf6). Child processes get `GGML_NO_BACKTRACE=1` (38ad0bcbd; `STRATA_BACKTRACE=1` leaves it out). The picture reader's READY is waited for with one deadline, other lines going to the log (4cce1ee4d). A request that comes while the server stops gets 503 (`server_draining`) (3cf22f5ef).
+- setup: the low-RAM check compared GiB with GB; the units now agree (9a779fb40). The parallel download's first range probe is retried (95e9b7341). A container's memory limit below the RAM counts as the RAM (81ac7c8ef). The download test was made steady (f328c2cd2).
+- Picture reader: the CPU build of `strata-vision` has its own reader (`tools/vision/own`; upstream 75ee0ea87 and 14 more commits; [DETAILS](DETAILS.md#images)). The 890M's default, the Vulkan build, keeps mtmd.
+
+On the 890M, six chats (greedy, 200 tokens, 24,576 slots) ran in three interleaved rounds on this integration's build with its defaults and with the KFD measures, the window warm-up and the segment pool off.
+The answers were the same in all three, and decode was 32.3 / 33.7 / 33.0 against 32.8 / 33.3 / 32.7 tok/s. The first request decoded at 40.2-41.4 tok/s instead of 37.1-39.7 with the window warm-up, and the time from the start to the first answer grew by 2-5 s, the KFD waits.
+
+Not taken:
+
+- The FP16 GEMM default for the 780M (gfx1103) alone (8d7f997d4) and the int8 prompt kernels for integrated Radeons (69394994a, 9187ef658).
+- The checkpoint pool (`STRATA_CKPT_POOL`): the upstream changes it needs, ca378670b and others, are not in this fork.
+- The split engine's hold check (part of 5aa7f1d88). This fork's split (`serve/split.py`) runs two `strata --serve` engines, and the decode engine takes the hold.
+- The changes to the picture reader's GPU towers (`vit_gpu.cu`, `vit_metal.mm`) and the floor for builds for older CPUs (`STRATA_ISA_FLOOR`): this fork's CPU build is the portable one alone, with AVX2 as its floor.
 
 ## Integration through Strata 0.1.59 (the Qwen 4 shapes)
 

@@ -10,6 +10,9 @@
 # On the GPU through Vulkan (ggml-vulkan; free software: Mesa's drivers, libvulkan-dev, glslc):
 #   cmake -S tools/vision -B build-vision-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release \
 #         -DLLAMA_DIR=third_party/main/llama.cpp -DSTRATA_VISION_VULKAN=ON
+#
+# Two picture readers in the program (--tower own|mtmd|auto, upstream's own-stack phase 3): Strata's own Qwen tower on the CPU (own/, no ggml) and llama.cpp's
+# mtmd.  `auto` (the default) takes ours in the CPU build and keeps mtmd in the Vulkan build (the GPU reader); see strata_vision.cpp.
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
 if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
@@ -45,10 +48,17 @@ set(GGML_VULKAN ${STRATA_VISION_VULKAN} CACHE BOOL "" FORCE)
 
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
 
+# our own Qwen vision tower on the CPU (own-stack phase 3): tools/vision/own, no ggml or llama.cpp inside
+add_subdirectory(own)
+
 add_executable(strata-vision strata_vision.cpp)
-target_link_libraries(strata-vision PRIVATE mtmd llama)
+target_link_libraries(strata-vision PRIVATE mtmd llama strata_vit_own)
 target_compile_features(strata-vision PRIVATE cxx_std_17)
 set_target_properties(strata-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+if(STRATA_VISION_VULKAN)
+  # the build's GPU backend, which `--tower auto` reads: this program is the GPU reader and keeps mtmd (own_auto_allowed)
+  target_compile_definitions(strata-vision PRIVATE STRATA_VISION_GPU_BUILD)
+endif()
 if(WIN32)
   # #24: the Windows package's CPU reader, cross-built as the engine is (cmake/toolchain-windows-msvc.cmake): the C
   # runtime's deprecation of getenv and fopen off, and the UTF-8 manifest the engine takes (upstream #3202)
@@ -56,6 +66,13 @@ if(WIN32)
   target_link_options(strata-vision PRIVATE
                       "LINKER:/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/strata-utf8.manifest")
 endif()
+
+# mtmd's side of the picture-preparation check (see own/oracle_prep.cpp): the same preprocessor class mtmd_tokenize uses
+add_executable(strata-vision-prep-oracle EXCLUDE_FROM_ALL own/oracle_prep.cpp)
+target_link_libraries(strata-vision-prep-oracle PRIVATE mtmd llama)
+target_include_directories(strata-vision-prep-oracle PRIVATE ${LLAMA_DIR}/tools/mtmd ${LLAMA_DIR}/ggml/include ${LLAMA_DIR}/include)
+target_compile_features(strata-vision-prep-oracle PRIVATE cxx_std_17)
+set_target_properties(strata-vision-prep-oracle PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # opens a GGUF that has tensor types llama.cpp does not know (a Gyro quantization's TQK6 / TQK7) for its vocabulary only
 add_executable(strata-vision-gguf-test EXCLUDE_FROM_ALL gguf_meta_test.cpp)

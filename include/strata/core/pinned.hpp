@@ -37,6 +37,17 @@ void arena_copy_devices(const std::vector<int>& devices);
 /// names the source.
 uint64_t pin_room(int device, std::string& why);
 
+/// Upstream 0a17fb99e: whether the expert arena skips its MADV_HUGEPAGE request.  `no_arena_thp` is STRATA_NO_ARENA_THP (nullptr
+/// when unset): "0" asks for the huge pages, any other value (empty too) skips the request; unset leaves it to `igpu_rule`, true on
+/// an integrated GPU on the HIP backend under Linux (core::kfd_igpu_class): huge-page compaction and collapse inside a registered
+/// range make KFD evict the process's queues, which upstream's Radeon 780M answered with a GPU reset in the first prompt (huge pages
+/// asked 8 of 9 starts failed, not asked 3 of 3 ran; not measured on the 890M).  `thp_always`: the kernel's THP mode is "always"
+/// (the request adds nothing, upstream #771).
+inline bool arena_skip_thp_request(const char* no_arena_thp, bool thp_always, bool igpu_rule) {
+    if (no_arena_thp != nullptr) return no_arena_thp[0] != '0' || thp_always;   // the user's own value: 0 = ask for them, else skip
+    return thp_always || igpu_rule;
+}
+
 enum class PageBacking { LargePages, NormalPages };
 
 struct PinnedArena {

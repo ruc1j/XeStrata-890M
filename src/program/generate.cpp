@@ -31,8 +31,12 @@
 #include "strata/core/grammar.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/park_pool_policy.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/core/kfd_settle.hpp"
+#include "strata/core/kfd_quiet.hpp"
+#include "strata/core/gpu_pause_time.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/ple_residency.hpp"
 #include "strata/core/on_device.hpp"
@@ -1208,6 +1212,20 @@ void disk_wait_threads(std::FILE* f) {
 // drawn: the expert cache fills the card by design, leaving 400-450 MiB free on the RTX 4070 and the B70, below
 // upstream's 512 MiB warning.
 std::atomic<int64_t> g_req_vram_free_mib{-1};
+/// Upstream 03e687ace / f55afa152, AMD on Linux: the driver's paused-GPU counter (ms, strata/core/gpu_pause_time.hpp) when the
+/// current request began; -1 before the first request, when not available, and on every GPU but the HIP backend's (asked at run
+/// time, core::hip_backend).  Read once per request, never per step.
+std::atomic<int64_t> g_req_gpu_pause_ms{-1};
+int64_t gpu_pause_now() {
+#if defined(__linux__)
+    return strata::core::hip_backend() ? strata::core::gpu_pause_ms_self() : -1;
+#else
+    return -1;
+#endif
+}
+/// The same counter when the engine last went idle (READY, then the end of every request): the next request's begin reports a
+/// pause that happened in between.  Only the request loop's thread touches it.
+strata::core::GpuPauseIdle g_gpu_pause_idle;
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
     strata::core::Progress& p = strata::core::progress();
@@ -1219,6 +1237,7 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
         std::fprintf(f, "  VRAM free when this request began: %lld MiB (a card the driver must move memory off of is "
                         "a cause of a window that never finishes: a larger --vram-reserve-mib leaves room)\n",
                      (long long) vf);
+    int64_t pause_before = -1;   // the GPU pause counter at the first pass, for the change over the 2 s
     for (int pass = 0; pass < 2; ++pass) {
         if (pass == 1) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -1235,6 +1254,12 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
                      m.commit_mib,
                      "in swap", m.avail_mib, m.faults, "major page faults so far"
         );
+        // AMD on Linux: how long the driver kept the GPU work paused (no line where the counter cannot be read)
+        const int64_t pause_now = gpu_pause_now();
+        const std::string pause_line = strata::core::gpu_pause_stall_line(pause_now, g_req_gpu_pause_ms.load(),
+                                                                           pass == 1 ? pause_before : -1);
+        if (!pause_line.empty()) std::fprintf(f, "%s\n", pause_line.c_str());
+        pause_before = pause_now;
         std::fflush(f);
     }
 }
@@ -1466,6 +1491,22 @@ using ConvCheckpoint = strata::core::ConversationCheckpoint;
 bool park_async_env() {   // STRATA_PARK_ASYNC (strata/core/conversation_snapshot.hpp)
     static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
     return on;
+}
+// STRATA_PARK_SEGPOOL_MIB=N (upstream 8f4a2e0af, 01e21ef20, ef371eba8; read once; Linux only, inert where the OS layer is not
+// written - Windows): the host buffers of parked conversations (K/V segments of 512 KiB and more) come from one arena of N MiB (at
+// most a quarter of the conversation cache) that a background thread makes resident while the engine is idle, so a park's first
+// touch of fresh pages is paid once instead of at every park (include/strata/core/conversation_segment_pool.hpp).  Unset: the
+// engine's default, min(2 GiB, a quarter of the cache) in 64 MiB steps (park_pool_policy.hpp); 0: off (a diagnostic switch).  Its
+// idle bytes count against --conversation-cache-mib and are given back before any parked conversation is evicted and before the RAM
+// floor is reached.  Every byte a park writes is the same; only where the buffers live differs.  -1: unset.
+long long park_segpool_env_mib() {
+    static const long long mib = [] {
+        const char* v = std::getenv("STRATA_PARK_SEGPOOL_MIB");
+        if (v == nullptr) return -1LL;
+        const long long n = std::strtoll(v, nullptr, 10);
+        return n > 0 ? n : 0LL;
+    }();
+    return mib;
 }
 
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
@@ -3431,6 +3472,18 @@ int main(int argc, char** argv) {
                          d, di.name.c_str(), di.compute_units, (double) di.total_bytes / (1024.0 * 1024 * 1024),
                          strata::prefill::Gemm::path(), strata::prefill::experts_path().c_str());
         }
+    }
+    // Upstream's integrated gfx11 under Linux (0a17fb99e, 8f6393a37, 0ee263992, f9932c6ae, 6069c9d0c), as the device reports it:
+    // every engine GPU an integrated one on the HIP backend (kfd_igpu_class).  The expert arena asks for no huge pages there
+    // (pinned.cpp), the engine waits for its own KFD eviction counter to go quiet after the expert cache is allocated and before
+    // READY (kfd_settle.hpp), makes the first request's CPU share buffers and staged copy during the load, and gives the model
+    // files' page cache back after the load (kfd_quiet.hpp).  Measured by upstream on a Radeon 780M; not measured on the 890M.
+    if (strata::core::kfd_igpu_class()) {
+        strata::core::kfd_settle_flag().store(true);
+        strata::core::kfd_quiet::class_flag().store(true);
+        if (std::getenv("STRATA_TRACE") != nullptr && strata::core::kfd_quiet::on(strata::core::kfd_quiet::Fix::Load))
+            std::fprintf(stderr, "strata trace: kfd quiet: load order active (settle after the expert cache, the CPU share's "
+                                 "buffers at init, a staged copy before READY)\n");
     }
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
     // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the
@@ -5460,6 +5513,32 @@ int main(int argc, char** argv) {
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
+#if defined(__linux__)
+    // Upstream 0ee263992 / 6d8e42886 (kfd_quiet.hpp, GIVE BACK; an integrated GPU on the HIP backend): the weights, the native
+    // projections and the head are on the device now, so the page cache of the files they were copied from is a second copy.
+    // Given back, it leaves the kernel free memory, and its proactive compaction no longer moves the pages the GPU maps
+    // (upstream's Radeon 780M: late compaction passes 3 of 8 starts with the cache, 0 of 8 without, MemFree at READY 1.6-2.4 GiB
+    // against 8.4-9.3).  The files the expert source reads in place (--mmap-experts) keep their cache; the experts' own pages go
+    // back as the host USM cache fills (release, below).  Advice only; STRATA_NO_ARENA_CACHE_DROP=1 keeps the cache.
+    if (strata::core::kfd_quiet::cache_drop_on(strata::core::kfd_quiet::class_flag().load(),
+                                               std::getenv("STRATA_NO_ARENA_CACHE_DROP")) && srcp != nullptr) {
+        std::vector<std::string> expert_files;
+        for (const auto& kv : srcp->model_inputs()) expert_files.push_back(kv.second);
+        const std::vector<std::string> files = strata::core::kfd_quiet::cache_drop_files(
+            o.pack, o.native_preset.empty() ? std::vector<std::string>{} : strata::gguf_split_paths(o.native_preset), o.ple_gguf,
+            srcp == &src || (srcp == &arena_src && arena_src.file_mapped()), expert_files);   // (STRATA_ARENA_MMAP: in place too)
+        uint64_t free0 = 0, cached0 = 0, free1 = 0, cached1 = 0;
+        const bool known = strata::platform::free_and_cached(free0, cached0);
+        const Clock::time_point t0 = Clock::now();
+        for (const std::string& f : files) strata::platform::drop_file_cache(f);
+        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+        if (known && strata::platform::free_and_cached(free1, cached1) && cached0 > cached1)
+            std::fprintf(stderr, "strata generate: the model files' cached pages were given back after the load: %.1f GiB "
+                                 "(%zu file%s, %.0f ms); the file cache is %.1f GiB now (STRATA_NO_ARENA_CACHE_DROP=1 keeps it)\n",
+                         (double) (cached0 - cached1) / 1073741824.0, files.size(), files.size() == 1 ? "" : "s", ms,
+                         (double) cached1 / 1073741824.0);
+    }
+#endif
     // --batch-cpu-split (EXPERIMENTAL): the CPU workers in two pools on separate cores, N0 for stage 0 and N1 for
     // stage 1 (a layer split over two GPUs with --batch-groups; anything else keeps the one pool)
     const bool cpu_split = o.batch_cpu_split[0] > 0 && multi_gpu && split_devs.size() == 1 && o.batch_groups > 1 &&
@@ -5993,6 +6072,15 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr, "                 PROFILE, ranked by routing frequency, no eviction.\n");
         }
+    }
+    // Upstream f9932c6ae (kfd_quiet.hpp, LOAD; an integrated GPU on the HIP backend): the expert cache's memory was just allocated
+    // (24 GiB of host USM on the 890M's default) and the kernel moves pages after such a step; the fill, the graph capture and the
+    // first GPU work wait until the process's KFD eviction counter has been quiet for 2 s (at most 10 s; nothing where the counter
+    // cannot be read; STRATA_NO_KFD_SETTLE=1 also turns it off)
+    if (o.expert_cache > 0 && strata::core::kfd_quiet::load_moves().settle_after_cache) {
+        const std::string said = strata::core::kfd_settle::line(strata::core::kfd_settle::settle_before_ready(),
+                                                                "the expert cache's fill");
+        if (!said.empty()) std::fprintf(stderr, "strata generate: %s\n", said.c_str());
     }
     // ---- R4.2e: fill the tier from the profile.  This is the only place the plan is applied, and it runs
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
@@ -7245,8 +7333,13 @@ int main(int argc, char** argv) {
     //
     // and each generated token is written to stdout as `T <id>` as soon as its verify window is done, followed by
     //
-    //     DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <stop|length|cancel|nonfinite> <drafts accepted>
+    //     DONE <generated> <prompt_tokens> <prompt_ms> <decode_ms> <stop|length|cancel|nonfinite|hold> <drafts accepted>
     //          <drafts offered> <prompt tokens reused> ... <prompt tokens read>   (see the DONE line below; #471)
+    //
+    // `hold` (upstream be101072b): the request carried the key hold=N:ID (the server's thinking budget) and ended after N
+    // emitted tokens, token ID (</think>) not among them; the session holds exactly what it emitted.  A `STOP` that
+    // arrives while a decode window runs drops that window whole (upstream 33648fef1, STRATA_SERVE_STOP_SKIP=0 keeps it):
+    // its tokens are not written, and the session ends at the ones that were.
     //
     // `nonfinite` (#879, upstream f332a855): a window's head logits held a NaN or an infinity
     // (Verifier::nonfinite_row).  None of that window's tokens was written; every state that may carry the poison (the
@@ -8193,6 +8286,67 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 && use_mtp ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // The segment pool (park_pool_policy.hpp, upstream 8f4a2e0af / 01e21ef20 / ef371eba8): one arena for the K/V buffers of
+        // parked conversations, memory held idle between parks so a park does not pay the first touch of fresh pages
+        // (STRATA_PARK_SEGPOOL_MIB=N sets its size, 0 turns it off; unset: min(2 GiB, a quarter of the cache); Linux only, the OS
+        // layer of Windows is not written yet: inert there).  Its idle bytes count against the cache's budget
+        // (ConversationCache::set_pool) and are given back before any parked conversation is evicted and before the RAM floor is
+        // reached; its top-up runs in the background, only while the engine is idle (park_pool_permit) and only while the budget
+        // and the RAM floor plus 1 GiB leave room.  The size follows the cache, which follows the RAM free after the load
+        // (auto_conversation_cache_mib), so it is no figure of one machine: the 2 GiB cap is upstream's (a 55K-token park took 283
+        // ms with 1 GiB, 117 ms with 2 GiB on upstream's l620), and the 890M's automatic cache of 1-2.3 GiB (62 GiB of RAM with the
+        // expert cache locked) gives an arena of 256-576 MiB.  Upstream's checkpoint pool (STRATA_CKPT_POOL), the other park pool,
+        // is not in this fork.  The arena is never destroyed (a buffer made from it may outlive this scope's objects).
+        strata::core::SegmentPool* segpool = nullptr;
+        std::atomic<size_t> segpool_allow{0};   // bytes the filler may still make resident in this pass (set on the host thread)
+        std::unique_ptr<strata::core::SegmentPoolFiller> segpool_filler;   // (after the allowance: it is joined first)
+        auto segpool_kick = [&] {
+            if (segpool == nullptr || !segpool_filler) return;
+            const size_t budget = conversations.enabled() ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0;
+            const size_t used = conversations.resident_bytes();
+            segpool_allow.store(budget > used ? budget - used : 0);
+            segpool_filler->kick();
+        };
+        // the pool's idle memory back to the system (before a RAM check that could fail with it held)
+        auto segpool_give_back = [&] {
+            if (segpool != nullptr && segpool->idle_bytes() > 0) segpool->shrink((size_t) -1);
+        };
+        if (conversations.enabled()) {
+            const size_t cache_mib = (size_t) o.conversation_cache_mib;
+            const long long env_mib = park_segpool_env_mib();   // -1 unset
+            const size_t want_mib = env_mib >= 0 ? (size_t) env_mib : strata::core::park_pool_plan(cache_mib, 0).segpool_mib;
+            if (want_mib > 0) {
+                const size_t bytes = std::min(want_mib * 1024 * 1024, cache_mib * 1024 * 1024 / 4);   // never more than a quarter of the cache
+                segpool = new strata::core::SegmentPool(strata::core::segment_pool_os(), bytes);
+                if (segpool->active() && strata::core::segment_pool_install(segpool)) {
+                    conversations.set_pool(segpool);
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                    segpool_filler = std::make_unique<strata::core::SegmentPoolFiller>(*segpool,
+                        [&segpool_allow, floor](size_t step) -> size_t {
+                            // upkeep only while the engine is idle (park_pool_policy.hpp): no page population beside a request's
+                            // work - on an integrated GPU the page faults would also take the memory the GPU reads from
+                            const size_t a = strata::core::park_pool_permit(strata::core::progress().busy.load(),
+                                                                            std::min(step, segpool_allow.load()));
+                            if (a == 0) return 0;
+                            const auto mem = strata::core::sample_host_memory();   // the floor and one more GiB of RAM must stay free
+                            if (!mem || mem->available < floor + ((uint64_t) 1 << 30U) + a) return 0;
+                            segpool_allow.fetch_sub(std::min(a, segpool_allow.load()));
+                            return a;
+                        },
+                        [] {
+                            strata::platform::name_this_thread("strata-segpool");
+                            strata::aux_cpus::pin_current_thread();   // (a no-op while --aux-cpus is off)
+                        });
+                    std::fprintf(stderr, "strata serve: conversation cache: a %zu MiB arena for the parked conversations' buffers "
+                                         "(%s; STRATA_PARK_SEGPOOL_MIB=0 turns it off)\n", segpool->capacity() >> 20U,
+                                 env_mib >= 0 ? "STRATA_PARK_SEGPOOL_MIB" : "a quarter of the cache, at most 2 GiB");
+                } else {
+                    if (std::getenv("STRATA_PARK_TRACE")) std::fprintf(stderr, "strata parktrace: segpool not reserved (%zu MiB wanted)\n", want_mib);
+                    segpool = nullptr;   // (the object stays allocated, inert)
+                }
+            }
+        }
+        segpool_kick();
         // a layer split parks every GPU's session (its layers), each copied on its own device
         std::vector<strata::core::ConversationStage> conv_stages;
         if (multi_gpu) {
@@ -8412,6 +8566,10 @@ int main(int argc, char** argv) {
             if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
+            // With the segment pool, no image is dropped (make_room, the RAM gate) while the last park's background copy
+            // (STRATA_PARK_ASYNC) could still write into it: its freed granules may go to this capture or back to the system
+            // (upstream synchronises the device here; the capture below joins the copy anyway, so this costs nothing)
+            if (segpool != nullptr) strata::core::conversation_park_join();
             const bool room = conversations.make_room(estimate, held, disk.enabled() ? &evicted : nullptr);
             save_evicted();   // before the capture allocates: the pushed-out images are freed once written
             if (!room) {
@@ -8428,10 +8586,13 @@ int main(int argc, char** argv) {
                 // though every parked conversation could give its RAM back - and refusing here throws away the whole
                 // prompt read that produced this snapshot (measured upstream: 270k tokens, 96 s).  Evict the least
                 // recently active parked conversations until it fits, or until none are left (with --conversation-save
-                // each is written first).  Each ConversationBuffer is a list of 16 MiB segments, each its own
-                // allocation, so an evicted entry is back with the kernel before the next check reads /proc/meminfo.
-                // The reading is the memory guard's (MemAvailable, the cgroup limits above the engine,
-                // --memory-limit-mib; upstream daa76552); `mem` keeps the last one for the refusal line.
+                // each is written first).  #5697 (upstream 8c71c4927): freed memory can stay in the C library's heap, which
+                // MemAvailable does not count (make_room's evictions above, dropped checkpoints): a failed check hands it
+                // back first (release_free_heap), and each eviction hands back the entry it drops (evict_oldest, or here
+                // once a saved entry is written and freed), so the next check reads it from /proc/meminfo.  The segment
+                // pool's idle bytes go back before either.  The reading is the memory guard's (MemAvailable, the cgroup
+                // limits above the engine, --memory-limit-mib; upstream daa76552); `mem` keeps the last one for the
+                // refusal line.
                 size_t freed = 0;
                 std::optional<strata::core::HostMemoryReading> mem;
                 auto admit = [&] {
@@ -8439,12 +8600,22 @@ int main(int argc, char** argv) {
                     return strata::core::conversation_memory_admit(
                         mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
                 };
-                while (!admit() && conversations.size() > 0 && freed < conversations.slots() &&
+                bool fits = admit();
+                if (!fits && segpool != nullptr && segpool->idle_bytes() > 0) { segpool_give_back(); fits = admit(); }
+                fits = fits || (strata::core::release_free_heap() && admit());
+                while (!fits && conversations.size() > 0 && freed < conversations.slots() &&
                        conversations.evict_oldest(disk.enabled() ? &evicted : nullptr)) {
                     ++freed;
-                    save_evicted();
+                    if (disk.enabled()) {   // written, then freed: its memory back to the system before the next check
+                        save_evicted();
+                        strata::core::release_free_heap();
+                    }
+                    // an evicted conversation's segments drawn from the pool went back to the pool's idle, still resident:
+                    // they go back to the system too, or MemAvailable never rises and every parked conversation goes
+                    segpool_give_back();
+                    fits = admit();
                 }
-                if (!admit()) {
+                if (!fits) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need "
                                          "%zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
@@ -8486,7 +8657,15 @@ int main(int argc, char** argv) {
                                        : !strata::core::conversation_split_save(image, view, src.stages, g,
                                                                                 *src.draft, err))
                     return false;
-                const auto mem_after = strata::core::sample_host_memory();
+                auto mem_after = strata::core::sample_host_memory();
+                // (the segment pool's idle memory is the first RAM to go back here too: a park the check refuses with the
+                // pool held would pass without it)
+                if (!strata::core::conversation_memory_admit(
+                        mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor) &&
+                    segpool != nullptr && segpool->idle_bytes() > 0) {
+                    segpool_give_back();
+                    mem_after = strata::core::sample_host_memory();
+                }
                 if (!strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld "
@@ -8503,6 +8682,15 @@ int main(int argc, char** argv) {
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes,
                              reused_bytes);
                 save_evicted();
+                if (segpool != nullptr) {
+                    segpool_kick();   // what this park freed or the pool gave back is topped up again once the engine is idle
+                    if (std::getenv("STRATA_PARK_TRACE"))
+                        std::fprintf(stderr, "strata parktrace: segpool resident %zu MiB, live %zu MiB, idle %zu MiB, hits %llu, "
+                                             "misses %llu; cache images %zu MiB\n", segpool->resident_bytes() >> 20U,
+                                     segpool->live_requested() >> 20U, segpool->idle_bytes() >> 20U,
+                                     (unsigned long long) segpool->hits(), (unsigned long long) segpool->misses(),
+                                     conversations.bytes() >> 20U);
+                }
             } catch (const std::bad_alloc&) {
                 evicted.clear();
                 // the src.ids session is untouched: read the prompt the ordinary way instead of ending the server
@@ -9597,10 +9785,84 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
+        // ---- window warm-up (upstream 84e11a773, 944850163): the first run of a window width captures its graph (and
+        // the commit graphs), so a width the drafts first reach inside a request pays the capture there - in its first
+        // reply, not at the start.  One dummy window per width 1..--spec, once, before READY; it changes nothing a request
+        // can see: the windows write K/V cells 0..T-1 and the recurrent state of the session, and session_zero() below
+        // zeroes the session exactly as a request that reuses nothing does; no checkpoint, conversation entry, sampler
+        // draw, policy sample or statistic of the decode loop is touched.  The expert cache may page in what the dummy
+        // token routes to (speed only).  Every width's graph is held from the start (the graphs a later capture could
+        // free when the device is full, #3702, still can be): the log line says the device memory they took.
+        // Single-stage serve without --batch only (the pipelined and the batch windows capture their own);
+        // STRATA_WINDOW_WARM=0 turns it off.
+        {
+            static const bool warm_off = [] { const char* v = std::getenv("STRATA_WINDOW_WARM"); return v != nullptr && v[0] == '0'; }();
+            const bool route_trace = std::getenv("STRATA_ROUTE_DUMP") != nullptr || std::getenv("STRATA_ROUTE_REPLAY") != nullptr;
+            const int warm_s = std::min<int>(o.spec, strata::kernels::kVerifyMaxT);
+            if (!warm_off && !route_trace && warm_s >= 2 && n_stages == 1 && o.batch == 0 && !(kvg.on && kvg.cells < warm_s + 64)) {
+                const Clock::time_point w0 = Clock::now();
+                size_t free0 = 0, free1 = 0, total_b = 0;
+                const bool mem0 = strata::gpu::mem_info(&free0, &total_b);
+                std::vector<int32_t> wtok((size_t) warm_s, 1), wout((size_t) warm_s + 1, 0);
+                std::string werr, wlist;
+                bool wok = true;
+                // (this fork's draft policy may pick any width 1..S - it has no --lookup-max-t - so every width is warmed; a
+                // width that fails, a capture the device has no room for among others, is left to its first request and the
+                // rest still run)
+                for (int t = 1; t <= warm_s; ++t) {
+                    const Clock::time_point t0 = Clock::now();
+                    drive.d.layers = 0;
+                    drive.d.experts = 0;
+                    drive.d.failed = false;
+                    std::string terr;
+                    const bool tok = ver.run(t, wtok.data(), 0, win_pool_fn, win_pool_user, wout.data(), terr) && !drive.d.failed;
+                    if (!tok && wok) werr = "width " + std::to_string(t) + ": " + (terr.empty() ? std::string("failed") : terr);
+                    wok = wok && tok;
+                    char wb[48];
+                    std::snprintf(wb, sizeof wb, "%s%d:%.0f%s", wlist.empty() ? "" : " ", t,
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), tok ? "" : "!");
+                    wlist += wb;
+                }
+                strata::core::session_zero(ss, g, nullptr, main_cs);
+                (void) strata::gpu::stream_sync(main_cs);
+                drive.d.layers = 0;
+                drive.d.experts = 0;
+                drive.d.failed = false;
+                const bool mem1 = mem0 && strata::gpu::mem_info(&free1, &total_b);
+                std::fprintf(stderr, "strata serve: window warm-up: ms per width %s, total %.0f ms, %lld MiB of device memory "
+                                     "(STRATA_WINDOW_WARM=0 turns it off)%s%s\n", wlist.c_str(),
+                             std::chrono::duration<double, std::milli>(Clock::now() - w0).count(),
+                             mem1 && free0 > free1 ? (long long) ((free0 - free1) >> 20U) : 0LL,
+                             wok ? "" : "; a window failed: ", wok ? "" : werr.c_str());
+            }
+        }
         strata::core::progress_at("idle");
         strata::gpu::pin_reserve_release();   // the engine is up: the pinned memory's last reserve goes back
+        // Upstream 6069c9d0c (kfd_quiet.hpp, LOAD; an integrated GPU on the HIP backend): one staged copy each way, from and
+        // into pageable memory, so that the HIP runtime makes its staging buffer and copy path now, before the settles below,
+        // and not inside the first request (upstream's Radeon 780M: +10-15 MiB of GTT in 3-5 steps there).  The device buffer
+        // is kept for the run (a free later would be one more driver event); nothing reads it.  Failures are ignored.
+        if (strata::core::kfd_quiet::load_moves().staged_copy_warm) {
+            static void* warm_dev = nullptr;
+            const size_t wn = strata::core::kfd_quiet::kStagedWarmBytes;
+            if (warm_dev == nullptr) warm_dev = strata::gpu::alloc_device(wn);
+            if (warm_dev != nullptr) {
+                std::vector<unsigned char> wh(wn, 0);
+                if (strata::gpu::copy(warm_dev, wh.data(), wn)) (void) strata::gpu::copy(wh.data(), warm_dev, wn);
+            }
+            if (std::getenv("STRATA_TRACE") != nullptr)
+                std::fprintf(stderr, "strata trace: kfd quiet: staged copy before READY %s\n",
+                             warm_dev != nullptr ? "done" : "skipped (no device memory)");
+        }
         strata::platform::settle_before_ready();
-        std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+        {   // upstream 8f6393a37 (kfd_settle.hpp; an integrated GPU on the HIP backend): until the GPU driver has stopped
+            // pausing the queues for the kernel's page moves; the time it waited is said (nothing elsewhere)
+            const std::string said = strata::core::kfd_settle::line(strata::core::kfd_settle::settle_before_ready(), "READY");
+            if (!said.empty()) std::fprintf(stderr, "strata generate: %s\n", said.c_str());
+        }
+        g_gpu_pause_idle.idle(gpu_pause_now());   // the gap before the first request starts here (the start's own pauses are not a "between")
+        // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)
+        std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -9746,6 +10008,7 @@ int main(int argc, char** argv) {
             int n_drafts = 1;              ///< STRATA_PIPED_MTP: how many of `draft` its next window checks
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
+            strata::core::SlotHold hold;   ///< GEN / BGEN hold=N:ID (the server's thinking budget): the slot ends with BDONE "hold" after N emitted tokens unless ID came first
             Clock::time_point t0;
             // the slot's own conversation cache (#465): the tokens its session holds (the prompt, then every token a
             // window fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from
@@ -10021,7 +10284,7 @@ int main(int argc, char** argv) {
                 const BSlot& sl = bs[(size_t) b];
                 const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
                 keep[(size_t) b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
-                                   sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
+                                   sl.produced + 2 <= strata::core::slot_cap(sl.max_new, sl.hold) && sl.p + 3 <= o.max_context ? 2 : 1;
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
                 std::printf("ERR %s\n", err.c_str());
@@ -10058,8 +10321,10 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(tok[first[a] + j]);   // the window fed it: the slot's session holds it now
                     std::printf("BT %d %d\n", b, (int) y);
                     ++sl.produced;
+                    strata::core::slot_hold_emitted(sl.hold, (int64_t) y);
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                    : strata::core::slot_hold_reached(sl.hold, sl.produced, sl.max_new) ? "hold"
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
@@ -10359,7 +10624,9 @@ int main(int argc, char** argv) {
                     std::printf("BT %d %d\n", blk.b, (int) y);
                     ++sl.produced;
                     ++bt_rows;
+                    strata::core::slot_hold_emitted(sl.hold, (int64_t) y);
                     const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                    : strata::core::slot_hold_reached(sl.hold, sl.produced, sl.max_new) ? "hold"
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
@@ -10453,8 +10720,10 @@ int main(int argc, char** argv) {
                     std::printf("BT %d %d\n", b, (int) y);
                     ++sl.produced;
                     ++bt_rows;
+                    strata::core::slot_hold_emitted(sl.hold, (int64_t) y);
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                    : strata::core::slot_hold_reached(sl.hold, sl.produced, sl.max_new) ? "hold"
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
@@ -10516,7 +10785,7 @@ int main(int argc, char** argv) {
                             G.pos[G.S] = sl.p;
                             ++G.S;
                             int nd = sl.draft_ready && !sl.stop ? sl.n_drafts : 0;
-                            nd = (int) std::min<int64_t>(nd, std::min<int64_t>(sl.max_new - sl.produced - 1,
+                            nd = (int) std::min<int64_t>(nd, std::min<int64_t>(strata::core::slot_cap(sl.max_new, sl.hold) - sl.produced - 1,
                                                                                 o.max_context - sl.p - 2));
                             for (int j = 0; j < nd; ++j) {
                                 G.rows[G.S] = b;
@@ -10618,6 +10887,9 @@ int main(int argc, char** argv) {
             return pmtp_settle();
         };
         for (;;) {
+            // Between requests (nothing in flight): the segment pool's upkeep, which the park and the prompt read leave alone
+            if (segpool != nullptr && !batch_on() && !(piped && pipe_inflight()) && !strata::core::progress().busy.load())
+                segpool_kick();
             if (batch_on() || (piped && pipe_inflight())) {   // the slots decode while no line waits
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
@@ -10690,6 +10962,7 @@ int main(int argc, char** argv) {
                     strata::core::progress().busy.store(false);
                     strata::core::progress().allow_until_ms.store(0);
                     strata::core::progress_at("idle");
+                    g_gpu_pause_idle.idle(gpu_pause_now());   // the gap to the next request starts here, whichever way this one ended
                 }
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
@@ -10791,6 +11064,7 @@ int main(int argc, char** argv) {
                             sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        segpool_give_back();   // (the segment pool's idle memory goes back before the RAM checks of a session save)
                         if (o.session_save_reclaim) {
                             const auto freed = strata::core::session_save_reclaim(
                                 checks, conversations, sl, floor, strata::core::available_host_bytes);
@@ -10862,6 +11136,7 @@ int main(int argc, char** argv) {
                         strata::core::SessionReadLimits limits;
                         limits.progress = moving;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        segpool_give_back();   // (the segment pool's idle memory goes back before the RAM checks of a session load)
                         limits.admit = [floor, &o](uint64_t need, std::string& why) {
                             const auto mem = strata::core::sample_host_memory();
                             const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
@@ -10975,6 +11250,11 @@ int main(int argc, char** argv) {
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
             // branch it leaves: N queries cost one prefix, not N.  Absent = as before.
             int64_t req_pin = 0;
+            // hold=N:ID (the server's thinking budget, GEN and BGEN; upstream be101072b, b92075d92): end the request after N
+            // emitted tokens unless token ID (</think>) came first, with the session at exactly what was emitted
+            // (serve_hold_remaining; a --batch slot: SlotHold); DONE / BDONE say "hold".  Absent = as before.  An older
+            // engine skips the key (unknown keys are skipped), and says no "hold" in READY.
+            long long req_hold_n = -1, req_hold_id = -1;
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -11017,6 +11297,15 @@ int main(int argc, char** argv) {
                     else if (key == "ckpt") req_ckpt = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
                     else if (key == "prefill") req_prefill_only = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::strtoll(tok.c_str() + eq + 1, nullptr, 10));
+                    else if (key == "hold") {
+                        char* he = nullptr;
+                        const long long hn = std::strtoll(tok.c_str() + eq + 1, &he, 10);
+                        if (he != nullptr && *he == ':' && hn > 0) {
+                            char* ie = nullptr;
+                            const long long hid = std::strtoll(he + 1, &ie, 10);
+                            if (ie != he + 1 && *ie == '\0' && hid >= 0) { req_hold_n = hn; req_hold_id = hid; }
+                        }
+                    }
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
@@ -11269,6 +11558,12 @@ int main(int argc, char** argv) {
                 // layouts eat into what the start reported)
                 size_t vf_b = 0, vt_b = 0;
                 if (strata::gpu::mem_info(&vf_b, &vt_b)) g_req_vram_free_mib.store((int64_t) (vf_b >> 20));
+            }
+            {   // AMD on Linux: the driver's GPU pause counter, once per request; a pause since the engine went idle gets its own line
+                const int64_t pause_begin = gpu_pause_now();
+                const std::string gap_line = g_gpu_pause_idle.begin(pause_begin);
+                if (!gap_line.empty()) std::fprintf(stderr, "%s\n", gap_line.c_str());
+                g_req_gpu_pause_ms.store(pause_begin);
             }
             int64_t resume = 0;
             bool from_live = false;
@@ -12355,10 +12650,11 @@ int main(int argc, char** argv) {
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             // on by default (upstream 243fdb213 measured it on HIP: 4 x R9700, Qwen3.8-Flash-Next IQ3_S, 0 of 16 continuations fell back to
             // the older checkpoint against 4 of 16 without it, #4677; here on every backend); STRATA_SERVE_STOP_BOUND=0 turns it off
-            static const bool stop_bound = [] {
-                const char* v = std::getenv("STRATA_SERVE_STOP_BOUND");
-                return v == nullptr || std::strcmp(v, "0") != 0;
-            }();
+            static const bool stop_bound = strata::core::serve_stop_bound_on(std::getenv("STRATA_SERVE_STOP_BOUND"));
+            // a window that finishes after the server's STOP is dropped whole (no commit, no tokens: upstream 33648fef1): the
+            // session ends at the rows the client was sent.  On by default; STRATA_SERVE_STOP_SKIP=0 turns it off
+            // (serve_stop_bound.hpp)
+            static const bool stop_skip = strata::core::serve_stop_skip_on(std::getenv("STRATA_SERVE_STOP_SKIP"));
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
@@ -12374,6 +12670,9 @@ int main(int argc, char** argv) {
             // last token, which joins the window as the fed-back head `x`.
             const size_t pen_gen0 = strata::kernels::penalty_window_from(consumed.size(), pen_prompt);
             const char* finish = "length";
+            // GEN hold=N:ID: on until ID is emitted; meanwhile the request's cap is min(max_new, N)
+            bool hold_on = req_hold_n > 0 && req_hold_id >= 0;
+            auto cap_now = [&]() -> int64_t { return hold_on ? std::min<int64_t>(max_new, req_hold_n) : (int64_t) max_new; };
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
@@ -12428,7 +12727,7 @@ int main(int argc, char** argv) {
                 std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                 return 1;
             }
-            if (pl_want && pl_serial == nullptr && !cancelled && produced_n < max_new) {
+            if (pl_want && pl_serial == nullptr && !cancelled && produced_n < cap_now()) {
                 pl_ran = true;
                 if (!pl_prepare(err)) {
                     std::printf("ERR %s\n", err.c_str());
@@ -12685,7 +12984,7 @@ int main(int argc, char** argv) {
                                 ss.ple_prev[0] = undo_ple[0];
                                 ss.ple_prev[1] = undo_ple[1];
                             }
-                            if (!VF(st, undo_w).pl_commit_async(undo_keep, err)) return die(err);
+                            if (undo_keep > 0 && !VF(st, undo_w).pl_commit_async(undo_keep, err)) return die(err);   // 0: the window was dropped (stop_skip)
                         }
                         doomed = false;
                         ++pl_undo;
@@ -12846,10 +13145,31 @@ int main(int argc, char** argv) {
                     chain_kind = 0;
                     int a = 0;
                     while (a < A.T - 1 && A.tok[a + 1] == outp[(size_t) a]) ++a;
-                    if (stop_bound)
-                        a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outp.data(), [&](int32_t y) {
+                    if (stop_bound || hold_on)   // (a hold always bounds the commit: the server's next pass continues from it)
+                        a = strata::core::serve_stop_bound(a + 1, strata::core::serve_hold_remaining(a + 1, produced_n, max_new,
+                                                               hold_on ? req_hold_n : -1, req_hold_id, outp.data()),
+                                                           outp.data(), [&](int32_t y) {
                             return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                         }) - 1;
+                    // STOP arrived while A was in flight: A is dropped whole (serve_skip_stopped_window), not committed on any stage and not
+                    // printed.  A front stage that B ran on has A committed speculatively (A.com): it goes back to the snapshot taken before
+                    // A, with no replay (undo_keep 0); a stage B never reached never committed A.
+                    if (stop_skip && stop_req.load() && A.seq > 0) {
+                        bool deferred = V1(A).commit_deferred();
+                        for (int st = 0; deferred && st < pl_nf; ++st) deferred = VF(st, A).commit_deferred();
+                        if (strata::core::serve_skip_stopped_window(true, true, false, false, deferred)) {
+                            finish = "cancel";
+                            if (B.launched) {
+                                doomed = true;
+                                D = B;
+                                undo_w = A;
+                                undo_keep = 0;
+                            }
+                            B = PW{};
+                            ending = true;
+                            continue;
+                        }
+                    }
                     if (!V1(A).pl_commit_async(a + 1, err)) return die(err);
                     for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
                     draft_offered += A.T - 1;
@@ -12859,8 +13179,9 @@ int main(int argc, char** argv) {
                     dec_T += A.T;
                     const bool nf = nonfinite_hit(V1(A), "decode");   // #879: none of its tokens goes out
                     bool eos = false;
-                    for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
+                    for (int i = 0; !nf && i <= a && produced_n < cap_now() && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
+                        if (hold_on && (int64_t) outp[(size_t) i] == req_hold_id) hold_on = false;
                         strata::core::progress_beat();
                         ++produced_n;
                         if (sfx_on) sfx.append(outp[(size_t) i]);
@@ -12870,7 +13191,7 @@ int main(int argc, char** argv) {
                     if (nf) finish = "nonfinite";
                     else if (eos) finish = "stop";
                     else if (stop_req.load()) finish = "cancel";
-                    const bool last = nf || eos || produced_n >= max_new || stop_req.load();
+                    const bool last = nf || eos || produced_n >= cap_now() || stop_req.load();
                     const bool on = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
@@ -13011,7 +13332,7 @@ int main(int argc, char** argv) {
             // the gated proposal's chain: the per-row gate only (the packet reads the failed draw as its NULL tail;
             // the cumulative rule or the policy's window could stop a chain short of its budget, which the packet refuses)
             const strata::core::MtpDrafter::More gated_more = [&](int n, const float* pr) { return pr[n - 1] >= (float) req_spec_min_p; };
-            while (!pl_ran && !cancelled && produced_n < max_new) {
+            while (!pl_ran && !cancelled && produced_n < cap_now()) {
                 int T = 1;
                 policy.set_context(p);
                 bool from_sfx = false;
@@ -13094,8 +13415,10 @@ int main(int argc, char** argv) {
                 }
                 {   // nor past the tokens still to be sent: a draft committed beyond them would be in the session but
                     // not in the reply, so the next request of the chat could not continue it and would read again
-                    // from an earlier checkpoint - by the prompt path, with other bits than the decode's
-                    const int lim = (int) std::min<int64_t>(S, max_new - produced_n);
+                    // from an earlier checkpoint - by the prompt path, with other bits than the decode's.  GEN hold=N:ID
+                    // counts the same way (cap_now): the rows a window may commit stop at the hold, and a window that
+                    // emits ID lets the next one go on - the same tokens, the session at exactly what was emitted
+                    const int lim = (int) std::min<int64_t>(S, cap_now() - produced_n);
                     T = std::min(T, lim);
                     chain_n = std::max(0, std::min(chain_n, lim - T));
                 }
@@ -13226,6 +13549,16 @@ int main(int argc, char** argv) {
                         if (f) std::fclose(f);
                     }
                 }
+                // STOP arrived while this window ran: drop it whole (serve_skip_stopped_window).  Not committed, not printed - the server throws
+                // away every token after its STOP - so the session ends at the rows the client was sent and the next request continues
+                // from it.  One flag read per window; a request that ends by its cap or EOS never sets the flag.  (This fork has no merged
+                // window.)  Verifier::drop_window: the GDN rows the deferred commit still holds are written by the flush after the loop.
+                if (stop_skip && stop_req.load() &&
+                    strata::core::serve_skip_stopped_window(true, true, false, first_window, ver.commit_deferred())) {
+                    ver.drop_window();
+                    finish = "cancel";
+                    break;
+                }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
                 if (grammar.active() && !grammar.commit(outv.data(), a + 1)) {   // the masks made this impossible
@@ -13285,15 +13618,18 @@ int main(int argc, char** argv) {
                 draft_accepted += a;
                 // Do not cache accepted rows whose outputs this request cannot emit (upstream excepts its merged first window, which
                 // carries prompt rows; this fork has none).
-                if (stop_bound)
-                    a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outv.data(), [&](int32_t y) {
+                if (stop_bound || hold_on)
+                    a = strata::core::serve_stop_bound(a + 1, strata::core::serve_hold_remaining(a + 1, produced_n, max_new,
+                                                           hold_on ? req_hold_n : -1, req_hold_id, outv.data()),
+                                                       outv.data(), [&](int32_t y) {
                         return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     }) - 1;
                 const bool initial_round = first_window;   // a single-row window: no proposal to learn from
                 first_window = false;
                 bool eos = false;
-                for (int i = 0; i <= a && produced_n < max_new && !eos; ++i) {
+                for (int i = 0; i <= a && produced_n < cap_now() && !eos; ++i) {
                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                    if (hold_on && (int64_t) outv[(size_t) i] == req_hold_id) hold_on = false;
                     if (req_logprobs >= 0) {   // row i of this window's head logits is the distribution token i came from
                         static std::vector<float> lrow;
                         static std::vector<int32_t> lord;
@@ -13332,14 +13668,14 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
-                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < cap_now())
                     mtp.set_draft_history(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
                 // DFlash2: the request ends here, so no draft follows and the window's committed rows would never reach the drafter's ring or
                 // its log: every turn would leave a hole of a + 1 positions behind it, which a later turn that resumes after this one finds
                 // blank (and cannot rebuild).  Update them now.
-                if (use_df2 && (eos || produced_n >= max_new)) {
+                if (use_df2 && (eos || produced_n >= cap_now())) {
                     const Clock::time_point tctx = Clock::now();
                     if (!df2.context(ver.tap_dev(), a + 1, p, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                     static const bool ctx_timing = std::getenv("STRATA_DF2_TIMING") != nullptr;
@@ -13357,7 +13693,7 @@ int main(int argc, char** argv) {
                     }
                     return true;
                 };
-                const bool drafted = !draft_on || eos || produced_n >= max_new ||
+                const bool drafted = !draft_on || eos || produced_n >= cap_now() ||
                                      (use_df2 ? draft_df2(a)
                                               : mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(),
                                                           gated_proposal ? gated_more : draft_more, nullptr,
@@ -13401,6 +13737,10 @@ int main(int argc, char** argv) {
                 x = outv[(size_t) a];
                 p += a + 1;
             }
+            // GEN hold=N:ID reached (ID not emitted): the server wraps up the thinking or asks for more.  (A --batch admission
+            // is a GEN of one token whose hold may be that one token: the slot must not start then.)
+            if (hold_on && std::strcmp(finish, "length") == 0 && produced_n >= req_hold_n && (produced_n < max_new || admit_slot >= 0))
+                finish = "hold";
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.set_gdn_defer(false, err) || !ver.wait_commit(err)) {
@@ -13581,6 +13921,8 @@ int main(int argc, char** argv) {
                     sl.p = p;
                     sl.produced = 1;
                     sl.max_new = admit_max_new;
+                    // the thinking budget goes on in the slot's windows (hold_on: the first token was not ID)
+                    sl.hold = strata::core::slot_hold_from(req_hold_n, req_hold_id, hold_on);
                     sl.t0 = Clock::now();
                     sl.ids = live;
                     if (batch_mtp) {   // the slot's first proposal, from the prompt's last row
@@ -13628,6 +13970,10 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * (double) read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * (double) produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            {   // AMD on Linux: the time the driver kept the GPU paused inside this request, when it is worth a line
+                const std::string pause_line = strata::core::gpu_pause_request_line(g_req_gpu_pause_ms.load(), gpu_pause_now());
+                if (!pause_line.empty()) std::fprintf(stderr, "%s\n", pause_line.c_str());
+            }
             if (strata::core::Verifier::verify_margin().on || ver.spec_windows > 0)   // the totals of the opt-in rules
                 std::fprintf(stderr, "strata serve: STRATA_VERIFY_MARGIN kept %lld of %lld mismatched drafts, log-prob "
                                      "given up %.3f; STRATA_SPEC_PROB judged %lld windows (totals since start)\n",

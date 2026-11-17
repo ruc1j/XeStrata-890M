@@ -131,6 +131,7 @@ from pathlib import Path
 from typing import Any
 
 from serve import loras as lora_api
+from serve.childenv import quiet_crash_env
 
 TURBO_STEPS = 8
 MAX_STEPS = 100                    # the base model's
@@ -1413,8 +1414,9 @@ class ImageGen:
         self.spare = int(self.cfg.get("spare_mib") or 1024)
         self.lock = threading.Lock()              # one request line at a time even when the service's turn is not taken
         self.loras = lora_api.folder(self.cfg)    # the adapters its DiT takes (serve/loras.py)
-        self.engine = ImageEngine(self.cfg, dict(os.environ) if env is None else env, self.dir / "strata-image.log",
-                                  self._say)
+        # ggml's abort path forks gdb: never on a user's machine (serve/childenv.py)
+        self.engine = ImageEngine(self.cfg, quiet_crash_env(dict(os.environ if env is None else env)),
+                                  self.dir / "strata-image.log", self._say)
         self.tok = None
         self._system: str | None = None          # HunyuanImage 3.0's system prompt, read once
         self.totals = {"images": 0, "jobs": 0, "seconds": 0.0, "failed": 0}

@@ -3441,6 +3441,16 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     return true;
 }
 
+bool Verifier::commit_deferred() const {
+    if (last_t_ < 1 || last_batch_) return false;
+    const bool self = last_t_ == 1 && !always_publish_ && one_token_self_commit();   // as commit() below
+    return !self && (next_ == nullptr || next_->commit_deferred());
+}
+
+void Verifier::drop_window() {
+    if (gdn_defer_ && defer_ok()) gdn_pend_ = true;
+}
+
 namespace { bool g_commit_async = false; }
 void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
 
@@ -3814,6 +3824,7 @@ bool InProcessStage::run_slot_rows(const int* rows, int S, const int32_t* tokens
     return next_->run_slot_rows(rows, S, tokens, pos, pool, user_, out, err);
 }
 bool InProcessStage::commit(int n_keep, std::string& err) { return next_->commit(n_keep, err); }
+bool InProcessStage::commit_deferred() const { return next_->commit_deferred(); }
 bool InProcessStage::commit_slot_prefixes(const int* keep, std::string& err) {
     return next_->commit_slot_prefixes(keep, err);
 }

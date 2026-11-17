@@ -16,6 +16,7 @@
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/kfd_quiet.hpp"   // LOAD: the CPU prompt share's buffers at init (an integrated GPU, HIP, Linux)
 #include "strata/platform/direct_file.hpp"
 
 #include "strata/core/geometry.hpp"
@@ -1458,6 +1459,33 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             m.owned.push_back(m.ident_table);
     }
     if (!ok) { err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens"; return false; }
+    // upstream 6069c9d0c (kfd_quiet.hpp, LOAD; an integrated GPU on the HIP backend under Linux): the CPU prompt share's pinned
+    // buffers and its timing events are made here, during the load, not at the first request's first sharing layer while its
+    // kernels run (upstream's Radeon 780M: the first request grew the GPU's GTT in steps).  The sizes that layer asks for, for
+    // the largest chunk that shares (below stream_all_min(): a larger one streams every expert); the prompt path keeps a buffer
+    // that is large enough and regrows one that is not, as before.  A failure here is no error: the prompt path tries as before.
+    if (strata::core::kfd_quiet::load_moves().cpu_share_buffers && chunk > 0 && cpu_pool_ != nullptr && cpu_share_on() &&
+        src != nullptr && strata::kernels::cpu::expert_layout().native && !strata::kernels::cpu::expert_layout().fmt.empty()) {
+        const int64_t ts = std::min<int64_t>(chunk, std::max<int64_t>(stream_all_min() - 1, 1));
+        const size_t want_x = (size_t) ts * N;
+        const size_t want_rows = (size_t) std::min<int64_t>(ts * K, (int64_t) strata::kernels::cpu::MAXT * g.n_expert) * N;
+        if (m.cpu_x == nullptr) {
+            if (strata::gpu::alloc_host(&m.cpu_x, want_x * sizeof(float))) m.cpu_x_n = want_x;
+            else m.cpu_x = nullptr;
+        }
+        if (m.cpu_rows == nullptr) {
+            if (strata::gpu::alloc_host(&m.cpu_rows, want_rows * sizeof(float))) m.cpu_rows_n = want_rows;
+            else m.cpu_rows = nullptr;
+        }
+        if (cpu_share_env() < 0.0 && m.cpu_ev[0] == nullptr &&
+            (!strata::gpu::event_create(&m.cpu_ev[0], true) || !strata::gpu::event_create(&m.cpu_ev[1], true))) {
+            if (m.cpu_ev[0] != nullptr) strata::gpu::event_destroy(m.cpu_ev[0]);
+            m.cpu_ev[0] = m.cpu_ev[1] = nullptr;   // the first sharing layer makes them, or says it cannot
+        }
+        if (std::getenv("STRATA_TRACE") != nullptr)
+            std::fprintf(stderr, "strata trace: kfd quiet: the CPU prompt share's buffers made at init (%lld-token chunks)%s\n",
+                         (long long) ts, m.cpu_x != nullptr && m.cpu_rows != nullptr ? "" : "; one was refused");
+    }
     Alloc o;
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;

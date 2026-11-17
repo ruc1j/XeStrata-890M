@@ -79,6 +79,8 @@ public:
     virtual bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
                                int32_t* out, std::string& err) = 0;
     virtual bool commit(int n_keep, std::string& err) = 0;
+    /// Verifier::commit_deferred of the next stage
+    virtual bool commit_deferred() const = 0;
     virtual bool commit_slot_prefixes(const int* keep, std::string& err) = 0;
     virtual bool wait_commit(std::string& err) = 0;
     virtual void set_sampling(const strata::kernels::SamplerParams& sp) = 0;
@@ -119,6 +121,7 @@ public:
     bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
                        int32_t* out, std::string& err) override;
     bool commit(int n_keep, std::string& err) override;
+    bool commit_deferred() const override;
     bool commit_slot_prefixes(const int* keep, std::string& err) override;
     bool wait_commit(std::string& err) override;
     void set_sampling(const strata::kernels::SamplerParams& sp) override;
@@ -287,6 +290,14 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// Is the last window's state change still undone (only `commit` / `pl_commit_async` advances it)?  False for a one-token
+    /// window that advanced the state itself (see commit) and for a batch window.  serve_skip_stopped_window asks this
+    /// before it drops a window nobody will read (upstream 33648fef1).
+    bool commit_deferred() const;
+    /// XeStrata-890M: the last window is dropped (serve_skip_stopped_window): no commit follows it.  Its graph ran the GDN
+    /// rows the deferred commit had stashed (set_gdn_defer) but, under STRATA_GDN_ACC, may have left them pending: the
+    /// next flush (set_gdn_defer(false), wait_commit) writes them as after a commit.
+    void drop_window();
     /// The adaptive tier's routing counts: usage[l * n_expert + e] += 1 for each expert e routed at layer l (of this
     /// verifier's layers) by the last window's first `rows` rows, the rows whose input was the text's (the last
     /// accepted token and the accepted drafts).  The rejected rows' routing is not counted, and neither is a row

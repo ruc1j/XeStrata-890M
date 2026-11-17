@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.2.12-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+XeStrata xe0.2.15-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
@@ -76,6 +76,34 @@ upstream の Strata 0.2.10 の既定の drafter、DFlash2（incoai/Qwen3.8-Flash
 交互 3 周（枠 24,576、冷却つき）: MTP 31.6 / 31.7 / 32.0 tok/s、DFlash2（confidence 0.6）29.6 / 29.6 / 29.8 tok/s で、中央値で 6.7% 遅いです。drafter は 7.7 ms/round、2,191 トークンに 942 round（1 round 2.3 トークン。MTP は 874 round、2.5 トークン）。6 チャットの greedy の答えは 3 周とも MTP と同じでした。チャットごとに見ると、コードと英語の 3 つ（クイックソート 37.2 対 36.5、transformer 33.2 対 32.4、bash 42.6 対 40.5）では DFlash2 が 2〜5% 速く、日本語の文章の 2 つ（四季 21.5 対 25.6、光合成 25.0 対 28.8）で 13〜16%、TCP/UDP（32.9 対 34.0）で 3% 遅いです。
 
 1 round に受け入れるトークンの数は MTP と同じほど（約 2.5）ですが、drafter 自身が 1 round に 7.8 ms かかり（5 層の Q4_0 の重み 0.5 GB を 890M の帯域で読む時間が大半）、MTP の約 4 ms より長いので、decode は 6〜7% 遅くなります。upstream が AMD の HIP で MTP より 4〜12% 速かったのは、帯域が 2.5〜6 倍のカード（Strix Halo、R9700）です。Issue #23（2026-10-24）の見積もり（drafter の重みの読みが MTP の 4 ms を超え、+2〜3% が上限）のとおりでした。drafter は下書きを変えるだけで、答えは verify が決めます。
+
+## Strata 0.1.61 の取り込み
+
+upstream の Strata 0.2.13.1 から 0.2.15（エンジンの版は 0.1.61、2026-11-16）までの 736 コミット（merge を除き、0.2.14 と 0.2.14.1 を含みます）を 1 件ずつ見て、エンジン・serve・setup・画像の読み手の層に当たるものを XeStrata-890M に移しました。一覧は `.upstream-0161.md`（リポジトリの根、git の外）です。
+大半（570 件）は CUDA と gfx12 の prompt のカーネル、Windows の Strix Halo、DeepSeek V4.1 を外す作業、app と Terminal と Control の層のもので、この fork には当たりません。
+統合 Radeon の長い prompt を upstream の int8 のカーネルで読む変更（69394994a）は、この fork が前から自前の SYCL のカーネルで読んでいるので取っていません。
+
+移したものは次のとおりです。
+
+- エンジンと serve: thinking budget の上限で、エンジンが思考をちょうどそのトークンで止めます（GEN の `hold=N:ID`、READY の `hold` と `holdb`、DONE の `hold`。upstream be101072b、5aa7f1d88、b92075d92、02020478b）。締めのパスは、エンジンがいま持っている状態から続けます。890M で上限 24 トークンの要求を送ると、思考は 24 トークンで止まり、締めのパスは 104 トークンのうち 85 トークンを読み直さずに続けました（62 + 24 − 1）。
+- エンジン: server が STOP を送ったあとに終わった decode の窓を、確定せずに捨てます（upstream 33648fef1、`STRATA_SERVE_STOP_SKIP=0` で切れます）。この fork の GDN の書き戻しを遅らせる設定（`STRATA_GDN_ACC`）で溜まった行は、捨てる窓の前に書き戻します（この fork の手当て、`Verifier::drop_window`）。
+- エンジン: 追い出した会話のメモリーを C ライブラリーのヒープに残さず、OS に返します（upstream 8c71c4927）。
+- エンジン: READY の前に、推測デコードの窓の幅を 1 回ずつ回してグラフを先に作ります（upstream 84e11a773、`STRATA_WINDOW_WARM=0` で切れます）。この fork の方策は 1 から S までのどの幅も使うので、すべての幅を回します。ある幅が失敗しても、残りの幅は回します。
+- エンジン: 置いた会話の K/V のバッファーを取る領域（segment pool。upstream e04c4c931、b0c818ad7、6aba6d5fb、8f4a2e0af、07cf3f4af、01e21ef20、ef371eba8、`STRATA_PARK_SEGPOOL_MIB`）。upstream のもう 1 つの領域、checkpoint pool はこの fork にないので、取っていません。RAM を確かめて置いた会話を追い出すときは、追い出すたびに領域の空いている分を OS に返します（upstream は最初の 1 回だけで、追い出した会話の分が領域に残り、RAM が増えないまま会話をすべて追い出すことがありました）。
+- エンジン: Linux の HIP の統合 GPU で、KFD がキューを止める操作を要求の最中に起こしにくくする手当て（upstream 0a17fb99e、8f6393a37、0ee263992、6d8e42886、f9932c6ae、6069c9d0c、f73fa7410、03e687ace、f55afa152）。upstream は gfx11 の統合 GPU の名前で選んでいましたが、この fork では KFD の topology とデバイスの報告で選びます（[DETAILS](DETAILS.ja.md#amd-の-apu)）。59375eb06 は、この fork に前からあります。
+- serve: パイプが閉じていても STOP で例外を出しません（bbf97633c）。boolean の引数に文字列で書かれた true と false を真偽値として読みます（1aabfb1ce）。待ち受けの bind で getfqdn を引きません（3e1fcaaf6）。子のプロセスに `GGML_NO_BACKTRACE=1` を渡します（38ad0bcbd、`STRATA_BACKTRACE=1` で渡しません）。画像の読み手の READY を 1 つの期限で待ち、ほかの行は記録に残します（4cce1ee4d）。止めているあいだに来た要求には 503（`server_draining`）を返します（3cf22f5ef）。
+- setup: 低 RAM の判定で GiB と GB を比べていた単位のずれを直しました（9a779fb40）。並列ダウンロードの最初の range の問い合わせを再試行します（95e9b7341）。コンテナの memory の上限が RAM より小さければ、それを RAM として数えます（81ac7c8ef）。ダウンロードの試験を安定させました（f328c2cd2）。
+- 画像の読み手: CPU 版の `strata-vision` の自前の読み手（`tools/vision/own`、upstream 75ee0ea87 ほか 14 コミット。[DETAILS](DETAILS.ja.md#画像)）。890M の既定の Vulkan 版は mtmd のままです。
+
+890M の 6 つのチャット（greedy、200 トークン、枠 24,576）を、この取り込みのビルドの既定と、KFD の手当て・窓の下準備・segment pool を切った形で交互に 3 周回しました。
+答えは 3 周とも同じで、decode は 32.3 / 33.7 / 33.0 対 32.8 / 33.3 / 32.7 tok/s でした。最初の要求は窓の下準備で 37.1〜39.7 から 40.2〜41.4 tok/s になり、起動から最初の答えまでは KFD の待ちの分だけ 2〜5 秒長くなります。
+
+入れていないものは次のとおりです。
+
+- 780M（gfx1103）だけの FP16 の GEMM の既定（8d7f997d4）と、統合 Radeon の int8 の prompt のカーネル（69394994a、9187ef658）。
+- checkpoint pool（`STRATA_CKPT_POOL`）。これが前提とする upstream の ca378670b ほかの変更が、この fork にありません。
+- split engine の hold の検査（5aa7f1d88 の一部）。この fork の split（`serve/split.py`）は `strata --serve` を 2 つ使い、decode の側のエンジンが hold を受けます。
+- 画像の読み手の GPU の塔（`vit_gpu.cu`、`vit_metal.mm`）の変更と、古い CPU 向けのビルドの下限（`STRATA_ISA_FLOOR`）。この fork の CPU 版は AVX2 を下限とする portable のビルドだけです。
 
 ## Strata 0.1.59 の取り込み（Qwen 4 の形状）
 

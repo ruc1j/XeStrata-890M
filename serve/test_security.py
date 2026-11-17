@@ -62,6 +62,22 @@ class HostNames(unittest.TestCase):
 
 
 class ListenAddress(unittest.TestCase):
+    def test_bind_does_not_look_up_a_host_name(self):
+        """upstream 3e1fcaaf6: http.server's own server_bind asks socket.getfqdn for the address; where the reverse
+        lookup stalls (GitHub's macOS runner: 35 s for the first lookup of every new process) a start listened that
+        much later.  No network answer may delay a start."""
+        refuse = AssertionError("server_bind looked up a host name")
+        with mock.patch.object(socket, "getfqdn", side_effect=refuse), \
+                mock.patch.object(socket, "gethostbyaddr", side_effect=refuse):
+            with Server(("127.0.0.1", 0), BaseHTTPRequestHandler) as s:
+                self.assertNotEqual(s.server_address[1], 0)
+
+    def test_bind_sets_server_name_to_the_address_and_server_port(self):
+        # (http.server set server_name to the looked-up name, "localhost" for 127.0.0.1; nothing here reads it)
+        with Server(("127.0.0.1", 0), BaseHTTPRequestHandler) as s:
+            self.assertEqual((s.server_name, s.server_port), ("127.0.0.1", s.server_address[1]))
+            self.assertGreater(s.server_port, 0)
+
     def test_ipv4_address_family(self):
         with Server(("127.0.0.1", 0), BaseHTTPRequestHandler, bind_and_activate=False) as s:
             self.assertEqual(s.address_family, socket.AF_INET)
