@@ -887,8 +887,12 @@ inline void v2_down(const sycl::nd_item<DIM>& it, int blk, int kc, const sycl::l
                     const bool upper = (lane & o) != 0;
 #pragma unroll
                     for (int i = 0; i < cnt / 2; ++i) {
-                        const float keep = upper ? v[cnt / 2 + i] : v[i];
-                        const float send = upper ? v[i] : v[cnt / 2 + i];
+                        // both values first, then the choice: a conditional between the two array elements is a
+                        // load at a run-time index, which the compiler writes as a compare and a select for each
+                        // of the 16 elements (three of them a row group in the gfx1150 ISA)
+                        const float a = v[i], b = v[cnt / 2 + i];
+                        const float keep = upper ? b : a;
+                        const float send = upper ? a : b;
                         v[i] = keep + strata_shfl_xor(sg, send, o);
                     }
                     cnt /= 2;
