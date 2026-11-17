@@ -1502,7 +1502,10 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
             const int r0 = (int) it.get_group(1) * 32;
             for (int c0 = e0; c0 < e1; c0 += kEntriesPass) {
                 const int cn = sycl::min(kEntriesPass, e1 - c0);
-                sycl::group_barrier(it.get_group());
+                // XeStrata-890M: the APU rows skip this barrier.  Nothing reads the local memory between the grid's
+                // copy and the barrier after x's, and after a chunk's last barrier no sub-group reads x or the grid
+                // again (the SwiGLU pass reads res, which the next chunk writes only after its second barrier).
+                if constexpr (!APU) sycl::group_barrier(it.get_group());
                 for (int j = 0; j < cn; ++j) {
                     const int* src = (const int*) (xq + (size_t) ent_tok[c0 + j] * xb);
                     for (int i = tid; i < xb * 9; i += WG) sx[j * xb * 9 + i] = src[i];
@@ -1588,7 +1591,9 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
             }
             for (int c0 = e0; c0 < e1; c0 += kEntriesPass) {
                 const int cn = sycl::min(kEntriesPass, e1 - c0);
-                sycl::group_barrier(it.get_group());
+                // XeStrata-890M: the APU rows take this barrier only from the second chunk on, where it keeps the copy
+                // of h from the sub-groups still reading the chunk before; nothing has read h before the first
+                if (!APU || c0 != e0) sycl::group_barrier(it.get_group());
                 const int* src = (const int*) (hq + (size_t) c0 * hb);   // a group's entries are contiguous
                 for (int i = tid; i < cn * hb * 9; i += WG) sh[i] = src[i];
                 sycl::group_barrier(it.get_group());
