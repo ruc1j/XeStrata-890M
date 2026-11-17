@@ -93,6 +93,9 @@ void gdn_pending_clear(int32_t* pn, int write_at, void* stream);
 /// fastest; call it before any graph is recorded (once a device; later calls return at once).  Untuned, the
 /// one-work-group-a-head form runs.  STRATA_GDN_STEP=0|1|2 fixes the form.
 void gdn_step_tune(int conv_channels, int h_k, int h_v, void* stream);
+/// For the parity test: every later launch takes this form (0..2), over the tuned choice and STRATA_GDN_STEP; -1
+/// gives the choice back.
+void gdn_step_force_form(int form);
 /// Whether side branches of a graph pay on this device: 16 rounds of eight small kernels in a row and three more,
 /// recorded in a row on `stream`, against the three as one on `stream` beside one on each of `side0` / `side1`
 /// (forked from `stream` and joined back, as the window's GDN layer branches), each graph replayed in turns; true when

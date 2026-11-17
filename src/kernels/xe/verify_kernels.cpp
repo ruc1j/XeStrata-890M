@@ -346,11 +346,17 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
                     o = sycl::fma(s[r], qt[rg * RPG + r], o);
                 }
                 ro[rg * GS_COLS + lc] = o;
-                sycl::group_barrier(it.get_group());
-                if (rg == 0 && t >= t_out_begin)
+            }
+            // XeStrata-890M: the rows' outputs after the loop, behind one barrier.  Every row has its own slots for the
+            // two reductions, so a row's second barrier only held the next row's first chain back until the slowest
+            // row group's output chain was done; the sums and their order are the same.
+            sycl::group_barrier(it.get_group());
+            if (rg == 0)
+                for (int t = t_out_begin; t < n; ++t) {
+                    const float* ro = &redo[(size_t) t * RG * GS_COLS];
                     y[(size_t) t * value_dim + (size_t) (head * S + col)] =
                         (ro[lc] + ro[GS_COLS + lc] + ro[2 * GS_COLS + lc] + ro[3 * GS_COLS + lc]) * sycl::rsqrt((float) S);
-            }
+                }
             if (n_keep != nullptr && n > 0)
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
@@ -725,13 +731,15 @@ core::PerDevice<GdnChoice>& gdn_choices() {
     static core::PerDevice<GdnChoice> choices;
     return choices;
 }
+std::atomic<int> g_gdn_form_override{-1};   // gdn_step_force_form
 int gdn_forced() {   // STRATA_GDN_STEP=0|1|2: one form always (one group a head, split, prefetch)
     static const int forced = [] {
         const char* v = std::getenv("STRATA_GDN_STEP");
         const long f = v == nullptr ? -1 : std::strtol(v, nullptr, 10);
         return f >= 0 && f < kGdnForms ? (int) f : -1;
     }();
-    return forced;
+    const int over = g_gdn_form_override.load(std::memory_order_relaxed);
+    return over >= 0 ? over : forced;
 }
 sycl::event gdn_step_form(int form, sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
@@ -756,6 +764,10 @@ sycl::event gdn_step_form(int form, sycl::queue& q, float* state, const float* h
                                  nullptr);
 }
 }  // namespace
+
+void gdn_step_force_form(int form) {
+    g_gdn_form_override.store(form >= 0 && form < kGdnForms ? form : -1, std::memory_order_relaxed);
+}
 
 void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
     if (C <= 0 || h_k <= 0 || h_v <= 0 || h_v % h_k) fail("gdn_step_tune: invalid arguments");
