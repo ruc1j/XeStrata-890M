@@ -34,7 +34,7 @@ The processor's own graphics (a UHD 770 on the development machine) is a second,
 ## A review of the 890M's decode
 
 One window of Qwen3.8-Flash-Next's decode was timed stage by stage, candidates for a faster window were listed for each stage, and they were implemented and measured one at a time, the largest expected gain first (2026-11-16 and 17).
-Sixteen changes went in. The 890M's decode of the greedy six chats (IQ2_XS, `--spec 4`, `--max-context 32768`, three interleaved rounds) went from 35.33, 36.49 and 36.43 tok/s to 41.06, 40.93 and 41.04 tok/s (36.08 to 41.01 on average, +13.7%). The answers are the same as before.
+Twenty-three changes went in. The 890M's decode of the greedy six chats (IQ2_XS, `--spec 4`, `--max-context 32768`, three interleaved rounds) went from 36.40, 36.02 and 36.50 tok/s to 41.90, 41.84 and 42.03 tok/s (36.31 to 41.92 on average, +15.5%). The answers are the same as before.
 Each change is either chosen from what the device reports (an integrated GPU, the HIP backend) or gives the same bits on every GPU.
 
 ### One window's time by stage
@@ -101,6 +101,21 @@ With these eight in, the stages were timed again and the candidates searched twi
 
 With the later eight the decode is 38.82 → 41.01 tok/s (+5.6%) against the first eight alone, three interleaved rounds.
 
+After that the gfx1150 ISA of the main kernels was read beside the source for waits and reads the source does not ask for, and seven more changes went in. All of them give the same bits.
+
+- The hyper-connection read's up: for each of a lane's two rows it read every token's lo (10 float4) from local memory; a store of the first row's result sat between them, so the compiler could not drop the second row's reads. Each token's lo is now read once for both rows.
+  The local-memory reads go from 112 to 72 with four rows; as a kernel on its own a three-row read goes 103.6 → 99.2 us, decode 40.49 → 40.89 tok/s (+1.0%, four rounds).
+- IQ2_S's sign mask: the compiler turned the expression that spreads the sign bits into a byte mask back into a 32-bit multiply (quarter rate on gfx11), eight of them a step of a gate/up row. The AMD device compile now builds the mask with a subtract and an xor.
+  As a kernel on its own the experts of a three-row window go 441.2 → 438.1 us.
+- The expert rows' addresses: the rows of an integrated GPU on the HIP backend derived each step's block and sub-block with a divide and a modulo and its place with a multiply. A lane's sub-block is the same for every step, so it is computed once a lane and a step is a constant further on.
+  As a kernel on its own the gate/up rows' change gives 438.2 → 432.8 us and the down rows' 432.2 → 429.3 us more; decode 41.52 → 41.92 tok/s (+1.0%, four rounds).
+- The hyper-connection read's down: where the rows' sums are spread over the sub-group, a conditional between two elements of an array had become a compare and a select for each of 16 elements. Both values are now taken first and then chosen. As a kernel on its own a four-row read goes 102.9 → 102.2 us.
+- The GDN quantization: in the closing norm and quantization kernel the loop of the two sub-group reductions was not unrolled, and the branch that picks the exchange instruction stayed at run time. Unrolled, the kernel goes from 537 lines to 366.
+- The experts' barriers: the gate/up and the down kernels of an integrated GPU on the HIP backend no longer take a barrier the data flow does not need (the first of a chunk of entries).
+- The plan of a layer: the plan kernel of a window with every expert in the cache read the experts' numbers twice; it is one pass now, and the total is no longer reduced a second time.
+
+With these seven the decode is 40.99 → 41.92 tok/s (+2.3%) against the sixteen before them, three interleaved rounds.
+
 ### What did not go in
 
 - Reading the PLE rows after the launch in the window graph that does not ask the host was slower, 37.25 → 37.01 tok/s.
@@ -111,6 +126,10 @@ With the later eight the decode is 38.82 → 41.01 tok/s (+5.6%) against the fir
 - Writing the GDN state back after the pending rows under the window's rows made no difference as a kernel on its own (a three-row step with three pending rows 110.8 us and 114.8 us).
 - `GPU_MAX_HW_QUEUES=8` gave 38.75 → 37.12 tok/s (-4.2%), and `ROC_ACTIVE_WAIT_TIMEOUT=50` 38.75 → 38.80 tok/s, no difference; neither went in.
 - Dropping the non-temporal hint from the loads of the Q2_0 down rows made no difference, 39.07 → 39.05 tok/s.
+- The ROCm runtime's settings (`DEBUG_HIP_DYNAMIC_QUEUES=0`, `DEBUG_HIP_FORCE_GRAPH_QUEUES`, `DEBUG_CLR_GRAPH_PACKET_CAPTURE`, `DEBUG_CLR_BATCH_CPU_SYNC_SIZE=1`) and `STRATA_WAIT_SLEEP_US=20` all stayed within the noise, 40.7 to 41.3 tok/s. A higher priority for the window's queue gave -0.6%.
+- In the expert rows, five loads instead of six in a down row (440.9 → 443.2 us with three rows), 64 rows a gate/up work-group (slower up to four rows, faster only with six) and the entries' test as a break of the loop (431.0 → 645.8 us) were none of them faster.
+- Writing the GDN step's state back through a pointer of its own took the registers from 126 to 64 but made no difference, as a kernel on its own or in decode.
+- Issuing the attention kernel's q and merge reads together was lower in decode in four rounds of four (by 0.02 to 0.49 tok/s). Dispatching the inject block first in the hyper-connection read made no difference.
 - The candidates that lower the precision (a two-stage output head, hyper-connection weights below 8 bits, the router in Q8_0 and others, seven in all) were not tried: the check that a kernel matches the CPU reference does not apply to them.
 
 What was checked: the free and contrib-llvm builds, CTest (in both, all but the two tests that have no pack pass), and that `tools/lint/run.sh` gives no new findings.
