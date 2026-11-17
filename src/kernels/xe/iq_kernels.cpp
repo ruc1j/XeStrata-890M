@@ -1199,18 +1199,20 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
                     const int qh = (int) (rc[u] & 0xFF);
                     w.ls0 = (int) ((rc[u] >> 8) & 0x0F);
                     w.ls1 = (int) (rc[u] >> 12);
+                    // the signed grid bytes are kept, not the bytes and their sign mask: dot_masked's operand,
+                    // made once here (signed_grid), and its mask 0
                     for (int l0 = 0; l0 < 8; l0 += 2) {
                         const Int2 grid_pos = grid_pair(gsrc, byte_of(ra[u], l0 / 2) | ((qh << (8 - l0)) & 0x300));
                         const uint32_t s8 = byte_of(rb[u], l0 / 2);
-                        w.g[l0] = grid_pos.x; w.m[l0] = sign_mask(s8);
-                        w.g[l0 + 1] = grid_pos.y; w.m[l0 + 1] = sign_mask(s8 >> 4);
+                        w.g[l0] = (int) signed_grid((uint32_t) grid_pos.x, s8); w.m[l0] = 0;
+                        w.g[l0 + 1] = (int) signed_grid((uint32_t) grid_pos.y, s8 >> 4); w.m[l0 + 1] = 0;
                     }
                 } else {
                     for (int k2 = 0; k2 < 8; k2 += 2) {
                         const Int2 grid_pos = grid_pair(gsrc, byte_of(ra[u], k2 / 2));
                         const uint32_t s8 = ksigns_byte((uint8_t) (rb[u] >> (7 * k2 / 2)));
-                        w.g[k2] = grid_pos.x; w.m[k2] = sign_mask(s8);
-                        w.g[k2 + 1] = grid_pos.y; w.m[k2 + 1] = sign_mask(s8 >> 4);
+                        w.g[k2] = (int) signed_grid((uint32_t) grid_pos.x, s8); w.m[k2] = 0;
+                        w.g[k2 + 1] = (int) signed_grid((uint32_t) grid_pos.y, s8 >> 4); w.m[k2 + 1] = 0;
                     }
                     w.ls = (int) (rb[u] >> 27 | 1);
                 }

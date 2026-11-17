@@ -79,10 +79,29 @@ inline Int2 grid_pair(const uint64_t* grid, int index) {
     const uint64_t g = grid[index];
     return {(int) (uint32_t) g, (int) (uint32_t) (g >> 32)};
 }
-// four sign bits as a 0xFF byte mask each
-inline uint32_t sign_mask(uint32_t nib) {   // (t << 8) - t is t * 0xFF: two full-rate instructions, not a quarter-rate multiply (gfx11)
-    const uint32_t t = ((nib & 0xF) * 0x00204081u) & 0x01010101u;
+// four sign bits as a 0x01 byte each
+inline uint32_t sign_ones(uint32_t nib) { return ((nib & 0xF) * 0x00204081u) & 0x01010101u; }
+// four sign bits as a 0xFF byte mask each.  (t << 8) - t is t * 0xFF, and the compiler writes it as that multiply: on
+// gfx11 a quarter-rate 32-bit one (t's bit 24 can be set, so not the 24-bit multiply), 8 a step of an IQ2_S row
+// (the gfx1150 ISA, 2026-11-17).  There each byte is taken from 0x80 instead (0x80 or 0x7F, no borrow across the
+// bytes) and its high bit flipped: a subtract and an xor.
+inline uint32_t sign_mask(uint32_t nib) {
+    const uint32_t t = sign_ones(nib);
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+    return (0x80808080u - t) ^ 0x80808080u;
+#else
     return (t << 8) - t;
+#endif
+}
+// The grid bytes g with the sign bits of nib applied (-g where a bit is set): dot_masked's operand, (g ^ m) + t, for a
+// decode that keeps the signed bytes instead of the mask (dot_masked then gets the mask 0).
+inline uint32_t signed_grid(uint32_t g, uint32_t nib) {
+    const uint32_t t = sign_ones(nib);
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+    return (g ^ ((0x80808080u - t) ^ 0x80808080u)) + t;
+#else
+    return (g ^ ((t << 8) - t)) + t;
+#endif
 }
 
 // Q2_0's four 2-bit codes of a byte (the lowest first) as four signed bytes code - 1: the bytes CUDA's __byte_perm
