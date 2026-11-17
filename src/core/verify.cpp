@@ -1442,6 +1442,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             return e == nullptr || std::strtol(e, nullptr, 10) != 0;
         }();
         bool g_ready = false;   // the shared expert's raw gates came with the router's launch
+        // XeStrata-890M: the top-10 in the launch that builds the resident plan (resident_plan_top10: a launch a layer
+        // less), where the plan is built on the device and nothing reads or changes the routing between the two.
+        // STRATA_PLAN_FUSE=0: the two launches.
+        static const bool plan_fuse = [] {
+            const char* e = std::getenv("STRATA_PLAN_FUSE");
+            return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+        }();
+        bool top10_in_plan = false;
         bool qdedup = false;    // the experts' q8_1 image of the input was made before the shared expert
         // STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): the top-10 picked again with a
         // logit bonus for the resident experts; the weights stay the router's (router.cpp)
@@ -1495,8 +1503,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     native_router_top10_publish(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm, (int64_t) n * N,
                                                 m_x_ + tb * N, m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs, (int) NE);
                     published = true;
-                } else
-                    native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs, (int) NE);
+                } else {
+                    top10_in_plan = plan_fuse && (device_plan_ || recording_res_) && route_prior <= 0.0f &&
+                                    route_resident_cfg().margin <= 0.0f && verify_ecap_cap() <= (int) K &&
+                                    !(rs_on_ && G == 1 && n <= 8 && T <= 8) && !rt_replay_ &&
+                                    resident_plan_top10_takes(n, (int) NE, (int) K);
+                    if (!top10_in_plan)
+                        native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs, (int) NE);
+                }
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {
@@ -1558,7 +1572,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                  (const int32_t*) (m_rpl_w_ + ((size_t) l * (size_t) MT + (size_t) tb) * (size_t) K),
                                  (int64_t) n * K, cs);
         }
-        if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
+        if (top10_in_plan)   // the top-10 and the plan in one launch (plan_fuse above)
+            resident_plan_top10(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, hits_.d_res + l * g.n_expert,
+                                (int) g.n_expert, hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                                plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
+                                (uint32_t) ((l - lb_) * G + grp + 1), cs, expert_keep, expert_ser.first,
+                                expert_ser.second);
+        else if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,

@@ -11,6 +11,7 @@
 // device-clock ticks, not the nanoseconds of CUDA's %globaltimer.
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/gdn.hpp"
+#include "router_top10_token.hpp"
 #include "xe_shuffle.hpp"
 #include "cuda_intrinsics.hpp"
 #include "strata/core/runtime.hpp"
@@ -1174,9 +1175,127 @@ void verify_stop_guard(float* logits, int T, int n_vocab, const int32_t* stop, i
     done(stream, e, "verify_stop_guard");
 }
 
-void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
-                   const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
-                   uint32_t ring, void* stream, int keep, float* w, int ser_kmin, float ser_t) {
+namespace {
+// resident_plan's arguments, as its kernels capture them
+struct ResidentPlan {
+    const int32_t* ids;
+    int n, k;
+    const int32_t* res;
+    int n_expert;
+    const uint8_t* cache_base;
+    const unsigned long long* slot_off;
+    long long blob;
+    int32_t* pl;
+    long long capx;
+    uint32_t* skip;
+    uint32_t ring;
+    int keep;
+    float* w;
+    bool ser_on;
+    int ser_kmin;
+    float ser_t;
+};
+
+// One work-item per entry (at most kVerifyMaxT * 10 of them; one work-item alone grouped them in ~70 us a layer,
+// upstream 882764d).  The plan is the host loop's exactly: groups in order of first occurrence, entries in a group
+// in index order.  Entry i: L = its expert's first index; its group = the first occurrences before L; the group
+// starts at the number of entries whose leader is before L; its place in it = the earlier entries with leader L.
+template <int WG>
+inline void resident_plan_group(const sycl::nd_item<1>& it, const ResidentPlan& a,
+                                const sycl::local_accessor<int32_t, 1>& s_ids,
+                                const sycl::local_accessor<int32_t, 1>& s_excl) {
+    const int32_t* const ids = a.ids;
+    const int n = a.n, k = a.k, n_expert = a.n_expert, keep = a.keep, ser_kmin = a.ser_kmin;
+    const int32_t* const res = a.res;
+    const uint8_t* const cache_base = a.cache_base;
+    const unsigned long long* const slot_off = a.slot_off;
+    const long long blob = a.blob, capx = a.capx;
+    int32_t* const pl = a.pl;
+    uint32_t* const skip = a.skip;
+    const uint32_t ring = a.ring;
+    float* const w = a.w;
+    const bool ser = a.ser_on;
+    const float ser_t = a.ser_t;
+    const auto grp = it.get_group();
+    const int t = (int) it.get_local_id(0);
+    bool use = t < n && t % k < keep;
+    if (ser && use && t % k >= ser_kmin) use = w[t] >= ser_t * w[t - t % k];   // read before any rescale
+    bool bad = false;
+    if (t < n) {
+        const int32_t ex = ids[t];
+        s_ids[t] = use ? ex : -1;   // a left-out entry joins no group
+        bad = use && (ex < 0 || ex >= n_expert || res[ex] < 0);
+    }
+    if (sycl::any_of_group(grp, bad)) {
+        if (t == 0) *skip = 0;
+        return;
+    }
+    if ((keep < k || ser) && w != nullptr) {
+        sycl::group_barrier(grp);   // every entry's `use` (s_ids) is written, and no weight is read any more
+        if (t < n && t % k == 0) {   // one work-item a token: its weights
+            float all = 0.0f, kept = 0.0f;
+            for (int j = 0; j < k; ++j) { all += w[t + j]; if (s_ids[t + j] >= 0) kept += w[t + j]; }
+            const float scale = kept > 0.0f ? all / kept : 1.0f;
+            for (int j = 0; j < k; ++j) w[t + j] = s_ids[t + j] >= 0 ? w[t + j] * scale : 0.0f;
+        }
+    }
+    // an entry's leader L (its expert's first index) and, for a leader, its entry count; then one scan of
+    // (entries << 16 | 1) over the leaders numbers the groups and gives their starts (upstream fe4de5de)
+    // (one pass over the ids gives the leader, the count and the place: a search for the leader first read
+    // them a second time, one id a trip)
+    int L = t, cnt = 0, pos = 0;
+    if (use) {
+        int first = t, all = 0;
+        for (int j = 0; j < n; ++j) {
+            const bool eq = s_ids[j] == s_ids[t];
+            all += eq ? 1 : 0;
+            pos += eq && j < t ? 1 : 0;
+            if (eq && j < first) first = j;
+        }
+        L = first;
+        cnt = L == t ? all : 0;
+    }
+    const int pack = L == t && use ? (cnt << 16) | 1 : 0;
+    const int excl = sycl::exclusive_scan_over_group(grp, pack, sycl::plus<int>());
+    s_excl[t] = excl;
+    if (t == WG - 1) s_excl[WG] = excl + pack;   // the total, which only work-item 0 reads (no second reduction)
+    sycl::group_barrier(grp);
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = reinterpret_cast<unsigned long long*>(pl + ptr_off);
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+    if (use) {
+        const int le = s_excl[L];
+        const int g = le & 0xffff, gstart = le >> 16;
+        dst[gstart + pos] = t;
+        tok[gstart + pos] = t / k;
+        if (L == t) {
+            const int32_t slot = res[s_ids[t]];
+            ptr[g] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+            start[g] = gstart;
+        }
+    }
+    sycl::group_barrier(grp);
+    if (t != 0) return;
+    const int total = s_excl[WG];
+    const int n_used = (int) (total >> 16);
+    const int groups = total & 0xffff;
+    start[groups] = n_used;
+    start2[0] = n_used;
+    counts[0] = groups;
+    counts[1] = n_used;
+    counts[2] = 0;
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+    *skip = ring;
+}
+
+ResidentPlan resident_plan_args(const int32_t* ids, int n, int k, const int32_t* res, int n_expert,
+                                const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+                                int32_t* pl, long long capx, uint32_t* skip, uint32_t ring, int keep, float* w,
+                                int ser_kmin, float ser_t) {
     // XeStrata-890M (keep < k, STRATA_EXPERT_KEEP): each token's experts past rank `keep` are left out of the plan and
     // their weights set to 0, the kept ones scaled to the token's old sum (the router ranks them by weight, first the
     // largest).  An approximation: it changes the output.
@@ -1184,95 +1303,71 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
     // its Kmin heaviest experts, and past them only those whose weight is at least t times its heaviest one; the
     // weights are rescaled as with keep.  Also an approximation.
     if (keep <= 0 || keep > k) keep = k;
-    const bool ser = ser_kmin > 0 && ser_t > 0.0f && w != nullptr;
-    if (ser && ser_kmin > k) ser_kmin = k;
-    // One work-item per entry (at most kVerifyMaxT * 10 of them; one work-item alone grouped them in ~70 us a layer,
-    // upstream 882764d).  The plan is the host loop's exactly: groups in order of first occurrence, entries in a group
-    // in index order.  Entry i: L = its expert's first index; its group = the first occurrences before L; the group
-    // starts at the number of entries whose leader is before L; its place in it = the earlier entries with leader L.
+    const bool ser_on = ser_kmin > 0 && ser_t > 0.0f && w != nullptr;
+    if (ser_on && ser_kmin > k) ser_kmin = k;
+    return {ids, n, k, res, n_expert, cache_base, slot_off, blob, pl, capx, skip, ring, keep, w, ser_on, ser_kmin, ser_t};
+}
+
+// XeStrata-890M: the router's top-10 of n_tok tokens (router.cpp's top10_token, one sub-group a token) and their plan
+// in one work-group: the first n_tok sub-groups write ids and w, and behind a barrier the group builds the plan from
+// them as resident_plan does.  WG: whole sub-groups for the tokens (128 work-items for up to 4, 256 for up to 8).
+template <int WG, int NPL>
+sycl::event launch_resident_plan_top10(sycl::queue& q, const float* logits, int32_t* ids, float* w, int n_tok,
+                                       const ResidentPlan& a) {
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
+        sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG + 1), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int tk = (int) sg.get_group_linear_id();
+            if (tk < n_tok)
+                router_detail::top10_token<NPL>(sg, logits + (size_t) tk * NPL * 32, ids + (size_t) tk * 10, w + (size_t) tk * 10,
+                                                nullptr,
+                                                nullptr);
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+            sycl::group_barrier(it.get_group());
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+            resident_plan_group<WG>(it, a, s_ids, s_excl);
+        });
+    });
+}
+}  // namespace
+
+void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
+                   const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
+                   uint32_t ring, void* stream, int keep, float* w, int ser_kmin, float ser_t) {
     constexpr int WG = 128;
     if (n > WG) throw std::invalid_argument("resident_plan: more entries than a work-group");
+    const ResidentPlan a = resident_plan_args(ids, n, k, res, n_expert, cache_base, slot_off, blob, pl, capx, skip, ring,
+                                              keep, w, ser_kmin, ser_t);
     const auto e = Q(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
         sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG + 1), h);   // + 1: the scan's total
-        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
-            const auto grp = it.get_group();
-            const int t = (int) it.get_local_id(0);
-            bool use = t < n && t % k < keep;
-            if (ser && use && t % k >= ser_kmin) use = w[t] >= ser_t * w[t - t % k];   // read before any rescale
-            bool bad = false;
-            if (t < n) {
-                const int32_t ex = ids[t];
-                s_ids[t] = use ? ex : -1;   // a left-out entry joins no group
-                bad = use && (ex < 0 || ex >= n_expert || res[ex] < 0);
-            }
-            if (sycl::any_of_group(grp, bad)) {
-                if (t == 0) *skip = 0;
-                return;
-            }
-            if ((keep < k || ser) && w != nullptr) {
-                sycl::group_barrier(grp);   // every entry's `use` (s_ids) is written, and no weight is read any more
-                if (t < n && t % k == 0) {   // one work-item a token: its weights
-                    float all = 0.0f, kept = 0.0f;
-                    for (int j = 0; j < k; ++j) { all += w[t + j]; if (s_ids[t + j] >= 0) kept += w[t + j]; }
-                    const float scale = kept > 0.0f ? all / kept : 1.0f;
-                    for (int j = 0; j < k; ++j) w[t + j] = s_ids[t + j] >= 0 ? w[t + j] * scale : 0.0f;
-                }
-            }
-            // an entry's leader L (its expert's first index) and, for a leader, its entry count; then one scan of
-            // (entries << 16 | 1) over the leaders numbers the groups and gives their starts (upstream fe4de5de)
-            // (one pass over the ids gives the leader, the count and the place: a search for the leader first read
-            // them a second time, one id a trip)
-            int L = t, cnt = 0, pos = 0;
-            if (use) {
-                int first = t, all = 0;
-                for (int j = 0; j < n; ++j) {
-                    const bool eq = s_ids[j] == s_ids[t];
-                    all += eq ? 1 : 0;
-                    pos += eq && j < t ? 1 : 0;
-                    if (eq && j < first) first = j;
-                }
-                L = first;
-                cnt = L == t ? all : 0;
-            }
-            const int pack = L == t && use ? (cnt << 16) | 1 : 0;
-            const int excl = sycl::exclusive_scan_over_group(grp, pack, sycl::plus<int>());
-            s_excl[t] = excl;
-            if (t == WG - 1) s_excl[WG] = excl + pack;   // the total, which only work-item 0 reads (no second reduction)
-            sycl::group_barrier(grp);
-            int32_t* counts = pl;
-            int32_t* start = pl + 4;
-            int32_t* dst = start + capx + 1;
-            int32_t* tok = dst + capx;
-            const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
-            unsigned long long* ptr = reinterpret_cast<unsigned long long*>(pl + ptr_off);
-            int32_t* start2 = pl + ptr_off + 4 * capx;
-            if (use) {
-                const int le = s_excl[L];
-                const int g = le & 0xffff, gstart = le >> 16;
-                dst[gstart + pos] = t;
-                tok[gstart + pos] = t / k;
-                if (L == t) {
-                    const int32_t slot = res[s_ids[t]];
-                    ptr[g] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
-                    start[g] = gstart;
-                }
-            }
-            sycl::group_barrier(grp);
-            if (t != 0) return;
-            const int total = s_excl[WG];
-            const int n_used = (int) (total >> 16);
-            const int groups = total & 0xffff;
-            start[groups] = n_used;
-            start2[0] = n_used;
-            counts[0] = groups;
-            counts[1] = n_used;
-            counts[2] = 0;
-            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-            *skip = ring;
-        });
+        h.parallel_for(sycl::nd_range<1>(WG, WG),
+                       [=](sycl::nd_item<1> it) { resident_plan_group<WG>(it, a, s_ids, s_excl); });
     });
     done(stream, e, "resident_plan");
+}
+
+bool resident_plan_top10_takes(int n_tok, int n_expert, int k) {
+    return n_tok >= 1 && n_tok <= 8 && k == 10 && (n_expert == 512 || n_expert == 256);
+}
+
+void resident_plan_top10(const float* logits, int32_t* ids, float* w, int n_tok, const int32_t* res, int n_expert,
+                         const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* pl,
+                         long long capx, uint32_t* skip, uint32_t ring, void* stream, int keep, int ser_kmin,
+                         float ser_t) {
+    if (!resident_plan_top10_takes(n_tok, n_expert, 10) || logits == nullptr || ids == nullptr || w == nullptr)
+        throw std::invalid_argument("resident_plan_top10: 1..8 tokens, 256 or 512 experts, top 10");
+    const ResidentPlan a = resident_plan_args(ids, n_tok * 10, 10, res, n_expert, cache_base, slot_off, blob, pl, capx,
+                                              skip, ring, keep, w, ser_kmin, ser_t);
+    auto& q = Q(stream);
+    const auto e = n_expert == 512
+        ? (n_tok <= 4 ? launch_resident_plan_top10<128, 16>(q, logits, ids, w, n_tok, a)
+                      : launch_resident_plan_top10<256, 16>(q, logits, ids, w, n_tok, a))
+        : (n_tok <= 4 ? launch_resident_plan_top10<128, 8>(q, logits, ids, w, n_tok, a)
+                      : launch_resident_plan_top10<256, 8>(q, logits, ids, w, n_tok, a));
+    done(stream, e, "resident_plan_top10");
 }
 
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
