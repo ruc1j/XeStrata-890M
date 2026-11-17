@@ -1124,6 +1124,10 @@ if(STRATA_ENABLE_XE)
     # as in the CUDA build)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels)
+    # STRATA_PA_FAST (gfx1150, after Strata-rdna3): the single-FP16 q and p against the bound derived for them; on other
+    # devices the variable changes nothing and the bound holds all the same
+    add_test(NAME qsa_prompt_attn_parity_pa_fast
+             COMMAND ${CMAKE_COMMAND} -E env STRATA_PA_FAST=1 $<TARGET_FILE:qsa_prompt_attn_parity> 8192 512 1)
     # the decode attention over every cell (Ornith-1.5's, Qwen3.5-9B's and llm-jp-4.1's full attention) against FP64
     # (synthetic)
     add_executable(qsa_dense_attn_parity src/kernels/qsa_dense_attn_parity.cpp)
