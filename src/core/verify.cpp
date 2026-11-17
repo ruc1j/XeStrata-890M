@@ -1212,6 +1212,15 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     return e == nullptr || std::strtol(e, nullptr, 10) != 0;
                 }();
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
+                // XeStrata-890M: the gate and the q8_1 image of the gated rows as the tail of the attention's merge
+                // launch (qsa_decode_attn_gate_q8_batch: two launches a QSA layer less; the same bytes in xq_), where
+                // nothing sits between the three: no rotated K/V (its transform back runs on attn_) and no stage
+                // stamps.  STRATA_QSA_MERGE_FUSE=0: the three launches.
+                static const bool merge_fuse = [] {
+                    const char* e = std::getenv("STRATA_QSA_MERGE_FUSE");
+                    return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+                }();
+                const bool merge_gq = merge_fuse && qb && !st.kv_rot && !st.kv_hybrid && !prof_on_ && !batch_rec_;
                 if (!mixed_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 // the query side on branches (upstream 2e4ddf6e): q with its split, norm, RoPE and rotation on side 0, the
                 // indexer query on side 1, beside the K/V side; side 1 joins before the block scores, side 0 before
@@ -1408,11 +1417,20 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 stamp(l, 12, grp);
                 const QsaAttnPools pools = qsa_attn_pools(st);
                 if (qbr && !join(0)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
+                if (merge_gq)
+                    qsa_decode_attn_gate_q8_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_,
+                                                  step_ + (size_t) tb * kStepCount, cap_, s,
+                                                  attn_scratch_ + (size_t) tb * attn_scratch_floats_,
+                                                  qfull_ + tb * NH * 2 * HD, xq_, n, cs);
+                else
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
                 stamp(l, 13, grp);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
+                if (merge_gq) {
+                    // gated and quantized in the merge's launch
+                } else
                 if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
                                               (int) (n * NH), (int) HD, cs);
                 else
@@ -1424,7 +1442,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                         qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
                 }
                 stamp(l, 14, grp);
-                native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
+                if (!merge_gq) native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
             }
         } catch (const std::exception& e) {

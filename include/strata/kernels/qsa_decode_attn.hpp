@@ -46,6 +46,14 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
+/// XeStrata-890M: qsa_decode_attn_batch with the decode window's next two launches in its merge launch: every
+/// attention value times the sigmoid of its gate (native_qsa_gate_apply over q_full [n_q, n_head, 2 * head_dim]) and
+/// the gated rows' q8_1 image (native_quantize_q8_1 of n_q rows of n_head * head_dim values) into xq.  The three
+/// launches' bytes; attn itself is not stored.
+void qsa_decode_attn_gate_q8_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                   int64_t cap, const QsaShapes& s, float* scratch, const float* q_full, void* xq,
+                                   int64_t n_q, void* stream);
+
 /// The same kernels over EVERY cell of the cache, cells [0, step[kStepNKv]), with no selection: the full attention of
 /// qwen35moe (Ornith-1.5: 16/2 heads of 256), qwen35 (Qwen3.5-9B: 16/4 heads of 256) and qwen3moe (llm-jp-4.1: 40/4
 /// heads of 128).  `max_cells` is the cache's capacity and sizes the grid (`qsa_decode_attn_scratch_floats(max_cells,

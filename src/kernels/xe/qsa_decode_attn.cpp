@@ -13,6 +13,7 @@
 // stay fused (sycl::fma), and the library's -ffp-contract=off leaves every other multiply-add as written.
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "xe_shuffle.hpp"
+#include "q8_1_finite.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/per_device.hpp"
@@ -383,6 +384,54 @@ sycl::event launch_merge(sycl::queue& queue, const float* part_acc_all, const fl
     });
 }
 
+// XeStrata-890M: launch_merge with the two launches that follow it in a decode window as its tail: the gate
+// (native_qsa_gate_apply's expression on the merged value) and the q8_1 image of the gated rows
+// (native_quantize_q8_1_rows' block: a work-group is one head of HD values, whole 32-value blocks, a sub-group each).
+// The same arithmetic on the same values, so xq has the three launches' bytes; attn itself is not stored.
+template <int HD, int G>
+sycl::event launch_merge_gate_q8(sycl::queue& queue, const float* part_acc_all, const float* part_m_all,
+                                 const float* part_l_all, int n_chunks, size_t n_head, size_t n_q,
+                                 long long scratch_stride, const float* q_full, uint8_t* xq) {
+    return queue.parallel_for(sycl::nd_range<2>({n_q, n_head * HD}, {1, HD}),
+                              [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const size_t y = it.get_group(0);
+        const float* part_acc = part_acc_all + y * (size_t) scratch_stride;
+        const float* part_m = part_m_all + y * (size_t) scratch_stride;
+        const float* part_l = part_l_all + y * (size_t) scratch_stride;
+        const int h = (int) it.get_group(1);                 // global query head
+        const int kvh = h / G, hl = h % G;
+        const int d = (int) it.get_local_id(1);
+        float M = -FLT_MAX;
+        for (int c = 0; c < n_chunks; ++c) M = sycl::fmax(M, part_m[(kvh * n_chunks + c) * G + hl]);
+        float L = 0.0f, acc = 0.0f;
+        for (int c = 0; c < n_chunks; ++c) {
+            const int slot = kvh * n_chunks + c;
+            const float m = part_m[slot * G + hl];
+            if (m == -FLT_MAX) continue;
+            const float w = sycl::exp(m - M);
+            L = sycl::fma(part_l[slot * G + hl], w, L);
+            acc = sycl::fma(part_acc[((size_t) slot * G + hl) * HD + d], w, acc);
+        }
+        const float a = L > 0.0f ? acc / L : 0.0f;
+        // the gate: the head's second half of q_full
+        const size_t head = y * n_head + (size_t) h;
+        const float raw = q_full[head * 2 * HD + HD + d];
+        const float sigmoid = 1.0f / (1.0f + sycl::exp(-raw));
+        const float o = a * sigmoid;
+        // the q8_1 block of the 32 values of this sub-group
+        const sycl::sub_group sg = it.get_sub_group();
+        const float amax = warp_max(sg, sycl::fabs(o));
+        const float sum = warp_sum(sg, o);
+        const float ds = xe::q8_1_finite(amax / 127.0f);
+        const int8_t qv = xe::q8_1_quant(o, ds, amax);
+        const size_t i = head * HD + (size_t) d;
+        uint8_t* const block = xq + (i / 32) * 36;
+        reinterpret_cast<int8_t*>(block + 4)[i % 32] = qv;
+        if (i % 32 == 0)
+            *reinterpret_cast<sycl::half2*>(block) = sycl::half2(sycl::half(ds), sycl::half(xe::q8_1_finite(sum)));
+    });
+}
+
 // The work-groups a KV head's cells are spread over (a slot each; chunk c to slot c % slots, in turn): every chunk its
 // own unless the chunks are at least twice what the GPU's compute units hold (8 groups a unit, all queries' and KV
 // heads' together), then that many slots, each reading its chunks in turn, and the merge reads fewer partials.  The
@@ -436,7 +485,8 @@ int nc_of(sycl::queue& q) {
 
 template <int HD, int G>
 void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-               const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream) {
+               const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream,
+               const float* q_full = nullptr, uint8_t* xq = nullptr) {
     const int kv_mode = kv_mode_of(pools);
     auto& queue = queue_for(stream);
     const int nkv = (int) s.n_head_kv, ps = (int) s.page_size;
@@ -452,7 +502,9 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     else
         launch_kv<HD, G, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
                                 n_slots, n_q, (int) cap, stride);
-    const auto e = launch_merge<HD, G>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q, stride);
+    const auto e = xq != nullptr
+        ? launch_merge_gate_q8<HD, G>(queue, part_acc, part_m, part_l, n_slots, (size_t) s.n_head, n_q, stride, q_full, xq)
+        : launch_merge<HD, G>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q, stride);
     if (!stream) core::Runtime::get().wait(e, "qsa_decode_attn");
 }
 
@@ -465,12 +517,16 @@ bool shape_ok(const QsaShapes& s) {
 }
 
 void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-         const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream) {
+         const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream,
+         const float* q_full = nullptr, uint8_t* xq = nullptr) {
     const int64_t g = s.n_head / s.n_head_kv;
-    if (s.head_dim == 256 && g == 12) run_shape<256, 12>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
-    else if (s.head_dim == 256 && g == 8) run_shape<256, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
-    else if (s.head_dim == 256 && g == 4) run_shape<256, 4>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
-    else run_shape<128, 10>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
+    if (s.head_dim == 256 && g == 12)
+        run_shape<256, 12>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, q_full, xq);
+    else if (s.head_dim == 256 && g == 8)
+        run_shape<256, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, q_full, xq);
+    else if (s.head_dim == 256 && g == 4)
+        run_shape<256, 4>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, q_full, xq);
+    else run_shape<128, 10>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, q_full, xq);
 }
 
 // qsa_dense_attn_tune's timing: the fp16 score loop's NC = 2, 4 and 8 over `cells` cells of a dummy cache, as the
@@ -577,6 +633,17 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         throw core::DeviceError("qsa_decode_attn_batch: unsupported geometry (" + shape_name(s) + ") or missing buffers");
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
     run(q, pools, ids, steps, cap, s, scratch, attn, (size_t) n_q, (long long) qsa_decode_attn_scratch_floats(cap, s), stream);
+}
+
+void qsa_decode_attn_gate_q8_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                                   int64_t cap, const QsaShapes& s, float* scratch, const float* q_full, void* xq,
+                                   int64_t n_q, void* stream) {
+    if (n_q <= 0) return;
+    if (!shape_ok(s) || cap <= 0 || !scratch || !ids || !steps || !pools.page_table || n_q > 65535 || !q_full || !xq)
+        throw core::DeviceError("qsa_decode_attn_gate_q8_batch: unsupported geometry (" + shape_name(s) +
+                                ") or missing buffers");
+    run(q, pools, ids, steps, cap, s, scratch, nullptr, (size_t) n_q, (long long) qsa_decode_attn_scratch_floats(cap, s),
+        stream, q_full, static_cast<uint8_t*>(xq));
 }
 
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {

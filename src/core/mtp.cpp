@@ -867,11 +867,21 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         }
         const QsaAttnPools pools = qsa_attn_pools(st_);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
-        qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
-        if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
-        for (int t = 0; t < T; ++t)
-            native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int) NH, (int) HD, cs);
-        native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
+        // XeStrata-890M: the gate and the q8_1 image as the tail of the merge's launch, as in the verify window
+        // (STRATA_QSA_MERGE_FUSE=0: the launches of their own); a rotated K/V transforms attn_ back in between
+        static const bool merge_fuse = [] {
+            const char* e = std::getenv("STRATA_QSA_MERGE_FUSE");
+            return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+        }();
+        if (merge_fuse && !st_.kv_rot) {
+            qsa_decode_attn_gate_q8_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, qfull_, xq_, T, cs);
+        } else {
+            qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+            if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
+            for (int t = 0; t < T; ++t)
+                native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int) NH, (int) HD, cs);
+            native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
+        }
         native_mmvq(q8_type("self_attn.o_proj.weight"), q8("self_attn.o_proj.weight"), xq_, bo_, (int) (NH * HD), (int) N, T, cs);
         // ---- the MLP hyper-connection (the attention write folded in)
         {
