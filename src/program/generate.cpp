@@ -156,18 +156,17 @@
 #include <vector>
 
 namespace {
-// The prompt path's chunk buffers a token, for the room kept out of an expert cache sized here: 680 KiB at
-// Qwen3.8-Flash-Next's shape (what its buffers come to).  Another shape's are not counted buffer by buffer: the figure
-// grows by the widest of the compiled shape's widths (core/geometry.hpp) over Qwen3.8-Flash-Next's - the residual
-// streams (n_embd), the attention rows (n_head head_dim), the DeltaNet's value rows and the experts' inner width - so
-// it errs to the roomy side there, and is 680 at Qwen3.8-Flash-Next's own.
-constexpr int64_t prefill_kib_per_token(const strata::core::ModelGeometry& g, const strata::core::ModelGeometry& base) {
-    const int64_t kib = 680;
-    return std::max({kib * g.n_embd / base.n_embd, kib * (g.n_head * g.head_dim) / (base.n_head * base.head_dim),
-                     kib * g.ssm_value_dim / base.ssm_value_dim, kib * g.n_ff / base.n_ff});
+// Whether the prompt path's buffers have Qwen3.8-Flash-Next's widths (core/geometry.hpp's defaults), the shape
+// upstream's figure for them was made for (own_prefill_mib): every width prefill.cpp sizes a buffer by.
+constexpr bool prefill_widths_equal(const strata::core::ModelGeometry& a, const strata::core::ModelGeometry& b) {
+    return a.n_embd == b.n_embd && a.hc == b.hc && a.hc_lr == b.hc_lr && a.n_expert == b.n_expert &&
+           a.n_expert_used == b.n_expert_used && a.n_ff == b.n_ff && a.ssm_conv_channels == b.ssm_conv_channels &&
+           a.ssm_value_dim == b.ssm_value_dim && a.ssm_v_heads == b.ssm_v_heads && a.n_head == b.n_head &&
+           a.n_head_kv == b.n_head_kv && a.head_dim == b.head_dim && a.idx_key_dim == b.idx_key_dim &&
+           a.idx_q_heads == b.idx_q_heads;
 }
-constexpr int64_t kPrefillKibPerToken = prefill_kib_per_token(strata::core::kCompiledGeometry, strata::core::ModelGeometry{});
-static_assert(prefill_kib_per_token(strata::core::ModelGeometry{}, strata::core::ModelGeometry{}) == 680);
+constexpr bool kPrefillWidthsAsUpstream =
+    prefill_widths_equal(strata::core::kCompiledGeometry, strata::core::ModelGeometry{});
 
 // A dump file closed on whichever return leaves the function that opened it.
 struct CloseFile {
@@ -5651,6 +5650,18 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --pipeline-windows %d: %lld MiB of CUDA0 kept out of the expert cache "
                              "(the second verifier%s)\n", o.pipeline_windows, (long long) (pipe_first >> 20),
                      o.pipeline_windows >= 2 ? ", the GDN snapshots" : "");
+    // The room a prompt path with buffers of its own takes out of an expert cache sized here.  At
+    // Qwen3.8-Flash-Next's widths it is upstream's figure, 160 MiB + 680 KiB a token, which sizes its caches as
+    // before.  The figure leaves out the ring a chunk of 2048 tokens or more takes (hundreds of slots of the largest
+    // blob), so it does not carry to another shape, whose buffers are counted instead (Prefill::bytes_needed, with
+    // the ring at its largest: the prompt path is planned after the cache is sized).  On the 890M at 2048
+    // tokens (2026-11-16): Qwen3.8-Flash-Next IQ2_XS counts 1383 MiB against the figure's 1520, a synthetic q4_lite
+    // 1578, q4_mid 3818 and q4_big 5106, each with the experts' prompt products in int8 at every size; a start whose
+    // timing gives the larger ones to FP16 (mmq_plan) counts about 230 MiB more for q4_big and 160 for q4_mid.
+    auto own_prefill_mib = [&](int64_t chunk) -> int64_t {
+        if (kPrefillWidthsAsUpstream) return 160 + (chunk * 680) / 1024;
+        return (int64_t) (strata::prefill::Prefill::bytes_needed(g, ss, chunk) / 1048576) + 1;
+    };
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
         // The batched prompt path's chunk buffers are allocated later, so reserve room for them here.
@@ -5660,7 +5671,7 @@ int main(int argc, char** argv) {
         const int64_t prefill_mib =
             (o.prefill_chunk > 0 && !borrow)
                 ? (multi_gpu ? (int64_t) (strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk) >> 20) + 1
-                             : 160 + (o.prefill_chunk * kPrefillKibPerToken) / 1024)
+                             : own_prefill_mib(o.prefill_chunk))
                 : 0;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         // on a GPU that shares the host's RAM the parked conversations are host allocations made after the cache is
@@ -5786,7 +5797,7 @@ int main(int argc, char** argv) {
         // room for them and the reserve, or the first prompt fails with "device buffers ... do not fit"
         size_t free_b = 0, total_b = 0;
         cache_mem_info(&free_b, &total_b);
-        const int64_t prefill_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * kPrefillKibPerToken) / 1024 : 0;
+        const int64_t prefill_mib = o.prefill_chunk > 0 ? own_prefill_mib(o.prefill_chunk) : 0;
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + pipe_first;
         const int64_t fit = std::max<int64_t>(((int64_t) free_b - reserve) / (int64_t) strata::kernels::cpu::expert_layout().max_blob, 0);
         if (o.expert_cache > fit) {
