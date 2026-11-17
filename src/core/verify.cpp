@@ -903,6 +903,36 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     // raises no flag for layer 0 before layer 1: the resident graph, a batch window, a stage that starts after layer 0.
     const bool ple_late = ple_on && !recording_res_ && !batch_rec_ && lb_ == 0;
     if (ple_on && !ple_late) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+    // The key and value projections depend only on each row's n-gram embedding: the group's rows go through the
+    // multi-row forms of the same kernels, the weights read once, each row's arithmetic the single-row call's
+    // (upstream d92c9feb).  The history-dependent rest stays row by row.  STRATA_PLE_BATCH=0: row by row.
+    static const bool ple_batch = [] {
+        const char* v = std::getenv("STRATA_PLE_BATCH");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    // XeStrata-890M (STRATA_PLE_BRANCH, default on with the side branches): in the graph that has the window's PLE rows
+    // at its start (the resident one), the two projections (65.5 MB of BF16 weights, read once a window) run on a
+    // third queue from here and join at layer 1, where they were: beside layer 0 instead of in a row before layer 1's
+    // work.  They read only the rows' embeddings, and layer 0 touches neither those nor their outputs: the same
+    // kernels, the same bits.  The BF16 key only (the native key quantizes into a buffer layer 0 uses).
+    // STRATA_PLE_BRANCH=0: at layer 1 on the window's queue, as before.
+    static const bool ple_branch_on = [] {
+        const char* v = std::getenv("STRATA_PLE_BRANCH");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    bool ple_side = false;
+    if (ple_branch_on && br && recording_res_ && ple_on && !ple_late && lb_ == 0 && le_ > 1 && fetch_side_ != nullptr &&
+        ple_batch && T > 1 && ss.ple.w.key_bf16 != nullptr && ple_native_bf16()) {
+        if (!strata::gpu::stream_fork(cs, fetch_side_)) { err = std::string("verify PLE branch: ") + strata::gpu::last_error(); return false; }
+        try {
+            bf16_gemv_fp32_mmvf_multi(ple_, N, ss.ple.w.key_bf16, ple_key_, NG_HC_DIM, N, NG_HC_DIM, T, fetch_side_);
+            bf16_gemv_fp32_mmvf_multi(ple_, N, ss.ple.w.value_bf16, ple_val_, N, N, N, T, fetch_side_);
+        } catch (const std::exception& e) {
+            err = std::string("verify PLE batch: ") + e.what();
+            return false;
+        }
+        ple_side = true;
+    }
 
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
@@ -969,17 +999,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
             // the window's residual writes in one launch (each row its own R, block output and injection)
             if (dec_batch) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
-            // The key and value projections depend only on each row's n-gram embedding: the group's rows go through
-            // the multi-row forms of the same kernels, the weights read once, each row's arithmetic the single-row
-            // call's (upstream d92c9feb).  The history-dependent rest stays row by row.  STRATA_PLE_BATCH=0: row by row.
-            static const bool ple_batch = [] {
-                const char* v = std::getenv("STRATA_PLE_BATCH");
-                return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-            }();
+            // the batched key and value projections (ple_batch, above): here, or joined from their branch
             PleWeights pw = ss.ple.w;
             const bool nkey = pw.key_native_data != nullptr && pw.key_bf16 == nullptr;
             const bool batched = ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey) && ple_native_bf16();
-            if (batched) {
+            if (ple_side) {
+                if (!strata::gpu::stream_join(cs, fetch_side_)) { err = std::string("verify PLE branch: ") + strata::gpu::last_error(); return false; }
+            } else if (batched) {
                 try {
                     if (pw.key_bf16 != nullptr) {
                         bf16_gemv_fp32_mmvf_multi(ple_ + tb * N, N, pw.key_bf16, ple_key_ + (size_t) tb * NG_HC_DIM,
