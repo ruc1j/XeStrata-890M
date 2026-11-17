@@ -27,7 +27,8 @@
 
 namespace strata::kernels {
 
-template <int THREADS, typename D> class SampleKernel;   // asked for its work-group (work_group_upto_1024)
+// NF: the greedy pick that also writes the rows' non-finite flags (sample_tokens_nonfinite)
+template <int THREADS, typename D, bool NF = false> class SampleKernel;   // asked for its work-group (work_group_upto_1024)
 template <int THREADS> using SampleKernelDouble = SampleKernel<THREADS, double>;
 template <int THREADS> using SampleKernelFloat = SampleKernel<THREADS, float>;
 
@@ -237,16 +238,19 @@ namespace {
 // The sampler's kernel with THREADS work-items a token (1024 where the device takes it: the argmax and the top-k are
 // the same with any count, ties going to the lowest id); D sums the kept probabilities, double where the device has
 // FP64 and float elsewhere (device_caps.hpp)
-template <int THREADS, typename D>
+template <int THREADS, typename D, bool NF = false>
 sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int n_vocab, const int* history,
-                          int history_len, SamplerParams pp, bool greedy, size_t words, int* out) {
+                          int history_len, SamplerParams pp, bool greedy, size_t words, int* out,
+                          uint32_t* nf = nullptr, int nf_blocks = 0) {
+    // NF: the row in nf_blocks slices of per_block logits, a flag each (logits_nonfinite_rows' layout)
+    const int per_block = NF ? (n_vocab + nf_blocks - 1) / nf_blocks : n_vocab;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<unsigned, 1> bits(sycl::range<1>(words), h);
         sycl::local_accessor<float, 1> sv(sycl::range<1>(THREADS / WARP), h);
         sycl::local_accessor<int, 1> si(sycl::range<1>(THREADS / WARP), h);
         sycl::local_accessor<int, 1> sel_ids(sycl::range<1>(KMAX), h);
         sycl::local_accessor<float, 1> sel_logit(sycl::range<1>(KMAX), h);
-        h.parallel_for<SampleKernel<THREADS, D>>(sycl::nd_range<1>((size_t) n_tokens * THREADS, THREADS),
+        h.parallel_for<SampleKernel<THREADS, D, NF>>(sycl::nd_range<1>((size_t) n_tokens * THREADS, THREADS),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const int t = (int) it.get_group(0);
             const int tid = (int) it.get_local_id(0);
@@ -257,10 +261,25 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
             if (greedy) {
                 float wv;
                 int wi;
+                // NF: the slices in which this item met a non-finite logit, a bit each.  The item's values go up, so
+                // the slice of a value is found by stepping, not dividing; the test is on the bits (exponent all
+                // ones), so a fast-math build cannot fold it away.
+                uint32_t bad = 0;
+                unsigned blk = 0;
+                int blk_end = 0;
+                if constexpr (NF) blk_end = per_block;
                 block_argmax<THREADS>(it, n_vocab, &sv[0], &si[0], [&](int v, float& s) {
+                    if constexpr (NF) {
+                        while (v >= blk_end) { ++blk; blk_end += per_block; }
+                        bad |= (uint32_t) ((sycl::bit_cast<uint32_t>(l[v]) & 0x7f800000u) == 0x7f800000u) << blk;
+                    }
                     s = apply_penalties(biased(pp, l, v, t, n_vocab), hit_count(w, b, v), pp);
                     return true;
                 }, wv, wi);
+                if constexpr (NF) {
+                    bad = sycl::reduce_over_group(it.get_group(), bad, sycl::bit_or<uint32_t>());
+                    if (tid < nf_blocks) nf[(size_t) t * (size_t) nf_blocks + (size_t) tid] = (bad >> (unsigned) tid) & 1u;
+                }
                 // a tie between two -inf candidates leaves wi == n_vocab, and the serial version answered 0
                 if (tid == 0) out[t] = (wi < n_vocab) ? wi : 0;
                 return;
@@ -654,6 +673,22 @@ bool gumbel_env() {
 }
 }  // namespace
 
+void sample_tokens_nonfinite(const float* logits, int n_tokens, int n_vocab, const SamplerParams& p, int* out,
+                             uint32_t* flags, int n_blocks, void* stream) {
+    if (n_tokens <= 0 || n_vocab <= 0) return;
+    if (!(p.greedy || p.temperature <= 0.0f) || flags == nullptr || n_blocks < 1 || n_blocks > 32)
+        throw core::DeviceError("sample_tokens_nonfinite: a greedy pick and 1..32 slices a row");
+    auto& q = core::Runtime::get().stream(stream);
+    const int wg = xe::has_fp64(q) ? xe::work_group_upto_1024<SampleKernelDouble>(q)
+                                   : xe::work_group_upto_1024<SampleKernelFloat>(q);
+    if (wg < n_blocks) throw core::DeviceError("sample_tokens_nonfinite: the work-group is smaller than the slices");
+    // (the greedy branch sums nothing: one kernel for every device, in sample_tokens' work-group)
+    const auto e = wg == 1024  ? sample_launch<1024, float, true>(q, logits, n_tokens, n_vocab, nullptr, 0, p, true, 1, out, flags, n_blocks)
+                   : wg == 512 ? sample_launch<512, float, true>(q, logits, n_tokens, n_vocab, nullptr, 0, p, true, 1, out, flags, n_blocks)
+                               : sample_launch<256, float, true>(q, logits, n_tokens, n_vocab, nullptr, 0, p, true, 1, out, flags, n_blocks);
+    if (!stream) core::Runtime::get().wait(e, "sample_tokens_nonfinite");
+}
+
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p_in, int* out, void* stream) {
     SamplerParams p = p_in;
@@ -691,7 +726,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
             return;
         }
     }
-    const auto e = launch(q, logits, n_tokens, n_vocab, history, history_len, pp, greedy, words, out);
+    const auto e = launch(q, logits, n_tokens, n_vocab, history, history_len, pp, greedy, words, out, nullptr, 0);
     if (!stream) core::Runtime::get().wait(e, "sample_tokens");
 }
 

@@ -890,10 +890,20 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     // a batch window: row t is slot t, whose state lives in its own session (upstream PR #559)
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
 
+    // XeStrata-890M (STRATA_WINDOW_GLUE_FUSE, default on): launches that run once a window on its serial chain are
+    // merged, with the same bytes: the window's inputs come from the mapped staging in one copy launch, and the greedy
+    // pick writes the rows' non-finite flags from its own pass over the logits (the tail, below).
+    // STRATA_WINDOW_GLUE_FUSE=0: a launch each, as before.
+    static const bool window_glue = [] {
+        const char* v = std::getenv("STRATA_WINDOW_GLUE_FUSE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
     // ---- the window's inputs, from mapped staging
-    copy_i32_from_mapped(tok_, m_tok_, T, cs);
-    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
+    if (!window_glue) {
+        copy_i32_from_mapped(tok_, m_tok_, T, cs);
+        copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
+        copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
+    }
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
@@ -902,7 +912,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     // the reads no longer hold the window's launch back (0.35 ms a window on the RTX 4070).  Not where the host
     // raises no flag for layer 0 before layer 1: the resident graph, a batch window, a stage that starts after layer 0.
     const bool ple_late = ple_on && !recording_res_ && !batch_rec_ && lb_ == 0;
-    if (ple_on && !ple_late) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+    if (window_glue) {
+        const strata::kernels::MappedCopy in[4] = {{tok_, m_tok_, T}, {step_, m_step_, (int64_t) T * kStepCount},
+                                                   {pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ)},
+                                                   {ple_, m_ple_, (int64_t) T * N}};
+        try {
+            strata::kernels::copy_from_mapped_multi(in, ple_on && !ple_late ? 4 : 3, cs);
+        } catch (const std::exception& e) { err = std::string("verify inputs: ") + e.what(); return false; }
+    } else if (ple_on && !ple_late) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
     // The key and value projections depend only on each row's n-gram embedding: the group's rows go through the
     // multi-row forms of the same kernels, the weights read once, each row's arithmetic the single-row call's
     // (upstream d92c9feb).  The history-dependent rest stays row by row.  STRATA_PLE_BATCH=0: row by row.
@@ -1932,9 +1949,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         SamplerParams sp;
         sp.greedy = true;
         sp.temperature = 0.0f;
-        sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
-        if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+        if (window_glue && nan_guard_on())
+            strata::kernels::sample_tokens_nonfinite(head_logits_, T, (int) n_vocab_, sp, m_out_, m_nf_,
+                                                     strata::kernels::kNonfiniteBlocks, cs);
+        else {
+            sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+            if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+        }
     }
     // every GDN layer has run the pending rows; they are cleared where the steps wrote the state (STRATA_GDN_ACC: at
     // gdn_acc_ rows; a one-token window that commits itself always)
