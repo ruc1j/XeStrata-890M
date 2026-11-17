@@ -1685,6 +1685,21 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     };
 
     // ---------------------------------------------------------------- post(l, group): experts, combine
+    // XeStrata-890M (STRATA_MTP_GLUE_FUSE, default on; the MTP layer's switch, mtp.cpp): the last layer's residual
+    // write is folded into the final mixer's read, as every layer's read folds the write before it (the same bits),
+    // so the window's tail has a launch less.  Where the window ends with the head and its rows take the fused read,
+    // in one group, and no control vector follows the write.
+    static const bool head_fold_on = [] {
+        const char* v = std::getenv("STRATA_MTP_GLUE_FUSE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    bool head_fold = false;
+    if (head_fold_on && le_ == g.n_layers && G == 1 && !batch_rec_ && head_ != nullptr && head_->loaded() &&
+        !cvec().covers(g.n_layers - 1) && fused_gr_supported(g.n_embd, g.hc, g.hc_lr)) {
+        const WeightRef *hd = wt.find("output_hc_down.weight"), *hu = wt.find("output_hc_up.weight");
+        head_fold = hd != nullptr && hu != nullptr &&
+                    (head_mix_multi_enabled() || (hd->hc_q8 != nullptr && hu->hc_q8 != nullptr));
+    }
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
@@ -1816,8 +1831,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                         (int) HC, cs);
         }
         if (l == g.n_layers - 1) {
-            if (dec_batch) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
-            else for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+            // head_fold: the head's read folds this write and leaves it in R (below)
+            if (!head_fold && dec_batch) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
+            else if (!head_fold) for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
             if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
@@ -1865,14 +1881,16 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         const bool mix_multi = (head_mix_multi_enabled() || mix_q8) && head_ != nullptr && head_->loaded() &&
                                fused_gr_supported(g.n_embd, g.hc, g.hc_lr);
         if (mix_multi) {
-            // the final mixer, the window's tokens in one read (no pending write: the last layer's was done above)
+            // the final mixer, the window's tokens in one read (head_fold: with the last layer's write folded in;
+            // else no pending write, the last layer's was done above)
             if (hn->kind != WeightKind::F32 || hd->kind != WeightKind::Bf16InF32 || hu->kind != WeightKind::Bf16InF32) {
                 err = "verify: the output_hc_* weights have the wrong engine forms";
                 return false;
             }
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
-                fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = false;
+                fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = head_fold;
+                if (head_fold) { fa[t].bo_prev = bo_ + (size_t) t * N; fa[t].inj_prev = inj2_ + (size_t) t * HC; }
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
                 fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
                 if (mix_q8) { fa[t].q8_down = (const uint8_t*) hd->hc_q8; fa[t].q8_up = (const uint8_t*) hu->hc_q8; }

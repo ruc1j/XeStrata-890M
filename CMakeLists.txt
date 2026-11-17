@@ -1175,6 +1175,10 @@ if(STRATA_ENABLE_XE)
     add_executable(gr_multi_parity src/kernels/gr_multi_parity.cpp)
     target_link_libraries(gr_multi_parity PRIVATE strata_kernels)
     add_test(NAME gr_multi_parity COMMAND gr_multi_parity)
+    # XeStrata-890M: the launches STRATA_MTP_GLUE_FUSE takes out of the MTP layer, against the launches they replace
+    add_executable(mtp_glue_parity src/kernels/mtp_glue_parity.cpp)
+    target_link_libraries(mtp_glue_parity PRIVATE strata_kernels)
+    add_test(NAME mtp_glue_parity COMMAND mtp_glue_parity)
     # #783 PR-e: the verify window's device-built expert plan against a host replay of its contract
     add_executable(resident_plan_parity src/kernels/resident_plan_parity.cpp)
     target_link_libraries(resident_plan_parity PRIVATE strata_kernels)

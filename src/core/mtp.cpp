@@ -769,6 +769,16 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), p, cs);
         else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
     };
+    // XeStrata-890M (STRATA_MTP_GLUE_FUSE, default on): four launches of the layer that only hand a value to the next
+    // one are taken by the kernels beside them, each with the same bits.  The embedding's and the hidden input's norm
+    // write their q8_1 images themselves (the norm's q8 output; the hidden one where the image fits the scratch, 8
+    // columns), K's norm and rotation are one launch a row (the fused kernel the query already takes), and the last
+    // residual write is folded into the final mixer's read, as every other read of the layer folds the write before
+    // it.  STRATA_MTP_GLUE_FUSE=0: the launches of their own, as before.
+    static const bool glue_fuse = [] {
+        const char* v = std::getenv("STRATA_MTP_GLUE_FUSE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
     try {
       if (!rest_only) {
         // ---- the two input branches
@@ -783,16 +793,28 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
             embedding_gather_dev(codes, scales, offsets, tok_, T, we->ne0, we->code_bits, we->code_bias, we->group_elems,
                                  (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), emb_, cs);
         }
-        native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
-        native_quantize_q8_1(en_, xq_, (int) N, T, cs);
+        const bool norm_q8 = glue_fuse && N % 32 == 0;
+        if (norm_q8)
+            native_qsa_rms_norm_weighted_q8_1(emb_, f32("pre_fc_norm_embedding.weight"), en_, xq_, (int) N, T, EPS, cs);
+        else {
+            native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
+            native_quantize_q8_1(en_, xq_, (int) N, T, cs);
+        }
         native_mmvq(q8_type("fc_embedding.weight"), q8("fc_embedding.weight"), xq_, e2_, (int) N, (int) N, T, cs);
-        if (hnorm_stream_)   // --mtp-hnorm stream: one RMS per stream, each scaled by its slice of the weight
-            native_qsa_rms_norm_grouped(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) N, (int) HC, (int) (T * HC), EPS, cs);
+        const bool hidden_q8 = norm_q8 && T * HC <= 8;   // one product reads the whole image
+        if (hnorm_stream_) {   // --mtp-hnorm stream: one RMS per stream, each scaled by its slice of the weight
+            if (hidden_q8)
+                native_qsa_rms_norm_grouped_q8_1(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, xq_, (int) N, (int) HC,
+                                                 (int) (T * HC), EPS, cs);
+            else
+                native_qsa_rms_norm_grouped(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) N, (int) HC, (int) (T * HC), EPS, cs);
+        } else if (hidden_q8)
+            native_qsa_rms_norm_weighted_q8_1(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, xq_, (int) (HC * N), T, EPS, cs);
         else
             native_qsa_rms_norm_weighted(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
         for (int c0 = 0; c0 < T * HC; c0 += 8) {
             const int nc = (int) std::min<int64_t>(8, T * HC - c0);
-            native_quantize_q8_1(hn_ + (size_t) c0 * N, xq_, (int) N, nc, cs);
+            if (!hidden_q8) native_quantize_q8_1(hn_ + (size_t) c0 * N, xq_, (int) N, nc, cs);
             native_mmvq(q8_type("fc_hidden.weight"), q8("fc_hidden.weight"), xq_, h2_ + (size_t) c0 * N, (int) N, (int) N, nc, cs);
         }
         add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
@@ -821,11 +843,16 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
             const char* v = std::getenv("STRATA_NO_BATCH_KV_STEP");
             return v != nullptr && std::strtol(v, nullptr, 10) != 0;
         }();
-        native_qsa_rms_norm_weighted(kcur_, f32("self_attn.k_norm.weight"), kcur_, (int) HD, (int) (T * NKV), EPS, cs);
-        for (int t = 0; t < T; ++t) {
-            float* kc = kcur_ + t * NKV * HD;
-            if (native_rope_enabled()) native_rope_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, rope_scaling(), pos + t * NH, cs);
-            else rope_neox_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, st_.cos_tab, st_.sin_tab, pos + t * NH, cs);
+        if (glue_fuse && fused_nr) {
+            for (int t = 0; t < T; ++t)
+                norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int) NKV, (int) HD, pos + t * NH);
+        } else {
+            native_qsa_rms_norm_weighted(kcur_, f32("self_attn.k_norm.weight"), kcur_, (int) HD, (int) (T * NKV), EPS, cs);
+            for (int t = 0; t < T; ++t) {
+                float* kc = kcur_ + t * NKV * HD;
+                if (native_rope_enabled()) native_rope_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, rope_scaling(), pos + t * NH, cs);
+                else rope_neox_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, st_.cos_tab, st_.sin_tab, pos + t * NH, cs);
+            }
         }
         if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp)
             fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
@@ -956,17 +983,20 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
                 moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
         }
         if (multi) native_moe_combine_multi(parts_, w_, shared_, y_, N, K, T, cs);
-        gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);   // the T residual writes in one launch
         // ---- the final mixer and the main model's head: the rows in one fused read (upstream edc592b1; the layers'
         // read without an injection weight); STRATA_HEAD_MIX_MULTI=0: gr_read per row
         static const bool head_mix_multi_on = [] {
             const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
-        if (head_mix_multi_on && fused_gr_supported(N, HC, g.hc_lr)) {
+        const bool head_multi = head_mix_multi_on && fused_gr_supported(N, HC, g.hc_lr);
+        const bool write_in_read = glue_fuse && head_multi;   // the read folds the write and leaves it in R_
+        if (!write_in_read) gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);   // the T residual writes in one launch
+        if (head_multi) {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
-                fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;
+                fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = write_in_read;
+                if (write_in_read) { fa[t].bo_prev = y_ + t * N; fa[t].inj_prev = inj2_ + t * HC; }
                 fa[t].w_norm = f32("hyper_connection_mixer.hc_norm.weight");
                 fa[t].w_down = bf16("hyper_connection_mixer.input_mix_weight_down.weight");
                 fa[t].w_up = bf16("hyper_connection_mixer.input_mix_weight_up.weight");

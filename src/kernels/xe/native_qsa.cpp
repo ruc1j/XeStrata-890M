@@ -163,6 +163,21 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* 
     else norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon, groups);
 }
 
+void native_qsa_rms_norm_grouped_q8_1(const float* input, const float* gamma, float* output, void* x_q8_1,
+                                      int n_cols, int groups, int n_rows, float epsilon, void* stream) {
+    if (groups < 1) throw std::invalid_argument("native QSA requires positive bounded dimensions");
+    const auto count = elements(n_cols, n_rows);
+    if (!std::isfinite(epsilon) || epsilon < 0.0f)
+        throw std::invalid_argument("native QSA requires finite nonnegative epsilon");
+    if (n_cols % 32 != 0 || x_q8_1 == nullptr) throw std::invalid_argument("the q8_1 output needs 32 | n_cols");
+    buffers(input, count * 4, gamma, std::size_t(n_cols) * groups * 4, output, stream);
+    auto& q = queue_for(stream);
+    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024<NormKernel>(q);
+    if (wg == 1024) norm<1024>(q, input, gamma, output, n_cols, n_rows, epsilon, groups, x_q8_1);
+    else if (wg == 512) norm<512>(q, input, gamma, output, n_cols, n_rows, epsilon, groups, x_q8_1);
+    else norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon, groups, x_q8_1);
+}
+
 void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,
                            int n_head, int head_dim, void* stream) {
     const auto count = elements(head_dim, n_head);
