@@ -268,6 +268,7 @@ struct Options {
     int ple_inflight = 256;   // slots for the reads queued to DirectFile's threads: more than they are (io_threads)
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
+    bool ple_io_thread_given = false;  ///< --ple-io-thread: the I/O worker also where the token thread is the default
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     int kv_grow = -1;                  ///< the elastic K/V (--kv-grow 1, --no-kv-grow 0, STRATA_KV_GROW; -1: by the device)
@@ -584,7 +585,9 @@ void usage() {
                  "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
                  "  --ple-inflight N     outstanding SSD reads (default 256)\n"
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
-                 "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
+                 "  --ple-sync-submit    submit table reads on the token thread (the default on an integrated GPU on the\n"
+                 "                       HIP backend; elsewhere an I/O thread)\n"
+                 "  --ple-io-thread      submit table reads on an I/O thread also there\n"
                  "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
                  "                       VRAM; default fp16 until gate G-C accepts int8\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
@@ -2621,6 +2624,7 @@ int main(int argc, char** argv) {
         else if (a == "--ple-inflight") o.ple_inflight = (int) std::strtol(next("--ple-inflight"), nullptr, 10);
         else if (a == "--ple-delay-us") o.ple_delay_us = std::strtod(next("--ple-delay-us"), nullptr);
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
+        else if (a == "--ple-io-thread") o.ple_io_thread_given = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::strtoll(next("--kv-resident"), nullptr, 10);
         else if (a == "--kv-grow") o.kv_grow = 1;
@@ -4613,7 +4617,16 @@ int main(int argc, char** argv) {
         const auto tpl = Clock::now();
         pio.max_inflight = (uint32_t) o.ple_inflight;
         pio.cache_rows = (uint64_t) o.ple_row_cache;
-        pio.io_thread = !o.ple_sync_submit;
+        // XeStrata-890M: on an integrated GPU on the HIP backend the token thread submits and reaps the table's reads
+        // itself (--ple-sync-submit's arm; --ple-io-thread keeps the I/O thread there).  A decode round issues a few
+        // reads and the window's launch waits for the last of them: through the I/O thread that read costs two more
+        // thread hand-offs, and the CPU's threads share the GPU's power.  The 890M's greedy 6 chats: the wait before
+        // the launch 0.21 -> 0.11 ms a window, 38.75 -> 38.89 tok/s (three interleaved rounds, each above).
+        {
+            const sycl::device& pd = strata::core::Runtime::get().device();
+            const bool uma_hip = pd.get_backend() == sycl::backend::ext_oneapi_hip && strata::core::integrated_gpu(pd);
+            pio.io_thread = o.ple_io_thread_given ? true : !(o.ple_sync_submit || uma_hip);
+        }
         // Keep the SSD awake while rows are asked for (PleReader::set_keepalive, upstream e128d6d): some SSDs stall
         // the first reads 50-150 ms after ~250 ms without a command.  STRATA_SSD_KEEPALIVE = ms without a read
         // before one page is read anyway (default 100, 0 = off), STRATA_SSD_KEEPALIVE_WINDOW = seconds after the
@@ -4623,7 +4636,7 @@ int main(int argc, char** argv) {
             const char* kw = std::getenv("STRATA_SSD_KEEPALIVE_WINDOW");
             pio.keepalive_ms = ka != nullptr && *ka ? std::clamp(std::strtod(ka, nullptr), 0.0, 10000.0) : 100.0;
             pio.keepalive_window_s = kw != nullptr && *kw ? std::clamp(std::strtod(kw, nullptr), 1.0, 86400.0) : 60.0;
-            if (pio.mode != strata::kernels::PleIo::Direct || !pio.io_thread) pio.keepalive_ms = 0;
+            if (pio.mode != strata::kernels::PleIo::Direct) pio.keepalive_ms = 0;
         }
         if (!ple_table.open(o.ple_gguf, err, pio)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
