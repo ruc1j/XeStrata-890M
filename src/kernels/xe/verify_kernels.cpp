@@ -1155,7 +1155,7 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
     if (n > WG) throw std::invalid_argument("resident_plan: more entries than a work-group");
     const auto e = Q(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
-        sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG), h);
+        sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG + 1), h);   // + 1: the scan's total
         h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
             const auto grp = it.get_group();
             const int t = (int) it.get_local_id(0);
@@ -1182,20 +1182,24 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             }
             // an entry's leader L (its expert's first index) and, for a leader, its entry count; then one scan of
             // (entries << 16 | 1) over the leaders numbers the groups and gives their starts (upstream fe4de5de)
+            // (one pass over the ids gives the leader, the count and the place: a search for the leader first read
+            // them a second time, one id a trip)
             int L = t, cnt = 0, pos = 0;
             if (use) {
-                for (int j = 0; j < t; ++j)
-                    if (s_ids[j] == s_ids[t]) { L = j; break; }
+                int first = t, all = 0;
                 for (int j = 0; j < n; ++j) {
-                    if (s_ids[j] != s_ids[t]) continue;
-                    if (L == t) ++cnt;
-                    if (j < t) ++pos;
+                    const bool eq = s_ids[j] == s_ids[t];
+                    all += eq ? 1 : 0;
+                    pos += eq && j < t ? 1 : 0;
+                    if (eq && j < first) first = j;
                 }
+                L = first;
+                cnt = L == t ? all : 0;
             }
             const int pack = L == t && use ? (cnt << 16) | 1 : 0;
             const int excl = sycl::exclusive_scan_over_group(grp, pack, sycl::plus<int>());
             s_excl[t] = excl;
-            const int total = sycl::reduce_over_group(grp, pack, sycl::plus<int>());
+            if (t == WG - 1) s_excl[WG] = excl + pack;   // the total, which only work-item 0 reads (no second reduction)
             sycl::group_barrier(grp);
             int32_t* counts = pl;
             int32_t* start = pl + 4;
@@ -1204,7 +1208,6 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
             unsigned long long* ptr = reinterpret_cast<unsigned long long*>(pl + ptr_off);
             int32_t* start2 = pl + ptr_off + 4 * capx;
-            const int n_used = (int) (total >> 16);
             if (use) {
                 const int le = s_excl[L];
                 const int g = le & 0xffff, gstart = le >> 16;
@@ -1218,6 +1221,8 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             }
             sycl::group_barrier(grp);
             if (t != 0) return;
+            const int total = s_excl[WG];
+            const int n_used = (int) (total >> 16);
             const int groups = total & 0xffff;
             start[groups] = n_used;
             start2[0] = n_used;
