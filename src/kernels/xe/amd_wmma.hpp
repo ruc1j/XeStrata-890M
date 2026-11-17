@@ -33,6 +33,22 @@ inline bool amd_wmma(const sycl::device& d) {
     return a >= static_cast<uint64_t>(syclex::architecture::amd_gpu_gfx1100) && a < 0x0200000000130000ull;
 }
 
+// The ports from Strata-rdna3 (nicejunjie/Strata-rdna3) that XeStrata-890M takes as opt-in switches have their bodies
+// only in gfx1150's (the Radeon 890M's) device code, and run only where the device reports that architecture: the
+// other devices keep the kernels they had.  This fork is measured on the 890M alone (AGENTS.md).
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__) && defined(__gfx1150__)
+#define STRATA_AMD_GFX1150 1
+#else
+#define STRATA_AMD_GFX1150 0
+#endif
+
+/// Whether the device is a gfx1150 GPU (the Radeon 890M), by the architecture SYCL reports.
+inline bool amd_gfx1150(const sycl::device& d) {
+    namespace syclex = sycl::ext::oneapi::experimental;
+    if (d.get_backend() != sycl::backend::ext_oneapi_hip) return false;
+    return d.get_info<syclex::info::device::architecture>() == syclex::architecture::amd_gpu_gfx1150;
+}
+
 #if STRATA_AMD_WMMA
 namespace wmma {
 
