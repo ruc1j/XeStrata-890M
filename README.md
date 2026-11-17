@@ -107,7 +107,9 @@ setup changes of upstream Strata 0.2.12 (engine 0.1.58) ([docs/XE.md](docs/XE.md
     projections, the MTP window's cap (one row more than `--spec`), the draft layer's default norm
     (`--mtp-hnorm stream`), the GDN step's barriers and the choice of the window's width. Then, from reading the
     kernels' gfx1150 ISA, reads, multiplies and barriers nothing needs were taken out of the hyper-connection read,
-    the expert rows, the GDN quantization and the plan of a layer. Together the 890M's decode is 36.3 → 41.9 tok/s,
+    the expert rows, the GDN quantization and the plan of a layer; and the router's top-10, the quantization of
+    the experts' input and of the attention's output, and small launches of the MTP layer and of the window's
+    start and end were merged into the launches beside them. Together the 890M's decode is 36.3 → 42.3 tok/s,
     with the same answers ([XE](docs/XE.md#a-review-of-the-890ms-decode)).
   - the draft chain and the window length are cut by the product of the drafts' probabilities so far
     (`STRATA_SPEC_CUM=c`, default 0.5 on HIP's integrated GPU, 0 elsewhere for the old rule; not used when

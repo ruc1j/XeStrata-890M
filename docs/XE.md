@@ -34,7 +34,7 @@ The processor's own graphics (a UHD 770 on the development machine) is a second,
 ## A review of the 890M's decode
 
 One window of Qwen3.8-Flash-Next's decode was timed stage by stage, candidates for a faster window were listed for each stage, and they were implemented and measured one at a time, the largest expected gain first (2026-11-16 and 17).
-Twenty-three changes went in. The 890M's decode of the greedy six chats (IQ2_XS, `--spec 4`, `--max-context 32768`, three interleaved rounds) went from 36.40, 36.02 and 36.50 tok/s to 41.90, 41.84 and 42.03 tok/s (36.31 to 41.92 on average, +15.5%). The answers are the same as before.
+Thirty-one changes went in. The 890M's decode of the greedy six chats (IQ2_XS, `--spec 4`, `--max-context 32768`, three interleaved rounds) went from 36.47, 36.45 and 35.91 tok/s to 42.15, 42.66 and 42.19 tok/s (36.28 to 42.33 on average, +16.7%). The answers are the same as before.
 Each change is either chosen from what the device reports (an integrated GPU, the HIP backend) or gives the same bits on every GPU.
 
 ### One window's time by stage
@@ -116,6 +116,21 @@ After that the gfx1150 ISA of the main kernels was read beside the source for wa
 
 With these seven the decode is 40.99 → 41.92 tok/s (+2.3%) against the sixteen before them, three interleaved rounds.
 
+After these, eight more went in that take small launches off the main queue's chain and waits out of the kernels. All of them give the same bits.
+
+- The table of the hyper-connection read's up: an up group of the fused kernel took a barrier only to copy the tokens' table into local memory. The copy now happens while the rows' loads are awaited. As a kernel on its own a four-row read goes 103.4 → 102.4 us.
+- The GDN step's k: every row read its 32 values of k from local memory twice (before and after a barrier), two at a time. They are read once as float4 and held in registers over the barrier; the registers for that come from building the addresses of the state's write-back again.
+  The VGPRs go from 126 to 104; as a kernel on its own a three-row step goes 61.8 → 60.1 us and one with three pending rows 71.0 → 64.1 us, decode 41.80 → 42.11 tok/s (+0.7%, four rounds).
+- The BF16 GEMV (the router, the PLE and the indexer's projections): the barrier that only waited for the zeros of the sums' slots is gone. Zeros are written to the slots no sub-group writes, and nothing else. Its decode was measured together with the GDN step's change above.
+- The router's top-10: in a window with every expert in the cache the top-10 runs inside the launch that plans the layer (`STRATA_PLAN_FUSE=0`: the two launches). Decode 42.24 → 42.52 tok/s (+0.7%, four rounds).
+  A layer has one launch less. From the cost measured by adding empty launches (about 2 us each) the estimate was +0.14%: a small launch in the main queue's chain costs more than an empty one.
+- The quantization of the experts' input: in a layer of that form the q8_1 image of the layer's input is written by more work-groups of the plan's launch. The shared expert's side branch forks right after the read and makes the same image on its own queue (`STRATA_Q8_PLAN=0`: as before). Decode 42.48 → 42.53 tok/s, within the noise.
+- The attention's gate and quantization: the merge, the gate and the q8_1 quantization of a QSA layer, three launches, are one (`STRATA_QSA_MERGE_FUSE=0`: as before). Decode 42.53 → 42.71 tok/s (+0.4%, four rounds).
+- The MTP draft layer: the norms of the embedding and of the hidden input write their q8_1 images themselves, K's norm and RoPE are one launch, and the last residual write is folded into the last read. The verify window's last write is folded into the head's read as well (`STRATA_MTP_GLUE_FUSE=0`: as before). Decode 42.61 → 42.68 tok/s, within the noise.
+- The verify window's start and end: the window's inputs (the tokens, the steps, the positions and the PLE rows) are copied in one launch. The greedy pick's kernel also checks the logits for a NaN or an infinity, so the launch that only checked them no longer reads the same logits again (`STRATA_WINDOW_GLUE_FUSE=0`: as before). Decode stays at 42.71 tok/s, no difference.
+
+With these eight the decode is 41.35 → 42.33 tok/s (+2.4%) against the twenty-three before them, three interleaved rounds.
+
 ### What did not go in
 
 - Reading the PLE rows after the launch in the window graph that does not ask the host was slower, 37.25 → 37.01 tok/s.
@@ -128,7 +143,10 @@ With these seven the decode is 40.99 → 41.92 tok/s (+2.3%) against the sixteen
 - Dropping the non-temporal hint from the loads of the Q2_0 down rows made no difference, 39.07 → 39.05 tok/s.
 - The ROCm runtime's settings (`DEBUG_HIP_DYNAMIC_QUEUES=0`, `DEBUG_HIP_FORCE_GRAPH_QUEUES`, `DEBUG_CLR_GRAPH_PACKET_CAPTURE`, `DEBUG_CLR_BATCH_CPU_SYNC_SIZE=1`) and `STRATA_WAIT_SLEEP_US=20` all stayed within the noise, 40.7 to 41.3 tok/s. A higher priority for the window's queue gave -0.6%.
 - In the expert rows, five loads instead of six in a down row (440.9 → 443.2 us with three rows), 64 rows a gate/up work-group (slower up to four rows, faster only with six) and the entries' test as a break of the loop (431.0 → 645.8 us) were none of them faster.
-- Writing the GDN step's state back through a pointer of its own took the registers from 126 to 64 but made no difference, as a kernel on its own or in decode.
+- Writing the GDN step's state back through a pointer of its own took the registers from 126 to 64 but made no difference by itself, as a kernel on its own or in decode. The form that holds k (above) uses the registers it freed.
+- The GDN step's closing norm as more groups of the recurrence's launch was faster as a kernel on its own, a three-row step 61.8 → 56.4 us, but made no difference in decode, 42.61 tok/s and 42.60 tok/s. A form in which groups spin until an earlier phase is done does not carry its gain as a kernel into decode. Others of that form, the router's GEMV and the plan in one launch among them, were not built.
+- In the hyper-connection read's up, four forms that issue the loads of x, of the partials or of lo together ahead made no difference as a kernel on its own (a three-row read 97.2 us and 97.5 to 98.3 us).
+- Laying the attention's query out lane by lane made the kernels' ISA 5 to 10% shorter, but decode went 42.11 → 41.60 tok/s (-1.2%).
 - Issuing the attention kernel's q and merge reads together was lower in decode in four rounds of four (by 0.02 to 0.49 tok/s). Dispatching the inject block first in the hyper-connection read made no difference.
 - The candidates that lower the precision (a two-stage output head, hyper-connection weights below 8 bits, the router in Q8_0 and others, seven in all) were not tried: the check that a kernel matches the CPU reference does not apply to them.
 
