@@ -9593,12 +9593,20 @@ int main(int argc, char** argv) {
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // the window the cost-aware rule kept in the MTP chain just drafted
         policy.set_robust(spec_cost);
-        if (spec_cost && use_mtp)
+        if (spec_cost && use_mtp) {
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
                 chain_rows = chain_st.best_rows;
                 return k;
             });
+            // XeStrata-890M: the drafts the rule's window verifies, so the drafter leaves the row of a last draft it
+            // dropped unread (STRATA_PLE_SKIP_DROPPED=0: every draft's row is read ahead, as before)
+            static const bool skip_dropped = [] {
+                const char* e = std::getenv("STRATA_PLE_SKIP_DROPPED");
+                return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+            }();
+            if (skip_dropped) mtp.set_chain_kept([&] { return chain_st.best_rows - 1; });
+        }
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -14383,12 +14391,20 @@ int main(int argc, char** argv) {
             }
         }
         policy.set_robust(spec_cost);
-        if (spec_cost && use_mtp)
+        if (spec_cost && use_mtp) {
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
                 chain_rows = chain_st.best_rows;
                 return k;
             });
+            // XeStrata-890M: the drafts the rule's window verifies, so the drafter leaves the row of a last draft it
+            // dropped unread (STRATA_PLE_SKIP_DROPPED=0: every draft's row is read ahead, as before)
+            static const bool skip_dropped = [] {
+                const char* e = std::getenv("STRATA_PLE_SKIP_DROPPED");
+                return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+            }();
+            if (skip_dropped) mtp.set_chain_kept([&] { return chain_st.best_rows - 1; });
+        }
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts

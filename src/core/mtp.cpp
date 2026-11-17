@@ -1475,7 +1475,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         ++n;
     }
     if (chain_rule_ && n >= max_steps) (void) chain_rule_(n - 1, pr[n - 1]);   // the last step of a full chain
-    prefetch_ple(drafts[n - 1]);
+    // The last draft's row is the one read still in flight when the window starts, and the window's gather waits for
+    // every read in flight.  A window that the chain's rule cut before the last draft does not take that row: its
+    // read is not issued (a row the window takes after all is read by the gather itself, Verifier::run).
+    if (!(chain_rule_ && chain_kept_ && chain_kept_() < n)) prefetch_ple(drafts[n - 1]);
     if (!strata::gpu::stream_sync(cs_)) {
         err = std::string("mtp draft: ") + strata::gpu::last_error();
         return false;

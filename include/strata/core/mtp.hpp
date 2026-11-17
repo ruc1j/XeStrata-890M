@@ -124,6 +124,9 @@ public:
     /// `min_p` (or STRATA_SPEC_CUM) test; false ends the chain.  Also called once for the last step of a chain that
     /// reached its length (so the rule sees every draft).  Empty: min_p decides.
     void set_chain_rule(std::function<bool(int, float)> f) { chain_rule_ = std::move(f); }
+    /// With a chain rule: how many of the chain's drafts the rule's window verifies (asked after the rule's last
+    /// call).  draft() then does not prefetch the PLE row of a last draft the window leaves out.
+    void set_chain_kept(std::function<int()> f) { chain_kept_ = std::move(f); }
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
@@ -138,6 +141,7 @@ public:
     /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     std::function<bool(int, float)> chain_rule_;
+    std::function<int()> chain_kept_;
     bool coupled() const { return coupled_active_; }
     /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): this request's drafts are SAMPLED from
     /// q and draft j's distribution is at spec_q() + j * kSpecQStride (ids, -1 terminated; then float bits), valid on
