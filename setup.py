@@ -4916,15 +4916,16 @@ def budget_choice(model, ram, asked) -> float:
     return int(asked) if asked == int(asked) else asked
 
 
-def memlock_gib() -> float:
+def memlock_gib(hard: bool = False) -> float:
     """The RAM (GiB) this user may lock (ulimit -l): the engine locks its resident copy of the experts so the OS does
     not swap it out; with a lower limit the copy stays unlocked (the engine says so).  Windows has no such limit: the
-    engine raises its working set's minimum instead."""
+    engine raises its working set's minimum instead.  `hard`: the hard limit (ulimit -Hl), which the engine raises
+    the soft one to for the expert cache in host USM."""
     if WIN:
         return float("inf")
     import resource
-    soft = resource.getrlimit(resource.RLIMIT_MEMLOCK)[0]
-    return float("inf") if soft == resource.RLIM_INFINITY else soft / 2 ** 30
+    limit = resource.getrlimit(resource.RLIMIT_MEMLOCK)[1 if hard else 0]
+    return float("inf") if limit == resource.RLIM_INFINITY else limit / 2 ** 30
 
 
 def settings_path() -> Path:
@@ -7685,6 +7686,10 @@ def main() -> int:
            "and the GPU reads them there (STRATA_CACHE_HOST=1 in the config's env; the experts are read from the model "
            f"files, --mmap-experts, and the prompt path has buffers of its own, --no-prefill-borrow). {SETUP_CMD} "
            "--host-cache off writes the engine's default path instead")
+        if memlock_gib(hard=True) < MODELS[model]["arena_gb"]:
+            warn("the experts in RAM cannot be locked (ulimit -Hl is below their size), so the OS may swap them out, "
+                 "and the GPU waits while it does: raise the memlock limit for your user (memlock in "
+                 "/etc/security/limits.conf, or DefaultLimitMEMLOCK in systemd's user.conf) and log in again")
     disk = rotational_disk(ple)                        # upstream #605
     if disk:
         tensor = next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)

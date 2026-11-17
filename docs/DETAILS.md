@@ -546,6 +546,16 @@ of an unlocked 40 GiB copy, 3–4.6 GiB went to swap and decoding ran at half sp
 That needs a memlock limit (`ulimit -l`) as large as the copy; setup warns when the limit is small.
 Raise it with `memlock` in `/etc/security/limits.conf` or `DefaultLimitMEMLOCK` in systemd's `user.conf`, then log in again.
 
+The expert cache in host USM (`STRATA_CACHE_HOST=1`) is locked with `mlock` as well, on Linux:
+when its pages are swapped out, the driver stops the process's GPU queues until they are back.
+On the 890M, a 38 GiB cache left unlocked had about 5 GiB swapped out, and the wait for the GPU reached its 20 s limit and stopped the run (`verify: timed out`).
+`STRATA_CACHE_MLOCK=0` leaves the cache pageable.
+So does a memory limit on the engine's cgroup, and the engine says so in one line:
+the cache's pages count against the cgroup, and locked, the kernel could not swap them out when the limit is reached.
+When the memlock limit (`ulimit -l`) is too low, the engine raises it to the hard limit (`ulimit -Hl`).
+When the hard limit is too low as well, it runs without the lock and says why.
+setup warns, when it writes these settings, if the hard limit is below the experts' size. Raise it as above.
+
 With a native pack whose experts the GPU mostly holds, `STRATA_ARENA_MMAP=1` in the engine's environment (opt-in, upstream #640) maps the experts read-only from the pack's `experts.bin`, not locked.
 The first start writes the arena to `experts.bin` (only when the drive has its size and 2 GiB more free); later starts map it.
 The pages of the experts in VRAM are handed back to the OS (`STRATA_ARENA_RELEASE=0` keeps them) and the rest are read ahead.

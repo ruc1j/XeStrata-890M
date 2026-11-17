@@ -135,5 +135,21 @@ class KfdIntegrated(unittest.TestCase):
         self.assertFalse(setup.kfd_integrated({"cpu_cores_count": "x", "local_mem_size": "0"}))
 
 
+class HostCacheLock(unittest.TestCase):
+    """The engine locks the host cache in RAM and raises the soft memlock limit to the hard one for it, so setup's
+    warning reads the hard limit."""
+
+    @unittest.skipIf(setup.WIN, "no memlock limit on Windows")
+    def test_the_hard_limit_is_not_below_the_soft_one(self):
+        self.assertGreaterEqual(setup.memlock_gib(hard=True), setup.memlock_gib())
+
+    @unittest.skipIf(setup.WIN, "no memlock limit on Windows")
+    def test_the_limits_are_read_from_the_process(self):
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        for limit, got in ((soft, setup.memlock_gib()), (hard, setup.memlock_gib(hard=True))):
+            self.assertEqual(got, float("inf") if limit == resource.RLIM_INFINITY else limit / 2 ** 30)
+
+
 if __name__ == "__main__":
     unittest.main()

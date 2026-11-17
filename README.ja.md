@@ -288,6 +288,8 @@ RAM がモデルを収めない PC（low-RAM モード）では、この設定�
 - RAM の余裕: エンジンは Linux が返せるメモリから 6 GiB（`STRATA_UMA_HEADROOM_GIB`）を引いた分を GPU の空きとして数えます。
   64 GB の PC でほかのプログラムをあまり動かさないなら、`"env"` に `"STRATA_UMA_HEADROOM_GIB": "3"` を足すと文脈に使えるメモリが増えます
   （setup は `"env"` を `STRATA_CACHE_HOST` だけで書き直すので、setup のあとに足します）。
+- エキスパートは RAM に固定します: エンジンは、RAM に置いたエキスパートを `mlock` で固定し、OS が swap に出さないようにします（swap に出ると、ページが戻るまで GPU が待ちます）。
+  memlock の上限（`ulimit -Hl`）がエキスパートの大きさより小さいと、固定できず、setup が警告します（[詳細](docs/DETAILS.ja.md#ram-がモデルより少ないとき省-ram-モード)）。
 
 **ログインしている間ずっと動かす**: `systemctl --user enable --now xestrata` で、最後に設定したモデルを起動しておきます
 （ブラウザは開きません）。先に一度設定しておきます。

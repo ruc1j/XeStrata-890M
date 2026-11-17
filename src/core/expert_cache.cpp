@@ -5,14 +5,24 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/core/expert_source.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 #include <numeric>
+#include <string>
 #include <utility>
 #include <cstring>
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <sys/resource.h>
+#endif
 
 namespace strata::core {
 
@@ -314,6 +324,68 @@ bool fake_piece_fail(bool first) {
 #endif
     return true;
 }
+#if !defined(_WIN32)
+// The host-USM slots (STRATA_CACHE_HOST=1) locked in RAM.  They are the process's own pages, which the GPU reads
+// through the driver's mapping of them: when the kernel swaps some out, the driver stops the process's queues until
+// they are back.  Experts do not compress, so a swap kept in RAM (zram) frees nothing by taking them, and the reclaim
+// that started goes on until the swap is full.  Measured on the 890M (61 GiB of RAM, 8 GiB of zram; 2026-11-16) with a
+// 38 GiB cache and a 98 GiB synthetic q4_deep model read from its file: the verify window timed out in 2 runs of 16
+// (5 GiB of the cache went to swap in the 18 s before it, in the one that was sampled), and in none of 14 with the
+// slots locked; a reclaim of the process's memory asked of the kernel in mid-decode (memory.reclaim) stopped the
+// queues for 4.5 s while 0.9 GiB of the cache went out, and for 0.3 s with the slots locked.  STRATA_CACHE_MLOCK=0
+// leaves them pageable.  So does a memory limit on the process's cgroup, which the kernel could not keep it under
+// with the slots locked (they are charged to it), and a memlock limit below the cache; each says so.
+void lock_host_slots(void* p, uint64_t bytes) {
+    if (const char* v = std::getenv("STRATA_CACHE_MLOCK"); v != nullptr && std::strtol(v, nullptr, 10) == 0) return;
+    const double gib = (double) bytes / 1073741824.0;
+    strata::core::detail::HostMemory hm;
+    if (strata::core::detail::host_available_memory(hm) && hm.cgroup_limit != ~uint64_t{0}) {
+        std::fprintf(stderr, "strata: the host expert cache (%.2f GiB) stays pageable: this cgroup has a memory limit "
+                             "(%.2f GiB)\n", gib, (double) hm.cgroup_limit / 1073741824.0);
+        return;
+    }
+    // what the process has locked already (the PLE table) counts against the limit: the soft limit is raised to what
+    // the hard one allows for both (no privilege needed), as the PLE table's lock does for itself
+    uint64_t locked_kb = 0;
+    {
+        std::ifstream status("/proc/self/status");
+        std::string key;
+        while (status >> key) {
+            if (key == "VmLck:") { status >> locked_kb; break; }
+            status.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+        }
+    }
+    struct rlimit rl {};
+    const rlim_t room = (rlim_t) bytes + (rlim_t) locked_kb * 1024 + (rlim_t) 1073741824;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < room &&
+        rl.rlim_max > rl.rlim_cur) {
+        struct rlimit up = rl;
+        up.rlim_cur = rl.rlim_max == RLIM_INFINITY ? room : std::min<rlim_t>(rl.rlim_max, room);
+        if (setrlimit(RLIMIT_MEMLOCK, &up) == 0)
+            std::fprintf(stderr, "strata: the memory this program may lock was %llu MiB; raised to %llu MiB for the "
+                                 "host expert cache\n", (unsigned long long) (rl.rlim_cur / 1048576),
+                         (unsigned long long) (up.rlim_cur / 1048576));
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (mlock(p, bytes) == 0) {
+        std::fprintf(stderr, "strata: the host expert cache is locked in RAM (%.2f GiB, %.1f s; STRATA_CACHE_MLOCK=0 "
+                             "leaves it pageable)\n", gib,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        return;
+    }
+    const int why = errno;
+    munlock(p, bytes);   // a lock that failed while it faulted pages in leaves the range marked
+    struct rlimit now {};
+    if (getrlimit(RLIMIT_MEMLOCK, &now) == 0 && now.rlim_cur != RLIM_INFINITY && now.rlim_cur < room)
+        std::fprintf(stderr, "strata: the host expert cache (%.2f GiB) was not locked in RAM: this program may lock "
+                             "only %.2f GiB (RLIMIT_MEMLOCK).  It still works; when the kernel swaps the cache out, "
+                             "the GPU waits for the pages.  In a systemd service set LimitMEMLOCK=infinity, elsewhere "
+                             "run `ulimit -l unlimited`\n", gib, (double) now.rlim_cur / 1073741824.0);
+    else
+        std::fprintf(stderr, "strata: the host expert cache (%.2f GiB) was not locked in RAM (mlock: %s): when the "
+                             "kernel swaps it out, the GPU waits for the pages\n", gib, std::strerror(why));
+}
+#endif
 }  // namespace
 
 void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
@@ -350,6 +422,9 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
             return false;
         }
         host_usm_ = true;
+#if !defined(_WIN32)
+        lock_host_slots(base_, want);
+#endif
     }
 
     // ---- **THE ALLOCATION IS CHECKED AGAINST THE CARD, NOT AGAINST THE REQUEST.**

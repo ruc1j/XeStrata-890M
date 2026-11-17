@@ -107,6 +107,10 @@ The synthetic models are a `tools/q4geo_synth.py --small-ple` GGUF, a `tools/iq_
 | q4_deep | 64 layers, 512 experts | 2.9 tok/s | 0.92, 1.03, 1.00 tok/s |
 
 The q4_deep synthetic model's experts do not fit the RAM. They are read from the file as it runs, hence this speed.
+
+With the q4_deep synthetic model the engine sometimes stopped with "verify: timed out" (2 runs of 16). The expert cache in host USM (38 GiB) was going to swap. When pages of the cache are swapped out, the driver stops the process's GPU queues until they are back. Expert weights do not compress, so a swap kept in RAM (zram) frees no memory by taking them, and the reclaim goes on until the swap is full. In the run that stopped, about 5 GiB of the cache went to swap in the 18 s before it.
+The engine now locks the host USM cache in RAM with `mlock` ([DETAILS](DETAILS.md#less-ram-than-the-model-the-low-ram-mode)). All 14 runs with the cache locked ran to the end. With a reclaim of 14 GiB asked of the kernel in mid-decode, the run without the lock stopped with the timeout and the run with it ran to the end. Flash-Next's settings use this cache too. Its greedy answers to 6 chats are the same before and after the lock, and its decode, measured three times each in turn, was 35.5 to 36.4 tok/s before and 36.1 to 36.5 tok/s after.
+
 The weights are random, so what the answers say cannot be checked. What was checked is that the greedy output stays the same across speculation windows (`--spec` 2, 4 and 6) and across two runs. Flash-Next gives the same greedy answers to 6 chats as before the change. Its decode, measured three times each in turn, was 35.0 to 36.5 tok/s before and 36.4 to 36.5 tok/s after.
 
 Not taken: the feed that ships models of a new shape (`strata_control` and setup's shape engine), the CUDA and HIP geometry, Metal, and the Windows Strix Halo changes. The fork has no such layer and its SYCL kernels have no matching switch. SYCL's Q5_K and Q6_K downs have been accepted by the fork's `native_expert_supported` all along.

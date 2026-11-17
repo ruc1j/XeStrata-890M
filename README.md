@@ -347,6 +347,10 @@ original path stays.
   (`STRATA_UMA_HEADROOM_GIB`). On a 64 GB PC that runs few other programs, adding
   `"STRATA_UMA_HEADROOM_GIB": "3"` to `"env"` increases the memory usable for the context (setup rewrites `"env"`
   with `STRATA_CACHE_HOST` alone, so add it after setup).
+- **The experts are locked in RAM:** the engine locks the experts it keeps in RAM (`mlock`) so the OS does not swap
+  them out (while they are swapped out, the GPU waits for the pages). With a memlock limit (`ulimit -Hl`) below the
+  experts' size they cannot be locked, and setup warns
+  ([details](docs/DETAILS.md#less-ram-than-the-model-the-low-ram-mode)).
 
 **Running it while you are logged in:** `systemctl --user enable --now xestrata` keeps the model set up last
 running (no browser opens). Set it up once first.
