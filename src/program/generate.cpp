@@ -556,9 +556,11 @@ struct Options {
     int lookup_chain = 0;
     bool lookup_chain_given = false;   ///< --lookup-chain was on the command line (the integrated GPU's default does not override it)
     int lookup_chain_min = 3;   ///< --lookup-chain-min M: the shortest match (in tokens, drafts included) it extends on
-    /// --mtp-hnorm stream (opt-in): the draft layer's pre_fc_norm_hidden normalizes each hyper-connection stream on
-    /// its own (llama.cpp's qwen4exp MTP graph) instead of one RMS over all four (the default, tools/mtp_probe.py).
+    /// --mtp-hnorm stream (the default on an integrated GPU on the HIP backend, opt-in elsewhere): the draft layer's
+    /// pre_fc_norm_hidden normalizes each hyper-connection stream on its own (llama.cpp's qwen4exp MTP graph) instead
+    /// of one RMS over all four (tools/mtp_probe.py).
     bool mtp_hnorm_stream = false;
+    bool mtp_hnorm_given = false;   ///< --mtp-hnorm was on the command line (the integrated GPU's default does not override it)
     /// A control vector on the residual stream (strata/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
     /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
@@ -709,7 +711,8 @@ void usage() {
                  "                       the HIP backend)\n"
                  "  --lookup-chain-min M  the shortest context match --lookup-chain extends on (default 3)\n"
                  "  --mtp-hnorm pooled|stream  the draft layer's hidden-input norm: one RMS over all four streams\n"
-                 "                       (default) or one per stream (llama.cpp's MTP graph)\n"
+                 "                       or one per stream (llama.cpp's MTP graph; the default on an integrated GPU on\n"
+                 "                       the HIP backend, pooled elsewhere)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -2805,6 +2808,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
             o.mtp_hnorm_stream = v == "stream";
+            o.mtp_hnorm_given = true;
         }
         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
         else if (a == "--control-vector-scaled") {
@@ -3169,6 +3173,19 @@ int main(int argc, char** argv) {
         o.pipeline_windows < 2 && o.draft != "dflash2" && strata::core::spec_cost_default()) {
         o.lookup_chain = 2;
         std::fprintf(stderr, "strata: --lookup-chain 2 (the integrated GPU's default; --lookup-chain 0 turns it off)\n");
+    }
+    // XeStrata-890M: --mtp-hnorm stream by default on an integrated GPU on the HIP backend.  setup has written the flag
+    // into an integrated GPU's configuration since 2026-10-29 (upstream's value for the DGX Spark); a configuration
+    // written before, or by hand, ran the pooled norm.  The drafts are accepted more often with the per-stream norm
+    // (the 890M's greedy 6 chats: 2.70 -> 2.91 tokens a window, 39.04 -> 40.52 tok/s, three interleaved rounds, each
+    // above; the same answers).  --mtp-hnorm pooled keeps the pooled norm.
+    if (!o.mtp_hnorm_given && !o.mtp.empty()) {
+        const sycl::device& hd = strata::core::Runtime::get().device();
+        if (hd.get_backend() == sycl::backend::ext_oneapi_hip && strata::core::integrated_gpu(hd)) {
+            o.mtp_hnorm_stream = true;
+            std::fprintf(stderr, "strata: --mtp-hnorm stream (the integrated GPU's default; --mtp-hnorm pooled keeps "
+                                 "the pooled norm)\n");
+        }
     }
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
     // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
