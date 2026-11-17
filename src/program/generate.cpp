@@ -546,7 +546,8 @@ struct Options {
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
     /// pay (strata/spec/draft_policy.hpp).  On by default; 0 = MTP only.
     int suffix_draft = 3;
-    /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
+    /// The MTP's own window cap (0 = --spec, or --spec + 1 where the window is scheduled by its cost): with --spec 6
+    /// --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
     /// --lookup-chain K (opt-in, 0 = off): prompt lookup CHAINED after the MTP's proposal.  The suffix drafter matches
     /// the context followed by the MTP's drafts and appends up to K of the tokens that followed that match to the same
@@ -683,7 +684,8 @@ void usage() {
                  "                       of the batched prompt path (0 = off; default: by what the two cost here)\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
-                 "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
+                 "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec, or --spec + 1 on an integrated GPU\n"
+                 "                       on the HIP backend; longer ones come from suffixes)\n"
                  "  --mtp-draft-vocab FILE  with --draft dflash2: the draft head's token subset (default <mtp>/draft_vocab.bin)\n"
                  "  --draft mtp|dflash2  the draft source (default mtp); dflash2 needs --draft-model PACK (tools/dflash2_pack.py --q4_0),\n"
                  "                       --spec 2 or more and --mtp DIR (for DIR/draft_vocab.bin) or --mtp-draft-vocab FILE; no MTP layer\n"
@@ -3139,6 +3141,18 @@ int main(int argc, char** argv) {
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
+        // XeStrata-890M: where the MTP's window is scheduled by its cost (STRATA_SPEC_COST, the integrated GPU on the
+        // HIP backend's default), the MTP may take one row more than --spec: the rule prices the wider window at the
+        // round time it measured and takes it only where it pays, and without the row it cannot take a window it
+        // would have had accepted whole.  The 890M's greedy 6 chats with --spec 4: about half of the windows of 4
+        // rows became 5, 2.62 -> 2.72 tokens a window, 38.78 -> 38.97 tok/s (three interleaved rounds, each above;
+        // the same answers); a cap of 6 rows gave nothing (38.75 -> 38.73).  --mtp-max-t N sets the cap itself.
+        if (!o.mtp.empty() && o.batch == 0 && o.pipeline_windows < 2 && o.draft != "dflash2" &&
+            strata::core::spec_cost_default()) {
+            o.mtp_max_t = std::min(o.spec + 1, 8);
+            std::fprintf(stderr, "strata: the MTP's windows go up to %d rows (--spec + 1, the integrated GPU's default; "
+                                 "--mtp-max-t %d keeps them at --spec)\n", o.mtp_max_t, o.spec);
+        }
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
     }
     // XeStrata-890M: --lookup-chain 2 by default where the MTP's window is scheduled by its cost (STRATA_SPEC_COST, the
