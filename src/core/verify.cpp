@@ -1423,6 +1423,35 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // the top-10 and the doorbell in one launch where nothing changes the routing between them (48 nodes fewer a
         // window; the plan's kernel runs after the doorbell, which the host does not read).  STRATA_ROUTER_PUBLISH=0: apart
         static const bool router_publish = [] { const char* v = std::getenv("STRATA_ROUTER_PUBLISH"); return v == nullptr || *v != '0'; }();
+        // XeStrata-890M (STRATA_SH_EARLY, default on with the shared expert's side branch): the branch forks here, ahead
+        // of the router, and not after the plan.  The shared expert reads only the layer's input (its q8_1 image, which
+        // the experts' rows share) and the router's aux row only gives the combine its gates, so nothing but the order
+        // of the launches changes: its 2.7 MB of weights a layer are then read beside the router's GEMV, the top-10 and
+        // the plan, which leave the memory mostly idle, and less of them beside the routed experts' rows, which are
+        // bound by it.  Only where the combine scales the shared rows (else the shared expert's own launch would read
+        // the gates while the router's launch writes them), in windows of two rows or more, and not in a layer whose
+        // gate/up rows are Hadamard-folded: that layer rewrites the q8_1 image on cs after the shared expert's place.
+        // STRATA_SH_EARLY=0: the fork after the plan, as before.
+        static const bool sh_early_on = [] {
+            const char* e = std::getenv("STRATA_SH_EARLY");
+            return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+        }();
+        static const bool qdedup_on = [] {
+            const char* e = std::getenv("STRATA_VERIFY_QDEDUP");
+            return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+        }();
+        const bool native_rows = strata::kernels::cpu::expert_layout().native;
+        const bool sh_early = sh_early_on && br && sh_branch && dec_batch && n > 1 && qdedup_on && native_rows &&
+                              !strata::kernels::cpu::expert_layout().fmt[(size_t) l].had_gu &&
+                              (!shared_expert_native_bf16() || (lfuse_gate && native_moe_combine_enabled()));
+        if (sh_early) {
+            float* xe = mixed_ + tb * N;
+            try {
+                quantize_q8_1_rows(xe, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                if (!shared_expert_native_bf16()) f32_to_bf16_bulk(xe, sh_bf16_ + tb * N, (int64_t) n * N, cs);
+            } catch (const std::exception& e) { err = std::string("verify shared expert: ") + e.what(); return false; }
+            if (!fork(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
+        }
         bool published = false;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && native_router_takes((int) NE, (int) K)) {
             try {
@@ -1533,19 +1562,15 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             nsw.q8_1 = xq_;
             // the experts' q8_1 image of the input first: the shared expert's gate and up read it instead of quantizing
             // the same rows again (the same bytes), and the BF16 copy only for a gate that reads it (upstream
-            // be7889ed).  STRATA_VERIFY_QDEDUP=0: as before.
-            static const bool qdedup_on = [] {
-                const char* e = std::getenv("STRATA_VERIFY_QDEDUP");
-                return e == nullptr || std::strtol(e, nullptr, 10) != 0;
-            }();
-            qdedup = qdedup_on && strata::kernels::cpu::expert_layout().native;
-            if (qdedup) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
-            if (!(qdedup && shared_expert_native_bf16())) {
+            // be7889ed).  STRATA_VERIFY_QDEDUP=0: as before.  (sh_early: both were recorded ahead of the fork.)
+            qdedup = qdedup_on && native_rows;
+            if (qdedup && !sh_early) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            if (!sh_early && !(qdedup && shared_expert_native_bf16())) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
                 else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
             }
             sh_side_[grp] = br && sh_branch;
-            if (sh_side_[grp] && !fork(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
+            if (sh_side_[grp] && !sh_early && !fork(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
             try {
                 // the window's combine scales the shared rows itself (upstream b08cf3e1; the same bits, a launch fewer)
                 gate_later_[grp] = shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data,
