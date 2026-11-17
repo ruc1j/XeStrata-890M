@@ -63,6 +63,8 @@ inline float warp_sum(const sycl::sub_group& sg, float v) {
 inline void q8_1_store(const sycl::sub_group& sg, const float xi, uint8_t* block, const int lane) {
 #pragma clang fp contract(off)
     float amax = sycl::fabs(xi), sum = xi;
+    // unrolled: rolled, strata_shfl_xor's choice of the exchange by the offset stays a run-time switch in every trip
+#pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         amax = sycl::fmax(amax, strata_shfl_xor(sg, amax, o));
         sum += strata_shfl_xor(sg, sum, o);
