@@ -13,14 +13,18 @@
 // XeStrata-890M: resident_plan_top10 (the router's top-10 and the plan in one launch) against the two launches it
 // replaces, native_router_top10_multi and resident_plan: the ids, the weights, the whole plan and the skip word, for
 // windows of 1..8 tokens of 512 and of 256 experts, the tokens' logits near each other (shared experts) or apart.
+// The same launch with the experts' q8_1 image as more work-groups: quantize_q8_1_rows' bytes, for rows of 2560
+// values with a zero row and with a row that has infinities and a NaN among them.
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 
 #include "parity_device.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -143,6 +147,11 @@ int main() {
     {
         auto* d_logits = dalloc<float>((size_t) 8 * NE);
         auto* d_w = dalloc<float>(128);
+        const int QN = 2560;                                  // the q8_1 image's row (n_embd)
+        const size_t q_bytes = (size_t) 8 * (QN / 32) * 36;   // 8 rows of q8_1 blocks
+        auto* d_qx = dalloc<float>((size_t) 8 * QN);
+        auto* d_qa = dalloc<uint8_t>(q_bytes);
+        auto* d_qb = dalloc<uint8_t>(q_bytes);
         std::normal_distribution<float> g(0.0f, 1.0f);
         for (const int ne : {512, 256}) {
             for (int n_tok = 1; n_tok <= 8; ++n_tok) {
@@ -160,6 +169,22 @@ int main() {
                     std::vector<int32_t> ids_a(n), ids_b(n), plan_a(plan_words), plan_b(plan_words);
                     std::vector<float> w_a(n), w_b(n);
                     uint32_t skip_a = 0, skip_b = 0;
+                    // the rows for the q8_1 image: variant 1 has a zero row, variant 2 a row with non-finite values
+                    std::vector<float> qx((size_t) n_tok * QN);
+                    for (auto& v : qx) v = 2.0f * g(rng);
+                    if (variant == 1) for (int i = 0; i < QN; ++i) qx[(size_t) (n_tok - 1) * QN + i] = 0.0f;
+                    if (variant == 2) {
+                        qx[5] = std::numeric_limits<float>::infinity();
+                        qx[300] = -std::numeric_limits<float>::infinity();
+                        qx[700] = std::numeric_limits<float>::quiet_NaN();
+                    }
+                    const size_t qn = (size_t) n_tok * (QN / 32) * 36;
+                    const std::vector<uint8_t> qjunk(q_bytes, 0x5A);
+                    std::vector<uint8_t> q_a(qn), q_b(qn);
+                    P::copy_bytes_in(d_qx, qx.data(), qx.size() * 4);
+                    P::copy_bytes_in(d_qa, qjunk.data(), q_bytes);
+                    P::copy_bytes_in(d_qb, qjunk.data(), q_bytes);
+                    k::quantize_q8_1_rows(d_qx, n_tok, QN, d_qa, st);
                     // the two launches
                     P::copy_bytes_in(d_plan, fill.data(), plan_words * 4);
                     P::copy_bytes_in(d_skip, &zero, 4);
@@ -177,9 +202,24 @@ int main() {
                     P::copy_bytes_in(d_w, junk.data(), (size_t) 128 * 4);
                     P::copy_bytes_in(d_plan, fill.data(), plan_words * 4);
                     P::copy_bytes_in(d_skip, &zero, 4);
+                    // (every other case also writes the q8_1 image)
+                    const bool with_q = (n_tok + variant) % 2 == 0 || variant == 1 || variant == 2;
                     k::resident_plan_top10(d_logits, d_ids, d_w, n_tok, d_res, ne, cache_base, use_off ? d_off : nullptr,
-                                           blob, d_plan, capx, d_skip, 9u, st);
+                                           blob, d_plan, capx, d_skip, 9u, st, 0, 0, 0.0f, with_q ? d_qx : nullptr,
+                                           n_tok, QN, d_qb);
                     P::sync();
+                    P::copy_bytes_out(q_a.data(), d_qa, qn);
+                    P::copy_bytes_out(q_b.data(), d_qb, qn);
+                    if (with_q && q_a != q_b) {
+                        std::printf("    *** %d experts, %d tokens, variant %d: the q8_1 image differs from "
+                                    "quantize_q8_1_rows' ***\n", ne, n_tok, variant);
+                        ++bad;
+                    }
+                    if (!with_q && std::memcmp(q_b.data(), qjunk.data(), qn) != 0) {
+                        std::printf("    *** %d experts, %d tokens, variant %d: the launch without the image wrote "
+                                    "it ***\n", ne, n_tok, variant);
+                        ++bad;
+                    }
                     P::copy_bytes_out(ids_b.data(), d_ids, (size_t) n * 4);
                     P::copy_bytes_out(w_b.data(), d_w, (size_t) n * 4);
                     P::copy_bytes_out(plan_b.data(), d_plan, plan_words * 4);

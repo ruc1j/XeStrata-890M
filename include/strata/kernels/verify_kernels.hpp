@@ -125,11 +125,14 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
 /// native_router_top10_multi(logits, ids, w, n_tok) and resident_plan(ids, n_tok * 10, 10, ..., keep, w, ser_kmin,
 /// ser_t) in one launch: the same ids, weights, plan and *skip (XeStrata-890M: a launch a layer less in the window
 /// graph).  resident_plan_top10_takes: 1..8 tokens, the native router's shapes (256 or 512 experts, top 10).
+/// With q_x: quantize_q8_1_rows(q_x, q_rows, q_cols, q_y) as more work-groups of the same launch (q_cols a multiple of
+/// 256): the experts' q8_1 image of the layer's input, that launch's bytes.
 bool resident_plan_top10_takes(int n_tok, int n_expert, int k);
 void resident_plan_top10(const float* logits, int32_t* ids, float* w, int n_tok, const int32_t* res_layer,
                          int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
                          int32_t* plan, long long capx, uint32_t* skip, uint32_t ring, void* stream, int keep = 0,
-                         int ser_kmin = 0, float ser_t = 0.0f);
+                         int ser_kmin = 0, float ser_t = 0.0f, const float* q_x = nullptr, int64_t q_rows = 0,
+                         int64_t q_cols = 0, void* q_y = nullptr);
 /// STRATA_VERIFY_ECAP=N (upstream PR 3545, opt-in, changes the output): the verify window's expert set capped in
 /// place - token 0 keeps all k picks, the speculative tail (tokens 1..n-1) keeps the top (cap - k) entries by
 /// routing weight; a dropped entry is redirected round-robin onto a kept expert with weight 0 (no extra expert read,

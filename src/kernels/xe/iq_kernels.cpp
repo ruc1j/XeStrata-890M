@@ -42,6 +42,7 @@
 #include "device_target.hpp"
 #include "iq_bits.hpp"
 #include "q8_1_finite.hpp"
+#include "q8_1_rows_item.hpp"
 #include "sm70_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_iq_kernels
 #include "strata/kernels/device_arch_tag.hpp"
@@ -2384,23 +2385,9 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
         const size_t total = (size_t) ((n8 + 255) / 256) * 256;
         sync_if_needed(stream, queue_for(stream).parallel_for(sycl::nd_range<1>(total, 256),
                               [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
-            const long long j = (long long) it.get_global_linear_id();   // values 8j .. 8j + 7
-            const bool in = j < n8;
-            const sycl::sub_group sg = it.get_sub_group();
-            float v[8], a = 0.0f, sum = 0.0f;
-            for (int q = 0; q < 8; ++q) {
-                v[q] = in ? x[8 * j + q] : 0.0f;
-                a = sycl::fmax(a, sycl::fabs(v[q]));
-                sum += v[q];
-            }
-            const float amax = sycl::reduce_over_group(sg, a, sycl::maximum<float>());   // 32 lanes: 256 values
-            sum += sycl::permute_group_by_xor(sg, sum, 1);
-            sum += sycl::permute_group_by_xor(sg, sum, 2);
-            if (!in) return;
-            const float d = canon::q8_scale(amax), id = canon::q8_inv(d);
-            const long long ib = j / 4, o = 8 * (j % 4);
-            for (int q = 0; q < 8; ++q) Y[ib].qs[o + q] = canon::q8_value(v[q], id);
-            if (o == 0) Y[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+            // values 8j .. 8j + 7 (q8_1_rows_item.hpp: the launch that builds the resident plan runs the same item)
+            q8_1_rows_item(it.get_sub_group(), (long long) it.get_global_linear_id(), n8, x,
+                           reinterpret_cast<uint8_t*>(Y));
         }), "quantize_q8_1_rows");
         return;
     }

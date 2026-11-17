@@ -11,6 +11,7 @@
 // device-clock ticks, not the nanoseconds of CUDA's %globaltimer.
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/gdn.hpp"
+#include "q8_1_rows_item.hpp"
 #include "router_top10_token.hpp"
 #include "xe_shuffle.hpp"
 #include "cuda_intrinsics.hpp"
@@ -1311,13 +1312,22 @@ ResidentPlan resident_plan_args(const int32_t* ids, int n, int k, const int32_t*
 // XeStrata-890M: the router's top-10 of n_tok tokens (router.cpp's top10_token, one sub-group a token) and their plan
 // in one work-group: the first n_tok sub-groups write ids and w, and behind a barrier the group builds the plan from
 // them as resident_plan does.  WG: whole sub-groups for the tokens (128 work-items for up to 4, 256 for up to 8).
+// With q_n8 > 0 the launch has more work-groups, which write the experts' q8_1 image of q_x (q_n8 * 8 values, rows of
+// whole 256s) to q_y: quantize_q8_1_rows' work-items (q8_1_rows_item.hpp), that launch's bytes.
 template <int WG, int NPL>
 sycl::event launch_resident_plan_top10(sycl::queue& q, const float* logits, int32_t* ids, float* w, int n_tok,
-                                       const ResidentPlan& a) {
+                                       const ResidentPlan& a, const float* q_x, long long q_n8, uint8_t* q_y) {
+    const size_t q_groups = q_n8 > 0 ? (size_t) ((q_n8 + WG - 1) / WG) : 0;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
         sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG + 1), h);
-        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        h.parallel_for(sycl::nd_range<1>((1 + q_groups) * WG, WG),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const long long g0 = (long long) it.get_group(0);
+            if (g0 > 0) {
+                q8_1_rows_item(it.get_sub_group(), (g0 - 1) * WG + (long long) it.get_local_id(0), q_n8, q_x, q_y);
+                return;
+            }
             const sycl::sub_group sg = it.get_sub_group();
             const int tk = (int) sg.get_group_linear_id();
             if (tk < n_tok)
@@ -1356,17 +1366,21 @@ bool resident_plan_top10_takes(int n_tok, int n_expert, int k) {
 void resident_plan_top10(const float* logits, int32_t* ids, float* w, int n_tok, const int32_t* res, int n_expert,
                          const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* pl,
                          long long capx, uint32_t* skip, uint32_t ring, void* stream, int keep, int ser_kmin,
-                         float ser_t) {
+                         float ser_t, const float* q_x, int64_t q_rows, int64_t q_cols, void* q_y) {
     if (!resident_plan_top10_takes(n_tok, n_expert, 10) || logits == nullptr || ids == nullptr || w == nullptr)
         throw std::invalid_argument("resident_plan_top10: 1..8 tokens, 256 or 512 experts, top 10");
+    const long long q_n8 = q_x != nullptr ? (long long) q_rows * q_cols / 8 : 0;
+    if (q_n8 > 0 && (q_cols % 256 != 0 || q_y == nullptr))
+        throw std::invalid_argument("resident_plan_top10: the q8_1 image takes rows of whole 256s");
+    uint8_t* const qy = static_cast<uint8_t*>(q_y);
     const ResidentPlan a = resident_plan_args(ids, n_tok * 10, 10, res, n_expert, cache_base, slot_off, blob, pl, capx,
                                               skip, ring, keep, w, ser_kmin, ser_t);
     auto& q = Q(stream);
     const auto e = n_expert == 512
-        ? (n_tok <= 4 ? launch_resident_plan_top10<128, 16>(q, logits, ids, w, n_tok, a)
-                      : launch_resident_plan_top10<256, 16>(q, logits, ids, w, n_tok, a))
-        : (n_tok <= 4 ? launch_resident_plan_top10<128, 8>(q, logits, ids, w, n_tok, a)
-                      : launch_resident_plan_top10<256, 8>(q, logits, ids, w, n_tok, a));
+        ? (n_tok <= 4 ? launch_resident_plan_top10<128, 16>(q, logits, ids, w, n_tok, a, q_x, q_n8, qy)
+                      : launch_resident_plan_top10<256, 16>(q, logits, ids, w, n_tok, a, q_x, q_n8, qy))
+        : (n_tok <= 4 ? launch_resident_plan_top10<128, 8>(q, logits, ids, w, n_tok, a, q_x, q_n8, qy)
+                      : launch_resident_plan_top10<256, 8>(q, logits, ids, w, n_tok, a, q_x, q_n8, qy));
     done(stream, e, "resident_plan_top10");
 }
 

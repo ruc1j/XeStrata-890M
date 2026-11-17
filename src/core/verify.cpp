@@ -1450,6 +1450,15 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             return e == nullptr || std::strtol(e, nullptr, 10) != 0;
         }();
         bool top10_in_plan = false;
+        // XeStrata-890M: with it, the experts' q8_1 image of the layer's input is written by more work-groups of that
+        // launch, and not by a launch of its own ahead of the shared expert's fork (STRATA_SH_EARLY): the branch then
+        // forks right after the read and makes its own copy of the image (the same bytes) on its queue, so the main
+        // queue has a launch a layer less.  STRATA_Q8_PLAN=0: the image's own launch, as before.
+        static const bool q8_plan_on = [] {
+            const char* e = std::getenv("STRATA_Q8_PLAN");
+            return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+        }();
+        bool q8_in_plan = false;
         bool qdedup = false;    // the experts' q8_1 image of the input was made before the shared expert
         // STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): the top-10 picked again with a
         // logit bonus for the resident experts; the weights stay the router's (router.cpp)
@@ -1478,10 +1487,18 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         const bool sh_early = sh_early_on && br && sh_branch && dec_batch && n > 1 && qdedup_on && native_rows &&
                               !strata::kernels::cpu::expert_layout().fmt[(size_t) l].had_gu &&
                               (!shared_expert_native_bf16() || (lfuse_gate && native_moe_combine_enabled()));
+        // (decided here, ahead of the fork; the launches themselves are below)
+        top10_in_plan = plan_fuse && dec_batch && n > 1 && w_router != nullptr && native_router_enabled() &&
+                        native_router_takes((int) NE, (int) K) && !(router_publish && !recording_res_) &&
+                        (device_plan_ || recording_res_) && route_prior <= 0.0f &&
+                        route_resident_cfg().margin <= 0.0f && verify_ecap_cap() <= (int) K &&
+                        !(rs_on_ && G == 1 && n <= 8 && T <= 8) && !rt_replay_ &&
+                        resident_plan_top10_takes(n, (int) NE, (int) K);
+        q8_in_plan = q8_plan_on && sh_early && top10_in_plan && G == 1 && shared_expert_native_bf16() && N % 256 == 0;
         if (sh_early) {
             float* xe = mixed_ + tb * N;
             try {
-                quantize_q8_1_rows(xe, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                if (!q8_in_plan) quantize_q8_1_rows(xe, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
                 if (!shared_expert_native_bf16()) f32_to_bf16_bulk(xe, sh_bf16_ + tb * N, (int64_t) n * N, cs);
             } catch (const std::exception& e) { err = std::string("verify shared expert: ") + e.what(); return false; }
             if (!fork(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
@@ -1503,14 +1520,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     native_router_top10_publish(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm, (int64_t) n * N,
                                                 m_x_ + tb * N, m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs, (int) NE);
                     published = true;
-                } else {
-                    top10_in_plan = plan_fuse && (device_plan_ || recording_res_) && route_prior <= 0.0f &&
-                                    route_resident_cfg().margin <= 0.0f && verify_ecap_cap() <= (int) K &&
-                                    !(rs_on_ && G == 1 && n <= 8 && T <= 8) && !rt_replay_ &&
-                                    resident_plan_top10_takes(n, (int) NE, (int) K);
-                    if (!top10_in_plan)
-                        native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs, (int) NE);
-                }
+                } else if (!top10_in_plan)
+                    native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs, (int) NE);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {
@@ -1577,7 +1588,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                 (int) g.n_expert, hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                                 plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                                 (uint32_t) ((l - lb_) * G + grp + 1), cs, expert_keep, expert_ser.first,
-                                expert_ser.second);
+                                expert_ser.second, q8_in_plan ? mixed_ + tb * N : nullptr, n, N,
+                                nat_xq_ + (size_t) tb * (N / 32) * 36);
         else if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -1618,14 +1630,19 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             sh_side_[grp] = br && sh_branch;
             if (sh_side_[grp] && !sh_early && !fork(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
             try {
+                // q8_in_plan: the branch's own copy of the input's q8_1 image, in the scratch its SwiGLU writes after
+                // the gate and up rows have read it (the experts' copy comes with the plan's launch)
+                if (q8_in_plan) quantize_q8_1_rows(xm, n, N, xq_, df_side_[0]);
                 // the window's combine scales the shared rows itself (upstream b08cf3e1; the same bits, a launch fewer)
                 gate_later_[grp] = shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data,
                                                        sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff,
                                                        sh_g_ + tb, shared_ + tb * N, N, g.n_ff,
                                                        sh_side_[grp] ? df_side_[0] : cs,
                                                        lfuse_gate && dec_batch && n > 1 && native_moe_combine_enabled(),
-                                                       g_ready, qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36)
-                                                                       : nullptr);
+                                                       g_ready,
+                                                       q8_in_plan ? (const void*) xq_
+                                                                  : qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36)
+                                                                           : nullptr);
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
