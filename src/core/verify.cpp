@@ -1666,7 +1666,11 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             // the experts' q8_1 image of the input first: the shared expert's gate and up read it instead of quantizing
             // the same rows again (the same bytes), and the BF16 copy only for a gate that reads it (upstream
             // be7889ed).  STRATA_VERIFY_QDEDUP=0: as before.  (sh_early: both were recorded ahead of the fork.)
-            qdedup = qdedup_on && native_rows;
+            // Not in a Hadamard-folded layer whose shared expert runs on the side branch: that layer rewrites the image
+            // on cs from the rotated rows right after the fork, with nothing ordering it after the branch's read, so
+            // the branch quantizes its own copy into xq_ instead (as with STRATA_VERIFY_QDEDUP=0).
+            const bool had_gu_l = native_rows && strata::kernels::cpu::expert_layout().fmt[(size_t) l].had_gu;
+            qdedup = qdedup_on && native_rows && !(had_gu_l && br && sh_branch);
             if (qdedup && !sh_early) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
             if (!sh_early && !(qdedup && shared_expert_native_bf16())) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
@@ -1697,7 +1701,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             // APR: Hadamard-folded gate/up take H (s * x); xm itself stays as it is (the shared expert above and the
             // doorbell copy for the CPU pool, which rotates its own in native_quant_act).  The q8_1 image qdedup wrote
             // for the shared expert is of the unrotated input, so a folded layer rewrites it from the rotated rows
-            // (the same stream, after the shared expert has read it).
+            // (the same stream, after the shared expert has read it; a shared expert on the side branch does not read
+            // it there, qdedup above).
             const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
             if (f.had_gu) {
                 hadamard_rows(xm, nat_xr_ + (size_t) tb * N, n, N, f.had_block, had_sx_, cs);
