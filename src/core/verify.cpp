@@ -56,6 +56,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <stdexcept>
 #include <immintrin.h>
 
 namespace strata::core {
@@ -781,13 +782,21 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (!df_side_[0] || !df_side_[1]) df_branch_ = df_branch_res_ = false;
         else if (v != nullptr) df_branch_ = df_branch_res_ = std::strtol(v, nullptr, 10) != 0;
         else {
+            bool recorded = true;   // the probe recorded and ran its branched graph
             try {
+                if (std::getenv("STRATA_DEBUG_BRANCH_PROBE_THROW") != nullptr)   // the catch below, for a test
+                    throw std::runtime_error("STRATA_DEBUG_BRANCH_PROBE_THROW");
                 df_branch_ = strata::kernels::graph_branch_pays(cs_, df_side_[0], df_side_[1]);
-            } catch (const std::exception&) {
-                df_branch_ = false;   // a device that cannot record such a graph keeps one queue
+            } catch (const std::exception& e) {
+                // a device that cannot record such a graph keeps one queue, in the resident window graph as well:
+                // its capture has no fallback, and would fail every window at the first fork
+                df_branch_ = false;
+                recorded = false;
+                std::fprintf(stderr, "strata verify: graph side branches: not used (the probe failed: %s)\n", e.what());
             }
             const sycl::device& d = Runtime::get().device();
-            df_branch_res_ = df_branch_ || (d.get_backend() == sycl::backend::ext_oneapi_hip && integrated_gpu(d));
+            df_branch_res_ = df_branch_ ||
+                             (recorded && d.get_backend() == sycl::backend::ext_oneapi_hip && integrated_gpu(d));
             if (df_branch_res_ && !df_branch_)
                 std::fprintf(stderr, "strata verify: graph side branches: used in the windows that do not ask the host "
                                      "(the integrated GPU's default; STRATA_DF_BRANCH=0 turns them off)\n");
