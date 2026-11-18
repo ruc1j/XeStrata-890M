@@ -16,13 +16,13 @@ Radeon 890M と 64 GB の RAM を積んだノート PC 1 台で動かします�
 
 | | 元の XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
-| decode（短い会話 6 つの平均） | 15〜22 tok/s | 約 38 tok/s |
-| prefill 523 トークン | 5.4 s（98 tok/s） | 2.55 s（205 tok/s） |
-| prefill 3,481 トークン | 29.1 s（119 tok/s） | 13.1 s（265 tok/s） |
-| prefill 2,669 トークン（同じ文の繰り返し） | 22.0 s（121 tok/s） | 10.0 s（267 tok/s） |
+| decode（短い会話 6 つの平均） | 15〜22 tok/s | 約 39 tok/s |
+| prefill 518 トークン | 5.4 s（98 tok/s） | 1.79 s（290 tok/s） |
+| prefill 3,461 トークン | 29.1 s（119 tok/s） | 10.2 s（339 tok/s） |
+| prefill 2,669 トークン（同じ文の繰り返し） | 22.0 s（121 tok/s） | 7.78 s（343 tok/s） |
 
-prefill の「元の XeStrata」の列は、この 890M で元の XeStrata の prefill の経路を測った値です。答えは丸めの差を除いて同じです。
-decode の行は、temperature 0.7 で 1 つの会話に 400 トークンを出した値です。greedy で 200 トークンずつ出すと、約 42 tok/s です。
+prefill の「元の XeStrata」の列は、この 890M で元の XeStrata の prefill の経路を測った値です。答えは丸めの差を除いて同じです。この列の 518 トークンと 3,461 トークンの行は、読ませる文書の先頭が今と違ったころに、523 トークンと 3,481 トークンで測った値です。
+decode の行は、temperature 0.7 で 1 つの会話に 400 トークンを出した値です。greedy で 200 トークンずつ出すと、約 43 tok/s です。
 
 > **目次:** [XeStrata-890M とは](#xestrata-890m-とは) · [必要なもの](#必要なもの) · [モデル](#モデル) ·
 > [インストール](#インストール)（[Releases](https://github.com/ruc1j/XeStrata-890M/releases)） · [使い方](#使い方) · [困ったとき](#困ったとき) · [しくみ](#しくみ) ·

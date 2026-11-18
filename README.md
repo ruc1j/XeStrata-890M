@@ -17,14 +17,15 @@ Speed on the 890M (Ryzen AI 9 HX 370, 64 GB RAM, Fedora 44, Qwen3.8-Flash-Next I
 
 | | original XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
-| decode (average of 6 short chats) | 15-22 tok/s | about 38 tok/s |
-| prefill 523 tokens | 5.4 s (98 tok/s) | 2.55 s (205 tok/s) |
-| prefill 3,481 tokens | 29.1 s (119 tok/s) | 13.1 s (265 tok/s) |
-| prefill 2,669 tokens (the same sentence repeated) | 22.0 s (121 tok/s) | 10.0 s (267 tok/s) |
+| decode (average of 6 short chats) | 15-22 tok/s | about 39 tok/s |
+| prefill 518 tokens | 5.4 s (98 tok/s) | 1.79 s (290 tok/s) |
+| prefill 3,461 tokens | 29.1 s (119 tok/s) | 10.2 s (339 tok/s) |
+| prefill 2,669 tokens (the same sentence repeated) | 22.0 s (121 tok/s) | 7.78 s (343 tok/s) |
 
 The "original XeStrata" prefill column was measured on this 890M along the original XeStrata's prefill path; the
-answers are the same apart from rounding differences.
-The decode row is at temperature 0.7 with 400 tokens a chat; greedy, with 200 tokens a chat, it is about 42 tok/s.
+answers are the same apart from rounding differences. Its 518- and 3,461-token rows were measured at 523 and
+3,481 tokens, when the start of the document read was different.
+The decode row is at temperature 0.7 with 400 tokens a chat; greedy, with 200 tokens a chat, it is about 43 tok/s.
 
 > **Contents:** [About XeStrata-890M](#about-xestrata-890m) · [What you need](#what-you-need) · [The model](#the-model) ·
 > [Install](#install) ([Releases](https://github.com/ruc1j/XeStrata-890M/releases)) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
