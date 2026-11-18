@@ -158,6 +158,9 @@ AMD の GPU では intel/llvm の DPC++ の HIP のターゲットでその SYCL
      （20 の prompt の次のトークンの KL 平均 0.020、最も確率の高いトークンは同じ）。`STRATA_GDN_CHUNKED=0` で FP32 のカーネル。
    - gfx1150 では、QSA の prompt attention の q と p を FP16 の 1 枚で持ち（`STRATA_PA_FAST`）、ハイパーコネクションの読みの up と mix を
      1 つのカーネルにしています（`STRATA_HC_UPMIX`）。Strata-rdna3 からの移植で、prefill は合わせて 4〜5% 速くなります（[XE](docs/XE.ja.md#strata-rdna3-からの移植)）。
+   - HIP の統合 GPU では、エキスパートの int8 の down の積が行を FP16 で書き、combine がそれを読みます（`STRATA_PF_DM16`、既定）。1 層が書いて読み戻す
+     行の量が半分になり、15,251 トークンの prompt の prefill は 313.3 → 316.5 tok/s（+1.0%）です。FP16 の丸めのぶん答えが変わることがあります。
+     `STRATA_PF_DM16=0` で FP32 の行に戻せます。
    - 自身のカーネルは rocBLAS と足す順が違い、MMQ のスケールの fma も丸めが変わるので、答えが丸めの差で変わることがあります（`STRATA_BLAS=1` なら密な積は元のまま）。
 
 ## 必要なもの

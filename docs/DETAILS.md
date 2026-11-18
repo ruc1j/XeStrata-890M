@@ -54,6 +54,8 @@ The prefill has four opt-in switches, set in the engine's environment. None of t
 
 `STRATA_GDN_TC=1` (opt-in, changes the reply, upstream 8c2a84694) runs the DeltaNet recurrence of prompt chunks of 128 tokens or more as a scan over blocks of 32 tokens on the matrix engines (Intel's XMX, NVIDIA's tensor cores, RDNA3 and RDNA4's WMMA). Its products take the values split in two FP16 parts and add in FP32, so the rounding differs from the default FP32 recurrence. A GPU without matrix engines, and `STRATA_NO_XMX=1`, keeps the default recurrence. It takes about 60 MiB of VRAM for its scratch.
 
+`STRATA_PF_DM16` (the default on an integrated GPU on the HIP backend, changes the reply) has the experts' int8 down products write their rows as FP16 and the combine read them, halving the rows a layer writes and reads back: on the 890M with IQ2_XS a 15,251-token prompt's prefill was 1.0% faster. `STRATA_PF_DM16=0` returns to FP32 rows, and `=1` turns it on on other GPUs. A layer with a CPU share or a helper GPU keeps FP32 ([XE](XE.md#integration-through-strata-0158)).
+
 An opt-in that reads the late layers of a long prompt approximately for a faster prefill (`STRATA_KVA=1`, it changes the answers) is in [KVA](KVA.md).
 
 ### Decode (tokens/s)

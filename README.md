@@ -211,6 +211,10 @@ setup changes of upstream Strata 0.2.15 (engine 0.1.61) ([docs/XE.md](docs/XE.md
   - on gfx1150, QSA's prompt attention holds q and p as one FP16 image each (`STRATA_PA_FAST`), and the
     hyper-connection read's up and mix are one kernel (`STRATA_HC_UPMIX`): ports from Strata-rdna3 that make prefill
     4-5% faster together ([XE](docs/XE.md#ports-from-strata-rdna3)).
+  - on an integrated GPU on the HIP backend, the experts' int8 down products write their rows as FP16 and the
+    combine reads them (`STRATA_PF_DM16`, default): a layer writes and reads back half the bytes, and a 15,251-token
+    prompt's prefill goes from 313.3 to 316.5 tok/s (+1.0%). The answers can change by the FP16 rounding.
+    `STRATA_PF_DM16=0` returns to FP32 rows.
   - the own kernels sum in a different order than rocBLAS and MMQ's scale fma rounds differently, so the answers
     can change by rounding differences (`STRATA_BLAS=1` keeps the dense products as they were).
 
