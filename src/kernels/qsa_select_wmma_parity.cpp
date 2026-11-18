@@ -27,6 +27,8 @@
 
 #include "parity_device.hpp"
 
+#include <sycl/sycl.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -54,8 +56,8 @@ void check(bool ok, const char* what) {
 float warp_order_dot(const float* key, const float* q, int pattern) {
     float v[32];
     for (int l = 0; l < 32; ++l) {
-        const float* k4 = key + l * 4;
-        const float* q4 = q + l * 4;
+        const float* k4 = key + (size_t) l * 4;
+        const float* q4 = q + (size_t) l * 4;
         float d;
         if (pattern == 0) d = k4[0] * q4[0] + k4[1] * q4[1] + k4[2] * q4[2] + k4[3] * q4[3];
         else if (pattern == 1) {
@@ -73,9 +75,9 @@ float warp_order_dot(const float* key, const float* q, int pattern) {
         }
         v[l] = d;
     }
-    for (int o = 16; o > 0; o >>= 1) {
+    for (unsigned o = 16; o > 0; o >>= 1u) {
         float t[32];
-        for (int l = 0; l < 32; ++l) t[l] = v[l] + v[l ^ o];
+        for (unsigned l = 0; l < 32; ++l) t[l] = v[l] + v[l ^ o];
         std::memcpy(v, t, sizeof v);
     }
     return v[0];
@@ -103,12 +105,12 @@ double bound_of(double S, double score) { return std::exp2(-9.5) * S + 8 * std::
 // --bench: the tiled FP32 scorer (qsa_block_scores_tc, run without STRATA_SELECT_WMMA) against the WMMA one, on random
 // keys and queries, as the prompt path calls them (one call a chunk of queries)
 int bench(int argc, char** argv) {
-    const int64_t ctx = argc > 2 ? std::atoll(argv[2]) : 32768;
-    const int64_t nq = argc > 3 ? std::atoll(argv[3]) : 2048;
-    const int reps = argc > 4 ? std::atoi(argv[4]) : 10;
+    const int64_t ctx = argc > 2 ? std::strtoll(argv[2], nullptr, 10) : 32768;
+    const int64_t nq = argc > 3 ? std::strtoll(argv[3], nullptr, 10) : 2048;
+    const int reps = argc > 4 ? (int) std::strtol(argv[4], nullptr, 10) : 10;
     const k::QsaShapes s = k::qsa_real_shapes();
     const int64_t max_blocks = ctx / 4 + 1;
-    std::mt19937 rng(7);
+    std::mt19937 rng(7);   // NOLINT(bugprone-random-generator-seed): the same data each run.
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> pooled((size_t) max_blocks * 128), dead(128), q((size_t) nq * 512);
     for (auto& x : pooled) x = nd(rng);
@@ -177,8 +179,8 @@ int bench(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench") return bench(argc, argv);
     const bool selftest = argc > 1 && std::string(argv[1]) == "--selftest";
-    const int64_t nq0 = (argc > 1 && !selftest) ? std::atoll(argv[1]) : 49;
-    const int64_t max_blocks = (argc > 2 && !selftest) ? std::atoll(argv[2]) : 620;
+    const int64_t nq0 = (argc > 1 && !selftest) ? std::strtoll(argv[1], nullptr, 10) : 49;
+    const int64_t max_blocks = (argc > 2 && !selftest) ? std::strtoll(argv[2], nullptr, 10) : 620;
     const k::QsaShapes s = k::qsa_real_shapes();
 
     // pattern 0: a shared direction plus noise (a spread like a real indexer's); pattern 1: one-hot and coordinate-coded
@@ -197,7 +199,7 @@ int main(int argc, char** argv) {
         std::printf("case: %s (%lld queries, reach %lld)\n", cs.name, (long long) cs.nq, (long long) cs.reach);
         const int64_t nq = cs.nq, reach = cs.reach;
         if (nq < 1 || reach < 4) continue;
-        std::mt19937 rng(1234);
+        std::mt19937 rng(1234);   // NOLINT(bugprone-random-generator-seed): the same data each run.
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<float> dir(128);
         for (auto& x : dir) x = nd(rng);
@@ -263,9 +265,9 @@ int main(int argc, char** argv) {
                 for (int p = 0; p < 6; ++p) {
                     float score = 0;
                     for (int h = 0; h < 4; ++h)
-                        score += std::fmax(warp_order_dot(key, &q[(size_t) i * 512 + h * 128], p), 0.0f);
+                        score += std::fmax(warp_order_dot(key, &q[(size_t) i * 512 + (size_t) h * 128], p), 0.0f);
                     if (b == n_bid && n_kv % 4 != 0) score += 1e9f;
-                    if (std::memcmp(&got, &score, 4) == 0) ++fit[p];
+                    if (sycl::bit_cast<uint32_t>(got) == sycl::bit_cast<uint32_t>(score)) ++fit[p];
                 }
             }
         }
@@ -301,12 +303,12 @@ int main(int argc, char** argv) {
             for (int64_t b = 0; b < max_blocks; ++b) {
                 const float got = sc_wmma[(size_t) i * max_blocks + b];
                 if (b > n_bid) {
-                    if (std::memcmp(&got, &CANARY, 4) != 0) untouched = false;
+                    if (sycl::bit_cast<uint32_t>(got) != sycl::bit_cast<uint32_t>(CANARY)) untouched = false;
                     continue;
                 }
                 if (b == n_bid) {
                     const float w = sc_warp[(size_t) i * max_blocks + b];
-                    if (std::memcmp(&got, &w, 4) != 0) tail_same = false;
+                    if (sycl::bit_cast<uint32_t>(got) != sycl::bit_cast<uint32_t>(w)) tail_same = false;
                 }
             }
         }

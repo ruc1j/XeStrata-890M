@@ -422,7 +422,7 @@ sycl::event block_scores_simt(sycl::queue& q, const float* pooled, const float* 
 // 16-31 repeat 0-15), B = 16 queries (column l % 16); the accumulator gives lane l query l % 16 and blocks 2e + l / 16.
 // A work-group of 4 sub-groups splits its 16 queries into bf16 pieces once, in local memory, and takes 4 x WITER x 16
 // blocks; the keys are read from global memory (the query tiles of a launch re-read them through L2).
-constexpr int WQT = 16, WITER = 4, WQS = IDX_DIM + 8, WWG = 128;
+constexpr int WQT = 16, WITER = 4, WQLD = IDX_DIM + 8, WWG = 128;
 #if STRATA_AMD_GFX1150
 // x's bf16 pieces as FP32 bit patterns whose upper 16 bits are the bf16 (the lower 16 zero)
 inline void split3(float x, uint32_t& hi, uint32_t& mid, uint32_t& lo) {
@@ -438,12 +438,12 @@ inline void split3(float x, uint32_t& hi, uint32_t& mid, uint32_t& lo) {
 // scorer (32K context, 2,048 queries: 12.8 against 10.1 ms)
 template<int P>
 struct BlockScoresWmma {
-    const float* pooled;
-    const float* q_idx;
-    const int32_t* steps;
-    int64_t nq, max_blocks, reach;
-    float* out;
-    sycl::local_accessor<uint16_t, 1> sq;   // [P][IDX_HEADS][WQT][WQS]: hi / mid (/ lo), head, query, dim
+    const float* pooled = nullptr;
+    const float* q_idx = nullptr;
+    const int32_t* steps = nullptr;
+    int64_t nq = 0, max_blocks = 0, reach = 0;
+    float* out = nullptr;
+    sycl::local_accessor<uint16_t, 1> sq;   // [P][IDX_HEADS][WQT][WQLD]: hi / mid (/ lo), head, query, dim
     sycl::local_accessor<int, 1> s_nbid;
     STRATA_AMD_REQD_WG(1, WWG)
     [[sycl::reqd_sub_group_size(WARP)]] void operator()(sycl::nd_item<2> it) const {
@@ -455,22 +455,22 @@ struct BlockScoresWmma {
         using MB = J::Bc<uint16_t>;
         const auto sg = it.get_sub_group();
         const int t = (int) it.get_local_id(1), lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
-        const int l16 = lane & 15, g = lane >> 4;
+        const int l16 = (int) ((unsigned) lane & 15u), g = (int) ((unsigned) lane >> 4u);
         const int64_t q0 = (int64_t) it.get_group(0) * WQT;
-        auto at = [](int p, int h, int qr, int d) { return (((size_t) p * IDX_HEADS + h) * WQT + qr) * WQS + d; };
+        auto at = [](int p, int h, int qr, int d) { return (((size_t) p * IDX_HEADS + h) * WQT + qr) * WQLD + d; };
         for (int i = t; i < WQT * IDX_HEADS * IDX_DIM / 4; i += WWG) {
             const int row = i / (IDX_DIM / 4), c = i % (IDX_DIM / 4);
             const int qr = row / IDX_HEADS, h = row % IDX_HEADS;
             sycl::float4 v(0.0f);
             if (q0 + qr < nq)
-                v = *reinterpret_cast<const sycl::float4*>(q_idx + ((q0 + qr) * IDX_HEADS + h) * IDX_DIM + c * 4);
+                v = *reinterpret_cast<const sycl::float4*>(q_idx + ((q0 + qr) * IDX_HEADS + h) * IDX_DIM + (int64_t) c * 4);
             const float x[4] = {v.x(), v.y(), v.z(), v.w()};
             for (int j = 0; j < 4; ++j) {
                 uint32_t hb, mb, lb;
                 split3(x[j], hb, mb, lb);
-                sq[at(0, h, qr, c * 4 + j)] = (uint16_t) (hb >> 16);
-                sq[at(1, h, qr, c * 4 + j)] = (uint16_t) (mb >> 16);
-                if constexpr (P == 3) sq[at(2, h, qr, c * 4 + j)] = (uint16_t) (lb >> 16);
+                sq[at(0, h, qr, c * 4 + j)] = (uint16_t) (hb >> 16u);
+                sq[at(1, h, qr, c * 4 + j)] = (uint16_t) (mb >> 16u);
+                if constexpr (P == 3) sq[at(2, h, qr, c * 4 + j)] = (uint16_t) (lb >> 16u);
             }
         }
         if (t < WQT) s_nbid[t] = q0 + t < nq ? steps[(q0 + t) * kStepCount + kStepNBid] : 0;
@@ -492,14 +492,14 @@ struct BlockScoresWmma {
                 MA ah, am, al;
                 for (int j = 0; j < 16; j += 4) {
                     sycl::float4 kv(0.0f);
-                    if (rv) kv = *reinterpret_cast<const sycl::float4*>(kp + kk * 16 + j);
+                    if (rv) kv = *reinterpret_cast<const sycl::float4*>(kp + (ptrdiff_t) kk * 16 + j);
                     const float x[4] = {kv.x(), kv.y(), kv.z(), kv.w()};
                     for (int e = 0; e < 4; ++e) {
                         uint32_t hb, mb, lb;
                         split3(x[e], hb, mb, lb);
-                        ah.v[j + e] = (short) (hb >> 16);
-                        am.v[j + e] = (short) (mb >> 16);
-                        if constexpr (P == 3) al.v[j + e] = (short) (lb >> 16);
+                        ah.v[j + e] = (short) (hb >> 16u);
+                        am.v[j + e] = (short) (mb >> 16u);
+                        if constexpr (P == 3) al.v[j + e] = (short) (lb >> 16u);
                     }
                 }
                 for (int h = 0; h < IDX_HEADS; ++h) {
@@ -542,7 +542,7 @@ sycl::event block_scores_wmma(sycl::queue& q, const float* pooled, const float* 
     const size_t gb = (size_t) ((reach + per - 1) / per), gq = (size_t) ((nq + WQT - 1) / WQT);
     return q.submit([&](sycl::handler& h) {
         BlockScoresWmma<P> k{pooled, q_idx, steps, nq, max_blocks, reach, out,
-                             sycl::local_accessor<uint16_t, 1>(sycl::range<1>((size_t) P * IDX_HEADS * WQT * WQS), h),
+                             sycl::local_accessor<uint16_t, 1>(sycl::range<1>((size_t) P * IDX_HEADS * WQT * WQLD), h),
                              sycl::local_accessor<int, 1>(sycl::range<1>(WQT), h)};
         h.parallel_for(sycl::nd_range<2>({gq, gb * WWG}, {1, (size_t) WWG}), k);
     });
@@ -606,7 +606,7 @@ bool qsa_block_scores_wmma(const float* pooled, const float* dead, const float* 
     const bool dev_ok = per_device.get(q.get_device(), [&q] {
         const bool ok = xe::amd_gfx1150(q.get_device()) && xe::max_work_group(q) >= (size_t) WWG &&
                         q.get_device().get_info<sycl::info::device::local_mem_size>() >=
-                            (size_t) 3 * IDX_HEADS * WQT * WQS * 2 + 64;
+                            (size_t) 3 * IDX_HEADS * WQT * WQLD * 2 + 64;
         if (ok) std::fprintf(stderr, "qsa select: block scores on WMMA (bf16 pieces)\n");
         return ok;
     });
