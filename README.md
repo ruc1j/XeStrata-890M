@@ -62,8 +62,9 @@ setup changes of upstream Strata 0.2.15 (engine 0.1.61) ([docs/XE.md](docs/XE.md
 **Main changes for the 890M** (by part, not in commit order)
 
 - The experts' cache in host USM (`STRATA_CACHE_HOST=1`, used together with `--mmap-experts --expert-cache 24576
-  --no-prefill-borrow`). On an integrated GPU the CPU is not left spinning while it waits for the GPU, and the file's
-  pages are returned to the OS when the host USM cache is filled.
+  --no-prefill-borrow`; setup writes these settings from what the integrated GPU reports:
+  [The settings for the 890M](#the-settings-for-the-890m)). On an integrated GPU the CPU is not left spinning while
+  it waits for the GPU, and the file's pages are returned to the OS when the host USM cache is filled.
 - **decode:**
   - experts' products: the loads of the rows one lane takes are issued together up front (the down of Q2_0, the
     gate/up of IQ2_S, IQ2_XXS and IQ1_M). On AMD, gate/up and SwiGLU are computed in a single kernel, and the form
