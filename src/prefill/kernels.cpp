@@ -347,14 +347,15 @@ void gr_mix_r(const float* R, const float* rs, const float* w, const float* g, f
         if (mixed_h) mixed_h[i] = hf(s);
     });
 }
-// STRATA_HC_UPMIX=1 (opt-in, gfx1150): the hyper-connection read's up projection with gr_mix_r as its epilogue, after
-// Strata-rdna3's S23 (nicejunjie/Strata-rdna3 src/prefill/kernels.cu, gr_upmix_kernel).  `gated` (T x 10240 floats) is
-// neither written nor read: a work-group of 16 sub-groups takes 256 tokens (16 a sub-group) x 16 columns x the 4 streams
-// on WMMA (BF16 in, FP32 accumulate over K = LR; the group's w_up rows staged in local memory once), and each lane then
-// holds the 4 streams' values of its (token, column) and mixes them in registers in gr_mix_r's order.  XeStrata's read
-// adds the BF16 low parts' product (lo16_lo, STRATA_PREFILL_BF16X2): its WMMA follows the high parts' at every step of
-// K.  The sums run in another order than the GEMM's: not gr_mix_r's bits.  512 work-items a group bound the kernel's
-// registers (Strata-rdna3: the 512-thread bound held it to 127 VGPRs where 256 took 237).
+// gfx1150's default (STRATA_HC_UPMIX=0 off): the hyper-connection read's up projection with gr_mix_r as its epilogue,
+// after Strata-rdna3's S23 (nicejunjie/Strata-rdna3 src/prefill/kernels.cu, gr_upmix_kernel).  `gated` (T x 10240
+// floats) is neither written nor read: a work-group of 16 sub-groups takes 256 tokens (16 a sub-group) x 16 columns x
+// the 4 streams on WMMA (BF16 in, FP32 accumulate over K = LR; the group's w_up rows staged in local memory once),
+// and each lane then holds the 4 streams' values of its (token, column) and mixes them in registers in gr_mix_r's
+// order.  XeStrata's read adds the BF16 low parts' product (lo16_lo, STRATA_PREFILL_BF16X2): its WMMA follows the
+// high parts' at every step of K.  The sums run in another order than the GEMM's: not gr_mix_r's bits.  512
+// work-items a group bound the kernel's registers (Strata-rdna3: the 512-thread bound held it to 127 VGPRs where 256
+// took 237).
 namespace {
 constexpr int UM_D = 16, UM_LD = LR + 8, UM_NT = 512;
 static_assert(N % UM_D == 0 && LR % 16 == 0, "gr_upmix: the columns in tiles of 16, K in steps of 16");
@@ -432,10 +433,12 @@ struct GrUpmix {
 };
 }  // namespace
 
+// The 890M, 3,461 to 30,153 tokens: prefill 1.7 to 3.2% faster in three interleaved rounds, the same answers
+// (2026-11-18).
 bool gr_upmix_on(void* stream) {
     static const bool env = [] {
         const char* v = std::getenv("STRATA_HC_UPMIX");
-        return v != nullptr && v[0] == '1';
+        return !(v != nullptr && v[0] == '0');
     }();
     if (!env) return false;
     auto& q = Q(stream);
@@ -445,7 +448,8 @@ bool gr_upmix_on(void* stream) {
         const bool ok = kernels::xe::amd_gfx1150(dev) &&
                         dev.get_info<sycl::info::device::max_work_group_size>() >= (size_t) UM_NT &&
                         dev.get_info<sycl::info::device::local_mem_size>() >= (size_t) HC * UM_D * UM_LD * 2;
-        if (ok) std::fprintf(stderr, "prefill: the hc read's up projection and mix in one kernel (STRATA_HC_UPMIX=1)\n");
+        if (ok && std::getenv("STRATA_HC_UPMIX") != nullptr)
+            std::fprintf(stderr, "prefill: the hc read's up projection and mix in one kernel (STRATA_HC_UPMIX)\n");
         return ok;
     });
 }

@@ -464,10 +464,10 @@ inline void mad(sycl::sub_group sg, D& d, A& a, B& b, D& c) { mx::joint_matrix_m
 template<typename M, typename P>
 inline void store(sycl::sub_group sg, M& m, P p, size_t ld) { mx::joint_matrix_store(sg, m, p, ld, mx::layout::row_major); }
 }  // namespace jmx
-// SPLIT = false (STRATA_PA_FAST=1 on gfx1150; Strata-rdna3's S23, nicejunjie/Strata-rdna3 qsa_prompt_attn.cu): q and
-// p as one FP16 image each instead of hi + lo, half the matrix products of q.k and p.v, rounding-level (FP16
-// attention, as usual flash-attention kernels take it).  Only gfx1150's device code has the body; other devices'
-// code keeps the split (`split` below), and the host launches it only on a gfx1150 device.
+// SPLIT = false (gfx1150's default, STRATA_PA_FAST=0 off; Strata-rdna3's S23, nicejunjie/Strata-rdna3
+// qsa_prompt_attn.cu): q and p as one FP16 image each instead of hi + lo, half the matrix products of q.k and p.v,
+// rounding-level (FP16 attention, as usual flash-attention kernels take it).  Only gfx1150's device code has the
+// body; other devices' code keeps the split (`split` below), and the host launches it only on a gfx1150 device.
 template<int KF, int VF, bool SPLIT = true>   // K's KvFmt (kF16, kI8), V's (kF16, kI8, kQ4)
 struct PromptAttnMma {
     static constexpr bool split = SPLIT || !STRATA_AMD_GFX1150;
@@ -1125,12 +1125,15 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             return v == nullptr || v[0] != '0';
         }();
         const int64_t nkv = s.n_head_kv, ps = s.page_size;
-        // STRATA_PA_FAST=1 (opt-in, gfx1150 only): q and p as one FP16 image each (PromptAttnMma's SPLIT = false)
+        // gfx1150 by default (STRATA_PA_FAST=0 off): q and p as one FP16 image each (PromptAttnMma's SPLIT = false).
+        // The 890M, 3,461 to 30,153 tokens: prefill 2.4 to 3.2% faster in 3 interleaved rounds; the answers' wording
+        // changes at some lengths, and the MTP drafts accepted after the prompt with it (2026-11-18).
         static core::PerDevice<bool> fast_dev;
         const bool fast = fast_dev.get(queue.get_device(), [&queue] {
             const char* v = std::getenv("STRATA_PA_FAST");
-            const bool on = v != nullptr && v[0] == '1' && xe::amd_gfx1150(queue.get_device());
-            if (on) std::fprintf(stderr, "qsa prompt attn: q and p as single FP16 images (STRATA_PA_FAST=1)\n");
+            const bool on = !(v != nullptr && v[0] == '0') && xe::amd_gfx1150(queue.get_device());
+            if (on && v != nullptr)
+                std::fprintf(stderr, "qsa prompt attn: q and p as single FP16 images (STRATA_PA_FAST)\n");
             return on;
         });
         sycl::event e;

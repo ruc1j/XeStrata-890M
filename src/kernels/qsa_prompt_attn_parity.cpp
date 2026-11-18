@@ -12,12 +12,12 @@
 //   2. the new and old outputs agree to a relative 1e-4 of the output scale;
 // then times both over a prompt chunk (the old one in batches of 32, as prefill.cpp calls it).
 // HIP builds (S6): the same checks for the RDNA4 matrix-core kernel (STRATA_HIP_WMMA), skipped (77) off gfx12.
-// STRATA_PA_FAST=1 (gfx1150: q and p as one FP16 image each, after Strata-rdna3's S23): check 1 becomes a bound derived
-// for that rounding, per sampled (query, head) against FP64: a logit moves by at most d = 2^-11 * sum_d |q k| / 16 (q's
-// FP16 rounding; the K codes are exact), so p by a factor within exp(+-2d), and p's own FP16 rounding adds 2^-11; the
-// output then lies within (exp(2d) - 1 + 2^-10) * max |v| of FP64, plus the FP32 kernel's error.  A negative control
-// moves one output by 2.5 times its bound and must fail the same check.  Check 2 (against the FP32 kernel) takes the
-// same bound.
+// Unless STRATA_PA_FAST=0 (gfx1150: q and p as one FP16 image each, after Strata-rdna3's S23): check 1 is a bound
+// derived for that rounding, per sampled (query, head) against FP64: a logit moves by at most d = 2^-11 * sum_d |q k|
+// / 16 (q's FP16 rounding; the K codes are exact), so p by a factor within exp(+-2d), and p's own FP16 rounding adds
+// 2^-11; the output then lies within (exp(2d) - 1 + 2^-10) * max |v| of FP64, plus the FP32 kernel's error.  A
+// negative control moves one output by 2.5 times its bound and must fail the same check.  Check 2 (against the FP32
+// kernel) takes the same bound.
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -169,7 +169,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     par::copy_out(nw.data(), d_new, nw.size());
     // 1. FP64 reference on a sample of queries
     const char* fast_env = std::getenv("STRATA_PA_FAST");
-    const bool fast = fast_env != nullptr && fast_env[0] == '1';
+    const bool fast = !(fast_env != nullptr && fast_env[0] == '0');   // gfx1150's default; the bound holds elsewhere
     double err_old = 0, err_new = 0, ref_scale = 0;
     double worst_use = 0;            // STRATA_PA_FAST: the largest error / bound
     int64_t over = 0, neg_over = 0;  // outputs past their bound; the negative control's

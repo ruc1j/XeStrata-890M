@@ -29,7 +29,7 @@ void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint1
 /// bits); FP32, BF16 and FP16 (either image may be null).
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
               int64_t T, void* stream, uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);
-/// STRATA_HC_UPMIX=1 (opt-in) on a gfx1150 GPU: gr_upmix runs here (after Strata-rdna3's S23).
+/// On a gfx1150 GPU unless STRATA_HC_UPMIX=0: gr_upmix runs here (after Strata-rdna3's S23).
 bool gr_upmix_on(void* stream);
 /// The up projection (lo16 x w_up^T, plus lo16_lo x w_up^T when lo16_lo is not null; BF16, FP32 accumulate) with
 /// gr_mix_r as its epilogue, `gated` never written: gr_mix_r's outputs, rounding-level (another summation order than
