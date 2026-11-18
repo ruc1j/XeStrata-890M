@@ -37,6 +37,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <limits>
 
 namespace strata::kernels {
@@ -463,8 +464,13 @@ inline void mad(sycl::sub_group sg, D& d, A& a, B& b, D& c) { mx::joint_matrix_m
 template<typename M, typename P>
 inline void store(sycl::sub_group sg, M& m, P p, size_t ld) { mx::joint_matrix_store(sg, m, p, ld, mx::layout::row_major); }
 }  // namespace jmx
-template<int KF, int VF>   // K's KvFmt (kF16, kI8), V's (kF16, kI8, kQ4)
+// SPLIT = false (STRATA_PA_FAST=1 on gfx1150; Strata-rdna3's S23, nicejunjie/Strata-rdna3 qsa_prompt_attn.cu): q and
+// p as one FP16 image each instead of hi + lo, half the matrix products of q.k and p.v, rounding-level (FP16
+// attention, as usual flash-attention kernels take it).  Only gfx1150's device code has the body; other devices'
+// code keeps the split (`split` below), and the host launches it only on a gfx1150 device.
+template<int KF, int VF, bool SPLIT = true>   // K's KvFmt (kF16, kI8), V's (kF16, kI8, kQ4)
 struct PromptAttnMma {
+    static constexpr bool split = SPLIT || !STRATA_AMD_GFX1150;
     static_assert(KF != kQ4, "Q4_0 K takes the FP32 kernel");
     using Pa = PromptAttn<kF16, kF16, pm::CH>;   // the helpers that do not depend on the pools
     static constexpr int VPG = VF == kQ4 ? 2 : 1;      // V scale groups a sub-group's 64 dims
@@ -533,9 +539,11 @@ struct PromptAttnMma {
         for (int i = t; i < R * HD; i += pm::WG) {
             const int r = i / HD, d = i % HD;
             half hi, lo;
-            Pa::split(r < G ? qp[r * HD + d] * qup : 0.0f, hi, lo);
+            const float x = r < G ? qp[r * HD + d] * qup : 0.0f;
+            if constexpr (split) Pa::split(x, hi, lo);
+            else hi = half(x);
             kvq[QH + (size_t) r * QS + d] = hi;
-            kvq[QL + (size_t) r * QS + d] = lo;
+            if constexpr (split) kvq[QL + (size_t) r * QS + d] = lo;
         }
         if (t < R) { mrow[t] = NEG_INF; lsum[t] = 0.0f; }
         sycl::group_barrier(grp);
@@ -544,7 +552,7 @@ struct PromptAttnMma {
         for (int kk = 0; kk < 4; ++kk) {
             const size_t off = (size_t) g * 64 + (size_t) kk * T16;
             J::load(sg, qa[kk], at(kvq, QH + off), QS);
-            J::load(sg, qb[kk], at(kvq, QL + off), QS);
+            if constexpr (split) J::load(sg, qb[kk], at(kvq, QL + off), QS);
         }
         // output values a lane: element lane + SG * i (i < TPL) of each of the sub-group's four 16 x 16 tiles, in
         // o[nt * TPL + i]
@@ -623,7 +631,7 @@ struct PromptAttnMma {
                     MBc b;
                     J::load(sg, b, at(kvq, KH + (size_t) g * 64 + (size_t) kk * T16), KR);
                     J::mad(sg, c, qa[kk], b, c);
-                    J::mad(sg, c, qb[kk], b, c);
+                    if constexpr (split) J::mad(sg, c, qb[kk], b, c);
                 }
                 J::store(sg, c, at(part, (size_t) g * R * CH), CH);
             }
@@ -684,9 +692,13 @@ struct PromptAttnMma {
                     for (int e = lane; e < R * CH; e += pm::SG) {
                         const float w = VF == kF16 ? vup : vs[(e % CH) * VS + vg] * vup;
                         half hi, lo;
-                        Pa::split(part[e] * w, hi, lo);
+                        if constexpr (split) {
+                            Pa::split(part[e] * w, hi, lo);
+                            pp[(size_t) (2 * vg + 1) * R * CH + e] = lo;
+                        } else {
+                            hi = half(part[e] * w);
+                        }
                         pp[(size_t) (2 * vg) * R * CH + e] = hi;
-                        pp[(size_t) (2 * vg + 1) * R * CH + e] = lo;
                     }
                 }
                 sycl::group_barrier(sg);
@@ -695,14 +707,14 @@ struct PromptAttnMma {
                     if (nt % (4 / VPG) == 0) {   // the V scale group of these 16 dims
                         const int vg = g * VPG + nt / (4 / VPG);
                         J::load(sg, ph, at(pp, (size_t) (2 * vg) * R * CH), CH);
-                        J::load(sg, pl, at(pp, (size_t) (2 * vg + 1) * R * CH), CH);
+                        if constexpr (split) J::load(sg, pl, at(pp, (size_t) (2 * vg + 1) * R * CH), CH);
                     }
                     MC acc;
                     J::fill(sg, acc, 0.0f);
                     MBr b;
                     J::load(sg, b, at(kvq, VH + (size_t) g * 64 + (size_t) nt * T16), KR);
                     J::mad(sg, acc, ph, b, acc);
-                    J::mad(sg, acc, pl, b, acc);
+                    if constexpr (split) J::mad(sg, acc, pl, b, acc);
 #if STRATA_AMD_WMMA
                     if (nt == 0)
                         for (int e = 0; e < 8; ++e) walpha[e] = alpha[J::row_of(whi, e)];
@@ -752,12 +764,12 @@ constexpr size_t mma_local_bytes() {
            (size_t) 3 * R * 4;
 }
 
-template<int KF, int VF>
+template<int KF, int VF, bool SPLIT = true>
 sycl::event launch_mma(sycl::queue& q, const float* qv, QsaAttnPools p, const int32_t* ids, const int32_t* steps,
                        int64_t cap, int64_t n_kv, int64_t page_size, float* attn, int64_t n_q) {
     const float scale_log2 = 1.4426950408889634f / std::sqrt((float) HD);
     return q.submit([&](sycl::handler& h) {
-        using K = PromptAttnMma<KF, VF>;
+        using K = PromptAttnMma<KF, VF, SPLIT>;
         K k{qv, p, ids, steps, cap, n_kv, page_size, scale_log2, attn,
             sycl::local_accessor<half, 1>(sycl::range<1>(K::KV_HALVES), h),
             sycl::local_accessor<long long, 1>(sycl::range<1>(pm::CH), h),
@@ -1113,20 +1125,31 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             return v == nullptr || v[0] != '0';
         }();
         const int64_t nkv = s.n_head_kv, ps = s.page_size;
+        // STRATA_PA_FAST=1 (opt-in, gfx1150 only): q and p as one FP16 image each (PromptAttnMma's SPLIT = false)
+        static core::PerDevice<bool> fast_dev;
+        const bool fast = fast_dev.get(queue.get_device(), [&queue] {
+            const char* v = std::getenv("STRATA_PA_FAST");
+            const bool on = v != nullptr && v[0] == '1' && xe::amd_gfx1150(queue.get_device());
+            if (on) std::fprintf(stderr, "qsa prompt attn: q and p as single FP16 images (STRATA_PA_FAST=1)\n");
+            return on;
+        });
         sycl::event e;
         if (pools.k_q != nullptr) {
             if (!pools.k_scale) return false;
             if (pools.v_q4 != nullptr)
-                e = launch_mma<kI8, kQ4>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
+                e = fast ? launch_mma<kI8, kQ4, false>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q)
+                         : launch_mma<kI8, kQ4>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
             else if (pools.v_q && pools.v_scale && ptx_on && slm >= sizeof(pv2::Smem) && ptx_attn_built(queue))
                 e = launch_ptx(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
             else if (pools.v_q && pools.v_scale)
-                e = launch_mma<kI8, kI8>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
+                e = fast ? launch_mma<kI8, kI8, false>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q)
+                         : launch_mma<kI8, kI8>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
             else
                 return false;
         } else {
             if (!pools.k_pool || !pools.v_pool) return false;
-            e = launch_mma<kF16, kF16>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
+            e = fast ? launch_mma<kF16, kF16, false>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q)
+                     : launch_mma<kF16, kF16>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
         }
         if (!stream) core::Runtime::get().wait(e, "qsa_prompt_attn_batch");
         return true;

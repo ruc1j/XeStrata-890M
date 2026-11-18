@@ -12,6 +12,12 @@
 //   2. the new and old outputs agree to a relative 1e-4 of the output scale;
 // then times both over a prompt chunk (the old one in batches of 32, as prefill.cpp calls it).
 // HIP builds (S6): the same checks for the RDNA4 matrix-core kernel (STRATA_HIP_WMMA), skipped (77) off gfx12.
+// STRATA_PA_FAST=1 (gfx1150: q and p as one FP16 image each, after Strata-rdna3's S23): check 1 becomes a bound derived
+// for that rounding, per sampled (query, head) against FP64: a logit moves by at most d = 2^-11 * sum_d |q k| / 16 (q's
+// FP16 rounding; the K codes are exact), so p by a factor within exp(+-2d), and p's own FP16 rounding adds 2^-11; the
+// output then lies within (exp(2d) - 1 + 2^-10) * max |v| of FP64, plus the FP32 kernel's error.  A negative control
+// moves one output by 2.5 times its bound and must fail the same check.  Check 2 (against the FP32 kernel) takes the
+// same bound.
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -162,27 +168,39 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     par::copy_out(o.data(), d_old, o.size());
     par::copy_out(nw.data(), d_new, nw.size());
     // 1. FP64 reference on a sample of queries
+    const char* fast_env = std::getenv("STRATA_PA_FAST");
+    const bool fast = fast_env != nullptr && fast_env[0] == '1';
     double err_old = 0, err_new = 0, ref_scale = 0;
+    double worst_use = 0;            // STRATA_PA_FAST: the largest error / bound
+    int64_t over = 0, neg_over = 0;  // outputs past their bound; the negative control's
+    std::vector<double> bound_at(o.size(), 0.0);
     for (int64_t i = 0; i < nq; i += std::max<int64_t>(1, nq / 16)) {
         const int64_t w = steps[i * k::kStepCount + k::kStepWidth];
         const int32_t* sel = ids.data() + i * cap;
         for (int64_t h = 0; h < NH; ++h) {
             const int64_t kvh = h / (NH / NKV);
             std::vector<double> sco((size_t) w);
-            double mx = -1e300;
+            double mx = -1e300, smax = 0, vmax = 0;
             for (int64_t c = 0; c < w; ++c) {
                 const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
-                double a = 0;
+                double a = 0, aa = 0;
                 for (int64_t d = 0; d < HD; ++d) {
                     const double kv = fmt == 2 ? q4v(k4, row, d)
                                       : fmt == 1 ? (double) kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
                     a += (double) q[(i * NH + h) * HD + d] * kv;
+                    aa += std::fabs((double) q[(i * NH + h) * HD + d] * kv);
+                    const double vv = fmt == 2 ? q4v(v4, row, d)
+                                      : fmt == 1 ? (double) vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
+                    vmax = std::max(vmax, std::fabs(vv));
                 }
                 sco[c] = a / 16.0;
+                smax = std::max(smax, aa / 16.0);
                 mx = std::max(mx, sco[c]);
             }
             double l = 0;
             for (auto& x : sco) { x = std::exp(x - mx); l += x; }
+            const double dl = std::ldexp(smax, -11);   // a logit's largest move from q's FP16 rounding
+            const double fast_bound = (std::expm1(2.0 * dl) + std::ldexp(1.0, -10)) * vmax;
             for (int64_t d = 0; d < HD; ++d) {
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {
@@ -196,14 +214,24 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 ref_scale = std::max(ref_scale, std::fabs(r));
                 err_old = std::max(err_old, std::fabs(o[at] - r));
                 err_new = std::max(err_new, std::fabs(nw[at] - r));
+                if (fast) {
+                    const double b = fast_bound + 4.0 * std::fabs(o[at] - r) + 1e-6 * vmax;
+                    bound_at[at] = b;
+                    const double e = std::fabs(nw[at] - r);
+                    if (e > b) ++over;
+                    worst_use = std::max(worst_use, e / b);
+                    if (std::fabs(nw[at] + 2.5 * b - r) <= b) ++neg_over;   // the control must land outside
+                }
             }
         }
     }
-    // 2. new vs old everywhere
+    // 2. new vs old everywhere (STRATA_PA_FAST: at the sampled outputs, within their bound)
     double diff = 0, scale = 0;
+    int64_t over2 = 0;
     for (size_t i = 0; i < o.size(); ++i) {
         diff = std::max(diff, (double) std::fabs(o[i] - nw[i]));
         scale = std::max(scale, (double) std::fabs(o[i]));
+        if (fast && bound_at[i] > 0 && std::fabs(o[i] - nw[i]) > bound_at[i]) ++over2;
     }
     // 3. speed
     auto timed = [&](auto f) {
@@ -214,8 +242,12 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     };
     const double ms_old = timed(old_run), ms_new = timed(new_run);
-    const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
-    const bool ok2 = diff <= 1e-4 * scale;
+    const bool ok1 = fast ? over == 0 && neg_over == 0 : err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
+    const bool ok2 = fast ? over2 == 0 : diff <= 1e-4 * scale;
+    if (fast)
+        std::printf("  STRATA_PA_FAST: outputs past the bound %lld (FP32 kernel %lld), worst use of the bound %.1f%%, "
+                    "negative control inside the bound %lld\n",
+                    (long long) over, (long long) over2, 100.0 * worst_use, (long long) neg_over);
     std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
                 "scale); %.3f -> %.3f ms per chunk (%.2fx)\n",
                 ok1 && ok2 ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,

@@ -1120,10 +1120,23 @@ if(STRATA_ENABLE_XE)
     add_executable(qsa_parity src/kernels/qsa_parity.cpp)
     target_link_libraries(qsa_parity PRIVATE strata_kernels)
     add_test(NAME qsa_parity COMMAND qsa_parity --selftest)
+    # STRATA_SELECT_WMMA (gfx1150, after Strata-rdna3): the QSA block scores on WMMA against FP64 and the warp kernel's
+    # selection; skipped (77) on other devices
+    add_executable(qsa_select_wmma_parity src/kernels/qsa_select_wmma_parity.cpp)
+    target_link_libraries(qsa_select_wmma_parity PRIVATE strata_kernels)
+    add_test(NAME qsa_select_wmma_parity COMMAND qsa_select_wmma_parity 49 620)
+    set_tests_properties(qsa_select_wmma_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    add_test(NAME qsa_select_wmma_parity_p3
+             COMMAND ${CMAKE_COMMAND} -E env STRATA_SELECT_WMMA=3 $<TARGET_FILE:qsa_select_wmma_parity> 49 620)
+    set_tests_properties(qsa_select_wmma_parity_p3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     # perf-review D-1: the prompt attention against the FP32 kernel and FP64 (a benchmark too: not a CTest case,
     # as in the CUDA build)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels)
+    # STRATA_PA_FAST (gfx1150, after Strata-rdna3): the single-FP16 q and p against the bound derived for them; on other
+    # devices the variable changes nothing and the bound holds all the same
+    add_test(NAME qsa_prompt_attn_parity_pa_fast
+             COMMAND ${CMAKE_COMMAND} -E env STRATA_PA_FAST=1 $<TARGET_FILE:qsa_prompt_attn_parity> 8192 512 1)
     # the decode attention over every cell (Ornith-1.5's, Qwen3.5-9B's and llm-jp-4.1's full attention) against FP64
     # (synthetic)
     add_executable(qsa_dense_attn_parity src/kernels/qsa_dense_attn_parity.cpp)
@@ -1167,6 +1180,12 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(gdn_prompt_parity PRIVATE strata_prefill)
     add_test(NAME gdn_prompt_parity COMMAND gdn_prompt_parity)
     add_test(NAME gdn_prompt_parity_fp32 COMMAND gdn_prompt_parity --chunked 0 --keyhead 0)
+    # STRATA_HC_UPMIX (gfx1150, after Strata-rdna3): the hc read's up projection and mix in one kernel against FP64;
+    # skipped (77) on other devices
+    add_executable(gr_upmix_parity src/prefill/gr_upmix_parity.cpp)
+    target_link_libraries(gr_upmix_parity PRIVATE strata_prefill)
+    add_test(NAME gr_upmix_parity COMMAND gr_upmix_parity)
+    set_tests_properties(gr_upmix_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     add_executable(gemm_bench src/kernels/gemm_bench.cpp)
     target_link_libraries(gemm_bench PRIVATE strata_kernels)
     # #783 PR-c: the multi-token router against the single one, the combine against its contract's host replay
