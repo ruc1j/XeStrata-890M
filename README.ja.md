@@ -12,7 +12,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 Radeon 890M と 64 GB の RAM を積んだノート PC 1 台で動かします。
 対象はこの GPU だけです。元の XeStrata が扱うほかの GPU のことは、このフォークでは扱いません。
 
-890M での速さ（Ryzen AI 9 HX 370、RAM 64 GB、Fedora 44、Qwen3.8-Flash-Next IQ2_XS、APU の電力 28 W）
+890M での速さ（Ryzen AI 9 HX 370、RAM 64 GB、Fedora 45（ROCm 7.2.2）、Qwen3.8-Flash-Next IQ2_XS、APU の電力 28 W）
 
 | | 元の XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
@@ -22,6 +22,7 @@ Radeon 890M と 64 GB の RAM を積んだノート PC 1 台で動かします�
 | prefill 2,669 トークン（同じ文の繰り返し） | 22.0 s（121 tok/s） | 7.78 s（343 tok/s） |
 
 prefill の「元の XeStrata」の列は、この 890M で元の XeStrata の prefill の経路を測った値です。答えは丸めの差を除いて同じです。この列の 518 トークンと 3,461 トークンの行は、読ませる文書の先頭が今と違ったころに、523 トークンと 3,481 トークンで測った値です。
+「元の XeStrata」の列は、decode も prefill も、OS が Fedora 44（ROCm 7.1.1）だったころに測りました。Fedora 45 に上げても、XeStrata-890M の decode と prefill の速さは変わっていません。
 decode の行は、temperature 0.7 で 1 つの会話に 400 トークンを出した値です。greedy で 200 トークンずつ出すと、約 43 tok/s です。
 
 > **目次:** [XeStrata-890M とは](#xestrata-890m-とは) · [必要なもの](#必要なもの) · [モデル](#モデル) ·
@@ -167,7 +168,7 @@ AMD の GPU では intel/llvm の DPC++ の HIP のターゲットでその SYCL
 | CPU | Ryzen AI 9 HX 370（12 コア 24 スレッド、AVX-512）。 |
 | RAM | 64 GB（IQ2_XS のエキスパート約 34 GiB をすべて RAM に置きます）。[モデル](#モデル)。 |
 | ディスク | モデルに 68 GB、MTP 層に約 6 GB。NVMe の SSD。 |
-| OS | Fedora 44（ディストリビューションの ROCm 7.1.1）。 |
+| OS | Fedora 44（ディストリビューションの ROCm 7.1.1）。上の表の XeStrata-890M の列は、Fedora 45（ROCm 7.2.2）でソースからビルドして測りました。 |
 | BIOS | GPU へのメモリの割り当て（VRAM）は既定（512 MB）のままで構いません。エキスパートは host USM に置くので、割り当てを増やす必要はありません。カーネルの起動オプション（`ttm.pages_limit` など）も変えません。 |
 
 

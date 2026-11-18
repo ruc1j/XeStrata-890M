@@ -13,7 +13,7 @@ It runs the 125-billion-parameter AI model **[Qwen3.8-Flash-Next](https://huggin
 on a single laptop with the Radeon 890M and 64 GB of RAM.
 Only this GPU is targeted; this fork does not cover the other GPUs the original XeStrata handles.
 
-Speed on the 890M (Ryzen AI 9 HX 370, 64 GB RAM, Fedora 44, Qwen3.8-Flash-Next IQ2_XS, 28 W APU power)
+Speed on the 890M (Ryzen AI 9 HX 370, 64 GB RAM, Fedora 45 (ROCm 7.2.2), Qwen3.8-Flash-Next IQ2_XS, 28 W APU power)
 
 | | original XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
@@ -25,6 +25,8 @@ Speed on the 890M (Ryzen AI 9 HX 370, 64 GB RAM, Fedora 44, Qwen3.8-Flash-Next I
 The "original XeStrata" prefill column was measured on this 890M along the original XeStrata's prefill path; the
 answers are the same apart from rounding differences. Its 518- and 3,461-token rows were measured at 523 and
 3,481 tokens, when the start of the document read was different.
+The "original XeStrata" column, decode and prefill alike, was measured while the OS was Fedora 44 (ROCm 7.1.1);
+moving to Fedora 45 did not change XeStrata-890M's decode or prefill speed.
 The decode row is at temperature 0.7 with 400 tokens a chat; greedy, with 200 tokens a chat, it is about 43 tok/s.
 
 > **Contents:** [About XeStrata-890M](#about-xestrata-890m) · [What you need](#what-you-need) · [The model](#the-model) ·
@@ -219,7 +221,7 @@ setup changes of upstream Strata 0.2.15 (engine 0.1.61) ([docs/XE.md](docs/XE.md
 | CPU | Ryzen AI 9 HX 370 (12 cores, 24 threads, AVX-512). |
 | RAM | 64 GB (all of the IQ2_XS experts, about 34 GiB, go in the RAM). [The model](#the-model). |
 | Disk | 68 GB for the model, about 6 GB for the MTP layer. An NVMe SSD. |
-| OS | Fedora 44 (the distribution's ROCm 7.1.1). |
+| OS | Fedora 44 (the distribution's ROCm 7.1.1). The XeStrata-890M column of the table at the top was measured on Fedora 45 (ROCm 7.2.2), built from source. |
 | BIOS | The memory allotted to the GPU (VRAM) can stay at the default (512 MB). The experts go in host USM, so no larger allotment is needed. Kernel boot options (`ttm.pages_limit` and the like) are not changed either. |
 
 ### AMD GPUs
