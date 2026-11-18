@@ -437,7 +437,7 @@ Ben1078's e8e0cdc40 (a metadata-only GGUF shard) was already in this fork's gguf
 ### Memory sizing on an integrated GPU and the expert source's bounds (Issue #67)
 
 Three changes of shoftee/Strata came in: the expert cache is sized from `MemAvailable`, not from the figure clamped by the cgroup's cap (48defc12e: the cache's pages are not charged to the cgroup); with `--conversation-cache-mib N` on an integrated GPU's `--serve` the auto expert cache's reserve grows by N (ff5809230); and ArenaExpertSource's prefetch, release and pinned check the layer's upper bound (f6094ff1e: 172K-190K prompts read past the table and stopped the engine). The fatal-signal backtrace did not come in.
-Ben1078's bd0e37bb4 (mlock of the HIP expert arena) did not come in: this fork's expert cache is hipHostMalloc memory, which the driver pins, and the mapped experts are page cache, not something mlock applies to.
+Ben1078's bd0e37bb4 (mlock of the HIP expert arena) did not come in: the mapped experts are page cache, not something mlock applies to. The expert cache in host USM is the process's own pages, which the driver does not pin and which could go to swap, so the engine later came to lock that cache itself with `mlock` ([Integration through Strata 0.1.59](#integration-through-strata-0159-the-qwen-4-shapes)).
 
 ### Separate cost tables for the lookup and MTP windows, the O_DIRECT fallback (Issue #64)
 
