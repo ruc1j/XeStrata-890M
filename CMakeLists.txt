@@ -1120,6 +1120,15 @@ if(STRATA_ENABLE_XE)
     add_executable(qsa_parity src/kernels/qsa_parity.cpp)
     target_link_libraries(qsa_parity PRIVATE strata_kernels)
     add_test(NAME qsa_parity COMMAND qsa_parity --selftest)
+    # STRATA_SELECT_WMMA (gfx1150, after Strata-rdna3): the QSA block scores on WMMA against FP64 and the warp kernel's
+    # selection; skipped (77) on other devices
+    add_executable(qsa_select_wmma_parity src/kernels/qsa_select_wmma_parity.cpp)
+    target_link_libraries(qsa_select_wmma_parity PRIVATE strata_kernels)
+    add_test(NAME qsa_select_wmma_parity COMMAND qsa_select_wmma_parity 49 620)
+    set_tests_properties(qsa_select_wmma_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    add_test(NAME qsa_select_wmma_parity_p3
+             COMMAND ${CMAKE_COMMAND} -E env STRATA_SELECT_WMMA=3 $<TARGET_FILE:qsa_select_wmma_parity> 49 620)
+    set_tests_properties(qsa_select_wmma_parity_p3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     # perf-review D-1: the prompt attention against the FP32 kernel and FP64 (a benchmark too: not a CTest case,
     # as in the CUDA build)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
