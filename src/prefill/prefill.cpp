@@ -2683,6 +2683,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // STRATA_PREFILL_TIMING: the hyper-connection read's parts on their own lines (the norm stays on "hc read";
                 // upstream e1e7e3268).  The int8 form (hc_mmq) does down and up in one, so its time lands on "down+silu".
                 pt.mark(kPfHcDown, cs);
+                const uint16_t* upmix_w = nullptr;   // STRATA_HC_UPMIX: the up projection runs in gr_upmix, below
                 if (!(hc8 && m.hc_mmq(wd, wu, T))) {
                     // STRATA_HC_Q8 with the BF16 copies dropped: each from its Q8_0 copy, dequantized on m.cs
                     core::WeightRef wdv = *wd, wuv = *wu;
@@ -2691,7 +2692,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!bf16_proj(m.gemm, &wdv, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
                     gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                     pt.mark(kPfHcUp, cs);
-                    if (!bf16_proj(m.gemm, &wuv, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                    if (wuv.kind == core::WeightKind::Bf16InF32 && wuv.data != nullptr && gr_upmix_on(m.cs))
+                        upmix_w = (const uint16_t*) wuv.data;
+                    else if (!bf16_proj(m.gemm, &wuv, m.lo16, m.gated, T, su, err, 0, m.lo16_lo))
+                        return false;
                 }
                 pt.mark(kPfHcInj, cs);
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
@@ -2716,8 +2720,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::fflush(df);
                     }
                 }
-                gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
-                         m.mixed_bf_lo);
+                if (upmix_w != nullptr)
+                    gr_upmix(m.lo16, m.lo16_lo, upmix_w, m.R, m.xn, (const float*) wn->data, m.mixed, m.mixed_bf, T,
+                             m.cs, m.mixed_h, m.mixed_bf_lo);
+                else
+                    gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
+                             m.mixed_bf_lo);
 
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
@@ -5169,10 +5177,15 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     if (wu->data == nullptr) wuv.data = core::hc_bf16_view(wu, 1, cs);
                     if (!bf16_proj(m.gemm, &wdv, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
                     gr_silu(m.lo, m.lo16, T, cs, m.lo16_lo);
-                    if (!bf16_proj(m.gemm, &wuv, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                    const bool upmix = wuv.kind == core::WeightKind::Bf16InF32 && wuv.data != nullptr && gr_upmix_on(cs);
+                    if (!upmix && !bf16_proj(m.gemm, &wuv, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
                     if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
-                    gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h,
-                             m.mixed_bf_lo);
+                    if (upmix)
+                        gr_upmix(m.lo16, m.lo16_lo, (const uint16_t*) wuv.data, m.R, m.xn, (const float*) wn->data,
+                                 m.mixed, m.mixed_bf, T, cs, m.mixed_h, m.mixed_bf_lo);
+                    else
+                        gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h,
+                                 m.mixed_bf_lo);
                     if (half == 0 && !core::is_qsa_layer(g, l)) {
                         // ======================= GDN (the default path's) =======================
                         const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),

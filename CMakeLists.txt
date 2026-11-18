@@ -1180,6 +1180,12 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(gdn_prompt_parity PRIVATE strata_prefill)
     add_test(NAME gdn_prompt_parity COMMAND gdn_prompt_parity)
     add_test(NAME gdn_prompt_parity_fp32 COMMAND gdn_prompt_parity --chunked 0 --keyhead 0)
+    # STRATA_HC_UPMIX (gfx1150, after Strata-rdna3): the hc read's up projection and mix in one kernel against FP64;
+    # skipped (77) on other devices
+    add_executable(gr_upmix_parity src/prefill/gr_upmix_parity.cpp)
+    target_link_libraries(gr_upmix_parity PRIVATE strata_prefill)
+    add_test(NAME gr_upmix_parity COMMAND gr_upmix_parity)
+    set_tests_properties(gr_upmix_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     add_executable(gemm_bench src/kernels/gemm_bench.cpp)
     target_link_libraries(gemm_bench PRIVATE strata_kernels)
     # #783 PR-c: the multi-token router against the single one, the combine against its contract's host replay

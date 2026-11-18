@@ -347,6 +347,121 @@ void gr_mix_r(const float* R, const float* rs, const float* w, const float* g, f
         if (mixed_h) mixed_h[i] = hf(s);
     });
 }
+// STRATA_HC_UPMIX=1 (opt-in, gfx1150): the hyper-connection read's up projection with gr_mix_r as its epilogue, after
+// Strata-rdna3's S23 (nicejunjie/Strata-rdna3 src/prefill/kernels.cu, gr_upmix_kernel).  `gated` (T x 10240 floats) is
+// neither written nor read: a work-group of 16 sub-groups takes 256 tokens (16 a sub-group) x 16 columns x the 4 streams
+// on WMMA (BF16 in, FP32 accumulate over K = LR; the group's w_up rows staged in local memory once), and each lane then
+// holds the 4 streams' values of its (token, column) and mixes them in registers in gr_mix_r's order.  XeStrata's read
+// adds the BF16 low parts' product (lo16_lo, STRATA_PREFILL_BF16X2): its WMMA follows the high parts' at every step of
+// K.  The sums run in another order than the GEMM's: not gr_mix_r's bits.  512 work-items a group bound the kernel's
+// registers (Strata-rdna3: the 512-thread bound held it to 127 VGPRs where 256 took 237).
+namespace {
+constexpr int UM_D = 16, UM_LD = LR + 8, UM_NT = 512;
+static_assert(N % UM_D == 0 && LR % 16 == 0, "gr_upmix: the columns in tiles of 16, K in steps of 16");
+struct GrUpmix {
+    const uint16_t* lo16 = nullptr;
+    const uint16_t* lo16_lo = nullptr;
+    const uint16_t* wu = nullptr;
+    const float* R = nullptr;
+    const float* rs = nullptr;
+    const float* w = nullptr;
+    float* mixed = nullptr;
+    uint16_t* mixed16 = nullptr;
+    uint16_t* mixed_h = nullptr;
+    uint16_t* mixed16_lo = nullptr;
+    int64_t T = 0;
+    sycl::local_accessor<uint16_t, 1> sb;   // [HC * UM_D][UM_LD]: w_up's rows c * N + d0 + dd, all K
+    STRATA_AMD_REQD_WG(1, UM_NT)
+    [[sycl::reqd_sub_group_size(WARP)]] void operator()(sycl::nd_item<2> it) const {
+#if !STRATA_AMD_GFX1150
+        (void) it;   // launched only on gfx1150 (gr_upmix_on)
+#else
+        namespace J = kernels::xe::wmma;
+        const auto sg = it.get_sub_group();
+        const int tid = (int) it.get_local_id(1), wave = (int) sg.get_group_linear_id();
+        const int l16 = J::lane16(sg), hi = J::half_of(sg);
+        const int64_t t0 = (int64_t) it.get_group(0) * (UM_NT / 2) + (int64_t) 16 * wave;
+        const int d0 = (int) it.get_group(1) * UM_D;
+        for (int i = tid; i < HC * UM_D * (LR / 8); i += UM_NT) {
+            const int rr = i / (LR / 8), q8 = i % (LR / 8);
+            const int c = rr / UM_D, dd = rr % UM_D;
+            const auto* src = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(wu + ((size_t) c * N + d0 + dd) * LR + (size_t) 8 * q8);
+            *reinterpret_cast<sycl::vec<uint32_t, 4>*>(&sb[(size_t) rr * UM_LD + (size_t) 8 * q8]) = *src;
+        }
+        sycl::group_barrier(it.get_group());
+        if (t0 >= T) return;
+        const int64_t ta = t0 + l16 < T ? t0 + l16 : T - 1;
+        const uint16_t* arow = lo16 + ta * LR;
+        const uint16_t* lrow = lo16_lo ? lo16_lo + ta * LR : nullptr;
+        J::C acc[HC];
+        for (int c = 0; c < HC; ++c) J::fill(sg, acc[c], 0.0f);
+        for (int ks = 0; ks < LR; ks += 16) {
+            J::A<uint16_t> a, al;
+            for (int e = 0; e < 16; ++e) a.v[e] = (short) arow[ks + e];
+            if (lrow)
+                for (int e = 0; e < 16; ++e) al.v[e] = (short) lrow[ks + e];
+            for (int c = 0; c < HC; ++c) {
+                J::Bc<uint16_t> b;
+                const uint16_t* br = &sb[(size_t) (c * UM_D + l16) * UM_LD + ks];
+                for (int e = 0; e < 16; ++e) b.v[e] = (short) br[e];
+                J::mad(sg, acc[c], a, b, acc[c]);
+                if (lrow) J::mad(sg, acc[c], al, b, acc[c]);
+            }
+        }
+        const int64_t d = d0 + l16;
+        for (int e = 0; e < 8; ++e) {
+            const int64_t t = t0 + J::row_of(hi, e);
+            if (t >= T) continue;
+            float sum = 0.0f;
+            for (int c = 0; c < HC; ++c) {
+                const float x = R[t * D + (int64_t) c * N + d] * rs[t * HC + c] * w[(int64_t) c * N + d];   // gr_mix_r's order
+                sum = sycl::fma(x, sigm(acc[c].v[e]), sum);
+            }
+            sum /= (float) HC;
+            const int64_t i = t * N + d;
+            mixed[i] = sum;
+            if (mixed16) {
+                const uint16_t h = bf(sum);
+                mixed16[i] = h;
+                if (mixed16_lo) mixed16_lo[i] = bf_lo(sum, h);
+            }
+            if (mixed_h) mixed_h[i] = hf(sum);
+        }
+#endif
+    }
+};
+}  // namespace
+
+bool gr_upmix_on(void* stream) {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_HC_UPMIX");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!env) return false;
+    auto& q = Q(stream);
+    static core::PerDevice<bool> per_device;
+    return per_device.get(q.get_device(), [&q] {
+        const sycl::device dev = q.get_device();
+        const bool ok = kernels::xe::amd_gfx1150(dev) &&
+                        dev.get_info<sycl::info::device::max_work_group_size>() >= (size_t) UM_NT &&
+                        dev.get_info<sycl::info::device::local_mem_size>() >= (size_t) HC * UM_D * UM_LD * 2;
+        if (ok) std::fprintf(stderr, "prefill: the hc read's up projection and mix in one kernel (STRATA_HC_UPMIX=1)\n");
+        return ok;
+    });
+}
+
+void gr_upmix(const uint16_t* lo16, const uint16_t* lo16_lo, const uint16_t* w_up, const float* R, const float* rs,
+              const float* w_norm, float* mixed, uint16_t* mixed16, int64_t T, void* stream, uint16_t* mixed_h,
+              uint16_t* mixed16_lo) {
+    if (T <= 0) return;
+    Q(stream).submit([&](sycl::handler& h) {
+        GrUpmix k{lo16, lo16_lo, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, mixed16_lo, T,
+                  sycl::local_accessor<uint16_t, 1>(sycl::range<1>((size_t) HC * UM_D * UM_LD), h)};
+        h.parallel_for(sycl::nd_range<2>({(size_t) ((T + UM_NT / 2 - 1) / (UM_NT / 2)), (size_t) (N / UM_D) * UM_NT},
+                                         {1, (size_t) UM_NT}),
+                       k);
+    });
+}
 // F-2: gr_write for one row (t, c), then gr_norm_rs's reduction over it with the next half's norm weights - the same
 // work-item to element mapping (256 work-items, stride 256) and block_sum, so rs and the BF16 image are the same bits,
 // and R is not read back
