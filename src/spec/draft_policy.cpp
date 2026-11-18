@@ -327,6 +327,7 @@ bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
         // a width not measured yet is tried a few times when the chain is likely to hold that far, and one whose time
         // has grown old once in a while, when its drafts are likely to hold (kStaleChain)
         if ((cost_n_[bk_][rows] < kProbes && st.q >= 0.15) || (stale_chain(rows) && st.q >= kProbeHeld)) st.best_rows = rows;
+        if (st.best_rows == rows && st.prefix_rows == rows - 1) st.prefix_rows = rows;
     }
     st.kept = st.best_rows - 1;
     if (rows + 1 > cap) return false;                       // no row left for another draft

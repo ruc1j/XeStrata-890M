@@ -96,6 +96,12 @@ public:
         double best_v = 0.0;
         int best_rows = 1;                ///< the window to verify: 1 + the drafts kept
         int kept = 0;                     ///< best_rows - 1
+        /// The widest window whose every draft was kept at its own step: draft idx joins only when the best width
+        /// after keep_draft(idx) takes it and the drafts before it joined.  best_rows can widen after a later draft
+        /// (the cost is not convex), and that later draft's probability comes from the draft head run on the earlier
+        /// draws: a sampled window (STRATA_SPEC_PROB) of best_rows would offer a draft by its own value, which
+        /// rejection sampling does not allow; prefix_rows sees each draft's probability only on the rows after it.
+        int prefix_rows = 1;
         double best_e = 1.0, best_c = 0.0;   ///< the best width's expected tokens and round ms (the rate rule)
     };
     /// Draft `idx` (0-based, probability p) was just computed: update `st` and say whether to compute draft idx + 1.

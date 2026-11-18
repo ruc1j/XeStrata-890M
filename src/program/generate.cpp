@@ -2439,8 +2439,9 @@ static bool gated_proposal_usable(bool serial_single_device, int lookup_chain, i
     static bool warned = false;
     if (!warned) {
         warned = true;
-        std::fprintf(stderr, "strata: STRATA_SPEC_PROB=1 keeps the older acceptance rule in this run (%s). That rule's output "
-                             "distribution is off when the confidence gate fails; STRATA_SPEC_PROB_GATE=top is exact here.\n", why);
+        std::fprintf(stderr, "strata: STRATA_SPEC_PROB=1 keeps the older acceptance rule in this run (%s): the drafts are "
+                             "judged against q in serve (the exact-match rule in generate), gated on q's top probability as with "
+                             "STRATA_SPEC_PROB_GATE=top.\n", why);
     }
     return false;
 }
@@ -9947,12 +9948,15 @@ int main(int argc, char** argv) {
         const bool spec_cost = strata::core::spec_cost_default();   // STRATA_SPEC_COST; on by default on the HIP integrated GPU
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // the window the cost-aware rule kept in the MTP chain just drafted
+        int chain_prefix_rows = 1;   // of it, the drafts each kept at their own step (a sampled window's, ChainState::prefix_rows)
         policy.set_robust(spec_cost);
         if (spec_cost && use_mtp) {
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
                 chain_rows = chain_st.best_rows;
-                return k;
+                chain_prefix_rows = chain_st.prefix_rows;
+                // a sampled request's window is the prefix: once a step did not extend it, no later draft is verified
+                return k && (!mtp.prob() || chain_st.prefix_rows == idx + 2);
             });
             // XeStrata-890M: the drafts the rule's window verifies, so the drafter leaves the row of a last draft it
             // dropped unread (STRATA_PLE_SKIP_DROPPED=0: every draft's row is read ahead, as before)
@@ -9960,7 +9964,9 @@ int main(int argc, char** argv) {
                 const char* e = std::getenv("STRATA_PLE_SKIP_DROPPED");
                 return e == nullptr || std::strtol(e, nullptr, 10) != 0;
             }();
-            if (skip_dropped) mtp.set_chain_kept([&] { return chain_st.best_rows - 1; });
+            // (a sampled request's window is the prefix the steps kept: ChainState::prefix_rows, below)
+            if (skip_dropped)
+                mtp.set_chain_kept([&] { return (mtp.prob() ? chain_st.prefix_rows : chain_st.best_rows) - 1; });
         }
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
@@ -13430,7 +13436,10 @@ int main(int argc, char** argv) {
                     double chain = 1.0;
                     while (T < S_mtp && (chain *= (double) dprob[(size_t) T - 1]) >= o.draft_conf) ++T;
                 } else if (use_mtp && spec_cost && !first_window) {
-                    T = std::clamp(chain_rows, 1, S_mtp);
+                    // STRATA_SPEC_PROB judges the MTP drafts against q (set_spec_q below): the window must not offer a
+                    // draft for what the drafts after it turned out to be, so it is the prefix each step kept
+                    // (spec_width_law_test); argmax drafts and the exact-match rule keep the best width
+                    T = std::clamp(mtp.prob() ? chain_prefix_rows : chain_rows, 1, S_mtp);
                 } else if (use_mtp && !req_minp_rule) {
                     T = policy.mtp_window(dprob.data(), S_mtp);
                 } else if (draft_on && req_spec_min_p > 0.0 && strata::core::spec_cum_threshold() > 0.0f) {   // mtp.hpp
