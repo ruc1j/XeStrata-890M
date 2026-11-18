@@ -155,6 +155,8 @@ AMD の GPU では intel/llvm の DPC++ の HIP のターゲットでその SYCL
      各チャンクの T = (I + A)^-1 と P を先に作り、スキャンは value head ごとに状態を WMMA の累積器に持ちます。1 層の再帰と norm が
      3,481 トークンで 14.4 → 8.0 ms、prefill は 2〜3% 短くなります。k・q・T・P と状態を FP16 に丸めるので、答えが変わることがあります
      （20 の prompt の次のトークンの KL 平均 0.020、最も確率の高いトークンは同じ）。`STRATA_GDN_CHUNKED=0` で FP32 のカーネル。
+   - gfx1150 では、QSA の prompt attention の q と p を FP16 の 1 枚で持ち（`STRATA_PA_FAST`）、ハイパーコネクションの読みの up と mix を
+     1 つのカーネルにしています（`STRATA_HC_UPMIX`）。Strata-rdna3 からの移植で、prefill は合わせて 4〜5% 速くなります（[XE](docs/XE.ja.md#strata-rdna3-からの移植)）。
    - 自身のカーネルは rocBLAS と足す順が違い、MMQ のスケールの fma も丸めが変わるので、答えが丸めの差で変わることがあります（`STRATA_BLAS=1` なら密な積は元のまま）。
 
 ## 必要なもの
@@ -445,7 +447,7 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
    - syv.ai と HyperQwen の貢献者による [HyperQwen](https://github.com/syv-ai/HyperQwen)。
    - Peasant Smith と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、SSD から読むエキスパートを順位で飛ばすやり方）。
    - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方）。
-  IQ4 の表引きの形は llama.cpp の HIP 版を参考にしています。
+   - nicejunjie による [Strata-rdna3](https://github.com/nicejunjie/Strata-rdna3) と、xyzzing による [Strata](https://github.com/xyzzing/Strata) の RDNA の移植（prefill の 3 つのカーネル: [XE](docs/XE.ja.md#strata-rdna3-からの移植)）。
   IQ4 の表引きの形は llama.cpp の HIP 版を参考にしています。
 - 部品の一覧は [third_party/main/README.md](third_party/main/README.md)、詳しくは [docs/DETAILS.ja.md](docs/DETAILS.ja.md#クレジットとライセンス) にあります。
 

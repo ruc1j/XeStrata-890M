@@ -204,6 +204,9 @@ setup changes of upstream Strata 0.2.15 (engine 0.1.61) ([docs/XE.md](docs/XE.md
     tokens, and prefill is 2-3% shorter. k, q, T, P and the state are rounded to FP16, so the answers can change
     (the average KL of the next token over 20 prompts is 0.020, and the most likely token stays the same).
     `STRATA_GDN_CHUNKED=0` for the FP32 kernels.
+  - on gfx1150, QSA's prompt attention holds q and p as one FP16 image each (`STRATA_PA_FAST`), and the
+    hyper-connection read's up and mix are one kernel (`STRATA_HC_UPMIX`): ports from Strata-rdna3 that make prefill
+    4-5% faster together ([XE](docs/XE.md#ports-from-strata-rdna3)).
   - the own kernels sum in a different order than rocBLAS and MMQ's scale fma rounds differently, so the answers
     can change by rounding differences (`STRATA_BLAS=1` keeps the dense products as they were).
 
@@ -536,7 +539,10 @@ permission under GPL section 7, what goes in, and how to report).
      of the experts missing from VRAM the CPU computes and how many are read over PCIe; skipping the experts read from the
      SSD by their rank);
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
-     models merges). The IQ4 lookup's form follows llama.cpp's HIP version.
+     models merges);
+   - [Strata-rdna3](https://github.com/nicejunjie/Strata-rdna3), by nicejunjie, and the RDNA ports of
+     [Strata](https://github.com/xyzzing/Strata), by xyzzing (three prefill kernels: [XE](docs/XE.md#ports-from-strata-rdna3)).
+     The IQ4 lookup's form follows llama.cpp's HIP version.
 - The parts are listed in [third_party/main/README.md](third_party/main/README.md); more in [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
 
 ## License

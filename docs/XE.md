@@ -152,6 +152,38 @@ With these eight the decode is 41.35 → 42.33 tok/s (+2.4%) against the twenty-
 
 What was checked: the free and contrib-llvm builds, CTest (in both, all but the two tests that have no pack pass), and that `tools/lint/run.sh` gives no new findings.
 
+## Ports from Strata-rdna3
+
+Three changes from [nicejunjie/Strata-rdna3](https://github.com/nicejunjie/Strata-rdna3) (a HIP fork for the RX 7900 XTX) that make the 890M's prefill faster (2026-11-18).
+Their bodies are in gfx1150's device code only, and the host takes them only where the device reports gfx1150: other GPUs keep their paths.
+
+| Change | What it does | Default | Prefill (3,461 to 30,153 tokens) |
+| --- | --- | --- | --- |
+| `STRATA_PA_FAST` | QSA's prompt attention holds q and p as one FP16 image each instead of two (hi and lo): half the WMMA of q.k and p.v | on for gfx1150 (`=0` off) | 2.4 to 3.2% faster |
+| `STRATA_HC_UPMIX` | the hyper-connection read's up projection and mix in one kernel, without writing the matrix between them (671 MB at 16K tokens) | on for gfx1150 (`=0` off) | 1.7 to 3.2% faster |
+| `STRATA_SELECT_WMMA` | QSA's block-selection scores on WMMA (BF16 in three parts, three products; `=3` six) | off (`=1` on) | within the noise |
+
+On the 890M (IQ2_XS, greedy, a summary of the start of docs/DETAILS.ja.md, three interleaved rounds), PA_FAST and HC_UPMIX together make the prefill 3.9 to 5.0% faster in every round.
+
+| Tokens | both off (ms) | both on (ms) |
+| --- | --- | --- |
+| 3,461 | 10,670 / 10,663 / 10,667 | 10,226 / 10,209 / 10,254 |
+| 8,145 | 25,310 / 25,338 / 25,345 | 24,138 / 24,150 / 24,155 |
+| 16,050 | 50,659 / 50,727 / 50,746 | 48,371 / 48,338 / 48,488 |
+| 30,153 | 96,491 / 96,517 / 96,786 | 91,932 / 91,884 / 91,982 |
+
+- HC_UPMIX does not change the answers.
+- PA_FAST rounds to FP16, so at some lengths the answer's wording changes (its content stays the same). The decode after the prompt moves with it too, as the MTP drafts hit differently: summarising 8 documents (256 tokens), 7 of them ran −2.2 to +10.7%, +1.7% as a geometric mean.
+- SELECT_WMMA makes the score kernel alone 1.39 times as fast at 8K, but block selection is under 1% of the prefill, and the whole did not change.
+- Tests: `qsa_prompt_attn_parity_pa_fast`, `qsa_prompt_attn_parity_split`, `qsa_select_wmma_parity` (`_p3`), `gr_upmix_parity`.
+
+Not ported:
+
+- mlock of the runtime's host blocks: this machine's SYCL has none of the `/dev/zero` shared maps rdna3 looks for.
+- 16-byte loads and stores in the hc write: about 0.4% expected.
+- The experts' prefill unpacked to FP16: the 890M model's quantisation types need codebooks of their own, and the 780M showed no difference.
+- The finer decode kernel switches: the 890M's decode is bound by bandwidth, and little was expected.
+
 ## Integration of upstream XeStrata through xe0.2.8-1
 
 Upstream XeStrata's main (MistVVK/XeStrata) was merged from the commit after xe0.2.2-1 up to 721afe51f of 2026-10-30 (xe0.2.8-1) on 2026-11-02.
