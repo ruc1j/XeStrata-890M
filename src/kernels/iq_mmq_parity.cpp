@@ -78,7 +78,8 @@ std::vector<uint8_t> weights(ggml_type t, int64_t rows, int64_t cols) {
     return w;
 }
 
-int check(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts) {
+// half: the rows out as FP16 (half_dst, STRATA_PF_DM16's down products), compared at FP16's precision
+int check(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts, bool half = false) {
     sycl::queue& q = strata::core::Runtime::get().compute();
     const int n = (int) counts.size();
     std::vector<int32_t> bounds(1, 0);
@@ -107,13 +108,18 @@ int check(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts)
     int32_t* db = dev.upload(bounds);
     int32_t* di = dev.upload(ids);
     uint8_t* dxq = dev.alloc<uint8_t>(xq_bytes);
-    float* dy = dev.alloc<float>((size_t) (R * N));
+    float* dy = dev.alloc<float>((size_t) (R * N));   // (half: the first half of it, as halves)
     strata::kernels::iq_mmq_quantize(q, dx, nullptr, dxq, K, K, R, strata::kernels::iq_mmq_type_sums((int) t)).wait();
-    strata::kernels::iq_mmq_grouped(q, (int) t, dw, w[0].size(), N, K, n, dxq, R, db, max_rows, di, dy, N).wait();
+    strata::kernels::iq_mmq_grouped(q, (int) t, dw, w[0].size(), N, K, n, dxq, R, db, max_rows, di, dy, N, nullptr, 0, 0,
+                                    half).wait();
     std::vector<uint8_t> xq(xq_bytes);
     std::vector<float> y((size_t) (R * N));
     P::copy_out(xq.data(), dxq, xq_bytes);
-    P::copy_out(y.data(), dy, y.size());
+    if (half) {
+        std::vector<ggml_fp16_t> yh((size_t) (R * N));
+        P::copy_out(reinterpret_cast<float*>(yh.data()), dy, yh.size() / 2);
+        for (size_t i = 0; i < y.size(); ++i) y[i] = ggml_fp16_to_fp32(yh[i]);
+    } else P::copy_out(y.data(), dy, y.size());
 
     // the reference: the device's int8 activations times their scales, the weights through ggml's dequantizer
     const auto* x8 = reinterpret_cast<const int8_t*>(xq.data());
@@ -141,9 +147,10 @@ int check(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts)
             }
     }
     const double rel = worst / std::max(scale, 1e-30);
-    const bool ok = rel < 1e-4 && std::isfinite(rel);
-    std::printf("  %-8s K %4lld, %d experts of up to %3lld rows: rel %.2e  %s\n", ggml_type_name(t), (long long) K, n,
-                (long long) max_rows, rel, ok ? "ok" : "*** FAIL ***");
+    const bool ok = rel < (half ? 1e-3 : 1e-4) && std::isfinite(rel);   // FP16: 11 bits, half an ulp of the largest
+    std::printf("  %-8s K %4lld, %d experts of up to %3lld rows%s: rel %.2e  %s\n", ggml_type_name(t), (long long) K, n,
+                (long long) max_rows, half ? ", FP16 rows" : "", rel,
+                ok ? "ok" : "*** FAIL ***");
     return ok ? 0 : 1;
 }
 
@@ -343,6 +350,7 @@ int main(int argc, char** argv) try {
         bad += check(GGML_TYPE_IQ3_XXS, 128, 512, c);
         bad += check(GGML_TYPE_IQ2_XS, 128, 512, c);
         bad += check(GGML_TYPE_Q4_K, 128, 512, c);
+        bad += check(GGML_TYPE_IQ2_XS, 128, 512, c, true);   // STRATA_PF_DM16's FP16 rows
     }
     std::printf(bad ? "FAIL\n" : "PASS\n");
     return bad ? 1 : 0;

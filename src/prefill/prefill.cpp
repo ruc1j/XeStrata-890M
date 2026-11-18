@@ -3978,6 +3978,33 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                          (long long) T);
                         }
                     }
+                    // debug: STRATA_DBG_DM_MAX=1 reports each layer's largest |value| of the down products' rows (Dm,
+                    // FP16 under STRATA_PF_DM16) and how many are not finite: the margin to FP16's largest, 65504
+                    if (static const bool dbg_dm = std::getenv("STRATA_DBG_DM_MAX") != nullptr; dbg_dm) {
+                        strata::gpu::stream_sync(m.cs);
+                        const size_t n_dm = (size_t) (T * K * N);
+                        float mx = 0.0f;
+                        int64_t nonfin = 0;
+                        if (dm16) {
+                            std::vector<sycl::half> h(n_dm);
+                            strata::gpu::copy(h.data(), m.Dm, n_dm * 2);
+                            for (sycl::half v : h) {
+                                const float f = (float) v;
+                                if (!std::isfinite(f)) ++nonfin;
+                                else mx = std::max(mx, std::fabs(f));
+                            }
+                        } else {
+                            std::vector<float> h(n_dm);
+                            strata::gpu::copy(h.data(), m.Dm, n_dm * 4);
+                            for (float f : h) {
+                                if (!std::isfinite(f)) ++nonfin;
+                                else mx = std::max(mx, std::fabs(f));
+                            }
+                        }
+                        std::fprintf(stderr, "strata dbg dm: chunk %lld layer %lld dm16 %d T %lld max %.1f nonfinite %lld\n",
+                                     (long long) stats_.chunks, (long long) l, (int) dm16, (long long) T, mx,
+                                     (long long) nonfin);
+                    }
                 }
                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
                 // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
