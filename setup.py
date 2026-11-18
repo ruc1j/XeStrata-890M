@@ -4989,9 +4989,9 @@ def uma_host_cache(gpu: dict, model: str, low_ram: bool, budget, multi: bool) ->
     model's experts (they live in RAM either way: the GPU's own pool, the GTT, is half of the RAM by the kernel's
     default), on a PC whose RAM holds the model (not the low-RAM mode, where the engine's own path is kept: the host
     cache with part of the experts is not measured), one GPU, and a model kept whole in RAM (not a RAM budget's).
-    On the Radeon 890M (Ryzen AI 9 HX 370, 64 GB) decode goes from 15-22 to about 31 tok/s (README).  The engine cuts
-    the count to what the RAM has free at start.  Not checked on another integrated GPU: a Strix Halo's carve-out can
-    hold the experts, and then the default path is kept."""
+    On the Radeon 890M (Ryzen AI 9 HX 370, 64 GB) decode goes from 15-22 to about 39 tok/s with the fork's other
+    decode changes (the README's table).  The engine cuts the count to what the RAM has free at start.  Not checked
+    on another integrated GPU: a Strix Halo's carve-out can hold the experts, and then the default path is kept."""
     return (bool(gpu.get("integrated")) and gpu.get("vendor") == "amd" and not low_ram and budget is None
             and not multi and gpu.get("carve_gb", 0.0) < MODELS[model]["arena_gb"])
 
@@ -7018,8 +7018,8 @@ def main() -> int:
     ap.add_argument("--host-cache", choices=["auto", "off"], default="auto",
                     help="XeStrata-890M: auto puts the expert cache in host USM, with every expert of the model in it, "
                          "on an integrated AMD GPU whose carve-out does not hold the experts and whose RAM holds the "
-                         "model (STRATA_CACHE_HOST=1, --mmap-experts, --no-prefill-borrow: decode 15-22 -> about 31 "
-                         "tok/s on the Radeon 890M); off writes the engine's default path instead")
+                         "model (STRATA_CACHE_HOST=1, --mmap-experts, --no-prefill-borrow: decode 15-22 -> about 39 "
+                         "tok/s on the Radeon 890M, the README's table); off writes the engine's default path instead")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
                     help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, "
                          "~38 on 64 GB; more is kept as you choose, with a note)")
