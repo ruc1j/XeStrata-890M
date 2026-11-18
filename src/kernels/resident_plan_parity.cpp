@@ -9,13 +9,22 @@
 // duplicates run from "every entry the same expert" to "all distinct", with and without a slot table (`slot_off`),
 // and the skip word (ring when the plan was built; 0 and the plan untouched when an expert was not resident).
 // Every word of the plan the host pool would read is compared with memcmp. GPU, synthetic, no model.
+//
+// XeStrata-890M: resident_plan_top10 (the router's top-10 and the plan in one launch) against the two launches it
+// replaces, native_router_top10_multi and resident_plan: the ids, the weights, the whole plan and the skip word, for
+// windows of 1..8 tokens of 512 and of 256 experts, the tokens' logits near each other (shared experts) or apart.
+// The same launch with the experts' q8_1 image as more work-groups: quantize_q8_1_rows' bytes, for rows of 2560
+// values with a zero row and with a row that has infinities and a NaN among them.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/native_router.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 
 #include "parity_device.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -129,6 +138,129 @@ int main() {
         ++cases;
         if (skip != 0 || !untouched) {
             std::printf("    *** a non-resident expert: skip=%u untouched=%d (want 0 / 1) ***\n", skip, (int) untouched);
+            ++bad;
+        }
+    }
+
+    // the top-10 and the plan in one launch: the two launches' bits
+    P::copy_bytes_in(d_res, res.data(), (size_t) NE * 4);
+    {
+        auto* d_logits = dalloc<float>((size_t) 8 * NE);
+        auto* d_w = dalloc<float>(128);
+        const int QN = 2560;                                  // the q8_1 image's row (n_embd)
+        const size_t q_bytes = (size_t) 8 * (QN / 32) * 36;   // 8 rows of q8_1 blocks
+        auto* d_qx = dalloc<float>((size_t) 8 * QN);
+        auto* d_qa = dalloc<uint8_t>(q_bytes);
+        auto* d_qb = dalloc<uint8_t>(q_bytes);
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        for (const int ne : {512, 256}) {
+            for (int n_tok = 1; n_tok <= 8; ++n_tok) {
+                for (int variant = 0; variant < 6; ++variant) {
+                    // variant 0..2: the tokens share most of their experts (noise on one row); 3..5: independent rows
+                    std::vector<float> logits((size_t) n_tok * ne), row((size_t) ne);
+                    for (auto& v : row) v = 3.0f * g(rng);
+                    for (int t = 0; t < n_tok; ++t)
+                        for (int e = 0; e < ne; ++e)
+                            logits[(size_t) t * ne + e] = variant < 3 ? row[(size_t) e] + 0.3f * (float) variant * g(rng)
+                                                                      : 3.0f * g(rng);
+                    const int n = n_tok * K;
+                    const bool use_off = (n_tok + variant) % 2 == 1;
+                    P::copy_bytes_in(d_logits, logits.data(), logits.size() * 4);
+                    std::vector<int32_t> ids_a(n), ids_b(n), plan_a(plan_words), plan_b(plan_words);
+                    std::vector<float> w_a(n), w_b(n);
+                    uint32_t skip_a = 0, skip_b = 0;
+                    // the rows for the q8_1 image: variant 1 has a zero row, variant 2 a row with non-finite values
+                    std::vector<float> qx((size_t) n_tok * QN);
+                    for (auto& v : qx) v = 2.0f * g(rng);
+                    if (variant == 1) for (int i = 0; i < QN; ++i) qx[(size_t) (n_tok - 1) * QN + i] = 0.0f;
+                    if (variant == 2) {
+                        qx[5] = std::numeric_limits<float>::infinity();
+                        qx[300] = -std::numeric_limits<float>::infinity();
+                        qx[700] = std::numeric_limits<float>::quiet_NaN();
+                    }
+                    const size_t qn = (size_t) n_tok * (QN / 32) * 36;
+                    const std::vector<uint8_t> qjunk(q_bytes, 0x5A);
+                    std::vector<uint8_t> q_a(qn), q_b(qn);
+                    P::copy_bytes_in(d_qx, qx.data(), qx.size() * 4);
+                    P::copy_bytes_in(d_qa, qjunk.data(), q_bytes);
+                    P::copy_bytes_in(d_qb, qjunk.data(), q_bytes);
+                    k::quantize_q8_1_rows(d_qx, n_tok, QN, d_qa, st);
+                    // the two launches
+                    P::copy_bytes_in(d_plan, fill.data(), plan_words * 4);
+                    P::copy_bytes_in(d_skip, &zero, 4);
+                    k::native_router_top10_multi(d_logits, d_ids, d_w, n_tok, st, ne);
+                    k::resident_plan(d_ids, n, K, d_res, ne, cache_base, use_off ? d_off : nullptr, blob, d_plan, capx,
+                                     d_skip, 9u, st, 0, d_w);
+                    P::sync();
+                    P::copy_bytes_out(ids_a.data(), d_ids, (size_t) n * 4);
+                    P::copy_bytes_out(w_a.data(), d_w, (size_t) n * 4);
+                    P::copy_bytes_out(plan_a.data(), d_plan, plan_words * 4);
+                    P::copy_bytes_out(&skip_a, d_skip, 4);
+                    // the one launch, over buffers that hold other values
+                    const std::vector<int32_t> junk(128, -7);
+                    P::copy_bytes_in(d_ids, junk.data(), (size_t) 128 * 4);
+                    P::copy_bytes_in(d_w, junk.data(), (size_t) 128 * 4);
+                    P::copy_bytes_in(d_plan, fill.data(), plan_words * 4);
+                    P::copy_bytes_in(d_skip, &zero, 4);
+                    // (every other case also writes the q8_1 image)
+                    const bool with_q = (n_tok + variant) % 2 == 0 || variant == 1 || variant == 2;
+                    k::resident_plan_top10(d_logits, d_ids, d_w, n_tok, d_res, ne, cache_base, use_off ? d_off : nullptr,
+                                           blob, d_plan, capx, d_skip, 9u, st, 0, 0, 0.0f, with_q ? d_qx : nullptr,
+                                           n_tok, QN, d_qb);
+                    P::sync();
+                    P::copy_bytes_out(q_a.data(), d_qa, qn);
+                    P::copy_bytes_out(q_b.data(), d_qb, qn);
+                    if (with_q && q_a != q_b) {
+                        std::printf("    *** %d experts, %d tokens, variant %d: the q8_1 image differs from "
+                                    "quantize_q8_1_rows' ***\n", ne, n_tok, variant);
+                        ++bad;
+                    }
+                    if (!with_q && std::memcmp(q_b.data(), qjunk.data(), qn) != 0) {
+                        std::printf("    *** %d experts, %d tokens, variant %d: the launch without the image wrote "
+                                    "it ***\n", ne, n_tok, variant);
+                        ++bad;
+                    }
+                    P::copy_bytes_out(ids_b.data(), d_ids, (size_t) n * 4);
+                    P::copy_bytes_out(w_b.data(), d_w, (size_t) n * 4);
+                    P::copy_bytes_out(plan_b.data(), d_plan, plan_words * 4);
+                    P::copy_bytes_out(&skip_b, d_skip, 4);
+                    const bool ok = skip_a == 9u && skip_b == 9u && ids_a == ids_b &&
+                                    std::memcmp(w_a.data(), w_b.data(), (size_t) n * 4) == 0 && plan_a == plan_b;
+                    ++cases;
+                    if (!ok) {
+                        std::printf("    *** %d experts, %d tokens, variant %d: the one launch differs from the two "
+                                    "(skip %u / %u) ***\n", ne, n_tok, variant, skip_a, skip_b);
+                        ++bad;
+                    }
+                }
+            }
+        }
+        // an expert of the top-10 not resident: *skip = 0, the plan untouched, the ids and weights still the router's
+        std::vector<int32_t> none((size_t) NE, -1);
+        P::copy_bytes_in(d_res, none.data(), (size_t) NE * 4);
+        std::vector<float> logits((size_t) 3 * NE);
+        for (auto& v : logits) v = 3.0f * g(rng);
+        P::copy_bytes_in(d_logits, logits.data(), logits.size() * 4);
+        std::vector<int32_t> ids_a(30), ids_b(30), plan(plan_words);
+        k::native_router_top10_multi(d_logits, d_ids, d_w, 3, st, NE);
+        P::sync();
+        P::copy_bytes_out(ids_a.data(), d_ids, (size_t) 30 * 4);
+        P::copy_bytes_in(d_plan, fill.data(), plan_words * 4);
+        const uint32_t nine = 9;
+        P::copy_bytes_in(d_skip, &nine, 4);
+        k::resident_plan_top10(d_logits, d_ids, d_w, 3, d_res, NE, cache_base, nullptr, blob, d_plan, capx, d_skip, 9u,
+                               st);
+        P::sync();
+        P::copy_bytes_out(ids_b.data(), d_ids, (size_t) 30 * 4);
+        P::copy_bytes_out(plan.data(), d_plan, plan_words * 4);
+        uint32_t skip = 99;
+        P::copy_bytes_out(&skip, d_skip, 4);
+        bool untouched = true;
+        for (int32_t w : plan) untouched = untouched && (uint32_t) w == 0xABABABABu;
+        ++cases;
+        if (skip != 0 || !untouched || ids_a != ids_b) {
+            std::printf("    *** the one launch, a non-resident expert: skip=%u untouched=%d ids %s ***\n", skip,
+                        (int) untouched, ids_a == ids_b ? "same" : "differ");
             ++bad;
         }
     }

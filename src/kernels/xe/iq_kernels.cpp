@@ -42,6 +42,7 @@
 #include "device_target.hpp"
 #include "iq_bits.hpp"
 #include "q8_1_finite.hpp"
+#include "q8_1_rows_item.hpp"
 #include "sm70_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_iq_kernels
 #include "strata/kernels/device_arch_tag.hpp"
@@ -1080,17 +1081,27 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
         // The words are the ones Split<42>::load reads and the sums are added in the same order: bitwise the same.
         constexpr int C = 6;
         const int K = nb * F::ipb;
+        // LPR a multiple of a block's steps (4 and 2): the lane's sub-block and its first block's offset computed
+        // once, a step a constant further on (as the IQ2_S rows below; a step past the row reads the last block)
+        constexpr bool kLaneSub = LPR % F::ipb == 0;
         for (int k0 = seg_lane; k0 < K; k0 += C * LPR) {
             uint16_t q[C][4];
             sycl::half dh[C];
+            const uint32_t sub = (uint32_t) seg_lane % (uint32_t) F::ipb;
+            const uint32_t kb0 = (uint32_t) k0 / (uint32_t) F::ipb;
+            const uint32_t boff = kb0 * (uint32_t) F::bsz, blast = (uint32_t) (nb - 1) * (uint32_t) F::bsz;
 #pragma unroll
             for (int u = 0; u < C; ++u) {
                 const int k = sycl::min(k0 + u * LPR, K - 1);
-                const block_q2_0* b = (const block_q2_0*) block_at<F>(row, k / F::ipb);
-                const uint16_t* qs = (const uint16_t*) b->qs + (ptrdiff_t) (k % F::ipb) * 4;
+                const block_q2_0* b = kLaneSub
+                    ? (const block_q2_0*) (row + (size_t) sycl::min(boff + (uint32_t) (u * (LPR / F::ipb) * F::bsz), blast))
+                    : (const block_q2_0*) block_at<F>(row, k / F::ipb);
+                const uint16_t* qs = (const uint16_t*) b->qs + (kLaneSub ? (ptrdiff_t) sub : (ptrdiff_t) (k % F::ipb)) * 4;
                 for (int j = 0; j < 4; ++j) q[u][j] = iq_bits::load_u16_nt(qs + j);
                 dh[u] = b->d;
             }
+            const block_q8_1* xk[NE];
+            for (int e = 0; e < NE; ++e) xk[e] = x[e] + (size_t) (kb0 * (uint32_t) (F::qk / 32));
 #pragma unroll
             for (int u = 0; u < C; ++u) {
                 const int k = k0 + u * LPR;
@@ -1101,10 +1112,15 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
                     w.qy[j] = (int) q2_0_bytes((uint32_t) q[u][j] >> 8);
                 }
                 w.d = (float) dh[u];
-                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-                const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
-                for (int e = 0; e < NE; ++e)
-                    if (e < n) s[e] += F::S::apply(w, x[e] + xo, iqs);
+                if constexpr (kLaneSub) {
+                    for (int e = 0; e < NE; ++e)
+                        if (e < n) s[e] += F::S::apply(w, xk[e] + u * (LPR / F::ipb) * (F::qk / 32), (int) (F::step * sub));
+                } else {
+                    const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                    const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+                    for (int e = 0; e < NE; ++e)
+                        if (e < n) s[e] += F::S::apply(w, x[e] + xo, iqs);
+                }
             }
         }
         for (int e = 0; e < NE; ++e) {
@@ -1172,24 +1188,38 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
         for (int k0 = seg_lane; k0 < K; k0 += C * LPR) {
             uint32_t ra[C], rb[C], rc[C];
             sycl::half dh[C];
+            // LPR a multiple of a block's steps (8 and 8 here): every step of the lane is the same sub-block of its
+            // block, and the blocks go up by LPR / ipb.  The sub-block and the first block's offset are then the
+            // lane's, computed once, and a step is that offset plus a constant (the gfx1150 ISA had a signed divide,
+            // a modulo and a 32-bit multiply for every step; 2026-11-17).  A step past the row reads the last block's
+            // (the lane's sub-block of it) and is not used.
+            const uint32_t sub = (uint32_t) seg_lane % (uint32_t) F::ipb;
+            const uint32_t kb0 = (uint32_t) k0 / (uint32_t) F::ipb;
+            const uint32_t boff = kb0 * (uint32_t) F::bsz, blast = (uint32_t) (nb - 1) * (uint32_t) F::bsz;
+            constexpr bool kLaneSub = LPR % F::ipb == 0;
 #pragma unroll
             for (int u = 0; u < C; ++u) {
                 const int k = sycl::min(k0 + u * LPR, K - 1);
-                const int iqs = F::step * (k % F::ipb);
+                const int iqs = kLaneSub ? (int) (F::step * sub) : F::step * (k % F::ipb);
+                const void* blk = kLaneSub ? (const void*) (row + (size_t) sycl::min(boff + (uint32_t) (u * (LPR / F::ipb) * F::bsz), blast))
+                                           : block_at<F>(row, k / F::ipb);
                 if constexpr (TY == 22) {
-                    const block_iq2_s* b = (const block_iq2_s*) block_at<F>(row, k / F::ipb);
+                    const block_iq2_s* b = (const block_iq2_s*) blk;
                     ra[u] = (uint32_t) get_int_b2(b->qs, iqs / 2);
                     rb[u] = (uint32_t) get_int_b2(b->qs, QK_K / 32 + iqs / 2);
                     rc[u] = (uint32_t) b->qh[iqs / 2] | ((uint32_t) b->scales[iqs / 2] << 8);
                     dh[u] = b->d;
                 } else {
-                    const block_iq2_xxs* b = (const block_iq2_xxs*) block_at<F>(row, k / F::ipb);
+                    const block_iq2_xxs* b = (const block_iq2_xxs*) blk;
                     ra[u] = (uint32_t) get_int_b2(b->qs, iqs);
                     rb[u] = (uint32_t) get_int_b2(b->qs, iqs + 1);
                     rc[u] = 0;
                     dh[u] = b->d;
                 }
             }
+            // the entries' activation blocks of the lane's first block: a step's are a constant further on
+            const block_q8_1* xk[NE];
+            for (int e = 0; e < NE; ++e) xk[e] = x[e] + (size_t) (kb0 * (uint32_t) (F::qk / 32));
 #pragma unroll
             for (int u = 0; u < C; ++u) {
                 const int k = k0 + u * LPR;
@@ -1199,26 +1229,33 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
                     const int qh = (int) (rc[u] & 0xFF);
                     w.ls0 = (int) ((rc[u] >> 8) & 0x0F);
                     w.ls1 = (int) (rc[u] >> 12);
+                    // the signed grid bytes are kept, not the bytes and their sign mask: dot_masked's operand,
+                    // made once here (signed_grid), and its mask 0
                     for (int l0 = 0; l0 < 8; l0 += 2) {
                         const Int2 grid_pos = grid_pair(gsrc, byte_of(ra[u], l0 / 2) | ((qh << (8 - l0)) & 0x300));
                         const uint32_t s8 = byte_of(rb[u], l0 / 2);
-                        w.g[l0] = grid_pos.x; w.m[l0] = sign_mask(s8);
-                        w.g[l0 + 1] = grid_pos.y; w.m[l0 + 1] = sign_mask(s8 >> 4);
+                        w.g[l0] = (int) signed_grid((uint32_t) grid_pos.x, s8); w.m[l0] = 0;
+                        w.g[l0 + 1] = (int) signed_grid((uint32_t) grid_pos.y, s8 >> 4); w.m[l0 + 1] = 0;
                     }
                 } else {
                     for (int k2 = 0; k2 < 8; k2 += 2) {
                         const Int2 grid_pos = grid_pair(gsrc, byte_of(ra[u], k2 / 2));
                         const uint32_t s8 = ksigns_byte((uint8_t) (rb[u] >> (7 * k2 / 2)));
-                        w.g[k2] = grid_pos.x; w.m[k2] = sign_mask(s8);
-                        w.g[k2 + 1] = grid_pos.y; w.m[k2 + 1] = sign_mask(s8 >> 4);
+                        w.g[k2] = (int) signed_grid((uint32_t) grid_pos.x, s8); w.m[k2] = 0;
+                        w.g[k2 + 1] = (int) signed_grid((uint32_t) grid_pos.y, s8 >> 4); w.m[k2 + 1] = 0;
                     }
                     w.ls = (int) (rb[u] >> 27 | 1);
                 }
                 w.d = (float) dh[u];
-                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
-                const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
-                for (int e = 0; e < NE; ++e)
-                    if (e < n) s[e] += F::S::apply(w, x[e] + xo, iqs);
+                if constexpr (kLaneSub) {
+                    for (int e = 0; e < NE; ++e)
+                        if (e < n) s[e] += F::S::apply(w, xk[e] + u * (LPR / F::ipb) * (F::qk / 32), (int) (F::step * sub));
+                } else {
+                    const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                    const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+                    for (int e = 0; e < NE; ++e)
+                        if (e < n) s[e] += F::S::apply(w, x[e] + xo, iqs);
+                }
             }
         }
         for (int e = 0; e < NE; ++e) {
@@ -1466,7 +1503,10 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
             const int r0 = (int) it.get_group(1) * 32;
             for (int c0 = e0; c0 < e1; c0 += kEntriesPass) {
                 const int cn = sycl::min(kEntriesPass, e1 - c0);
-                sycl::group_barrier(it.get_group());
+                // XeStrata-890M: the APU rows skip this barrier.  Nothing reads the local memory between the grid's
+                // copy and the barrier after x's, and after a chunk's last barrier no sub-group reads x or the grid
+                // again (the SwiGLU pass reads res, which the next chunk writes only after its second barrier).
+                if constexpr (!APU) sycl::group_barrier(it.get_group());
                 for (int j = 0; j < cn; ++j) {
                     const int* src = (const int*) (xq + (size_t) ent_tok[c0 + j] * xb);
                     for (int i = tid; i < xb * 9; i += WG) sx[j * xb * 9 + i] = src[i];
@@ -1552,7 +1592,9 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
             }
             for (int c0 = e0; c0 < e1; c0 += kEntriesPass) {
                 const int cn = sycl::min(kEntriesPass, e1 - c0);
-                sycl::group_barrier(it.get_group());
+                // XeStrata-890M: the APU rows take this barrier only from the second chunk on, where it keeps the copy
+                // of h from the sub-groups still reading the chunk before; nothing has read h before the first
+                if (!APU || c0 != e0) sycl::group_barrier(it.get_group());
                 const int* src = (const int*) (hq + (size_t) c0 * hb);   // a group's entries are contiguous
                 for (int i = tid; i < cn * hb * 9; i += WG) sh[i] = src[i];
                 sycl::group_barrier(it.get_group());
@@ -2343,23 +2385,9 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
         const size_t total = (size_t) ((n8 + 255) / 256) * 256;
         sync_if_needed(stream, queue_for(stream).parallel_for(sycl::nd_range<1>(total, 256),
                               [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
-            const long long j = (long long) it.get_global_linear_id();   // values 8j .. 8j + 7
-            const bool in = j < n8;
-            const sycl::sub_group sg = it.get_sub_group();
-            float v[8], a = 0.0f, sum = 0.0f;
-            for (int q = 0; q < 8; ++q) {
-                v[q] = in ? x[8 * j + q] : 0.0f;
-                a = sycl::fmax(a, sycl::fabs(v[q]));
-                sum += v[q];
-            }
-            const float amax = sycl::reduce_over_group(sg, a, sycl::maximum<float>());   // 32 lanes: 256 values
-            sum += sycl::permute_group_by_xor(sg, sum, 1);
-            sum += sycl::permute_group_by_xor(sg, sum, 2);
-            if (!in) return;
-            const float d = canon::q8_scale(amax), id = canon::q8_inv(d);
-            const long long ib = j / 4, o = 8 * (j % 4);
-            for (int q = 0; q < 8; ++q) Y[ib].qs[o + q] = canon::q8_value(v[q], id);
-            if (o == 0) Y[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+            // values 8j .. 8j + 7 (q8_1_rows_item.hpp: the launch that builds the resident plan runs the same item)
+            q8_1_rows_item(it.get_sub_group(), (long long) it.get_global_linear_id(), n8, x,
+                           reinterpret_cast<uint8_t*>(Y));
         }), "quantize_q8_1_rows");
         return;
     }

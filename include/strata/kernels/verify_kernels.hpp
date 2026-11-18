@@ -93,6 +93,9 @@ void gdn_pending_clear(int32_t* pn, int write_at, void* stream);
 /// fastest; call it before any graph is recorded (once a device; later calls return at once).  Untuned, the
 /// one-work-group-a-head form runs.  STRATA_GDN_STEP=0|1|2 fixes the form.
 void gdn_step_tune(int conv_channels, int h_k, int h_v, void* stream);
+/// For the parity test: every later launch takes this form (0..2), over the tuned choice and STRATA_GDN_STEP; -1
+/// gives the choice back.
+void gdn_step_force_form(int form);
 /// Whether side branches of a graph pay on this device: 16 rounds of eight small kernels in a row and three more,
 /// recorded in a row on `stream`, against the three as one on `stream` beside one on each of `side0` / `side1`
 /// (forked from `stream` and joined back, as the window's GDN layer branches), each graph replayed in turns; true when
@@ -119,6 +122,17 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, int keep = 0, float* w = nullptr,
                    int ser_kmin = 0, float ser_t = 0.0f);
+/// native_router_top10_multi(logits, ids, w, n_tok) and resident_plan(ids, n_tok * 10, 10, ..., keep, w, ser_kmin,
+/// ser_t) in one launch: the same ids, weights, plan and *skip (XeStrata-890M: a launch a layer less in the window
+/// graph).  resident_plan_top10_takes: 1..8 tokens, the native router's shapes (256 or 512 experts, top 10).
+/// With q_x: quantize_q8_1_rows(q_x, q_rows, q_cols, q_y) as more work-groups of the same launch (q_cols a multiple of
+/// 256): the experts' q8_1 image of the layer's input, that launch's bytes.
+bool resident_plan_top10_takes(int n_tok, int n_expert, int k);
+void resident_plan_top10(const float* logits, int32_t* ids, float* w, int n_tok, const int32_t* res_layer,
+                         int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+                         int32_t* plan, long long capx, uint32_t* skip, uint32_t ring, void* stream, int keep = 0,
+                         int ser_kmin = 0, float ser_t = 0.0f, const float* q_x = nullptr, int64_t q_rows = 0,
+                         int64_t q_cols = 0, void* q_y = nullptr);
 /// STRATA_VERIFY_ECAP=N (upstream PR 3545, opt-in, changes the output): the verify window's expert set capped in
 /// place - token 0 keeps all k picks, the speculative tail (tokens 1..n-1) keeps the top (cap - k) entries by
 /// routing weight; a dropped entry is redirected round-robin onto a kept expert with weight 0 (no extra expert read,

@@ -11,6 +11,8 @@
 // device-clock ticks, not the nanoseconds of CUDA's %globaltimer.
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/gdn.hpp"
+#include "q8_1_rows_item.hpp"
+#include "router_top10_token.hpp"
 #include "xe_shuffle.hpp"
 #include "cuda_intrinsics.hpp"
 #include "strata/core/runtime.hpp"
@@ -63,6 +65,8 @@ inline float warp_sum(const sycl::sub_group& sg, float v) {
 inline void q8_1_store(const sycl::sub_group& sg, const float xi, uint8_t* block, const int lane) {
 #pragma clang fp contract(off)
     float amax = sycl::fabs(xi), sum = xi;
+    // unrolled: rolled, strata_shfl_xor's choice of the exchange by the offset stays a run-time switch in every trip
+#pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
         amax = sycl::fmax(amax, strata_shfl_xor(sg, amax, o));
         sum += strata_shfl_xor(sg, sum, o);
@@ -260,9 +264,15 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
     const float *ph = pend ? pend->h : nullptr, *pg = pend ? pend->gate : nullptr, *pb = pend ? pend->beta : nullptr;
     const int32_t* pn = pend ? pend->n : nullptr;
     const int write_at = pend ? sycl::max(pend->write_at, 1) : 1;   // STRATA_GDN_ACC: the state written at this many rows
+    // the state's pointer once more for the write-backs: a kernel argument of its own, so the 32 row addresses of the
+    // loads (64 registers a lane) are not kept alive to the stores at the kernel's end
+    float* const state_wb = state;
     q.submit([&](sycl::handler& hd) {
         const size_t mt = (size_t) T;   // the pending rows go through in chunks of T
-        sycl::local_accessor<float, 1> sk(sycl::range<1>(mt * S), hd), sq(sycl::range<1>(mt * S), hd),
+        // k and q as float4: a lane reads its row group's 32 values of a row as 8 of them, and holds k's over the
+        // row's barrier (read value by value, k came out of local memory on both sides of it, a wait after each pair)
+        sycl::local_accessor<sycl::float4, 1> sk(sycl::range<1>(mt * S / 4), hd), sq(sycl::range<1>(mt * S / 4), hd);
+        sycl::local_accessor<float, 1>
             sv(sycl::range<1>(mt * GS_COLS), hd), sg(sycl::range<1>(2 * mt), hd),
             redk(sycl::range<1>(mt * RG * GS_COLS), hd), redo(sycl::range<1>(mt * RG * GS_COLS), hd);
         hd.parallel_for(sycl::nd_range<1>((size_t) h_v * (S / GS_COLS) * GS_COLS * RG, (size_t) GS_COLS * RG),
@@ -282,10 +292,12 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
             // (the same arithmetic in the same order), and the state written back once; this window's rows then
             // start from it as they would after that commit
             const int np = pn != nullptr ? *pn : 0;
+            float* const skf = reinterpret_cast<float*>(&sk[0]);
+            float* const sqf = reinterpret_cast<float*>(&sq[0]);
             for (int p0 = 0; p0 < np; p0 += (int) mt) {
                 const int pc = sycl::min(np - p0, (int) mt);
                 const float* pht = ph + (size_t) p0 * C;
-                for (int i = tid; i < pc * S; i += GS_COLS * RG) sk[i] = pht[(size_t) (i / S) * C + qk + qh * S + i % S];
+                for (int i = tid; i < pc * S; i += GS_COLS * RG) skf[i] = pht[(size_t) (i / S) * C + qk + qh * S + i % S];
                 for (int i = tid; i < pc * GS_COLS; i += GS_COLS * RG)
                     sv[i] = pht[(size_t) (i / GS_COLS) * C + 2 * qk + head * S + c0 + i % GS_COLS];
                 if (tid < pc) {
@@ -294,30 +306,45 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
                 }
                 sycl::group_barrier(it.get_group());
                 for (int t = 0; t < pc; ++t) {
-                    const float* kt = &sk[(size_t) t * S];
+                    const sycl::float4* kt = &sk[(size_t) (t * S + rg * RPG) / 4];
                     float* rk = &redk[(size_t) t * RG * GS_COLS];
                     const float g = sg[2 * t];
+                    sycl::float4 kk[RPG / 4];
+                    #pragma unroll
+                    for (int j = 0; j < RPG / 4; ++j) kk[j] = kt[j];
                     float kv = 0.0f;
                     #pragma unroll
-                    for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], kt[rg * RPG + r], kv);
+                    for (int r = 0; r < RPG; r += 4) {
+                        const sycl::float4 kr = kk[r / 4];
+                        kv = sycl::fma(s[r], kr.x(), kv); kv = sycl::fma(s[r + 1], kr.y(), kv);
+                        kv = sycl::fma(s[r + 2], kr.z(), kv); kv = sycl::fma(s[r + 3], kr.w(), kv);
+                    }
                     rk[rg * GS_COLS + lc] = kv;
                     sycl::group_barrier(it.get_group());
                     const float kv_col = rk[lc] + rk[GS_COLS + lc] + rk[2 * GS_COLS + lc] + rk[3 * GS_COLS + lc];
                     const float delta = (sv[t * GS_COLS + lc] - g * kv_col) * sg[2 * t + 1];
                     #pragma unroll
-                    for (int r = 0; r < RPG; ++r) s[r] = sycl::fma(g, s[r], kt[rg * RPG + r] * delta);
+                    for (int r = 0; r < RPG; r += 4) {
+                        const sycl::float4 kr = kk[r / 4];
+                        s[r] = sycl::fma(g, s[r], kr.x() * delta);
+                        s[r + 1] = sycl::fma(g, s[r + 1], kr.y() * delta);
+                        s[r + 2] = sycl::fma(g, s[r + 2], kr.z() * delta);
+                        s[r + 3] = sycl::fma(g, s[r + 3], kr.w() * delta);
+                    }
                 }
                 sycl::group_barrier(it.get_group());   // the next chunk's or the window's staging reuses sk, sv, sg
             }
             // (a window that keeps its rows writes the state at its end; STRATA_GDN_ACC: below write_at rows the state
             // stays as read, and the next window runs these rows again, after the ones its commit appends)
-            if (np >= write_at && (n_keep == nullptr || n <= 0))
+            if (np >= write_at && (n_keep == nullptr || n <= 0)) {
+                float* wb = state_wb + ((size_t) (rg * RPG) * h_v + head) * S + col;
                 #pragma unroll
-                for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+                for (int r = 0; r < RPG; ++r) wb[r * row_stride] = s[r];
+            }
             for (int i = tid; i < n * S; i += GS_COLS * RG) {
                 const float* ht = hbuf + (size_t) (i / S) * C;
-                sk[i] = ht[qk + qh * S + i % S];
-                sq[i] = ht[qh * S + i % S];
+                skf[i] = ht[qk + qh * S + i % S];
+                sqf[i] = ht[qh * S + i % S];
             }
             for (int i = tid; i < n * GS_COLS; i += GS_COLS * RG)
                 sv[i] = hbuf[(size_t) (i / GS_COLS) * C + 2 * qk + head * S + c0 + i % GS_COLS];
@@ -327,33 +354,55 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
             }
             sycl::group_barrier(it.get_group());
             for (int t = 0; t < n; ++t) {
-                const float* kt = &sk[(size_t) t * S];
-                const float* qt = &sq[(size_t) t * S];
+                const sycl::float4* kt = &sk[(size_t) (t * S + rg * RPG) / 4];
+                const sycl::float4* qt = &sq[(size_t) (t * S + rg * RPG) / 4];
                 float* rk = &redk[(size_t) t * RG * GS_COLS];
                 float* ro = &redo[(size_t) t * RG * GS_COLS];
                 const float g = sg[2 * t];
+                sycl::float4 kk[RPG / 4];
+                #pragma unroll
+                for (int j = 0; j < RPG / 4; ++j) kk[j] = kt[j];
                 float kv = 0.0f;
                 #pragma unroll
-                for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], kt[rg * RPG + r], kv);
+                for (int r = 0; r < RPG; r += 4) {
+                    const sycl::float4 kr = kk[r / 4];
+                    kv = sycl::fma(s[r], kr.x(), kv); kv = sycl::fma(s[r + 1], kr.y(), kv);
+                    kv = sycl::fma(s[r + 2], kr.z(), kv); kv = sycl::fma(s[r + 3], kr.w(), kv);
+                }
                 rk[rg * GS_COLS + lc] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = rk[lc] + rk[GS_COLS + lc] + rk[2 * GS_COLS + lc] + rk[3 * GS_COLS + lc];
                 const float delta = (sv[t * GS_COLS + lc] - g * kv_col) * sg[2 * t + 1];
                 float o = 0.0f;
                 #pragma unroll
-                for (int r = 0; r < RPG; ++r) {
-                    s[r] = sycl::fma(g, s[r], kt[rg * RPG + r] * delta);
-                    o = sycl::fma(s[r], qt[rg * RPG + r], o);
+                for (int r = 0; r < RPG; r += 4) {
+                    const sycl::float4 kr = kk[r / 4], qv = qt[r / 4];
+                    s[r] = sycl::fma(g, s[r], kr.x() * delta);
+                    o = sycl::fma(s[r], qv.x(), o);
+                    s[r + 1] = sycl::fma(g, s[r + 1], kr.y() * delta);
+                    o = sycl::fma(s[r + 1], qv.y(), o);
+                    s[r + 2] = sycl::fma(g, s[r + 2], kr.z() * delta);
+                    o = sycl::fma(s[r + 2], qv.z(), o);
+                    s[r + 3] = sycl::fma(g, s[r + 3], kr.w() * delta);
+                    o = sycl::fma(s[r + 3], qv.w(), o);
                 }
                 ro[rg * GS_COLS + lc] = o;
-                sycl::group_barrier(it.get_group());
-                if (rg == 0 && t >= t_out_begin)
+            }
+            // XeStrata-890M: the rows' outputs after the loop, behind one barrier.  Every row has its own slots for the
+            // two reductions, so a row's second barrier only held the next row's first chain back until the slowest
+            // row group's output chain was done; the sums and their order are the same.
+            sycl::group_barrier(it.get_group());
+            if (rg == 0)
+                for (int t = t_out_begin; t < n; ++t) {
+                    const float* ro = &redo[(size_t) t * RG * GS_COLS];
                     y[(size_t) t * value_dim + (size_t) (head * S + col)] =
                         (ro[lc] + ro[GS_COLS + lc] + ro[2 * GS_COLS + lc] + ro[3 * GS_COLS + lc]) * sycl::rsqrt((float) S);
-            }
-            if (n_keep != nullptr && n > 0)
+                }
+            if (n_keep != nullptr && n > 0) {
+                float* wb = state_wb + ((size_t) (rg * RPG) * h_v + head) * S + col;
                 #pragma unroll
-                for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+                for (int r = 0; r < RPG; ++r) wb[r * row_stride] = s[r];
+            }
         });
     });
 #else
@@ -725,13 +774,15 @@ core::PerDevice<GdnChoice>& gdn_choices() {
     static core::PerDevice<GdnChoice> choices;
     return choices;
 }
+std::atomic<int> g_gdn_form_override{-1};   // gdn_step_force_form
 int gdn_forced() {   // STRATA_GDN_STEP=0|1|2: one form always (one group a head, split, prefetch)
     static const int forced = [] {
         const char* v = std::getenv("STRATA_GDN_STEP");
         const long f = v == nullptr ? -1 : std::strtol(v, nullptr, 10);
         return f >= 0 && f < kGdnForms ? (int) f : -1;
     }();
-    return forced;
+    const int over = g_gdn_form_override.load(std::memory_order_relaxed);
+    return over >= 0 ? over : forced;
 }
 sycl::event gdn_step_form(int form, sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
@@ -756,6 +807,10 @@ sycl::event gdn_step_form(int form, sycl::queue& q, float* state, const float* h
                                  nullptr);
 }
 }  // namespace
+
+void gdn_step_force_form(int form) {
+    g_gdn_form_override.store(form >= 0 && form < kGdnForms ? form : -1, std::memory_order_relaxed);
+}
 
 void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
     if (C <= 0 || h_k <= 0 || h_v <= 0 || h_v % h_k) fail("gdn_step_tune: invalid arguments");
@@ -1121,9 +1176,127 @@ void verify_stop_guard(float* logits, int T, int n_vocab, const int32_t* stop, i
     done(stream, e, "verify_stop_guard");
 }
 
-void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
-                   const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
-                   uint32_t ring, void* stream, int keep, float* w, int ser_kmin, float ser_t) {
+namespace {
+// resident_plan's arguments, as its kernels capture them
+struct ResidentPlan {
+    const int32_t* ids;
+    int n, k;
+    const int32_t* res;
+    int n_expert;
+    const uint8_t* cache_base;
+    const unsigned long long* slot_off;
+    long long blob;
+    int32_t* pl;
+    long long capx;
+    uint32_t* skip;
+    uint32_t ring;
+    int keep;
+    float* w;
+    bool ser_on;
+    int ser_kmin;
+    float ser_t;
+};
+
+// One work-item per entry (at most kVerifyMaxT * 10 of them; one work-item alone grouped them in ~70 us a layer,
+// upstream 882764d).  The plan is the host loop's exactly: groups in order of first occurrence, entries in a group
+// in index order.  Entry i: L = its expert's first index; its group = the first occurrences before L; the group
+// starts at the number of entries whose leader is before L; its place in it = the earlier entries with leader L.
+template <int WG>
+inline void resident_plan_group(const sycl::nd_item<1>& it, const ResidentPlan& a,
+                                const sycl::local_accessor<int32_t, 1>& s_ids,
+                                const sycl::local_accessor<int32_t, 1>& s_excl) {
+    const int32_t* const ids = a.ids;
+    const int n = a.n, k = a.k, n_expert = a.n_expert, keep = a.keep, ser_kmin = a.ser_kmin;
+    const int32_t* const res = a.res;
+    const uint8_t* const cache_base = a.cache_base;
+    const unsigned long long* const slot_off = a.slot_off;
+    const long long blob = a.blob, capx = a.capx;
+    int32_t* const pl = a.pl;
+    uint32_t* const skip = a.skip;
+    const uint32_t ring = a.ring;
+    float* const w = a.w;
+    const bool ser = a.ser_on;
+    const float ser_t = a.ser_t;
+    const auto grp = it.get_group();
+    const int t = (int) it.get_local_id(0);
+    bool use = t < n && t % k < keep;
+    if (ser && use && t % k >= ser_kmin) use = w[t] >= ser_t * w[t - t % k];   // read before any rescale
+    bool bad = false;
+    if (t < n) {
+        const int32_t ex = ids[t];
+        s_ids[t] = use ? ex : -1;   // a left-out entry joins no group
+        bad = use && (ex < 0 || ex >= n_expert || res[ex] < 0);
+    }
+    if (sycl::any_of_group(grp, bad)) {
+        if (t == 0) *skip = 0;
+        return;
+    }
+    if ((keep < k || ser) && w != nullptr) {
+        sycl::group_barrier(grp);   // every entry's `use` (s_ids) is written, and no weight is read any more
+        if (t < n && t % k == 0) {   // one work-item a token: its weights
+            float all = 0.0f, kept = 0.0f;
+            for (int j = 0; j < k; ++j) { all += w[t + j]; if (s_ids[t + j] >= 0) kept += w[t + j]; }
+            const float scale = kept > 0.0f ? all / kept : 1.0f;
+            for (int j = 0; j < k; ++j) w[t + j] = s_ids[t + j] >= 0 ? w[t + j] * scale : 0.0f;
+        }
+    }
+    // an entry's leader L (its expert's first index) and, for a leader, its entry count; then one scan of
+    // (entries << 16 | 1) over the leaders numbers the groups and gives their starts (upstream fe4de5de)
+    // (one pass over the ids gives the leader, the count and the place: a search for the leader first read
+    // them a second time, one id a trip)
+    int L = t, cnt = 0, pos = 0;
+    if (use) {
+        int first = t, all = 0;
+        for (int j = 0; j < n; ++j) {
+            const bool eq = s_ids[j] == s_ids[t];
+            all += eq ? 1 : 0;
+            pos += eq && j < t ? 1 : 0;
+            if (eq && j < first) first = j;
+        }
+        L = first;
+        cnt = L == t ? all : 0;
+    }
+    const int pack = L == t && use ? (cnt << 16) | 1 : 0;
+    const int excl = sycl::exclusive_scan_over_group(grp, pack, sycl::plus<int>());
+    s_excl[t] = excl;
+    if (t == WG - 1) s_excl[WG] = excl + pack;   // the total, which only work-item 0 reads (no second reduction)
+    sycl::group_barrier(grp);
+    int32_t* counts = pl;
+    int32_t* start = pl + 4;
+    int32_t* dst = start + capx + 1;
+    int32_t* tok = dst + capx;
+    const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+    unsigned long long* ptr = reinterpret_cast<unsigned long long*>(pl + ptr_off);
+    int32_t* start2 = pl + ptr_off + 4 * capx;
+    if (use) {
+        const int le = s_excl[L];
+        const int g = le & 0xffff, gstart = le >> 16;
+        dst[gstart + pos] = t;
+        tok[gstart + pos] = t / k;
+        if (L == t) {
+            const int32_t slot = res[s_ids[t]];
+            ptr[g] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+            start[g] = gstart;
+        }
+    }
+    sycl::group_barrier(grp);
+    if (t != 0) return;
+    const int total = s_excl[WG];
+    const int n_used = (int) (total >> 16);
+    const int groups = total & 0xffff;
+    start[groups] = n_used;
+    start2[0] = n_used;
+    counts[0] = groups;
+    counts[1] = n_used;
+    counts[2] = 0;
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+    *skip = ring;
+}
+
+ResidentPlan resident_plan_args(const int32_t* ids, int n, int k, const int32_t* res, int n_expert,
+                                const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+                                int32_t* pl, long long capx, uint32_t* skip, uint32_t ring, int keep, float* w,
+                                int ser_kmin, float ser_t) {
     // XeStrata-890M (keep < k, STRATA_EXPERT_KEEP): each token's experts past rank `keep` are left out of the plan and
     // their weights set to 0, the kept ones scaled to the token's old sum (the router ranks them by weight, first the
     // largest).  An approximation: it changes the output.
@@ -1131,90 +1304,84 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
     // its Kmin heaviest experts, and past them only those whose weight is at least t times its heaviest one; the
     // weights are rescaled as with keep.  Also an approximation.
     if (keep <= 0 || keep > k) keep = k;
-    const bool ser = ser_kmin > 0 && ser_t > 0.0f && w != nullptr;
-    if (ser && ser_kmin > k) ser_kmin = k;
-    // One work-item per entry (at most kVerifyMaxT * 10 of them; one work-item alone grouped them in ~70 us a layer,
-    // upstream 882764d).  The plan is the host loop's exactly: groups in order of first occurrence, entries in a group
-    // in index order.  Entry i: L = its expert's first index; its group = the first occurrences before L; the group
-    // starts at the number of entries whose leader is before L; its place in it = the earlier entries with leader L.
-    constexpr int WG = 128;
-    if (n > WG) throw std::invalid_argument("resident_plan: more entries than a work-group");
-    const auto e = Q(stream).submit([&](sycl::handler& h) {
+    const bool ser_on = ser_kmin > 0 && ser_t > 0.0f && w != nullptr;
+    if (ser_on && ser_kmin > k) ser_kmin = k;
+    return {ids, n, k, res, n_expert, cache_base, slot_off, blob, pl, capx, skip, ring, keep, w, ser_on, ser_kmin, ser_t};
+}
+
+// XeStrata-890M: the router's top-10 of n_tok tokens (router.cpp's top10_token, one sub-group a token) and their plan
+// in one work-group: the first n_tok sub-groups write ids and w, and behind a barrier the group builds the plan from
+// them as resident_plan does.  WG: whole sub-groups for the tokens (128 work-items for up to 4, 256 for up to 8).
+// With q_n8 > 0 the launch has more work-groups, which write the experts' q8_1 image of q_x (q_n8 * 8 values, rows of
+// whole 256s) to q_y: quantize_q8_1_rows' work-items (q8_1_rows_item.hpp), that launch's bytes.
+template <int WG, int NPL>
+sycl::event launch_resident_plan_top10(sycl::queue& q, const float* logits, int32_t* ids, float* w, int n_tok,
+                                       const ResidentPlan& a, const float* q_x, long long q_n8, uint8_t* q_y) {
+    const size_t q_groups = q_n8 > 0 ? (size_t) ((q_n8 + WG - 1) / WG) : 0;
+    return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
-        sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG), h);
-        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
-            const auto grp = it.get_group();
-            const int t = (int) it.get_local_id(0);
-            bool use = t < n && t % k < keep;
-            if (ser && use && t % k >= ser_kmin) use = w[t] >= ser_t * w[t - t % k];   // read before any rescale
-            bool bad = false;
-            if (t < n) {
-                const int32_t ex = ids[t];
-                s_ids[t] = use ? ex : -1;   // a left-out entry joins no group
-                bad = use && (ex < 0 || ex >= n_expert || res[ex] < 0);
-            }
-            if (sycl::any_of_group(grp, bad)) {
-                if (t == 0) *skip = 0;
+        sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG + 1), h);
+        h.parallel_for(sycl::nd_range<1>((1 + q_groups) * WG, WG),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const long long g0 = (long long) it.get_group(0);
+            if (g0 > 0) {
+                q8_1_rows_item(it.get_sub_group(), (g0 - 1) * WG + (long long) it.get_local_id(0), q_n8, q_x, q_y);
                 return;
             }
-            if ((keep < k || ser) && w != nullptr) {
-                sycl::group_barrier(grp);   // every entry's `use` (s_ids) is written, and no weight is read any more
-                if (t < n && t % k == 0) {   // one work-item a token: its weights
-                    float all = 0.0f, kept = 0.0f;
-                    for (int j = 0; j < k; ++j) { all += w[t + j]; if (s_ids[t + j] >= 0) kept += w[t + j]; }
-                    const float scale = kept > 0.0f ? all / kept : 1.0f;
-                    for (int j = 0; j < k; ++j) w[t + j] = s_ids[t + j] >= 0 ? w[t + j] * scale : 0.0f;
-                }
-            }
-            // an entry's leader L (its expert's first index) and, for a leader, its entry count; then one scan of
-            // (entries << 16 | 1) over the leaders numbers the groups and gives their starts (upstream fe4de5de)
-            int L = t, cnt = 0, pos = 0;
-            if (use) {
-                for (int j = 0; j < t; ++j)
-                    if (s_ids[j] == s_ids[t]) { L = j; break; }
-                for (int j = 0; j < n; ++j) {
-                    if (s_ids[j] != s_ids[t]) continue;
-                    if (L == t) ++cnt;
-                    if (j < t) ++pos;
-                }
-            }
-            const int pack = L == t && use ? (cnt << 16) | 1 : 0;
-            const int excl = sycl::exclusive_scan_over_group(grp, pack, sycl::plus<int>());
-            s_excl[t] = excl;
-            const int total = sycl::reduce_over_group(grp, pack, sycl::plus<int>());
-            sycl::group_barrier(grp);
-            int32_t* counts = pl;
-            int32_t* start = pl + 4;
-            int32_t* dst = start + capx + 1;
-            int32_t* tok = dst + capx;
-            const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
-            unsigned long long* ptr = reinterpret_cast<unsigned long long*>(pl + ptr_off);
-            int32_t* start2 = pl + ptr_off + 4 * capx;
-            const int n_used = (int) (total >> 16);
-            if (use) {
-                const int le = s_excl[L];
-                const int g = le & 0xffff, gstart = le >> 16;
-                dst[gstart + pos] = t;
-                tok[gstart + pos] = t / k;
-                if (L == t) {
-                    const int32_t slot = res[s_ids[t]];
-                    ptr[g] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
-                    start[g] = gstart;
-                }
-            }
-            sycl::group_barrier(grp);
-            if (t != 0) return;
-            const int groups = total & 0xffff;
-            start[groups] = n_used;
-            start2[0] = n_used;
-            counts[0] = groups;
-            counts[1] = n_used;
-            counts[2] = 0;
+            const sycl::sub_group sg = it.get_sub_group();
+            const int tk = (int) sg.get_group_linear_id();
+            if (tk < n_tok)
+                router_detail::top10_token<NPL>(sg, logits + (size_t) tk * NPL * 32, ids + (size_t) tk * 10, w + (size_t) tk * 10,
+                                                nullptr,
+                                                nullptr);
             sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-            *skip = ring;
+            sycl::group_barrier(it.get_group());
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+            resident_plan_group<WG>(it, a, s_ids, s_excl);
         });
     });
+}
+}  // namespace
+
+void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
+                   const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
+                   uint32_t ring, void* stream, int keep, float* w, int ser_kmin, float ser_t) {
+    constexpr int WG = 128;
+    if (n > WG) throw std::invalid_argument("resident_plan: more entries than a work-group");
+    const ResidentPlan a = resident_plan_args(ids, n, k, res, n_expert, cache_base, slot_off, blob, pl, capx, skip, ring,
+                                              keep, w, ser_kmin, ser_t);
+    const auto e = Q(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
+        sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG + 1), h);   // + 1: the scan's total
+        h.parallel_for(sycl::nd_range<1>(WG, WG),
+                       [=](sycl::nd_item<1> it) { resident_plan_group<WG>(it, a, s_ids, s_excl); });
+    });
     done(stream, e, "resident_plan");
+}
+
+bool resident_plan_top10_takes(int n_tok, int n_expert, int k) {
+    return n_tok >= 1 && n_tok <= 8 && k == 10 && (n_expert == 512 || n_expert == 256);
+}
+
+void resident_plan_top10(const float* logits, int32_t* ids, float* w, int n_tok, const int32_t* res, int n_expert,
+                         const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* pl,
+                         long long capx, uint32_t* skip, uint32_t ring, void* stream, int keep, int ser_kmin,
+                         float ser_t, const float* q_x, int64_t q_rows, int64_t q_cols, void* q_y) {
+    if (!resident_plan_top10_takes(n_tok, n_expert, 10) || logits == nullptr || ids == nullptr || w == nullptr)
+        throw std::invalid_argument("resident_plan_top10: 1..8 tokens, 256 or 512 experts, top 10");
+    const long long q_n8 = q_x != nullptr ? (long long) q_rows * q_cols / 8 : 0;
+    if (q_n8 > 0 && (q_cols % 256 != 0 || q_y == nullptr))
+        throw std::invalid_argument("resident_plan_top10: the q8_1 image takes rows of whole 256s");
+    uint8_t* const qy = static_cast<uint8_t*>(q_y);
+    const ResidentPlan a = resident_plan_args(ids, n_tok * 10, 10, res, n_expert, cache_base, slot_off, blob, pl, capx,
+                                              skip, ring, keep, w, ser_kmin, ser_t);
+    auto& q = Q(stream);
+    const auto e = n_expert == 512
+        ? (n_tok <= 4 ? launch_resident_plan_top10<128, 16>(q, logits, ids, w, n_tok, a, q_x, q_n8, qy)
+                      : launch_resident_plan_top10<256, 16>(q, logits, ids, w, n_tok, a, q_x, q_n8, qy))
+        : (n_tok <= 4 ? launch_resident_plan_top10<128, 8>(q, logits, ids, w, n_tok, a, q_x, q_n8, qy)
+                      : launch_resident_plan_top10<256, 8>(q, logits, ids, w, n_tok, a, q_x, q_n8, qy));
+    done(stream, e, "resident_plan_top10");
 }
 
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {

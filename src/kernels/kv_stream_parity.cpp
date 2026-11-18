@@ -18,6 +18,8 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/native_qsa.hpp"
 
 #include "parity_device.hpp"
 
@@ -148,6 +150,15 @@ bool run(int fmt) {
     float* scratch = dalloc<float>(NQ * scr);
     float* out_ref = dalloc<float>(NQ * NH * D);
     float* out_str = dalloc<float>(NQ * NH * D);
+    // XeStrata-890M: the merge launch with the gate and the q8_1 image as its tail (qsa_decode_attn_gate_q8_batch)
+    // against the three launches it replaces
+    const size_t xq_bytes = (size_t) NQ * NH * D / 32 * 36;
+    float* q_full = dalloc<float>(NQ * NH * 2 * D);
+    float* gated = dalloc<float>(NQ * NH * D);
+    uint8_t* xq_ref = dalloc<uint8_t>(xq_bytes);
+    uint8_t* xq_one = dalloc<uint8_t>(xq_bytes);
+    std::vector<float> hqf((size_t) NQ * NH * 2 * D);
+    std::vector<uint8_t> xa(xq_bytes), xb(xq_bytes);
     std::vector<float> hk(H * D), hv(H * D), hq(NQ * NH * D), a((size_t) NQ * NH * D), b2((size_t) NQ * NH * D);
     std::vector<int32_t> pt(n_blocks), sb(n_slots);
 
@@ -186,6 +197,27 @@ bool run(int fmt) {
         strata::parity::copy_bytes_out(b2.data(), out_str, (size_t) n_q * NH * D * 4);
         if (std::memcmp(a.data(), b2.data(), (size_t) n_q * NH * D * 4) != 0) {
             if (bad++ < 5) std::fprintf(stderr, "  %s pos %lld n_q %d: streamed attention differs\n", name, (long long) pos, n_q);
+        }
+        // the gate and the q8_1 image: three launches against the one
+        {
+            for (auto& x : hqf) x = 2.0f * nd(rng);
+            const size_t nb = (size_t) n_q * NH * D / 32 * 36;
+            const std::vector<uint8_t> junk(xq_bytes, 0x5A);
+            strata::parity::copy_bytes_in(q_full, hqf.data(), hqf.size() * 4);
+            strata::parity::copy_bytes_in(xq_ref, junk.data(), xq_bytes);
+            strata::parity::copy_bytes_in(xq_one, junk.data(), xq_bytes);
+            void* st = strata::parity::stream();   // (the gate and the quantization take an explicit stream)
+            k::native_qsa_gate_apply(out_ref, q_full, gated, (int) (n_q * NH), (int) D, st);
+            k::native_quantize_q8_1(gated, xq_ref, (int) (NH * D), n_q, st);
+            k::qsa_decode_attn_gate_q8_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, q_full, xq_one, n_q, st);
+            strata::parity::sync();
+            strata::parity::copy_bytes_out(xa.data(), xq_ref, nb);
+            strata::parity::copy_bytes_out(xb.data(), xq_one, nb);
+            if (std::memcmp(xa.data(), xb.data(), nb) != 0) {
+                if (bad++ < 5)
+                    std::fprintf(stderr, "  %s pos %lld n_q %d: the merge launch's gated q8_1 image differs from the three "
+                                         "launches'\n", name, (long long) pos, n_q);
+            }
         }
         // the map inverts itself
         strata::parity::copy_bytes_out(pt.data(), m.page_table, n_blocks * 4);

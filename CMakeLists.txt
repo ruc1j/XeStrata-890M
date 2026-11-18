@@ -14,7 +14,7 @@ set(STRATA_UPSTREAM_COMMIT "c775728")
 # version is <upstream>-<revision> everywhere: the version name (the tag, what the engine says) xe<upstream>-<revision>
 # (xe0.1.43.1-1), the packages <upstream>-<revision> (rpm: Version and Release).  Before 2026-10-13 a later release
 # took a fifth number instead (xe0.1.43.1 was 0.1.43's second), which upstream's own 0.1.43.1 then collided with.
-set(XESTRATA_REVISION 1)
+set(XESTRATA_REVISION 2)
 set(XESTRATA_VERSION "${STRATA_UPSTREAM_VERSION}-${XESTRATA_REVISION}")
 set(STRATA_VERSION_NAME "xe${XESTRATA_VERSION}")
 # The packages' version: an upstream pre-release (0.2.0-beta) with "~" for its "-" (0.2.0~beta), which deb and rpm
@@ -1129,6 +1129,11 @@ if(STRATA_ENABLE_XE)
     add_test(NAME qsa_select_wmma_parity_p3
              COMMAND ${CMAKE_COMMAND} -E env STRATA_SELECT_WMMA=3 $<TARGET_FILE:qsa_select_wmma_parity> 49 620)
     set_tests_properties(qsa_select_wmma_parity_p3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    # the indexer's block scores (the window graph's kernels) against a host reference, and the rows form against the
+    # per-row one, memcmp
+    add_executable(qsa_score_parity src/kernels/qsa_score_parity.cpp)
+    target_link_libraries(qsa_score_parity PRIVATE strata_kernels)
+    add_test(NAME qsa_score_parity COMMAND qsa_score_parity)
     # perf-review D-1: the prompt attention against the FP32 kernel and FP64 (a benchmark too: not a CTest case,
     # as in the CUDA build)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
@@ -1165,6 +1170,11 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(mmvq_bench PRIVATE strata_kernels)
     add_executable(expert_bench src/kernels/expert_bench.cpp)
     target_link_libraries(expert_bench PRIVATE strata_kernels)
+    # the decode window's GDN step (the recurrence and the output norm, every form, with and without pending rows)
+    # against a host reference in FP64, and the forms against each other, memcmp
+    add_executable(gdn_step_parity src/kernels/gdn_step_parity.cpp)
+    target_link_libraries(gdn_step_parity PRIVATE strata_kernels)
+    add_test(NAME gdn_step_parity COMMAND gdn_step_parity)
     add_executable(gdn_bench src/kernels/gdn_bench.cpp)
     target_link_libraries(gdn_bench PRIVATE strata_kernels)
     add_executable(gr_bench src/kernels/gr_bench.cpp)
@@ -1196,6 +1206,10 @@ if(STRATA_ENABLE_XE)
     add_executable(gr_multi_parity src/kernels/gr_multi_parity.cpp)
     target_link_libraries(gr_multi_parity PRIVATE strata_kernels)
     add_test(NAME gr_multi_parity COMMAND gr_multi_parity)
+    # XeStrata-890M: the launches STRATA_MTP_GLUE_FUSE takes out of the MTP layer, against the launches they replace
+    add_executable(mtp_glue_parity src/kernels/mtp_glue_parity.cpp)
+    target_link_libraries(mtp_glue_parity PRIVATE strata_kernels)
+    add_test(NAME mtp_glue_parity COMMAND mtp_glue_parity)
     # #783 PR-e: the verify window's device-built expert plan against a host replay of its contract
     add_executable(resident_plan_parity src/kernels/resident_plan_parity.cpp)
     target_link_libraries(resident_plan_parity PRIVATE strata_kernels)

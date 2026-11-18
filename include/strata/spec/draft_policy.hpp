@@ -80,8 +80,9 @@ public:
     void set_context(long long pos);
     /// The measured round cost of every window size seen: "T1:39.8(n=120) T2:..." for the log / the next process's table.
     std::string cost_table_text() const;
-    /// STRATA_SPEC_COST: a round time far above what is known for that width (the first use of a width captures its graph; a stalled
-    /// round) counts as a tenth of a sample, so one capture cannot price a width out of use.  Off: the cost EMA as it always was.
+    /// STRATA_SPEC_COST: a width's first three round times count by their least, later ones move its cost down faster than up
+    /// and are cut a quarter above it, and the MTP chain tries a width again whose time has grown old - so one disturbed round
+    /// cannot price a width out of use (draft_policy.cpp).  Off: the cost EMA as it always was.
     void set_robust(bool on) { robust_ = on; }
 
     /// COST-AWARE MTP WINDOW (STRATA_SPEC_COST=1): the MTP chain is drafted one step at a time; after draft j (probability p_j)
@@ -95,6 +96,7 @@ public:
         double best_v = 0.0;
         int best_rows = 1;                ///< the window to verify: 1 + the drafts kept
         int kept = 0;                     ///< best_rows - 1
+        double best_e = 1.0, best_c = 0.0;   ///< the best width's expected tokens and round ms (the rate rule)
     };
     /// Draft `idx` (0-based, probability p) was just computed: update `st` and say whether to compute draft idx + 1.
     /// idx == 0 starts a new chain.  `cap` = the widest window (rows).
@@ -149,7 +151,12 @@ private:
     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
     double rounds_ = 0;                                    // rounds observed so far
     bool robust_ = false;
+    double rate_tok_ = 0, rate_ms_ = 0, rate_n_ = 0;       // tokens committed and round ms of the rounds timed (decayed)
+    void observe_rate(double tokens, double ms);
+    bool rate_rule() const;                                // keep_draft compares by the long-run rate (set_robust)
     double clamp_sample(int t, double ms, bool lookup = false) const;
+    void update_cost(double& mean, double& n, double ms) const;   // one round's time into a size's cost
+    bool stale_chain(int t) const;                                // keep_draft: a size's time is old enough to try again
     static constexpr int kPBuckets = 8;
     std::array<double, kPBuckets> pa_ok_{}, pa_n_{};       // MTP drafts reached / accepted by probability bucket (decayed)
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> last_{};   // the round at which each size was last measured

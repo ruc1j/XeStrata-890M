@@ -74,8 +74,9 @@ public:
     /// Block until every row of the ticket is in `out_raw`. Returns false on an I/O error (message in `err`).
     bool collect(Ticket t, std::string& err);
 
-    /// Keep the SSD awake while the table is in use (io_thread mode only; call after `open`): when no read has
-    /// gone out for `period_ms`, the worker reads one page of the table, until `window_s` after the last `issue`.
+    /// Keep the SSD awake while the table is in use (call after `open`): when no read has gone out for
+    /// `period_ms`, the worker reads one page of the table, until `window_s` after the last `issue`.  Without the
+    /// I/O thread a thread of its own does, through its own handle on the file (its counts are in `snapshot`).
     /// Some SSDs drop into a power state after ~250 ms without a command and stall the next reads 50-150 ms
     /// (a WD_BLACK SN7100 on Windows 11; the NVMe idle timeouts of the power plan did not change it), which in
     /// decode happens after a few rounds whose rows all came from the row cache. 0 turns it off (the reader's

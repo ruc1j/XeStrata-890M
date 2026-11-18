@@ -284,6 +284,7 @@ struct Options {
     int ple_inflight = 256;   // slots for the reads queued to DirectFile's threads: more than they are (io_threads)
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
+    bool ple_io_thread_given = false;  ///< --ple-io-thread: the I/O worker also where the token thread is the default
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     int kv_grow = -1;                  ///< the elastic K/V (--kv-grow 1, --no-kv-grow 0, STRATA_KV_GROW; -1: by the device)
@@ -562,16 +563,20 @@ struct Options {
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
     /// pay (strata/spec/draft_policy.hpp).  On by default; 0 = MTP only.
     int suffix_draft = 3;
-    /// The MTP's own window cap (0 = --spec): with --spec 6 --mtp-max-t 4 the long windows come from suffix matches.
+    /// The MTP's own window cap (0 = --spec, or --spec + 1 where the window is scheduled by its cost): with --spec 6
+    /// --mtp-max-t 4 the long windows come from suffix matches.
     int mtp_max_t = 0;
     /// --lookup-chain K (opt-in, 0 = off): prompt lookup CHAINED after the MTP's proposal.  The suffix drafter matches
     /// the context followed by the MTP's drafts and appends up to K of the tokens that followed that match to the same
     /// verify window (the window grows to at most 8).  Greedy verification keeps the output; its own counts are kept.
     int lookup_chain = 0;
+    bool lookup_chain_given = false;   ///< --lookup-chain was on the command line (the integrated GPU's default does not override it)
     int lookup_chain_min = 3;   ///< --lookup-chain-min M: the shortest match (in tokens, drafts included) it extends on
-    /// --mtp-hnorm stream (opt-in): the draft layer's pre_fc_norm_hidden normalizes each hyper-connection stream on
-    /// its own (llama.cpp's qwen4exp MTP graph) instead of one RMS over all four (the default, tools/mtp_probe.py).
+    /// --mtp-hnorm stream (the default on an integrated GPU on the HIP backend, opt-in elsewhere): the draft layer's
+    /// pre_fc_norm_hidden normalizes each hyper-connection stream on its own (llama.cpp's qwen4exp MTP graph) instead
+    /// of one RMS over all four (tools/mtp_probe.py).
     bool mtp_hnorm_stream = false;
+    bool mtp_hnorm_given = false;   ///< --mtp-hnorm was on the command line (the integrated GPU's default does not override it)
     /// A control vector on the residual stream (strata/kernels/cvec.hpp), with llama.cpp's flags: the
     /// `experimental-speed-projection` profile passes `--control-vector-scaled FILE:1.0 --control-vector-layer-range
     /// 4 44 --cvec-mode project --cvec-dir per-layer`.  None by default; --serve switches a loaded one per request.
@@ -598,7 +603,9 @@ void usage() {
                  "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
                  "  --ple-inflight N     outstanding SSD reads (default 256)\n"
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
-                 "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
+                 "  --ple-sync-submit    submit table reads on the token thread (the default on an integrated GPU on the\n"
+                 "                       HIP backend; elsewhere an I/O thread)\n"
+                 "  --ple-io-thread      submit table reads on an I/O thread also there\n"
                  "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
                  "                       VRAM; default fp16 until gate G-C accepts int8\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
@@ -698,7 +705,8 @@ void usage() {
                  "                       of the batched prompt path (0 = off; default: by what the two cost here)\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
-                 "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
+                 "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec, or --spec + 1 on an integrated GPU\n"
+                 "                       on the HIP backend; longer ones come from suffixes)\n"
                  "  --mtp-draft-vocab FILE  with --draft dflash2: the draft head's token subset (default <mtp>/draft_vocab.bin)\n"
                  "  --draft mtp|dflash2  the draft source (default mtp); dflash2 needs --draft-model PACK (tools/dflash2_pack.py --q4_0),\n"
                  "                       --spec 2 or more and --mtp DIR (for DIR/draft_vocab.bin) or --mtp-draft-vocab FILE; no MTP layer\n"
@@ -714,11 +722,13 @@ void usage() {
                  "  --spec-min-p P       --spec-window min-p: how sure the draft layer must be to extend a verify window\n"
                  "                       by another guess (setup writes 0.5; --calibrate measures it on this PC, see\n"
                  "                       docs/DETAILS.md)\n"
-                 "  --lookup-chain K     opt-in: after the MTP's drafts, add up to K prompt-lookup drafts that continue\n"
-                 "                       them (the window grows to at most 8; default 0 = off)\n"
+                 "  --lookup-chain K     after the MTP's drafts, add up to K prompt-lookup drafts that continue them\n"
+                 "                       (the window grows to at most 8; default 0 = off, 2 on an integrated GPU on\n"
+                 "                       the HIP backend)\n"
                  "  --lookup-chain-min M  the shortest context match --lookup-chain extends on (default 3)\n"
                  "  --mtp-hnorm pooled|stream  the draft layer's hidden-input norm: one RMS over all four streams\n"
-                 "                       (default) or one per stream (llama.cpp's MTP graph)\n"
+                 "                       or one per stream (llama.cpp's MTP graph; the default on an integrated GPU on\n"
+                 "                       the HIP backend, pooled elsewhere)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -1338,9 +1348,15 @@ private:
 int adapt_lag() { return strata::core::adapt_lag(); }
 
 /// A window that may start before the adaptive tier's swaps reach the device's residency table (STRATA_ADAPT_NOWAIT=1,
-/// STRATA_ADAPT_LAG > 1) plans every layer on the host: the device-side plan and the resident graph read that table and
-/// would take an expert the host already evicted as resident (upstream 3f2db5e2's case: the evicted expert computed on
-/// the CPU from no activation, or read from a slot being refilled).  set_always_publish turns both off.
+/// STRATA_ADAPT_LAG > 1, the default) does not plan a layer from that table: the device-side plan (E-6) reads it layer
+/// by layer and would take an expert the host already evicted as resident (upstream 3f2db5e2's case: the evicted
+/// expert computed on the CPU from no activation, or read from a slot being refilled).  set_device_table_lags turns
+/// it off.  The resident window graph stays on: the verifier takes it only for a window whose experts are all
+/// resident in the host's table, and a swap leaves a hole there from when it is issued (`adapt`) until its copy has
+/// landed and the table is uploaded (`apply_pending`); every other change of the host's table (the K/V's growth, the
+/// prompt path's borrowed slots, the VRAM reserve) uploads it before the next window.  With every expert in the cache
+/// there is nothing to swap, and the windows run without the host (the 890M, greedy 6 chats: 36.01 -> 36.58 tok/s,
+/// the same answers, 2026-11-16).
 bool adapt_device_table_lags() { return adapt_nowait() || adapt_lag() > 1; }
 
 /// Whether a decode window ends at the adaptive tier's next position (#152).  A swap moves experts between the CPU and
@@ -2665,6 +2681,7 @@ int main(int argc, char** argv) {
         else if (a == "--ple-inflight") o.ple_inflight = (int) std::strtol(next("--ple-inflight"), nullptr, 10);
         else if (a == "--ple-delay-us") o.ple_delay_us = std::strtod(next("--ple-delay-us"), nullptr);
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
+        else if (a == "--ple-io-thread") o.ple_io_thread_given = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::strtoll(next("--kv-resident"), nullptr, 10);
         else if (a == "--kv-grow") o.kv_grow = 1;
@@ -2833,7 +2850,10 @@ int main(int argc, char** argv) {
         }
         else if (a == "--draft-conf") o.draft_conf = std::clamp(std::strtod(next("--draft-conf"), nullptr), 0.0, 1.0);
         else if (a == "--draft-cap") o.draft_cap = std::max(0, (int) std::strtol(next("--draft-cap"), nullptr, 10));
-        else if (a == "--lookup-chain") o.lookup_chain = std::clamp((int) std::strtol(next("--lookup-chain"), nullptr, 10), 0, 7);
+        else if (a == "--lookup-chain") {
+            o.lookup_chain = std::clamp((int) std::strtol(next("--lookup-chain"), nullptr, 10), 0, 7);
+            o.lookup_chain_given = true;
+        }
         else if (a == "--lookup-chain-min") o.lookup_chain_min = std::max(3, (int) std::strtol(next("--lookup-chain-min"), nullptr, 10));
         else if (a == "--mtp-hnorm") {
             const std::string v = next("--mtp-hnorm");
@@ -2842,6 +2862,7 @@ int main(int argc, char** argv) {
                 return 2;
             }
             o.mtp_hnorm_stream = v == "stream";
+            o.mtp_hnorm_given = true;
         }
         else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
         else if (a == "--control-vector-scaled") {
@@ -3182,7 +3203,43 @@ int main(int argc, char** argv) {
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
+        // XeStrata-890M: where the MTP's window is scheduled by its cost (STRATA_SPEC_COST, the integrated GPU on the
+        // HIP backend's default), the MTP may take one row more than --spec: the rule prices the wider window at the
+        // round time it measured and takes it only where it pays, and without the row it cannot take a window it
+        // would have had accepted whole.  The 890M's greedy 6 chats with --spec 4: about half of the windows of 4
+        // rows became 5, 2.62 -> 2.72 tokens a window, 38.78 -> 38.97 tok/s (three interleaved rounds, each above;
+        // the same answers); a cap of 6 rows gave nothing (38.75 -> 38.73).  --mtp-max-t N sets the cap itself.
+        if (!o.mtp.empty() && o.batch == 0 && o.pipeline_windows < 2 && o.draft != "dflash2" &&
+            strata::core::spec_cost_default()) {
+            o.mtp_max_t = std::min(o.spec + 1, 8);
+            std::fprintf(stderr, "strata: the MTP's windows go up to %d rows (--spec + 1, the integrated GPU's default; "
+                                 "--mtp-max-t %d keeps them at --spec)\n", o.mtp_max_t, o.spec);
+        }
         o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
+    }
+    // XeStrata-890M: --lookup-chain 2 by default where the MTP's window is scheduled by its cost (STRATA_SPEC_COST, the
+    // integrated GPU on the HIP backend's default): the policy prices a chained row at the round times it measured and
+    // adds one only where it pays, and a row costs this GPU little beside a round's fixed part (about 8.5 ms of 52).
+    // The 890M's greedy 6 chats, four interleaved rounds: 38.03 -> 38.31 tok/s, each round above; the same answers.
+    // --lookup-chain 0 turns it off.  Not with --batch slots, pipelined windows or another drafter (they decode
+    // without the chain).
+    if (!o.lookup_chain_given && !o.mtp.empty() && o.spec >= 2 && o.suffix_draft > 0 && o.batch == 0 &&
+        o.pipeline_windows < 2 && o.draft != "dflash2" && strata::core::spec_cost_default()) {
+        o.lookup_chain = 2;
+        std::fprintf(stderr, "strata: --lookup-chain 2 (the integrated GPU's default; --lookup-chain 0 turns it off)\n");
+    }
+    // XeStrata-890M: --mtp-hnorm stream by default on an integrated GPU on the HIP backend.  setup has written the flag
+    // into an integrated GPU's configuration since 2026-10-29 (upstream's value for the DGX Spark); a configuration
+    // written before, or by hand, ran the pooled norm.  The drafts are accepted more often with the per-stream norm
+    // (the 890M's greedy 6 chats: 2.70 -> 2.91 tokens a window, 39.04 -> 40.52 tok/s, three interleaved rounds, each
+    // above; the same answers).  --mtp-hnorm pooled keeps the pooled norm.
+    if (!o.mtp_hnorm_given && !o.mtp.empty()) {
+        const sycl::device& hd = strata::core::Runtime::get().device();
+        if (hd.get_backend() == sycl::backend::ext_oneapi_hip && strata::core::integrated_gpu(hd)) {
+            o.mtp_hnorm_stream = true;
+            std::fprintf(stderr, "strata: --mtp-hnorm stream (the integrated GPU's default; --mtp-hnorm pooled keeps "
+                                 "the pooled norm)\n");
+        }
     }
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
     // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
@@ -4650,7 +4707,16 @@ int main(int argc, char** argv) {
         const auto tpl = Clock::now();
         pio.max_inflight = (uint32_t) o.ple_inflight;
         pio.cache_rows = (uint64_t) o.ple_row_cache;
-        pio.io_thread = !o.ple_sync_submit;
+        // XeStrata-890M: on an integrated GPU on the HIP backend the token thread submits and reaps the table's reads
+        // itself (--ple-sync-submit's arm; --ple-io-thread keeps the I/O thread there).  A decode round issues a few
+        // reads and the window's launch waits for the last of them: through the I/O thread that read costs two more
+        // thread hand-offs, and the CPU's threads share the GPU's power.  The 890M's greedy 6 chats: the wait before
+        // the launch 0.21 -> 0.11 ms a window, 38.75 -> 38.89 tok/s (three interleaved rounds, each above).
+        {
+            const sycl::device& pd = strata::core::Runtime::get().device();
+            const bool uma_hip = pd.get_backend() == sycl::backend::ext_oneapi_hip && strata::core::integrated_gpu(pd);
+            pio.io_thread = o.ple_io_thread_given ? true : !(o.ple_sync_submit || uma_hip);
+        }
         // Keep the SSD awake while rows are asked for (PleReader::set_keepalive, upstream e128d6d): some SSDs stall
         // the first reads 50-150 ms after ~250 ms without a command.  STRATA_SSD_KEEPALIVE = ms without a read
         // before one page is read anyway (default 100, 0 = off), STRATA_SSD_KEEPALIVE_WINDOW = seconds after the
@@ -4660,7 +4726,7 @@ int main(int argc, char** argv) {
             const char* kw = std::getenv("STRATA_SSD_KEEPALIVE_WINDOW");
             pio.keepalive_ms = ka != nullptr && *ka ? std::clamp(std::strtod(ka, nullptr), 0.0, 10000.0) : 100.0;
             pio.keepalive_window_s = kw != nullptr && *kw ? std::clamp(std::strtod(kw, nullptr), 1.0, 86400.0) : 60.0;
-            if (pio.mode != strata::kernels::PleIo::Direct || !pio.io_thread) pio.keepalive_ms = 0;
+            if (pio.mode != strata::kernels::PleIo::Direct) pio.keepalive_ms = 0;
         }
         if (!ple_table.open(o.ple_gguf, err, pio)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -7871,7 +7937,7 @@ int main(int argc, char** argv) {
                     // --batch-mtp: every stage runs the first one's windows of two rows a slot (up to kVerifyMaxT rows,
                     // the hand-off's size) and bounds its captured batch layouts like it (upstream 48f2c47d)
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
-                    if (adapt_device_table_lags()) gs.ver.set_always_publish(true);
+                    if (adapt_device_table_lags()) gs.ver.set_device_table_lags(true);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
                                        batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
@@ -7978,7 +8044,7 @@ int main(int argc, char** argv) {
                 stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
         }
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp: slot rotation makes many layouts (LRU)
-        if (adapt_device_table_lags()) ver.set_always_publish(true);
+        if (adapt_device_table_lags()) ver.set_device_table_lags(true);
         if (use_df2) ver.set_taps(df2.tap_layers());
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
@@ -9882,12 +9948,20 @@ int main(int argc, char** argv) {
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // the window the cost-aware rule kept in the MTP chain just drafted
         policy.set_robust(spec_cost);
-        if (spec_cost && use_mtp)
+        if (spec_cost && use_mtp) {
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
                 chain_rows = chain_st.best_rows;
                 return k;
             });
+            // XeStrata-890M: the drafts the rule's window verifies, so the drafter leaves the row of a last draft it
+            // dropped unread (STRATA_PLE_SKIP_DROPPED=0: every draft's row is read ahead, as before)
+            static const bool skip_dropped = [] {
+                const char* e = std::getenv("STRATA_PLE_SKIP_DROPPED");
+                return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+            }();
+            if (skip_dropped) mtp.set_chain_kept([&] { return chain_st.best_rows - 1; });
+        }
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
         // or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt order;
         // each image's rows go to its run of <|image_pad|> tokens, whose M-RoPE positions are mtmd's: t = p,
@@ -12689,6 +12763,7 @@ int main(int argc, char** argv) {
             double dt_run = 0, dt_commit = 0, dt_draft = 0, dt_pre = 0, dt_join = 0, dt_adapt = 0;
             const int64_t adapt_swaps0 = adapt_swaps_n, adapt_sync0 = adapt_sync_n;
             int64_t dec_windows = 0, dec_T = 0;
+            std::array<int64_t, 9> dec_hist{};   // STRATA_DECODE_TIMING: the windows of each size (kVerifyMaxT + 1)
             const int64_t decode_hits0 = drive.d.cache_hits;
             // the expert tiers this request read from (DONE's RAM / file blobs and file MB)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
@@ -13703,6 +13778,7 @@ int main(int argc, char** argv) {
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
                     ++dec_windows; dec_T += T;
+                    ++dec_hist[(size_t) std::clamp(T, 0, 8)];
                 }
                 const Clock::time_point tj0 = Clock::now();
                 if (adapt_thr.joinable()) adapt_thr.join();
@@ -13726,12 +13802,14 @@ int main(int argc, char** argv) {
                     if (!from_sfx) df2_gate.observe(dwin_s.data(), T, a);
                     df2_gate.observe_round(std::chrono::duration<double, std::milli>(Clock::now() - round0).count(), a + 1);
                 }
+                // (a round whose window captured its graph gives no time, as in generate mode: observe() then counts its
+                // drafts only)
+                const double round_ms = ver.captured_last() ? 0.0
+                                      : std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
                 if (timed_round && !eos && chain_n == 0)
-                    policy.observe(from_sfx, T, a, sfx_match,
-                                   std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                    policy.observe(from_sfx, T, a, sfx_match, round_ms);
                 else if (timed_round && !eos)   // a chained window: its MTP part, its chain, its cost
-                    policy.observe_chain(T_mtp, chain_n, a, cm,
-                                         std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                    policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
@@ -13765,6 +13843,13 @@ int main(int argc, char** argv) {
                              (double) (d1.misses - ds0.misses) / (w * L), (double) (d1.entries - ds0.entries) / (w * L),
                              (double) (d1.hits - ds0.hits) / (w * L), (double) (d1.pcie - ds0.pcie) / (w * L),
                              dt_adapt / w, (long long) (adapt_swaps_n - adapt_swaps0), (long long) (adapt_sync_n - adapt_sync0));
+                {   // which sizes the windows took, and the round costs the policy has measured so far (the whole process)
+                    std::string sizes;
+                    for (size_t t = 1; t < dec_hist.size(); ++t)
+                        if (dec_hist[t] > 0) sizes += " T" + std::to_string(t) + ":" + std::to_string(dec_hist[t]);
+                    std::fprintf(stderr, "strata decode windows:%s; round costs %s\n", sizes.c_str(),
+                                 policy.cost_table_text().c_str());
+                }
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile (upstream fe9c10ca, b4405a0e)
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;
@@ -14498,7 +14583,7 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
         vh.h_res = host_res.empty() ? nullptr : host_res.data();   // every expert resident: windows without the host
-        if (adapt_device_table_lags()) ver.set_always_publish(true);
+        if (adapt_device_table_lags()) ver.set_device_table_lags(true);
         if (use_df2) ver.set_taps(df2.tap_layers());
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -14745,12 +14830,20 @@ int main(int argc, char** argv) {
             }
         }
         policy.set_robust(spec_cost);
-        if (spec_cost && use_mtp)
+        if (spec_cost && use_mtp) {
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
                 chain_rows = chain_st.best_rows;
                 return k;
             });
+            // XeStrata-890M: the drafts the rule's window verifies, so the drafter leaves the row of a last draft it
+            // dropped unread (STRATA_PLE_SKIP_DROPPED=0: every draft's row is read ahead, as before)
+            static const bool skip_dropped = [] {
+                const char* e = std::getenv("STRATA_PLE_SKIP_DROPPED");
+                return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+            }();
+            if (skip_dropped) mtp.set_chain_kept([&] { return chain_st.best_rows - 1; });
+        }
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts

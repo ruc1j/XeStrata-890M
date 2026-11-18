@@ -50,6 +50,11 @@ struct SamplerParams {
 // A verify window's rows need DIFFERENT histories: row t follows the window's drafts 1..t (`penalty_rows`).
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
+// The greedy pick of sample_tokens without a history (p greedy; its bias and mask as there) and, from the same pass
+// over the logits, logits_nonfinite_rows' flags (verify_kernels.hpp): flags[t * n_blocks + b] = 1 when slice b of row
+// t holds a NaN or an infinity, else 0; n_blocks 1..32.  The same picks and the same flags as the two launches.
+void sample_tokens_nonfinite(const float* logits, int n_tokens, int n_vocab, const SamplerParams& p, int* out,
+                             uint32_t* flags, int n_blocks, void* stream);
 
 // ---- COUPLED DRAFT SAMPLING (include/strata/core/coupled_draft.hpp, STRATA_SPEC_COUPLED=1).  Device pointers
 // throughout; every per-request / per-round value comes from device memory, so the calls can be captured.

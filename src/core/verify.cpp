@@ -765,17 +765,32 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     {   // the mixer's side branches (upstream 2e4ddf6e) where they pay on this device: measured once (the RTX 4070
         // +0.7%; the B70 lost 4%, its graphs' forks and joins cost more than the overlap gave).  STRATA_DF_BRANCH=0|1
         // fixes the choice.
+        //
+        // XeStrata-890M: the window graph that never asks the host (every expert resident) takes the branches on an
+        // integrated GPU on the HIP backend whatever the probe says.  The probe is small kernels only, and what the
+        // branches give a window is their overlap with the experts' memory-bound kernels, which the probe has none
+        // of: on the 890M with ROCm 7.2 it reads the branched graph 1-4% faster, short of its 5% line in every start,
+        // and 8-16% slower once the runtime waits on the CPU for the joins (ROC_CPU_WAIT_FOR_SIGNAL=1, which the
+        // engine sets there: device.cpp), while the branches give that graph's decode 36.78 -> 37.72 tok/s, and
+        // 36.7 -> 38.1 with the CPU wait (greedy 6 chats, 2026-11-16).  The host-planned graph keeps the probe's
+        // answer (the branches cost it 0.6% there, 36.44 -> 36.22 tok/s), and so does every other device's resident
+        // graph (not measured).
         const char* v = std::getenv("STRATA_DF_BRANCH");
         for (int i = 0; i < 2; ++i)
             if (!df_side_[i]) df_side_[i] = strata::gpu::stream_create();
-        if (!df_side_[0] || !df_side_[1]) df_branch_ = false;
-        else if (v != nullptr) df_branch_ = std::strtol(v, nullptr, 10) != 0;
+        if (!df_side_[0] || !df_side_[1]) df_branch_ = df_branch_res_ = false;
+        else if (v != nullptr) df_branch_ = df_branch_res_ = std::strtol(v, nullptr, 10) != 0;
         else {
             try {
                 df_branch_ = strata::kernels::graph_branch_pays(cs_, df_side_[0], df_side_[1]);
             } catch (const std::exception&) {
                 df_branch_ = false;   // a device that cannot record such a graph keeps one queue
             }
+            const sycl::device& d = Runtime::get().device();
+            df_branch_res_ = df_branch_ || (d.get_backend() == sycl::backend::ext_oneapi_hip && integrated_gpu(d));
+            if (df_branch_res_ && !df_branch_)
+                std::fprintf(stderr, "strata verify: graph side branches: used in the windows that do not ask the host "
+                                     "(the integrated GPU's default; STRATA_DF_BRANCH=0 turns them off)\n");
         }
         // the PCIe share's fetch on a side branch of the window graph, beside the VRAM hits (post()): the fetch waits
         // on the link, the hits on the GPU, so side by side the hits' time hides under the fetch.  Where the graph's
@@ -799,11 +814,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-        // (not with set_always_publish: the device table may lag the host's while windows are in flight)
-        device_plan_ = !always_publish_ && v != nullptr && (int) std::strtol(v, nullptr, 10) != 0;
+        // (not with set_always_publish or set_device_table_lags: the device table may lag the host's while windows
+        // are in flight or a swap's copy has not landed)
+        device_plan_ = !always_publish_ && !table_lags_ && v != nullptr && (int) std::strtol(v, nullptr, 10) != 0;
     }
     {
         const char* v = std::getenv("STRATA_VERIFY_RESIDENT_GRAPH");
+        // (kept with set_device_table_lags: run() asks the host's table, which a swap in flight leaves with a hole)
         res_graph_ = !always_publish_ && hits.h_res != nullptr && hits.d_res != nullptr &&
                      (v == nullptr || std::strtol(v, nullptr, 10) != 0);
     }
@@ -852,7 +869,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     // STRATA_DF_BRANCH: mixer work that reads only the layer's input on a side branch of the graph.  fork(i): side i
     // after everything on cs so far; join(i): cs after everything on side i - a branch never races with what came
     // before its fork or after its join.  Not in a split or batch window, nor under the profiler (its stamps are on cs).
-    const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_;
+    const bool br = (recording_res_ ? df_branch_res_ : df_branch_) && G == 1 && !batch_rec_ && !prof_on_;
     auto fork = [&](int i) { return strata::gpu::stream_fork(cs, df_side_[i]); };
     auto join = [&](int i) { return strata::gpu::stream_join(cs, df_side_[i]); };
     // see Verifier::commit; not in a pipelined window (always_publish_), which a misprediction rolls back
@@ -874,10 +891,20 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     // a batch window: row t is slot t, whose state lives in its own session (upstream PR #559)
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
 
+    // XeStrata-890M (STRATA_WINDOW_GLUE_FUSE, default on): launches that run once a window on its serial chain are
+    // merged, with the same bytes: the window's inputs come from the mapped staging in one copy launch, and the greedy
+    // pick writes the rows' non-finite flags from its own pass over the logits (the tail, below).
+    // STRATA_WINDOW_GLUE_FUSE=0: a launch each, as before.
+    static const bool window_glue = [] {
+        const char* v = std::getenv("STRATA_WINDOW_GLUE_FUSE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
     // ---- the window's inputs, from mapped staging
-    copy_i32_from_mapped(tok_, m_tok_, T, cs);
-    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
+    if (!window_glue) {
+        copy_i32_from_mapped(tok_, m_tok_, T, cs);
+        copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
+        copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
+    }
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
@@ -886,7 +913,44 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     // the reads no longer hold the window's launch back (0.35 ms a window on the RTX 4070).  Not where the host
     // raises no flag for layer 0 before layer 1: the resident graph, a batch window, a stage that starts after layer 0.
     const bool ple_late = ple_on && !recording_res_ && !batch_rec_ && lb_ == 0;
-    if (ple_on && !ple_late) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+    if (window_glue) {
+        const strata::kernels::MappedCopy in[4] = {{tok_, m_tok_, T}, {step_, m_step_, (int64_t) T * kStepCount},
+                                                   {pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ)},
+                                                   {ple_, m_ple_, (int64_t) T * N}};
+        try {
+            strata::kernels::copy_from_mapped_multi(in, ple_on && !ple_late ? 4 : 3, cs);
+        } catch (const std::exception& e) { err = std::string("verify inputs: ") + e.what(); return false; }
+    } else if (ple_on && !ple_late) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+    // The key and value projections depend only on each row's n-gram embedding: the group's rows go through the
+    // multi-row forms of the same kernels, the weights read once, each row's arithmetic the single-row call's
+    // (upstream d92c9feb).  The history-dependent rest stays row by row.  STRATA_PLE_BATCH=0: row by row.
+    static const bool ple_batch = [] {
+        const char* v = std::getenv("STRATA_PLE_BATCH");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    // XeStrata-890M (STRATA_PLE_BRANCH, default on with the side branches): in the graph that has the window's PLE rows
+    // at its start (the resident one), the two projections (65.5 MB of BF16 weights, read once a window) run on a
+    // third queue from here and join at layer 1, where they were: beside layer 0 instead of in a row before layer 1's
+    // work.  They read only the rows' embeddings, and layer 0 touches neither those nor their outputs: the same
+    // kernels, the same bits.  The BF16 key only (the native key quantizes into a buffer layer 0 uses).
+    // STRATA_PLE_BRANCH=0: at layer 1 on the window's queue, as before.
+    static const bool ple_branch_on = [] {
+        const char* v = std::getenv("STRATA_PLE_BRANCH");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    bool ple_side = false;
+    if (ple_branch_on && br && recording_res_ && ple_on && !ple_late && lb_ == 0 && le_ > 1 && fetch_side_ != nullptr &&
+        ple_batch && T > 1 && ss.ple.w.key_bf16 != nullptr && ple_native_bf16()) {
+        if (!strata::gpu::stream_fork(cs, fetch_side_)) { err = std::string("verify PLE branch: ") + strata::gpu::last_error(); return false; }
+        try {
+            bf16_gemv_fp32_mmvf_multi(ple_, N, ss.ple.w.key_bf16, ple_key_, NG_HC_DIM, N, NG_HC_DIM, T, fetch_side_);
+            bf16_gemv_fp32_mmvf_multi(ple_, N, ss.ple.w.value_bf16, ple_val_, N, N, N, T, fetch_side_);
+        } catch (const std::exception& e) {
+            err = std::string("verify PLE batch: ") + e.what();
+            return false;
+        }
+        ple_side = true;
+    }
 
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
@@ -953,17 +1017,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
             // the window's residual writes in one launch (each row its own R, block output and injection)
             if (dec_batch) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
-            // The key and value projections depend only on each row's n-gram embedding: the group's rows go through
-            // the multi-row forms of the same kernels, the weights read once, each row's arithmetic the single-row
-            // call's (upstream d92c9feb).  The history-dependent rest stays row by row.  STRATA_PLE_BATCH=0: row by row.
-            static const bool ple_batch = [] {
-                const char* v = std::getenv("STRATA_PLE_BATCH");
-                return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-            }();
+            // the batched key and value projections (ple_batch, above): here, or joined from their branch
             PleWeights pw = ss.ple.w;
             const bool nkey = pw.key_native_data != nullptr && pw.key_bf16 == nullptr;
             const bool batched = ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey) && ple_native_bf16();
-            if (batched) {
+            if (ple_side) {
+                if (!strata::gpu::stream_join(cs, fetch_side_)) { err = std::string("verify PLE branch: ") + strata::gpu::last_error(); return false; }
+            } else if (batched) {
                 try {
                     if (pw.key_bf16 != nullptr) {
                         bf16_gemv_fp32_mmvf_multi(ple_ + tb * N, N, pw.key_bf16, ple_key_ + (size_t) tb * NG_HC_DIM,
@@ -1170,11 +1230,31 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     return e == nullptr || std::strtol(e, nullptr, 10) != 0;
                 }();
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
+                // XeStrata-890M: the gate and the q8_1 image of the gated rows as the tail of the attention's merge
+                // launch (qsa_decode_attn_gate_q8_batch: two launches a QSA layer less; the same bytes in xq_), where
+                // nothing sits between the three: no rotated K/V (its transform back runs on attn_) and no stage
+                // stamps.  STRATA_QSA_MERGE_FUSE=0: the three launches.
+                static const bool merge_fuse = [] {
+                    const char* e = std::getenv("STRATA_QSA_MERGE_FUSE");
+                    return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+                }();
+                const bool merge_gq = merge_fuse && qb && !st.kv_rot && !st.kv_hybrid && !prof_on_ && !batch_rec_;
                 if (!mixed_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 // the query side on branches (upstream 2e4ddf6e): q with its split, norm, RoPE and rotation on side 0, the
                 // indexer query on side 1, beside the K/V side; side 1 joins before the block scores, side 0 before
                 // attention (xq_ and mixed_ are not rewritten before then)
                 const bool qbr = br && qb;
+                // While the window's last row selects every cell of the cache (a context up to the selection's width,
+                // 2,051 cells), every row's top-k is the identity and reads no score: the indexer's query product
+                // (its 2.6 MB of weights a layer) and the scores return at once.  The rows form of the scores only
+                // (qsa_rows below); the query's norm and RoPE still run, on rows nothing reads.
+                static const bool sel_skip = [] {
+                    const char* e = std::getenv("STRATA_QSA_SKIP_IDENTITY");
+                    return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+                }();
+                const int32_t* sel_last = step_ + (ptrdiff_t) (te - 1) * kStepCount;
+                const int32_t* sel_all_a = sel_skip && qb && !batch_rec_ ? sel_last + kStepNKv : nullptr;
+                const int32_t* sel_all_b = sel_all_a != nullptr ? sel_last + kStepWidth : nullptr;
                 // q out of the q|gate rows, normed and rotated: one launch where the fused kernel applies, else the
                 // split copy and norm_rope (the batched rows only: native QSA and native RoPE are on)
                 auto q_split_norm_rope = [&](strata::gpu::Stream on) -> bool {
@@ -1200,7 +1280,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, df_side_[0]);
                     if (!fork(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
-                                              N, IQ * ID, n, df_side_[1]);
+                                              N, IQ * ID, n, df_side_[1], sel_all_a, sel_all_b);
                     norm_rope_on(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, df_side_[1]);
                 }
                 if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
@@ -1299,7 +1379,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     if (!q_split_norm_rope(cs)) return false;
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
-                                              N, IQ * ID, n, cs);
+                                              N, IQ * ID, n, cs, sel_all_a, sel_all_b);
                     norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
                 } else {
                 for (int t = tb; t < te; ++t) {
@@ -1355,11 +1435,20 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 stamp(l, 12, grp);
                 const QsaAttnPools pools = qsa_attn_pools(st);
                 if (qbr && !join(0)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
+                if (merge_gq)
+                    qsa_decode_attn_gate_q8_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_,
+                                                  step_ + (size_t) tb * kStepCount, cap_, s,
+                                                  attn_scratch_ + (size_t) tb * attn_scratch_floats_,
+                                                  qfull_ + tb * NH * 2 * HD, xq_, n, cs);
+                else
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
                 stamp(l, 13, grp);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
+                if (merge_gq) {
+                    // gated and quantized in the merge's launch
+                } else
                 if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
                                               (int) (n * NH), (int) HD, cs);
                 else
@@ -1371,7 +1460,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                         qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
                 }
                 stamp(l, 14, grp);
-                native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
+                if (!merge_gq) native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
             }
         } catch (const std::exception& e) {
@@ -1389,6 +1478,23 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             return e == nullptr || std::strtol(e, nullptr, 10) != 0;
         }();
         bool g_ready = false;   // the shared expert's raw gates came with the router's launch
+        // XeStrata-890M: the top-10 in the launch that builds the resident plan (resident_plan_top10: a launch a layer
+        // less), where the plan is built on the device and nothing reads or changes the routing between the two.
+        // STRATA_PLAN_FUSE=0: the two launches.
+        static const bool plan_fuse = [] {
+            const char* e = std::getenv("STRATA_PLAN_FUSE");
+            return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+        }();
+        bool top10_in_plan = false;
+        // XeStrata-890M: with it, the experts' q8_1 image of the layer's input is written by more work-groups of that
+        // launch, and not by a launch of its own ahead of the shared expert's fork (STRATA_SH_EARLY): the branch then
+        // forks right after the read and makes its own copy of the image (the same bytes) on its queue, so the main
+        // queue has a launch a layer less.  STRATA_Q8_PLAN=0: the image's own launch, as before.
+        static const bool q8_plan_on = [] {
+            const char* e = std::getenv("STRATA_Q8_PLAN");
+            return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+        }();
+        bool q8_in_plan = false;
         bool qdedup = false;    // the experts' q8_1 image of the input was made before the shared expert
         // STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): the top-10 picked again with a
         // logit bonus for the resident experts; the weights stay the router's (router.cpp)
@@ -1396,6 +1502,43 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // the top-10 and the doorbell in one launch where nothing changes the routing between them (48 nodes fewer a
         // window; the plan's kernel runs after the doorbell, which the host does not read).  STRATA_ROUTER_PUBLISH=0: apart
         static const bool router_publish = [] { const char* v = std::getenv("STRATA_ROUTER_PUBLISH"); return v == nullptr || *v != '0'; }();
+        // XeStrata-890M (STRATA_SH_EARLY, default on with the shared expert's side branch): the branch forks here, ahead
+        // of the router, and not after the plan.  The shared expert reads only the layer's input (its q8_1 image, which
+        // the experts' rows share) and the router's aux row only gives the combine its gates, so nothing but the order
+        // of the launches changes: its 2.7 MB of weights a layer are then read beside the router's GEMV, the top-10 and
+        // the plan, which leave the memory mostly idle, and less of them beside the routed experts' rows, which are
+        // bound by it.  Only where the combine scales the shared rows (else the shared expert's own launch would read
+        // the gates while the router's launch writes them), in windows of two rows or more, and not in a layer whose
+        // gate/up rows are Hadamard-folded: that layer rewrites the q8_1 image on cs after the shared expert's place.
+        // STRATA_SH_EARLY=0: the fork after the plan, as before.
+        static const bool sh_early_on = [] {
+            const char* e = std::getenv("STRATA_SH_EARLY");
+            return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+        }();
+        static const bool qdedup_on = [] {
+            const char* e = std::getenv("STRATA_VERIFY_QDEDUP");
+            return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+        }();
+        const bool native_rows = strata::kernels::cpu::expert_layout().native;
+        const bool sh_early = sh_early_on && br && sh_branch && dec_batch && n > 1 && qdedup_on && native_rows &&
+                              !strata::kernels::cpu::expert_layout().fmt[(size_t) l].had_gu &&
+                              (!shared_expert_native_bf16() || (lfuse_gate && native_moe_combine_enabled()));
+        // (decided here, ahead of the fork; the launches themselves are below)
+        top10_in_plan = plan_fuse && dec_batch && n > 1 && w_router != nullptr && native_router_enabled() &&
+                        native_router_takes((int) NE, (int) K) && !(router_publish && !recording_res_) &&
+                        (device_plan_ || recording_res_) && route_prior <= 0.0f &&
+                        route_resident_cfg().margin <= 0.0f && verify_ecap_cap() <= (int) K &&
+                        !(rs_on_ && G == 1 && n <= 8 && T <= 8) && !rt_replay_ &&
+                        resident_plan_top10_takes(n, (int) NE, (int) K);
+        q8_in_plan = q8_plan_on && sh_early && top10_in_plan && G == 1 && shared_expert_native_bf16() && N % 256 == 0;
+        if (sh_early) {
+            float* xe = mixed_ + tb * N;
+            try {
+                if (!q8_in_plan) quantize_q8_1_rows(xe, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                if (!shared_expert_native_bf16()) f32_to_bf16_bulk(xe, sh_bf16_ + tb * N, (int64_t) n * N, cs);
+            } catch (const std::exception& e) { err = std::string("verify shared expert: ") + e.what(); return false; }
+            if (!fork(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
+        }
         bool published = false;
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && native_router_takes((int) NE, (int) K)) {
             try {
@@ -1413,7 +1556,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     native_router_top10_publish(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, xm, (int64_t) n * N,
                                                 m_x_ + tb * N, m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs, (int) NE);
                     published = true;
-                } else
+                } else if (!top10_in_plan)
                     native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs, (int) NE);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
         } else
@@ -1476,7 +1619,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                  (const int32_t*) (m_rpl_w_ + ((size_t) l * (size_t) MT + (size_t) tb) * (size_t) K),
                                  (int64_t) n * K, cs);
         }
-        if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
+        if (top10_in_plan)   // the top-10 and the plan in one launch (plan_fuse above)
+            resident_plan_top10(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, hits_.d_res + l * g.n_expert,
+                                (int) g.n_expert, hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                                plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
+                                (uint32_t) ((l - lb_) * G + grp + 1), cs, expert_keep, expert_ser.first,
+                                expert_ser.second, q8_in_plan ? mixed_ + tb * N : nullptr, n, N,
+                                nat_xq_ + (size_t) tb * (N / 32) * 36);
+        else if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
@@ -1506,28 +1656,29 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             nsw.q8_1 = xq_;
             // the experts' q8_1 image of the input first: the shared expert's gate and up read it instead of quantizing
             // the same rows again (the same bytes), and the BF16 copy only for a gate that reads it (upstream
-            // be7889ed).  STRATA_VERIFY_QDEDUP=0: as before.
-            static const bool qdedup_on = [] {
-                const char* e = std::getenv("STRATA_VERIFY_QDEDUP");
-                return e == nullptr || std::strtol(e, nullptr, 10) != 0;
-            }();
-            qdedup = qdedup_on && strata::kernels::cpu::expert_layout().native;
-            if (qdedup) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
-            if (!(qdedup && shared_expert_native_bf16())) {
+            // be7889ed).  STRATA_VERIFY_QDEDUP=0: as before.  (sh_early: both were recorded ahead of the fork.)
+            qdedup = qdedup_on && native_rows;
+            if (qdedup && !sh_early) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            if (!sh_early && !(qdedup && shared_expert_native_bf16())) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
                 else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
             }
             sh_side_[grp] = br && sh_branch;
-            if (sh_side_[grp] && !fork(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
+            if (sh_side_[grp] && !sh_early && !fork(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
             try {
+                // q8_in_plan: the branch's own copy of the input's q8_1 image, in the scratch its SwiGLU writes after
+                // the gate and up rows have read it (the experts' copy comes with the plan's launch)
+                if (q8_in_plan) quantize_q8_1_rows(xm, n, N, xq_, df_side_[0]);
                 // the window's combine scales the shared rows itself (upstream b08cf3e1; the same bits, a launch fewer)
                 gate_later_[grp] = shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data,
                                                        sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff,
                                                        sh_g_ + tb, shared_ + tb * N, N, g.n_ff,
                                                        sh_side_[grp] ? df_side_[0] : cs,
                                                        lfuse_gate && dec_batch && n > 1 && native_moe_combine_enabled(),
-                                                       g_ready, qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36)
-                                                                       : nullptr);
+                                                       g_ready,
+                                                       q8_in_plan ? (const void*) xq_
+                                                                  : qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36)
+                                                                           : nullptr);
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
@@ -1552,6 +1703,21 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     };
 
     // ---------------------------------------------------------------- post(l, group): experts, combine
+    // XeStrata-890M (STRATA_MTP_GLUE_FUSE, default on; the MTP layer's switch, mtp.cpp): the last layer's residual
+    // write is folded into the final mixer's read, as every layer's read folds the write before it (the same bits),
+    // so the window's tail has a launch less.  Where the window ends with the head and its rows take the fused read,
+    // in one group, and no control vector follows the write.
+    static const bool head_fold_on = [] {
+        const char* v = std::getenv("STRATA_MTP_GLUE_FUSE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    bool head_fold = false;
+    if (head_fold_on && le_ == g.n_layers && G == 1 && !batch_rec_ && head_ != nullptr && head_->loaded() &&
+        !cvec().covers(g.n_layers - 1) && fused_gr_supported(g.n_embd, g.hc, g.hc_lr)) {
+        const WeightRef *hd = wt.find("output_hc_down.weight"), *hu = wt.find("output_hc_up.weight");
+        head_fold = hd != nullptr && hu != nullptr &&
+                    (head_mix_multi_enabled() || (hd->hc_q8 != nullptr && hu->hc_q8 != nullptr));
+    }
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
@@ -1620,7 +1786,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         }
         grouped(p_ptr, p_start, p_counts, cap);
         stamp(l, 20, grp);
-        if (recording_res_) {   // no PCIe share and no CPU share: the CPU's rows are zeros
+        const bool multi_combine = dec_batch && n > 1 && native_moe_combine_enabled();
+        const bool fold_hits = multi_combine && native_moe_fuse_hits();   // the hit rows added inside the combine
+        // the resident graph has no CPU share: its combine reads the hit rows alone, and the rows of zeros it would
+        // add them to are neither written nor read (a layer's launch and K rows a token less)
+        const bool no_parts = recording_res_ && fold_hits;
+        if (no_parts) {
+        } else if (recording_res_) {   // no PCIe share and no CPU share: the CPU's rows are zeros
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                      skip_ + grp, ring, cs);
         } else {
@@ -1650,13 +1822,11 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             sh_side_[grp] = false;
             if (!join(0)) { err = std::string("verify shared branch: ") + strata::gpu::last_error(); return false; }
         }
-        const bool multi_combine = dec_batch && n > 1 && native_moe_combine_enabled();
-        const bool fold_hits = multi_combine && native_moe_fuse_hits();   // the hit rows added inside the combine
         if (!fold_hits) moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         if (multi_combine) {   // one launch for the window's rows
             try {
                 if (fold_hits)
-                    native_moe_combine_multi_hits(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+                    native_moe_combine_multi_hits(no_parts ? nullptr : parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
                                                   shared_ + tb * N, bo_ + tb * N, N, K, n, cs,
                                                   gate_later_[grp] ? sh_g_ + tb : nullptr);
                 else
@@ -1679,8 +1849,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                         (int) HC, cs);
         }
         if (l == g.n_layers - 1) {
-            if (dec_batch) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
-            else for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+            // head_fold: the head's read folds this write and leaves it in R (below)
+            if (!head_fold && dec_batch) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
+            else if (!head_fold) for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
             if (cvec().covers(l)) cvec_apply(Rt(tb), l, n, HC * N, nullptr, 0, nullptr, 0, false, cs);
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
@@ -1728,14 +1899,16 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         const bool mix_multi = (head_mix_multi_enabled() || mix_q8) && head_ != nullptr && head_->loaded() &&
                                fused_gr_supported(g.n_embd, g.hc, g.hc_lr);
         if (mix_multi) {
-            // the final mixer, the window's tokens in one read (no pending write: the last layer's was done above)
+            // the final mixer, the window's tokens in one read (head_fold: with the last layer's write folded in;
+            // else no pending write, the last layer's was done above)
             if (hn->kind != WeightKind::F32 || hd->kind != WeightKind::Bf16InF32 || hu->kind != WeightKind::Bf16InF32) {
                 err = "verify: the output_hc_* weights have the wrong engine forms";
                 return false;
             }
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
-                fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = false;
+                fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = head_fold;
+                if (head_fold) { fa[t].bo_prev = bo_ + (size_t) t * N; fa[t].inj_prev = inj2_ + (size_t) t * HC; }
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
                 fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
                 if (mix_q8) { fa[t].q8_down = (const uint8_t*) hd->hc_q8; fa[t].q8_up = (const uint8_t*) hu->hc_q8; }
@@ -1777,9 +1950,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         SamplerParams sp;
         sp.greedy = true;
         sp.temperature = 0.0f;
-        sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
-        if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+        if (window_glue && nan_guard_on())
+            strata::kernels::sample_tokens_nonfinite(head_logits_, T, (int) n_vocab_, sp, m_out_, m_nf_,
+                                                     strata::kernels::kNonfiniteBlocks, cs);
+        else {
+            sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+            if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+        }
     }
     // every GDN layer has run the pending rows; they are cleared where the steps wrote the state (STRATA_GDN_ACC: at
     // gdn_acc_ rows; a one-token window that commits itself always)

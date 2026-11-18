@@ -31,6 +31,127 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
 
+## A review of the 890M's decode
+
+One window of Qwen3.8-Flash-Next's decode was timed stage by stage, candidates for a faster window were listed for each stage, and they were implemented and measured one at a time, the largest expected gain first (2026-11-16 and 17).
+Thirty-one changes went in. The 890M's decode of the greedy six chats (IQ2_XS, `--spec 4`, `--max-context 32768`, three interleaved rounds) went from 36.47, 36.45 and 35.91 tok/s to 42.15, 42.66 and 42.19 tok/s (36.28 to 42.33 on average, +16.7%). The answers are the same as before.
+Each change is either chosen from what the device reports (an integrated GPU, the HIP backend) or gives the same bits on every GPU.
+
+### One window's time by stage
+
+Before the changes one window took 76.4 ms and gave 2.64 tokens on average (the mean of the six chats' 433 windows, measured with the per-stage clocks).
+
+| Stage | Time in a window | Share | Mainly |
+| --- | --- | --- | --- |
+| Experts | 22.3 ms | 29.2% | the experts' products 18.8, the shared expert and the quantization 2.9 |
+| GDN (36 layers) | 18.9 ms | 24.7% | the qkv GEMV 6.0, out-proj 4.1, z 4.1, the recurrence 3.9 |
+| Hyper-connection reads | 18.6 ms | 24.3% | the second read and the router 10.0, the first read 8.5 |
+| QSA attention (12 layers) | 5.9 ms | 7.7% | the GEMVs of q and the indexer's query 2.8, out-proj 1.4 |
+| Speculative decoding's drafts | 5.6 ms | 7.4% | the MTP drafts |
+| Output head | 3.9 ms | 5.0% | the product over 338 MB of IQ4_XS |
+| Waiting on the GPU | 1.7 ms | 2.2% | the kernels that wait for the host, and empty launches |
+| Host | 0.4 ms | 0.5% | the per-layer plan, the commit and the output |
+
+The per-stage clocks slow a window down: without them one window takes about 72 ms.
+The gaps between kernel launches are inside the stages' times. Measured by adding empty launches to every layer, one launch costs about 2 us (576 more launches a window: -1.5%).
+
+### What went in
+
+The numbers are the 890M's decode of the greedy six chats, the mean of three interleaved rounds before and after that change (four where it says so). The answers are the same before and after each.
+
+- The window graph when every expert is in the cache: since `STRATA_ADAPT_LAG` became 2 by default (the merge of 2026-10-25), a window ran the graph the host plans layer by layer even with every expert in the cache.
+  What a setting that does not wait for a swap's copy has to stop is only the plan in which the device reads the residency table layer by layer (`STRATA_VERIFY_DEVICE_PLAN`). The window graph that does not ask the host is chosen window by window from the host's table, so it is now used with that setting as well.
+  The per-layer round trips between the GPU and the host go, and so do the kernels that wait for the host. 36.01 → 36.58 tok/s (+1.6%).
+- Side branches: whether the window graph takes its side branches (the GDN layer's ab and z, and the shared expert, beside the other kernels) is decided at start-up by timing a graph of small kernels. With ROCm 7.2 the difference it measures became 1 to 4%, short of its 5% line, and the branches were not used.
+  On an integrated GPU on the HIP backend, the window graph that does not ask the host now takes the branches whatever that measurement says (`STRATA_DF_BRANCH=0` turns them off): what the branches give a window is their overlap with the experts' memory-bound kernels, and the start-up graph has none of those.
+  The graph the host plans is still decided by the measurement (on the 890M the branches take it from 36.44 down to 36.22 tok/s). 36.78 → 37.72 tok/s (+2.6%).
+- How the ROCm runtime waits: on a machine whose AMD GPUs are all integrated, the engine puts `ROC_CPU_WAIT_FOR_SIGNAL=1` into its environment before it lists the devices (a value the user set stays as it is; Linux only).
+  When a command waits for one on another queue, the ROCm runtime by default queues a barrier that waits on the GPU; with this setting it waits on the CPU. The side branches split each layer over queues and join them, so every join takes this wait.
+  37.72 → 38.10 tok/s (+1.0%). The prefill of a 2,669-token prompt is 329.8 → 329.1 tok/s, within the noise.
+- Speculative decoding's cost table: the round time `STRATA_SPEC_COST` keeps for each window width could go wrong and stay wrong, and the windows then stayed too narrow or too wide to the end of the process (34.0 to 35.6 tok/s, 4 of about 60 starts).
+  A width's first three times now count by their least, not their mean. After that a time shorter than the mean is followed with a weight of 0.25 and a longer one with 0.1, and a longer one is cut at 1.25 times the mean. The MTP chain tries a width again that has not been timed for more than 128 rounds, when its drafts are at least 0.5 likely to hold.
+  None of the 14 starts after the change had a table gone wrong. `STRATA_DECODE_TIMING=1` also prints, for each request, a line with how many windows took each width and the cost table.
+- `--lookup-chain 2`: where the cost rule is the default (an integrated GPU on the HIP backend), `--lookup-chain 2` is now the default, with `--mtp` and the suffix drafts and none of `--batch`, pipelined windows and `--draft dflash2` (`--lookup-chain 0` turns it off).
+  The cost of an added row is estimated from the times DraftPolicy measured, and a row is added only where it pays. The window's limit goes from 6 rows to 8, and verify's device buffers from 72.5 MiB to 86.6 MiB. 38.03 → 38.31 tok/s (+0.7%, four rounds).
+- The rows of zeros the combine read: the window graph that does not ask the host has no share computed by the CPU. The CPU's rows it filled with zeros in every layer (10 rows a token) are no longer written, and the combine reads only the rows the GPU computed. The result is bit-identical (`native_multi_parity`).
+- The grid of the QSA indexer's scores: the score kernels launched a grid sized from `--max-context` (1,025 work-groups a layer at 32768), and the work-groups past the context returned at once.
+  The grid is now a fixed one sized from the number of compute units (64 work-groups on the 890M), and each sub-group steps to the blocks a grid's width further on. The scores are bit-identical (`qsa_score_parity`).
+- The indexer while the context is shorter than the selection's width: while the context is 2,051 cells or fewer, the selection is every cell and reads no score. For that long the indexer's query product (2.6 MB of weights a layer) and the scores are skipped (`STRATA_QSA_SKIP_IDENTITY=0` for the former behaviour).
+
+The last three together give 38.20 → 38.66 tok/s (+1.2%).
+
+With these eight in, the stages were timed again and the candidates searched twice more; eight more changes went in.
+
+- Where the shared expert's side branch forks: it forked after the router, the top-10 and the plan. The shared expert reads only the layer's input, so it now forks ahead of the router (`STRATA_SH_EARLY=0` for the former place).
+  The router's GEMV, the top-10 and the plan leave the memory bandwidth free, and the shared expert's weights (about 2.7 MB a layer) are read meanwhile. Only the order of the launches changes. 38.82 → 38.92 tok/s (+0.3%, two rounds; a third started from a cold GPU and is left out).
+- The PLE rows of drafts the window does not verify: the draft layer reads each draft's PLE row ahead. When the cost rule left the last draft out of the window, its row is not read (`STRATA_PLE_SKIP_DROPPED=0` for the former behaviour).
+  A window's launch waits for every read in flight, so the wait before the launch goes from 0.21 ms a window to 0.16 ms.
+- The PLE projections: layer 1's key and value projections (65.5 MB of BF16 weights) ran in a row at the start of layer 1. In the window graph that does not ask the host they are launched at the window's start on a third queue and joined at layer 1 (`STRATA_PLE_BRANCH=0` for the former place).
+  The same kernels on the same inputs. The decode difference is within the noise; a window is 0.03 to 0.04 ms shorter.
+- The MTP window's cap: where the cost rule is the default, the MTP's windows go up to one row more than `--spec` when `--mtp-max-t` is not given (5 rows with `--spec 4`; `--mtp-max-t 4` for the former cap).
+  A window gives 2.72 tokens instead of 2.62, 38.78 → 38.97 tok/s (+0.5%). A cap of 6 rows was no faster (38.75 → 38.73 tok/s), so it is one row only.
+- The thread that reads the PLE table: on an integrated GPU on the HIP backend the token thread submits and reaps the table's direct reads (`--ple-io-thread` for the I/O thread). Through the I/O thread, the last read, which the window's launch waits for, takes two more thread hand-offs.
+  The wait before the launch goes from 0.21 ms a window to 0.12 ms, 38.81 → 38.87 tok/s. The SSD keep-alive goes on in this mode as well, on a thread of its own.
+- The draft layer's norm: on an integrated GPU on the HIP backend, `--mtp-hnorm stream` (the draft layer's hidden input normalized per hyper-connection stream) is now the engine's default (`--mtp-hnorm pooled` for the former norm).
+  Setup has written the flag into an integrated GPU's configuration since 2026-10-29, but a configuration made before that, or by hand, ran the pooled norm; so did the one these measurements used. A window gives 2.91 tokens instead of 2.70, 39.04 → 40.52 tok/s (+3.8%).
+- The GDN step's barriers: the window's GDN step had two barriers for every row of the window. Each row has its own slots for the sums, so the output sums now follow the row loop and a row has one barrier. The order of the additions is the same and the result is bit-identical (`gdn_step_parity`).
+  As a kernel on its own a three-row step goes 73.2 → 62.1 us; decode 40.60 → 40.79 tok/s (+0.5%).
+- How the window's width is chosen: the cost rule took the width with the most expected tokens per round time of the window itself. It now takes the width with the most expected tokens less lambda times the round time, lambda being the rate of the whole stream of windows (`STRATA_SPEC_RATE=0` for the former choice).
+  A window of unsure drafts gets narrower and one after sure drafts wider. As many drafts are accepted and fewer are verified, 40.51 → 40.64 tok/s (+0.3%, four rounds).
+
+With the later eight the decode is 38.82 → 41.01 tok/s (+5.6%) against the first eight alone, three interleaved rounds.
+
+After that the gfx1150 ISA of the main kernels was read beside the source for waits and reads the source does not ask for, and seven more changes went in. All of them give the same bits.
+
+- The hyper-connection read's up: for each of a lane's two rows it read every token's lo (10 float4) from local memory; a store of the first row's result sat between them, so the compiler could not drop the second row's reads. Each token's lo is now read once for both rows.
+  The local-memory reads go from 112 to 72 with four rows; as a kernel on its own a three-row read goes 103.6 → 99.2 us, decode 40.49 → 40.89 tok/s (+1.0%, four rounds).
+- IQ2_S's sign mask: the compiler turned the expression that spreads the sign bits into a byte mask back into a 32-bit multiply (quarter rate on gfx11), eight of them a step of a gate/up row. The AMD device compile now builds the mask with a subtract and an xor.
+  As a kernel on its own the experts of a three-row window go 441.2 → 438.1 us.
+- The expert rows' addresses: the rows of an integrated GPU on the HIP backend derived each step's block and sub-block with a divide and a modulo and its place with a multiply. A lane's sub-block is the same for every step, so it is computed once a lane and a step is a constant further on.
+  As a kernel on its own the gate/up rows' change gives 438.2 → 432.8 us and the down rows' 432.2 → 429.3 us more; decode 41.52 → 41.92 tok/s (+1.0%, four rounds).
+- The hyper-connection read's down: where the rows' sums are spread over the sub-group, a conditional between two elements of an array had become a compare and a select for each of 16 elements. Both values are now taken first and then chosen. As a kernel on its own a four-row read goes 102.9 → 102.2 us.
+- The GDN quantization: in the closing norm and quantization kernel the loop of the two sub-group reductions was not unrolled, and the branch that picks the exchange instruction stayed at run time. Unrolled, the kernel goes from 537 lines to 366.
+- The experts' barriers: the gate/up and the down kernels of an integrated GPU on the HIP backend no longer take a barrier the data flow does not need (the first of a chunk of entries).
+- The plan of a layer: the plan kernel of a window with every expert in the cache read the experts' numbers twice; it is one pass now, and the total is no longer reduced a second time.
+
+With these seven the decode is 40.99 → 41.92 tok/s (+2.3%) against the sixteen before them, three interleaved rounds.
+
+After these, eight more went in that take small launches off the main queue's chain and waits out of the kernels. All of them give the same bits.
+
+- The table of the hyper-connection read's up: an up group of the fused kernel took a barrier only to copy the tokens' table into local memory. The copy now happens while the rows' loads are awaited. As a kernel on its own a four-row read goes 103.4 → 102.4 us.
+- The GDN step's k: every row read its 32 values of k from local memory twice (before and after a barrier), two at a time. They are read once as float4 and held in registers over the barrier; the registers for that come from building the addresses of the state's write-back again.
+  The VGPRs go from 126 to 104; as a kernel on its own a three-row step goes 61.8 → 60.1 us and one with three pending rows 71.0 → 64.1 us, decode 41.80 → 42.11 tok/s (+0.7%, four rounds).
+- The BF16 GEMV (the router, the PLE and the indexer's projections): the barrier that only waited for the zeros of the sums' slots is gone. Zeros are written to the slots no sub-group writes, and nothing else. Its decode was measured together with the GDN step's change above.
+- The router's top-10: in a window with every expert in the cache the top-10 runs inside the launch that plans the layer (`STRATA_PLAN_FUSE=0`: the two launches). Decode 42.24 → 42.52 tok/s (+0.7%, four rounds).
+  A layer has one launch less. From the cost measured by adding empty launches (about 2 us each) the estimate was +0.14%: a small launch in the main queue's chain costs more than an empty one.
+- The quantization of the experts' input: in a layer of that form the q8_1 image of the layer's input is written by more work-groups of the plan's launch. The shared expert's side branch forks right after the read and makes the same image on its own queue (`STRATA_Q8_PLAN=0`: as before). Decode 42.48 → 42.53 tok/s, within the noise.
+- The attention's gate and quantization: the merge, the gate and the q8_1 quantization of a QSA layer, three launches, are one (`STRATA_QSA_MERGE_FUSE=0`: as before). Decode 42.53 → 42.71 tok/s (+0.4%, four rounds).
+- The MTP draft layer: the norms of the embedding and of the hidden input write their q8_1 images themselves, K's norm and RoPE are one launch, and the last residual write is folded into the last read. The verify window's last write is folded into the head's read as well (`STRATA_MTP_GLUE_FUSE=0`: as before). Decode 42.61 → 42.68 tok/s, within the noise.
+- The verify window's start and end: the window's inputs (the tokens, the steps, the positions and the PLE rows) are copied in one launch. The greedy pick's kernel also checks the logits for a NaN or an infinity, so the launch that only checked them no longer reads the same logits again (`STRATA_WINDOW_GLUE_FUSE=0`: as before). Decode stays at 42.71 tok/s, no difference.
+
+With these eight the decode is 41.35 → 42.33 tok/s (+2.4%) against the twenty-three before them, three interleaved rounds.
+
+### What did not go in
+
+- Reading the PLE rows after the launch in the window graph that does not ask the host was slower, 37.25 → 37.01 tok/s.
+- Splitting off the z GEMV after qkv to overlap it with the GDN recurrence gave 37.79 → 37.29 tok/s (-1.3%).
+- Reading the experts' weights with wide 32-bit and 64-bit loads did not change the number of load instructions: the compiler already merges the 16-bit reads. Only the non-temporal hint changed, and it gave 37.29 → 36.89 tok/s (-1.1%).
+- Computing the GDN recurrence lane by lane was slower as a kernel on its own, a three-row step 74.5 → 110.4 us, and the choice at start-up never picked it.
+- A GDN step in which a lane keeps one column's state gave the existing forms' bits, but was slower as a kernel on its own, a three-row step 72.7 → 144.5 us: the compiler takes 256 VGPRs for it, and fewer waves run at once.
+- Writing the GDN state back after the pending rows under the window's rows made no difference as a kernel on its own (a three-row step with three pending rows 110.8 us and 114.8 us).
+- `GPU_MAX_HW_QUEUES=8` gave 38.75 → 37.12 tok/s (-4.2%), and `ROC_ACTIVE_WAIT_TIMEOUT=50` 38.75 → 38.80 tok/s, no difference; neither went in.
+- Dropping the non-temporal hint from the loads of the Q2_0 down rows made no difference, 39.07 → 39.05 tok/s.
+- The ROCm runtime's settings (`DEBUG_HIP_DYNAMIC_QUEUES=0`, `DEBUG_HIP_FORCE_GRAPH_QUEUES`, `DEBUG_CLR_GRAPH_PACKET_CAPTURE`, `DEBUG_CLR_BATCH_CPU_SYNC_SIZE=1`) and `STRATA_WAIT_SLEEP_US=20` all stayed within the noise, 40.7 to 41.3 tok/s. A higher priority for the window's queue gave -0.6%.
+- In the expert rows, five loads instead of six in a down row (440.9 → 443.2 us with three rows), 64 rows a gate/up work-group (slower up to four rows, faster only with six) and the entries' test as a break of the loop (431.0 → 645.8 us) were none of them faster.
+- Writing the GDN step's state back through a pointer of its own took the registers from 126 to 64 but made no difference by itself, as a kernel on its own or in decode. The form that holds k (above) uses the registers it freed.
+- The GDN step's closing norm as more groups of the recurrence's launch was faster as a kernel on its own, a three-row step 61.8 → 56.4 us, but made no difference in decode, 42.61 tok/s and 42.60 tok/s. A form in which groups spin until an earlier phase is done does not carry its gain as a kernel into decode. Others of that form, the router's GEMV and the plan in one launch among them, were not built.
+- In the hyper-connection read's up, four forms that issue the loads of x, of the partials or of lo together ahead made no difference as a kernel on its own (a three-row read 97.2 us and 97.5 to 98.3 us).
+- Laying the attention's query out lane by lane made the kernels' ISA 5 to 10% shorter, but decode went 42.11 → 41.60 tok/s (-1.2%).
+- Issuing the attention kernel's q and merge reads together was lower in decode in four rounds of four (by 0.02 to 0.49 tok/s). Dispatching the inject block first in the hyper-connection read made no difference.
+- The candidates that lower the precision (a two-stage output head, hyper-connection weights below 8 bits, the router in Q8_0 and others, seven in all) were not tried: the check that a kernel matches the CPU reference does not apply to them.
+
+What was checked: the free and contrib-llvm builds, CTest (in both, all but the two tests that have no pack pass), and that `tools/lint/run.sh` gives no new findings.
+
 ## Integration of upstream XeStrata through xe0.2.8-1
 
 Upstream XeStrata's main (MistVVK/XeStrata) was merged from the commit after xe0.2.2-1 up to 721afe51f of 2026-10-30 (xe0.2.8-1) on 2026-11-02.
@@ -745,7 +866,7 @@ The main things carried:
 - `STRATA_PREFILL_CPU_SHARE=auto` (the default): a short chunk's least-routed experts are computed by the idle CPU pool.
 - `--kv-grow`: the K/V takes VRAM only for the cells a request has reached, and the expert cache uses the rest.
   It is on by default where the device's virtual memory mapping granularity is 2 MiB or more (on for the RTX 4070; the B70's is 64 KiB, off).
-- `--adapt-async` (the resident mode's default), `--batch-mtp` (the default with `--batch` and `--mtp`), `--pipeline-windows` (the default on a split of two Xe2 GPUs, opt-in otherwise, [MULTIGPU](MULTIGPU.md)) and `--lookup-chain` (opt-in).
+- `--adapt-async` (the resident mode's default), `--batch-mtp` (the default with `--batch` and `--mtp`), `--pipeline-windows` (the default on a split of two Xe2 GPUs, opt-in otherwise, [MULTIGPU](MULTIGPU.md)) and `--lookup-chain` (opt-in; 2 by default on an integrated GPU on the HIP backend since 2026-11-16, [A review of the 890M's decode](#a-review-of-the-890ms-decode)).
 - Setup's additions (`--inspect`, `--source modelscope`, a 200K context and more) and the server's changes.
 
 Of the paths meant to be faster, those faster on the B70 or the RTX 4070 without being slower on the other are carried.

@@ -61,8 +61,12 @@ void f32_gemm_rows(const float* x, int64_t ldx, const float* w, float* y, int64_
                    int64_t n_tok, void* stream);
 /// bf16_gemv_fp32_mmvf for n_tok (1..8) activation rows x[t * ldx], outputs y[t * ldy + j]; one launch,
 /// the weight read once, every output bit-identical to its own single-row call.
+/// `skip_a`, `skip_b` (both or neither; device memory read when the launch runs, so a captured graph follows it): the
+/// launch does nothing while *skip_a <= *skip_b, and y keeps what it held - for a product whose reader is known, at
+/// run time, not to read it (the QSA indexer's queries while the selection is every cell).
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
-                               int64_t n_in, int64_t n_out, int n_tok, void* stream);
+                               int64_t n_in, int64_t n_out, int n_tok, void* stream, const int32_t* skip_a = nullptr,
+                               const int32_t* skip_b = nullptr);
 /// Times bf16_gemv_fp32_mmvf_multi's two forms (a row a work-group, 4 rows a work-group: the same bits) on the stream's
 /// device for an n_in x n_out matrix and 2..8 rows, and keeps the faster for each; call it before any graph is
 /// recorded (once a device and shape).  Untuned shapes take a row a work-group.  STRATA_MMVF_ROWS=0|1 fixes the form.

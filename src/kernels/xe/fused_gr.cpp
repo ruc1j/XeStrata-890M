@@ -188,6 +188,15 @@ public:
         (void) m; (void) it;
 #endif
     }
+    // stage() without its barrier, for a kernel that takes a barrier of its own before its first read of the table
+    template <int D, int NT = kFusedGrMaxT>
+    void fill(const GrMulti& m, const sycl::nd_item<D>& it) const {
+#if STRATA_DEVICE_NOT_INTEL
+        if (it.get_local_linear_id() == 0) copy(m, std::make_integer_sequence<int, NT>{});
+#else
+        (void) m; (void) it;
+#endif
+    }
     const FusedGrArgs& operator()(const GrMulti& m, int k) const {
 #if STRATA_DEVICE_NOT_INTEL
         (void) m;
@@ -907,8 +916,12 @@ inline void v2_down(const sycl::nd_item<DIM>& it, int blk, int kc, const sycl::l
                     const bool upper = (lane & o) != 0;
 #pragma unroll
                     for (int i = 0; i < cnt / 2; ++i) {
-                        const float keep = upper ? v[cnt / 2 + i] : v[i];
-                        const float send = upper ? v[i] : v[cnt / 2 + i];
+                        // both values first, then the choice: a conditional between the two array elements is a
+                        // load at a run-time index, which the compiler writes as a compare and a select for each
+                        // of the 16 elements (three of them a row group in the gfx1150 ISA)
+                        const float a = v[i], b = v[cnt / 2 + i];
+                        const float keep = upper ? b : a;
+                        const float send = upper ? a : b;
                         v[i] = keep + strata_shfl_xor(sg, send, o);
                     }
                     cnt /= 2;
@@ -984,13 +997,29 @@ inline void v2_up(const sycl::nd_item<1>& it, int grp, const TokArgs& tok, const
     if (grp == 0 && t < T * HC && m.a[0].w_inject != nullptr)
         tok(m, t / HC).inject_out[t % HC] = low[(size_t) (t / HC) * PR + LR + t % HC];
     sycl::group_barrier(it.get_group());
+    // a token's lo comes out of local memory once for the lane's two rows (the store to g used to sit between the
+    // rows' passes, so the reads were made again for the second); each row's products and sums are the ones above
+    float xv[2], mine[2];
+    int gi[2];
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
         const int r = g8 + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
-        const float xv = j < T ? xw[(size_t) j * D + i] : 0.0f;
-        float mine = 0.0f;
+        xv[p] = j < T ? xw[(size_t) j * D + i] : 0.0f;
+        mine[p] = 0.0f;
+        gi[p] = (j * HC + c) * UPM_COLS + dd;
+    }
 #pragma unroll
-        for (int k = 0; k < T; ++k) {
+    for (int k = 0; k < T; ++k) {
+        float4 xl[4][3];
+#pragma unroll
+        for (int qq = 0; qq < 4; ++qq)
+#pragma unroll
+            for (int st = 0; st < 3; ++st) {
+                const int v = 4 * (j + 8 * qq) + 128 * st;
+                if (v < LR) xl[qq][st] = lo[k * LR / 4 + v / 4];
+            }
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
             float aq[4];
 #pragma unroll
             for (int qq = 0; qq < 4; ++qq) {
@@ -1000,7 +1029,7 @@ inline void v2_up(const sycl::nd_item<1>& it, int grp, const TokArgs& tok, const
                     const int v = 4 * (j + 8 * qq) + 128 * st;
                     if (v < LR) {
                         const float4 w = q8_four(wq[p][qq][st], wd[p][qq][st]);
-                        const float4 x = lo[k * LR / 4 + v / 4];
+                        const float4 x = xl[qq][st];
                         acc = sycl::fma(w.x(), x.x(), acc); acc = sycl::fma(w.y(), x.y(), acc);
                         acc = sycl::fma(w.z(), x.z(), acc); acc = sycl::fma(w.w(), x.w(), acc);
                     }
@@ -1009,9 +1038,12 @@ inline void v2_up(const sycl::nd_item<1>& it, int grp, const TokArgs& tok, const
             }
             float sum = (aq[0] + aq[2]) + (aq[1] + aq[3]);
             for (int o = 4; o > 0; o >>= 1) sum += strata_shfl_xor(sg, sum, o);
-            if (j == k) mine = sum;
+            if (j == k) mine[p] = sum;
         }
-        if (j < T) g[(j * HC + c) * UPM_COLS + dd] = xv * sigmoidf_(mine);
+    }
+    if (j < T) {
+        g[gi[0]] = xv[0] * sigmoidf_(mine[0]);
+        g[gi[1]] = xv[1] * sigmoidf_(mine[1]);
     }
     sycl::group_barrier(it.get_group());
     for (int i = t; i < T * UPM_COLS; i += THREADS) {
@@ -1086,15 +1118,25 @@ sycl::event gr_read_v2(sycl::queue& q, const GrMulti& m, float* scratch) {
                     v2_down<T>(it, dg / V2_NKC, dg % V2_NKC, xs, last, qd, wi, xw, part, tickets, low,
                                [&] { wait(sync, (uint32_t) NNORM); }, [&] { signal(sync + 1); });
                 } else {
-                    tok.template stage<1, T>(m, it);
+                    // An up group reads the table only after its wait's barrier, so the table is filled inside the
+                    // wait, behind the rows' loads, without stage()'s barrier ahead of them.  The count of the up
+                    // groups past their wait is taken before that barrier too (only a group's lane 0 reads the
+                    // counters, in its spin, so "past the spin" is "past the wait"): the barrier's wait for the
+                    // rows covers the atomic's return, which used to stand before lane 0's lo load.
                     v2_up<T>(it, grp - NNORM - NDOWN, tok, m, lo, g, low, xw, [&] {
-                        wait(sync + 1, (uint32_t) (v2_nb<T>() + 1));
-                        // the last up group past its wait: every group's waits are over, the counters back to 0
-                        if (t == 0 && Counter(sync[2]).fetch_add(1u) == (uint32_t) (NUP - 1)) {
-                            Counter(sync[0]).store(0u);
-                            Counter(sync[1]).store(0u);
-                            Counter(sync[2]).store(0u);
+                        tok.template fill<1, T>(m, it);
+                        if (t == 0) {
+                            Counter cn(sync[1]);
+                            while (cn.load() < (uint32_t) (v2_nb<T>() + 1)) v2_pause();
+                            // the last up group past its spin: every group's waits are over, the counters back to 0
+                            if (Counter(sync[2]).fetch_add(1u) == (uint32_t) (NUP - 1)) {
+                                Counter(sync[0]).store(0u);
+                                Counter(sync[1]).store(0u);
+                                Counter(sync[2]).store(0u);
+                            }
                         }
+                        sycl::group_barrier(it.get_group());
+                        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
                     });
                 }
             });

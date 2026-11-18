@@ -33,7 +33,9 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 
 /// The same scores for a verify window's rows (consecutive positions of one sequence, so their n_bid rise): one
 /// sub-group a block reads its key once for every row, and the four heads' lane sums reduce with the same pairings as
-/// qsa_block_scores' (the bits are its own, upstream 5b6c9398's STRATA_QSA_ROWS).  For a graph: the grid is max_blocks.
+/// qsa_block_scores' (the bits are its own, upstream 5b6c9398's STRATA_QSA_ROWS).  For a graph: a fixed grid whose
+/// sub-groups stride over the blocks up to the last row's n_bid, as qsa_block_scores' without active_blocks.  Nothing
+/// is written while the last row's selection is every cell (n_kv <= width): qsa_block_topk then reads no score.
 void qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
                            int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
 

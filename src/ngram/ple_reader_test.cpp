@@ -610,16 +610,35 @@ int selftest(const std::string& dir, uint32_t rb) {
         rd.reset_stats();
         CHECK(rd.snapshot().keepalive_reads == 0 && rd.snapshot().keepalive_us_max == 0, "reset_stats kept keep-alive counts");
     }
-    {   // the caller's thread does the reads: no worker, so no keep-alive
+    {   // the caller's thread does the reads: the keep-alive has a thread of its own
         ng::PleReader rd;
         std::string err;
         CHECK(rd.open(path, HEADER, N, 16, 0, err, false, rb), "open: %s", err.c_str());
-        rd.set_keepalive(20.0, 1.0);
+        rd.set_keepalive(20.0, 0.5);
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        CHECK(rd.snapshot().keepalive_reads == 0, "caller thread: keep-alive before any rows were asked for");
         std::vector<uint32_t> rows(16);
         for (auto& r : rows) r = rng() % N;
         check_rows(rd, rows, N, rb, "keep-alive, caller thread");
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
-        CHECK(rd.snapshot().keepalive_reads == 0, "keep-alive without the worker thread");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        const uint64_t k1 = rd.snapshot().keepalive_reads;
+        CHECK(k1 >= 5 && k1 <= 20, "caller thread: %llu keep-alive reads in 300 ms at 20 ms", (unsigned long long) k1);
+        CHECK(rd.snapshot().reads <= rows.size(), "caller thread: a keep-alive read was counted as a row read");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));   // past the window
+        const uint64_t k2 = rd.snapshot().keepalive_reads;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        CHECK(rd.snapshot().keepalive_reads <= k2 + 1, "caller thread: keep-alive went on past its window");
+        for (auto& r : rows) r = rng() % N;
+        check_rows(rd, rows, N, rb, "keep-alive, caller thread, after the window");   // rows again: it starts again
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        CHECK(rd.snapshot().keepalive_reads >= k2 + 4, "caller thread: the keep-alive did not start again");
+        rd.set_keepalive(0, 0.5);                           // off
+        const uint64_t k4 = rd.snapshot().keepalive_reads;
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        CHECK(rd.snapshot().keepalive_reads <= k4 + 1, "caller thread: keep-alive went on after it was turned off");
+        rd.reset_stats();
+        CHECK(rd.snapshot().keepalive_reads == 0 && rd.snapshot().keepalive_us_max == 0,
+              "caller thread: reset_stats kept keep-alive counts");
     }
     std::filesystem::remove(path);
     std::printf("ple_reader selftest (row_bytes=%u): %s\n", rb, g_fail ? "FAILED" : "OK");

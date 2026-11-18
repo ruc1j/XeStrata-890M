@@ -16,12 +16,13 @@ Radeon 890M と 64 GB の RAM を積んだノート PC 1 台で動かします�
 
 | | 元の XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
-| decode（短い会話 6 つの平均） | 15〜22 tok/s | 約 31 tok/s |
+| decode（短い会話 6 つの平均） | 15〜22 tok/s | 約 38 tok/s |
 | prefill 523 トークン | 5.4 s（98 tok/s） | 2.55 s（205 tok/s） |
 | prefill 3,481 トークン | 29.1 s（119 tok/s） | 13.1 s（265 tok/s） |
 | prefill 2,669 トークン（同じ文の繰り返し） | 22.0 s（121 tok/s） | 10.0 s（267 tok/s） |
 
 prefill の「元の XeStrata」の列は、この 890M で元の XeStrata の prefill の経路を測った値です。答えは丸めの差を除いて同じです。
+decode の行は、temperature 0.7 で 1 つの会話に 400 トークンを出した値です。greedy で 200 トークンずつ出すと、約 42 tok/s です。
 
 > **目次:** [XeStrata-890M とは](#xestrata-890m-とは) · [必要なもの](#必要なもの) · [モデル](#モデル) ·
 > [インストール](#インストール)（[Releases](https://github.com/ruc1j/XeStrata-890M/releases)） · [使い方](#使い方) · [困ったとき](#困ったとき) · [しくみ](#しくみ) ·
@@ -81,6 +82,15 @@ AMD の GPU では intel/llvm の DPC++ の HIP のターゲットでその SYCL
    - shared expert（gate・up・down の小さい GEMV 3 本）をグラフの側枝でエキスパートの段と並べます（`STRATA_SH_BRANCH`、側枝が効く GPU で既定。
      上流の SH_STREAM に当たります）。同じカーネルを同じ順で使い、combine の前で合流するので答えはビット単位で同じです。890M の decode は
      +2.5〜3.0%（35.5 → 36.5 tok/s）。`STRATA_SH_BRANCH=0` で元の順。
+   - 全エキスパートが cache にある窓は、入れ替えの写しを待たない既定の設定でも、host に聞かない 1 つのグラフで動かします。HIP の統合 GPU では、
+     このグラフは起動時の計測の結果にかかわらず側枝を使います（`STRATA_DF_BRANCH=0` で切れます）。AMD の GPU が統合 GPU だけの機械では、
+     ROCm のランタイムが別のキューを待つ所を CPU の側で待たせます（エンジンが `ROC_CPU_WAIT_FOR_SIGNAL=1` を置きます。利用者が設定していればその値のまま）。
+     推測デコードの費用の表は、乱れた 1 周で外れたままにならない数え方にし、`--lookup-chain 2` を既定にしました。QSA の索引では、点数のカーネルの格子を固定にし、
+     文脈が選択の幅（2,051 セル）以下の間は query 側の積と点数を計算しません。続けて、shared expert の側枝を分ける位置、PLE の表の読みと射影、
+     MTP の窓の上限（`--spec` より 1 行広く）、下書きの層の正規化の既定（`--mtp-hnorm stream`）、GDN の step のバリア、窓の幅の選び方も見直しました。
+     そのあと、カーネルの gfx1150 の ISA を読んで、ハイパーコネクションの読み、エキスパートの行、GDN の量子化、層ごとの計画から、要らない読みと乗算とバリアを除きました。
+     さらに、router の top-10、エキスパートの入力と注意の出力の量子化、MTP の層と窓の始めと終わりの小さい起動を、隣の起動にまとめました。
+     890M の decode は、合わせて 36.3 → 42.3 tok/s で、答えは同じです（[XE](docs/XE.ja.md#890m-の-decode-の見直し)）。
    - 下書きの鎖と窓の長さを、下書き 1 つずつの確率（`--spec-min-p`）ではなく、ここまでの下書きの確率の積で切ります
      （`STRATA_SPEC_CUM=c`、HIP の統合 GPU では既定 0.5、ほかは 0 で従来の規則。`--spec-min-p` が 0 のときは使いません。HIP の統合 GPU では 2026-10-31 から、費用を見て窓を決める `STRATA_SPEC_COST` が既定で、この規則はその上に `STRATA_SPEC_COST=0` で戻ります）。
      head が自信のある間は長く下書きし、迷い始めたら短く切ります。`--spec 6` と組み合わせて使います。abliterated 版の 6 チャット（28 W）では、

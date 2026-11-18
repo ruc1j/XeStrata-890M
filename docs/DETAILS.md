@@ -70,11 +70,14 @@ Decode speed depends on the text as well.
 Speculative decoding runs faster when more of the drafted tokens are accepted, so a difference of a few percent between neighbouring cells means nothing
 (IQ2_XS is faster at 128K than at 64K because it accepted 0.768 of its drafts there against 0.683).
 
-`--lookup-chain K` (default 0, off) checks, after the draft layer's guesses, up to K more tokens that followed the same
+`--lookup-chain K` (default 0, off; 2 on an integrated GPU on the HIP backend) checks, after the draft layer's guesses, up to K more tokens that followed the same
 text earlier in the conversation (upstream 2312c83b).
 It speeds up handing back a given text nearly as it was, and slows ordinary chat a little
 (B70, IQ2_XS, K=3: rewriting a document 109.6 → 129.2, ordinary chat 71.1 → 68.3 tokens/s).
 `--lookup-chain-min M` is the match it needs before adding any (default 3 tokens).
+On an integrated GPU on the HIP backend the rule that sizes the window by its cost (`STRATA_SPEC_COST`) prices the added
+rows as well and adds one only where it pays, so K=2 is the default there
+(890M, IQ2_XS, six chats of ordinary text: 38.03 → 38.31 tok/s; `--lookup-chain 0` turns it off).
 
 In the server's decode, a missed expert (not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the
 top 10, the smallest weights) contributes zero to that token, and one that every token of a verify window routes that
@@ -138,7 +141,7 @@ The engine counts an integrated GPU's free memory as the smaller of what its run
 For the models that keep a RAM budget of their experts (UD-Q4_K_XL, UD-IQ4_XS), setup writes the expert cache as a number, not `auto` (upstream #1715).
 The cache and the budget draw on the same RAM, so `auto`, sized from the memory free at start, would count what the budget has not taken yet and leave the OS nothing.
 The number is the RAM less 24 GB and the budget (and a KV cache streamed to RAM), in slots; `--expert-cache N` in the config's `args` sets another.
-On an integrated GPU setup normalizes the draft head's hidden input per hyper-connection stream (`--mtp-hnorm stream`, the value upstream's setup gives the DGX Spark). On the 890M decode was 5% faster (greedy, the mean of three interleaved rounds: 31.2 -> 32.7 tok/s) with the same answers; `--mtp-hnorm pooled` in the config's `args` restores the earlier form.
+On an integrated GPU setup normalizes the draft head's hidden input per hyper-connection stream (`--mtp-hnorm stream`, the value upstream's setup gives the DGX Spark). On an integrated GPU on the HIP backend the engine does so by default also for a configuration without the flag (since 2026-11-17). On the 890M decode was 5% faster (greedy, the mean of three interleaved rounds: 31.2 -> 32.7 tok/s) with the same answers; `--mtp-hnorm pooled` in the config's `args` restores the earlier form.
 The 890M's prompt chunk is 2,048 tokens with `--prefill auto` and `--no-prefill-borrow`, so a 15K-token prompt is read in eight chunks. With `--prefill 8192` every expert product holds four times the rows a launch and each layer's experts stream twice instead of eight times, and a 15K-token prompt read 283-294 -> 324 tok/s in the first round. The chunk's buffers, though, grow by about 4 GiB (160 + chunk x 680 / 1024 MiB), the 33 GiB expert cache and the page cache of the mapped files no longer fit in the 62 GiB of RAM beside them, and the second round went to swap (zram) and 71 tok/s. The products' groups change shape, so the answers change too. The default stays at 2,048; a machine with RAM to spare can try `--prefill 8192`.
 The expert cache's pages (GTT, or host memory) are the driver's and never charged to the cgroup, so the engine sizes the cache from the RAM Linux has available (`MemAvailable`), not from the figure clamped by the cgroup's cap (shoftee/Strata 48defc12e: a unit with a low MemoryMax read as "no room for a cache"). The log says so when the cgroup's figure is lower. Host allocations keep the cgroup's figure.
 With `--conversation-cache-mib N` on an integrated GPU's `--serve`, the parked conversations spend the same RAM, so the auto expert cache's reserve grows by that N (shoftee/Strata ff5809230). A conversation cache sized later from the free RAM (the default) changes nothing.

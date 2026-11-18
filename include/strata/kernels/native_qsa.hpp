@@ -34,6 +34,11 @@ void native_qsa_rms_norm_weighted_q8_1(const float* input, const float* gamma, f
 void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* output,
                                  int n_cols, int groups, int n_rows, float epsilon, void* stream);
 
+// The grouped norm, writing the output also as q8_1 blocks (n_cols a multiple of 32) into x_q8_1, bit for bit
+// native_quantize_q8_1 of the output's n_rows rows.
+void native_qsa_rms_norm_grouped_q8_1(const float* input, const float* gamma, float* output, void* x_q8_1,
+                                      int n_cols, int groups, int n_rows, float epsilon, void* stream);
+
 // attn/output [head_dim,n_head]; q_full [2*head_dim,n_head], each row is
 // [query channels, gate channels]. Output is attn*sigmoid(second-half gate).
 // Exact output==attn is supported; all other spans must be disjoint.

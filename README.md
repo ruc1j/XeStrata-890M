@@ -17,13 +17,14 @@ Speed on the 890M (Ryzen AI 9 HX 370, 64 GB RAM, Fedora 44, Qwen3.8-Flash-Next I
 
 | | original XeStrata | XeStrata-890M |
 | --- | ---: | ---: |
-| decode (average of 6 short chats) | 15-22 tok/s | about 31 tok/s |
+| decode (average of 6 short chats) | 15-22 tok/s | about 38 tok/s |
 | prefill 523 tokens | 5.4 s (98 tok/s) | 2.55 s (205 tok/s) |
 | prefill 3,481 tokens | 29.1 s (119 tok/s) | 13.1 s (265 tok/s) |
 | prefill 2,669 tokens (the same sentence repeated) | 22.0 s (121 tok/s) | 10.0 s (267 tok/s) |
 
 The "original XeStrata" prefill column was measured on this 890M along the original XeStrata's prefill path; the
 answers are the same apart from rounding differences.
+The decode row is at temperature 0.7 with 400 tokens a chat; greedy, with 200 tokens a chat, it is about 42 tok/s.
 
 > **Contents:** [About XeStrata-890M](#about-xestrata-890m) · [What you need](#what-you-need) · [The model](#the-model) ·
 > [Install](#install) ([Releases](https://github.com/ruc1j/XeStrata-890M/releases)) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
@@ -96,6 +97,21 @@ setup changes of upstream Strata 0.2.15 (engine 0.1.61) ([docs/XE.md](docs/XE.md
     experts' stage (`STRATA_SH_BRANCH`, default on GPUs where a side branch pays off; upstream's counterpart is
     SH_STREAM); the same kernels in the same order, joined before combine, so the answers are bit-identical. 890M
     decode is +2.5-3.0% (35.5 → 36.5 tok/s). `STRATA_SH_BRANCH=0` for the original order.
+  - a window with every expert in the cache runs one graph that does not ask the host, also with the default that
+    does not wait for a swap's copy. On an integrated GPU on the HIP backend that graph takes the side branches
+    whatever the start-up measurement says (`STRATA_DF_BRANCH=0` turns them off). On a machine whose AMD GPUs are all
+    integrated, the ROCm runtime waits on the CPU where it waits for another queue (the engine sets
+    `ROC_CPU_WAIT_FOR_SIGNAL=1`; a value the user set stays). The cost table of speculative decoding no longer stays
+    wrong after one disturbed round, and `--lookup-chain 2` is the default. The QSA indexer's score kernels take a
+    fixed grid, and while the context is within the selection's width (2,051 cells) the query product and the
+    scores are not computed. After these: where the shared expert's side branch forks, the PLE table's reads and
+    projections, the MTP window's cap (one row more than `--spec`), the draft layer's default norm
+    (`--mtp-hnorm stream`), the GDN step's barriers and the choice of the window's width. Then, from reading the
+    kernels' gfx1150 ISA, reads, multiplies and barriers nothing needs were taken out of the hyper-connection read,
+    the expert rows, the GDN quantization and the plan of a layer; and the router's top-10, the quantization of
+    the experts' input and of the attention's output, and small launches of the MTP layer and of the window's
+    start and end were merged into the launches beside them. Together the 890M's decode is 36.3 → 42.3 tok/s,
+    with the same answers ([XE](docs/XE.md#a-review-of-the-890ms-decode)).
   - the draft chain and the window length are cut by the product of the drafts' probabilities so far
     (`STRATA_SPEC_CUM=c`, default 0.5 on HIP's integrated GPU, 0 elsewhere for the old rule; not used when
     `--spec-min-p` is 0; on HIP's integrated GPU the cost-aware window `STRATA_SPEC_COST` is the default since

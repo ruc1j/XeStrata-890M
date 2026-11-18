@@ -10,7 +10,9 @@
 //   * native_moe_combine / native_moe_combine_multi (k = 10 and 9, with and without a shared row, an aligned and a
 //     misaligned output; upstream's float4 k = 10 kernel measured slower on the B70 and is not here) against a host
 //     replay of the documented contract (src/kernels/xe/native_moe.cpp, not CUDA's FMA): every product rounds to
-//     F32 and is added in expert order, the shared row once: memcmp.
+//     F32 and is added in expert order, the shared row once: memcmp;
+//   * native_moe_combine_multi_hits against the host's replay of moe_hit_add then that combine, with the parts rows
+//     and without them (nullptr): memcmp.
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -166,6 +168,68 @@ int main() {
             }
         }
         std::printf("  %-52s %s (%d cases)\n", (std::string("combine ") + c.name).c_str(), cfg_bad ? "*** NO ***" : "bitwise", cases);
+        bad += cfg_bad;
+    }
+
+    // ---- the combine with the hit rows folded in (native_moe_combine_multi_hits): against the host's replay of
+    // moe_hit_add then the combine, with the parts rows and without them (nullptr: every part zero, none read)
+    for (const Cfg& c : cfgs) {
+        int cfg_bad = 0, cases = 0;
+        for (int n = 1; n <= 8; ++n) {
+            const int cap = n * c.k;
+            std::vector<float> parts((size_t) cap * N), hits((size_t) cap * N), w((size_t) cap), sh((size_t) n * N);
+            for (auto& v : parts) v = gauss(rng);
+            for (auto& v : hits) v = gauss(rng);
+            for (auto& v : w) v = (float) (rng() % 1000) / 1000.0f;
+            for (auto& v : sh) v = gauss(rng);
+            // about two entries in three have a hit row; the list also holds entries out of range, which are skipped
+            std::vector<int32_t> dst;
+            std::vector<uint8_t> is_hit((size_t) cap, 0);
+            for (int e = 0; e < cap; ++e)
+                if (rng() % 3 != 0) { dst.push_back(e); is_hit[(size_t) e] = 1; }
+            std::shuffle(dst.begin(), dst.end(), rng);
+            dst.push_back(-1);
+            dst.push_back(cap);
+            const std::vector<int32_t> count{(int32_t) dst.size()};
+            float* d_p = up(parts);
+            float* d_h = up(hits);
+            float* d_w = up(w);
+            float* d_s = up(sh);
+            int32_t* d_dst = up(dst);
+            int32_t* d_n = up(count);
+            auto* d_o = static_cast<float*>(P::alloc_bytes((size_t) n * N * 4 + 64));
+            float* out = d_o + c.out_off;
+            for (int with_parts = 1; with_parts >= 0; --with_parts) {
+                native_moe_combine_multi_hits(with_parts ? d_p : nullptr, d_h, d_dst, d_n, d_w, c.shared ? d_s : nullptr,
+                                              out, N, c.k, n, st);
+                P::sync();
+                const auto got = down(out, (size_t) n * N);
+                std::vector<float> want((size_t) n * N);
+                for (int t = 0; t < n; ++t)
+                    for (int col = 0; col < N; ++col) {
+                        auto entry = [&](int e) {
+                            const size_t o = ((size_t) t * c.k + e) * N + col;
+                            const float part = with_parts ? parts[o] : 0.0f;
+                            return is_hit[(size_t) t * c.k + e] ? part + hits[o] : part;
+                        };
+                        float s = entry(0) * w[(size_t) t * c.k];
+                        for (int e = 1; e < c.k; ++e) {
+                            const float product = entry(e) * w[(size_t) t * c.k + e];
+                            s = s + product;
+                        }
+                        if (c.shared) s += sh[(size_t) t * N + col];
+                        want[(size_t) t * N + col] = s;
+                    }
+                ++cases;
+                if (!same(got, want)) {
+                    std::printf("    *** native_moe_combine_multi_hits n=%d (%s, %s) differs from the host replay ***\n", n,
+                                c.name, with_parts ? "with parts" : "no parts");
+                    ++cfg_bad;
+                }
+            }
+        }
+        std::printf("  %-52s %s (%d cases)\n", (std::string("combine + hits ") + c.name).c_str(),
+                    cfg_bad ? "*** NO ***" : "bitwise", cases);
         bad += cfg_bad;
     }
 

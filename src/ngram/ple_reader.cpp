@@ -6,6 +6,7 @@
 #include "strata/platform/aux_cpus.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -108,8 +109,98 @@ struct TicketState {
 // and reaps completions, so `issue` on the caller's thread only builds jobs and wakes it (~11 us per ReadFile
 // no longer lands on the host loop). `mu` guards everything below except `file`, which only the worker touches
 // (plus `wake`, which is thread-safe). Without `io_thread` the caller does all of it, as before.
+//
+// XeStrata-890M: without `io_thread` the keep-alive has a thread of its own (Keeper) with its own handle on the file,
+// since `file` is the caller's there: it reads one page when the caller has sent no read for the period, and shares
+// with the caller only the two times below and its counts (atomics), so the caller's path takes no lock.
+namespace {
+// the keep-alive's page: a different one each time (xorshift)
+inline uint64_t next_page_rng(uint64_t& rng) {
+    rng ^= rng << 13;
+    rng ^= rng >> 7;
+    rng ^= rng << 17;
+    return rng;
+}
+
+struct Keeper {
+    DirectFile file;                       // the keeper's own handle
+    std::thread th;
+    std::mutex mu;                         // period, window, stop
+    std::condition_variable cv;
+    bool stop = false;
+    double keep_us = 0, window_us = 0;
+    uint8_t* buf = nullptr;                // one page
+    uint64_t first_page = 0, end_page = 0; // the table's pages
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    std::atomic<double> last_issue{0};     // the caller's last `issue`, steady-clock microseconds
+    std::atomic<double> last_read{0};      // the last read that went out, the caller's rows or a keep-alive
+    std::atomic<uint64_t> reads{0};        // ReaderStats::keepalive_reads / keepalive_us_max in this mode
+    std::atomic<double> us_max{0};
+
+    void loop() {
+        std::unique_lock<std::mutex> lk(mu);
+        while (!stop) {
+            const double now = now_us(), li = last_issue.load(std::memory_order_relaxed);
+            if (keep_us <= 0 || li <= 0 || now - li > window_us) {   // off, or no rows asked for within the window
+                cv.wait(lk);
+                continue;
+            }
+            const double due = last_read.load(std::memory_order_relaxed) + keep_us;
+            if (now < due) {
+                cv.wait_for(lk, std::chrono::microseconds(std::max<int64_t>(1000, (int64_t) (due - now))));
+                continue;
+            }
+            // one page of the table, a different one each time, so the SSD really reads
+            const uint64_t pick = next_page_rng(rng);
+            const uint64_t offset = (first_page + (end_page > first_page ? pick % (end_page - first_page) : 0)) * PAGE;
+            lk.unlock();
+            const double t0 = now_us();
+            std::string kerr;
+            bool ok = file.submit(offset, buf, PAGE, 0, kerr);
+            while (ok) {
+                Completion c[4];
+                const int n = file.wait(c, 4, -1);
+                if (n <= 0) { ok = false; break; }
+                bool done = false;
+                for (int i = 0; i < n; ++i)
+                    if (c[i].tag != DirectFile::WAKE_TAG) { done = true; ok = c[i].ok; }
+                if (done) break;
+            }
+            lk.lock();
+            if (!ok) {                             // a keep-alive read that fails turns it off, not the reader
+                keep_us = 0;
+                continue;
+            }
+            const double t1 = now_us();
+            last_read.store(t1, std::memory_order_relaxed);
+            reads.fetch_add(1, std::memory_order_relaxed);
+            if (t1 - t0 > us_max.load(std::memory_order_relaxed)) us_max.store(t1 - t0, std::memory_order_relaxed);
+        }
+    }
+    void shut() {
+        if (th.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                stop = true;
+            }
+            cv.notify_all();
+            th.join();
+        }
+        file.close();
+        DirectFile::free_aligned(buf);
+        buf = nullptr;
+        stop = false;
+        keep_us = 0;
+        last_issue.store(0);
+        last_read.store(0);
+    }
+};
+}  // namespace
+
 struct PleReader::Impl {
     DirectFile file;
+    Keeper keeper;                         // caller-thread mode's keep-alive
+    std::string path;                      // for the keeper's handle
     uint64_t table_offset = 0;
     uint64_t n_rows = 0;
     uint32_t row_bytes = ROW_BYTES;
@@ -181,6 +272,7 @@ struct PleReader::Impl {
                 return false;
             }
             last_read_us = j.issued_us;
+            if (!threaded) keeper.last_read.store(j.issued_us, std::memory_order_relaxed);
             if (!j.keepalive) {                    // a keep-alive read counts when it completes (`finish`)
                 stats.submit_us += now_us() - j.issued_us;
                 ++stats.reads;
@@ -198,12 +290,10 @@ struct PleReader::Impl {
 
     /// One page of the table, a different one each time, so the SSD really reads (not its controller's buffer).
     void queue_keepalive() {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
+        const uint64_t pick = next_page_rng(rng);
         const uint64_t first = table_offset / PAGE, end = (table_offset + n_rows * (uint64_t) row_bytes) / PAGE;
         Job j;
-        j.offset = (first + (end > first ? rng % (end - first) : 0)) * PAGE;
+        j.offset = (first + (end > first ? pick % (end - first) : 0)) * PAGE;
         j.length = PAGE;
         j.keepalive = true;
         queue.push_back(std::move(j));
@@ -351,6 +441,7 @@ bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_
     if (max_inflight == 0 || max_inflight > 1024) { err = "PleReader: max_inflight must be 1..1024"; return false; }
     if (row_bytes == 0 || row_bytes > PAGE) { err = "PleReader: row_bytes must be 1..4096"; return false; }
     if (!impl_->file.open(path, err)) return false;
+    impl_->path = path;
     impl_->row_bytes = row_bytes;
     if (table_offset + n_rows * (uint64_t) row_bytes > impl_->file.size()) {
         err = "PleReader: the table extends past the end of " + path;
@@ -392,6 +483,7 @@ bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_
 
 void PleReader::close() {
     Impl& m = *impl_;
+    m.keeper.shut();
     if (m.worker.joinable()) {
         {
             std::lock_guard<std::mutex> lk(m.mu);
@@ -440,6 +532,13 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     const double now = now_us();
     const bool rearm = m.keep_us > 0 && (m.last_issue_us <= 0 || now - m.last_issue_us > m.keep_window_us);
     m.last_issue_us = now;
+    if (!m.threaded && m.keeper.th.joinable()) {   // caller-thread mode: the keeper's clock, and a wake after a lapse
+        const double before = m.keeper.last_issue.exchange(now, std::memory_order_relaxed);
+        if (before <= 0 || now - before > 50e3) {  // (no shorter period than 50 ms is worth a wake a ticket)
+            { std::lock_guard<std::mutex> kl(m.keeper.mu); }
+            m.keeper.cv.notify_one();
+        }
+    }
     TicketState& ts = m.tickets[id];
     // After a failed read the reader stays failed (`collect` reports `error` until the next `open`) and its worker has
     // parked (worker_loop). A ticket queued now would never be read and `collect` would wait for it for ever, so it
@@ -596,6 +695,33 @@ bool PleReader::collect(Ticket t, std::string& err) {
 
 void PleReader::set_keepalive(double period_ms, double window_s) {
     Impl& m = *impl_;
+    if (!m.threaded) {   // caller-thread mode: the keeper's thread, started with the first period
+        Keeper& k = m.keeper;
+        if (period_ms > 0 && !k.th.joinable() && m.file.is_open()) {
+            std::string kerr;
+            k.buf = (uint8_t*) DirectFile::alloc_aligned(PAGE);
+            if (k.buf == nullptr || !k.file.open(m.path, kerr)) {   // no keep-alive then; the reader is as it was
+                k.shut();
+                return;
+            }
+            k.first_page = m.table_offset / PAGE;
+            k.end_page = (m.table_offset + m.n_rows * (uint64_t) m.row_bytes) / PAGE;
+            k.rng = m.rng;
+            try {
+                k.th = std::thread([&k] { strata::aux_cpus::pin_current_thread(); k.loop(); });
+            } catch (...) {
+                k.shut();
+                return;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> kl(k.mu);
+            k.keep_us = k.th.joinable() && period_ms > 0 ? period_ms * 1000.0 : 0.0;
+            k.window_us = window_s > 0 ? window_s * 1e6 : 0.0;
+        }
+        k.cv.notify_all();
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(m.mu);
         m.keep_us = m.threaded && period_ms > 0 ? period_ms * 1000.0 : 0.0;
@@ -613,7 +739,12 @@ ReaderStats PleReader::snapshot() const {
     Impl& m = *impl_;
     std::unique_lock<std::mutex> lk(m.mu, std::defer_lock);
     if (m.threaded) lk.lock();
-    return m.stats;
+    ReaderStats s = m.stats;
+    if (!m.threaded) {   // the keeper's counts
+        s.keepalive_reads = m.keeper.reads.load(std::memory_order_relaxed);
+        s.keepalive_us_max = m.keeper.us_max.load(std::memory_order_relaxed);
+    }
+    return s;
 }
 void PleReader::reset_stats() {
     Impl& m = *impl_;
@@ -621,6 +752,8 @@ void PleReader::reset_stats() {
     if (m.threaded) lk.lock();                     // the worker may be counting a keep-alive read
     m.stats = ReaderStats{};
     m.ring_pos = 0;
+    m.keeper.reads.store(0, std::memory_order_relaxed);
+    m.keeper.us_max.store(0, std::memory_order_relaxed);
 }
 uint64_t PleReader::cache_capacity() const { return impl_->cache.sets * WAYS; }
 uint64_t PleReader::cache_size() const { return impl_->cache.used; }

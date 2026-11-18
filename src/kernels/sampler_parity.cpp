@@ -12,6 +12,7 @@
 // DIFFER - then requires the kernel to agree with the specified one.  Without the first half, the test would
 // pass against either order.
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include "parity_device.hpp"
 
@@ -1005,6 +1006,60 @@ int main(int argc, char** argv) {
                     "gumbel: flag read, greedy unchanged", flag_bad ? "*** WRONG ***" : "matches", same, T,
                     greedy_same ? "unchanged" : "CHANGED");
         bad += flag_bad;
+    }
+
+    // ---- XeStrata-890M: the greedy pick that writes the rows' non-finite flags from its own pass
+    // (sample_tokens_nonfinite) against sample_tokens and logits_nonfinite_rows: the picks and the 16 flags a row.
+    // Clean rows, a NaN or an infinity in each slice in turn, in the last value of the row and in several slices at
+    // once; the head's width and one that the slices do not divide.
+    {
+        namespace P = strata::parity;
+        namespace K = strata::kernels;
+        int wrong = 0, cases = 0;
+        std::mt19937 rng(879u);   // NOLINT(bugprone-random-generator-seed): a fixed fixture
+        std::normal_distribution<float> gd(0.0f, 2.0f);
+        for (const int nv : {248320, 1000, 37}) {
+            const int T = 8, NB = K::kNonfiniteBlocks, per = (nv + NB - 1) / NB;
+            std::vector<float> l((size_t) nv * T);
+            auto* d_l = static_cast<float*>(P::alloc_bytes(l.size() * sizeof(float)));
+            auto* d_a = static_cast<int*>(P::alloc_bytes((size_t) T * sizeof(int)));
+            auto* d_b = static_cast<int*>(P::alloc_bytes((size_t) T * sizeof(int)));
+            auto* f_a = static_cast<uint32_t*>(P::alloc_bytes((size_t) T * NB * sizeof(uint32_t)));
+            auto* f_b = static_cast<uint32_t*>(P::alloc_bytes((size_t) T * NB * sizeof(uint32_t)));
+            for (int round = 0; round < NB + 3; ++round) {
+                for (auto& v : l) v = gd(rng);
+                for (int t = 0; t < T; ++t) {
+                    float* row = l.data() + (size_t) t * nv;
+                    const float poison = t % 2 == 1 ? std::numeric_limits<float>::quiet_NaN()
+                                                    : t % 4 == 2 ? -std::numeric_limits<float>::infinity()
+                                                                 : std::numeric_limits<float>::infinity();
+                    if (round < NB) {            // one value in slice `round` (rows 0..5; rows 6 and 7 stay clean)
+                        const int lo = round * per, hi = std::min(nv, lo + per);
+                        if (t < 6 && lo < hi) row[lo + (int) (rng() % (unsigned) (hi - lo))] = poison;
+                    } else if (round == NB) {    // the row's last value
+                        if (t < 4) row[nv - 1] = poison;
+                    } else if (round == NB + 1) {   // several slices
+                        for (int i = 0; i < 5; ++i) row[(int) (rng() % (unsigned) nv)] = poison;
+                    }                            // round NB + 2: every row clean
+                }
+                P::copy_bytes_in(d_l, l.data(), l.size() * sizeof(float));
+                K::SamplerParams p; p.greedy = true; p.temperature = 0.0f;
+                K::sample_tokens_nonfinite(d_l, T, nv, p, d_a, f_a, NB, nullptr);
+                K::sample_tokens(d_l, T, nv, nullptr, 0, p, d_b, nullptr);
+                K::logits_nonfinite_rows(d_l, T, nv, f_b, nullptr);
+                std::vector<int> ga((size_t) T), gb((size_t) T);
+                std::vector<uint32_t> fa((size_t) T * NB), fb((size_t) T * NB);
+                P::copy_bytes_out(ga.data(), d_a, ga.size() * sizeof(int));
+                P::copy_bytes_out(gb.data(), d_b, gb.size() * sizeof(int));
+                P::copy_bytes_out(fa.data(), f_a, fa.size() * sizeof(uint32_t));
+                P::copy_bytes_out(fb.data(), f_b, fb.size() * sizeof(uint32_t));
+                ++cases;
+                wrong += ga != gb || fa != fb;
+            }
+        }
+        std::printf("  %-34s %s (%d of %d cases differ)\n", "greedy pick with non-finite flags",
+                    wrong ? "*** WRONG ***" : "matches", wrong, cases);
+        bad += wrong != 0;
     }
 
     std::printf("\nsampler: %d failures\n", bad);

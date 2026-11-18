@@ -86,6 +86,9 @@ struct MmvfAux {
     const uint16_t* w = nullptr;
     float* y = nullptr;
     int64_t ldy = 0;
+    // bf16_gemv_fp32_mmvf_multi's skip_a / skip_b: the launch does nothing while *skip_a <= *skip_b
+    const int32_t* skip_a = nullptr;
+    const int32_t* skip_b = nullptr;
 };
 
 // W: uint16_t for BF16 weights, float for F32 ones (ggml-cuda's mmvf over a float2 pair, the same FMAs and sums).
@@ -97,6 +100,7 @@ sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const W* w,
         sycl::local_accessor<float, 1> partials(sycl::range<1>(NT * 32), h);
         h.parallel_for(sycl::nd_range<1>((size_t) (n_out + (aux.w ? 1 : 0)) * BLOCK_SIZE, BLOCK_SIZE),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            if (aux.skip_a != nullptr && *aux.skip_a <= *aux.skip_b) return;   // the whole launch
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_local_id(0);
             const size_t rowi = it.get_group(0);
@@ -104,10 +108,11 @@ sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const W* w,
             const W* row = w + rowi * n_in;
             if constexpr (std::is_same_v<W, uint16_t>)
                 if (is_aux && aux.w != nullptr) row = aux.w;   // the extra row exists only with aux.w
-            if constexpr (BLOCK_SIZE > 32) {
-                if (t < 32)
+            // the partials' slots past the group's sub-groups are zero for the last sum; the sub-groups write the
+            // others, so the zeros need no barrier of their own before the products (the one below covers both)
+            if constexpr (BLOCK_SIZE > 32 && BLOCK_SIZE < 32 * 32) {
+                if (t >= BLOCK_SIZE / 32 && t < 32)
                     for (int k = 0; k < NT; ++k) partials[k * 32 + t] = 0.0f;
-                sycl::group_barrier(it.get_group());
             }
             float acc[NT];
             for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
@@ -154,20 +159,21 @@ sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const W* w,
 // pairs t, t + BLOCK_SIZE, ... with launch_mmvf's two ordered FMAs and its sub-group and work-group sums.
 template<int BLOCK_SIZE, int NT, int RPB, bool EXACT = false>
 sycl::event launch_mmvf_rows(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
-                             int n_in, int64_t n_out, int n_tok_arg) {
+                             int n_in, int64_t n_out, int n_tok_arg, MmvfAux aux = {}) {
     const int n_tok = EXACT ? NT : n_tok_arg;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> partials(sycl::range<1>((size_t) RPB * NT * 32), h);
         h.parallel_for(sycl::nd_range<1>((size_t) ((n_out + RPB - 1) / RPB) * BLOCK_SIZE, BLOCK_SIZE),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            if (aux.skip_a != nullptr && *aux.skip_a <= *aux.skip_b) return;   // the whole launch
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_local_id(0);
             const int64_t o0 = (int64_t) it.get_group(0) * RPB;
-            if constexpr (BLOCK_SIZE > 32) {
-                if (t < 32)
+            // (the zeros of the partials' unused slots without a barrier of their own, as in launch_mmvf)
+            if constexpr (BLOCK_SIZE > 32 && BLOCK_SIZE < 32 * 32) {
+                if (t >= BLOCK_SIZE / 32 && t < 32)
                     for (int r = 0; r < RPB; ++r)
                         for (int k = 0; k < NT; ++k) partials[(r * NT + k) * 32 + t] = 0.0f;
-                sycl::group_barrier(it.get_group());
             }
             float acc[RPB][NT];
             for (int r = 0; r < RPB; ++r)
@@ -257,14 +263,14 @@ void dispatch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* 
                    int64_t n_in, int64_t n_out, int n_tok, bool rows = false, MmvfAux aux = {}) {
     if (NT > 1 && rows) {
         switch (mmvf_block_size(n_in)) {
-            case 32: launch_mmvf_rows<32, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-            case 64: launch_mmvf_rows<64, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-            case 96: launch_mmvf_rows<96, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-            case 128: launch_mmvf_rows<128, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-            case 160: launch_mmvf_rows<160, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-            case 192: launch_mmvf_rows<192, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-            case 224: launch_mmvf_rows<224, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-            default: launch_mmvf_rows<256, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
+            case 32: launch_mmvf_rows<32, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+            case 64: launch_mmvf_rows<64, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+            case 96: launch_mmvf_rows<96, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+            case 128: launch_mmvf_rows<128, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+            case 160: launch_mmvf_rows<160, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+            case 192: launch_mmvf_rows<192, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+            case 224: launch_mmvf_rows<224, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+            default: launch_mmvf_rows<256, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
         }
         return;
     }
@@ -343,13 +349,17 @@ void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_i
 }
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
-                               int64_t n_in, int64_t n_out, int n_tok, void* stream) {
-    if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
+                               int64_t n_in, int64_t n_out, int n_tok, void* stream, const int32_t* skip_a,
+                               const int32_t* skip_b) {
+    const bool skip = skip_a != nullptr && skip_b != nullptr;
+    if (n_tok == 1 && ldy >= n_out && !skip) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
     if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
     auto& q = queue_for(stream);
-    multi_dispatch(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, n_out >= 64 && rows_form(q, n_in, n_out, n_tok));
+    MmvfAux aux;
+    if (skip) { aux.skip_a = skip_a; aux.skip_b = skip_b; }
+    multi_dispatch(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, n_out >= 64 && rows_form(q, n_in, n_out, n_tok), aux);
     if (!stream) core::Runtime::get().finish(q);
 }
 

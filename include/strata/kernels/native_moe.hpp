@@ -26,6 +26,8 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
 /// native_moe_combine_multi with moe_hit_add folded in (upstream a9917a55's STRATA_FUSE_HITS): the entries listed in
 /// dst[0, *count) (entry = token * k + expert, at most n_tok * k of them) read parts + hits, as the add moe_hit_add makes
 /// in place would leave them; the same bits, one launch fewer.  STRATA_FUSE_HITS=0: the two launches.
+/// `parts` nullptr: every part is zero and none is read (the window whose experts are all resident has no CPU share);
+/// an entry is then 0.0f + its hit row, or zero, the bits the zero-filled parts gave.
 bool native_moe_fuse_hits();
 void native_moe_combine_multi_hits(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
                                    const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k,

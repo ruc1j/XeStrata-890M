@@ -64,11 +64,14 @@ bool native_moe_fuse_hits() {
     return on;
 }
 
-void native_moe_combine_multi_hits(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
-                                   const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k,
-                                   int n_tok, void* stream, const float* shared_gate) {
-    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1 || (shared_gate && !shared) || !hits || !dst || !count)
-        throw std::invalid_argument("native MoE combine (hits) requires a stream, width, 1..15 experts, tokens, hits");
+namespace {
+
+// native_moe_combine_multi_hits' launch.  kParts false: no `parts` rows are read, an entry is its hit row or zero
+// (0.0f + the hit row, the sum the zero-filled parts gave, so the bits are the same).
+template <bool kParts>
+void combine_multi_hits(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
+                        const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k, int n_tok,
+                        void* stream, const float* shared_gate) {
     constexpr int WG = 256;
     const int cap = n_tok * (int) k;
     const size_t cols = (size_t) ((n_embd + WG - 1) / WG) * WG;
@@ -84,17 +87,17 @@ void native_moe_combine_multi_hits(const float* parts, const float* hits, const 
             sycl::group_barrier(it.get_group());
             const int64_t tk = int64_t(it.get_group(0)), col = int64_t(it.get_global_id(1));
             if (col >= n_embd) return;
-            const float* p = parts + tk * k * n_embd;
+            const float* p = kParts ? parts + tk * k * n_embd : nullptr;
             const float* hp = hits + tk * k * n_embd;
             const float* w = weights + tk * k;
             const uint8_t* ht = &hit[(size_t) (tk * k)];
-            const float p0 = ht[0] ? p[col] + hp[col] : p[col];   // moe_hit_add's sum, then its product
-            float sum = p0 * w[0];
-            for (int expert = 1; expert < k; ++expert) {
+            auto entry = [=](int expert) {   // moe_hit_add's sum
                 const int64_t o = int64_t(expert) * n_embd + col;
-                const float pe = ht[expert] ? p[o] + hp[o] : p[o];
-                sum += pe * w[expert];
-            }
+                if constexpr (kParts) return ht[expert] ? p[o] + hp[o] : p[o];
+                else return ht[expert] ? 0.0f + hp[o] : 0.0f;
+            };
+            float sum = entry(0) * w[0];   // then its product
+            for (int expert = 1; expert < k; ++expert) sum += entry(expert) * w[expert];
             if (shared) {
                 float sv = shared[tk * n_embd + col];
                 if (shared_gate) {
@@ -106,6 +109,19 @@ void native_moe_combine_multi_hits(const float* parts, const float* hits, const 
             output[tk * n_embd + col] = sum;
         });
     });
+}
+
+}  // namespace
+
+void native_moe_combine_multi_hits(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
+                                   const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k,
+                                   int n_tok, void* stream, const float* shared_gate) {
+    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1 || (shared_gate && !shared) || !hits || !dst || !count)
+        throw std::invalid_argument("native MoE combine (hits) requires a stream, width, 1..15 experts, tokens, hits");
+    if (parts != nullptr)
+        combine_multi_hits<true>(parts, hits, dst, count, weights, shared, output, n_embd, k, n_tok, stream, shared_gate);
+    else
+        combine_multi_hits<false>(parts, hits, dst, count, weights, shared, output, n_embd, k, n_tok, stream, shared_gate);
 }
 
 void native_moe_combine_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
