@@ -78,10 +78,11 @@ bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64
 /// and its ancestors, or v1 memory.limit_in_bytes), ~0 when there is none - what a container can never exceed.
 struct HostMemory {
     uint64_t available = 0;
-    /// MemAvailable alone, before any cgroup cap: what an allocation the cgroup is NOT charged for may use.  A GPU
-    /// cache on an APU is such an allocation (its GTT pages, or the host USM, are the driver's: memcg never charges
-    /// them), and MemAvailable already counts them as used RAM, so this is the honest budget for one (shoftee/Strata
-    /// 48defc12e).  Host allocations keep `available`, the cgroup's cap.
+    /// MemAvailable alone, before any cgroup cap: what an allocation the cgroup is NOT charged for could use (pages
+    /// the GPU driver owns, which memcg never charges; shoftee/Strata 48defc12e sized the host-USM cache from it).
+    /// No cache is sized from it now: the GPU caches from the device's report, and XeStrata-890M's cache in host USM
+    /// (STRATA_CACHE_HOST=1) from `available`, since its hipHostMalloc pages are the process's anonymous pages,
+    /// charged to its cgroup.  generate reports it beside `available` (the cache's total, the memory guard's log).
     uint64_t mem_available = 0;
     uint64_t cgroup_limit = ~uint64_t{0};
 };

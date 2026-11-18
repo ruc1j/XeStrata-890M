@@ -5755,7 +5755,8 @@ int main(int argc, char** argv) {
     }
     // STRATA_CACHE_HOST=1: the expert cache in host USM (ExpertCache::set_host_usm), on a GPU that shares the host's
     // RAM only.  Its slots then come out of the RAM, not the GPU's pool: the sizing below counts what Linux can give
-    // (MemAvailable, less STRATA_UMA_HEADROOM_GIB as for any integrated GPU) instead of the free VRAM.
+    // (MemAvailable within the process's cgroup, less STRATA_UMA_HEADROOM_GIB as for any integrated GPU) instead of the
+    // free VRAM.
     const bool cache_host = [&] {
         const char* v = std::getenv("STRATA_CACHE_HOST");
         if (v == nullptr || v[0] != '1' || multi_gpu) return false;
@@ -5770,14 +5771,20 @@ int main(int argc, char** argv) {
         if (!cache_host) return strata::gpu::mem_info(free_b, total_b);
         strata::core::detail::HostMemory hm;
         if (!strata::core::detail::host_available_memory(hm)) return false;
-        // the cache's pages are the driver's (host USM), which memcg never charges: sized from the RAM the OS has
-        // available (MemAvailable), not from the cgroup's cap, which a cap set low on purpose made read as "no room"
-        // (shoftee/Strata 48defc12e); the host allocations keep the cap
-        uint64_t f = hm.mem_available != 0 ? hm.mem_available : hm.available;
-        if (hm.mem_available != 0 && hm.available < hm.mem_available)
-            std::fprintf(stderr, "strata generate: the expert cache is sized from the RAM Linux has available (%.2f GiB), not from "
-                                 "this cgroup's cap (%.2f GiB left): the cache's memory is not charged to the cgroup\n",
-                         (double) hm.mem_available / 1073741824.0, (double) hm.available / 1073741824.0);
+        // the cache's pages (hipHostMalloc) are the process's anonymous pages, charged to its memory cgroup: on the 890M
+        // (ROCm 7.2, Linux 7.2) a 38 GiB cache showed as 39.7 GiB of RssAnon and in the cgroup's anon (2026-11-16), and
+        // 1 GiB of hipHostMalloc(NonCoherent) raised memory.current by 1 GiB (2026-11-19).  So the cache is sized
+        // within the cgroup's cap (hm.available), not from MemAvailable as shoftee/Strata 48defc12e sizes a cache in
+        // the GPU's own pages: one over the cap would be swapped out (which stops the queues, see lock_host_slots) or
+        // killed.  The log says so when the cap is what holds it back
+        uint64_t f = hm.available;
+        static bool said_cap = false;   // the sizing asks again as the reserve adapts: said once
+        if (hm.mem_available != 0 && hm.available < hm.mem_available && !said_cap) {
+            said_cap = true;
+            std::fprintf(stderr, "strata generate: the expert cache is sized within this cgroup's memory limit (%.2f GiB left, "
+                                 "against %.2f GiB Linux has available): its pages are charged to the cgroup\n",
+                         (double) hm.available / 1073741824.0, (double) hm.mem_available / 1073741824.0);
+        }
         strata::core::apply_uma_limit(f);
         *free_b = (size_t) f;
         *total_b = (size_t) hm.mem_available != 0 ? (size_t) hm.mem_available : (size_t) hm.available;

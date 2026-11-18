@@ -437,7 +437,7 @@ Ben1078 の e8e0cdc40（GGUF のメタデータだけの shard）は、この fo
 
 ### 統合 GPU のメモリーの決め方と expert source の上限の検査（Issue #67）
 
-shoftee/Strata の 3 つを移しました。expert cache の大きさは cgroup の上限で丸めた値でなく `MemAvailable` から決め（48defc12e。cache のページは cgroup に課金されない）、統合 GPU の `--serve` で `--conversation-cache-mib N` を書いたときは自動の expert cache の reserve に N を足し（ff5809230）、ArenaExpertSource の prefetch・release・pinned に層の上限の検査を足しました（f6094ff1e。172K〜190K の prompt で表の外を読んで止まっていた）。fatal signal の backtrace は入れていません。
+shoftee/Strata の 3 つを移しました。expert cache の大きさは cgroup の上限で丸めた値でなく `MemAvailable` から決め（48defc12e。cache のページは cgroup に課金されない。ただし host USM に置く cache はプロセスのページで課金されるので、2026-11-19 から cgroup の上限の中で決めています）、統合 GPU の `--serve` で `--conversation-cache-mib N` を書いたときは自動の expert cache の reserve に N を足し（ff5809230）、ArenaExpertSource の prefetch・release・pinned に層の上限の検査を足しました（f6094ff1e。172K〜190K の prompt で表の外を読んで止まっていた）。fatal signal の backtrace は入れていません。
 Ben1078 の bd0e37bb4（HIP の expert の arena の mlock）は入れていません。mmap のエキスパートはページキャッシュで、mlock の対象ではありません。host USM に置く expert cache はプロセスのページで、ドライバーは固定せず、swap に出ることがありました。そのため、あとからエンジンがこのキャッシュを自分で `mlock` で固定するようにしました（[Strata 0.1.59 の取り込み](#strata-0159-の取り込みqwen-4-の形状)）。
 
 ### lookup の窓と MTP の窓で別の費用の表、O_DIRECT の開き直し（Issue #64）
