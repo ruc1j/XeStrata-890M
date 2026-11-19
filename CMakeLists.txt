@@ -1352,6 +1352,12 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(${pool_test} PRIVATE Threads::Threads)
     add_test(NAME ${pool_test} COMMAND ${pool_test})
   endforeach()
+  # #6052 (upstream 2c8d300ad): the periodic conversation checkpoints (--prompt-cache-every) on the resumed request's
+  # grid (header-only)
+  add_executable(prompt_checkpoint_grid_test src/core/prompt_checkpoint_grid_test.cpp)
+  target_include_directories(prompt_checkpoint_grid_test PRIVATE include)
+  target_compile_features(prompt_checkpoint_grid_test PRIVATE cxx_std_17)
+  add_test(NAME prompt_checkpoint_grid_test COMMAND prompt_checkpoint_grid_test)
   # #5697 (upstream 8c71c4927): an evicted parked conversation gives its RAM back to the system (glibc's heap; RSS before
   # and after)
   add_executable(conversation_heap_test src/core/conversation_heap_test.cpp)

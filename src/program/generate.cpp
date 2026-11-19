@@ -24,6 +24,7 @@
 #include "strata/program/done_line.hpp"
 #include "strata/program/shared_options.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/prompt_checkpoint_grid.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/logit_bias.hpp"
@@ -8778,6 +8779,7 @@ int main(int argc, char** argv) {
             return park_source(src, held);
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
+        int64_t pp_check_anchor = 0;   // #6052: where the request resumed: the periodic checkpoints sit on its grid
         bool pp_tail_saved = false;
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
         // mid-read reports as read, instead of the whole prompt
@@ -8998,7 +9000,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
                                          "above); the request goes on without it\n", (long long) done);
                 }
-                if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
+                if (periodic_checkpoint)
+                    pp_next_check = strata::core::next_periodic_checkpoint(pp_check_anchor, done, o.prompt_cache_every);
                 if (tail_checkpoint) pp_tail_saved = true;
             }
             return true;
@@ -9012,7 +9015,7 @@ int main(int argc, char** argv) {
                 strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
                     if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
-                    part_next[i] = done + o.prompt_cache_every;
+                    part_next[i] = strata::core::next_periodic_checkpoint(pp_check_anchor, done, o.prompt_cache_every);
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
                     if (!checkpoint_save(part, stage_ss, g)) {
@@ -12086,6 +12089,7 @@ int main(int argc, char** argv) {
             pp_from = read_from;
             pp_reached = read_from;
             pp_t0 = r0;
+            pp_check_anchor = resume;
             pp_next_check = reread_to > 0 || !req_ckpt ? INT64_MAX : resume + o.prompt_cache_every;   // ckpt=0: none
             pp_tail_saved = reread_to > 0 || !req_ckpt;   // ckpt=0 (#861): no tail checkpoint either
             {
