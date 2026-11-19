@@ -1022,6 +1022,12 @@ print(r.choices[0].message.content)
   エージェントの 1,462 ターンでは、意図どおりに読めたのがこれで 98.3%、なしで 92.9% でした。
   `xestrata-<model>.json` に `"tool_call_recovery": false` を書くと、これを切ります。
   それでも呼び出しとして読めない `<tool_call>` の塊は、server のウィンドウで数を出します。
+  ツールを宣言した要求の返答が、server の動かさない呼び出しの形（宣言していないツールの名前、終わりの前で切れた呼び出し、呼び出しとして読めない塊）で終わったときは、同じ要求の中で 1 回だけ書き直させます（upstream e05e6e0cc）。
+  その形の部分は送らずに止めておき、宣言したツール（と、書かれた名前にいちばん近いもの）を挙げた短い注意をモデルに読ませて、新しい返答で置き換えます。
+  推し量った名前で動かすことはありません。
+  `/metrics/prometheus` は、書き直した数を `strata:tool_markup_retries_total` で数えます。
+  それでもその形で終わった返答には、`strata_unread_tool_markup`（`reason` は `cut_off` か `unreadable`、`chars`）を付けます。
+  `xestrata-<model>.json` に `"tool_markup_retry": false` を書くか、環境変数を `STRATA_TOOL_MARKUP_RETRY=0` にすると、前のように文として送ります。
 - **呼び出しの読み手が直すもの、直さないもの**: 文字列の引数が呼び出しを丸ごと引用していても、自分の `</parameter><parameter=NAME>` を繰り返していても、値はそのままです（upstream #4078）。
   `</function>` の抜けた呼び出しは、回答の中でも思考の中でも呼び出しとして読みます（upstream #4427）。
   ツールが配列かオブジェクトと宣言した引数（または型を宣言していない引数）に書き損じがあれば、書かれたとおりに読みます: 末尾や二重のカンマ、一重引用符や `True`・`False`・`None`、オブジェクトのメンバーの間の裸の文字列（`"status": "pending", "in_progress", "pending": false`）、最後に閉じていない括弧。

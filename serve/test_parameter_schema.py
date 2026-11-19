@@ -163,7 +163,9 @@ class ParameterSchema(unittest.TestCase):
                                   stream_tools=True)
             events = parser.feed('<tool_call>\n<function=f>\n<parameter=x>\n"1"')
             partial = "".join(e.text for e in events if e.kind == "tool_args")
-            self.assertEqual(partial != '{"x":', immediate)
+            # a constrained value is held until the call closes (upstream #5493: its key goes out once, with the value
+            # the final call has), so nothing of it streams yet
+            self.assertEqual(partial, '{"x":"\\"1\\"' if immediate else "{")
 
 
 @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is not installed")

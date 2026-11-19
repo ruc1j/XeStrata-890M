@@ -2440,7 +2440,7 @@ class EngineDeath(unittest.TestCase):
                                      ("/v1/responses", {"model": "m", "input": "hi"}, "response.failed")):
                 with self.subTest(path):
                     text = post(path, {**body, "stream": True})
-                    self.assertIn("internal error (RuntimeError: a bug)", text)
+                    self.assertIn("the server failed while answering", text)   # the details: the log only
                     self.assertIn(said, text)
             svc.engine = MockEngine(tok, "</think>\n\n<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n"
                                          "</function>\n</tool_call>", max_context=CTX)
@@ -3296,6 +3296,68 @@ class ConfigReasoningEffort(unittest.TestCase):
         self.assertEqual(cfg, {"args": ["--ctx", "4096"]})
 
 
+class LoadSharedSettings(unittest.TestCase):
+    """#4933: one unknown key in `.shared-settings.json` used to clear EVERY shared setting, silently.
+
+    The strict reader stays for POST /settings, where a client can be told which key is wrong.  At start-up the file
+    is read key by key instead: the keys the server understands keep applying and each one it does not is named and
+    skipped.  A file that cannot be parsed, or is not an object, is still ignored as a whole."""
+
+    def load(self, text):
+        from serve.server import load_shared_settings
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "x.shared-settings.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        said = []
+        got = load_shared_settings(path, warn=said.append)
+        return got, said
+
+    def test_two_known_keys_are_both_kept(self):
+        got, said = self.load('{"reasoning_effort": "medium", "top_p": 0.9}')
+        self.assertEqual(got, {"reasoning_effort": "medium", "top_p": 0.9})
+        self.assertEqual(said, [])
+
+    def test_an_unknown_key_no_longer_clears_the_known_ones(self):
+        # A made-up key, and not `preserve_thinking`: #4932 teaches the server that name, so on a tree carrying both
+        # changes this example would be a KNOWN key and the test would pass without exercising anything.
+        got, said = self.load('{"reasoning_effort": "medium", "preserve_thoughts": false}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertEqual(len(said), 1)
+        self.assertIn("preserve_thoughts", said[0])
+        self.assertIn("skipped", said[0])
+
+    def test_a_known_key_with_a_bad_value_is_named_and_skipped(self):
+        got, said = self.load('{"reasoning_effort": "medium", "top_p": 5}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertIn("top_p", said[0])
+
+    def test_several_bad_keys_are_each_named(self):
+        got, said = self.load('{"reasoning_effort": "medium", "nope": 1, "top_k": 900}')
+        self.assertEqual(got, {"reasoning_effort": "medium"})
+        self.assertEqual(len(said), 2)
+
+    def test_an_unreadable_file_is_ignored_whole_and_says_so(self):
+        got, said = self.load('{not json')
+        self.assertEqual(got, {})
+        self.assertEqual(len(said), 1)
+        self.assertIn("ignored", said[0])
+
+    def test_a_non_object_is_ignored_whole_and_says_so(self):
+        got, said = self.load('["reasoning_effort"]')
+        self.assertEqual(got, {})
+        self.assertEqual(len(said), 1)
+        self.assertIn("ignored", said[0])
+
+    def test_a_missing_file_is_quiet(self):
+        from serve.server import load_shared_settings
+        said = []
+        self.assertEqual(load_shared_settings(os.path.join(tempfile.gettempdir(), "no-such-file-4933.json"),
+                                              warn=said.append), {})
+        self.assertEqual(said, [])              # no file is the normal case: nothing to report
+
+
 class JoinedEngineArgs(unittest.TestCase):
     """#2267: "--ple-io mmap" written as one element of the config's args reached the engine as one argument."""
 
@@ -4108,6 +4170,25 @@ class SharingTheGpu(unittest.TestCase):
         self.svc.free_vram_mib = lambda: 20000                      # the peer let go: the next try loads
         self.assertEqual(self._raw_chat()[0], 200)
 
+    def test_gpu_refusal_on_responses_sends_retry_after_too(self):
+        """The same refusal as above on /v1/responses: docs/DETAILS.md promises the header with no route limit."""
+        self.svc.min_free_vram_mib = 8000
+        self.svc.free_vram_mib = lambda: 2000
+        self.svc.vram_free_wait_s = 0.2                              # (not the 15 s wait for memory)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self.svc.unload()
+                r = urllib.request.Request(self.base + "/v1/responses",
+                                           data=json.dumps({"model": "m", "input": "hi", "stream": stream}).encode(),
+                                           headers={"Content-Type": "application/json"}, method="POST")
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(r, timeout=30)
+                with caught.exception as e:
+                    self.assertEqual(e.code, 503)
+                    self.assertEqual(e.headers["Retry-After"], "15")
+                    self.assertIn("in use by another program", json.loads(e.read())["error"]["message"])
+                self.assertEqual(self.engine.starts, 0)
+
     def test_before_load_strict_refuses_even_with_free_vram(self):
         self.svc.before_load = [sys.executable, "-c", "import sys; sys.exit(7)"]
         self.svc.before_load_strict = True
@@ -4663,6 +4744,30 @@ class ForcedToolChoice(unittest.TestCase):
                 if not stream:
                     # the text is untouched
                     self.assertIn("<function=execute_gdscript>", b["choices"][0]["message"]["content"])
+
+    def test_an_undeclared_call_names_the_closest_declared_tool_and_runs_nothing(self):
+        """#5904 / #5933 / #4622: `read_file` for a declared `read` stays text with finish "stop" (nothing runs under a
+        guessed name); the marker names the closest declared tool as a hint.  A name close to nothing gets no hint."""
+        tools = [{"type": "function", "function": {"name": n, "description": n, "parameters": {
+            "type": "object", "properties": {"q": {"type": "string"}}}}} for n in ("read", "write", "search")]
+        for written, hint in (("read_file", "read"), ("Write", "write"), ("serch", "search"),
+                              ("execute_gdscript", None)):
+            self.says(self._undeclared_call_answer(written))
+            for stream in (False, True):
+                with self.subTest(written=written, stream=stream):
+                    code, b = self.openai(stream=stream, tools=tools)
+                    finish, calls, _ = self.call_of(code, b, stream)
+                    self.assertEqual((finish, calls), ("stop", []), b)
+                    want = {"name": written, "reason": "undeclared", **({"closest_declared": hint} if hint else {})}
+                    self.assertEqual(self._rejected_of(b, stream), [want])
+
+    def test_closest_declared(self):
+        from serve.server import closest_declared
+        self.assertEqual(closest_declared("read_file", ["read", "write"]), "read")
+        self.assertEqual(closest_declared("ReadFile", ["read_file", "write"]), "read_file")
+        self.assertIsNone(closest_declared("file", ["read_file", "write_file"]))      # two candidates: no guess
+        self.assertIsNone(closest_declared("gashfunction_calls", ["grep", "read"]))
+        self.assertIsNone(closest_declared("x", []))
 
     def test_undeclared_tool_calls_call_hands_the_call_to_the_client(self):
         """#4622: "undeclared_tool_calls": "call" returns the well-formed call of an undeclared name as a tool call (the
@@ -6494,7 +6599,9 @@ class OpenAIChunksTerminal(unittest.TestCase):
     def test_a_cancelled_run_that_stops_early_is_not_an_error(self):
         gone = threading.Event()
         gone.set()                                   # the client left: nobody reads the end
-        self.assertEqual(len(self.chunks([], cancel=gone)), 1)
+        # #4758: the role chunk goes out with the first data, and a run that stopped before any has none: no chunk
+        # at all, and no error either
+        self.assertEqual(self.chunks([], cancel=gone), [])
 
 
 if __name__ == "__main__":
@@ -6643,3 +6750,122 @@ class ImageEditForm(unittest.TestCase):
         self.assertEqual((fields["num_inference_steps"], fields["guidance_scale"], fields["true_cfg_scale"]),
                          (4, 2.5, 2.5))
         self.assertIsInstance(fields["guidance_scale"], float)
+
+
+class ToolCallParameterCoercionAndDedup(unittest.TestCase):
+    """Repeated non-string parameters (the model rewrites an array/object parameter in the same call), Python booleans
+    (`True`/`False`), and empty/`null`/`None` non-string parameters produce identical valid JSON in both whole and
+    streamed (`stream_tools=True`) parsing."""
+
+    SCHEMA = [
+        {
+            "name": "fit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "free": {"type": "array"},
+                    "bounds": {"type": "array"},
+                    "dry_run": {"type": "boolean"},
+                    "timeout": {"type": "integer"},
+                    "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    "count": {"type": "integer"},
+                },
+            },
+        }
+    ]
+
+    def test_a_rewrite_further_down_the_call_streams_once_with_the_later_value(self):
+        # (our fix-up) the PR's check of a parameter that follows itself covered the adjacent rewrite only: a rewrite
+        # after another parameter streamed both writes (two JSON keys) or the earlier one
+        body = ("<tool_call>\n<function=fit>\n"
+                "<parameter=bounds>\n[1, 2]\n</parameter>\n"
+                "<parameter=path>\ncurve.dat\n</parameter>\n"
+                "<parameter=bounds>\n[10, 20]\n</parameter>\n"
+                "<parameter=timeout>\n5\n</parameter>\n"
+                "<parameter=timeout>\n7\n</parameter>\n"
+                "</function>\n</tool_call>")
+        self.check(body, {"path": "curve.dat", "bounds": [10, 20], "timeout": 7})
+        for step in (1, 7, 10_000):
+            evs = self.events(body, step)
+            streamed = "".join(e.text for e in evs if e.kind == "tool_args")
+            self.assertEqual(streamed.count('"bounds"'), 1, streamed)
+            self.assertEqual(streamed.count('"timeout"'), 1, streamed)
+
+    def test_null_where_the_type_allows_it_and_false_and_zero_kept(self):
+        # (our fix-up) a null placeholder is null when the declared type allows null, not left out; false and 0 stay
+        body = ("<tool_call>\n<function=fit>\n"
+                "<parameter=limit>\nNone\n</parameter>\n"
+                "<parameter=dry_run>\nfalse\n</parameter>\n"
+                "<parameter=count>\n0\n</parameter>\n"
+                "</function>\n</tool_call>")
+        self.check(body, {"limit": None, "dry_run": False, "count": 0})
+
+    def test_without_a_schema_a_none_stays_text(self):
+        from serve.frontend import parse_tool_call
+        call = parse_tool_call("<function=other>\n<parameter=x>\nNone\n</parameter>\n</function>", None)
+        self.assertEqual(call.arguments, {"x": "None"})
+
+    def events(self, body: str, step: int):
+        from serve.frontend import OutputParser
+        text = "</think>\n\n" + body
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=True, recover=True)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        return evs + p.finish()
+
+    def parse(self, body: str, stream_tools: bool, step: int):
+        from serve.frontend import OutputParser
+        text = "</think>\n\n" + body
+        p = OutputParser(thinking=True, tools=self.SCHEMA, stream_tools=stream_tools, recover=True)
+        evs = []
+        for i in range(0, len(text), step):
+            evs += p.feed(text[i:i + step])
+        evs += p.finish()
+        made = [e.call for e in evs if e.kind == "tool_call" and e.call is not None]
+        calls = [(c.name, c.arguments) for c in made]
+        if stream_tools:
+            for c in made:
+                streamed = "".join(
+                    e.text for e in evs if e.kind == "tool_args" and e.call is not None and e.call.id == c.id
+                )
+                self.assertEqual(json.loads(streamed), c.arguments)
+        return calls
+
+    def check(self, body: str, expected_args: dict):
+        for stream_tools in (False, True):
+            for step in (1, 5, 19, 10_000):
+                with self.subTest(stream_tools=stream_tools, step=step):
+                    self.assertEqual(self.parse(body, stream_tools, step), [("fit", expected_args)])
+
+    def test_duplicate_array_parameter_uses_last_occurrence(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=path>\ncurve.dat\n</parameter>\n"
+            "<parameter=bounds>\n[{\"min\": 1, \"max\": 2}]\n</parameter>\n"
+            "<parameter=bounds>\n[{\"min\": 10, \"max\": 20}]\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {"path": "curve.dat", "bounds": [{"min": 10, "max": 20}]})
+
+    def test_python_booleans_and_empty_or_null_non_strings(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=path>\ncurve.dat\n</parameter>\n"
+            "<parameter=dry_run>\nTrue\n</parameter>\n"
+            "<parameter=free>\nnull\n</parameter>\n"
+            "<parameter=bounds>\nNone\n</parameter>\n"
+            "<parameter=timeout>\n\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {"path": "curve.dat", "dry_run": True})
+
+    def test_only_skipped_non_string_parameters_yield_empty_object(self):
+        body = (
+            "<tool_call>\n<function=fit>\n"
+            "<parameter=free>\nnull\n</parameter>\n"
+            "<parameter=timeout>\nNone\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        self.check(body, {})

@@ -1111,6 +1111,12 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   On 1,462 agent turns 98.3% read as intended with it and 92.9% without.
   `"tool_call_recovery": false` in `xestrata-<model>.json` turns it off.
   A `<tool_call>` block that still does not read as a call is counted in the server window.
+  A reply to a request with tools that ends in tool-call markup the server does not run (a tool name the request did not declare, a call cut off before its end, a block that reads as no call) is written again once, inside the same request (upstream e05e6e0cc).
+  The markup is held back, the model reads a short note naming the declared tools (and the one closest to the name it wrote), and its new reply takes the markup's place.
+  Nothing is run under a guessed name.
+  `/metrics/prometheus` counts the retries in `strata:tool_markup_retries_total`.
+  A reply that still ends in such markup carries `strata_unread_tool_markup` (`reason`: `cut_off` or `unreadable`, `chars`).
+  `"tool_markup_retry": false` in `xestrata-<model>.json`, or `STRATA_TOOL_MARKUP_RETRY=0` in the environment, sends the markup as text, as before.
 - **What the parser repairs, and what it leaves.** A string argument that quotes a whole tool call, or repeats its own `</parameter><parameter=NAME>`, stays exact (upstream #4078).
   A call whose `</function>` was left out is read as the call (upstream #4427), in the answer and inside the thinking.
   An argument the tool declares as an array or an object, or declares nothing for, is read as written when it has a slip in it: a trailing or doubled comma, single quotes or `True`/`False`/`None`, a bare string between two members of an object (`"status": "pending", "in_progress", "pending": false`), brackets left open at the end.

@@ -69,8 +69,9 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a 
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve.childenv import quiet_crash_env  # noqa: E402
-from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
-                            OutputParser, ToolCall, allowed_tools, anthropic_format, anthropic_to_messages,
+from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END,  # noqa: E402
+                            ChatTemplate, Event, GlmOutputParser, HarmonyParser, OutputParser, ToolCall, allowed_tools,
+                            anthropic_format, anthropic_to_messages,
                             anthropic_tools,
                             custom_tool_names, forced_call, images_of, legacy_function_call, legacy_functions,
                             literal_tags, thinking_signature, mark_think_literals,
@@ -221,6 +222,15 @@ REPEAT_STOP_TOKENS = 256
 ANSWER_ROOM_MIN_CAP = 1024
 # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 ANSWER_RESERVE_MIN = 512
+FIT_MIN_ROOM = 1024          # #5924: fit_max_tokens never shortens max_tokens below this (a 400 instead; see fit_floor)
+
+
+def fit_floor(ctx: int) -> int:
+    """#5924: the least room fit_max_tokens shortens a max_tokens to: FIT_MIN_ROOM (thinking plus an answer or a tool
+    call), at most a quarter of a small context (test and tiny contexts keep their shortening)."""
+    return max(1, min(FIT_MIN_ROOM, (ctx - CTX_SLACK) // 4))
+
+
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -308,11 +318,14 @@ class ContextOverflow(ValueError):
     long", and shortens max_tokens on "input length and `max_tokens` exceed context limit") then does what it does for
     Anthropic's own error (#4838)."""
 
-    def __init__(self, text, *, prompt, context, max_new=None):
+    def __init__(self, text, *, prompt, context, max_new=None, min_room=None):
         super().__init__(text)
-        self.prompt, self.context, self.max_new = prompt, context, max_new
+        self.prompt, self.context, self.max_new, self.min_room = prompt, context, max_new, min_room
 
     def anthropic_text(self) -> str:
+        if self.min_room:              # #5924: room left, but less than an answer needs: the client should compact
+            return (f"prompt is too long: {self.prompt} tokens > {self.context - CTX_SLACK - self.min_room} maximum; "
+                    f"{self}")
         largest = self.context - CTX_SLACK - 1     # the largest prompt that still leaves a token
         if self.max_new is None or self.prompt > largest:     # the prompt alone leaves no room
             return f"prompt is too long: {self.prompt} tokens > {largest} maximum; {self}"
@@ -387,6 +400,9 @@ VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 600.0)   # a first GPU st
 VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
 ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
 
+# A stalled peer must release the request turn; 0 preserves unbounded socket waits.
+PEER_STALL_S = _timeout_env("STRATA_PEER_STALL_S", 120.0)
+
 
 # ------------------------------------------------------------------------------------------------ engines
 class Engine(Protocol):
@@ -428,6 +444,13 @@ class EngineDied(RuntimeError):
     restarts = True
 
 
+class EngineClosing(EngineDied):
+    """#6055: the server stopped (or unloaded) the engine under a request it had already accepted, and the engine ended
+    that request on the close's STOP before it finished.  The request failed; it did not end by itself: never a
+    successful reply with no tokens and finish "length".  Nothing restarts the engine for it."""
+    restarts = False
+
+
 def died_note(e: Exception) -> str:
     """What an API error says about an EngineDied: the cause, and that the next request restarts the engine - only
     where it really is ended."""
@@ -442,6 +465,10 @@ class EngineStarting(RuntimeError):
 class ClientGone(Exception):
     """#1999: the client hung up while its request was being prepared (an image URL downloading, a picture encoding or
     waiting for its turn): nothing is left to answer."""
+
+
+class ServerStopping(RuntimeError):
+    """The drain deadline (--shutdown-timeout) cancelled a request whose client may still be waiting for its answer."""
 
 
 class ModelBusy(RuntimeError):
@@ -1165,6 +1192,7 @@ class StrataEngine:
         if self.info.get("engine"):
             self.info["version"] = str(self.info["engine"])
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
+        self.closing = False                            # #6055: close() is ending this engine (set before its STOP)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         # which engine process this is (a request notes its own); first, so a request that sees the new number sees
         # the new queues (#4451)
@@ -1588,6 +1616,9 @@ class StrataEngine:
                 proc.stdin.write(text + "\n")
                 proc.stdin.flush()
         except (OSError, ValueError):                    # the pipe is gone (closed: ValueError): the engine died
+            # #6055: or close() closed stdin - a write then raises ValueError, which reached the client as a 400
+            if getattr(self, "closing", False):
+                raise EngineClosing("this instance is draining; retry against the next instance") from None
             raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
 
     def _send_for(self, born: int, text: str):
@@ -1701,6 +1732,13 @@ class StrataEngine:
                 self._ctl_result = ("done", None)
                 return
 
+    def _raise_if_closed_under(self, finish: str | None, cancel: threading.Event) -> None:
+        """#6055: a request the engine ended with "cancel" although the request itself was not cancelled, while close()
+        is ending the engine: close()'s STOP cut it off.  It failed (EngineClosing, a 503 the client can retry), where
+        it used to end as a successful reply with the tokens so far (none, while its prompt was read) and "length"."""
+        if finish == "cancel" and getattr(self, "closing", False) and not cancel.is_set():
+            raise EngineClosing("this instance is draining; retry against the next instance")
+
     def _done_finish(self) -> str | None:
         """The finish field of the DONE line the control lines read last (None: none since it was cleared)."""
         f = (getattr(self, "_last_done", None) or "").split()
@@ -1795,8 +1833,14 @@ class StrataEngine:
         except EngineDied:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
-        releasing = self.slot_releasing
-        releasing.add(slot)
+        releasing, claims = self.slot_releasing, self.slot_claims
+        if self.gen != born:     # #5657: a restart came in since the check above (its number moves before its objects
+            return               # do): these sets may be the NEW engine's, whose request holds this slot number now
+        with self.slot_cv:
+            # Transfer the claim before the waiter can free the slot. A queued BDONE may let the next request
+            # claim it immediately; the previous request must not discard that new claim afterwards.
+            releasing.add(slot)
+            claims.discard(slot)
 
         def wait():
             end = time.monotonic() + self.QUARANTINE_S      # no-progress limit: every line of the slot starts it again
@@ -2237,6 +2281,8 @@ class StrataEngine:
                         yield t
                     if not cont and self._done_finish() == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (upstream Strata #879)")
+                    if not cont:
+                        self._raise_if_closed_under(self._done_finish(), cancel)   # #6055
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         yielded_legs.append(self.last)
                         continue                            # gave way: again once the shorter request is in
@@ -2288,6 +2334,7 @@ class StrataEngine:
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (upstream Strata #879)")
+                        self._raise_if_closed_under(f[3] if len(f) > 3 else None, cancel)   # #6055
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in self.eos_ids)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
@@ -2382,7 +2429,6 @@ class StrataEngine:
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self._release_slot_when_done(slot, stream, born)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
@@ -2504,6 +2550,9 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
         self.own_lp_lines(sampling, cancel)             # this request's LP lines only
+        # the engine this request runs on, and its line queue (#5573: its STOP goes to it, never to a successor, and the
+        # drain after an early stop reads its lines, not the successor's)
+        proc0, lines_q = self.proc, self.lines
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -2511,10 +2560,13 @@ class StrataEngine:
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
             head = "GEN 0 prefill=1"
+        line = f"{head} {','.join(str(int(t)) for t in ids)}\n"   # (a bad id stays the request's own ValueError)
         try:
-            self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+            self.proc.stdin.write(line)
             self.proc.stdin.flush()
-        except (OSError, ValueError):                    # the pipe is gone (closed: ValueError): the engine died
+        except (OSError, ValueError, EngineDied):        # the pipe is gone (closed: ValueError): the engine died
+            if getattr(self, "closing", False):         # #6055: or close() closed it (a write then raises ValueError)
+                raise EngineClosing("this instance is draining; retry against the next instance") from None
             raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
@@ -2588,6 +2640,7 @@ class StrataEngine:
                     done = True
                     if self.last.get("finish") == "nonfinite":   # #879
                         raise EngineNonFinite("the engine's logits became non-finite (upstream Strata #879)")
+                    self._raise_if_closed_under(self.last.get("finish"), cancel)
                     return
                 elif line.startswith("ERR"):
                     done = True
@@ -2599,6 +2652,9 @@ class StrataEngine:
                 # stdin (a write then raises ValueError) before it clears `proc` (None then) - the STOP has nobody to
                 # reach, and the request's own outcome must not be replaced by that error
                 proc = self.proc
+                # #5573: a restart replaced the engine; a STOP would end its successor's request
+                if proc is not proc0:
+                    proc = None
                 if self.can_stop and proc is not None:
                     try:
                         proc.stdin.write("STOP\n")
@@ -2614,7 +2670,7 @@ class StrataEngine:
                     try:
                         if left is not None and left <= 0:
                             raise queue.Empty
-                        line = self.lines.get(timeout=left)
+                        line = lines_q.get(timeout=left)
                     except queue.Empty:
                         raise self._silent("the engine did not finish the request after it was stopped (STOP) "
                                            f"within {allow:.0f} s") from None
@@ -2811,6 +2867,8 @@ class StrataEngine:
         try:
             if self.proc.poll() is None:
                 try:
+                    # #6055: marked first, so a request still running fails (EngineClosing) instead of ending as a reply
+                    self.closing = True
                     if self.can_stop:        # an engine in a request finishes it and frees its memory itself (shoftee
                         self.proc.stdin.write("STOP\n")   # 2feece509: a busy stop 20 s -> ~1 s, exit code -15 -> 0)
                     self.proc.stdin.write("QUIT\n")
@@ -3754,6 +3812,22 @@ def model_switcher(svc, mode: str = "") -> dict:
 OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
 
 
+def token_limit(value, name: str):
+    """#4037: a reply's token limit (max_tokens, max_completion_tokens) is a whole number: 1 or more, or -1 / 0 for no
+    cap (docs/DETAILS.md).  None (absent or null) stays None.  A whole number written as a float (4096.0) or as a string
+    of digits with an optional sign ("1024": clients rely on it, as int() always took it) is converted.  A boolean, a
+    fraction (2.5, "2.5"), any other string or any other type is refused: int() used to turn true into 1 and 2.5 into 2.
+    ValueError = a 400."""
+    if value is None:
+        return None
+    if isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+", value):
+        value = int(value)
+    fraction = isinstance(value, float) and not value.is_integer()
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or fraction or value < -1:
+        raise ValueError(f"{name} must be a whole number, 1 or more, or -1 or 0 for no cap")
+    return int(value)
+
+
 def stop_strings(req: dict) -> list[str]:
     """The request's stop strings: OpenAI's `stop` (a string or a list of up to 4) or Anthropic's `stop_sequences`
     (a list).  Empty strings are left out.  A bad value is a ValueError, so a 400 before anything is generated."""
@@ -3961,6 +4035,11 @@ class Service:
         self.undeclared_tool_calls = "text"
         # on unless the config's "tool_call_recovery" is false: tool calls in forms next to the template's
         self.tool_call_recovery = True
+        # upstream e05e6e0cc (a): a reply to a request with tools that ends in tool-call markup that is no call is
+        # written again once (default on; STRATA_TOOL_MARKUP_RETRY=0 or the config's "tool_markup_retry": false sends it
+        # as text)
+        self.tool_markup_retry = os.environ.get("STRATA_TOOL_MARKUP_RETRY", "1").strip().lower() not in (
+            "0", "off", "false", "no")
         self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = stop_token_ids(tokenizer)
@@ -4745,6 +4824,10 @@ class Service:
             ("strata:tool_calls_unread_total", "counter",
              "<tool_call> blocks returned as text (an undeclared name or a form the template does not use)",
              t.get("tool_calls_unread", 0)),
+            ("strata:tool_markup_retries_total", "counter",
+             "Replies that ended in tool-call markup that is no call and were written again once "
+             "(STRATA_TOOL_MARKUP_RETRY)",
+             t.get("tool_markup_retries", 0)),
             ("strata:tool_args_repaired_total", "counter",
              "Tool call arguments (a JSON array or object) that were damaged and read as written",
              t.get("tool_args_repaired", 0)),
@@ -5063,6 +5146,17 @@ class Service:
                                       f"({ctx}); requests are never truncated", prompt=len(ids), context=ctx)
             max_new = room
         elif max_new > room:
+            floor = fit_floor(ctx)
+            if self.fit_max_tokens and room < floor:
+                # #5924: a clamp to a few hundred tokens left a thinking model no room to answer (or to write a tool
+                # call); agents resent the turn and wrote the same truncated sentence again and again.  The context is
+                # all but full: a 400 that says so makes the client compact (Claude Code reads "prompt is too long").
+                self.forget_prompt(encoded_ids)
+                raise ContextOverflow("request exceeds the context window: "
+                                      f"the prompt ({len(ids)} tokens) leaves {max(0, room)} of the {ctx}-token "
+                                      f"context, fewer than the {floor} an answer needs; Strata never truncates "
+                                      f"requests. Shorten the conversation, or send max_tokens {max(0, room)} or less",
+                                      prompt=len(ids), context=ctx, max_new=max_new, min_room=floor)
             if not self.fit_max_tokens:
                 self.forget_prompt(encoded_ids)
                 raise ContextOverflow("request exceeds the context window: "
@@ -5304,8 +5398,20 @@ class Service:
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
 
+        # the names the parser takes as declared: the request's tools and those its history called (#4663)
+        declared: list[str] = [t["name"] for t in with_history_tools(tools, sampling) or []
+                               if isinstance(t, dict) and isinstance(t.get("name"), str)]
+        # upstream e05e6e0cc (a): armed for a request with tools, on the template's own call form (the Qwen form; the
+        # GLM and Harmony readers keep sending the text as it is)
+        hold = ToolMarkupHold(bool(self.tool_markup_retry and declared and not harmony and reader is OutputParser))
+        parser_done, markup_retried = False, None
+
         def cut(evs):
-            """The events with the answer's text cut at a stop string (OpenAI stop, Anthropic stop_sequences)."""
+            """The events with the answer's text cut at a stop string (OpenAI stop, Anthropic stop_sequences), then
+            through the tool-markup hold (a)."""
+            return hold.push(_cut(evs))
+
+        def _cut(evs):
             if stops is None:
                 return evs
             out = []
@@ -5322,6 +5428,7 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
+        forced_text = force                             # (a): the retry opens a forced call again (tool_choice)
         opening, written = [], ""                       # without thinking the prompt ends with the forced opening:
         if force and not thinking:                      # the parser reads it as if the model had written it
             written = force                             # (a grammar's prefix: the reply starts with it)
@@ -5686,6 +5793,56 @@ class Service:
                             # tokens, a tag held back) or the reasoning count is short: on from the live session
                             prompt = prompt + seg
                             continue
+                        if (hold.armed and not hold.calls and finish == "stop" and not (wrap or opens)
+                                and not cancel.is_set() and not repeated and not looped and parser.state != "reasoning"
+                                and (stops is None or (stops.hit is None and not stops.held))):
+                            # upstream e05e6e0cc (a): the model stopped (a request with tools).  Read the rest of its
+                            # output here, as the end would: a call that is whole there goes out as one; when the reply
+                            # ends in tool-call markup that is no call (held back, not sent), it is written again once
+                            for ev in cut(parser.finish("stop")):
+                                if one_call and ev.kind in ("tool_start", "tool_args", "tool_call"):
+                                    if one_done:
+                                        continue
+                                    one_done = ev.kind == "tool_call"
+                                yield "event", ev
+                            parser_done = True
+                            dead = dead_markup_tail(hold.text) if hold.held and not hold.calls else None
+                            if dead is not None:
+                                names = [x for x in markup_names(hold.text) if x not in declared]
+                                kind = "rejected" if names else dead[1]
+                                near = closest_declared(names[0], declared) if names else None
+                                note = tool_retry_note(kind, names[:3], declared, near)
+                                extra = self.tok.encode(IM_END + "\n<|im_start|>user\n" + note + IM_END
+                                                        + "\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                                                        + (forced_text or ""), parse_special=True)
+                                if max_new - n - len(extra) >= TOOL_RETRY_MIN_ROOM:
+                                    dropped = hold.drop()
+                                    hold.armed = False          # one retry: its own reply goes out as it is written
+                                    markup_retried = {"reason": kind, "chars": len(dropped), "names": names[:3]}
+                                    with self.status_lock:
+                                        t = self.totals
+                                        t["tool_markup_retries"] = t.get("tool_markup_retries", 0) + 1
+                                        t["tool_calls_unread"] = (t.get("tool_calls_unread", 0)
+                                                                  + getattr(parser, "unread", 0))
+                                    print(f"[strata] the reply ended in tool-call markup that is no call ({kind}"
+                                          + (f": {', '.join(names[:3])}" if names else "")
+                                          + (f", closest declared {near}" if near else "")
+                                          + f"; {len(dropped)} characters held back): writing the reply's end again "
+                                          "once (STRATA_TOOL_MARKUP_RETRY=0 turns this off)", flush=True)
+                                    max_new -= len(extra)       # the note is prompt: the reply keeps inside the context
+                                    prompt = prompt + seg + extra
+                                    parser = reader(thinking=False, tools=with_history_tools(tools, sampling),
+                                                    stream_tools=True, recover=self.tool_call_recovery,
+                                                    declared_only=declared_only,
+                                                    deferred=deferred or self.undeclared_tool_calls == "call")
+                                    detok, tail, parser_done = Detokenizer(self.tok), "", False
+                                    force, budget = None, None
+                                    if forced_text:     # a forced call (tool_choice): its opening again, read as
+                                        for ev in cut(parser.feed(forced_text)):     # if the model had written it
+                                            yield "event", ev
+                                    finish = "length"
+                                    continue
+                            break
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -5828,12 +5985,16 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
-        for ev in cut(parser.finish(finish)):
-            if one_call and ev.kind in ("tool_start", "tool_args", "tool_call"):
-                if one_done:
-                    continue                            # calls read from the thinking at the end: the first only
-                one_done = ev.kind == "tool_call"
+        if not parser_done:
+            for ev in cut(parser.finish(finish)):
+                if one_call and ev.kind in ("tool_start", "tool_args", "tool_call"):
+                    if one_done:
+                        continue                        # calls read from the thinking at the end: the first only
+                    one_done = ev.kind == "tool_call"
+                yield "event", ev
+        for ev in hold.release():                       # no retry (or its reply): the held text goes out as it is
             yield "event", ev
+        hold.armed = False
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
@@ -5852,7 +6013,7 @@ class Service:
                 self.totals["tool_args_repaired"] = self.totals.get("tool_args_repaired", 0) + len(notes)
             print(f"[strata] {len(notes)} tool call argument(s) repaired: {'; '.join(sorted(set(notes)))}", flush=True)
         unread = getattr(parser, "unread", 0)          # the Harmony reader keeps no such count
-        rejected = []
+        rejected: list = []
         if unread:
             named = getattr(parser, "unread_names", None)
             print(f"[strata] {unread} <tool_call> block(s) in the answer did not read as a call of a declared "
@@ -5863,9 +6024,20 @@ class Service:
                 self.totals["tool_calls_unread"] = self.totals.get("tool_calls_unread", 0) + unread
             # #3796 (upstream 805ebe17b): the same names for the client, a machine-readable marker next to the text,
             # which stays as the model wrote it
-            rejected = [{"name": nm, "reason": "undeclared"} for nm in named or []]
+            # #5904 / #5933 / #4622: plus the declared tool the name comes closest to, as a hint for the client or the
+            # model's next turn.  Only a hint: the call is not run under that name (a guessed tool is a safety risk;
+            # "undeclared_tool_calls": "call" stays the only way to run an undeclared call)
+            rejected = []
+            for nm in named or []:
+                entry = {"name": nm, "reason": "undeclared"}
+                near = closest_declared(nm, declared)
+                if near:
+                    entry["closest_declared"] = near
+                rejected.append(entry)
         if stops is not None and stops.hit is None and stops.held:
-            yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
+            # the held tail was not a stop string after all
+            for ev in hold.push([Event("content", stops.flush())]):
+                yield "event", ev
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "reasoning_tokens": thinking_n,
                 "reasoning_recoveries": recovery_count}
@@ -5873,7 +6045,178 @@ class Service:
             done["stop_sequence"] = stops.hit
         if rejected:
             done["rejected_tool_calls"] = rejected
+        if markup_retried is not None:
+            done["tool_markup_retry"] = markup_retried
+        if declared:
+            # strata_unread_tool_markup: the reply the client got ends in tool-call markup that is no call and is not
+            # one of strata_rejected_tool_calls' (a declared name's block that does not read, a cut one)
+            text = hold.reply_text()
+            tail_markup = dead_markup_tail(text)
+            if tail_markup is not None:
+                said = {e["name"] for e in rejected}
+                if not said.intersection(markup_names(text[tail_markup[0]:])):
+                    done["unread_tool_markup"] = {"reason": tail_markup[1], "chars": len(text) - tail_markup[0]}
+            if ("unread_tool_markup" not in done and hold.started - hold.finished and finish != "cancel"
+                    and not cancel.is_set()):
+                # a call the model had started (tool_start and argument pieces were sent) and the output ended inside -
+                # max tokens, or a stop in the middle of it: no tool_call follows and no markup is in the answer's text
+                # to find above.  The client still hears that the call was cut (chars 0: it is not in the text); the
+                # server's own retry (finish "stop", no call started) never ran for it, and a cut by max tokens would
+                # only meet the same cap again.
+                done["unread_tool_markup"] = {"reason": "cut_off", "chars": 0}
         yield "done", done
+
+
+def closest_declared(name: str, declared: list[str]) -> str | None:
+    """#5904 / #5933: the declared tool name an undeclared one comes closest to (`read_file` -> `read`), for the hint in
+    strata_rejected_tool_calls; None when none is clearly close.  The one declared name the written one contains or is
+    contained in (ignoring case and `_` / `-` / `.`), else the best difflib match at a ratio of 0.75 or more."""
+    import difflib
+    if not name or not declared:
+        return None
+    norm = lambda s: re.sub(r"[_\-.\s]", "", s.lower())     # noqa: E731
+    n = norm(name)
+    inside = [d for d in declared if norm(d) and (norm(d) in n or n in norm(d))]
+    if len(inside) == 1:
+        return inside[0]
+    best = difflib.get_close_matches(name.lower(), [d.lower() for d in declared], n=1, cutoff=0.75)
+    if best:
+        return next(d for d in declared if d.lower() == best[0])
+    return None
+
+
+TOOL_RETRY_MIN_ROOM = 64     # (a): the retry runs only with this many output tokens left after its note
+_MARKUP_OPENER = re.compile(r"<tool_call>|<function=")
+
+
+def _line_start(s: str, i: int) -> bool:
+    head = s[:i].rstrip(" \t")
+    return not head or head.endswith("\n")
+
+
+def dead_markup_tail(text: str) -> tuple[int, str] | None:
+    """The tool-call markup a reply's text ends in: (where the run of blocks at the end starts, "cut_off" |
+    "unreadable"), or None when the text does not end in one.  A block opens with `<tool_call>` (or a bare `<function=`)
+    at a line start, outside a ``` fence; "cut_off": the last block has no closer (`</tool_call>`, or `</function>` for
+    a bare one), "unreadable": it closed (the parser read it as no call).  Text after a block's closer means the reply
+    went on: None."""
+    s = text.rstrip()
+    start, reason, end = None, None, len(s)
+    while True:
+        part = s[:end]
+        iw = max((m.start() for m in re.finditer(re.escape(CALL_START), part) if _line_start(part, m.start())),
+                 default=-1)
+        ib = max((m.start() for m in re.finditer(re.escape(FUNC_START), part) if _line_start(part, m.start())),
+                 default=-1)
+        bare = ib > iw and (iw < 0 or CALL_END in part[iw:ib])
+        i = ib if bare else iw
+        if i < 0:
+            break
+        body = part[i:]
+        closer = FUNC_END if bare else CALL_END
+        k = body.find(closer)
+        if k >= 0 and body[k + len(closer):].strip():
+            break                                       # the block closed and text follows it: not the reply's end
+        closed = k >= 0
+        if reason is None:
+            reason = "unreadable" if closed or body.endswith(FUNC_END) else "cut_off"
+        elif not closed:
+            break                                       # an unclosed block before the last one: the run starts after it
+        start, end = i, len(part[:i].rstrip())
+    if start is None or reason is None or s[:start].count("```") % 2:
+        return None
+    return start, reason
+
+
+def markup_names(text: str) -> list[str]:
+    """The names written in the `<function=NAME>` openers of a piece of text."""
+    return [m.group(1).strip() for m in re.finditer(r"<function=([^<>\n]+?)>", text)]
+
+
+def tool_retry_note(reason: str, names: list[str], declared: list[str], near: str | None) -> str:
+    """(a): the user-turn note the one retry reads: why the call was not run, the declared tools, the hint."""
+    what = {"rejected": "it names " + ", ".join(f"`{x}`" for x in names) + ", which is not one of the tools you can "
+                                                                           "call",
+            "cut_off": "it was cut off before its end",
+            "unreadable": "it is not in a form that can be read"}[reason]
+    listed = ", ".join(declared[:40]) + (f" and {len(declared) - 40} more" if len(declared) > 40 else "")
+    hint = f" Did you mean `{near}`?" if near else ""
+    return (f"[Strata server] Your last reply ended with a tool call that was not run: {what}.{hint} The tools you can "
+            f"call are: {listed}. Write the call again in this form, with a tool from that list:\n"
+            f"{CALL_START}\n{FUNC_START}TOOL_NAME>\n<parameter=PARAMETER_NAME>\nvalue\n</parameter>\n"
+            f"{FUNC_END}\n{CALL_END}\n"
+            "or answer in plain text if no tool is needed.")
+
+
+class ToolMarkupHold:
+    """(a) The answer's text from a tool-call opener at a line start is held back until the reply goes on past the block
+    (then it is sent as it is) or ends in it (then the server may write the reply's end again, once, in place of it).
+    Unarmed it holds nothing; it always keeps the text it sent, for strata_unread_tool_markup."""
+
+    def __init__(self, armed: bool):
+        self.armed = armed
+        self.held: list[Event] = []
+        self.text = ""
+        self.closed = False                             # a closer (`</tool_call>` / `</function>`) is in the held text
+        self.sent: list[str] = []
+        self.prev = ""                                  # the last characters sent (a line start at the reply's start)
+        self.fences = 0                                 # ``` marks sent so far
+        self.calls = False                              # a tool call came out: the reply does not end in dead markup
+        self.started: set = set()                       # the ids of calls announced (tool_start) ...
+        self.finished: set = set()                      # ... and of those whose final tool_call came
+
+    def _send(self, ev: Event) -> Event:
+        if ev.text:
+            self.sent.append(ev.text)
+            self.prev = (self.prev + ev.text)[-16:]
+            self.fences += ev.text.count("```")
+        return ev
+
+    def _opener(self, text: str) -> int:
+        for m in _MARKUP_OPENER.finditer(text):
+            seen = self.prev + text[:m.start()]
+            if _line_start(seen, len(seen)) and (self.fences + text[:m.start()].count("```")) % 2 == 0:
+                return m.start()
+        return -1
+
+    def push(self, evs: list) -> list:
+        out = []
+        for ev in evs:
+            if ev.kind != "content":
+                if ev.kind in ("tool_start", "tool_call"):
+                    self.calls = True
+                    (self.started if ev.kind == "tool_start" else self.finished).add(ev.call.id)
+                out += self.release()
+                out.append(ev)
+                continue
+            text = ev.text or ""
+            if not self.held:
+                p = self._opener(text) if self.armed and text else -1
+                if p < 0:
+                    out.append(self._send(ev))
+                    continue
+                if p:
+                    out.append(self._send(Event("content", text[:p])))
+                ev, text = Event("content", text[p:]), text[p:]
+            self.held.append(ev)
+            self.text += text
+            if not self.closed:                         # (until a closer arrives the block is open: held, no scan)
+                near = self.text[-(len(text) + len(CALL_END)):]
+                self.closed = CALL_END in near or FUNC_END in near
+            if self.closed and text.strip() and dead_markup_tail(self.text) is None:
+                out += self.release()                   # text after the block: the reply goes on
+        return out
+
+    def release(self) -> list:
+        evs, self.held, self.text, self.closed = self.held, [], "", False
+        return [self._send(ev) for ev in evs]
+
+    def drop(self) -> str:
+        text, self.held, self.text, self.closed = self.text, [], "", False
+        return text
+
+    def reply_text(self) -> str:
+        return "".join(self.sent)
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -6494,7 +6837,18 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
                 "system_fingerprint": fingerprint,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-    yield chunk({"role": "assistant", "content": ""})
+    # #2391: the role-only chunk goes out right before the first data chunk, not before the prompt is read: a client
+    # that times the first data chunk (llama-benchy's TTFR / est_ppt) would otherwise see a prefill of ~0 ms.  vLLM
+    # and llama.cpp send it with the engine's first output too.  The keep-alive comments are not data and go first.
+    opened = False
+
+    def first():
+        nonlocal opened
+        if opened:
+            return ()
+        opened = True
+        return (chunk({"role": "assistant", "content": ""}),)
+
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
@@ -6508,8 +6862,11 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
             pp = prompt_progress(svc) if want_progress else None
+            if pp is not None:
+                yield from first()
             yield None if pp is None else {**chunk({}), "prompt_progress": pp}
         elif kind == "mcp":
+            yield from first()
             c = chunk({})
             c["strata_mcp"] = x
             yield c
@@ -6518,8 +6875,10 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             call = cast(ToolCall, ev.call)          # (every tool_* event carries its call)
             if ev.kind == "reasoning" and ev.text:
                 # llama.cpp's reasoning_content and vLLM's reasoning: the same text, for a client that reads either
+                yield from first()
                 yield chunk({"reasoning_content": ev.text, "reasoning": ev.text})
             elif ev.kind == "content" and ev.text:
+                yield from first()
                 yield chunk({"content": ev.text})
             elif ev.kind in ("tool_start", "tool_args") and call.name in customs:
                 pass                                # a custom tool's input is sent whole, with its tool_call
@@ -6527,26 +6886,31 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
                 given = call.arguments
                 text = given["input"] if isinstance(given, dict) and set(given) == {"input"} \
                     and isinstance(given["input"], str) else json.dumps(given, ensure_ascii=False)
+                yield from first()
                 yield chunk({"tool_calls": [{"index": calls, "id": call.id, "type": "custom",
                                              "custom": {"name": call.name, "input": text}}]})
                 calls += 1
             elif ev.kind == "tool_start":
                 streamed[call.id] = calls
                 calls += 1
+                yield from first()
                 yield chunk({"tool_calls": [{"index": streamed[call.id], "id": call.id, "type": "function",
                                              "function": {"name": call.name, "arguments": ""}}]})
             elif ev.kind == "tool_args":
+                yield from first()
                 yield chunk({"tool_calls": [{"index": streamed[call.id], "function": {"arguments": ev.text}}]})
             elif ev.kind == "tool_call" and call.id in streamed:
                 finished.add(getattr(ev.call, "id", None))
             elif ev.kind == "tool_call":
                 args = json.dumps(call.arguments, ensure_ascii=False)
+                yield from first()
                 yield chunk({"tool_calls": [{"index": calls, "id": call.id, "type": "function",
                                              "function": {"name": call.name, "arguments": args}}]})
                 calls += 1
         else:
             answered_done = True
             # a streamed call without its final tool_call is one the output ended inside: not "tool_calls" (#211)
+            yield from first()                     # an empty answer still opens with the role
             whole = calls and streamed.keys() <= finished
             fin = cast(dict, x)                     # the run's last item: the DONE figures
             ended = fin["finish"]
@@ -6563,6 +6927,8 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
                 last["timings"] = fin["timings"]          # llama.cpp's field: the speed its clients show
             if fin.get("rejected_tool_calls"):          # #3796: only when a call was refused as undeclared
                 last["strata_rejected_tool_calls"] = fin["rejected_tool_calls"]
+            if fin.get("unread_tool_markup"):
+                last["strata_unread_tool_markup"] = fin["unread_tool_markup"]
             yield last
     if not answered_done and not cancel.is_set():
         # Every admitted request ends with a "done" event that carries its finish reason.  A run that simply stopped (a
@@ -6683,6 +7049,8 @@ def openai_collect(chunks) -> dict:
         out["timings"] = last["timings"]
     if last.get("strata_rejected_tool_calls"):
         out["strata_rejected_tool_calls"] = last["strata_rejected_tool_calls"]
+    if last.get("strata_unread_tool_markup"):
+        out["strata_unread_tool_markup"] = last["strata_unread_tool_markup"]
     if lps["content"] or lps["reasoning_content"]:
         out["choices"][0]["logprobs"] = {"content": lps["content"],
                                          **({"reasoning_content": lps["reasoning_content"]}
@@ -6749,17 +7117,30 @@ def _with_reasoning(lps: dict, entries: list) -> dict:
 
 
 def structured_chunks(chunks, validator):
-    """Buffer structured streams so a client never receives unvalidated content."""
+    """Buffer structured streams so a client never receives unvalidated content.  A turn that calls a tool is not the
+    final answer: from its first call on, what was held goes out as it is and the rest streams unchecked, as
+    /v1/responses does."""
     buffered = []
     heartbeat = time.monotonic()
     try:
         for chunk in chunks:
+            if buffered is None:
+                yield chunk
+                continue
             progress = chunk is not None and "prompt_progress" in chunk
+            got = (chunk.get("choices") or [{}])[0].get("delta", {}) if chunk is not None else {}
+            if chunk is not None and not progress and got.get("tool_calls"):
+                yield from buffered
+                yield chunk
+                buffered = None
+                continue
             if chunk is not None and not progress:
                 buffered.append(chunk)      # a progress chunk carries no content: there is nothing in it to validate
             if chunk is None or progress or time.monotonic() - heartbeat >= 1:
                 heartbeat = time.monotonic()
                 yield chunk if progress else None
+        if buffered is None:
+            return
         result = openai_collect(buffered)
         choice = result["choices"][0]
         content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
@@ -6881,6 +7262,8 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                            "usage": anthropic_usage(ids, x.get("reused"), x["completion_tokens"])}
             if x.get("rejected_tool_calls"):
                 delta_event["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796
+            if x.get("unread_tool_markup"):
+                delta_event["strata_unread_tool_markup"] = x["unread_tool_markup"]
             yield "message_delta", delta_event
             yield "message_stop", {"type": "message_stop"}
 
@@ -6921,6 +7304,8 @@ def anthropic_collect(events) -> dict:
             msg["usage"].update(e["usage"])
             if e.get("strata_rejected_tool_calls"):
                 msg["strata_rejected_tool_calls"] = e["strata_rejected_tool_calls"]
+            if e.get("strata_unread_tool_markup"):
+                msg["strata_unread_tool_markup"] = e["strata_unread_tool_markup"]
     assert msg is not None                          # anthropic_events always starts with message_start
     msg["content"] = blocks
     return msg
@@ -7065,6 +7450,7 @@ class BadBody(Exception):
 
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
+        timeout = PEER_STALL_S
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
         record = None                                       # #332: this request's monitor record, if kept
@@ -7214,12 +7600,15 @@ def make_handler(svc: Service):
                              f"turns this check off"}})
             return False
 
-        def _foreign_page(self) -> bool:
+        def _foreign_page(self, body: bool = True) -> bool:
             """Without an API key, a /v1 POST from a browser page of another site (any site can POST text/plain
             there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
-            then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before."""
+            then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before.
+            The /v1 foreign-Origin rule (owner 11-16, the same contract as the app host's /v1): an Origin header
+            that is present but empty is another site too, and GET /v1 goes through the same check (body=False:
+            no content type to check)."""
             origin = self.headers.get("Origin")
-            if svc.api_key or not origin:
+            if svc.api_key or origin is None:
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
@@ -7229,7 +7618,7 @@ def make_handler(svc: Service):
                        f"or add the page's host to \"allowed_hosts\" (or its origin to \"cors_origins\") in the config")
                 self._json(403, {"error": {"type": "forbidden", "message": msg}})
                 return True
-            if not self.headers.get("Content-Type", "").startswith("application/json"):
+            if body and not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return True
             return False
@@ -7345,6 +7734,8 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/v1/") and self._foreign_page(body=False):
+                return
             if path.startswith("/tool-media/"):
                 if not self._authorized():
                     return
@@ -7639,10 +8030,14 @@ def make_handler(svc: Service):
                 try:
                     svc.load()
                     self._json(200, {"status": "loaded"})
-                except GpuBusy as e:
+                except (GpuBusy, EngineStarting) as e:
                     ra = getattr(e, "retry_after", None)
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
+                except EngineDied as e:                      # #2497: a program that cannot start (or died at READY)
+                    self._json(503, {"error": {"type": "server_error", "message": died_note(e)}})
+                except EngineStuck as e:                     # is a 503 with the reason, as on the request routes,
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})   # not a dropped connection
                 return
             if getattr(svc, "draining", False) and path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                 # upstream 3cf22f5ef (#6055): the server is stopping and the engine closes: refused before the body is
@@ -8130,10 +8525,13 @@ def make_handler(svc: Service):
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
             self._cors()
             self.end_headers()
-            if STREAM_WRITE_TIMEOUT_S > 0:
+            # (#4271) a stuck write ends as OSError: disconnected.  The connection's own PEER_STALL_S deadline stays the
+            # bound when it is the shorter one: one stall rule for every socket operation.
+            # self.timeout: PEER_STALL_S when the class was made
+            limits = [x for x in (STREAM_WRITE_TIMEOUT_S, self.timeout) if x]
+            if limits:
                 try:
-                    # (#4271) a stuck write ends as OSError: disconnected
-                    self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)
+                    self.connection.settimeout(min(limits))
                 except OSError:
                     pass
 
@@ -8185,10 +8583,7 @@ def make_handler(svc: Service):
                     not isinstance(modalities, list) or any(m != "text" for m in modalities)):
                 raise ValueError("modalities: this server answers in text only (no audio output)")
             for key in ("max_completion_tokens", "max_tokens"):   # OpenAI's integers: 2.9 is a 400, not 2
-                v = req.get(key)
-                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
-                                      or isinstance(v, float) and not v.is_integer()):
-                    raise ValueError(f"{key} must be a whole number")
+                token_limit(req.get(key), key)                # (#4037: 4096.0 and "1024" are whole numbers too)
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             require_messages(messages)   # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing
@@ -8198,11 +8593,13 @@ def make_handler(svc: Service):
             tools, choice = allowed_tools(req.get("tool_choice"), tools)   # the tools it lists, and its mode
             force = forced_call(choice, tools,                      # a bad value is a 400 before anything is sent
                                 getattr(svc.template, "call_form", "qwen"))
-            messages, validator = prepare_format(req.get("response_format"), messages)
-            if validator is not None and (tools or req.get("strata_mcp")):
-                raise ValueError("structured response_format with tools/MCP is not supported")
+            messages, validator = prepare_format(req.get("response_format"), messages, with_tools=bool(tools))
+            if validator is not None and req.get("strata_mcp"):
+                raise ValueError("structured response_format with MCP is not supported")
             svc.load()
-            max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            limit_new = token_limit(req.get("max_completion_tokens"), "max_completion_tokens")
+            limit_old = token_limit(req.get("max_tokens"), "max_tokens")      # (both checked, whichever is used)
+            max_req = max_new = limit_new or limit_old or 0                   # 0/-1: the rest
             if top_logprobs(req) is not None and batch_slots_on(svc.engine) and max_req != 1:
                 # --parallel: a slot's "BT <slot> <id>" lines carry no LP line; an admission - a max_tokens 1
                 # request - does.  Past that token a reply would hold entries for a prefix only, which a client cannot
@@ -8321,10 +8718,28 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
-            except Exception as e:  # noqa: BLE001 - a bug after the stream started: said, and the stream ends
-                err = {"error": {"type": "server_error", "message": self._stream_bug(e)}}
-                self._note(error=err["error"])
+            except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:
+                self._chat_failed(str(e))                    # _post's handler would write HTTP into the stream's body
+            except ClientGone:
+                raise
+            # no silent end: the client would take it for a whole answer
+            except Exception:
+                self._chat_failed(self._stream_crashed())
+
+        def _stream_crashed(self):
+            """An unexpected error in a started stream: the traceback for the log, a plain sentence for the client (the
+            error's text can hold what the client must not see; upstream cf0743747)."""
+            import traceback
+            print("[strata] error in a started stream:\n" + traceback.format_exc(), flush=True)
+            return "the server failed while answering; the server's log has the details"
+
+        def _chat_failed(self, message):
+            err = {"error": {"type": "server_error", "message": message}}
+            self._note(error=err["error"])
+            try:
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except OSError:
+                self._note(outcome="disconnected")
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
@@ -8363,7 +8778,9 @@ def make_handler(svc: Service):
                 return self._json(429, responses_error_body(str(e), "rate_limit_exceeded", code="rate_limit_exceeded"),
                                   headers={"Retry-After": 1})
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
-                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                ra = getattr(e, "retry_after", None)         # #1997: as chat and messages (only GpuBusy carries one)
+                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"),
+                                  headers={"Retry-After": int(ra)} if ra else None)
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
@@ -8402,6 +8819,12 @@ def make_handler(svc: Service):
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     yield from asm.finish(done, check)
+                elif cancel.is_set() or (done or {}).get("finish") == "cancel":
+                    # no final event exists: collect() must not read the last delta as the answer, a stream must not
+                    # end without response.failed.  Cancelled by cancel_owned_requests, or by a client that left
+                    if svc.draining:
+                        raise ServerStopping("this instance is draining; retry against the next instance")
+                    raise ClientGone()
             items = self._capture(events(), "responses")
             if not req.get("stream"):
                 try:
@@ -8409,6 +8832,9 @@ def make_handler(svc: Service):
                 except StructuredOutputError as e:
                     return self._json(502, responses_error_body(str(e), "server_error",
                                                                 code="structured_output_failed"))
+                except ServerStopping as e:                  # as a request refused while draining
+                    return self._json(503, responses_error_body(str(e), "server_error", code="server_draining"),
+                                      retry_after=1)
                 except EngineDied as e:
                     return self._json(503, responses_error_body(died_note(e), "server_error",
                                                                 code="server_error"))
@@ -8444,12 +8870,20 @@ def make_handler(svc: Service):
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, died_note(e), "server_error", send)
+            except ServerStopping as e:                      # server_error: ResponseErrorCode is a closed list
+                self._responses_failed(asm, str(e), "server_error", send)
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
-            except Exception as e:  # noqa: BLE001 - a bug after the stream started: response.failed, as above
-                self._responses_failed(asm, self._stream_bug(e), "server_error", send)
+            # _post would write HTTP into the stream's body
+            except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:
+                self._responses_failed(asm, str(e), "server_error", send)
+            except ClientGone:
+                raise
+            # no silent end: the client would take it for a whole answer
+            except Exception:
+                self._responses_failed(asm, self._stream_crashed(), "server_error", send)
 
         def _responses_failed(self, asm, message, code, send):
             # OpenAI's order: the error event, then response.failed - made in that order, as the sequence numbers
@@ -8570,13 +9004,15 @@ def make_handler(svc: Service):
             while True:
                 try:
                     try:
-                        ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
+                        ids, thinking, max_new = svc.prepare(messages, shown, kw,
+                                                             int(req.get("max_output_tokens") or 0),
                                                              force=force, req=req, cancel=cancel)
                     except ValueError:
                         if shown is tools:
                             raise
                         shown = tools                        # too long with the kept tools: the request as sent
-                        ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
+                        ids, thinking, max_new = svc.prepare(messages, shown, kw,
+                                                             int(req.get("max_output_tokens") or 0),
                                                              force=force, req=req, cancel=cancel)
                     break
                 except ResponsesError:
@@ -8591,6 +9027,14 @@ def make_handler(svc: Service):
                     messages = fewer
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
+            # #4621 / #1917 (upstream e04cb092f): what the client's own tool_search returned in THIS request's input is
+            # declared in the conversation where the search answered; after the prompt is made (so its start, and the
+            # conversation cache, stay as they were) the parser and the response accept exactly those names as declared
+            # - never a guessed one.  tool_choice "none" (tools None) hides the found tools too.
+            found, found_names = responses_api.client_found_tools(req)
+            if tools is not None and found:
+                tools = tools + [t for t in found if t["name"] not in names]
+                names = {**found_names, **names}
             req = dict(req)
             strict, patterns = constrained_tools(responses_api.given_tools(req))   # namespaces' and additional_tools'
             svc.attach_grammar(req, answer_grammar(responses_api.text_format(req), thinking)
@@ -8627,8 +9071,10 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(ids)})
 
         def _anthropic(self, req):
-            asked = req.get("max_tokens")                     # Anthropic's required field (the shared settings' own
-            if isinstance(asked, bool) or not isinstance(asked, int) or asked < 1:   # default does not stand in)
+            # Anthropic's required field (the shared settings' own default does not stand in); upstream #4037: 4096.0
+            # and "1024" are whole numbers too
+            asked = token_limit(req.get("max_tokens"), "max_tokens")
+            if asked is None or asked < 1:
                 raise ValueError("max_tokens: a whole number of 1 or more is required")
             svc.load()
             req = svc.with_shared(req, "anthropic")
@@ -8638,9 +9084,9 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = callable_tools = None
             force = forced_call(req.get("tool_choice"), tools,        # "any" / {"type": "tool", "name": N}
-                                getattr(svc.template, "call_form", "qwen"))
+                                getattr(svc.template, "call_form", "qwen"), callable_tools)
             messages, validator = anthropic_prepare_format(req, messages, tools)
-            max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            max_new = token_limit(req.get("max_tokens"), "max_tokens") or 0   # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
@@ -8700,17 +9146,22 @@ def make_handler(svc: Service):
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
-            except Exception as e:  # noqa: BLE001 - a bug after the stream started: the error event, as above
-                err = {"type": "error", "error": {"type": "api_error", "message": self._stream_bug(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            # _post would write HTTP into the stream's body
+            except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:
+                self._anthropic_failed(str(e), "overloaded_error" if isinstance(e, GpuBusy) else "api_error")
+            except ClientGone:
+                raise
+            # no silent end: the client would take it for a whole answer
+            except Exception:
+                self._anthropic_failed(self._stream_crashed(), "api_error")
 
-        def _stream_bug(self, e: Exception) -> str:
-            """An error no other handler expects, raised after a stream's headers went out (a bug): its traceback to
-            the log, and the sentence its error event carries - a stream that only stopped read as an empty answer."""
-            import traceback
-            print(f"[strata] error in a stream ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
-            return f"internal error ({type(e).__name__}: {e}); the server's log has the details"
+        def _anthropic_failed(self, message, kind):
+            err = {"type": "error", "error": {"type": kind, "message": message}}
+            self._note(error=err["error"])
+            try:
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except OSError:
+                self._note(outcome="disconnected")
 
     return Handler
 
@@ -9085,6 +9536,37 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
 
 SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
                "experimental_speed_projection")
+
+
+def load_shared_settings(path, warn=print) -> dict:
+    """The Chat settings kept next to a config between starts, read so that one bad key cannot erase the others.
+
+    The strict reader below belongs to POST /settings, where a client is there to be told which key is wrong and can
+    fix it.  At start-up nobody is there: the old code called the same strict reader and caught its ValueError with
+    `svc.shared = {}`, so a single unknown key - a typo, a key from a newer version, or a setting the server does not
+    know - discarded every OTHER setting in the file, `reasoning_effort` included, without a word in the log (#4933).
+
+    So the two failures are told apart here: a file that cannot be read, or is not a JSON object, is still ignored as
+    a whole (nothing in it can be trusted); a file that IS an object keeps every key the server understands, and each
+    key it does not is named on one line and skipped."""
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}                   # no file yet: the normal case on a first start, nothing to report
+    except (OSError, ValueError) as e:
+        warn(f"[strata] the Chat settings in {path} are ignored ({e}); other apps use their own settings")
+        return {}
+    if not isinstance(doc, dict):
+        warn(f"[strata] the Chat settings in {path} are ignored (a JSON object was expected, found "
+             f"{type(doc).__name__}); other apps use their own settings")
+        return {}
+    out = {}
+    for key, value in doc.items():
+        try:
+            out.update(clean_shared_defaults({key: value}))
+        except ValueError as e:
+            warn(f"[strata] one Chat setting in {path} is skipped ({e}); the others still apply")
+    return out
 
 
 def clean_shared_defaults(d) -> dict:
@@ -9886,6 +10368,11 @@ def _main() -> int:
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
     svc.undeclared_tool_calls = undeclared_tool_calls_setting(cfg)
+    # (a): false (or STRATA_TOOL_MARKUP_RETRY=0) sends the markup as text
+    retry = cfg.get("tool_markup_retry", True)
+    if not isinstance(retry, bool):
+        raise SystemExit(f"[strata] config \"tool_markup_retry\" must be true or false, not {retry!r}")
+    svc.tool_markup_retry = svc.tool_markup_retry and retry
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
@@ -9927,13 +10414,10 @@ def _main() -> int:
     svc.port = a.port
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
-        try:
-            svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
-            if svc.shared:
-                print("[strata] other apps use the Chat settings: " +
-                      ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
-        except (OSError, ValueError):
-            svc.shared = {}
+        svc.shared = load_shared_settings(svc.shared_path)      # #4933: one unknown key no longer clears the rest
+        if svc.shared:
+            print("[strata] other apps use the Chat settings: " +
+                  ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
     if hub is not None:
         import atexit
         svc.mcp = hub
