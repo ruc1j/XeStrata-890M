@@ -134,6 +134,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
+# (upstream 497ee681c) intel/llvm's clang++ links SYCL code through temporary objects in /tmp, which it deletes when the
+# link ends.  With the linker's own dependency file (CMake 3.27+, Ninja and Makefile generators) those objects become link
+# inputs that never exist again, so every executable relinked on every build (81 of them in build/free).  Off, a link
+# depends only on the libraries named here: a library the linker finds on its own (a ROCm or intel/llvm runtime upgrade)
+# needs a clean build.
+set(CMAKE_LINK_DEPENDS_USE_LINKER OFF)
 # Windows' C runtime marks standard C functions (getenv, fopen, sscanf) deprecated in favour of its own _s versions
 if(WIN32)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
