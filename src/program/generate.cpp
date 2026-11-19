@@ -8678,23 +8678,46 @@ int main(int argc, char** argv) {
                 bool fits = admit();
                 if (!fits && segpool != nullptr && segpool->idle_bytes() > 0) { segpool_give_back(); fits = admit(); }
                 fits = fits || (strata::core::release_free_heap() && admit());
-                while (!fits && conversations.size() > 0 && freed < conversations.slots() &&
-                       conversations.evict_oldest(disk.enabled() ? &evicted : nullptr)) {
-                    ++freed;
-                    if (disk.enabled()) {   // written, then freed: its memory back to the system before the next check
-                        save_evicted();
-                        strata::core::release_free_heap();
+                // #5697 (upstream 96edb9337): oldest first until it fits, and no further than the memory that comes
+                // back: an eviction whose bytes the reading does not show (the C library kept them) stops the loop, and
+                // the rest stay parked.  With --conversation-save each is written first; an evicted conversation's
+                // segments drawn from the pool go back to the system too, or MemAvailable never rises.
+                bool no_progress = false;
+                std::string cannot_help_note;   // #2253: the refusal line's note when no eviction could have made room
+                if (!fits) {
+                    const strata::core::EvictForRam r = strata::core::evict_for_ram(
+                        admit, [&] { return mem ? std::optional<uint64_t>(mem->available) : std::nullopt; },
+                        [&]() -> size_t {
+                            const size_t b = conversations.oldest_evictable_bytes();
+                            if (b == 0 || !conversations.evict_oldest(disk.enabled() ? &evicted : nullptr)) return 0;
+                            if (disk.enabled()) {   // written, then freed: its memory back before the next check
+                                save_evicted();
+                                strata::core::release_free_heap();
+                            }
+                            segpool_give_back();
+                            return b;
+                        },
+                        conversations.slots(),
+                        // #2253: short by more than every parked conversation that may go holds: none is evicted
+                        (uint64_t) additional > UINT64_MAX - floor ? UINT64_MAX : (uint64_t) additional + floor,
+                        (uint64_t) conversations.evictable_bytes());
+                    fits = r.fits;
+                    freed = r.evicted;
+                    no_progress = r.no_progress;
+                    if (r.cannot_help) {
+                        char note[160];
+                        std::snprintf(note, sizeof note, "; short by %llu MiB, more than the %zu parked hold (%zu MiB), so none was evicted",
+                                      (unsigned long long) (r.short_by >> 20U), conversations.size(), conversations.evictable_bytes() >> 20U);
+                        cannot_help_note = note;
                     }
-                    // an evicted conversation's segments drawn from the pool went back to the pool's idle, still resident:
-                    // they go back to the system too, or MemAvailable never rises and every parked conversation goes
-                    segpool_give_back();
-                    fits = admit();
                 }
                 if (!fits) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need "
-                                         "%zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
+                                         "%zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked%s%s)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
-                                 freed, conversations.size());
+                                 freed, conversations.size(),
+                                 no_progress ? "; the last eviction gave no memory back, so the rest stay parked" : "",
+                                 cannot_help_note.c_str());
                     return true;
                 }
                 if (freed)

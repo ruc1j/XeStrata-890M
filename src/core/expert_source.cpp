@@ -2734,7 +2734,11 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
         const int64_t e = ids[i];
         if (e < 0 || e >= d.n_expert) {
             d.failed = true;
-            d.fail = "a routed expert id is out of range";
+            static thread_local char oor_buf[160];      // where it was, for a report (upstream 709d0a99c)
+            std::snprintf(oor_buf, sizeof oor_buf,
+                          "a routed expert id is out of range (layer %lld, entry %lld/%lld, id %lld, n_expert %d)",
+                          (long long) d.layers, (long long) i, (long long) k, (long long) e, (int) d.n_expert);
+            d.fail = oor_buf;
             d.fail_layer = d.layers;
             d.fail_expert = e;
             return;
@@ -2961,7 +2965,7 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
-void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
+void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids_live, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
@@ -2977,6 +2981,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
+    // `ids_live` is host memory the GPU writes (the verifier's h_ids_): a GPU that does not wait for this call goes on
+    // to the next layer and rewrites it (upstream f0f39de26, #6016: about 0.8% of calls).  Everything below reads this
+    // copy, taken once, so the tables, the plan, the jobs and the clean-up of job_of all see the same experts.
+    int32_t ids_copy[kMaxWindowEntries];
+    for (int64_t i = 0; i < n_tok * k; ++i) ids_copy[i] = ids_live[i];
+    const int32_t* const ids = ids_copy;
     if (d.lookahead) d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);
     if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
     const ExpertLayout& lay = expert_layout();
@@ -3232,6 +3242,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }
     if (d.cold_mode == 4 && d.zc_fmt.size() < d.jobs_multi.size()) d.zc_fmt.resize(d.jobs_multi.size());   // jobs keep pointers
     int njobs = 0;
+    // the experts this call opened a job for, cleared in job_of on every way out of the call (upstream f0f39de26: a
+    // return in the middle left them set, and the next window added its tokens to that stale job)
+    struct OpenedJobs {
+        explicit OpenedJobs(std::vector<int16_t>& j) : job_of(j) {}
+        OpenedJobs(const OpenedJobs&) = delete;
+        OpenedJobs& operator=(const OpenedJobs&) = delete;
+        ~OpenedJobs() { for (int q = 0; q < n; ++q) job_of[(size_t) e[q]] = -1; }
+        std::vector<int16_t>& job_of;
+        int64_t e[kMaxWindowEntries] = {};
+        int n = 0;
+    } opened(d.job_of);
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
@@ -3239,7 +3260,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             float* row = out + (size_t) i * W;
             if (e < 0 || e >= d.n_expert) {
                 d.failed = true;
-                d.fail = "a routed expert id is out of range";
+                static thread_local char oor_buf[160];
+                std::snprintf(oor_buf, sizeof oor_buf,
+                              "a routed expert id is out of range (layer %lld, entry %lld/%lld, id %lld, n_expert %d)",
+                              (long long) d.layers, (long long) i, (long long) n_tok * k, (long long) e,
+                              (int) d.n_expert);
+                d.fail = oor_buf;
                 d.fail_layer = d.layers;
                 d.fail_expert = e;
                 return;
@@ -3282,6 +3308,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     return;
                 }
                 jo = (int16_t) njobs++;
+                opened.e[opened.n++] = e;
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
                 nj.nt = 0;
@@ -3323,10 +3350,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
     if (split_m >= 0 && njobs > 0 && d.remote_count == 0) refine_split(d, split_m > 0, njobs, ms(c3, c4));
-    for (int64_t i = 0; i < n_tok * k; ++i) {
-        const int64_t e = ids[i];
-        if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
-    }
     d.multi_misses += njobs;
     ++d.layers;
     d.experts += n_tok * k;

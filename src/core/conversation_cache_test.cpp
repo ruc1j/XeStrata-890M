@@ -164,8 +164,13 @@ int main() {
         pinned.checkpoints.back().pinned = true;
         pinned.checkpoints.back().gdn.resize(64, 1);
         cache.put(std::move(pinned));
+        const size_t pinned_bytes = cache.bytes();
         cache.put(image({9, 8, 7}));
+        // #2253: what the RAM gate may count on: everything parked but the pinned conversation
+        check(cache.evictable_bytes() == cache.bytes() - pinned_bytes && cache.evictable_bytes() == image({9, 8, 7}).bytes(),
+              "#2253: evictable_bytes leaves out the conversation that holds a pinned prefix");
         check(cache.evict_oldest() && cache.size() == 1, "the oldest unpinned conversation went (the pinned one is older)");
+        check(cache.evictable_bytes() == 0, "#2253: only a pinned one is left: nothing may go");
         check(!cache.evict_oldest() && cache.size() == 1, "only a pinned one is left: nothing more can go");
         // #879: after non-finite logits every parked conversation goes, the pinned one too
         cache.put(image({4, 5, 6}));
@@ -336,6 +341,8 @@ int main() {
         check(cache.find(sib.serial) != nullptr && cache.size() == 2 && cache.evictions() == 1 && !cache.guard_blocked(),
               "the slot limit evicts the other entry, not the guarded donor");
         check(cache.best(std::vector<int64_t>{7, 7, 7, 1}, {}, true).tokens == 0, "the other one went");
+        check(cache.evictable_bytes() == cache.bytes() - cache.find(sib.serial)->bytes(),
+              "#2253: evictable_bytes leaves out the guarded donor");
         SavedConversation rewritten = image({1, 2, 3, 4, 10, 11, 40});   // holds A's deepest checkpoint: supersedes A
         rewritten.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
         check(cache.put(std::move(rewritten)) && cache.find(sib.serial) != nullptr && cache.superseded() == 0,
@@ -469,6 +476,30 @@ int main() {
         p2.checkpoints.back().gdn.resize(64, 1);
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+        // #5697: an image that cannot fit beside the pinned entry even with every other entry gone is refused BEFORE
+        // anything is evicted: the two ordinary conversations stay parked (before, both were evicted, then refused)
+        auto p3 = image({1,2,3});
+        p3.checkpoints.push_back(ConversationCheckpoint{});
+        p3.checkpoints.back().ids = {1,2};
+        p3.checkpoints.back().pinned = true;
+        p3.checkpoints.back().gdn.resize(64, 1);
+        ConversationCache keep(pinned_bytes + one * 2, 4);
+        check(keep.put(std::move(p3)) && keep.put(image({7,8,9})) && keep.put(image({4,5,6})) && keep.size() == 3,
+              "a pinned conversation and two ordinary ones are parked");
+        check(!keep.make_room(one * 2 + 1) && keep.size() == 3 && keep.evictions() == 0,
+              "a park too big for the room beside the pin is refused with nothing evicted");
+        check(keep.best(std::vector<int32_t>{7,8,9,1}, {}, true).tokens == 3 && keep.best(std::vector<int32_t>{4,5,6,1}, {}, true).tokens == 3,
+              "both ordinary conversations can still be restored");
+        check(keep.make_room(one * 2) && keep.size() == 1 && keep.evictions() == 2,
+              "a park that fits once both go evicts both (as before)");
+        ConversationCache slots(pinned_bytes * 4 + one * 4, 1);
+        auto p4 = image({1,2,3});
+        p4.checkpoints.push_back(ConversationCheckpoint{});
+        p4.checkpoints.back().ids = {1,2};
+        p4.checkpoints.back().pinned = true;
+        p4.checkpoints.back().gdn.resize(64, 1);
+        check(slots.put(std::move(p4)) && !slots.make_room(one) && slots.size() == 1 && slots.evictions() == 0,
+              "one slot, held by a pin: refused, nothing evicted");
     }
     {
         // upstream #1503, the cross-conversation leak: the retained K/V of a restored conversation must never be reused

@@ -273,7 +273,9 @@ void route_prior_launch(sycl::queue& q, const float* logits, const int32_t* res_
             s[i] = p[i] + (res_layer[e] >= 0 ? lambda : 0.0f);   // the selection score
             p[i] = sycl::exp(p[i] - mx);                         // the router's probability (unnormalised)
         }
+        constexpr int kNE = NPL * 32;
         float sel_p = 0.0f, sel_sum = 0.0f;
+        int sel_id = -1, sel_n = 0;
         for (int rank = 0; rank < 10; ++rank) {
             float best = -FLT_MAX, bp = 0.0f;
             int be = 1 << 30;
@@ -285,11 +287,21 @@ void route_prior_launch(sycl::queue& q, const float* logits, const int32_t* res_
                 const float op = strata_shfl_xor(sg, bp, m);
                 if (ob > best || (ob == best && oe < be)) { best = ob; be = oe; bp = op; }
             }
-            if ((be & 31) == lane) s[be >> 5] = -FLT_MAX;
-            if (lane == rank) { id[rank] = be; sel_p = bp; }
+            // a degenerate token row (every s NaN or -inf: garbage logits) leaves be at the sentinel on every lane:
+            // be >> 5 would index past s[], and the sentinel in ids would stop the request at the host's range
+            // check (upstream 709d0a99c)
+            if (be < kNE && (be & 31) == lane) s[be >> 5] = -FLT_MAX;
+            if (lane == rank) { sel_id = be; sel_p = bp; }
             sel_sum += bp;                                       // the same on every lane
+            sel_n += (be < kNE);
         }
-        if (lane < 10) w[lane] = sel_p / sycl::fmax(sel_sum, 1e-30f);
+        // ids and weights are written together, and only when every rank found a real candidate and the picked
+        // mass is finite and positive; otherwise the whole row keeps the router's own top-10 and weights (upstream
+        // 5144e8b53): a row partly written would mix the prior's ids with the router's, perhaps one expert twice
+        if (lane < 10 && sel_n == 10 && sycl::isfinite(sel_sum) && sel_sum > 0.0f) {
+            id[lane] = sel_id;
+            w[lane] = sel_p / sel_sum;
+        }
     });
 }
 }  // namespace
