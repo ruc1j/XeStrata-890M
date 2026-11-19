@@ -1449,6 +1449,7 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
   llm-jp's card names no sampling, so it is not in the table and decodes greedy as before.
   The order of precedence: the request, the web page's shared Chat settings, the config's `sampling` block, the card.
   Greedy is only for who asks for it: `temperature: 0` in the request, or `"sampling": {"temperature": 0}` in the config.
+  A penalty moves the picks away from the greedy ones, so a temperature-0 request gets none of the model card's penalties (upstream #2940); a penalty the request or the config sets itself still applies.
   The web page sends no sampling of its own until you change its Chat settings (it showed and sent 0.6 before); an old stored 0.6 with the default top_p and top_k counts as not set.
   Chat settings takes a min_p too; empty, it is the server's default (the config's `sampling.min_p`).
 - The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) ride the same path.

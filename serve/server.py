@@ -5243,7 +5243,9 @@ class Service:
             return
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
-        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
+        card = model_card_sampling(self.model_arch, thinking,
+                                   greedy=asks_greedy(sampling, self.shared, self.sampling_defaults))
+        defaults = {**card, **self.sampling_defaults, **self.shared}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
@@ -7960,7 +7962,9 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            defaults = {**model_card_sampling(svc.model_arch, True), **svc.sampling_defaults, **svc.shared}
+            greedy = asks_greedy(svc.shared, svc.sampling_defaults)
+            defaults = {**model_card_sampling(svc.model_arch, True, greedy=greedy),
+                        **svc.sampling_defaults, **svc.shared}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
@@ -9446,10 +9450,31 @@ def card_family(cfg: dict) -> str | None:
     return None
 
 
-def model_card_sampling(arch, thinking) -> dict:
-    """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family)."""
+# The card's penalties: a greedy request must not get them (see model_card_sampling)
+CARD_PENALTIES = ("presence_penalty", "frequency_penalty", "repetition_penalty")
+
+
+def model_card_sampling(arch, thinking, greedy=False) -> dict:
+    """The model card's sampling for the family `arch` and the thinking state ({} for an unknown or unset family).
+    `greedy` (temperature 0 asked for, see asks_greedy): without the card's penalties, so a greedy request stays greedy.
+    A penalty moves the engine's picks (it is applied to the logits before the argmax): the answer is no longer the
+    greedy one.  (Upstream's engine also samples such a row and runs no MTP drafts; this engine keeps both.)"""
     sets = MODEL_CARD_SAMPLING.get(arch) if arch else None
-    return dict(sets["thinking" if thinking else "instruct"]) if sets else {}
+    card = dict(sets["thinking" if thinking else "instruct"]) if sets else {}
+    if greedy:
+        for k in CARD_PENALTIES:
+            card.pop(k, None)
+    return card
+
+
+def asks_greedy(*layers) -> bool:
+    """True when greedy is asked for: the first of `layers` (highest precedence first - the request, the shared Chat
+    settings, the config's `sampling` block) that sets a temperature sets 0."""
+    for layer in layers:
+        t = (layer or {}).get("temperature")
+        if t is not None:
+            return isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0
+    return False
 
 
 def _history_call_names(req) -> list:
