@@ -15,6 +15,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from serve import childenv  # noqa: E402
 from serve.childenv import DEVELOPER_SWITCH, NO_BACKTRACE, quiet_crash_env  # noqa: E402
 
 
@@ -82,6 +83,43 @@ class SpawnEnvironments(unittest.TestCase):
                     m = images.ImageGen({"exe": "strata-image", "diffusion_model": "d.gguf", "vae": "v.gguf",
                                          "llm": "l.gguf", "out_dir": d}, env=env)
                     self.assertEqual(m.engine.env[NO_BACKTRACE], "1")
+
+
+class OwnArenas(unittest.TestCase):
+    """upstream aeecf0f5d, the server's half: MALLOC_ARENA_MAX=2 for the server itself, nothing for its children."""
+
+    def test_not_when_the_variable_was_set(self):
+        with mock.patch.dict(os.environ, {"MALLOC_ARENA_MAX": "8"}):
+            self.assertFalse(childenv.limit_own_arenas())
+
+    def test_not_off_linux(self):
+        with mock.patch.object(childenv.sys, "platform", "win32"):
+            self.assertFalse(childenv.limit_own_arenas())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
+    def test_a_c_library_without_the_call_is_survived(self):
+        class NoMallopt:
+            def __getattr__(self, name):
+                raise AttributeError(name)
+        with mock.patch.dict(os.environ, {}), mock.patch("ctypes.CDLL", return_value=NoMallopt()):
+            os.environ.pop("MALLOC_ARENA_MAX", None)
+            self.assertFalse(childenv.limit_own_arenas())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
+    def test_glibc_takes_it_and_the_children_get_nothing(self):
+        import ctypes
+        if not hasattr(ctypes.CDLL(None), "mallopt"):
+            self.skipTest("not glibc")
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("MALLOC_ARENA_MAX", None)
+            self.assertTrue(childenv.limit_own_arenas())
+            self.assertNotIn("MALLOC_ARENA_MAX", os.environ)
+
+    def test_the_server_calls_it_in_main(self):
+        text = (Path(__file__).resolve().parent / "server.py").read_text(encoding="utf-8")
+        main = text[text.index("\ndef main() -> int:"):text.index("\ndef _main() -> int:")]
+        self.assertIn("limit_own_arenas()", main)
+        self.assertNotIn("MALLOC_ARENA_MAX", text)      # the engine's environment is not given it
 
 
 if __name__ == "__main__":

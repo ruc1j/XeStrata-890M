@@ -68,7 +68,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
-from serve.childenv import quiet_crash_env  # noqa: E402
+from serve.childenv import limit_own_arenas, quiet_crash_env  # noqa: E402
 from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END,  # noqa: E402
                             ChatTemplate, Event, GlmOutputParser, HarmonyParser, OutputParser, ToolCall, allowed_tools,
                             anthropic_format, anthropic_to_messages,
@@ -10098,6 +10098,7 @@ def main() -> int:
     that stops taking output must not hold a request's turn, a cancel or an admission.  STRATA_BLOCKING_CONSOLE=1 turns
     it off (testers)."""
     quiet_crash_env()                                  # every child inherits it: no gdb (serve/childenv.py)
+    limit_own_arenas()                                 # glibc's arenas of this server only (serve/childenv.py)
     # #5787: a native death names its Python line in this server's own output
     arm_faulthandler()
     if os.environ.get("STRATA_BLOCKING_CONSOLE") == "1":

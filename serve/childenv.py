@@ -14,6 +14,7 @@ nothing is set here, and the environment is left as the developer made it).
 from __future__ import annotations
 
 import os
+import sys
 
 NO_BACKTRACE = "GGML_NO_BACKTRACE"
 DEVELOPER_SWITCH = "STRATA_BACKTRACE"
@@ -37,3 +38,24 @@ def quiet_crash_env(env: dict | None = None):
     if NO_BACKTRACE not in target and not developer_wants_backtrace(target):
         target[NO_BACKTRACE] = "1"
     return target
+
+
+# upstream aeecf0f5d: glibc gives every thread that allocates its own memory arena, up to eight per core, and a server
+# that starts a thread per request keeps a little of each.  This fork caps the server's own arenas only: the engine is
+# not given MALLOC_ARENA_MAX (its CPU expert threads allocate side by side), so its environment is left as it is.
+ARENA_VAR = "MALLOC_ARENA_MAX"
+ARENA_VALUE = 2
+M_ARENA_MAX = -8                                    # glibc's mallopt(3) parameter number
+
+
+def limit_own_arenas() -> bool:
+    """mallopt(M_ARENA_MAX, 2) for this process (glibc takes it while the process runs).  False, and nothing done, when
+    MALLOC_ARENA_MAX was set (the person's value wins), off Linux, or when the C library has no such call (musl).  It
+    sets no environment variable, so the children the server starts keep glibc's default."""
+    if not sys.platform.startswith("linux") or ARENA_VAR in os.environ:
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.CDLL(None).mallopt(M_ARENA_MAX, ARENA_VALUE))
+    except (OSError, AttributeError, ValueError):
+        return False
