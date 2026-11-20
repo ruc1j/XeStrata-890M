@@ -2505,11 +2505,11 @@ static bool prepare_gated_window(strata::core::gated::Packet& packet,
 }
 
 // #4350 (upstream e1b27d54b): after a fatal GPU error (a memory access fault, a lost device) the device cannot be used again,
-// and unwinding the destructors on it can hang until the stall watchdog (#224).  A failed decode window / commit therefore ends
-// the engine at once when the error says the device is gone, with "ERR fatal GPU error: ..." as its last stdout line: the server
-// fails the request in flight with a 503 and starts the engine again on the next request, like any engine death.  Upstream reads
-// the CUDA runtime's sticky error; SYCL keeps none, so the text of the error the failed call reported (the runtime's own words,
-// HIP's and Level Zero's) is read instead.
+// and unwinding the destructors on it can hang until the stall watchdog (#224).  A failed decode window / commit, or a failed
+// prompt read (upstream 85c949f85), therefore ends the engine at once when the error says the device is gone, with "ERR fatal
+// GPU error: ..." as its last stdout line: the server fails the request in flight with a 503 and starts the engine again on
+// the next request, like any engine death.  Upstream reads the CUDA runtime's sticky error; SYCL keeps none, so the text of
+// the error the failed call reported (the runtime's own words, HIP's and Level Zero's) is read instead.
 // STRATA_INJECT_FATAL=N (a test hook, off when unset): the Nth decode window fails with the text of a real fatal error, the same way.
 [[noreturn]] static void exit_gpu_fatal(const std::string& what) {
     std::fprintf(stderr, "strata serve: fatal GPU error (%s): the engine ends so that the server can start it again\n", what.c_str());
@@ -12651,10 +12651,12 @@ int main(int argc, char** argv) {
                 const bool win = windows_ok(at, to);
                 const auto tpart = Clock::now();
                 if (win && !refill(err)) {
+                    exit_if_gpu_fatal(err);
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
                 if (!win && !lend(to - at, err)) {
+                    exit_if_gpu_fatal(err);
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -12682,6 +12684,9 @@ int main(int argc, char** argv) {
                 }
                 if (!sp_ok) {
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
+                        // upstream 85c949f85 (#6054): a prompt read the device failed under ends at once, as a decode
+                        // window does; a return from main would run the static destructors on the broken device
+                        exit_if_gpu_fatal(err);
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
