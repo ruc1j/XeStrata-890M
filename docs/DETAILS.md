@@ -687,6 +687,9 @@ The app has three tabs:
   Its conversation cache card shows how many prefill tokens the cache gave back (in the last request and since the
   start) and, with `--conversation-cache-mib`, the parked conversations and their memory, and how many were parked,
   restored and evicted (upstream #596; the same is under `"conversation_cache"` in `/metrics`).
+  `"conversation_cache"` in `/metrics` also counts the conversations the cache did not park, by reason (`refused`);
+  `/metrics/prometheus` gives the parked conversations, how many were parked, restored and evicted, and the ones
+  not parked by reason (`strata:conversation_cache_refused_total`).
 - About: the model and engine settings, and the addresses to connect other apps.
 
 `http://127.0.0.1:8095/?q=your question` opens it with a new chat already asking.

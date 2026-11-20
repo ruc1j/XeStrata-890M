@@ -637,6 +637,7 @@ setup はそこでファイルを見つけ、設定を書き直します。
 - Monitor: モデルが何をしているか（prefill 中ならその進み具合、decode 中ならその速さ）、
   GPU の負荷、VRAM、温度、電力、PCIe の通信量、CPU、RAM、ディスク、使っている文脈、最近の要求です。
   会話のキャッシュのカードには prefill のトークンのうちキャッシュから戻せた数（最後の要求と起動から）と、`--conversation-cache-mib` を入れていれば、置いた会話の数とメモリ、置いた・戻した・追い出した回数が出ます（upstream #596。`/metrics` の `"conversation_cache"` にも同じもの）。
+  `/metrics` の `"conversation_cache"` には、キャッシュが置かなかった会話の数も、理由ごとに出ます（`refused`）。`/metrics/prometheus` は、置いている会話の数と、置いた・戻した・追い出した数、置かなかった数を理由ごとに出します（`strata:conversation_cache_refused_total`）。
 - About: モデルとエンジンの設定、ほかのアプリをつなぐアドレスです。
 
 `http://127.0.0.1:8095/?q=質問` を開くと、その質問をした新しい会話から始まります。
