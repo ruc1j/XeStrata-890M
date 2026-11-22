@@ -21,14 +21,19 @@ class ReferenceParser(OutputParser):
                 s = line.lstrip()
                 was_fenced = bool(self.fence)
                 if self.fence:
-                    if len(s) - len(s.lstrip(self.fence[0])) >= len(self.fence):   # #4702: as many fence characters as opened it
+                    # #4702: as many fence characters as opened it
+                    if len(s) - len(s.lstrip(self.fence[0])) >= len(self.fence):
                         self.fence = ""
                 elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
                     self.fence = s[0] * (len(s) - len(s.lstrip(s[0])))
                 elif not s:
                     self.ticks = 0
+                # #4923: a span opened at a line's end goes on until closed
+                elif self.ticks % 2:
+                    self.ticks = (self.ticks + line.count("`")) % 2
+                # ... any other unpaired backtick is not carried
                 else:
-                    self.ticks += line.count("`")
+                    self.ticks = 1 if line.count("`") % 2 and line[line.rfind("`") + 1:].strip()[:1] in ("", "<") else 0
                 if was_fenced or self.fence:                                       # #4703: indented code blocks
                     self._prev_blank = self._indented = False
                 elif not s:
@@ -52,7 +57,8 @@ class TrackTests(unittest.TestCase):
 
     def test_fragment_state_from_varied_initial_states(self):
         fragments = ("", "a", "é🙂", "`", "``", "```", "~~~", "\r", "\n", "\r\n",
-                     "\n\n", "\n    code\n", "    x\n", "  ```python\n", "````md\n", "```quoted```\n", "~\ntext", "\t\nrest")
+                     "\n\n", "\n    code\n", "    x\n", "  ```python\n", "````md\n", "```quoted```\n", "~\ntext",
+                     "\t\nrest")
         for fence, line, ticks, text in itertools.product(("", "`", "~"),
                                                           ("", "  ", "``", "code `"),
                                                           (0, 1, 2, 3), fragments):

@@ -1008,9 +1008,10 @@ To switch between it and other model servers behind one address, see [LLAMA_SWAP
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
 `/models` and `/v1/models` list the model with its context limit and input modalities.
+The context limit is in `meta.n_ctx` and under the names other APIs use too (`max_model_len`, `context_length`, `max_context_length`).
 It is listed before it is loaded and while it starts too, with `status` `loading` (`unloaded` when it was unloaded for idleness).
 OpenAI's `created` (the server's start time) and `owned_by` (`xestrata`) are included.
-`GET /v1/models/{id}` returns one model; an unknown id is a 404 (`model_not_found`).
+`GET /v1/models/{id}` (and `GET /models/{id}`) returns one model; an unknown id is a 404 (`model_not_found`).
 `/props` gives the original chat template, the context limit, the configured generation defaults (shared settings take precedence),
 the model path and the engine version where available.
 Context means the full engine context, not the resident KV window.
@@ -1051,7 +1052,9 @@ A `--reasoning-effort` in `args` is moved there by the server, with a note.
 The levels are instructions the model was trained with, not a hard token limit:
 on easy questions all three think briefly, on hard ones `high` thinks longest and is most accurate.
 
-- **A hard thinking budget (opt-in).** `"reasoning_budget_tokens": N` (or llama.cpp's `"thinking_budget_tokens": N`, which clients written for llama-server send) in a request (OpenAI or Anthropic) caps the thinking at N tokens.
+- **A hard thinking budget (opt-in).** `"reasoning_budget_tokens": N` in a request (OpenAI or Anthropic) caps the thinking at N tokens.
+  The names other providers use are read too: vLLM's `thinking_token_budget`, Qwen's `thinking_budget` and llama.cpp's `thinking_budget_tokens`.
+  `reasoning_budget_tokens` wins over them, and of the others the first in that order does.
   When it gets there the server ends it with a short wrap-up line and `</think>`, and the model answers from there.
   The engine stops the thinking at exactly the token that reaches the budget (upstream be101072b; the same in a `--batch` slot, b92075d92), and the wrap-up pass continues from the state the engine holds, so the thinking is not read again.
   The wrap-up is part of the thinking the client sees and counts as output tokens.

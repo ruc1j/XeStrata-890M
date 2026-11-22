@@ -877,6 +877,13 @@ class ConvCacheLog:
     """upstream #596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
     cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
     which is the log): read on from where it was last read, from the start of the engine's current run."""
+    # #879: these two completed recovery messages follow ConversationCache::clear(), which removes every parked
+    # entry and its retained K/V.  Keep history counters: the clear is not a cache park or restore event.
+    CLEARED = re.compile(
+        r"strata serve: after non-finite logits \(#879\): (?:the restored session replaces the live one; dropped \d+ "
+        r"parked "
+        r"conversations?|dropped the live session, \d+ checkpoints?, \d+ parked conversations? and \d+ idle slots? "
+        r"\(\d+ running slots? not kept after their reply\); reading this prompt from token 0)$")
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
@@ -934,6 +941,8 @@ class ConvCacheLog:
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
             if "conversation cache:" not in line:
+                if self.CLEARED.fullmatch(line):
+                    self.state["parked"] = self.state["bytes"] = 0
                 continue
             m = self.EVENT.search(line)
             if m:
@@ -1279,8 +1288,17 @@ class StrataEngine:
         self.__dict__.setdefault("lp_lines", LPLines())   # (token id, LP line): logprobs
         last_t = None
         slot_q: list[queue.Queue] = getattr(self, "slot_q", [])
+        log = getattr(self, "log", None)                # retain this process's log across a restart
         line = None
         for line in proc.stdout:
+            # upstream 9106e010f (#4197): stderr already reaches the log; the engine's own ERR lines come on the
+            # protocol pipe, so they are written there too
+            if line.startswith("ERR ") and log not in (None, subprocess.DEVNULL):
+                try:
+                    log.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} native {line.rstrip()}\n")
+                    log.flush()
+                except (OSError, ValueError):          # a closed/full log must not prevent EOF publication
+                    pass
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -1804,6 +1822,13 @@ class StrataEngine:
             self.last = {**self.last, "finish": f[3],
                          "decode_ms": admission_ms + float(f[4]) if admission_ms is not None else None,
                          "generated": int(f[2]) if f[2].isdigit() else None}
+            for field in f[5:]:
+                key, eq, value = field.partition("=")
+                if eq and key == "drafts":   # drafts=<checked>:<kept>: the slot's own --batch-mtp counters (#5890)
+                    offered, colon, accepted = value.partition(":")
+                    if colon and offered.isdigit() and accepted.isdigit():
+                        self.last["drafts_offered"] = (self.last.get("drafts_offered") or 0) + int(offered)
+                        self.last["drafts_accepted"] = (self.last.get("drafts_accepted") or 0) + int(accepted)
 
     def _raise_if_fatal_gpu(self, line: str) -> None:
         """#4350: the engine's ERR line "fatal GPU error: ..." means it is ending (its GPU context is gone).  The
@@ -2081,6 +2106,15 @@ class StrataEngine:
         own_lp = self.own_lp_lines(sampling, cancel, make_current=False)
         out: list[int] = []
         pending: list[int] = []
+        # upstream 4f0e0f8b0 (#3492): the request's own clocks: a slot's live view shows them in every leg (a leg after
+        # another one starts with the reply so far)
+        began, first_at = time.time(), None
+
+        def arrived(t):
+            nonlocal first_at
+            if first_at is None:
+                first_at = time.time()
+            pending.append(t)
         prompt, left = list(ids), int(max_new)
 
         def leg_keys() -> str:
@@ -2145,7 +2179,7 @@ class StrataEngine:
                                     self.slot_claims.add(reserved)
                             if reserved is not None:
                                 self._send_for(born, f"BYIELD {reserved}")
-                    for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way,
+                    for x in self._control(cancel, arrived, stop_when=others, on_quiet=give_way,
                                            lines_q=lines_q):
                         while pending:
                             t = pending.pop(0)
@@ -2250,7 +2284,7 @@ class StrataEngine:
                     head = f"BGENI {slot} {left}{leg_keys()} {embeddings}" if embeddings else \
                         f"BGEN {slot} {left}{leg_keys()}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
-                            "started": time.time(), "first_token": None}
+                            "started": began, "first_token": None}
                     self.slot_live[slot] = live
                     self._last_done = None                  # (#879: this admission's DONE decides below)
                     if own_lp is not None:
@@ -2270,7 +2304,7 @@ class StrataEngine:
                             self._send_for(born, f"BYIELD {slot}")
                             asked = True
                     try:
-                        for x in self._control(cancel, pending.append, on_quiet=ask, lines_q=lines_q):
+                        for x in self._control(cancel, arrived, on_quiet=ask, lines_q=lines_q):
                             while pending:
                                 t = pending.pop(0)
                                 out.append(t)
@@ -2316,7 +2350,7 @@ class StrataEngine:
                 holding = False
                 if not cont:
                     return
-                live.update(state="decoding", first_token=time.time(), generated=len(out))
+                live.update(state="decoding", first_token=first_at or time.time(), generated=len(out))
                 gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
                 going_solo = False
                 while True:
@@ -3151,13 +3185,17 @@ class Vision:
             args += ["--min-tokens", str(cfg["min_tokens"])]
         return args
 
-    def _ensure_dir(self):
+    def _ensure_dir(self) -> bool:
         """#3370: a temp cleaner (Windows Storage Sense) removes the empty work folder
         while the encoder is unloaded; the next start then failed with WinError 267 for
-        as long as the server lived.  Make it again; pictures cached in it are gone."""
+        as long as the server lived.  Make it again; pictures cached in it are gone.
+        True when it was made again: a reader that is running has its `cwd` in the removed
+        folder (#5755), so it cannot see the files of the new one and has to be started again."""
         if not self.dir.is_dir():
             self.dir.mkdir(parents=True, exist_ok=True)
             self.cache.clear()
+            return True
+        return False
 
     def _start(self):
         """Start the encoder process and wait (bounded) for its READY; RuntimeError when it does not come."""
@@ -3405,7 +3443,10 @@ class Vision:
         data = self.normalize(source if isinstance(source, bytes) else self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
-            self._ensure_dir()
+            if self._ensure_dir() and self.alive():
+                # #5755: that reader's cwd is the removed folder, so the file written below is invisible to it and
+                # every picture would fail until the server is restarted
+                self.restart()
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
                 return self.cache[key]
@@ -4213,12 +4254,15 @@ class Service:
 
     def reasoning_budget(self, req) -> int | None:
         """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens` (or, as
-        llama.cpp reads it, `thinking_budget_tokens`), else the config's.  0 (or less) means no budget, so a request can
-        turn a configured one off.  ValueError (a 400) for anything that is not a whole number."""
+        llama.cpp reads it, `thinking_budget_tokens`; or vLLM's `thinking_token_budget`, or Qwen's `thinking_budget`:
+        the three names pi's thinkingTokenBudgetField can send), else the config's.  The request's own
+        `reasoning_budget_tokens` wins; of the other names the first in that order does.  0 (or less) means no budget,
+        so a request can turn a configured one off.  ValueError (a 400) for anything that is not a whole number."""
         req = req if isinstance(req, dict) else {}
         value = req.get("reasoning_budget_tokens")
-        if value is None:                                # a null does not hide the other name
-            value = req.get("thinking_budget_tokens")
+        for alias in ("thinking_token_budget", "thinking_budget", "thinking_budget_tokens"):
+            if value is None:                            # a null does not hide the other names
+                value = req.get(alias)
         if value is None:
             value = self.reasoning_budget_tokens
         if isinstance(value, float) and value.is_integer():
@@ -5419,7 +5463,8 @@ class Service:
                 budget = max(1, max_new - reserve)
         reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
         parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
-                  reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True, recover=self.tool_call_recovery,
+                  reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
+                         recover=self.tool_call_recovery,
                          declared_only=declared_only,
                          # #4622: opt-in, as for a deferred tool
                          deferred=deferred or self.undeclared_tool_calls == "call"))
@@ -6080,6 +6125,10 @@ class Service:
                 "reasoning_recoveries": recovery_count}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
+            if finish == "length":
+                # #4035: the stop string was found and cut from the answer, so the answer ended at it: "stop", not the
+                # token cap that fell on the same token (the Anthropic route already says stop_sequence)
+                done["finish"] = "stop"
         if rejected:
             done["rejected_tool_calls"] = rejected
         if markup_retried is not None:
@@ -7071,7 +7120,9 @@ def openai_collect(chunks) -> dict:
     if last["choices"][0]["finish_reason"] != "tool_calls":
         calls = [c for c in calls if c.get("type") == "custom"
                  or _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
-    msg: dict = {"role": "assistant", "content": "".join(content) or None}
+    # upstream 47b5dcda1 (#5249): null content only beside tool calls, as OpenAI sends it; a reply that ran out of
+    # tokens while thinking gets "" so strict OpenAI clients and proxies that require a string do not fail on it
+    msg: dict = {"role": "assistant", "content": "".join(content) or (None if calls else "")}
     if "".join(reasoning):
         msg["reasoning_content"] = msg["reasoning"] = "".join(reasoning)
     if calls:
@@ -7951,9 +8002,9 @@ def make_handler(svc: Service):
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     self._json(200, {"object": "list", "data": self._models()})
-            elif path.startswith("/v1/models/"):         # OpenAI's retrieve: one model by its id
+            elif path.startswith(("/v1/models/", "/models/")):   # OpenAI's retrieve: one model by its id (#5460)
                 if self._authorized():
-                    want = unquote(path[len("/v1/models/"):])
+                    want = unquote(path[len("/v1/models/" if path.startswith("/v1/models/") else "/models/"):])
                     found = next((m for m in self._models() if m["id"] == want), None)
                     if found is None:
                         self._json(404, {"error": {"message": f"The model '{want}' does not exist",
@@ -7996,8 +8047,11 @@ def make_handler(svc: Service):
             status = "loaded" if svc.loaded() else "unloaded" \
                 if svc.idle_unload_s or getattr(svc.engine, "unloaded", False) else "loading"
             common = {"object": "model", "created": int(svc.started_at), "owned_by": "xestrata"}
+            # the context size under the names other APIs use too (vLLM's max_model_len, OpenRouter's context_length,
+            # KoboldCpp's max_context_length), so a client that sizes its window from /v1/models reads it (#1882, #6116)
+            ctx = svc.reported_ctx()
             model = {"id": svc.model, **common, "status": {"value": status},
-                     "meta": {"n_ctx": svc.reported_ctx()},
+                     "max_model_len": ctx, "context_length": ctx, "max_context_length": ctx, "meta": {"n_ctx": ctx},
                      "architecture": {"input_modalities": (["text", "image"] if svc.vision is not None else ["text"]),
                                       "output_modalities": ["text"]}}
             if svc.aliases:
@@ -8211,6 +8265,19 @@ def make_handler(svc: Service):
                 print(f"[strata] 500: a file error ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
                 self._json(500, {"error": {"type": "server_error", "message": "the server could not read or write a "
                                            f"file of its own: {e.strerror or type(e).__name__}"}})
+            except BadBody:
+                raise
+            except Exception as e:
+                # #4757 (upstream e626616e4): an unexpected error in a request handler is answered 500 with the
+                # traceback in the log, not a dropped connection.  Once the answer began there is nothing to replace.
+                if getattr(self, "answer_started", False):
+                    raise
+                import traceback
+                print(f"[strata] 500 internal error ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
+                self._note(error=f"{type(e).__name__}: {e}")
+                message = f"internal server error ({type(e).__name__}: {e})"
+                self._json(500, responses_error_body(message, "server_error") if path == "/v1/responses"
+                           else {"error": {"type": "server_error", "message": message}})
             finally:
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
@@ -9999,25 +10066,64 @@ def asks_greedy(*layers) -> bool:
 def _history_call_names(req) -> list:
     """The tool names a request's own conversation called, in order, on any of the three routes: Chat Completions (an
     assistant message's tool_calls), Anthropic (an assistant message's tool_use blocks) and Responses (function_call /
-    custom_tool_call input items, a namespace in front as `namespace.name`)."""
+    custom_tool_call input items, a namespace in front as `namespace.name`).  #6120 (upstream 1bc720a34): a name every
+    call of which the client REFUSED (its result says the tool does not exist: `AI_NoSuchToolError: Model tried to call
+    unavailable tool 'edit'`) is not a tool the client has and is left out."""
     names = []
+    calls = []          # (name, call id)
+    results = {}        # call id -> the text of its result
     for message in req.get("messages") or []:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
+        if not isinstance(message, dict):
             continue
-        for call in message.get("tool_calls") or []:
-            names.append((call.get("function") or {}).get("name") if isinstance(call, dict) else None)
+        if message.get("role") == "tool":
+            results[message.get("tool_call_id")] = _result_text(message.get("content"))
         content = message.get("content")
         for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                results[block.get("tool_use_id")] = _result_text(block.get("content"))
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            calls.append(((call.get("function") or {}).get("name") if isinstance(call, dict) else None,
+                          call.get("id") if isinstance(call, dict) else None))
+        for block in content if isinstance(content, list) else []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
-                names.append(block.get("name"))
+                calls.append((block.get("name"), block.get("id")))
     items = req.get("input")
     for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and item.get("type") in ("function_call_output", "custom_tool_call_output"):
+            results[item.get("call_id")] = _result_text(item.get("output"))
         if isinstance(item, dict) and item.get("type") in ("function_call", "custom_tool_call"):
             name = item.get("name")
             if isinstance(name, str) and name and isinstance(item.get("namespace"), str) and item["namespace"]:
                 name = f"{item['namespace']}.{name}"
+            calls.append((name, item.get("call_id")))
+    kept: dict = {}
+    for name, call_id in calls:
+        refused = call_id is not None and call_id in results and _refusal(results[call_id])
+        kept[name] = kept.get(name, False) or not refused
+    for name, _ in calls:
+        if kept.get(name) and name not in names:
             names.append(name)
     return names
+
+
+def _result_text(content) -> str:
+    """The text of a tool result in any of the routes' shapes (a string, or a list of text parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+    return ""
+
+
+_REFUSAL = re.compile(r"NoSuchTool|rejected before execution|unavailable tool|unknown tool|no such tool|"
+                      r"tool '?[\w.:-]+'? (?:does not exist|is not available|not found)", re.IGNORECASE)
+
+
+def _refusal(text: str) -> bool:
+    """#6120: a tool result in which the client says the tool called does not exist (so the call never ran)."""
+    return bool(_REFUSAL.search(text or ""))
 
 
 def with_history_tools(tools, req) -> list:

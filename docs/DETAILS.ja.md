@@ -919,9 +919,10 @@ server は `http://127.0.0.1:8095` で待ち受けます（setup の `--port`、
 | MCP サーバーとその状態とツール（[下](#mcp-サーバーのツールを使う)） | `GET /mcp` |
 
 `/models` と `/v1/models` は、モデルを文脈の上限と入力の種類とともに示します。
+文脈の上限は `meta.n_ctx` のほか、ほかの API が使う名前（`max_model_len`、`context_length`、`max_context_length`）でも入ります。
 読み込む前と起動中も並び、`status` が `loading`（遊休で下ろしたときは `unloaded`）になります。
 OpenAI の `created`（server の起動時刻）と `owned_by`（`xestrata`）も付きます。
-`GET /v1/models/{id}` は 1 つのモデルを返し、知らない id には 404（`model_not_found`）を返します。
+`GET /v1/models/{id}`（`GET /models/{id}` でも同じです）は 1 つのモデルを返し、知らない id には 404（`model_not_found`）を返します。
 `/props` は、元のチャットテンプレート、文脈の上限、設定した生成の既定値（共有の設定が優先）、モデルのパス、エンジンの版を、わかる範囲で示します。
 文脈は、エンジンの文脈全体で、VRAM に置く KV の範囲ではありません。
 `n_predict: -1` は、出力の上限を決めていないという意味です。
@@ -961,7 +962,9 @@ print(r.choices[0].message.content)
 深さは、モデルが学習した指示で、トークン数の厳密な上限ではありません。
 易しい質問では 3 つとも短く考え、難しい質問では `high` がいちばん長く考えて、いちばん正確です。
 
-- **思考の厳密な上限（任意）**: 要求に `"reasoning_budget_tokens": N`（llama-server 向けのクライアントが送る llama.cpp の `"thinking_budget_tokens": N` でも。OpenAI でも Anthropic でも）を付けると、思考を N トークンで打ち切ります。
+- **思考の厳密な上限（任意）**: 要求に `"reasoning_budget_tokens": N` を付けると、思考を N トークンで打ち切ります（OpenAI でも Anthropic でも）。
+  ほかの提供元の名前でも受けます: vLLM の `thinking_token_budget`、Qwen の `thinking_budget`、llama.cpp の `thinking_budget_tokens` です。
+  複数あるときは `reasoning_budget_tokens` が優先し、残りはこの順で最初のものを使います。
   そこに達すると、server は短い締めの行と `</think>` で思考を終え、モデルはそこから答えます。
   エンジンは思考が上限に達したトークンでちょうど止まり（upstream be101072b、`--batch` の枠は b92075d92）、締めのパスはエンジンがいま持っている状態から続けるので、思考を読み直しません。
   締めの行はクライアントから見える思考の一部で、出力のトークンに数えます。
