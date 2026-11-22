@@ -99,7 +99,7 @@ HF_REVISIONS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
     # 2026-10-07 (adds IQ3_S)
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",
-    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "bba88856f8c3c0c9e40e45f82d05e228b814ac43",  # 2026-10-19
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
     "ornith-ai/Ornith-1.5-35B-A3B-GGUF": "12393612fd4f730ff5aadc23e9b8f9648aa49ceb",                 # 2026-10-11
     "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF": "0bfdfe7f6c424de60481c26379c9d821469f75f1",         # 2026-10-11
@@ -652,7 +652,7 @@ HUIHUI_FILES = {
 # The Coder's IQ1_M shards and its picture reader (the original's file), same source and form.
 CODER_FILES = {
     "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf":
-        (29608446496, "e11083ba855e7666b48ea3f2db6a9c3a20c18751a012cc24f948de91b7087fad"),
+        (29608446496, "bfa3644db4adfff072fc946c20994f2909d2cf89879d83f80a4c811d4016c211"),
     "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf":
         (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
     "mmproj-Qwen3.8-Flash-Next-BF16.gguf":
@@ -7230,6 +7230,11 @@ def main() -> int:
         why = "--setup" if a.setup else "--check" if a.check else "no model is installed yet"
         warn(f"--calibrate does nothing with {why}: it tunes a model that is already installed. Run "
              "xestrata --setup first, then xestrata --calibrate [--model NAME]")
+    if have and not (a.setup or a.check) and (a.calibrate or not (a.model or a.family or a.no_start)):
+        given = [f for f, v in (("--kv", a.kv), ("--context", a.context), ("--vision", a.vision)) if v is not None]
+        if given:                                      # upstream 56e3540b3 (#3182): said, not dropped
+            warn(f"{', '.join(given)} only apply when a model is set up: this start keeps its saved settings. To "
+                 f"change them: {SETUP_CMD} --setup --model NAME " + " ".join(given) + " ...")
     if have and a.calibrate and not (a.setup or a.check):
         targets = calibration_targets(have, a.model, a.family)
         if not targets:                                # upstream #2036: --model names a model that is not installed

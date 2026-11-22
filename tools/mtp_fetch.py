@@ -305,12 +305,16 @@ def check_range(status, content_range, start, end):
         raise IOError("range request answered with Content-Range %r, not %s..." % (content_range, want))
 
 
+OTHER_REPO = None    # --repo: the resolve base URL of another checkpoint's repository, when one was given
+
+
 def pinned():
     """The tensors' hashes (SHA256, the pinned revision's) apply: whenever this run asks for the pinned revision -
     from Hugging Face, ModelScope, or (STRATA_ALLOW_UNPINNED=1, resolve_repo) the current files that replaced it, which
     must still be the same bytes (#31: that path used to drop every check).  Not when STRATA_MTP_REVISION names
-    another revision: the table is not that one's."""
-    return REVISION == PINNED_REVISION
+    another revision: the table is not that one's, nor when --repo names another checkpoint's repository (upstream
+    c9b6956c6: a finetune that keeps its own MTP tensors)."""
+    return REVISION == PINNED_REVISION and REPO != OTHER_REPO
 
 
 def sha256_of(path):
@@ -499,11 +503,18 @@ def verify(out):
 
 
 def main():
+    global REPO, OTHER_REPO
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["inventory", "fetch", "verify"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--only")
+    ap.add_argument("--repo", help="the BF16 checkpoint's resolve base URL to read the MTP tensors from (default: the "
+                                   "pinned Qwen/Qwen3.8-Flash-Next revision); a finetune that keeps them in its own "
+                                   "repo, e.g. https://huggingface.co/<user>/<finetune>/resolve/main/ - its tensors "
+                                   "are not checked against the pinned SHA256")
     a = ap.parse_args()
+    if a.repo:
+        REPO = OTHER_REPO = a.repo if a.repo.endswith("/") else a.repo + "/"
     if a.cmd == "verify":                           # offline: the hashes are the pinned revision's
         bad = verify(a.out)
         for name in bad:
