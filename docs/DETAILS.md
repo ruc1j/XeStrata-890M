@@ -81,17 +81,19 @@ On an integrated GPU on the HIP backend the rule that sizes the window by its co
 rows as well and adds one only where it pays, so K=2 is the default there
 (890M, IQ2_XS, six chats of ordinary text: 38.03 → 38.31 tok/s; `--lookup-chain 0` turns it off).
 
-In the server's decode, a missed expert (not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the
-top 10, the smallest weights) contributes zero to that token, and one that every token of a verify window routes that
-low is neither read nor computed (`STRATA_ROUTE_TAIL_SKIP`, default 7, upstream b4e3407b). The other experts keep their
+With `STRATA_ROUTE_TAIL_SKIP=7`, in the server's decode a missed expert (not in VRAM) that a token routes at rank 7 or
+lower (the 8th to 10th of the top 10, the smallest weights) contributes zero to that token, and one that every token of
+a verify window routes that low is neither read nor computed (upstream b4e3407b).
+It is off by default. Rank 7 was the default before; upstream turned its default off for the answers' quality
+(962475995, engine 0.1.63), and XeStrata follows. The other experts keep their
 weights (no renormalisation), so the answers differ slightly. Upstream zeroes it only when no other token of the window
 needs the expert, so a token's output depended on the window's other rows; here it is decided for each token.
 It does nothing when every expert is in VRAM (nothing is skipped), with `--batch` and with a helper cache
 (`--expert-cache-device1..3`); on a layer split each stage skips its own.
-By default it is also off when 90% or more of the experts are in VRAM (upstream's #1884: the misses are few and the
-skip costs more draft acceptance than it saves; a V100 32 GB with Coder IQ1_M at 94.8% decoded 1-2% slower);
-`STRATA_TAIL_SKIP_MAX_CACHED=<percent>` moves that line (101: always on).
-`STRATA_ROUTE_TAIL_SKIP=0` turns it off and 1-9 sets the rank; the start prints one line.
+With most of the experts in VRAM the misses are few and the skip costs more draft acceptance than it saves
+(upstream's #1884: a V100 32 GB with Coder IQ1_M at 94.8% decoded 1-2% slower).
+1-9 sets the rank; when it is on, the start prints one line. `STRATA_TAIL_SKIP_MAX_CACHED`, which moved the default
+rule's line, is no longer read.
 
 Measured (IQ3_XXS)
 

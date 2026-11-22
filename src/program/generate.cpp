@@ -9088,38 +9088,19 @@ int main(int argc, char** argv) {
         strata::core::PcieSplitTimes* const pcie_split_ptr = drive.d.pcie_split;
         bool pcie_move_decided = false;   // the arena's move into host USM: decided once, after a prompt is read
         std::vector<int64_t> routed_seen;   // the prompts' routings already given to the adaptive tier's counts
-        {   // STRATA_ROUTE_TAIL_SKIP: ON BY DEFAULT (rank 7, upstream b4e3407b; measured on XeStrata's GPUs, docs/DETAILS.md): a
-            // missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed
-            // (answers differ slightly; =0 restores the bytes of a build without it).  No default and no line when every
-            // expert is in VRAM (nothing to skip); off with --batch slots (a window then mixes requests, and one request's
-            // skip would depend on another's tokens) and with a helper GPU (the dispatch skips nothing there).  A layer
-            // split is fine: each stage skips by itself.
-            const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
+        {   // STRATA_ROUTE_TAIL_SKIP: OFF BY DEFAULT (upstream 962475995, engine 0.1.63: users reported lower quality; this
+            // start-up set rank 7 until then, where fewer than 90% of the experts were cached).  A missed expert that every
+            // token of a verify window routes at the rank or lower is neither copied nor computed (answers differ
+            // slightly); STRATA_ROUTE_TAIL_SKIP=7 turns it on, 1 to 9 pick a rank.  An unset value is rank 0
+            // (strata/core/tail_skip_default.hpp), so this start-up sets nothing.  Nothing to say when every expert is in
+            // VRAM (nothing to skip).
             const bool all_experts_resident = !host_res.empty() &&
                 std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
-            const bool helper = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
-                                            [](int n) { return n > 0; });
-            // #1884 (upstream 6ab541f6): with nearly every expert in the GPU cache the few misses are cheap and the skip
-            // costs more draft acceptance than it saves (upstream: V100 32 GB, Coder IQ1_M, 94.8% cached, -1..2% decode).
-            // STRATA_TAIL_SKIP_MAX_CACHED=<percent> (default 90) moves the line; 101 = never.
-            size_t cached_experts = 0;
-            for (int32_t r : host_res) cached_experts += r >= 0 ? 1 : 0;
-            const char* mcs = std::getenv("STRATA_TAIL_SKIP_MAX_CACHED");
-            const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::strtod(mcs, nullptr) / 100.0 : 0.90;
-            const bool nearly_all_cached = !host_res.empty() && !all_experts_resident &&
-                                           (double) cached_experts >= max_cached * (double) host_res.size();
-            if (tse == nullptr && nearly_all_cached && o.batch <= 0 && !helper)
-                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in "
-                                     "the GPU cache, so few are missed and skipping them costs more draft acceptance than "
-                                     "it saves; STRATA_ROUTE_TAIL_SKIP=7 turns it on\n",
-                             100.0 * (double) cached_experts / (double) host_res.size());
-            if (tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch <= 0 && !helper)
-                strata::core::set_tail_skip_rank(7);
             if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
-                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert a token routes at rank "
-                                     "%d or lower contributes zero to it (answers differ slightly); "
-                                     "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
-                             tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON: a missed expert a token routes at rank "
+                                     "%d or lower contributes zero to it (answers differ slightly); it is off when "
+                                     "STRATA_ROUTE_TAIL_SKIP is not set or is 0\n", strata::core::tail_skip_rank(),
+                             strata::core::tail_skip_rank());
         }
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays

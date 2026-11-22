@@ -548,7 +548,7 @@ bool setup_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, bo
 /// 64K prompt the reading came out up to 3x low on the RX 9060 XT's machine).
 void read_memory_rate_before(const ExpertDispatch& d, int64_t n_layers);
 
-/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
+/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 (tail_skip_default.hpp).
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,

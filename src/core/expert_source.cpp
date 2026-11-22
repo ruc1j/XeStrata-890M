@@ -4,6 +4,7 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/tail_skip_default.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -2969,16 +2970,14 @@ void refine_split(ExpertDispatch& d, bool both, int experts, double ms) {
 }
 
 // STRATA_ROUTE_TAIL_SKIP: the rank from which a missed expert that every token of the window routes that low is
-// skipped (upstream b4e3407b).  An explicit environment value is read once; the serve start-up (generate.cpp) sets the
-// default where it applies.
+// skipped (upstream b4e3407b).  An environment value is read once.  Not set: off (strata/core/tail_skip_default.hpp;
+// the serve start-up set rank 7 until upstream 962475995).
 std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
 }  // namespace
 int tail_skip_rank() {
     int r = g_tail_skip_rank.load(std::memory_order_relaxed);
     if (r < 0) {
-        const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP");
-        r = v != nullptr ? (int) std::strtol(v, nullptr, 10) : 0;
-        r = r > 0 && r < 10 ? r : 0;
+        r = tail_skip_rank_from_text(std::getenv("STRATA_ROUTE_TAIL_SKIP"));
         g_tail_skip_rank.store(r, std::memory_order_relaxed);
     }
     return r;
