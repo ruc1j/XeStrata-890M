@@ -83,6 +83,7 @@
 #include "strata/program/conv_cache.hpp"
 #include "strata/core/gated_proposal.hpp"
 #include "strata/program/draft_kv_plan.hpp"
+#include "strata/program/bdone_drafts.hpp"
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/program/message_boundary.hpp"
@@ -3307,8 +3308,20 @@ int main(int argc, char** argv) {
             } catch (const std::exception&) {
                 ple_only = false;   // an unreadable table fails with its own message when it loads
             }
-            if (!ple_only &&
-                std::find(o.native_dense_gguf.begin(), o.native_dense_gguf.end(), o.ple_gguf) == o.native_dense_gguf.end())
+            // The PLE shard is often kept on another disk, so --ple-gguf can name the same file that the split
+            // discovery found beside --native, through a different path (a symlink, a bind mount, a second mount
+            // point). Compare file identity, not the path string: admitting one split.no twice makes NativeDense
+            // refuse the model with "duplicate split shard number", which names the split metadata instead of the
+            // repeated shard.
+            auto same_shard = [](const std::string& a, const std::string& b) {
+                if (a == b) return true;
+                std::error_code ec;
+                const bool same = std::filesystem::equivalent(a, b, ec);
+                return !ec && same;
+            };
+            const bool ple_present = std::any_of(o.native_dense_gguf.begin(), o.native_dense_gguf.end(),
+                                                 [&](const std::string& s) { return same_shard(s, o.ple_gguf); });
+            if (!ple_only && !ple_present)
                 o.native_dense_gguf.push_back(o.ple_gguf);
         }
         // Plan v0.3 (24 Sep): the CPU experts stay on the VNNI kernel.  The llama.cpp-CPU-exact q8_0 contract
@@ -4536,11 +4549,20 @@ int main(int argc, char** argv) {
             const bool knobs = o.rope_scale > 1.0 || o.rope_freq_scale > 0 || o.yarn_ext_factor > 0 ||
                                o.yarn_attn_factor != 1.0;
             const double base = rope_cfg.freq_base;
+            const double trained = rope_cfg.orig_ctx;   // the model's (or --yarn-orig-ctx), before the reset
             rope_cfg = strata::kernels::RopeScaling{};
             rope_cfg.freq_base = base;
             if (knobs)
                 std::fprintf(stderr, "strata generate: note: no rope scaling is active (none), so --rope-scale, "
                                      "--rope-freq-scale and the --yarn-* knobs have no effect\n");
+            // a --max-context set by hand past the trained one ran without a word: setup adds yarn there, a config
+            // written by hand did not
+            if (trained >= 1 && (double) o.max_context > trained)
+                std::fprintf(stderr, "strata generate: WARNING: --max-context %lld is past the model's trained context "
+                                     "of %.0f and no rope scaling is active: positions past it rotate by angles the model "
+                                     "never saw, and it can lose track there. To extend the context: --rope-scaling yarn "
+                                     "--rope-scale %.3g (what setup writes above %.0f)\n",
+                             (long long) o.max_context, trained, (double) o.max_context / trained, trained);
         }
         if (const char* why = strata::kernels::rope_scaling_invalid(rope_cfg)) {
             std::fprintf(stderr, "strata generate: invalid rope scaling configuration: %s (factor %g, freq_scale %g, "
@@ -9896,7 +9918,17 @@ int main(int argc, char** argv) {
         // Single-stage serve without --batch only (the pipelined and the batch windows capture their own);
         // STRATA_WINDOW_WARM=0 turns it off.
         {
-            static const bool warm_off = [] { const char* v = std::getenv("STRATA_WINDOW_WARM"); return v != nullptr && v[0] == '0'; }();
+            // upstream 027aac9bd (#6171): not while STRATA_ROUTE_PRIOR is on.  The warm-up's dummy token pages its experts
+            // into the cache, and the prior routes the first request towards what is resident, so they would bend its
+            // answer (upstream: P(<|im_end|>) over a long passkey answer 4.8-7.4% in the first request after a start
+            // against 1.4-1.7% with the warm-up or the prior off; RTX 3090, IQ4_XS).  STRATA_WINDOW_WARM=1 forces it.
+            static const bool warm_off = [] {
+                const char* w = std::getenv("STRATA_WINDOW_WARM");
+                if (w != nullptr && w[0] == '0') return true;
+                if (w != nullptr && w[0] == '1') return false;
+                const char* prior = std::getenv("STRATA_ROUTE_PRIOR");   // read as verify.cpp reads it
+                return prior != nullptr && std::strtod(prior, nullptr) > 0.0;
+            }();
             const bool route_trace = std::getenv("STRATA_ROUTE_DUMP") != nullptr || std::getenv("STRATA_ROUTE_REPLAY") != nullptr;
             const int warm_s = std::min<int>(o.spec, strata::kernels::kVerifyMaxT);
             if (!warm_off && !route_trace && warm_s >= 2 && n_stages == 1 && o.batch == 0 && !(kvg.on && kvg.cells < warm_s + 64)) {
@@ -10121,6 +10153,8 @@ int main(int argc, char** argv) {
             int n_drafts = 1;              ///< STRATA_PIPED_MTP: how many of `draft` its next window checks
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
+            /// --batch-mtp: the proposals its windows checked / kept since the admission (BDONE's drafts=, upstream 5152c0366)
+            int64_t drafts_off = 0, drafts_acc = 0;
             strata::core::SlotHold hold;   ///< GEN / BGEN hold=N:ID (the server's thinking budget): the slot ends with BDONE "hold" after N emitted tokens unless ID came first
             Clock::time_point t0;
             // the slot's own conversation cache (#465): the tokens its session holds (the prompt, then every token a
@@ -10411,6 +10445,10 @@ int main(int argc, char** argv) {
             for (int a = 0; a < A; ++a) {
                 bt_rows += keep[(size_t) active[a]];
                 bt_accepted += keep[(size_t) active[a]] - 1;
+                if (batch_mtp) {   // the slot's own counters, for its BDONE (the response's draft_n / draft_n_accepted)
+                    bs[(size_t) active[a]].drafts_off += 1;   // one proposal a slot and window
+                    bs[(size_t) active[a]].drafts_acc += keep[(size_t) active[a]] - 1;
+                }
             }
             for (int a = 0; a < A; ++a) {
                 const int b = active[a];
@@ -10441,7 +10479,8 @@ int main(int argc, char** argv) {
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f%s\n", b, (long long) sl.produced, fin, ms,
+                                    strata::program::bdone_drafts_text(sl.drafts_off, sl.drafts_acc).c_str());
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;   // its session holds sl.ids
                         break;
@@ -10699,6 +10738,8 @@ int main(int argc, char** argv) {
                 keep[(size_t) b] = blk.keep;
                 bt_accepted += blk.keep - 1;
                 pm_checked += blk.n - 1;
+                bs[(size_t) b].drafts_off += blk.n - 1;   // the slot's own counters, for its BDONE
+                bs[(size_t) b].drafts_acc += blk.keep - 1;
             }
             PmCommit c;
             std::copy(G.rows, G.rows + G.S, c.rows);
@@ -10743,7 +10784,8 @@ int main(int argc, char** argv) {
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", blk.b, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f%s\n", blk.b, (long long) sl.produced, fin, ms,
+                                    strata::program::bdone_drafts_text(sl.drafts_off, sl.drafts_acc).c_str());
                         sl.active = false;
                         sl.draft_ready = false;
                         // a cache again (#857), as on the pipelined path without drafts: final once its commits have
@@ -10840,7 +10882,8 @@ int main(int argc, char** argv) {
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f%s\n", b, (long long) sl.produced, fin, ms,
+                                    strata::program::bdone_drafts_text(sl.drafts_off, sl.drafts_acc).c_str());
                         sl.active = false;
                         // a pipelined slot is a cache again, so a request left alone in its slot goes back to the
                         // solo path with its drafts (upstream fc844436, #857): its state is final once its last window

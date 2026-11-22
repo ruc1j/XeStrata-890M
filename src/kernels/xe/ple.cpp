@@ -42,6 +42,8 @@ bool overlap(const void* a, size_t a_bytes, const void* b, size_t b_bytes) {
 
 inline uint16_t bf16_bits(float f) {
     uint32_t i = sycl::bit_cast<uint32_t>(f);
+    // a NaN stays a quiet NaN, as in bf16_bits.hpp: the rounding add would carry it into -0 or inf
+    if ((i & 0x7FFFFFFFu) > 0x7F800000u) return (uint16_t) ((i >> 16u) | 64u);
     i = (i + ((i >> 16) & 1u) + 0x7FFFu) & 0xFFFF0000u;
     return (uint16_t) (i >> 16);
 }

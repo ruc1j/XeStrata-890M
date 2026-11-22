@@ -542,6 +542,10 @@ if(STRATA_ENABLE_XE)
     add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
     target_link_libraries(file_expert_source_test PRIVATE strata_engine)
     add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
+    # the RAM probe on fixture files (cgroup v2, a group without a memory controller, a hybrid host, cgroup v1): no GPU
+    add_executable(host_memory_test tests/core/host_memory_test.cpp)
+    target_link_libraries(host_memory_test PRIVATE strata_engine)
+    add_test(NAME host_memory_test COMMAND host_memory_test)
     # STRATA_EXCHANGE_ROTATE's ownership table (CPU) and its integration with the source (a GPU)
     add_executable(exchange_storage_test tests/core/exchange_storage_test.cpp)
     target_include_directories(exchange_storage_test PRIVATE include)
@@ -1332,12 +1336,18 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(kva_test PRIVATE include)
   add_test(NAME kva_test COMMAND kva_test)
   # the layer split's pure rules (header-only, no GPU; upstream 1c6c82ef, cb6c549c, a22a0e8c): the automatic split's
-  # minimum stage size, the --batch-groups resolution and which path builds the draft layer's prompt K/V
-  foreach(rule_test split_rules_test batch_groups_test draft_kv_plan_test)
+  # minimum stage size, the --batch-groups resolution, which path builds the draft layer's prompt K/V, and a --batch
+  # slot's draft counters in its BDONE line (upstream 5152c0366)
+  foreach(rule_test split_rules_test batch_groups_test draft_kv_plan_test bdone_drafts_test)
     add_executable(${rule_test} src/program/${rule_test}.cpp)
     target_include_directories(${rule_test} PRIVATE include)
     add_test(NAME ${rule_test} COMMAND ${rule_test})
   endforeach()
+  # upstream 2720fddb1 (#5822): the batch indexer append names the predicate that failed, with its values (header-only,
+  # no GPU)
+  add_executable(qsa_batch_check_test tests/prefill/qsa_batch_check_test.cpp)
+  target_include_directories(qsa_batch_check_test PRIVATE include)
+  add_test(NAME qsa_batch_check_test COMMAND qsa_batch_check_test)
   # --serve's parked conversations (upstream ccc660b-cecf697): the cache's ownership and matching, and the RAM
   # admission's MemAvailable parsing (host only)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/ngram/ple_reader.cpp - see include/strata/ngram/ple_reader.hpp.
 #include "strata/ngram/ple_reader.hpp"
+#include "strata/core/progress.hpp"   // #4682: a completed table read is progress for the serve watchdog
 #include "strata/platform/aux_cpus.hpp"
 
 #include <algorithm>
@@ -327,6 +328,9 @@ struct PleReader::Impl {
             free_slots.push_back(s);
             return false;
         }
+        // #4682: a slow drive that still returns rows is not a stopped engine (--ple-io direct: random 4 KiB reads, 16
+        // a token)
+        strata::core::progress_beat();
         record_latency(now_us() - j.issued_us);
         stats.bytes += c.bytes;
         const uint8_t* buf = slot_buf(s);

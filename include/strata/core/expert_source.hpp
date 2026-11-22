@@ -85,10 +85,13 @@ struct HostMemory {
     /// charged to its cgroup.  generate reports it beside `available` (the cache's total, the memory guard's log).
     uint64_t mem_available = 0;
     uint64_t cgroup_limit = ~uint64_t{0};
+    const char* why = nullptr;        ///< when host_available_memory is false: what it could not read (a static text, for the log line)
 };
 
 /// Linux reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
-/// defaults are the real files).  cgroup v2 as before (an unreadable limit of a group that has one fails); cgroup v1's
+/// defaults are the real files).  cgroup v2: a group whose memory.max exists but cannot be read fails; a group without a
+/// memory.max has no memory controller and no limit of its own (its parents are read), and a "0::" path that is not in
+/// this namespace's mount reads the mount's root as the process's own group (#5196); cgroup v1's
 /// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes); no cgroup line at all is
 /// MemAvailable alone.  False when the RAM cannot be determined.
 bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/meminfo",

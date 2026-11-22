@@ -352,12 +352,12 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
         if (fields >> key >> value >> unit && key == "MemAvailable:" && unit == "kB" &&
             value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
     }
-    if (bytes == 0) return false;
+    if (bytes == 0) { m.why = "MemAvailable is not in /proc/meminfo"; return false; }
     m.mem_available = bytes;   // the physical figure, before the cgroup clamp below
     // Account for the tightest cgroup ancestor limit when its normal mount is visible.
     // This is a point-in-time guard, not a reservation against concurrent allocations.
     std::ifstream groups(self_cgroup);
-    if (!groups) return false;
+    if (!groups) { m.why = "/proc/self/cgroup cannot be read"; return false; }
     const std::filesystem::path root(cgroup_root);
     bool v2 = false;
     std::string v1_path;   // the memory controller's group (cgroup v1), when there is no v2 line
@@ -371,29 +371,43 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
                 if (c == "memory") v1_path = line.substr(c2 + 1);
             continue;
         }
+        // A hybrid host (cgroup v1 controllers plus a "0::/..." line for the unified hierarchy; Docker on a v1 host, e.g.
+        // Vast's containers): the root is the v1 tree, it has no cgroup.controllers, and the "0::" path is not in it.
+        // That line is no v2 limit then; the v1 branch below reads the memory controller.  (Before, this returned false
+        // and --resident-budget-gib was ignored: "cannot determine available memory".)
+        if (!std::filesystem::exists(root / "cgroup.controllers")) continue;
         auto path = (root / line.substr(4)).lexically_normal();
-        if (path.string().rfind(root.string(), 0) != 0 || !std::filesystem::is_directory(path)) return false;
+        if (path.string().rfind(root.string(), 0) != 0) { m.why = "the process's cgroup path leaves the cgroup mount"; return false; }
+        // #5196: a process whose "0::" path is not in this mount (a container without a cgroup namespace of its own: its
+        // /proc/self/cgroup names the host's path, while /sys/fs/cgroup is its own group) - the mount's root is that group.
+        // On a real v2 host the root has no memory.max and imposes nothing, so MemAvailable alone applies then.
+        if (!std::filesystem::is_directory(path)) path = root;
         v2 = true;
         while (path.string().rfind(root.string(), 0) == 0) {
+            // A group without a memory.max has no memory controller (it is not in its parent's subtree_control) and no limit
+            // of its own; its parents are read.  (Before: "cannot determine available memory" on such a host, with free RAM.)
+            if (!std::filesystem::exists(path / "memory.max")) {
+                if (path == root) break;
+                path = path.parent_path();
+                continue;
+            }
             std::ifstream limit_file(path / "memory.max"), current_file(path / "memory.current");
             std::string limit;
             uint64_t current = 0;
             const bool readable = bool(limit_file >> limit) && bool(current_file >> current);
-            // The host's root cgroup has no memory.max; ordinary child groups must expose their limits.
-            if (!readable && !(path == root && !std::filesystem::exists(path / "memory.max") &&
-                               std::filesystem::exists(path / "cgroup.controllers"))) return false;
+            if (!readable) { m.why = "a cgroup's memory.max or memory.current cannot be read"; return false; }
             if (readable && limit != "max") {
                 try {
                     size_t consumed = 0;
                     const uint64_t cap = std::stoull(limit, &consumed);
-                    if (consumed != limit.size()) return false;
+                    if (consumed != limit.size()) { m.why = "a cgroup's memory.max is not a number"; return false; }
                     CgroupMemoryStat stat;
-                    if (!read_cgroup_memory_stat(path, current, stat)) return false;
+                    if (!read_cgroup_memory_stat(path, current, stat)) { m.why = "a cgroup's memory.stat has no counters"; return false; }
                     uint64_t cgroup_available = 0;
-                    if (!cgroup_available_bytes(cap, stat, cgroup_available)) return false;
+                    if (!cgroup_available_bytes(cap, stat, cgroup_available)) { m.why = "a cgroup's counters do not add up"; return false; }
                     bytes = std::min(bytes, cgroup_available);
                     m.cgroup_limit = std::min(m.cgroup_limit, cap);
-                } catch (...) { return false; }
+                } catch (...) { m.why = "a cgroup's memory.max is not a number"; return false; }
             }
             if (path == root) break;
             path = path.parent_path();
@@ -468,9 +482,12 @@ std::string page_cache_hint(const std::string& meminfo_text) {
 
 namespace {
 
-bool available_memory_bytes(uint64_t& bytes) {
+bool available_memory_bytes(uint64_t& bytes, std::string* why = nullptr) {
     detail::HostMemory m;
-    if (!detail::host_available_memory(m)) return false;
+    if (!detail::host_available_memory(m)) {
+        if (why != nullptr && m.why != nullptr) *why = std::string(" (") + m.why + ")";   // what could not be read, for the log line
+        return false;
+    }
     bytes = m.available;
     return bytes > 0;
 }
@@ -1909,8 +1926,9 @@ bool FileExpertSource::pin_complement(
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
         // they fit, the rest left on the mapped files; clamped to what the RAM has room for.
         uint64_t physical = 0;
-        if (!available_memory_bytes(physical)) {
-            err = "FileExpertSource: cannot determine available RAM for --resident-budget-gib";
+        std::string mem_why;
+        if (!available_memory_bytes(physical, &mem_why)) {
+            err = "FileExpertSource: cannot determine available RAM for --resident-budget-gib" + mem_why;
             return false;
         }
         budget_physical = physical;
@@ -1999,8 +2017,9 @@ bool FileExpertSource::pin_complement(
     if (bytes > 0 || lend) {
         // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own
         // allocations, the file cache) failed a budget the first one had clamped.  (A budget turns `lend` off.)
-        if (physical == 0 && !available_memory_bytes(physical)) {
-            err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
+        std::string mem_why3;
+        if (physical == 0 && !available_memory_bytes(physical, &mem_why3)) {
+            err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check" + mem_why3;
             return false;
         }
         budget = physical > headroom_bytes ? physical - headroom_bytes : 0;
@@ -2050,8 +2069,9 @@ bool FileExpertSource::pin_complement(
     uint64_t stage_lent_bytes = 0;
     if (!stage_lend_regions_.empty()) {
         if (budget == std::numeric_limits<uint64_t>::max()) {   // #403: the one reading, taken now
-            if (physical == 0 && !available_memory_bytes(physical)) {
-                err = "FileExpertSource: cannot determine available RAM for the stage lend regions";
+            std::string mem_why2;
+            if (physical == 0 && !available_memory_bytes(physical, &mem_why2)) {
+                err = "FileExpertSource: cannot determine available RAM for the stage lend regions" + mem_why2;
                 return false;
             }
             budget = physical > headroom_bytes ? physical - headroom_bytes : 0;

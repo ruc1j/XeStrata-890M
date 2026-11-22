@@ -7,6 +7,7 @@
 // pointer stays valid.  Over strata::gpu's chunk calls (sycl_ext_oneapi_virtual_mem: the Level Zero and CUDA adapters).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
