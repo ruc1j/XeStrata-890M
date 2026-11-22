@@ -262,6 +262,8 @@ serve のツール呼び出しの読み手は、この fork が引数の型を s
 
 - MTP なしのセッションの保存と復元の修正（1b58c335d）。この fork は MTP なしのセッションファイルを断るので、同じ不具合は起きません。
 - systemd-oomd からモデルの読み込みを守る pacer（02c4bd423、aa754707c、cc0242cc8）。
+- prefill のエキスパートを FP16 の行列命令で計算するカーネル（`STRATA_PF_F16=2`、upstream bbb22af24 と 7c3f971e1。upstream も gfx1150 では既定にしていません）。upstream の HIP 版そのものを 890M で動かして比べました。3,419 トークンの prefill で、エキスパートの積にかかる時間は upstream の既定で 4,995 ms、`STRATA_PF_F16=2` で 3,638 ms、この fork の int8 のカーネルで 3,719 ms（gate/up 2,530 + down 1,189）です。fork のカーネルと差がないので、移していません。prefill 全体では、upstream は `STRATA_PF_F16=2` で 3〜5.5% 速くなり（16,085 トークンで 114〜117 → 121〜123 tok/s、交互 3 周）、fork は同じ長さで約 316 tok/s です。
+- 新しいモデルの Hy4-Flash（Tencent、220B）のエンジン。公開されているいちばん小さいファイル（SQ-64）が 62 GB で、ほかに 67.6 GB の Engram のファイルが要ります。RAM 62 GiB の 890M の PC では動かして確かめられないので、移していません。
 - cgroup v1 の page cache の加算（c9f031dcd）と、`--prefill` の塊の上限（c983ecc64）。前者が前提とする upstream の部品が、この fork にありません。後者は CUDA の grid の行数に合わせた修正です。
 
 ## Strata 0.1.61 の取り込み

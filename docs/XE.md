@@ -261,6 +261,8 @@ What did not go in:
 
 - The fix to saving and restoring a session without the MTP (1b58c335d). This fork refuses a session file without the MTP, so the fault does not occur.
 - The pacer that keeps systemd-oomd from ending a model load (02c4bd423, aa754707c, cc0242cc8).
+- The kernel that computes the prefill's experts on the FP16 matrix instructions (`STRATA_PF_F16=2`, upstream bbb22af24 and 7c3f971e1; upstream does not make it the default on gfx1150 either). Upstream's own HIP build was run on the 890M for the comparison. In a prefill of 3,419 tokens the experts' products take 4,995 ms on upstream's default, 3,638 ms with `STRATA_PF_F16=2`, and 3,719 ms on this fork's int8 kernels (gate/up 2,530 + down 1,189). That is no difference to the fork's kernels, so it is not carried over. Over the whole prefill upstream gains 3 to 5.5% with `STRATA_PF_F16=2` (16,085 tokens: 114-117 to 121-123 tok/s, three interleaved rounds), and the fork reads the same length at about 316 tok/s.
+- The engine of the new model Hy4-Flash (Tencent, 220B). The smallest published file (SQ-64) is 62 GB and needs a 67.6 GB Engram file beside it. A PC with the 890M and 62 GiB of RAM cannot run it to check it, so it is not carried over.
 - The cgroup v1 page cache credit (c9f031dcd) and the cap on `--prefill`'s chunk (c983ecc64). The first needs a part of upstream this fork does not have; the second fits CUDA's grid rows.
 
 ## Integration through Strata 0.1.61
