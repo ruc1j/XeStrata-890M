@@ -658,7 +658,14 @@ CODER_FILES = {
     "mmproj-Qwen3.8-Flash-Next-BF16.gguf":
         (907543008, "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0"),
 }
-UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
+# RAM beside the budget where the 17 below was not measured: a unified-memory GPU (its expert cache and the budget share
+# the RAM) and what text_ram_gb counts for a config
+UNSLOTH_RAM_LEFT_GB = 24
+# RAM beside the RAM budget (resident_budget_gib): the OS, the engine, and the file cache the rest is read through.
+# upstream 8780e9fdc (2026-11-19): 24 -> 17, a 64 GB PC 40 -> 47 GiB (upstream, a 64 GiB limit, UD-Q4_K_XL: decode 57.7
+# -> 84.2 tok/s, a 65K prompt reads 97.7 -> 37.0 GB from the SSD, and it ran on when an 8 GiB program started after the
+# load)
+UNSLOTH_BUDGET_LEFT_GB = 17
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
 # serve the setup takes yarn (or asks, when interactive) and the factor final / 262144 (at least 1), keeps an explicit
 # --rope-scaling / --rope-scale, and refuses an explicit --rope-scaling none there.
@@ -4955,13 +4962,43 @@ def model_shards(fam: dict, model: str) -> int:
     return MODELS.get(model, {}).get("shards", fam.get("shards", 2))
 
 
-def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
+def resident_budget_gib(model, ram, kv_ram_gb=0.0, uma=False) -> int:
     """UD-Q4_K_XL, UD-IQ4_XS: the GiB of experts the engine keeps in RAM (--resident-budget-gib): the RAM (GB,
-    ram_gb()) less 24 for the OS, the engine and the file cache the other experts are read through, less a KV cache
-    streamed to RAM; at most all of them, at least 8.  A 64 GB PC (~62 GiB): 38, 36 with a 128K context
-    (the 2026-10-03-ud-low-ram record)."""
-    gib = round(ram) - UNSLOTH_RAM_LEFT_GB - math.ceil(kv_ram_gb)
+    ram_gb(), rounded up to the size the PC is sold with: nominal_ram_gb) less 17 (UNSLOTH_BUDGET_LEFT_GB) for the OS,
+    the engine and the file cache the other experts are read through, less a KV cache streamed to RAM; at most all of
+    them, at least 8.  A 64 GB PC: 47, 45 with a 128K context (upstream 8780e9fdc and c8d70bbcd; it was the RAM less 24:
+    38 and 36 on a PC that reads 62 GiB).
+    A unified-memory GPU (`uma`) keeps the rule it had, the reading less 24 (UNSLOTH_RAM_LEFT_GB): there the GPU's
+    expert cache is RAM too, and upstream measured the 17 on discrete cards only."""
+    if uma:
+        return _budget_gib(model, ram, kv_ram_gb, UNSLOTH_RAM_LEFT_GB)
+    return _budget_gib(model, nominal_ram_gb(ram), kv_ram_gb, UNSLOTH_BUDGET_LEFT_GB)
+
+
+def shares_ram(gpu) -> bool:
+    """True when this GPU's memory is the PC's RAM (an integrated GPU): its RAM budget keeps the 24 GB rule."""
+    return bool((gpu or {}).get("integrated"))
+
+
+def _budget_gib(model, ram, kv_ram_gb, left) -> int:
+    gib = round(ram) - left - math.ceil(kv_ram_gb)
     return max(8, min(gib, int(MODELS[model]["arena_gb"] / 1.073741824)))
+
+
+NOMINAL_RAM_GB = (16, 24, 32, 48, 64, 96, 128, 192, 256)     # the sizes a PC is sold with (above 256: a multiple of 8)
+NOMINAL_RAM_MARGIN = 0.03                                    # a reading this close under one of them is that size
+
+
+def nominal_ram_gb(ram) -> float:
+    """The RAM reading rounded UP to the size the PC is sold with, where it reads within 3% under it (upstream
+    c8d70bbcd): a "64 GB" PC reads 62.5 to 63.7 GiB on Linux and 63.1 on Windows, which gave 46 on one and 47 on the
+    other.  A PC that really has less (60 GB) is not counted as 64: 3% under 64 is 62.1.  Only the RAM budget rule uses
+    it (resident_budget_gib); every other test keeps the reading."""
+    ram = float(ram)
+    size = next((n for n in NOMINAL_RAM_GB if ram <= n), None)
+    if size is None:
+        size = math.ceil(ram / 8) * 8
+    return float(size) if size * (1 - NOMINAL_RAM_MARGIN) <= ram <= size else ram
 
 
 UMA_EXPERTS = 24576            # the Flash-Next model's experts (48 layers x 512): the most an expert cache can hold
@@ -5025,18 +5062,18 @@ def uma_holds_experts(model, ram, gpu) -> bool:
     return pool > 0 and UMA_POOL_FIXED_GIB + arena_gib + UMA_POOL_MARGIN_GIB <= pool
 
 
-def budget_choice(model, ram, asked) -> float:
+def budget_choice(model, ram, asked, uma=False) -> float:
     """UD-Q4_K_XL's or UD-IQ4_XS's RAM budget: --resident-budget-gib N as given, else the recommendation
     (resident_budget_gib).  More than the recommendation is kept, with what it risks (setup recommends, it never
     forces)."""
-    rec = resident_budget_gib(model, ram)
+    rec = resident_budget_gib(model, ram, uma=uma)
     if asked is None:
         return rec
     if asked > rec:
         warn(f"a {asked:g} GiB RAM budget is more than setup recommends for this PC ({rec} GiB: the RAM less "
-             f"{UNSLOTH_RAM_LEFT_GB} GB for the OS, the engine and the file cache that reads the other experts). Kept "
-             "as you chose: the engine clamps it to the RAM it finds free at start (less 8 GiB), and the file cache "
-             "gets less room - it may be slower, or run the PC out of RAM under load")
+             f"{UNSLOTH_RAM_LEFT_GB if uma else UNSLOTH_BUDGET_LEFT_GB} GB for the OS, the engine and the file cache "
+             "that reads the other experts). Kept as you chose: the engine clamps it to the RAM it finds free at start "
+             "(less 8 GiB), and the file cache gets less room - it may be slower, or run the PC out of RAM under load")
     return int(asked) if asked == int(asked) else asked
 
 
@@ -7021,8 +7058,8 @@ def main() -> int:
                          "model (STRATA_CACHE_HOST=1, --mmap-experts, --no-prefill-borrow: decode 15-22 -> about 39 "
                          "tok/s on the Radeon 890M, the README's table); off writes the engine's default path instead")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
-                    help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, "
-                         "~38 on 64 GB; more is kept as you choose, with a note)")
+                    help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 17 GB, "
+                         "47 on 64 GB; a GPU that shares the RAM: less 24 GB; more is kept as you choose, with a note)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
                          "default: 700); the expert cache takes that much less")
@@ -7367,7 +7404,8 @@ def main() -> int:
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
             vram = gpu_expert_vram(gpu) + sum(max(0.0, gpu_expert_vram(gpu_info(i)) - 5) for i in sel[1:])
             if d.get("budget"):
-                fits = f"fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest read from the SSD"
+                fits = (f"fits with {resident_budget_gib(m, ram, uma=shares_ram(gpu))} GiB of its experts in RAM, "
+                        "the rest read from the SSD")
                 if uma_holds_experts(m, ram, gpu):     # upstream 86ffdbeb1: every expert in the RAM the GPU shares
                     fits = f"fits with all of its {d['arena_gb']:.0f} GB of experts in the RAM the GPU shares"
                 verdict = ("EXPERIMENTAL, " if d.get("experimental") else "") + fits if ram >= d["ram_gb"] \
@@ -7448,7 +7486,8 @@ def main() -> int:
             fit += "   (installed)"
         if d.get("budget") and not uma_holds_experts(m, ram, gpu):
             say(f"  {i}) {m} {d['about']}; download {d['download_gb']:.0f} GB, keeps ~"
-                f"{resident_budget_gib(m, ram)} GB of its {d['arena_gb']:.0f} GB of experts in RAM{fit}")
+                f"{resident_budget_gib(m, ram, uma=shares_ram(gpu))} GB of its {d['arena_gb']:.0f} GB of experts in "
+                f"RAM{fit}")
             continue
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, vram) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, vram):.0f}%, "
@@ -7478,13 +7517,14 @@ def main() -> int:
                  "slower than the 2-3-bit models")
         if ram < MODELS[model]["ram_gb"]:
             confirm_risk(f"{model} needs {MODELS[model]['ram_gb']} GB of RAM or more; this PC has {ram:.0f} GB: "
-                         f"its RAM budget would be {resident_budget_gib(model, ram)} GiB, so nearly every expert is "
+                         f"its RAM budget would be {resident_budget_gib(model, ram, uma=shares_ram(gpu))} GiB, so "
+                         "nearly every expert is "
                          "read from the SSD while it answers (very slow), and it may run out of RAM",
                          bool(a.model), a.yes, f"{model} needs {MODELS[model]['ram_gb']} GB of RAM or more; this PC "
                          f"has {ram:.0f} GB", f"choose one of the 2-3-bit models, or --model {model} --yes to "
                          "install it anyway", "  Install it anyway?")
             warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
-        budget = budget_choice(model, ram, a.resident_budget_gib)
+        budget = budget_choice(model, ram, a.resident_budget_gib, uma=shares_ram(gpu))
         ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
         if a.low_ram not in ("auto", "off"):
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
@@ -7862,7 +7902,7 @@ def main() -> int:
         args += ["--kv-resident", "32768"]
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
         if budget is not None and a.resident_budget_gib is None:   # its RAM comes out of the experts' budget
-            budget = resident_budget_gib(model, ram, kv_ram_gb)
+            budget = resident_budget_gib(model, ram, kv_ram_gb, uma=shares_ram(gpu))
             ok(f"RAM budget: {budget} GiB (less the KV cache's RAM)")
     elif ctx >= 65536:   # #620: say why, so a regenerated config without --kv-resident is no surprise
         ok(f"KV streaming off: it needs ~{kv_ram_gb:.1f} GB of RAM beside the ~{MODELS[model]['ram_gb']} GB {model} "

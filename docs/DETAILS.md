@@ -297,7 +297,7 @@ Its license is the Swift Open License 1.0: read it on the model page.
 
 **[Unsloth's UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** is a ~4-bit i-quant of the original model in three shards (94 GB; upstream #621).
 Its experts' gate and up are IQ3_S (IQ4_XS in one layer) and its downs IQ4_NL (Q8_0 in five layers), 59.5 GB of them.
-The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 24 GB).
+The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 17 GB, less 24 GB with a GPU that shares the RAM).
 With about 80 GB of RAM every expert fits it.
 setup asks about images (on by default); the image encoder is the original model's.
 
@@ -322,8 +322,13 @@ IQ3_XXS's 32K decode: B70 +3.5%, RTX 4070 the same (prefill +1%), RX 9060 XT +0.
 The engine reads the experts from the GGUF files in place.
 It keeps a RAM budget of them, the most-used first after the ones the GPU holds (`--resident-budget-gib N`).
 When the budget has room left, the slots the prompt path borrows keep their experts in RAM too (the engine prints `the prompt path's lend region: N of its M slots keep their experts in RAM too`; upstream f2e142f4, #1683); before, a budget always left them out, and every prompt read the lent slots' experts from the files again.
-setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:
-36 GiB on a 64 GB PC with a 128K context.
+setup chooses the RAM less 17 GB for N, less the KV cache too when that lives in RAM:
+45 GiB on a 64 GB PC with a 128K context.
+A RAM reading within 3% under a size PCs are sold with (64 GB, for example) counts as that size.
+It was the RAM less 24 GB before. Upstream measured under a 64 GiB limit: decode 57.7 → 84.2 tok/s, and a 65K prompt
+read 37.0 GB from the SSD instead of 97.7; so it is 17 GB now (8780e9fdc, c8d70bbcd).
+On a PC whose GPU shares the RAM (an integrated GPU) the GPU's expert cache is RAM as well, so the rule stays as it was
+there: the RAM reading less 24 GB.
 The rest come from the SSD while it answers.
 Images can be chosen, with a warning that this file has not been run with them (upstream #967; reported working upstream).
 
