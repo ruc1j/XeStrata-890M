@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_first_chunk.py - #2391: open with the first response data; emit the role exactly once.
 
     python -m unittest serve.test_first_chunk -v

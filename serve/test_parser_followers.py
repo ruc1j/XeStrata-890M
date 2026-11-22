@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_parser_followers.py - #6032 R1: what ends a parameter value after its `</parameter>`, and the parameter
 names a damaged opener writes (cases from PR #6032's test_parser_followers.py, Gyro / Coder-L recordings; the ones of
 later repairs left out), plus negatives: text that only looks like a follower stays in the value.

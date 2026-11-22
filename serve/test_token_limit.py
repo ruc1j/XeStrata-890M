@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """#4037: the reply's token limit is one whole number on every route.  A boolean, a fraction, a string or a list used to
 be coerced by int() on the Chat and Messages routes (true became 1, 2.5 became 2) while Responses refused them; all
 three now answer 400 before anything is sent to the engine.  -1 and 0 (no cap), a positive whole number and an absent or

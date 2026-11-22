@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_parser_named_param.py - #5969's third form (recovery on): inside the call format's `<function=NAME>`, a
 parameter opened as `<parameter name="K">` (the Anthropic XML form's opener; a user's report of stopped agent turns has
 it, and the trailing-`</parameter>` replay of 11-16 lost the parameter) is parameter K when K is a declared parameter of

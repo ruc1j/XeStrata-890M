@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """#4210 #5244: Codex multi-agent v2 items on /v1/responses. A worker's task and its answer arrive as `agent_message`
 items (Codex's own input_text header, then the payload in an `encrypted_content` part that holds plain text when the
 agents run here); agent calls may arrive as `multi_agent_call` / `multi_agent_call_output`. They were refused with a 400

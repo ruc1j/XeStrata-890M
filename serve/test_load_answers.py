@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """PR #4307's honest-answers part, on the routes as they are (the pre-save ladder it is stacked on is not part of this):
 POST /load and POST /v1/load answer an engine that dies or cannot be ended while it starts with a 503 and a JSON error,
 instead of an unhandled exception that closed the connection with no answer."""

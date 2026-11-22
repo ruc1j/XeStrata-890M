@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_responses.py - #451: the Responses API (POST /v1/responses) against the mock engine (no GPU, no pack).
 
     python -m unittest serve.test_responses -v

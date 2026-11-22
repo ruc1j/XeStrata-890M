@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_parser_xml_elems.py - #6032 R4 (recovery on): declared parameters written as XML elements
 `<NAME>value</NAME>`, alone or mixed with `<parameter=NAME>` ones, and a call closed by a stray `</user>` (Gyro /
 Coder-L recordings; cases from PR #6032's test_parser_xml_elems.py), with negatives: an undeclared tag and

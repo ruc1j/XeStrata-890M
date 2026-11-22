@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_cut_arguments.py - a call max_tokens cut short, replayed in a client's history (soak 11-17, 0.2.16): its
 arguments arrive as text that starts like a JSON object and is not valid JSON.  The prompt must show the model the call
 it wrote, with its parameters, not `<parameter=arguments>` + the cut text: after a dozen cut calls in a history the

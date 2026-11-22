@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_tool_markup_retry.py - (a): a reply to a request with tools that ends in tool-call markup that is no call
 (a name the request did not declare, a call cut before its end, a block that reads as no call) is written again once,
 inside the same request; strata_unread_tool_markup marks a reply that still ends in such markup.  The 43 forms are the

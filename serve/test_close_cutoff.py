@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """#6055: a request the server had accepted, cut off because the server stops the engine under it.
 
 The stop path closes the engine (StrataEngine.close: STOP, then QUIT).  The engine ends the request that is still

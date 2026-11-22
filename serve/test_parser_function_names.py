@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_parser_function_names.py - #6032 R6 (recovery on): the tool's opener written damaged right after
 `<tool_call>` - its `>` left out (`<function=Grep` + line break), the bare `<Grep>`, `<=Read>` - for a declared tool
 (Gyro / Coder-L recordings; cases from PR #6032's test_parser_followers.py, test_parser_stub.py D,

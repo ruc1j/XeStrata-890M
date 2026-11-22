@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """#5787: a native death of the serve process leaves the Python stack of the crashing thread in its own output.
 
     The field reports (ten automatic restarts over three days, on a Windows box, in one thread) all said the same

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_stop_open_string.py - a tool call whose string value is still open when the model's output ends with a
 normal stop (EOS) is never repaired into a complete call, on any of the three APIs, streamed or not (soak 11-17, s005
 turn 36).

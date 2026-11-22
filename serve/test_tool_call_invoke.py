@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_tool_call_invoke.py - #5969's parser part (recovery on): a call written in Claude's
 `<invoke name="NAME"><parameter name="K">V</parameter></invoke>` dialect inside the `<tool_call>` wrapper is the call
 (cases from PR #5969's test_tool_call_envelope.py InvokeDialect, Sergey Zinchenko; the incident reply ended at

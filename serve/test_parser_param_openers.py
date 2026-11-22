@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_parser_param_openers.py - #6032 R2 (recovery on): damaged parameter openers of a declared parameter not
 set yet - `<parameter=NAME: value`, a bare `<NAME>` / `</NAME>`, `<=NAME>` - read as that parameter (cases from PR
 #6032's test_parser_damaged_param_openers.py, test_parser_bare_param_opener.py and test_parser_followers.py, Gyro /

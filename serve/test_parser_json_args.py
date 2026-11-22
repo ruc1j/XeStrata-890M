@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_parser_json_args.py - #6032 R3 (recovery on): a call whose body is `<arguments>` + a JSON object instead
 of `<parameter=` tags (Gyro / Coder-L recording; cases from PR #6032's test_parser_json_args.py): the object is the
 call's arguments, closed by `</arguments>`, by the stray `</parameter>` the model wrote, or by nothing; string values of

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_v1_origin.py - the /v1 foreign-Origin rule (owner 11-16), the same contract as the app host's /v1.
 
 While no api_key is set, a /v1 request whose Origin names a page of another site is refused with 403: any site can make

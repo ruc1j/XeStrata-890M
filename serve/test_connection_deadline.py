@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-License-Identifier: MIT
 """A client that has stopped does not own a handler thread, and does not own the engine's single turn.
 
 The handler's connection has a deadline (PEER_STALL_S, STRATA_PEER_STALL_S): the longest a socket operation may block
