@@ -10,9 +10,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.2.15-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
-移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 upstream の Strata 0.2.15（エンジンの版は 0.1.61、`c775728`）までの変更のうち、
-この fork に当たるものを取り込んでいます（[Strata 0.1.61 の取り込み](#strata-0161-の取り込み)から [Strata 0.1.38 の取り込み](#strata-0138-の取り込み)までの各節）。
+XeStrata xe0.2.19-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 upstream の Strata 0.2.19（エンジンの版は 0.1.65、`c6f6427`）までの変更のうち、
+この fork に当たるものを取り込んでいます（[Strata 0.1.65 の取り込み](#strata-0165-の取り込み)から [Strata 0.1.38 の取り込み](#strata-0138-の取り込み)までの各節）。
 同じ SYCL のコードを intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
 upstream の CUDA のビルドは廃止してソースも消しました。
 CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe の各ソースは移植元の CUDA のファイル名をコメントに書いています。
@@ -229,6 +229,37 @@ upstream の Strata 0.2.10 の既定の drafter、DFlash2（incoai/Qwen3.8-Flash
 交互 3 周（枠 24,576、冷却つき）: MTP 31.6 / 31.7 / 32.0 tok/s、DFlash2（confidence 0.6）29.6 / 29.6 / 29.8 tok/s で、中央値で 6.7% 遅いです。drafter は 7.7 ms/round、2,191 トークンに 942 round（1 round 2.3 トークン。MTP は 874 round、2.5 トークン）。6 チャットの greedy の答えは 3 周とも MTP と同じでした。チャットごとに見ると、コードと英語の 3 つ（クイックソート 37.2 対 36.5、transformer 33.2 対 32.4、bash 42.6 対 40.5）では DFlash2 が 2〜5% 速く、日本語の文章の 2 つ（四季 21.5 対 25.6、光合成 25.0 対 28.8）で 13〜16%、TCP/UDP（32.9 対 34.0）で 3% 遅いです。
 
 1 round に受け入れるトークンの数は MTP と同じほど（約 2.5）ですが、drafter 自身が 1 round に 7.8 ms かかり（5 層の Q4_0 の重み 0.5 GB を 890M の帯域で読む時間が大半）、MTP の約 4 ms より長いので、decode は 6〜7% 遅くなります。upstream が AMD の HIP で MTP より 4〜12% 速かったのは、帯域が 2.5〜6 倍のカード（Strix Halo、R9700）です。Issue #23（2026-10-24）の見積もり（drafter の重みの読みが MTP の 4 ms を超え、+2〜3% が上限）のとおりでした。drafter は下書きを変えるだけで、答えは verify が決めます。
+
+## Strata 0.1.65 の取り込み
+
+upstream の Strata 0.2.15 から 0.2.19（エンジンの版は 0.1.65、2026-11-22）までの 1,082 コミット（merge を除きます。0.2.16 までが 609、その先が 473）を 1 件ずつ見て、エンジン・serve・setup・tools の層に当たるものを XeStrata-890M に移しました。一覧は `.upstream-0162.md` と `.upstream-0165.md`（リポジトリの根、git の外）です。
+大半は、NVIDIA と Windows と複数 GPU 向けの変更、app と Terminal と Control の層、新しいモデルの Hy4-Flash と Inkling-2-Mini のエンジンで、この節で移したものには入っていません。
+serve のツール呼び出しの読み手は、この fork が引数の型を schema から読むので、upstream の差分はそのままでは当たりません。当たらなかった分は fork の形に書き直しました。
+
+移したものは次のとおりです。
+
+- エンジン: `STRATA_ROUTE_TAIL_SKIP` の既定をオフにしました（upstream 962475995。答えの質を理由にした upstream の判断です）。`STRATA_ROUTE_TAIL_SKIP=7` でオンにできます（[DETAILS](DETAILS.ja.md)）。890M のふつうの起動では、エキスパートの 90% 以上がキャッシュに入るので、前から働いていませんでした。
+- エンジン: cgroup の中での RAM の空きの読み方を直しました（cfb3d9bcb、ad9aa7597）。cgroup v1 の制御と `0::` の行が混ざる host では v1 の上限を読み、`memory.max` のない group は親の上限を読みます。読めなかったときは、何が読めなかったかを誤りの文に添えます。
+- エンジン: PLE の表を読んでいる間も、serve が停止を見張るための進行を数えます（c369e7392、fbd35fc21、fdba9ebd9）。遅いドライブでの読みを、止まったエンジンと取り違えません。
+- エンジン: `STRATA_ROUTE_PRIOR`（opt-in）が、縮退したトークンで番兵の値を ids に書かないようにしました（709d0a99c、5144e8b53）。オンの間は、READY の前の窓の下準備も飛ばします（027aac9bd）。
+- エンジン: CPU のエキスパートの窓が、GPU が書き換える ids を、処理の始めに一度だけ写して読みます（f0f39de26）。
+- エンジン: 会話キャッシュは、入りきらない会話を、何かを追い出す前に断ります（4c3470aa8）。追い出してもメモリーが戻らないときは追い出しを止めます（96edb9337、a1b7cd186）。
+- エンジン: serve で prompt の読み込みが GPU の誤りで失敗したら、すぐに終わります（85c949f85 の考えを fork の形で）。
+- エンジン: `--batch-mtp` のスロットごとの draft の数を BDONE の行で返します（5152c0366）。f32 から bf16 への変換は NaN を NaN のまま保ちます（fda204b5c）。`--max-context` が学習時の文脈を超えていて rope scaling がないときは WARNING を出します（252e6ea0c）。
+- serve: ツール呼び出しの読み。崩れた閉じタグや開きタグ、`<arguments>` の JSON、Claude の `<invoke>` の形、思考の中の `<function=NAME>` だけの呼び出し、文の中の対にならないバッククォートなどを読めるようにしました（8426249f0、05795a84a、7c743ad7f、db0c38425、859f0da47、c447a2850、20056dbbe、5959daece ほか）。ストリームで流す長い引数の解析は線形にしました（fb3c3ea69）。integer や number の引数に書かれた `+10`、`010`、`.5` を数として読みます（bee824a22）。
+- serve: ツールを宣言した要求の返答が、動かさない呼び出しの形で終わったら、同じ要求の中で 1 回だけ書き直させます（e05e6e0cc、`"tool_markup_retry": false` か `STRATA_TOOL_MARKUP_RETRY=0` で切れます）。
+- serve: 返し方。200 を返したあとの誤りは、その API の最後のフレームで伝えます（cf0743747）。想定外の誤りには、接続を切らずに 500 を返します（e626616e4）。要求の欄の型が違うときは、欄の名前を言う 400 を返します（c2767a851、84ae5707b、3755e94a3）。サーバーが止めたことで切れた要求は 503 にします（b1cdaa389）。
+- serve: `/v1/models` が文脈の上限を `max_model_len`、`context_length`、`max_context_length` でも返し、`GET /models/{id}` にも答えます（dd6da3a9d、18cce81d0、23d94d00a）。思考の上限は `thinking_token_budget` と `thinking_budget` からも読みます（7ffd66628）。
+- serve: `--prompt-cache-every` の定期チェックポイントを、再開した位置からの格子に置きます（2c8d300ad）。temperature 0 の要求には、モデルカードのペナルティを付けません（d7ce708ba、3313dbd61）。server の glibc のメモリー区画を 2 つに抑えます（aeecf0f5d の server の側）。
+- serve: Responses API の `max_output_tokens` で切れた答え、Codex の multi-agent v2 の item、クライアント側の `tool_search`（3af02433a、3cb933d29、277af44e9、e04cb092f）。
+- setup: RAM の予算（`--resident-budget-gib`）の規則を、RAM から 17 GB を引く形にしました（8780e9fdc、c8d70bbcd）。GPU が RAM を共有する PC は、upstream と同じく 24 GB を引く元の規則のままなので、890M では変わりません。
+- setup と tools: Coder のモデルの pin（3d54c7137）、`mtp_fetch.py` の `--repo`（c9b6956c6）、`--batch` のスロットを上書きされた会話の続きを確かめる試験の道具（6da257d80）ほか。
+
+入れていないものは次のとおりです。
+
+- MTP なしのセッションの保存と復元の修正（1b58c335d）。この fork は MTP なしのセッションファイルを断るので、同じ不具合は起きません。
+- systemd-oomd からモデルの読み込みを守る pacer（02c4bd423、aa754707c、cc0242cc8）。
+- cgroup v1 の page cache の加算（c9f031dcd）と、`--prefill` の塊の上限（c983ecc64）。前者が前提とする upstream の部品が、この fork にありません。後者は CUDA の grid の行数に合わせた修正です。
 
 ## Strata 0.1.61 の取り込み
 

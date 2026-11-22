@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// SPDX-License-Identifier: MIT
 // include/strata/program/bdone_drafts.hpp - the draft counters of a --batch slot in its BDONE line (#5890).
 //
 // With --batch-mtp the proposals are checked in the slot windows, and the engine counted them only in its totals ("strata batch: MTP proposals accepted N of M") and the

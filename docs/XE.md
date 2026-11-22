@@ -10,9 +10,9 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.2.15-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
-It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries the changes that apply to this fork up to upstream Strata 0.2.15 (engine 0.1.61, `c775728`)
-(the sections from [Integration through Strata 0.1.61](#integration-through-strata-0161) down to [Integration through Strata 0.1.38](#integration-through-strata-0138)).
+XeStrata xe0.2.19-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries the changes that apply to this fork up to upstream Strata 0.2.19 (engine 0.1.65, `c6f6427`)
+(the sections from [Integration through Strata 0.1.65](#integration-through-strata-0165) down to [Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
 Upstream's CUDA build is retired and its sources are removed.
 Upstream Strata (`3ce2523`) keeps them, and each Xe source names the CUDA file it ports in a comment.
@@ -228,6 +228,37 @@ Measured (the 890M, the abliterated IQ2_XS, the bench's 6 chats, greedy, `--spec
 Three interleaved rounds (24,576 slots, cooled between runs): the MTP 31.6 / 31.7 / 32.0 tok/s, DFlash2 (confidence 0.6) 29.6 / 29.6 / 29.8 tok/s, 6.7% slower by the medians. The drafter took 7.7 ms a round, 942 rounds for 2,191 tokens (2.3 tokens a round; the MTP 874 rounds, 2.5). The six chats' greedy answers were the MTP's in all three rounds. By chat, DFlash2 was 2 to 5% faster on the three code and English chats (quicksort 37.2 against 36.5, the transformer 33.2 against 32.4, bash 42.6 against 40.5), 13 to 16% slower on the two Japanese prose chats (the seasons 21.5 against 25.6, photosynthesis 25.0 against 28.8) and 3% slower on TCP/UDP (32.9 against 34.0).
 
 The tokens accepted a round are about the MTP's (about 2.5), but the drafter itself takes 7.8 ms a round (mostly the time the 890M's bandwidth needs to read the 5 layers' 0.5 GB of Q4_0 weights), longer than the MTP's about 4 ms, so decode is 6 to 7% slower. Where upstream measured DFlash2 4 to 12% faster than the MTP on AMD HIP, the cards (Strix Halo, the R9700) have 2.5 to 6 times the bandwidth. Issue #23's estimate (2026-10-24: the drafter's weight reads exceed the MTP's 4 ms, +2 to 3% at best) held. The drafter changes only the drafts; the verify decides the answers.
+
+## Integration through Strata 0.1.65
+
+Strata 0.2.15 to 0.2.19 (engine version 0.1.65, 2026-11-22) is 1,082 commits without the merges (609 up to 0.2.16, 473 after it). Each was looked at, and what touches the engine, serve, setup and the tools went into XeStrata-890M. The lists are `.upstream-0162.md` and `.upstream-0165.md` (the repository root, outside git).
+Most of them are changes for NVIDIA, Windows and several GPUs, the app, Terminal and Control layers, and the engines of the new models Hy4-Flash and Inkling-2-Mini; none of those is in what this section brought in.
+serve's tool call reader takes the argument types from the schema in this fork, so upstream's patches do not apply as they are; the ones that did not were written again in the fork's form.
+
+What went in:
+
+- Engine: `STRATA_ROUTE_TAIL_SKIP` is off by default (upstream 962475995, upstream's decision for the answers' quality). `STRATA_ROUTE_TAIL_SKIP=7` turns it on ([DETAILS](DETAILS.md)). An ordinary start on the 890M has 90% or more of the experts in the cache, where it did nothing before either.
+- Engine: the reading of the free RAM inside a cgroup (cfb3d9bcb, ad9aa7597). A host that mixes cgroup v1 controllers with a `0::` line reads v1's limit, and a group without `memory.max` reads its parents' limit. When nothing could be read, the error says what could not.
+- Engine: reading the PLE table counts as progress for serve's stall watch (c369e7392, fbd35fc21, fdba9ebd9), so a read from a slow drive is not taken for a hung engine.
+- Engine: `STRATA_ROUTE_PRIOR` (opt-in) no longer writes its sentinel into the ids of a degenerate token (709d0a99c, 5144e8b53). While it is on, the window warm-up before READY is skipped too (027aac9bd).
+- Engine: the CPU experts' window copies the ids, which the GPU rewrites, once at its entry (f0f39de26).
+- Engine: the conversation cache refuses a conversation that does not fit before it evicts anything (4c3470aa8), and stops evicting when that gives no memory back (96edb9337, a1b7cd186).
+- Engine: when serve's prompt read fails with a GPU error, the engine ends at once (the idea of 85c949f85, in the fork's form).
+- Engine: a `--batch-mtp` slot's draft counts come back on the BDONE line (5152c0366). The f32 to bf16 conversion keeps a NaN a NaN (fda204b5c). A `--max-context` past the trained context without rope scaling gives a WARNING (252e6ea0c).
+- serve: the tool call reader. It reads broken closing and opening tags, JSON inside `<arguments>`, Claude's `<invoke>` form, a bare `<function=NAME>` call inside the reasoning, a single unpaired backtick in the text and more (8426249f0, 05795a84a, 7c743ad7f, db0c38425, 859f0da47, c447a2850, 20056dbbe, 5959daece and others). Parsing a long streamed argument is linear (fb3c3ea69). `+10`, `010` and `.5` in an integer or number argument are read as numbers (bee824a22).
+- serve: when the answer to a request that declared tools ends in a call form that does not run, the model is asked once, inside the same request, to write it again (e05e6e0cc; `"tool_markup_retry": false` or `STRATA_TOOL_MARKUP_RETRY=0` turns it off).
+- serve: the answers. An error after the 200 is told in that API's last frame (cf0743747). An unexpected error gives a 500 without dropping the connection (e626616e4). A request field of the wrong type gives a 400 that names the field (c2767a851, 84ae5707b, 3755e94a3). A request cut short because the server stopped it gives a 503 (b1cdaa389).
+- serve: `/v1/models` gives the context limit as `max_model_len`, `context_length` and `max_context_length` as well, and `GET /models/{id}` answers (dd6da3a9d, 18cce81d0, 23d94d00a). The thinking budget is also read from `thinking_token_budget` and `thinking_budget` (7ffd66628).
+- serve: the periodic checkpoints of `--prompt-cache-every` sit on a grid from the resumed position (2c8d300ad). A request at temperature 0 gets no model card penalties (d7ce708ba, 3313dbd61). The server keeps glibc to two memory arenas (the server side of aeecf0f5d).
+- serve: the Responses API's answer cut by `max_output_tokens`, Codex's multi-agent v2 items and the client-side `tool_search` (3af02433a, 3cb933d29, 277af44e9, e04cb092f).
+- setup: the RAM budget rule (`--resident-budget-gib`) is the RAM less 17 GB (8780e9fdc, c8d70bbcd). A PC whose GPU shares the RAM keeps the rule it had, the RAM less 24 GB, as upstream does, so nothing changes on the 890M.
+- setup and tools: the Coder model's pin (3d54c7137), `--repo` of `mtp_fetch.py` (c9b6956c6), the tool that checks a conversation's continuation after its `--batch` slot was overwritten (6da257d80) and others.
+
+What did not go in:
+
+- The fix to saving and restoring a session without the MTP (1b58c335d). This fork refuses a session file without the MTP, so the fault does not occur.
+- The pacer that keeps systemd-oomd from ending a model load (02c4bd423, aa754707c, cc0242cc8).
+- The cgroup v1 page cache credit (c9f031dcd) and the cap on `--prefill`'s chunk (c983ecc64). The first needs a part of upstream this fork does not have; the second fits CUDA's grid rows.
 
 ## Integration through Strata 0.1.61
 

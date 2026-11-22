@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // The chat history's logic (serve/web/history.js) and the browser store behind the saved-chats list (serve/web/chatstore.js),
 // run in Node. The store runs against a small stub of IndexedDB that is faithful where the code depends on it: a read's result
 // is on the request and not on the store; a write the browser refuses fires abort on the transaction; a blocked open never

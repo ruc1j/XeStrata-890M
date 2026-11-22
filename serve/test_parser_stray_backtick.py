@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+# SPDX-License-Identifier: MIT
 """#4923: one unpaired backtick in a sentence must not hide the tool calls that follow it in the same paragraph.
 
 The inline-code bookkeeping counted backticks across the paragraph.  A model that wrote a tool name as inline code and

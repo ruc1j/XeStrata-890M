@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// SPDX-License-Identifier: MIT
 // include/strata/kernels/qsa_batch_check.hpp - the argument check of native_qsa_indexer_append_batch, with the failed predicate named.
 //
 // #5822: the check threw one text ("bad geometry, positions, parameters or scaling") for seven different causes, so three engine exits on 0.1.58 could not be

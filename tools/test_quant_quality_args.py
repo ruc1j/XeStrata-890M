@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+# SPDX-License-Identifier: MIT
 """Tests for the engine command tools/quant_quality.py builds, without starting an engine.
 
     python -m unittest tools.test_quant_quality_args

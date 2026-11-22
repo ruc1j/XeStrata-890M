@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// SPDX-License-Identifier: MIT
 #pragma once
 // include/strata/core/prompt_checkpoint_grid.hpp - where the next periodic conversation checkpoint of a prompt read
 // is due (--prompt-cache-every).  Header-only; generate.cpp's single-card path and a layer split's per-stage parts use
