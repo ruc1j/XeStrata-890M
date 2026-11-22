@@ -1143,6 +1143,12 @@ if(STRATA_ENABLE_XE)
     add_test(NAME qsa_select_wmma_parity_p3
              COMMAND ${CMAKE_COMMAND} -E env STRATA_SELECT_WMMA=3 $<TARGET_FILE:qsa_select_wmma_parity> 49 620)
     set_tests_properties(qsa_select_wmma_parity_p3 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    # the DFlash2 drafter's attention kernels against a float64 reference (synthetic, no model): the FP32 default and the
+    # one on RDNA's matrix instructions (STRATA_DF2_ATTN=3); 77 where the device has no such instructions
+    add_executable(dflash2_attention_parity src/kernels/dflash2_attention_parity.cpp)
+    target_link_libraries(dflash2_attention_parity PRIVATE strata_kernels)
+    add_test(NAME dflash2_attention_parity COMMAND dflash2_attention_parity)
+    set_tests_properties(dflash2_attention_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     # the indexer's block scores (the window graph's kernels) against a host reference, and the rows form against the
     # per-row one, memcmp
     add_executable(qsa_score_parity src/kernels/qsa_score_parity.cpp)

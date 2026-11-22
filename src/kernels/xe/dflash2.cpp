@@ -21,8 +21,10 @@
 // Everything is asynchronous on the queue, allocates nothing and can be recorded into a graph.
 #include "strata/kernels/dflash2.hpp"
 #include "strata/core/runtime.hpp"
+#include "amd_wmma.hpp"
 #include "cuda_intrinsics.hpp"
 #include "device_target.hpp"
+#include "xe_shuffle.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -47,6 +49,7 @@ constexpr int HD = kDf2Hd;
 int g_gemm_variant = 0;   // bench only (df2_gemm_variant)
 int g_attn_chunk = 0;     // bench only (df2_attention_chunk)
 int g_attn_variant = 0;   // 0: STRATA_DF2_ATTN or the default; 1: the CUDA file kernel (128 work-items); 2: 256 work-items, O[2][8]
+//                           3: RDNA's matrix instructions, FP16 operands (devices without them: 2)
 
 #define DF2_SG32 [[sycl::reqd_sub_group_size(32)]]
 // sub-groups of 16 where the device compile has them (Intel); 32 elsewhere, where the kernels that need 16 lanes are never launched
@@ -199,6 +202,167 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
 namespace {
 constexpr int AS4 = 33;   // local row stride of the Q / K / V tiles in float4 (132 floats: conflict-free for the 4 x 4 tiles)
 constexpr int PS4 = 9;    // stride of the transposed probabilities P[key][query] in float4 (36 floats)
+constexpr int AS_H = 136;   // FP16 row stride of the Q / K tiles of the WMMA kernel (128 + 8 halves: 16-byte aligned rows)
+constexpr int VS_H = 40;    // FP16 stride of its transposed V[dim][key] (32 keys + 8)
+constexpr int PS_H = 40;    // FP16 stride of its P[query][key]
+
+// XeStrata-890M, STRATA_DF2_ATTN=3 (opt-in): the attention on RDNA's matrix instructions (upstream d31256b79's
+// attn_part_wmma_gfx11_kernel).  Q, K and the transposed V are staged as FP16 in local memory (about 24 KiB against the FP32
+// tiles' 42), S = Q K^T is a 2 x 2 grid of 16 x 16 x 16 tiles and O += P V 2 x 8 tiles, with FP32 accumulation: a sub-group
+// takes 16 queries, and 16 keys of S or 64 dims of O.  The operands round to FP16, so the partials differ from the FP32
+// kernels' in the last bits.  Devices without these instructions keep the default kernel.
+struct AttnWmma {
+    const float* q = nullptr;
+    const float* kring = nullptr;
+    const float* vring = nullptr;
+    const float* kblk = nullptr;
+    const float* vblk = nullptr;
+    const int32_t* anchor_pos = nullptr;
+    int ring_slots = 0, window = 0, CK = 0;
+    float* part = nullptr;
+    const int64_t* tag = nullptr;
+    const int32_t* epoch_ptr = nullptr;
+    sycl::local_accessor<sycl::half, 1> Qs, KV, Ps;
+    sycl::local_accessor<float, 1> Sc, m_s, l_s, corr_s;
+    sycl::local_accessor<unsigned char, 1> kvalid;
+    STRATA_AMD_REQD_WG(1, 128)
+    DF2_SG32 void operator()(nd_item<2> it) const {
+#if !STRATA_AMD_WMMA
+        (void) it;   // launched only where the device has the instructions (df2_attention)
+#else
+        namespace wm = xe::wmma;
+        const sycl::sub_group sg = it.get_sub_group();
+        const int chunk = (int) it.get_group(0), kvh = (int) it.get_group(1), tid = (int) it.get_local_id(1);
+        const int wave = tid / 32, l16 = tid % 16, hi = (tid / 16) % 2;
+        const int s = *anchor_pos;
+        const int lo = s - (window - 1) > 0 ? s - (window - 1) : 0;
+        const int nctx = s - lo;
+        const int nkeys = nctx + kDf2Rows;
+        const int k_begin = chunk * CK;
+        const int64_t ep = tag != nullptr ? (int64_t) *epoch_ptr * (int64_t) 4294967296 : 0;   // the epoch in the upper half
+        float* const pbase = part + (((size_t) chunk * kDf2Kv + (size_t) kvh) * 32) * 130;
+        if (k_begin >= nkeys) {
+            for (int i = tid; i < 32 * 130; i += 128) pbase[i] = (i % 130 == 0) ? -INFINITY : 0.0f;
+            return;
+        }
+        const float scale = sycl::rsqrt((float) HD);
+        for (int i = tid; i < 32 * HD / 4; i += 128) {   // Q: 32 queries x 128, scaled, FP16
+            const int a = i / (HD / 4), d4 = i % (HD / 4);
+            const int row = a / 4, g = a % 4;
+            const sycl::float4 v = *reinterpret_cast<const sycl::float4*>(q + ((size_t) row * 32 + (size_t) kvh * kDf2Gqa + (size_t) g) * HD + (size_t) d4 * 4) * scale;
+            sycl::half* d = &Qs[(size_t) a * AS_H + (size_t) d4 * 4];
+            d[0] = (sycl::half) v.x(); d[1] = (sycl::half) v.y(); d[2] = (sycl::half) v.z(); d[3] = (sycl::half) v.w();
+        }
+        if (tid < 32) { m_s[tid] = -INFINITY; l_s[tid] = 0.0f; }
+        // a sub-group: 16 queries (q_tile); for S 16 keys (k_tile), for O 64 dims (d_base, 4 tiles of 16)
+        const int q_tile = (wave / 2) * 16, k_tile = (wave % 2) * 16, d_base = (wave % 2) * 64;
+        wm::C O[4];
+#pragma unroll
+        for (int dt = 0; dt < 4; ++dt) wm::fill(sg, O[dt], 0.0f);
+        const int k_end = sycl::min(k_begin + CK, nkeys);
+        auto key_row = [&](int k, int d4, const float* ring, const float* blk) {
+            sycl::float4 v(0.f, 0.f, 0.f, 0.f);
+            if (k < nctx) v = *reinterpret_cast<const sycl::float4*>(ring + ((size_t) kvh * (size_t) ring_slots + (size_t) ((lo + k) % ring_slots)) * HD + (size_t) d4 * 4);
+            else if (k < nkeys) v = *reinterpret_cast<const sycl::float4*>(blk + ((size_t) (k - nctx) * kDf2Kv + (size_t) kvh) * HD + (size_t) d4 * 4);
+            return v;
+        };
+        for (int k0 = k_begin; k0 < k_end; k0 += 32) {
+            bar(it);
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {   // K: 32 keys x 128, row-major
+                const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
+                const sycl::float4 v = key_row(k0 + t, d4, kring, kblk);
+                sycl::half* d = &KV[(size_t) t * AS_H + (size_t) d4 * 4];
+                d[0] = (sycl::half) v.x(); d[1] = (sycl::half) v.y(); d[2] = (sycl::half) v.z(); d[3] = (sycl::half) v.w();
+            }
+            if (tid < 32) {
+                const int k = k0 + tid;
+                kvalid[tid] = (tag == nullptr || k >= nctx || k >= nkeys) ? 1 : (tag[(lo + k) % ring_slots] == ep + (int64_t) (lo + k) ? 1 : 0);
+            }
+            bar(it);
+            {   // S = Q K^T: the 4 sub-groups take the 2 x 2 tiles, 8 steps of 16 dims
+                wm::C sc;
+                wm::fill(sg, sc, 0.0f);
+#pragma unroll
+                for (int d = 0; d < HD; d += 16) {
+                    wm::A<sycl::half> qa;
+                    wm::Bc<sycl::half> kb;
+                    wm::load(sg, qa, &Qs[(size_t) q_tile * AS_H + (size_t) d], (size_t) AS_H);
+                    wm::load(sg, kb, &KV[(size_t) k_tile * AS_H + (size_t) d], (size_t) AS_H);
+                    wm::mad(sg, sc, qa, kb, sc);
+                }
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int qi = q_tile + wm::row_of(hi, e), t = k_tile + l16, k = k0 + t, row = qi / 4;
+                    bool ok = k < nkeys;
+                    if (ok && k < nctx) ok = (lo + k) > (s + row - window) && kvalid[t];
+                    Sc[(size_t) qi * 33 + (size_t) t] = ok ? sc.v[e] : -INFINITY;
+                }
+            }
+            bar(it);
+            {   // online softmax: query = tid / 4, 8 keys each, 4 lanes per query; P[query][key] in FP16
+                const int qi = tid / 4, sub = tid % 4;
+                float v[8], tmax = -INFINITY;
+#pragma unroll
+                for (int u = 0; u < 8; ++u) { v[u] = Sc[(size_t) qi * 33 + (size_t) sub * 8 + (size_t) u]; tmax = sycl::fmax(tmax, v[u]); }
+                tmax = sycl::fmax(tmax, strata_shfl_xor(sg, tmax, 1));
+                tmax = sycl::fmax(tmax, strata_shfl_xor(sg, tmax, 2));
+                const float m_old = m_s[qi];
+                const float mn = sycl::fmax(m_old, tmax);
+                const float corr = (m_old == -INFINITY) ? 0.0f : sycl::exp(m_old - mn);
+                float psum = 0.0f;
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    const float p = v[u] == -INFINITY ? 0.0f : sycl::exp(v[u] - mn);
+                    Ps[(size_t) qi * PS_H + (size_t) sub * 8 + (size_t) u] = (sycl::half) p;
+                    psum += p;
+                }
+                psum += strata_shfl_xor(sg, psum, 1);
+                psum += strata_shfl_xor(sg, psum, 2);
+                if (sub == 0) { l_s[qi] = l_s[qi] * corr + psum; m_s[qi] = mn; corr_s[qi] = corr; }
+            }
+            bar(it);
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {   // V transposed, Vt[dim][key]: P's rows and Vt's rows are both contiguous fragments
+                const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
+                const sycl::float4 v = key_row(k0 + t, d4, vring, vblk);
+                KV[(size_t) (d4 * 4 + 0) * VS_H + (size_t) t] = (sycl::half) v.x();
+                KV[(size_t) (d4 * 4 + 1) * VS_H + (size_t) t] = (sycl::half) v.y();
+                KV[(size_t) (d4 * 4 + 2) * VS_H + (size_t) t] = (sycl::half) v.z();
+                KV[(size_t) (d4 * 4 + 3) * VS_H + (size_t) t] = (sycl::half) v.w();
+            }
+            bar(it);
+            {   // O = O * corr + P V: 2 steps of 16 keys over the sub-group's 4 dim tiles
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const float cr = corr_s[q_tile + wm::row_of(hi, e)];
+#pragma unroll
+                    for (int dt = 0; dt < 4; ++dt) O[dt].v[e] *= cr;
+                }
+                wm::A<sycl::half> pa0, pa1;
+                wm::load(sg, pa0, &Ps[(size_t) q_tile * PS_H], (size_t) PS_H);
+                wm::load(sg, pa1, &Ps[(size_t) q_tile * PS_H + 16], (size_t) PS_H);
+#pragma unroll
+                for (int dt = 0; dt < 4; ++dt) {
+                    wm::Bc<sycl::half> vb0, vb1;
+                    wm::load(sg, vb0, &KV[(size_t) (d_base + dt * 16) * VS_H], (size_t) VS_H);
+                    wm::load(sg, vb1, &KV[(size_t) (d_base + dt * 16) * VS_H + 16], (size_t) VS_H);
+                    wm::mad(sg, O[dt], pa0, vb0, O[dt]);
+                    wm::mad(sg, O[dt], pa1, vb1, O[dt]);
+                }
+            }
+        }
+        bar(it);
+        if (tid < 32) { pbase[(size_t) tid * 130] = m_s[tid]; pbase[(size_t) tid * 130 + 1] = l_s[tid]; }
+#pragma unroll
+        for (int dt = 0; dt < 4; ++dt) {
+#pragma unroll
+            for (int e = 0; e < 8; ++e)
+                pbase[(size_t) (q_tile + wm::row_of(hi, e)) * 130 + 2 + (size_t) (d_base + dt * 16 + l16)] = O[dt].v[e];
+        }
+#endif
+    }
+};
 }
 
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos, int ring_slots,
@@ -209,7 +373,18 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
     static const int env_ck = [] { const char* e = std::getenv("STRATA_DF2_ATTN_CHUNK"); return e ? std::atoi(e) : 0; }();
     const int CK = g_attn_chunk != 0 ? g_attn_chunk : env_ck == 128 ? 128 : DF2_ATTN_CHUNK_AUTO;   // keys per work-group: 64 (33 chunks) or 128 (17)
     const int nch = CK == 128 ? kDf2MaxChunks : kDf2PartChunks;
-    if (av == 2) {
+    if (av == 3 && xe::amd_wmma(qu->get_device())) {   // RDNA's matrix instructions (AttnWmma); other devices take the default
+        qu->submit([&](sycl::handler& h) {
+            AttnWmma kn{q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, CK, part, tag, epoch_ptr,
+                        sycl::local_accessor<sycl::half, 1>((size_t) 32 * AS_H, h),
+                        sycl::local_accessor<sycl::half, 1>((size_t) HD * VS_H, h),
+                        sycl::local_accessor<sycl::half, 1>((size_t) 32 * PS_H, h), sycl::local_accessor<float, 1>((size_t) 32 * 33, h),
+                        sycl::local_accessor<float, 1>(32, h), sycl::local_accessor<float, 1>(32, h), sycl::local_accessor<float, 1>(32, h),
+                        sycl::local_accessor<unsigned char, 1>(32, h)};
+            h.parallel_for(sycl::nd_range<2>({(size_t) nch, (size_t) kDf2Kv * 128}, {1, 128}), kn);
+        });
+    } else
+    if (av == 2 || av == 3) {
         qu->submit([&](sycl::handler& h) {
             sycl::local_accessor<sycl::float4, 1> Qs(32 * AS4, h), Ks(32 * AS4, h), Ps(32 * PS4, h);
             sycl::local_accessor<float, 1> Sc(32 * 33, h), m_s(32, h), l_s(32, h), corr_s(32, h);

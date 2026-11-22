@@ -230,6 +230,8 @@ upstream の Strata 0.2.10 の既定の drafter、DFlash2（incoai/Qwen3.8-Flash
 
 1 round に受け入れるトークンの数は MTP と同じほど（約 2.5）ですが、drafter 自身が 1 round に 7.8 ms かかり（5 層の Q4_0 の重み 0.5 GB を 890M の帯域で読む時間が大半）、MTP の約 4 ms より長いので、decode は 6〜7% 遅くなります。upstream が AMD の HIP で MTP より 4〜12% 速かったのは、帯域が 2.5〜6 倍のカード（Strix Halo、R9700）です。Issue #23（2026-10-24）の見積もり（drafter の重みの読みが MTP の 4 ms を超え、+2〜3% が上限）のとおりでした。drafter は下書きを変えるだけで、答えは verify が決めます。
 
+upstream が Strata-rdna3 から取り込んだ attention のカーネル（d31256b79）も、opt-in で移してあります（`STRATA_DF2_ATTN=3`）。Q と K と転置した V を FP16 でローカルメモリーに置き、S = Q K^T と O += P V を RDNA の行列命令（WMMA）で計算します。float64 の参照との差は出力の RMS の 0.2〜0.4% です（`dflash2_attention_parity`）。890M の交互 3 周（6 チャット、greedy、400 トークン）で、drafter は 7.89 / 7.72 / 7.72 ms から 7.61 / 7.57 / 7.56 ms/round になり、decode は 36.23 / 36.96 / 36.92 対 36.75 / 37.01 / 37.01 tok/s でした。同じ周の MTP は 40.81 / 42.27 / 42.02 tok/s です。答えは 3 周とも MTP と同じでした。drafter の時間の大半は重みを読む時間なので、attention を速くしても MTP との差は埋まりません。既定は FP32 のカーネルのままです。
+
 ## Strata 0.1.65 の取り込み
 
 upstream の Strata 0.2.15 から 0.2.19（エンジンの版は 0.1.65、2026-11-22）までの 1,082 コミット（merge を除きます。0.2.16 までが 609、その先が 473）を 1 件ずつ見て、エンジン・serve・setup・tools の層に当たるものを XeStrata-890M に移しました。一覧は `.upstream-0162.md` と `.upstream-0165.md`（リポジトリの根、git の外）です。
@@ -252,6 +254,7 @@ serve のツール呼び出しの読み手は、この fork が引数の型を s
 - serve: `/v1/models` が文脈の上限を `max_model_len`、`context_length`、`max_context_length` でも返し、`GET /models/{id}` にも答えます（dd6da3a9d、18cce81d0、23d94d00a）。思考の上限は `thinking_token_budget` と `thinking_budget` からも読みます（7ffd66628）。
 - serve: `--prompt-cache-every` の定期チェックポイントを、再開した位置からの格子に置きます（2c8d300ad）。temperature 0 の要求には、モデルカードのペナルティを付けません（d7ce708ba、3313dbd61）。server の glibc のメモリー区画を 2 つに抑えます（aeecf0f5d の server の側）。
 - serve: Responses API の `max_output_tokens` で切れた答え、Codex の multi-agent v2 の item、クライアント側の `tool_search`（3af02433a、3cb933d29、277af44e9、e04cb092f）。
+- エンジン: DFlash2 の drafter の attention を RDNA の行列命令で計算するカーネルを、opt-in で移しました（`STRATA_DF2_ATTN=3`、upstream d31256b79。数字は上の DFlash2 の節にあります）。
 - setup: RAM の予算（`--resident-budget-gib`）の規則を、RAM から 17 GB を引く形にしました（8780e9fdc、c8d70bbcd）。GPU が RAM を共有する PC は、upstream と同じく 24 GB を引く元の規則のままなので、890M では変わりません。
 - setup と tools: Coder のモデルの pin（3d54c7137）、`mtp_fetch.py` の `--repo`（c9b6956c6）、`--batch` のスロットを上書きされた会話の続きを確かめる試験の道具（6da257d80）ほか。
 

@@ -229,6 +229,8 @@ Three interleaved rounds (24,576 slots, cooled between runs): the MTP 31.6 / 31.
 
 The tokens accepted a round are about the MTP's (about 2.5), but the drafter itself takes 7.8 ms a round (mostly the time the 890M's bandwidth needs to read the 5 layers' 0.5 GB of Q4_0 weights), longer than the MTP's about 4 ms, so decode is 6 to 7% slower. Where upstream measured DFlash2 4 to 12% faster than the MTP on AMD HIP, the cards (Strix Halo, the R9700) have 2.5 to 6 times the bandwidth. Issue #23's estimate (2026-10-24: the drafter's weight reads exceed the MTP's 4 ms, +2 to 3% at best) held. The drafter changes only the drafts; the verify decides the answers.
 
+The attention kernel upstream took from Strata-rdna3 (d31256b79) is here as well, opt-in (`STRATA_DF2_ATTN=3`). It stages Q, K and the transposed V as FP16 in local memory and computes S = Q K^T and O += P V on RDNA's matrix instructions (WMMA). Against a float64 reference it differs by 0.2 to 0.4% of the output's RMS (`dflash2_attention_parity`). Three interleaved rounds on the 890M (six chats, greedy, 400 tokens): the drafter went from 7.89 / 7.72 / 7.72 ms to 7.61 / 7.57 / 7.56 ms a round, and decode was 36.23 / 36.96 / 36.92 against 36.75 / 37.01 / 37.01 tok/s. The MTP in the same rounds: 40.81 / 42.27 / 42.02 tok/s. The answers were the MTP's in all three rounds. Most of the drafter's time is reading its weights, so a faster attention does not close the gap to the MTP. The default stays the FP32 kernel.
+
 ## Integration through Strata 0.1.65
 
 Strata 0.2.15 to 0.2.19 (engine version 0.1.65, 2026-11-22) is 1,082 commits without the merges (609 up to 0.2.16, 473 after it). Each was looked at, and what touches the engine, serve, setup and the tools went into XeStrata-890M. The lists are `.upstream-0162.md` and `.upstream-0165.md` (the repository root, outside git).
@@ -251,6 +253,7 @@ What went in:
 - serve: `/v1/models` gives the context limit as `max_model_len`, `context_length` and `max_context_length` as well, and `GET /models/{id}` answers (dd6da3a9d, 18cce81d0, 23d94d00a). The thinking budget is also read from `thinking_token_budget` and `thinking_budget` (7ffd66628).
 - serve: the periodic checkpoints of `--prompt-cache-every` sit on a grid from the resumed position (2c8d300ad). A request at temperature 0 gets no model card penalties (d7ce708ba, 3313dbd61). The server keeps glibc to two memory arenas (the server side of aeecf0f5d).
 - serve: the Responses API's answer cut by `max_output_tokens`, Codex's multi-agent v2 items and the client-side `tool_search` (3af02433a, 3cb933d29, 277af44e9, e04cb092f).
+- Engine: a kernel that computes the DFlash2 drafter's attention on RDNA's matrix instructions, opt-in (`STRATA_DF2_ATTN=3`, upstream d31256b79; the numbers are in the DFlash2 section above).
 - setup: the RAM budget rule (`--resident-budget-gib`) is the RAM less 17 GB (8780e9fdc, c8d70bbcd). A PC whose GPU shares the RAM keeps the rule it had, the RAM less 24 GB, as upstream does, so nothing changes on the 890M.
 - setup and tools: the Coder model's pin (3d54c7137), `--repo` of `mtp_fetch.py` (c9b6956c6), the tool that checks a conversation's continuation after its `--batch` slot was overwritten (6da257d80) and others.
 

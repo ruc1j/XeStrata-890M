@@ -79,8 +79,8 @@ struct C {
     fv8 v;
 };
 
-inline int lane16(sycl::sub_group sg) { return (int) (sg.get_local_linear_id() & 15); }
-inline int half_of(sycl::sub_group sg) { return (int) (sg.get_local_linear_id() >> 4); }
+inline int lane16(sycl::sub_group sg) { return (int) (sg.get_local_linear_id() & 15u); }
+inline int half_of(sycl::sub_group sg) { return (int) (sg.get_local_linear_id() >> 4u); }
 
 template<typename P> inline auto* raw(P p) {
     if constexpr (std::is_pointer_v<P>) return p;
