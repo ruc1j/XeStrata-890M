@@ -49,6 +49,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <chrono>
 #include <cmath>
@@ -151,12 +152,15 @@ struct RouteTrace {
     std::mutex mu;
     bool replay = false;
     std::string error;
+    // A request's routing by (position, layer): sparse, so the tables grow with the records the file holds and not with
+    // the positions it names (a window's first position is the prompt's length; a malformed one could be any int32).
     struct Req {
-        int64_t k = 0, layers = 0;
+        int64_t k = 0;
         std::vector<int32_t> ids;
         std::vector<float> w;
-        std::vector<uint8_t> have;   // [pos * layers + layer]
+        std::unordered_map<int64_t, size_t> row;   // pos * kMaxLayers + layer -> the row of ids and w
     };
+    static constexpr int64_t kMaxLayers = 1024;
     std::vector<Req> reqs;
 
     bool load(const char* path) {
@@ -167,7 +171,7 @@ struct RouteTrace {
         std::vector<float> w;
         while (std::fread(h, sizeof h, 1, f) == 1) {
             const int32_t r = h[0], pos = h[1], l = h[2], k = h[3];
-            if (r < 0 || r > 1 << 20 || pos < 0 || l < 0 || l >= 1024 || k < 1 || k > 64) {
+            if (r < 0 || r > 1 << 20 || pos < 0 || l < 0 || l >= kMaxLayers || k < 1 || k > 64) {
                 error = std::string("STRATA_ROUTE_REPLAY: ") + path + ": a malformed record";
                 break;
             }
@@ -177,33 +181,23 @@ struct RouteTrace {
                 error = std::string("STRATA_ROUTE_REPLAY: ") + path + ": a truncated record";
                 break;
             }
-            if ((size_t) r >= reqs.size()) reqs.resize((size_t) r + 1);
+            if ((size_t) r > reqs.size()) {   // the dump numbers its requests 0, 1, 2, ... in order
+                error = std::string("STRATA_ROUTE_REPLAY: ") + path + ": a record of request " + std::to_string(r) +
+                        " before request " + std::to_string(reqs.size());
+                break;
+            }
+            if ((size_t) r == reqs.size()) reqs.emplace_back();
             Req& q = reqs[(size_t) r];
             if (q.k == 0) q.k = k;
             if (q.k != k) { error = std::string("STRATA_ROUTE_REPLAY: ") + path + ": records of two k"; break; }
-            if (l >= q.layers) {   // re-strided to the deeper layer count
-                const int64_t L2 = l + 1, P = q.layers > 0 ? (int64_t) q.have.size() / q.layers : 0;
-                Req n;
-                n.k = k; n.layers = L2;
-                n.ids.assign((size_t) (P * L2 * k), 0); n.w.assign(n.ids.size(), 0.0f); n.have.assign((size_t) (P * L2), 0);
-                for (int64_t p = 0; p < P; ++p)
-                    for (int64_t j = 0; j < q.layers; ++j) {
-                        const size_t a = (size_t) (p * q.layers + j), b = (size_t) (p * L2 + j);
-                        n.have[b] = q.have[a];
-                        std::memcpy(&n.ids[b * (size_t) k], &q.ids[a * (size_t) k], (size_t) k * 4);
-                        std::memcpy(&n.w[b * (size_t) k], &q.w[a * (size_t) k], (size_t) k * 4);
-                    }
-                q = std::move(n);
+            const auto [it, added] = q.row.try_emplace((int64_t) pos * kMaxLayers + l, q.row.size());
+            if (added) {
+                q.ids.resize(q.ids.size() + (size_t) k);
+                q.w.resize(q.w.size() + (size_t) k);
             }
-            const size_t slot = (size_t) pos * (size_t) q.layers + (size_t) l;
-            if (slot >= q.have.size()) {
-                q.have.resize(slot + 1, 0);
-                q.ids.resize((slot + 1) * (size_t) k, 0);
-                q.w.resize((slot + 1) * (size_t) k, 0.0f);
-            }
-            q.have[slot] = 1;   // a position read again (a rejected draft) keeps its last routing
-            std::memcpy(&q.ids[slot * (size_t) k], ids.data(), (size_t) k * 4);
-            std::memcpy(&q.w[slot * (size_t) k], w.data(), (size_t) k * 4);
+            // a position read again (a rejected draft) keeps its last routing
+            std::memcpy(&q.ids[it->second * (size_t) k], ids.data(), (size_t) k * 4);
+            std::memcpy(&q.w[it->second * (size_t) k], w.data(), (size_t) k * 4);
         }
         std::fclose(f);
         return error.empty();
@@ -220,15 +214,15 @@ struct RouteTrace {
         }
         for (int64_t l = lb; l < le; ++l)
             for (int t = 0; t < T; ++t) {
-                const size_t slot = (size_t) (pos0 + t) * (size_t) (q ? q->layers : 0) + (size_t) l;
-                if (q == nullptr || l >= q->layers || slot >= q->have.size() || !q->have[slot]) {
+                const auto it = q != nullptr && l < kMaxLayers ? q->row.find((pos0 + t) * kMaxLayers + l) : decltype(Req::row)::const_iterator();
+                if (q == nullptr || l >= kMaxLayers || it == q->row.end()) {
                     err = "STRATA_ROUTE_REPLAY: no routing for request " + std::to_string(r) + ", position " +
                           std::to_string(pos0 + t) + ", layer " + std::to_string(l);
                     return false;
                 }
                 const size_t d = ((size_t) l * (size_t) MT + (size_t) t) * (size_t) K;
-                std::memcpy(ids + d, &q->ids[slot * (size_t) K], (size_t) K * 4);
-                std::memcpy(w + d, &q->w[slot * (size_t) K], (size_t) K * 4);
+                std::memcpy(ids + d, &q->ids[it->second * (size_t) K], (size_t) K * 4);
+                std::memcpy(w + d, &q->w[it->second * (size_t) K], (size_t) K * 4);
             }
         return true;
     }
@@ -255,7 +249,13 @@ RouteTrace& route_trace() {
             if (t.dump == nullptr) t.error = std::string("STRATA_ROUTE_DUMP: cannot write ") + p;
         }
         if (const char* p = std::getenv("STRATA_ROUTE_REPLAY"); p != nullptr && *p) {
-            t.replay = t.load(p);
+            try {
+                t.replay = t.load(p);
+            } catch (const std::exception& e) {   // a table too large for the RAM: an error of the file, not an abort
+                t.replay = false;
+                t.reqs.clear();
+                t.error = std::string("STRATA_ROUTE_REPLAY: ") + p + ": " + e.what();
+            }
             if (t.replay)
                 std::fprintf(stderr, "route replay: %zu requests from %s (the reference's experts and weights)\n",
                              t.reqs.size(), p);
