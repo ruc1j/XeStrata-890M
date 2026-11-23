@@ -84,6 +84,12 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
     if (!f) { err = "dflash2: cannot open " + path; return false; }
     uint32_t hdr[3];
     if (!f.read(reinterpret_cast<char*>(hdr), 12) || std::memcmp(hdr, "DF2P", 4) != 0 || hdr[1] != 1) { err = "dflash2: " + path + " is not a DF2P v1 pack"; return false; }
+    // The pack's own numbers (the index length, each tensor's offset and size) are checked against the file before they size an
+    // allocation or a copy: a pack that claims more than the file holds is refused here, not written past the device buffer.
+    f.seekg(0, std::ios::end);
+    const uint64_t file_bytes = (uint64_t) (int64_t) f.tellg();
+    f.seekg(12, std::ios::beg);
+    if (!f || (uint64_t) hdr[2] > file_bytes - 12) { err = "dflash2: the pack's index is cut short"; return false; }
     std::string index(hdr[2], ' ');
     if (!f.read(index.data(), hdr[2])) { err = "dflash2: the pack's index is cut short"; return false; }
     const int64_t data_off = 12 + (int64_t) hdr[2];
@@ -115,13 +121,29 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
                 for (const char* q = c; *q;) { taps_.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q == ',') ++q; }
             }
         } else if (std::sscanf(line.c_str(), "t %255s %63s %lld %lld %lld %lld", a, b, &v1, &v2, &v3, &v4) == 6) {
+            const uint64_t data_bytes = file_bytes - (uint64_t) data_off;
+            if (v1 < 0 || v2 < 0 || v3 < 0 || v4 < 0 || (uint64_t) v3 > data_bytes || (uint64_t) v4 > data_bytes - (uint64_t) v3) {
+                err = "dflash2: tensor " + std::string(a) + " lies outside the pack (" + path + ")";
+                return false;
+            }
             Tensor t;
             t.name = a; t.dtype = b; t.rows = v1; t.cols = v2; t.off = (uint64_t) v3; t.bytes = (uint64_t) v4;
+            if (t.dtype == "q4_0" && (t.cols < 32 || t.cols % 32 != 0 || t.bytes % 18 != 0 || t.bytes / 18 % (uint64_t) (t.cols / 32) != 0 ||
+                                      t.bytes / 18 / (uint64_t) (t.cols / 32) != (uint64_t) t.rows)) {   // 18 bytes per 32 values
+                err = "dflash2: tensor " + t.name + " is not the size of a Q4_0 matrix of its shape (" + path + ")";
+                return false;
+            }
             tensors_.push_back(t);
             total = std::max(total, t.off + t.bytes);
         }
     }
-    if (tensors_.empty() || NH_ != 32 || NKV_ != 8 || HD_ != 128 || rank_ != 256 || N_ != 2560 || L_ > 8 || window_ + 16 > kRing) {
+    // The layer count bounds the K/V rings (kring_ has 8), inter sizes the MLP buffers, conv_group splits the 2560 rows into at most 160
+    // groups (the dynamic conv rows are 640 wide: 2 convs x 2 taps x 160), and the taps are the main model's layers whose rows the
+    // 5 x 2560 tap buffers hold.
+    bool taps_ok = !taps_.empty() && taps_.size() <= 5;
+    for (const int t : taps_) taps_ok = taps_ok && t >= 0 && t < 1024;
+    if (tensors_.empty() || NH_ != 32 || NKV_ != 8 || HD_ != 128 || rank_ != 256 || N_ != 2560 || L_ < 1 || L_ > 8 || window_ < 1 ||
+        window_ + 16 > kRing || I_ < 1 || I_ % 32 != 0 || group_ < 1 || N_ % group_ != 0 || N_ / group_ > 160 || !taps_ok) {
         err = "dflash2: the pack's shape is not the Flash-Next drafter this engine was written for";
         return false;
     }
