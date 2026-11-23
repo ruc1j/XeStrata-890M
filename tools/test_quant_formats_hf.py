@@ -35,6 +35,10 @@ def shard() -> bytes:
 
 
 class Response(io.BytesIO):
+    def __init__(self, data: bytes, status: int = 200, headers: dict | None = None):
+        super().__init__(data)
+        self.status, self.headers = status, headers or {}
+
     def __enter__(self):
         return self
 
@@ -42,7 +46,11 @@ class Response(io.BytesIO):
         return False
 
 
-def serve(files: dict[str, bytes]):
+def serve(files: dict[str, bytes], ranges: bool = True, reads: list | None = None):
+    """A fake Hugging Face: the model's file list, and its files by range requests (`ranges` False: a mirror that
+    ignores Range and answers 200 with the whole file).  `reads` collects the file answers it gave."""
+    reads = [] if reads is None else reads
+
     def urlopen(req, timeout=None):
         url = req if isinstance(req, str) else req.full_url
         if "/api/models/" in url:
@@ -50,7 +58,14 @@ def serve(files: dict[str, bytes]):
             return Response(json.dumps(tree).encode())
         name = url.rsplit("/", 1)[1]
         lo, hi = map(int, re.match(r"bytes=([0-9]+)-([0-9]+)", req.get_header("Range")).groups())
-        return Response(files[name][lo:hi + 1])
+        data = files[name]
+        if not ranges:
+            resp = Response(data)
+        else:
+            hi = min(hi, len(data) - 1)
+            resp = Response(data[lo:hi + 1], 206, {"Content-Range": f"bytes {lo}-{hi}/{len(data)}"})
+        reads.append(resp)
+        return resp
     return mock.patch.object(Q.urllib.request, "urlopen", urlopen)
 
 
@@ -72,6 +87,15 @@ class HfHeaders(unittest.TestCase):
             with self.assertRaises(ValueError) as cm:
                 Q.hf_headers("org/repo", "rev", "dir")
         self.assertIn("m.gguf", str(cm.exception))
+
+    def test_a_server_that_ignores_range_is_refused_unread(self):
+        # Issue #81: a 200 with the whole shard is an error, and its body is not read into memory
+        reads: list = []
+        with serve({"m.gguf": shard() + bytes(1 << 20)}, ranges=False, reads=reads):
+            with self.assertRaises(OSError):
+                Q.RangeFile("https://huggingface.co/org/repo/resolve/rev/m.gguf").read(16)
+        self.assertTrue(reads)
+        self.assertEqual([r.tell() for r in reads], [0] * len(reads))
 
 
 if __name__ == "__main__":

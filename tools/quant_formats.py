@@ -48,7 +48,12 @@ class RangeFile(io.RawIOBase):
         while self.buf_at + len(self.buf) < need_to:
             start = self.buf_at + len(self.buf)
             req = urllib.request.Request(self.url, headers={"Range": f"bytes={start}-{start + self.CHUNK - 1}"})
-            data = urllib.request.urlopen(req, timeout=120).read()
+            with urllib.request.urlopen(req, timeout=120) as r:
+                # only the range asked for when the server says so (206 and its Content-Range): a mirror or proxy that
+                # ignores Range answers 200 with the whole file, which is not read
+                if r.status != 206 or not (r.headers.get("Content-Range") or "").startswith(f"bytes {start}-"):
+                    raise OSError(f"{self.url}: the server ignored the Range header (HTTP {r.status})")
+                data = r.read(self.CHUNK)
             if not data:
                 raise EOFError(self.url)
             self.buf += data

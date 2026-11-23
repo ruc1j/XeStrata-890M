@@ -394,6 +394,84 @@ class Resume(unittest.TestCase):
             self.assertEqual((Path(d) / NAME).read_bytes(), DATA)
 
 
+class PieceList(unittest.TestCase):
+    """_load_pieces on a .part.chunks that is not this file's list (Issue #80)."""
+
+    def load(self, side_text):
+        with small_pieces(), tempfile.TemporaryDirectory() as d:
+            part = Path(d) / (NAME + ".part")
+            part.write_bytes(DATA[:CHUNK * 3])
+            side = Path(d) / (NAME + ".part.chunks")
+            side.write_text(side_text, encoding="utf-8")
+            got = setup._load_pieces(part, len(DATA))
+            return got, part.exists(), side.exists()
+
+    def test_a_list_that_is_not_an_object_starts_the_file_over(self):
+        for text in ("[1,2,3]", "123", '"x"', "null"):
+            with self.subTest(text=text):
+                self.assertEqual(self.load(text), (set(), False, False))
+
+    def test_a_range_below_the_first_piece_is_not_counted(self):
+        text = json.dumps({"v": 1, "total": len(DATA), "chunk": CHUNK, "done": [[-3, 2]]})
+        got, part, side = self.load(text)
+        self.assertEqual(got, {0, 1})
+        self.assertTrue(part and side)
+
+    def test_a_good_list_is_read(self):
+        text = json.dumps({"v": 1, "total": len(DATA), "chunk": CHUNK, "done": [[0, 2]]})
+        self.assertEqual(self.load(text)[0], {0, 1})
+
+
+class RatioHeadRange(unittest.TestCase):
+    """write_ratio_head reads its bytes by range requests and refuses a server that ignores Range (Issue #81)."""
+
+    BODY = bytes(range(256)) * 64
+
+    def fake_qi(self, d):
+        want = self.BODY[100:110]
+        return type("QI", (), {
+            "ratio_head_path": staticmethod(lambda m: Path(d) / "ratio_head.bin"),
+            "ratio_head_bytes": staticmethod(lambda read, endpoint: read("https://hf.test/x.safetensors", 100, 109)),
+            "HUNYUANIMAGE3_RATIO_HEAD_SHA": hashlib.sha256(want).hexdigest()})
+
+    def opener(self, ranges, bodies):
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def urlopen(req, timeout=None):
+            lo, hi = map(int, re.match(r"bytes=(\d+)-(\d+)", req.get_header("Range")).groups())
+            if ranges:
+                r = Resp(self.BODY[lo:hi + 1])
+                r.status, r.headers = 206, {"Content-Range": f"bytes {lo}-{hi}/{len(self.BODY)}"}
+            else:
+                r = Resp(self.BODY)
+                r.status, r.headers = 200, {}
+            bodies.append(r)
+            return r
+        return mock.patch.object(setup.urllib.request, "urlopen", urlopen)
+
+    def test_a_ranged_answer_is_written(self):
+        bodies = []
+        with tempfile.TemporaryDirectory() as d, self.opener(True, bodies), \
+                mock.patch.object(setup.time, "sleep", lambda s: None), contextlib.redirect_stdout(io.StringIO()):
+            setup.write_ratio_head(self.fake_qi(d), Path(d))
+            self.assertEqual((Path(d) / "ratio_head.bin").read_bytes(), self.BODY[100:110])
+
+    def test_a_whole_file_answer_is_refused_unread(self):
+        bodies = []
+        with tempfile.TemporaryDirectory() as d, self.opener(False, bodies), \
+                mock.patch.object(setup.time, "sleep", lambda s: None), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                setup.write_ratio_head(self.fake_qi(d), Path(d))
+            self.assertFalse((Path(d) / "ratio_head.bin").exists())
+        self.assertTrue(bodies)
+        self.assertEqual([b.tell() for b in bodies], [0] * len(bodies))
+
+
 class Failures(unittest.TestCase):
     def test_a_piece_that_fails_once_is_tried_again(self):
         def faults(path, start, end, nth):
@@ -491,13 +569,16 @@ class Failures(unittest.TestCase):
 
     def test_a_kept_bad_file_stays_while_there_is_room(self):
         other = bytes((b ^ 0x55) for b in DATA)
+        # room for the new copy whatever the test's own disk has free (Issue #88: a small tmpfs took the other branch)
+        usage = type("U", (), {"free": 1 << 40, "total": 1 << 41, "used": 0})()
         seen = []
 
         def faults(path, start, end, nth):
             seen.append(files(self.d))
             return None
 
-        with small_pieces(), Server(faults=faults) as srv, tempfile.TemporaryDirectory() as d:
+        with small_pieces(), Server(faults=faults) as srv, tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(setup.shutil, "disk_usage", lambda p: usage):
             self.d = d
             (Path(d) / (NAME + ".bad")).write_bytes(other)
             code, out = run(srv, d)

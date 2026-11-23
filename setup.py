@@ -2835,8 +2835,9 @@ def _load_pieces(part: Path, total: int) -> set:
     if side.is_file():
         try:
             data = json.loads(side.read_text(encoding="utf-8"))
-            if data.get("v") == 1 and data.get("total") == total and data.get("chunk") == DL_CHUNK and size is not None:
-                done = {i for a, b in data["done"] for i in range(int(a), min(int(b), n))}
+            if (isinstance(data, dict) and data.get("v") == 1 and data.get("total") == total
+                    and data.get("chunk") == DL_CHUNK and size is not None):
+                done = {i for a, b in data["done"] for i in range(max(int(a), 0), min(int(b), n))}
                 return {i for i in done if min((i + 1) * DL_CHUNK, total) <= size}
         except (OSError, ValueError, TypeError, KeyError):
             pass
@@ -4683,7 +4684,13 @@ def write_ratio_head(QI, models_dir: Path) -> None:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "strata-setup",
                                                            "Range": f"bytes={start}-{end}"})
-                data = urllib.request.urlopen(req, timeout=120).read()
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    # only the range asked for when the server says so (206 and its Content-Range): a mirror or proxy
+                    # that ignores Range answers 200 with the whole shard, which is not read
+                    got = r.headers.get("Content-Range") or ""
+                    if r.status != 206 or not got.startswith(f"bytes {start}-{end}/"):
+                        raise OSError(f"the server ignored the Range header (HTTP {r.status})")
+                    data = r.read(end - start + 1)
                 if len(data) == end - start + 1:
                     return data
             except (urllib.error.URLError, OSError):
