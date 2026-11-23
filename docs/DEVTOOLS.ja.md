@@ -66,7 +66,7 @@ mdl は `dnf download --resolve ruby rubygems` の rpm を `.lint/ruby/usr/` に
 
 `.github/workflows/checks.yml` は、main と apu-speed への push とプルリクエストで、GPU の要らない検査を GitHub Actions で動かします:
 serve と tools の Python のテスト、shellcheck、`reuse lint`、Markdown のリンク（lychee の `--offline` と `--include-fragments`。見出しへのリンクも確かめます）、ライセンスの種別（`tools/license_class.py`。upstream のタグを Strata のリポジトリから取ってきます）。
-もう 1 つのジョブは Fedora のコンテナーで、push やプルリクエストが変えたファイルに `tools/lint/run.sh` をかけます。道具のバージョンは手元と同じです。
+もう 1 つのジョブは Fedora のコンテナーで、push やプルリクエストが変えたファイルに、変更の前と後の両方で `tools/lint/run.sh` をかけます。行番号を除いて比べ、変更で増えた指摘があるときだけ失敗します（`tools/lint/new_findings.py`）。前からある指摘は残っていても通ります。道具のバージョンは手元と同じです。
 clang-tidy とコンパイラーの警告はビルドが要るので CI にはなく（`STRATA_LINT_ALLOW_SKIP=clang-tidy`）、エンジンのビルドと CTest と計測は GPU が要るので、どれも開発機で動かします。
 
 ## intel/llvm をソースからビルドする

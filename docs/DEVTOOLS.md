@@ -63,7 +63,7 @@ For mdl, unpack the rpms of `dnf download --resolve ruby rubygems` under `.lint/
 
 `.github/workflows/checks.yml` runs the checks that need no GPU on GitHub Actions, on every push and pull request to main and apu-speed:
 the Python tests of serve and tools, shellcheck, `reuse lint`, the Markdown files' links (lychee's `--offline` and `--include-fragments`: the links to headings as well) and the license classes (`tools/license_class.py`, which fetches upstream's tag from Strata's repository).
-A second job runs `tools/lint/run.sh` on the files the push or the pull request changed, in a Fedora container, with the same tool versions as the developer's machine.
+A second job runs `tools/lint/run.sh` on the files the push or the pull request changed, before the change and after it, in a Fedora container, with the same tool versions as the developer's machine. It compares the two without the line numbers and fails only on the findings the change adds (`tools/lint/new_findings.py`): findings that were there before may stay.
 clang-tidy and the compiler's warnings need the build, so they are not in the CI (`STRATA_LINT_ALLOW_SKIP=clang-tidy`); the engine's build, CTest and the measurements need the GPU; all of them run on the development machine.
 
 ## intel/llvm from source

@@ -74,7 +74,18 @@ jobs:
           git config --global --add safe.directory "$PWD"
           # a new branch's push has no "before": its own last commit then
           if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then BASE=HEAD~1; fi
-          mapfile -t files < <(git diff --name-only --diff-filter=d "$(git merge-base "$BASE" HEAD)" HEAD)
+          base=$(git merge-base "$BASE" HEAD)
+          mapfile -t files < <(git diff --name-only --diff-filter=d "$base" HEAD)
           if [ ${#files[@]} -eq 0 ]; then echo "nothing changed"; exit 0; fi
-          tools/lint/run.sh "${files[@]}"
+          # the same files before the change, linted with the same tools: only the findings the change adds fail the job
+          # (the files keep the findings that were there before; AGENTS.md, Lints)
+          git worktree add -q --detach ../base "$base"
+          ln -s "$PWD/.lint" ../base/.lint
+          rm -rf ../base/tools/lint && cp -r tools/lint ../base/tools/lint   # this commit's lints and settings on both
+          before=()
+          for f in "${files[@]}"; do [ -f "../base/$f" ] && before+=("$f"); done
+          if [ ${#before[@]} -gt 0 ]; then (cd ../base && tools/lint/run.sh "${before[@]}") > ../lint-base.txt 2>&1; else : > ../lint-base.txt; fi
+          tools/lint/run.sh "${files[@]}" > ../lint-final.txt 2>&1
+          cat ../lint-final.txt
+          python3 tools/lint/new_findings.py ../lint-base.txt ../lint-final.txt
         shell: bash
