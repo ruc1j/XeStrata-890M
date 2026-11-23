@@ -4335,12 +4335,11 @@ int lm_r_env() {            // 0 auto, 1 vram, 2 host
     }();
     return v;
 }
-// VRAM left free while a prompt runs (the verify windows, the driver): STRATA_PREFILL_LM_MARGIN_MIB, 96 MiB unset
+// VRAM left free while a prompt runs (the verify windows, the driver): STRATA_PREFILL_LM_MARGIN_MIB, 96 MiB unset.
+// Read as the other sizes in MiB are (env_mib): a sign, other characters or a value whose << 20 wraps are refused with a
+// message and the default kept, so a margin is never silently 0 or negative.  At most 1 TiB, more than any device has.
 int64_t lm_margin_bytes() {
-    static const int64_t v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_LM_MARGIN_MIB");
-        return (e ? (int64_t) std::strtoll(e, nullptr, 10) : (int64_t) 96) << 20;
-    }();
+    static const int64_t v = (int64_t) std::min<uint64_t>(strata::core::env_mib("STRATA_PREFILL_LM_MARGIN_MIB", 96), 1ull << 40u);
     return v;
 }
 constexpr int64_t kLmDefaultTokens = 8192;
