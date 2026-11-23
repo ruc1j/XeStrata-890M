@@ -207,7 +207,7 @@ Fedora 44 で、次の 3 つのどれかで入れます。rpm がいちばん簡
 1. 入れます。ROCm のライブラリ（HIP、rocBLAS、hipBLASLt）は rpm が推奨の依存として一緒に入ります。
 
    ```bash
-   sudo dnf install ./xestrata-free-0.2.15-1.x86_64.rpm
+   sudo dnf install ./xestrata-free-0.2.19-1.x86_64.rpm
    sudo usermod -aG render,video $USER    # /dev/kfd と /dev/dri/renderD* を開けるように。ログインし直します
    ```
 

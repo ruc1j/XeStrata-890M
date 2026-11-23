@@ -264,7 +264,7 @@ In each, setup looks at the GPU and writes [the settings for the 890M](#the-sett
 1. Install it. The ROCm libraries (HIP, rocBLAS, hipBLASLt) come with it as recommended dependencies.
 
    ```bash
-   sudo dnf install ./xestrata-free-0.2.15-1.x86_64.rpm
+   sudo dnf install ./xestrata-free-0.2.19-1.x86_64.rpm
    sudo usermod -aG render,video $USER    # to open /dev/kfd and /dev/dri/renderD*; log out and back in
    ```
 
