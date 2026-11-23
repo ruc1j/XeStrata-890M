@@ -25,11 +25,10 @@ XeStrata の開発で、リント、確認、測定のために入れる道具�
 `STRATA_LINT_ALLOW_SKIP=1` を付けると、一覧は出したまま、ほかに指摘がなければ 0 で終わります。
 `.lint/venv/bin`、`.lint/bin`、`.lint/node_modules/.bin` は `run.sh` が PATH の先頭に足すので、そこに入れた道具はそのまま見つかります。
 
-ディストリビューションから入れるもの。
+ディストリビューションから入れるもの（Python と npm の道具は、下の `.lint/` のものを使います）。
 
 ```sh
-sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyflakes codespell \
-    markdownlint cmake-format tidy eslint
+sudo apt install clang-tidy cppcheck markdownlint tidy
 ```
 
 `tools/lint/run.sh` は、ディストリビューションの clang-tidy ではなく、SYCL を理解する oneAPI の clang-tidy（`/opt/intel/oneapi/compiler` の下）を使います。
@@ -43,16 +42,19 @@ cmake -S . -B build/free -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
 ディストリビューションにないもの、またはあっても古すぎるものは `.lint/` に入れます。
 
+Python と npm の道具のバージョンは、CI と同じものを `tools/lint/requirements.txt` と `tools/lint/package.json` で固定しています。
+道具が新しくなると見つけるものが変わるので、上げるときはこの 2 つのファイルを書き換え、CI と手元を一緒に上げます。
+venv の Python は 3.14 にします。cmake-lint（cmakelang 0.6.13）は、Python 3.15 の `re.Scanner` がキャプチャグループを断るので、3.15 では止まります。
+
 ```sh
-python3 -m venv .lint/venv && .lint/venv/bin/pip install ruff reuse        # ruff 0.16, reuse 6.2
-npm install --prefix .lint stylelint stylelint-config-recommended         # stylelint 17
+python3.14 -m venv .lint/venv && .lint/venv/bin/pip install -r tools/lint/requirements.txt   # reuse、ruff、mypy、flake8、codespell、cmake-lint、shellcheck
+cp tools/lint/package.json .lint/ && npm install --prefix .lint                         # stylelint、eslint 8
 mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-x86_64-unknown-linux-gnu.tar.gz \
     | tar -xz -C .lint/bin --strip-components=1 lychee-x86_64-unknown-linux-gnu/lychee   # lychee 0.24
 ```
 
-apt のないディストリビューションでは、shellcheck と cmake-lint は pip から（`.lint/venv/bin/pip install shellcheck-py cmakelang`）、
-gitleaks は GitHub の Releases のバイナリを `.lint/bin/` に、eslint は npm から（`npm install --prefix .lint eslint@8`。`run.sh` は eslintrc の形の設定を渡すので 8 系です）入れられます。
-`tools/lint/run.sh` は、ディストリビューションの `reuse` があればそれを使い、なければ `.lint/venv/bin/reuse` を使います。
+gitleaks は GitHub の Releases のバイナリ（v8.30.1）を `.lint/bin/` に入れます。
+`tools/lint/run.sh` は `.lint/venv/bin` を PATH の先頭に置くので、ディストリビューションに `reuse` などがあっても、`.lint/venv` のものを使います。
 root になれない PC では tidy と mdl もディストリビューションのパッケージを `.lint/` に展開して使えます（Fedora の例）。
 tidy は `dnf download tidy libtidy` の rpm を `rpm2cpio | cpio -idm` で展開し、`usr/bin/tidy` と `usr/lib64/libtidy.so*` を `.lint/tidy/` に置いて、
 `.lint/bin/tidy` を `LD_LIBRARY_PATH` をそこに向けて実行するシェルスクリプトにします。
@@ -62,9 +64,10 @@ mdl は `dnf download --resolve ruby rubygems` の rpm を `.lint/ruby/usr/` に
 
 ### CI
 
-`.github/workflows/checks.yml` は、main と apu-speed への push と main へのプルリクエストで、GPU の要らない検査を GitHub Actions で動かします:
-serve と tools の Python のテスト、shellcheck、`reuse lint`、Markdown のリンク（lychee の `--offline`）、ライセンスの種別（`tools/license_class.py`。upstream のタグを Strata のリポジトリから取ってきます）。
-エンジンのビルドと CTest と計測は GPU が要るので CI にはなく、開発機で動かします。
+`.github/workflows/checks.yml` は、main と apu-speed への push とプルリクエストで、GPU の要らない検査を GitHub Actions で動かします:
+serve と tools の Python のテスト、shellcheck、`reuse lint`、Markdown のリンク（lychee の `--offline` と `--include-fragments`。見出しへのリンクも確かめます）、ライセンスの種別（`tools/license_class.py`。upstream のタグを Strata のリポジトリから取ってきます）。
+もう 1 つのジョブは Fedora のコンテナーで、push やプルリクエストが変えたファイルに `tools/lint/run.sh` をかけます。道具のバージョンは手元と同じです。
+clang-tidy とコンパイラーの警告はビルドが要るので CI にはなく（`STRATA_LINT_ALLOW_SKIP=clang-tidy`）、エンジンのビルドと CTest と計測は GPU が要るので、どれも開発機で動かします。
 
 ## intel/llvm をソースからビルドする
 

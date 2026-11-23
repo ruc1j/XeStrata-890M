@@ -467,7 +467,7 @@ MarchRaBBiT/XeStrata's change that passes the RDNA matrix attentions a work-grou
 
 ### Serve fixes from other forks (Issue #66)
 
-Ben1078/Strata's 8b90ab807 came in: with `"effort_position": "end"` a request's final user message that holds nothing but a `<system-reminder>` moves into the system turn right before the answer, and the next turn reuses the conversation's checkpoint ([DETAILS](DETAILS.md#api)).
+Ben1078/Strata's 8b90ab807 came in: with `"effort_position": "end"` a request's final user message that holds nothing but a `<system-reminder>` moves into the system turn right before the answer, and the next turn reuses the conversation's checkpoint ([DETAILS](DETAILS.md#using-it)).
 shoftee/Strata's 2feece509 came in as well: a stop closes the listening socket first, writes the engine STOP before QUIT so it finishes its request, and joins the handler threads last (a busy stop 20 s -> about 1 s in shoftee's measurement). A write to a closed pipe (ValueError) counts as the engine's end too.
 Ben1078's e8e0cdc40 (a metadata-only GGUF shard) was already in this fork's gguf_reader.hpp.
 

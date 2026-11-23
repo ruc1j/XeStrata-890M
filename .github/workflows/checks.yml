@@ -1,14 +1,16 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# The checks that need no GPU, on every push to main and apu-speed and every pull request to main: the Python tests of
-# serve/ and tools/, shellcheck, reuse lint, the Markdown files' links and the license classes (AGENTS.md, Lints).
-# The engine's build, CTest and the measurements need the GPU and run on the developer's machine (docs/BUILD.md).
+# The checks that need no GPU, on every push to main and apu-speed and every pull request to them: the Python tests of
+# serve/ and tools/, shellcheck, reuse lint, the Markdown files' links and the license classes; and the lints of
+# tools/lint/run.sh on the files the push or the pull request changed (AGENTS.md, Lints), with the tool versions
+# tools/lint/requirements.txt and tools/lint/package.json pin.  clang-tidy and the compiler's warnings need the build and
+# run on the developer's machine, as the engine's build, CTest and the measurements do (they need the GPU; docs/BUILD.md).
 name: checks
 on:
   push:
     branches: [main, apu-speed]
   pull_request:
-    branches: [main]
+    branches: [main, apu-speed]
 jobs:
   cpu:
     runs-on: ubuntu-latest
@@ -23,7 +25,8 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q shellcheck
-          python3 -m pip install -q reuse -r requirements.txt   # serve's packages (regex, jinja2, numpy, ...)
+          # reuse at the version of tools/lint/requirements.txt, serve's packages (regex, jinja2, numpy, ...)
+          python3 -m pip install -q "$(grep '^reuse==' tools/lint/requirements.txt)" -r requirements.txt
           mkdir -p .lint/bin
           curl -sSL https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C .lint/bin --strip-components=1 lychee-x86_64-unknown-linux-gnu/lychee
@@ -34,8 +37,44 @@ jobs:
       - name: shellcheck
         run: git ls-files -- '*.sh' ':!third_party' | xargs shellcheck
       - name: Markdown links
-        run: git ls-files -- '*.md' ':!third_party' | xargs .lint/bin/lychee --offline --no-progress
+        run: git ls-files -- '*.md' ':!third_party' | xargs .lint/bin/lychee --offline --no-progress --include-fragments
       - name: serve tests
         run: python3 -m unittest discover -s serve -t .
       - name: tools tests
         run: python3 -m unittest $(ls tools/test_*.py | sed 's|/|.|; s|\.py$||')
+  # the lints of tools/lint/run.sh on the changed files, in Fedora (the distribution of the developer's machine: its
+  # cppcheck and tidy are the versions run there)
+  lints:
+    runs-on: ubuntu-latest
+    container: fedora:45
+    steps:
+      - name: git
+        run: dnf install -y -q git-core
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: the tools
+        run: |
+          # Python 3.14: cmake-lint (cmakelang 0.6.13) stops on 3.15's re.Scanner, which refuses its capturing groups
+          dnf install -y -q python3.14 cppcheck tidy ruby rubygems nodejs-npm findutils
+          python3.14 -m venv .lint/venv
+          .lint/venv/bin/pip install -q -r tools/lint/requirements.txt -r requirements.txt
+          gem install --no-document mdl -v 0.18.1
+          cp tools/lint/package.json .lint/ && npm install --prefix .lint --no-audit --no-fund -s
+          mkdir -p .lint/bin
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            | tar -xz -C .lint/bin gitleaks
+          curl -sSL https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C .lint/bin --strip-components=1 lychee-x86_64-unknown-linux-gnu/lychee
+      - name: lints of the changed files (tools/lint/run.sh; clang-tidy needs the build)
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+          STRATA_LINT_ALLOW_SKIP: clang-tidy
+        run: |
+          git config --global --add safe.directory "$PWD"
+          # a new branch's push has no "before": its own last commit then
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then BASE=HEAD~1; fi
+          mapfile -t files < <(git diff --name-only --diff-filter=d "$(git merge-base "$BASE" HEAD)" HEAD)
+          if [ ${#files[@]} -eq 0 ]; then echo "nothing changed"; exit 0; fi
+          tools/lint/run.sh "${files[@]}"
+        shell: bash

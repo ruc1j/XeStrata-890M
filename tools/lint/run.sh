@@ -5,7 +5,8 @@
 # tools/lint/run.sh [FILE...] - the lints of AGENTS.md on the given files, by kind; without files, on the files that
 # differ from HEAD (changed or new, not deleted).  Run from the repository root.  Exits 1 when any lint reports, and
 # when a lint could not run because its tool is not installed (the tools are listed at the end; STRATA_LINT_ALLOW_SKIP=1
-# accepts that and exits 0 when nothing else reports).  The tools come from the distribution or from .lint/
+# accepts that and exits 0 when nothing else reports, and a comma-separated list of lints, STRATA_LINT_ALLOW_SKIP=clang-tidy
+# for the CI, which has no build, accepts those alone).  The tools come from the distribution or from .lint/
 # (docs/DEVTOOLS.md#lints): .lint/venv/bin, .lint/bin and .lint/node_modules/.bin are put on the PATH here.
 # STRATA_LINT_BUILD names the build folder whose compile_commands.json clang-tidy reads (default build/free;
 # configure it with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON); STRATA_CLANG_TIDY names a clang-tidy that knows SYCL
@@ -126,7 +127,7 @@ fi
 [ ${#cmake[@]} -gt 0 ] && run cmake-lint cmake-lint -c "$C/cmake-format.py" -- "${cmake[@]}"
 if [ ${#md[@]} -gt 0 ]; then
   run markdownlint mdl --style "$C/mdl_style.rb" "${md[@]}"
-  run lychee lychee --offline --no-progress "${md[@]}"
+  run lychee lychee --offline --no-progress --include-fragments "${md[@]}"
 fi
 [ ${#css[@]} -gt 0 ] && run stylelint stylelint --config "$C/stylelint.config.mjs" \
   --config-basedir .lint "${css[@]}"
@@ -144,8 +145,13 @@ python3 tools/license_class.py "${all[@]}" || status=1
 run reuse reuse lint --quiet
 if [ ${#skipped[@]} -gt 0 ]; then
   echo "== not run, their tools are not installed: ${skipped[*]} (docs/DEVTOOLS.md#lints)"
-  if [ "${STRATA_LINT_ALLOW_SKIP:-0}" = 1 ]; then
-    echo "   accepted (STRATA_LINT_ALLOW_SKIP=1)"
+  allow=${STRATA_LINT_ALLOW_SKIP:-0}
+  missing=()
+  for n in "${skipped[@]}"; do
+    [ "$allow" = 1 ] || [[ ",$allow," == *",$n,"* ]] || missing+=("$n")
+  done
+  if [ ${#missing[@]} -eq 0 ]; then
+    echo "   accepted (STRATA_LINT_ALLOW_SKIP=$allow)"
   else
     status=1
   fi

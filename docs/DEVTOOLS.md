@@ -25,11 +25,10 @@ When `run.sh` skips a lint because its tool is not installed, it lists those at 
 With `STRATA_LINT_ALLOW_SKIP=1` it still prints the list but exits 0 when nothing else reports.
 `run.sh` puts `.lint/venv/bin`, `.lint/bin` and `.lint/node_modules/.bin` at the front of the PATH, so a tool installed there is found as it is.
 
-From the distribution.
+From the distribution (the Python and npm tools are the ones in `.lint/`, below).
 
 ```sh
-sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyflakes codespell \
-    markdownlint cmake-format tidy eslint
+sudo apt install clang-tidy cppcheck markdownlint tidy
 ```
 
 `tools/lint/run.sh` runs oneAPI's clang-tidy, which knows SYCL (found under `/opt/intel/oneapi/compiler`), not the distribution's.
@@ -43,25 +42,29 @@ cmake -S . -B build/free -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
 The ones the distribution does not package, or packages too old, go into `.lint/`.
 
+The versions of the Python and npm tools are pinned, the same as the CI's, in `tools/lint/requirements.txt` and `tools/lint/package.json`.
+A new release of a tool changes what it finds, so it is taken by changing those two files, for the CI and the developer's machine together.
+The venv's Python is 3.14: cmake-lint (cmakelang 0.6.13) stops on Python 3.15, whose `re.Scanner` refuses its capturing groups.
+
 ```sh
-python3 -m venv .lint/venv && .lint/venv/bin/pip install ruff reuse        # ruff 0.16, reuse 6.2
-npm install --prefix .lint stylelint stylelint-config-recommended         # stylelint 17
+python3.14 -m venv .lint/venv && .lint/venv/bin/pip install -r tools/lint/requirements.txt   # reuse, ruff, mypy, flake8, codespell, cmake-lint, shellcheck
+cp tools/lint/package.json .lint/ && npm install --prefix .lint                         # stylelint, eslint 8
 mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-x86_64-unknown-linux-gnu.tar.gz \
     | tar -xz -C .lint/bin --strip-components=1 lychee-x86_64-unknown-linux-gnu/lychee   # lychee 0.24
 ```
 
-On a distribution without apt, shellcheck and cmake-lint come from pip (`.lint/venv/bin/pip install shellcheck-py cmakelang`),
-gitleaks as the binary of its GitHub Releases into `.lint/bin/`, and eslint from npm (`npm install --prefix .lint eslint@8`: `run.sh` passes an eslintrc-style configuration, which is the 8 series).
-`tools/lint/run.sh` uses the distribution's `reuse` when there is one and `.lint/venv/bin/reuse` otherwise.
+gitleaks goes into `.lint/bin/` as the binary of its GitHub Releases (v8.30.1).
+`tools/lint/run.sh` puts `.lint/venv/bin` first on the PATH, so it uses the tools of `.lint/venv` even where the distribution has `reuse` and the others.
 On a PC where root is not at hand, tidy and mdl can be unpacked from the distribution's packages into `.lint/` (Fedora's, for example).
 For tidy, unpack the rpms of `dnf download tidy libtidy` with `rpm2cpio | cpio -idm`, put `usr/bin/tidy` and `usr/lib64/libtidy.so*` under `.lint/tidy/`, and make `.lint/bin/tidy` a shell script that runs it with `LD_LIBRARY_PATH` pointed there.
 For mdl, unpack the rpms of `dnf download --resolve ruby rubygems` under `.lint/ruby/usr/`, set `RUBYLIB` to `share/rubygems`, `share/ruby`, `lib64/ruby`, `share/gems/gems/*/lib` and `lib64/gems/ruby/*` (the rpm's extensions point at `/usr/lib64/gems/ruby`, which is not there, so they are given directly), run `ruby-mri usr/bin/gem install --no-document mdl` with `GEM_HOME=.lint/ruby/gems`, and make `.lint/bin/mdl` a script that runs `ruby-mri .lint/ruby/gems/bin/mdl` in that environment.
 
 ### CI
 
-`.github/workflows/checks.yml` runs the checks that need no GPU on GitHub Actions, on every push to main and apu-speed and every pull request to main:
-the Python tests of serve and tools, shellcheck, `reuse lint`, the Markdown files' links (lychee's `--offline`) and the license classes (`tools/license_class.py`, which fetches upstream's tag from Strata's repository).
-The engine's build, CTest and the measurements need the GPU, so they are not in the CI and run on the development machine.
+`.github/workflows/checks.yml` runs the checks that need no GPU on GitHub Actions, on every push and pull request to main and apu-speed:
+the Python tests of serve and tools, shellcheck, `reuse lint`, the Markdown files' links (lychee's `--offline` and `--include-fragments`: the links to headings as well) and the license classes (`tools/license_class.py`, which fetches upstream's tag from Strata's repository).
+A second job runs `tools/lint/run.sh` on the files the push or the pull request changed, in a Fedora container, with the same tool versions as the developer's machine.
+clang-tidy and the compiler's warnings need the build, so they are not in the CI (`STRATA_LINT_ALLOW_SKIP=clang-tidy`); the engine's build, CTest and the measurements need the GPU; all of them run on the development machine.
 
 ## intel/llvm from source
 

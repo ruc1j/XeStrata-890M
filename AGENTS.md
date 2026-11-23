@@ -173,7 +173,7 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 | Python | flake8, ruff, mypy |
 | Shell | shellcheck |
 | CMake | cmake-lint |
-| Markdown | mdl, lychee (`--offline`: links to files in the repository) |
+| Markdown | mdl, lychee (`--offline --include-fragments`: links to files and headings in the repository) |
 | CSS / JavaScript / HTML | stylelint, eslint, tidy |
 | all text files | codespell |
 | every file | gitleaks (built-in rules; `.gitleaksignore` lists the findings that are not secrets, each with its reason) |
@@ -181,8 +181,8 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 | the whole repository | `reuse lint` (see Licenses above) |
 
 The files a change touches must get no new findings; findings that were there before may stay.
-A lint whose tool is not installed does not run, and `run.sh` then exits 1 with the list of them (`STRATA_LINT_ALLOW_SKIP=1` accepts that); install the tools as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#lints) describes.
-`.github/workflows/checks.yml` runs the checks that need no GPU (the Python tests of `serve/` and `tools/`, shellcheck, `reuse lint`, the Markdown links, `tools/license_class.py`) on every push to `main` and `apu-speed` and every pull request to `main`; the build and CTest are not in it.
+A lint whose tool is not installed does not run, and `run.sh` then exits 1 with the list of them (`STRATA_LINT_ALLOW_SKIP=1` accepts that, `STRATA_LINT_ALLOW_SKIP=clang-tidy` that lint alone); install the tools as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#lints) describes, at the versions `tools/lint/requirements.txt` and `tools/lint/package.json` pin.
+`.github/workflows/checks.yml` runs the checks that need no GPU (the Python tests of `serve/` and `tools/`, shellcheck, `reuse lint`, the Markdown links, `tools/license_class.py`, and `run.sh` on the changed files with every lint but clang-tidy and the compiler's warnings) on every push and pull request to `main` and `apu-speed`; the build and CTest are not in it.
 Other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
 Their headers, and the SYCL runtime's, give no clang-tidy findings to the sources that include them.
 An engine carried over from upstream Strata as upstream wrote it (`src/inkling2mini/` and `src/quant/`, with their headers under `include/strata/`) is checked by clang-tidy without three checks: `bugprone-signed-bitwise`, `bugprone-implicit-widening-of-multiplication-result` and `bugprone-narrowing-conversions`.

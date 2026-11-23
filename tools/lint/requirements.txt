@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# The Python lint tools of tools/lint/run.sh at the versions the CI and .lint/venv share (docs/DEVTOOLS.md#lints):
+# a new release of one changes what it finds, so it is taken here, on purpose, and not by the next install.
+reuse==6.2.0
+ruff==0.17.2
+mypy==2.4.0
+flake8==7.4.1
+codespell==2.4.3
+cmakelang==0.6.13
+shellcheck-py==0.11.0.1
