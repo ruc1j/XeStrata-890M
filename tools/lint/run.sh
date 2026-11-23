@@ -72,22 +72,46 @@ fi
 if [ ${#cpp[@]} -gt 0 ]; then
   if [ -n "$CLANG_TIDY" ] && [ -f "$BUILD/compile_commands.json" ]; then
     tidy=("$CLANG_TIDY" --quiet -p "$BUILD" --config-file="$C/clang-tidy.yaml")
-    mapfile -t cxx < <(printf '%s\n' "${cpp[@]}" | grep '\.cpp$')
+    # The folders of an engine carried over from upstream Strata as upstream wrote it (Inkling-2-Mini's, and the
+    # codecs of the .strata v1.1 files it reads): three checks are off there.  They flag the idiom of that code - bit
+    # fields unpacked from signed integers, index products in int, sums narrowed to the stored width - about a
+    # thousand times, and writing each one out would leave no line as upstream has it, for the next integration to
+    # carry over.  Every other check stays on there, and the code XeStrata writes elsewhere keeps all of them.
+    carried='^(src|include/strata)/(inkling2mini|quant)/'
+    relaxed=("--checks=-bugprone-signed-bitwise,-bugprone-implicit-widening-of-multiplication-result,-bugprone-narrowing-conversions")
+    mapfile -t cxx < <(printf '%s\n' "${cpp[@]}" | grep '\.cpp$' | grep -v -E "$carried")
+    mapfile -t cxxc < <(printf '%s\n' "${cpp[@]}" | grep '\.cpp$' | grep -E "$carried")
     mapfile -t hpp < <(printf '%s\n' "${cpp[@]}" | grep '\.hpp$')
     [ ${#cxx[@]} -gt 0 ] && run clang-tidy "${tidy[@]}" "${cxx[@]}"
+    [ ${#cxxc[@]} -gt 0 ] && run "clang-tidy (an engine carried over from upstream: three checks off)" "${tidy[@]}" "${relaxed[@]}" "${cxxc[@]}"
     # A header is checked inside a source that includes it, with that source's command: alone it gets the command of
     # whichever source's path is nearest, often one without -fsycl, and misses the macros a source defines before the
     # include (strata/kernels/device_arch_tag.hpp).  --line-filter keeps the header's findings only.
     if [ ${#hpp[@]} -gt 0 ]; then
       mapfile -t tus < <(python3 -c 'import json, sys; print("\n".join(sorted({e["file"] for e in json.load(open(sys.argv[1]))})))' \
         "$BUILD/compile_commands.json")
+      tu_of() {  # tu_of HEADER: the first source that includes it, itself or through other headers (four deep)
+        local want=("$1") next f inc t
+        for _ in 1 2 3 4; do
+          next=()
+          for f in "${want[@]}"; do
+            case "$f" in include/*) inc="[<\"]${f#include/}[>\"]" ;; *) inc="\"([^\"]*/)?${f##*/}\"" ;; esac
+            t=$(grep -l -E "^#include $inc" "${tus[@]}" 2>/dev/null | head -n 1)
+            [ -n "$t" ] && { echo "$t"; return; }
+            mapfile -t -O "${#next[@]}" next < <(grep -rl -E --include='*.h' --include='*.hpp' "^#include $inc" src include 2>/dev/null)
+          done
+          [ ${#next[@]} -gt 0 ] || return
+          want=("${next[@]}")
+        done
+      }
       for h in "${hpp[@]}"; do
-        case "$h" in include/*) inc="[<\"]${h#include/}[>\"]" ;; *) inc="\"([^\"]*/)?${h##*/}\"" ;; esac
-        tu=$(grep -l -E "^#include $inc" "${tus[@]}" 2>/dev/null | head -n 1)
+        tu=$(tu_of "$h")
+        htidy=("${tidy[@]}")
+        [[ $h =~ $carried ]] && htidy+=("${relaxed[@]}")
         if [ -n "$tu" ]; then
-          run "clang-tidy $h (in ${tu#"$PWD"/})" "${tidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$h\"}]" "$tu"
+          run "clang-tidy $h (in ${tu#"$PWD"/})" "${htidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$h\"}]" "$tu"
         else
-          run "clang-tidy $h" "${tidy[@]}" "$h"
+          run "clang-tidy $h" "${htidy[@]}" "$h"
         fi
       done
     fi
@@ -96,6 +120,7 @@ if [ ${#cpp[@]} -gt 0 ]; then
     skipped+=(clang-tidy)
   fi
   run cppcheck cppcheck --quiet --error-exitcode=1 --std=c++20 --enable=warning,performance --library="$C/cppcheck.cfg" \
+    --inline-suppr \
     --suppress=missingIncludeSystem --suppress=noCopyConstructor --suppress=noOperatorEq "${cpp[@]}"
 fi
 [ ${#cmake[@]} -gt 0 ] && run cmake-lint cmake-lint -c "$C/cmake-format.py" -- "${cmake[@]}"

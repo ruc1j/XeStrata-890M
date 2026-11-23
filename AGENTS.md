@@ -184,6 +184,10 @@ The files a change touches must get no new findings; findings that were there be
 A lint whose tool is not installed does not run, and `run.sh` then exits 1 with the list of them (`STRATA_LINT_ALLOW_SKIP=1` accepts that); install the tools as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#lints) describes.
 `.github/workflows/checks.yml` runs the checks that need no GPU (the Python tests of `serve/` and `tools/`, shellcheck, `reuse lint`, the Markdown links, `tools/license_class.py`) on every push to `main` and `apu-speed` and every pull request to `main`; the build and CTest are not in it.
 Other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
+Their headers, and the SYCL runtime's, give no clang-tidy findings to the sources that include them.
+An engine carried over from upstream Strata as upstream wrote it (`src/inkling2mini/` and `src/quant/`, with their headers under `include/strata/`) is checked by clang-tidy without three checks: `bugprone-signed-bitwise`, `bugprone-implicit-widening-of-multiplication-result` and `bugprone-narrowing-conversions`.
+They flag that code's idiom (bit fields unpacked from signed integers, index products in `int`) about a thousand times, and writing each one out would leave no line as upstream has it for the next integration to carry over.
+Every other lint holds there; a finding on a line that means what it says is marked there with its reason (`// NOLINT(<check>): <reason>.`, `// cppcheck-suppress <id> ; <reason>`).
 clang-tidy reads `compile_commands.json` from the build folder (`build/free`, or `STRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
 
 Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`).

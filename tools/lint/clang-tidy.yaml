@@ -8,4 +8,9 @@
 # check (opt-in) too: it would have the options, the engine's state and the kernels' argument blocks ordered by size
 # rather than by meaning, for bytes that do not matter there.  The unchecked optional access: its flow analysis took
 # 491 of the 590 s clang-tidy spent on src/program/generate.cpp (2026-10-24), for a type the code uses in a few places.
+# Headers: a source's findings include those in the headers it reads (clang-tidy's default from LLVM 21 on).  Another
+# project's headers in third_party/ and the SYCL runtime's own are left out: they are kept as their projects wrote
+# them (AGENTS.md: third_party gets gitleaks and reuse only), and stb_image.h alone gives about 600 findings to every
+# source that includes it.
 Checks: '-*,bugprone-*,performance-*,clang-analyzer-*,-bugprone-easily-swappable-parameters,-performance-enum-size,-performance-no-int-to-ptr,-bugprone-reserved-identifier,-clang-analyzer-optin.performance.Padding,-bugprone-unchecked-optional-access'
+ExcludeHeaderFilterRegex: '(^|/)third_party/|/include/sycl/'
