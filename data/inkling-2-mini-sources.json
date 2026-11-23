@@ -1,0 +1,9 @@
+{
+ "note": "Hugging Face repository for Thinking Machines Inkling-2-Mini (.strata v1.1), at a pinned commit. Overridden by STRATA_INKLING2MINI_SOURCE or config key inkling2mini_source.",
+ "sources": [
+  {
+   "kind": "http",
+   "base": "https://huggingface.co/strata-engine/Inkling-2-Mini-Strata/resolve/04996a1e2c45009b6a04f2af126cb6bdb2ba3587"
+  }
+ ]
+}

@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+#
+# Findings of gitleaks (tools/lint/run.sh) that are not secrets, by fingerprint (file:rule:line).
+# Zstandard's xxhash.h, kept as that project wrote it: the variable is named data_key (XXH3's key material, a
+# constant of the algorithm), which the generic-api-key rule takes for a key.
+third_party/main/zstd-dec/common/xxhash.h:generic-api-key:4836
+third_party/main/zstd-dec/common/xxhash.h:generic-api-key:4885

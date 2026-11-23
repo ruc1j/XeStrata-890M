@@ -235,7 +235,7 @@ upstream が Strata-rdna3 から取り込んだ attention のカーネル（d312
 ## Strata 0.1.65 の取り込み
 
 upstream の Strata 0.2.15 から 0.2.19（エンジンの版は 0.1.65、2026-11-22）までの 1,082 コミット（merge を除きます。0.2.16 までが 609、その先が 473）を 1 件ずつ見て、エンジン・serve・setup・tools の層に当たるものを XeStrata-890M に移しました。一覧は `.upstream-0162.md` と `.upstream-0165.md`（リポジトリの根、git の外）です。
-大半は、NVIDIA と Windows と複数 GPU 向けの変更、app と Terminal と Control の層、新しいモデルの Hy4-Flash と Inkling-2-Mini のエンジンで、この節で移したものには入っていません。
+大半は、NVIDIA と Windows と複数 GPU 向けの変更、app と Terminal と Control の層、新しいモデルの Hy4-Flash のエンジンで、この節で移したものには入っていません。
 serve のツール呼び出しの読み手は、この fork が引数の型を schema から読むので、upstream の差分はそのままでは当たりません。当たらなかった分は fork の形に書き直しました。
 
 移したものは次のとおりです。
@@ -255,6 +255,7 @@ serve のツール呼び出しの読み手は、この fork が引数の型を s
 - serve: `--prompt-cache-every` の定期チェックポイントを、再開した位置からの格子に置きます（2c8d300ad）。temperature 0 の要求には、モデルカードのペナルティを付けません（d7ce708ba、3313dbd61）。server の glibc のメモリー区画を 2 つに抑えます（aeecf0f5d の server の側）。
 - serve: Responses API の `max_output_tokens` で切れた答え、Codex の multi-agent v2 の item、クライアント側の `tool_search`（3af02433a、3cb933d29、277af44e9、e04cb092f）。
 - エンジン: DFlash2 の drafter の attention を RDNA の行列命令で計算するカーネルを、opt-in で移しました（`STRATA_DF2_ATTN=3`、upstream d31256b79。数字は上の DFlash2 の節にあります）。
+- 新しいモデル: Thinking Machines の Inkling-2-Mini を、upstream の専用のエンジン（`strata-inkling-2-mini`）ごと移しました（[DETAILS](DETAILS.ja.md#inkling-2-mini専用のエンジンで動くモデル)）。upstream の CUDA・HIP・Metal のバックエンドは取らず、SYCL のバックエンドを AMD の 32 レーンの sub-group で動くように直しています。モデルの名前は略さずに書く決まりなので、upstream の `ink_` などの名前は `inkling2mini_` に置き換えました（`tools/upstream/inkling2mini_names.sed`）。
 - setup: RAM の予算（`--resident-budget-gib`）の規則を、RAM から 17 GB を引く形にしました（8780e9fdc、c8d70bbcd）。GPU が RAM を共有する PC は、upstream と同じく 24 GB を引く元の規則のままなので、890M では変わりません。
 - setup と tools: Coder のモデルの pin（3d54c7137）、`mtp_fetch.py` の `--repo`（c9b6956c6）、`--batch` のスロットを上書きされた会話の続きを確かめる試験の道具（6da257d80）ほか。
 

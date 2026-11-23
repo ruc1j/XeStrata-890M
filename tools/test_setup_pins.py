@@ -54,6 +54,15 @@ def quiet(fn, *args, **kw):
 class HuggingFacePins(unittest.TestCase):
     def test_every_model_url_is_pinned(self):
         for name, fam in setup.FAMILIES.items():
+            if fam.get("inkling2mini"):   # its sources are a list of its own (data/inkling-2-mini-sources.json),
+                # the shipped one a Hugging Face commit; every file's size is pinned and the model files' SHA-256
+                from serve import inkling2mini_family
+                with self.subTest(family=name):
+                    for src in inkling2mini_family.sources(env={}):
+                        self.assertRegex(src["base"] + "/", SHA)
+                    for version, m in fam["models"].items():
+                        self.assertRegex(m["sha256"], r"^[0-9a-f]{64}$")
+                continue
             if fam.get("plain"):   # Ornith-1.5, llm-jp-4.1: each version names its repository, pinned in HF_REVISIONS
                 for version, m in fam["models"].items():
                     with self.subTest(family=name, version=version):

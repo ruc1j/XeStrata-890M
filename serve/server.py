@@ -70,7 +70,9 @@ SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a 
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve.childenv import limit_own_arenas, quiet_crash_env  # noqa: E402
 from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END,  # noqa: E402
-                            ChatTemplate, Event, GlmOutputParser, HarmonyParser, OutputParser, ToolCall, allowed_tools,
+                            ChatTemplate, Event, GlmOutputParser, HarmonyParser, Inkling2MiniOutputParser, OutputParser,
+                            ToolCall,
+                            allowed_tools,
                             anthropic_format, anthropic_to_messages,
                             anthropic_tools,
                             custom_tool_names, forced_call, images_of, legacy_function_call, legacy_functions,
@@ -81,6 +83,7 @@ from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import release_check  # noqa: E402
 from serve import loop_guard  # noqa: E402
+from serve import inkling2mini_dialect, inkling2mini_kind  # noqa: E402
 from serve.structured import (StructuredOutputError, answer_grammar, checked_calls, constrained_tools,  # noqa: E402
                               extract_json, prepare_format, strict_schemas, tool_grammar, validated_json)
 from serve import responses as responses_api  # noqa: E402
@@ -1071,6 +1074,9 @@ class StrataEngine:
                  *, fds: tuple[int, ...] = ()):
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         self.spawn_kw = {"fds": tuple(fds)} if fds else {}           # descriptors the engine inherits (split's arena)
+        # Inkling-2-Mini's engine (serve/inkling2mini_kind.py): its own program, 1 to 64 slots, DSpark, the image reader
+        # inside
+        self.inkling2mini_engine = inkling2mini_kind.is_inkling2mini_exe(exe)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -1560,8 +1566,14 @@ class StrataEngine:
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
 
+    def _gen_keys(self, sampling: dict) -> str:
+        """sampling_keys for this engine: the Inkling-2-Mini engine's own set where it is that engine."""
+        if getattr(self, "inkling2mini_engine", False):
+            return self.sampling_keys(sampling, inkling2mini=True)
+        return self.sampling_keys(sampling)
+
     @staticmethod
-    def sampling_keys(sampling: dict) -> str:
+    def sampling_keys(sampling: dict, *, inkling2mini: bool = False) -> str:
         keys = ""
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
@@ -1596,6 +1608,12 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        if inkling2mini:
+            # the Inkling-2-Mini engine takes the keys above and its pictures' files (image=<path>); it refuses the
+            # Flash-Next keys below
+            for path in sampling.get("strata_inkling2mini_images") or []:
+                keys += " image=" + inkling2mini_kind.encode_path(path)
+            return keys
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -2100,7 +2118,7 @@ class StrataEngine:
         # the thinking budget's hold (upstream b92075d92): the reasoning tokens left when this pass starts, and
         # </think>'s id; its key goes on per leg (leg_keys below)
         hold = (sampling or {}).get(HOLD_KEY)
-        keys = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY})
+        keys = self._gen_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY})
         # logprobs: only a request the server let through (max_tokens 1, see the handler) asks for them here; its LP
         # lines go to its own LPLines, made the engine's while it has the control lines (below)
         own_lp = self.own_lp_lines(sampling, cancel, make_current=False)
@@ -2613,8 +2631,8 @@ class StrataEngine:
         # drain after an early stop reads its lines, not the successor's)
         proc0, lines_q = self.proc, self.lines
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        gen_keys = self._gen_keys(sampling or {})
+        head = f"GENI {int(max_new)}{gen_keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{gen_keys}"
         if prefill_only:                                 # split serving (serve/split.py): read the prompt, no token
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
@@ -3603,10 +3621,12 @@ def layer_split_value(cfg: dict) -> str:
     return ",".join(str(x) for x in vals)
 
 
-def engine_args(cfg: dict) -> list[str]:
+def engine_args(cfg: dict, exe: str | None = None) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
-    layer_split_value)."""
+    layer_split_value).  `exe`: the engine program, asked what it can do where the arguments depend on it."""
+    if inkling2mini_kind.is_inkling2mini(cfg):         # the Inkling-2-Mini engine takes its own flags
+        return inkling2mini_kind.engine_args(cfg, exe, announce=exe is not None)
     args = list(cfg["args"])
     # #1322: a config with a "vision" section but without --vision in its args (written by an older setup run, or edited
     # by hand) advertised images and then refused every picture ("this engine was started without --vision").  The
@@ -4001,6 +4021,12 @@ class Service:
         self.vision_error: str | None = None           # why the configured encoder did not start (images off)
         self.vision_fallback: str | None = None        # why a later encoder serves instead of the configured one
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
+        # Inkling-2-Mini's engine (serve/inkling2mini_kind.py): its channel tags stay text inside a message as well,
+        # its end tokens end a reply (below), its channels are read by Inkling2MiniOutputParser, and it never thinks
+        self.inkling2mini = getattr(engine, "inkling2mini_engine", False) is True
+        if self.inkling2mini:
+            self.literals = literal_tags(list(getattr(tokenizer, "control_tokens", ()))
+                                         + inkling2mini_kind.literal_tags(tokenizer))
         # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.fit_max_tokens = fit_max_tokens
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -4109,6 +4135,8 @@ class Service:
         self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = stop_token_ids(tokenizer)
+        if self.inkling2mini:
+            self.stop_ids |= inkling2mini_kind.end_ids(tokenizer)
         if hasattr(engine, "eos_ids"):
             engine.eos_ids = self.stop_ids
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
@@ -4677,6 +4705,8 @@ class Service:
     def effort_default(self) -> str | None:
         """The thinking level of a request that names none: the Chat settings shared with apps first, then the config's
         "reasoning_effort" (#1641).  Every API reads it here (the Responses API did not: 0.1.44.1)."""
+        if self.inkling2mini:                          # Inkling-2-Mini has no thinking levels
+            return None
         return self.shared.get("reasoning_effort") or self.config_effort
 
     def with_shared(self, req: dict, api: str) -> dict:
@@ -4844,7 +4874,8 @@ class Service:
         # the image jobs that ended beside the chat's requests, newest first (the Monitor's Requests table); the
         # conversation cache counts the chat's only
         rows = sorted(hist + (self.images.recent() if self.images is not None else []), key=lambda r: r["time"])
-        engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
+        engine = {"model": self.model, "max_context": self.reported_ctx(),
+                  "images": self.vision is not None or self.engine_reads_images(),
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = (self.telemetry.snapshot() if getattr(self, "telemetry", None)
                else {"now": {}, "history": {}, "static": {}})
@@ -4931,7 +4962,7 @@ class Service:
             return round(v / unit, digits) if isinstance(v, (int, float)) else None
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
-        images = self.vision is not None and not getattr(self.vision, "dead", None)
+        images = (self.vision is not None and not getattr(self.vision, "dead", None)) or self.engine_reads_images()
         vision_error = self.vision_error or (getattr(self.vision, "dead", None) if self.vision is not None else None)
         return {
             "service": "strata", "model": self.model,
@@ -4970,6 +5001,8 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        if self.inkling2mini:   # no thinking levels to place: its template renders the request as it is (ChatTemplate)
+            return self.template.render(messages, tools=tools, **kwargs)
         # thinking unless asked off, as the server counts it (encode_prompt): said to the template, since Unsloth's
         # Qwen3.5-9B template thinks only when enable_thinking is given true (the others think unless it is false)
         kwargs = {"enable_thinking": True, **kwargs}
@@ -5105,8 +5138,13 @@ class Service:
     def forced_ids(self, force, kwargs) -> list[int]:
         """The tokens of a forced call's opening (forced_call) that end the prompt: without thinking the reply starts
         with it (see run); with thinking it is written after the thinking, as part of the reply."""
-        return self.tok.encode(force, parse_special=True) if force and kwargs.get("enable_thinking", True) is False \
-            else []
+        return self.tok.encode(self.force_text(force), parse_special=True) \
+            if force and kwargs.get("enable_thinking", True) is False else []
+
+    def force_text(self, force):
+        """forced_call's opening of the call the reply must make, in this model's spelling (Inkling-2-Mini writes a
+        call in a channel of its own: serve/inkling2mini_dialect.py)."""
+        return inkling2mini_dialect.force_text(force) if self.inkling2mini else force
 
     def prompt_ids(self, messages, tools, kwargs, force=None, cancel=None, store=True, wake=False):
         """The prompt the engine reads for these messages, as prepare() and Anthropic's count_tokens make it -> (the
@@ -5147,6 +5185,17 @@ class Service:
         ids = ids + self.forced_ids(force, kwargs)
         encoded: list = []
         images = images_of(messages)
+        self._drop_inkling2mini_images()               # an earlier pass of this request left its files: gone first
+        if images and self.inkling2mini:
+            # the Inkling-2-Mini engine reads pictures itself (INFO images=1): each goes to it as a file beside the
+            # request (image=<path>, in prompt order), and the engine puts its tokens where the template wrote the mark
+            if (getattr(self.engine, "info", None) or {}).get("images") != 1:
+                raise ValueError(inkling2mini_kind.NO_IMAGES_REPLY)
+            if getattr(self, "offline", False) and any(src.startswith(("http://", "https://")) for src in images):
+                raise ValueError("offline mode cannot download an image URL; send a data: image instead")
+            self.embeddings.inkling2mini = inkling2mini_kind.write_images(
+                images, lambda src: fetched[src] if src in fetched else Vision.load(src), Vision.normalize, cancel)
+            images = []
         if images:
             if self.vision is None:
                 if self.vision_error:
@@ -5205,6 +5254,8 @@ class Service:
         prompt; with thinking, Service.run writes it once the thinking is over."""
         self.embeddings.path = None
         self.embeddings.keys = None
+        if self.inkling2mini:                          # no thinking, so a forced call opens the reply (forced_ids)
+            kwargs = inkling2mini_dialect.template_kwargs(kwargs)
         messages, ids, encoded_ids, encoded = self.prompt_ids(messages, tools, kwargs, force, cancel)
         images = encoded
         ctx = self.engine.max_context
@@ -5346,6 +5397,21 @@ class Service:
         path, self.embeddings.path = getattr(self.embeddings, "path", None), None
         if path is not None:
             Path(path).unlink(missing_ok=True)
+        self._drop_inkling2mini_images()
+
+    def engine_reads_images(self) -> bool:
+        """Whether the engine reads pictures itself, with no encoder beside it (Inkling-2-Mini's, started with its
+        Vision file: INFO images=1)."""
+        return bool(self.inkling2mini and (getattr(self.engine, "info", None) or {}).get("images") == 1)
+
+    def _drop_inkling2mini_images(self) -> None:
+        """Delete the picture files of an Inkling-2-Mini request (the engine has read them by the end of it)."""
+        paths, self.embeddings.inkling2mini = getattr(self.embeddings, "inkling2mini", None), None
+        for path in paths or []:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
@@ -5461,7 +5527,8 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
+        reader = (Inkling2MiniOutputParser if self.inkling2mini
+                  else GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser)
         parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
                   reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
                          recover=self.tool_call_recovery,
@@ -5514,7 +5581,7 @@ class Service:
         opening, written = [], ""                       # without thinking the prompt ends with the forced opening:
         if force and not thinking:                      # the parser reads it as if the model had written it
             written = force                             # (a grammar's prefix: the reply starts with it)
-            opening, force = parser.feed(force), None
+            opening, force = parser.feed(self.force_text(force)), None
         tail = ""                                       # the last characters written (the newlines before a call)
         one_done = False                                # one_call: the reply's one call has been written
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
@@ -5525,6 +5592,9 @@ class Service:
         raw_ids: list = []                              # every generated id (STRATA_DEBUG: dump raw model text)
         admission_rejected = False                      # #3040: the batch slots refused it before it read anything
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
+        own_images = getattr(self.embeddings, "inkling2mini", None)   # Inkling-2-Mini: this request's picture files
+        if own_images:
+            sampling = {**(sampling or {}), "strata_inkling2mini_images": list(own_images)}
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
@@ -8717,6 +8787,7 @@ def make_handler(svc: Service):
                 if bad:
                     raise ValueError(f"allowed_token_ids: {bad[0]} is outside the vocabulary (0..{n_vocab - 1})")
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
+            inkling2mini_kind.refuse(svc.engine, req)          # what the Inkling-2-Mini engine does not do (logprobs)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
             extra: list = []
@@ -10374,7 +10445,8 @@ def _main() -> int:
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         try:
-            effort_end = effort_end_args(cfg, exe, tok)  # #458
+            # #458; the Inkling-2-Mini engine has no thinking levels and takes none of these arguments
+            effort_end = None if inkling2mini_kind.is_inkling2mini(cfg) else effort_end_args(cfg, exe, tok)
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         from serve import replicas as rp
@@ -10394,7 +10466,8 @@ def _main() -> int:
         elif split_serve:
             engine = start_split(cfg, split_serve, exe, effort_end or [], lazy)
         else:
-            engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+            engine = StrataEngine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"),
+                                  log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"), engine.info.get("experts_ram"))

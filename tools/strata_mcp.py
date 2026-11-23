@@ -161,6 +161,9 @@ FALLBACK_FAMILIES = {
     "glm53": {"title": "GLM-5.3-Flash",
               "about": "320B, 18B active; a large MoE for the PCs whose RAM and VRAM hold 95 GB or more",
               "tag": "glm53-"},
+    "inkling-2-mini": {"title": "Inkling-2-Mini",
+                       "about": "26.4B, 3.4B active, a looped MoE on an engine of its own; 10 to 20 GB",
+                       "tag": "inkling-2-mini-"},
 }
 FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "

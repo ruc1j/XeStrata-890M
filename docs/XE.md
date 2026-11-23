@@ -234,7 +234,7 @@ The attention kernel upstream took from Strata-rdna3 (d31256b79) is here as well
 ## Integration through Strata 0.1.65
 
 Strata 0.2.15 to 0.2.19 (engine version 0.1.65, 2026-11-22) is 1,082 commits without the merges (609 up to 0.2.16, 473 after it). Each was looked at, and what touches the engine, serve, setup and the tools went into XeStrata-890M. The lists are `.upstream-0162.md` and `.upstream-0165.md` (the repository root, outside git).
-Most of them are changes for NVIDIA, Windows and several GPUs, the app, Terminal and Control layers, and the engines of the new models Hy4-Flash and Inkling-2-Mini; none of those is in what this section brought in.
+Most of them are changes for NVIDIA, Windows and several GPUs, the app, Terminal and Control layers, and the engine of the new model Hy4-Flash; none of those is in what this section brought in.
 serve's tool call reader takes the argument types from the schema in this fork, so upstream's patches do not apply as they are; the ones that did not were written again in the fork's form.
 
 What went in:
@@ -254,6 +254,7 @@ What went in:
 - serve: the periodic checkpoints of `--prompt-cache-every` sit on a grid from the resumed position (2c8d300ad). A request at temperature 0 gets no model card penalties (d7ce708ba, 3313dbd61). The server keeps glibc to two memory arenas (the server side of aeecf0f5d).
 - serve: the Responses API's answer cut by `max_output_tokens`, Codex's multi-agent v2 items and the client-side `tool_search` (3af02433a, 3cb933d29, 277af44e9, e04cb092f).
 - Engine: a kernel that computes the DFlash2 drafter's attention on RDNA's matrix instructions, opt-in (`STRATA_DF2_ATTN=3`, upstream d31256b79; the numbers are in the DFlash2 section above).
+- A new model: Thinking Machines' Inkling-2-Mini, carried over with upstream's engine for it (`strata-inkling-2-mini`; [DETAILS](DETAILS.md#or-inkling-2-mini-a-model-on-an-engine-of-its-own)). Upstream's CUDA, HIP and Metal backends are not taken; the SYCL backend is changed to run on AMD's 32-lane sub-groups. A model's name is written in full here, so upstream's `ink_` and similar names became `inkling2mini_` (`tools/upstream/inkling2mini_names.sed`).
 - setup: the RAM budget rule (`--resident-budget-gib`) is the RAM less 17 GB (8780e9fdc, c8d70bbcd). A PC whose GPU shares the RAM keeps the rule it had, the RAM less 24 GB, as upstream does, so nothing changes on the 890M.
 - setup and tools: the Coder model's pin (3d54c7137), `--repo` of `mtp_fetch.py` (c9b6956c6), the tool that checks a conversation's continuation after its `--batch` slot was overwritten (6da257d80) and others.
 

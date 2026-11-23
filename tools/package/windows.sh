@@ -128,7 +128,7 @@ cmake -G Ninja -S "$src" -B /build/engine -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_CUDA_PTX= -DSTRATA_ONEMKL=ON -DMKL_ROOT=/build/mkl -DSTRATA_HIP_ARCHS="$hip_archs" -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON -DSTRATA_GGML_DIR="$llama" \
   -DSTRATA_CUDNN_ROOT=/opt/cudnn -DSTRATA_CUDA_WINDOWS_LIBS=/build/cudalib -DSTRATA_ROCM_WINDOWS_LIBS=/build/rocmwin
-cmake --build /build/engine --target strata strata-device strata-image onemath_backend_libs -j "$jobs"
+cmake --build /build/engine --target strata strata-device strata-image strata-inkling-2-mini onemath_backend_libs -j "$jobs"
 # the image encoder on the CPU (tools/vision, llama.cpp's mtmd), with the same toolchain (#24: the config pointed to
 # it and the package had none); the Vulkan one is Linux's only
 cmake -G Ninja -S "$src/tools/vision" -B /build/vision -DCMAKE_BUILD_TYPE=Release \

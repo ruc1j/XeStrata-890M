@@ -33,7 +33,8 @@ from pathlib import Path
 # not use).  ze_loader.dll comes with Intel's driver, nvcuda.dll and nvml.dll with NVIDIA's, amdhip64_7.dll with AMD's.
 SYCL_DLLS = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_adapter_cuda.dll", "ur_adapter_hip.dll",
              "ur_adapter_level_zero.dll", "ur_adapter_level_zero_v2.dll", "xptifw.dll")
-ENGINE_EXES = ("strata.exe", "strata-device.exe", "strata-image.exe", "strata-vision-cpu.exe")
+ENGINE_EXES = ("strata.exe", "strata-device.exe", "strata-image.exe", "strata-inkling-2-mini.exe",
+               "strata-vision-cpu.exe")
 # oneMath and its oneMKL backend (the engine's build folder's bin/), which loads oneMKL where the user installed it
 ONEMATH_DLLS = ("onemath.dll", "onemath_blas_mklgpu.dll", "onemath_blas_cublas.dll", "onemath_blas_rocblas.dll")
 # AMD GPUs' image attention: the engine's module that opens aotriton (on an AMD GPU only), aotriton's library (built
@@ -117,6 +118,8 @@ COMPONENTS = [
      "https://github.com/NVIDIA/cudnn-frontend", ["src:third_party/main/cudnn-frontend/LICENSE.txt"], []),
     ("stb_image (compiled into strata-image.exe)", "2.30", "MIT OR Unlicense", "https://github.com/nothings/stb",
      ["src:third_party/main/stb/LICENSE"], []),
+    ("Zstandard's decoder (compiled into strata-inkling-2-mini.exe)", "1.5.6", "BSD-3-Clause",
+     "https://github.com/facebook/zstd", ["src:third_party/main/zstd-dec/LICENSE"], []),
     ("libjxl's cjxl (statically linked with Highway, Brotli, skcms, libpng, zlib, libjpeg-turbo, giflib, libwebp and "
      "sjpeg)", "jxl", "BSD-3-Clause; the libraries under their own licenses (Apache-2.0, BSD-3-Clause, MIT, zlib, IJG, "
      "libpng)", "https://github.com/libjxl/libjxl", ["jxl:licenses/LICENSE.*"], ["app/engine/cjxl.exe"]),

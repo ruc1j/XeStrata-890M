@@ -1052,6 +1052,43 @@ if(STRATA_ENABLE_XE)
   strata_utf8_manifest(strata-image)
   target_link_libraries(strata-image PRIVATE strata_image)
 
+  # ---- strata-inkling-2-mini: Thinking Machines' Inkling-2-Mini (a looped MoE: 24 layers, 48 visits; `.strata` v1.1 files), on
+  # upstream Strata's engine for it (src/inkling2mini/, upstream's engine/src/inkling2 with the model's name written out:
+  # tools/upstream/inkling2mini_names.sed).  A program of its own beside `strata`, with the same `--serve` protocol: the model
+  # file's reader and the zstd decoder it needs, the scalar codecs of upstream's quant layer (src/quant/), a CPU backend (the
+  # reference) and the SYCL backend.  Upstream's CUDA, HIP and Metal backends are not taken: the SYCL one reaches the GPUs.
+  option(STRATA_BUILD_INKLING2MINI "Build strata-inkling-2-mini, the engine for Inkling-2-Mini" ON)
+  if(STRATA_BUILD_INKLING2MINI)
+    enable_language(C)
+    set(_strata_zstd ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/zstd-dec)
+    add_library(strata_zstd_dec STATIC
+      ${_strata_zstd}/common/debug.c ${_strata_zstd}/common/entropy_common.c ${_strata_zstd}/common/error_private.c
+      ${_strata_zstd}/common/fse_decompress.c ${_strata_zstd}/common/xxhash.c ${_strata_zstd}/common/zstd_common.c
+      ${_strata_zstd}/decompress/huf_decompress.c ${_strata_zstd}/decompress/zstd_ddict.c
+      ${_strata_zstd}/decompress/zstd_decompress.c ${_strata_zstd}/decompress/zstd_decompress_block.c)
+    target_include_directories(strata_zstd_dec PUBLIC ${_strata_zstd} ${_strata_zstd}/common ${_strata_zstd}/decompress)
+    target_compile_definitions(strata_zstd_dec PRIVATE ZSTD_DISABLE_ASM=1)
+    add_library(strata_inkling2mini_core STATIC
+      src/artifact/strata_reader.cpp src/quant/sk_codecs.cpp src/quant/dequant.cpp src/quant/types.cpp
+      src/inkling2mini/inkling2mini_loop.cpp src/inkling2mini/inkling2mini_cpu_backend.cpp)
+    target_include_directories(strata_inkling2mini_core PUBLIC include src src/inkling2mini third_party/main/stb)
+    target_link_libraries(strata_inkling2mini_core PUBLIC strata_zstd_dec Threads::Threads)
+    target_compile_options(strata_inkling2mini_core PRIVATE -mavx2 -mfma -mf16c)
+    add_library(strata_inkling2mini_sycl STATIC src/inkling2mini/sycl/inkling2mini_sycl_backend.cpp)
+    target_include_directories(strata_inkling2mini_sycl PRIVATE src/inkling2mini/sycl)
+    target_link_libraries(strata_inkling2mini_sycl PUBLIC strata_inkling2mini_core strata_sycl)
+    target_compile_options(strata_inkling2mini_sycl PRIVATE -fno-fast-math)
+    target_compile_definitions(strata_inkling2mini_core PUBLIC INKLING2MINI_ENABLE_SYCL=1)
+    add_executable(strata-inkling-2-mini src/inkling2mini/inkling2mini_main.cpp)
+    strata_utf8_manifest(strata-inkling-2-mini)
+    target_compile_definitions(strata-inkling-2-mini PRIVATE INKLING2MINI_VERSION="${STRATA_VERSION_NAME}")
+    target_link_libraries(strata-inkling-2-mini PRIVATE strata_inkling2mini_sycl)
+    if(STRATA_BUILD_TESTS)   # the program links and starts (no model file: a run on one is tools' and the records')
+      add_test(NAME inkling2mini_version COMMAND strata-inkling-2-mini --version)
+      set_tests_properties(inkling2mini_version PROPERTIES PASS_REGULAR_EXPRESSION "strata-inkling-2-mini ")
+    endif()
+  endif()
+
   if(STRATA_BUILD_TESTS)
     add_executable(elementwise_parity src/kernels/elementwise_parity.cpp)
     target_link_libraries(elementwise_parity PRIVATE strata_kernels)

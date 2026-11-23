@@ -1,13 +1,16 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Which tool-call spelling a chat template documents, read from the template's text.
 
-No imports from the rest of the server: tools/qwen4_intake.py and serve/frontend.py share this one function, so the report
-that says "this model writes XML calls" and the parser the server picks cannot disagree.
+No imports from the rest of the server: tools/qwen4_intake.py and serve/frontend.py share this one function, so the
+report that says "this model writes XML calls" and the parser the server picks cannot disagree.
 
-    xml   `<tool_call>` around `<function=NAME>` and `<parameter=NAME>` blocks (Qwen3.6, Qwen3.8-Flash-Next: every template Strata ships)
-    json  `<tool_call>` around a JSON object `{"name": ..., "arguments": {...}}` (Qwen3, Hermes)
-    dsml  DeepSeek-V4's `<｜DSML｜...>` blocks
+    xml  `<tool_call>` around `<function=NAME>` and `<parameter=NAME>` blocks (Qwen3.6, Qwen3.8-Flash-Next: every
+    template Strata ships) json  `<tool_call>` around a JSON object `{"name": ..., "arguments": {...}}` (Qwen3, Hermes)
+    dsml  DeepSeek-V4's `<｜DSML｜...>` blocks inkling2mini  Inkling-2-Mini's channels: tools declared under
+    `tool_declare<|content_xml|>`, a call written as
+          `<|content_invoke_tool_json|>` and a JSON object (serve/inkling2mini_dialect.py turns it into the json form)
     none  the template has no tool section
     other the template documents tools in a form this module does not know
 """
@@ -17,6 +20,7 @@ import re
 
 _DSML = "｜DSML｜"          # the full-width bars DeepSeek's template writes
 _XML_OPEN = re.compile(r"<function=[^>]*>")
+_INKLING2MINI = "<|content_invoke_tool_json|>"   # Thinking Machines' Inkling-2-Mini
 
 
 def tool_format(source: str) -> str:
@@ -25,10 +29,13 @@ def tool_format(source: str) -> str:
         return "none"
     if _DSML in source:
         return "dsml"
+    if _INKLING2MINI in source or "tool_declare<|content_xml|>" in source:
+        return "inkling2mini"
     has_call = "<tool_call>" in source
     if has_call and _XML_OPEN.search(source) and "<parameter=" in source:
         return "xml"
-    if has_call and ("tools" in source) and ('"name"' in source or "'name'" in source or "| tojson" in source or "|tojson" in source):
+    if has_call and ("tools" in source) and ('"name"' in source or "'name'" in source or "| tojson" in source
+                                             or "|tojson" in source):
         return "json"
     if "tools" not in source and not has_call:
         return "none"
@@ -36,8 +43,8 @@ def tool_format(source: str) -> str:
 
 
 def thinking_tags(source: str) -> dict:
-    """The reasoning tags the template mentions: whether it writes `<think>` itself (into the generation prompt) and takes an
-    `enable_thinking` switch."""
+    """The reasoning tags the template mentions: whether it writes `<think>` itself (into the generation prompt) and
+    takes an `enable_thinking` switch."""
     src = source if isinstance(source, str) else ""
     return {"has_think_tags": "<think>" in src and "</think>" in src,
             "enable_thinking_switch": "enable_thinking" in src,

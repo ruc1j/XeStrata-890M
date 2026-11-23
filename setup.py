@@ -75,7 +75,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn
 
-from serve import childenv, places, release_check
+from serve import childenv, inkling2mini_family, inkling2mini_fit, places, release_check
 
 ROOT = Path(__file__).resolve().parent
 WIN = places.WIN
@@ -923,6 +923,22 @@ PLAIN_FAMILIES["glm53"] = {
                       "size": sum(x["size"] for x in _GLM53_IQ4), "about": "4-bit (Unsloth Dynamic), the best quality"},
     }}
 FAMILIES.update(PLAIN_FAMILIES)
+# Inkling-2-Mini (Thinking Machines; upstream Strata's `.strata` files of it): a looped MoE (24 layers, 48 visits) on an
+# engine of its own, strata-inkling-2-mini (src/inkling2mini/), with its DSpark drafter and its image reader inside.
+# setup_inkling2mini sets it up; the sizes, their pins and the rule that recommends one are serve/inkling2mini_family.py
+# and serve/inkling2mini_fit.py.  Listed with the plain families (its own files, no pack), not one of PLAIN_FAMILIES.
+INKLING2MINI = inkling2mini_family.FAMILY
+FAMILIES[INKLING2MINI] = {
+    "title": inkling2mini_family.TITLE, "by": "Thinking Machines, in upstream Strata's .strata builds",
+    "about": "26.4B, 3.4B active, a looped MoE on an engine of its own; 10 to 20 GB",
+    "license": "Thinking Machines Inkling-2-Mini: https://huggingface.co/thinkingmachines/Inkling-2-Mini",
+    "tag": inkling2mini_family.TAG, "name": inkling2mini_family.FAMILY, "max_context": inkling2mini_fit.CONTEXTS[-1],
+    "plain": True, "inkling2mini": True,
+    "models": {b: {"file": inkling2mini_fit.BUILDS[b]["file"],
+                   "size": inkling2mini_family.FILES[inkling2mini_fit.BUILDS[b]["file"]][0],
+                   "sha256": inkling2mini_family.FILES[inkling2mini_fit.BUILDS[b]["file"]][1],
+                   "about": inkling2mini_family.BUILD_ABOUT[b], "tested": b == "SQ-10"}
+               for b in inkling2mini_fit.ORDER[::-1]}}
 
 
 def plain_parts(d: dict) -> list[dict[str, Any]]:
@@ -6776,6 +6792,145 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     return finish_setup(a, cfg, tag, port, adopted, vision != "none", tune=False)
 
 
+INKLING2MINI_EXE = inkling2mini_family.EXE
+
+
+def inkling2mini_fetch(a, name: str, folder: Path) -> Path:
+    """One of Inkling-2-Mini's files in `folder`: kept when it is there and whole, else downloaded from the first
+    source that has it (serve/inkling2mini_family.py: the config's, STRATA_INKLING2MINI_SOURCE, the shipped list),
+    then checked against its pinned size and, where one is pinned, its SHA-256."""
+    dst = folder / name
+    pin = inkling2mini_family.FILES.get(name) or inkling2mini_family.TOKENIZER_FILES.get(name)
+    size, sha = pin if pin else (None, None)
+    whole = dst.exists() and (done(dst) or (size is not None and dst.stat().st_size == size))
+    if not whole:
+        urls = [u for src in inkling2mini_family.sources() for u in inkling2mini_family.urls_for(name, src)]
+        if not urls:
+            fail(f"no download source for {name} is configured",
+                 f"put the file in {folder} (or set {inkling2mini_family.SOURCE_ENV}) and run this again")
+        download(urls[0], dst)
+    if sha and size is not None:
+        verify_sha256(dst, size, sha)
+    elif size is not None and dst.stat().st_size != size:
+        fail(f"{name} is {dst.stat().st_size:,} bytes, not {size:,}", "delete it and run setup again")
+    return dst
+
+
+def setup_inkling2mini(a, fam: dict, gpu: dict, ram: float, roots: list, port: int, adopted: Path | None) -> int:
+    """Steps 2-7 for Inkling-2-Mini: its size (recommended by serve/inkling2mini_fit.py from what the GPU reports: an
+    integrated GPU that shares the RAM, or a card's memory), its context, whether it reads images, the engine
+    (strata-inkling-2-mini, beside `strata`), its files (size and SHA-256 pinned), its tokenizer and chat template
+    written out, and the config.  The engine takes none of Qwen3.8-Flash-Next's options: no pack, no MTP layer (its
+    drafter is in the model file), no expert cache or low-RAM settings (it places the experts itself), and its image
+    reader is inside it (no encoder beside it)."""
+    names = list(fam["models"])
+    if a.model and a.model not in names:
+        fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
+    igpu = shares_ram(gpu)
+    vram = None if igpu else float(gpu.get("vram_gb", 0.0)) / inkling2mini_fit.GIB_TO_GB
+    want_vision = a.vision not in ("no", "none")
+    rec = inkling2mini_fit.recommend(vram, ram, igpu, a.context, want_vision, igpu=igpu)["build"]
+    rows = {r["build"]: r for r in inkling2mini_fit.rows(vram, ram, igpu, a.context, want_vision)}
+    words = {"full_vram": "all of it in the GPU's memory", "ram_vram_zero_ssd": "in the GPU's memory and RAM",
+             "near_resident_ssd": "a little of it read from the SSD", "cross_tier_ssd": "much of it read from the SSD"}
+    for i, m in enumerate(names, 1):
+        r = rows[m]
+        say(f"  {i}) {m:6s} {fam['models'][m]['about']}; download {r['download_gb']:.1f} GB - {words[r['mode']]}"
+            + ("" if fam["models"][m].get("tested") else "   [untested]") + ("   (recommended)" if m == rec else ""))
+    model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)],
+                                     str(names.index(rec) + 1), a.yes)) - 1]
+    if not fam["models"][model].get("tested"):
+        warn(f"{model} has not been run with this release")
+    ok(f"size: {model}")
+    tag = fam["tag"] + model
+    contexts = [c for c in inkling2mini_fit.CONTEXTS if c <= fam["max_context"]]
+    if a.context:
+        if a.context > inkling2mini_fit.MAX_CONTEXT:
+            fail(f"{fam['title']} takes up to {inkling2mini_fit.MAX_CONTEXT} tokens of context",
+                 f"--context {inkling2mini_fit.MAX_CONTEXT}")
+        ctx = a.context
+    else:
+        say()
+        say("  Context length = how much text the model can see at once:")
+        for i, c in enumerate(contexts, 1):
+            say(f"  {i}) {c // 1024}K tokens" + ("   (recommended)" if c == inkling2mini_fit.DEFAULT_CONTEXT else ""))
+        ctx = contexts[int(ask("Context?", [str(i) for i in range(1, len(contexts) + 1)],
+                               str(contexts.index(inkling2mini_fit.DEFAULT_CONTEXT) + 1), a.yes)) - 1]
+    ok(f"context: {ctx} tokens")
+    if a.vision:
+        vision = want_vision
+    else:
+        say()
+        say("  Images: the model can also read pictures; its reader is a 0.6 GB file the engine loads itself.")
+        vision = ask("Do you want images?", ["y", "n"], "y", a.yes) == "y"
+    ok("images: " + ("on (read by the engine)" if vision else "off"))
+    for flag, given in (("--kv", a.kv), ("--low-ram", a.low_ram not in (None, "auto")), ("--gpus", bool(a.gpus)),
+                        ("--resident-budget-gib", a.resident_budget_gib is not None)):
+        if given:
+            warn(f"{flag} does not apply to {fam['title']}: its engine has no such setting")
+    models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / "Inkling-2-Mini"
+    files = inkling2mini_family.files_of(model, vision)
+    left = sum(inkling2mini_family.size_of(n) or 0 for n in files
+               if not (models_dir / n).exists() or (models_dir / n).stat().st_size != inkling2mini_family.size_of(n))
+    if left and free_gb(models_dir) < left / 1e9:
+        fail(f"not enough free disk space in {models_dir}: need ~{left / 1e9:.0f} GB, "
+             f"{free_gb(models_dir):.0f} GB free", "use --models-dir on a bigger drive")
+
+    _, eng, _, lib_dirs = prepare_engine(a, gpu, "none")
+    exe = eng / INKLING2MINI_EXE
+    if not exe.exists():
+        fail(f"this engine has no {INKLING2MINI_EXE} (the program that runs {fam['title']})",
+             "install a XeStrata package that has it, or build it (cmake --build ... --target strata-inkling-2-mini)")
+
+    step(5, f"downloading {fam['title']} {model}")
+    paths = [inkling2mini_fetch(a, n, models_dir) for n in files]
+    ok(f"model file present: {paths[0]}")
+    if vision:
+        ok(f"image reader: {paths[-1]}")
+
+    step(6, "preparing the model for Strata")
+    tok_dir = (find_in(roots, f"tokenizers/{tag.lower()}") or roots[0] / "tokenizers" / tag.lower())
+    if not (tok_dir / "tokenizer" / "vocab.json").exists():
+        sys.path.insert(0, str(ROOT / "tools"))
+        import inkling2mini_tokenizer
+        inkling2mini_tokenizer.convert_files(
+            inkling2mini_fetch(a, inkling2mini_family.TOKENIZER_FILE, models_dir),
+            inkling2mini_fetch(a, inkling2mini_family.CHAT_TEMPLATE_FILE, models_dir), tok_dir / "tokenizer")
+    ok(f"tokenizer: {tok_dir / 'tokenizer'}")
+
+    step(7, "writing the model's settings" if PACKAGED else "writing the start script")
+    args = ["--native", str(paths[0]), "--max-context", str(ctx)]
+    if vision:
+        args += ["--vision", str(paths[-1])]
+    cfg: dict[str, Any] = {"exe": str(exe), "arch": inkling2mini_family.ARCH, "args": args, "cwd": str(STATE),
+                           "tokenizer": str(tok_dir / "tokenizer"), "model_name": inkling2mini_family.model_key(model),
+                           "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
+    if a.parallel is not None and a.parallel >= 2:
+        cfg["parallel"] = min(int(a.parallel), inkling2mini_family.MAX_PARALLEL)
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if a.browser is not None:
+        cfg["open_browser"] = a.browser
+    cfg_path = CONF / f"xestrata-{tag.lower()}.json"
+    CONF.mkdir(parents=True, exist_ok=True)
+    STATE.mkdir(parents=True, exist_ok=True)
+    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
+    script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
+    if script is not None:
+        ok(f"start script: {script.name}")
+    say()
+    say("All set.")
+    say(f"  API (OpenAI):     http://127.0.0.1:{port}/v1   (any API key; model name: anything)")
+    say(f"  API (Anthropic):  http://127.0.0.1:{port}/v1/messages")
+    say(f"  Next time:        just run {SETUP_CMD}" + (f" (or {script.name})" if script else "") +
+        " - it starts right away")
+    if a.no_start:
+        return 0
+    return start(cfg_path, port)
+
+
 def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images: bool, tune: bool = True,
                  notes: list[str] | tuple = ()) -> int:
     """The end of an install: the model's config written, its start script, the warm-up, what to do next, and the
@@ -6934,7 +7089,7 @@ def main() -> int:
              "it), a pull request is welcome")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
-    plain_models = [m for f in PLAIN_FAMILIES.values() for m in f["models"]]
+    plain_models = [m for f in PLAIN_FAMILIES.values() for m in f["models"]] + list(FAMILIES[INKLING2MINI]["models"])
     ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *plain_models])))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
@@ -7462,6 +7617,8 @@ def main() -> int:
     ok(f"model: {fam['title']}")
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
+    if fam.get("inkling2mini"):
+        return setup_inkling2mini(a, fam, gpu, ram, roots, port, adopted)
     if fam.get("plain"):
         return setup_plain(a, family, fam, gpu, chosen, sel, found, gpu_chosen, ram, roots, elsewhere, port, adopted)
     say()

@@ -176,7 +176,7 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 | Markdown | mdl, lychee (`--offline`: links to files in the repository) |
 | CSS / JavaScript / HTML | stylelint, eslint, tidy |
 | all text files | codespell |
-| every file | gitleaks (built-in rules, no configuration of its own) |
+| every file | gitleaks (built-in rules; `.gitleaksignore` lists the findings that are not secrets, each with its reason) |
 | every file | `tools/license_class.py` (the license classes, see Licenses above) |
 | the whole repository | `reuse lint` (see Licenses above) |
 

@@ -21,7 +21,8 @@ SPDX-License-Identifier = "MIT"
 
 # upstream's data files XeStrata has changed or added to (the Japanese draft vocabulary; the fingerprints of the files XeStrata adds)
 [[annotations]]
-path = ["data/draft_vocab_ja.bin", "data/gguf_fingerprints.json", "serve/web/locales/*.json"]
+path = ["data/draft_vocab_ja.bin", "data/gguf_fingerprints.json", "serve/web/locales/*.json",
+        "data/inkling-2-mini-sources.json"]
 SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
 SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
@@ -115,6 +116,11 @@ SPDX-License-Identifier = "Apache-2.0 WITH LLVM-exception"
 path = ["third_party/main/quantscope/**"]
 SPDX-FileCopyrightText = "2026 1872183316 (https://github.com/1872183316/quantscope)"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = ["third_party/main/zstd-dec/**"]
+SPDX-FileCopyrightText = "Meta Platforms, Inc. and affiliates"
+SPDX-License-Identifier = "BSD-3-Clause"
 
 [[annotations]]
 path = ["third_party/main/stb/**"]

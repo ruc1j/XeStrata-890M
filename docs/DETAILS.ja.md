@@ -488,6 +488,27 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--vision` | `--serve` で画像つきの要求を受ける（Qwen3.5-9B と qwen35moe のモデル。setup が画像を選んだとき書きます） |
 | `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N` | 文脈の延長 |
 
+### Inkling-2-Mini（専用のエンジンで動くモデル）
+
+Thinking Machines の [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) は、26.4B（1 トークンで使うのは 3.4B）のループ型の MoE です。24 の層を 48 回通ります。
+Qwen3.8-Flash-Next とは作りが違うので、専用のエンジン `strata-inkling-2-mini` が動かします（upstream Strata のエンジンを移したもの、`src/inkling2mini/`）。
+モデルのファイルは upstream Strata が配っている `.strata` 形式で、SQ-10（10.5 GB）、SQ-15（14.3 GB）、SQ-20（19.3 GB）の 3 つの大きさがあります。
+
+```sh
+xestrata --setup --family inkling-2-mini
+```
+
+- setup は大きさ、文脈の長さ、画像を読むかどうかを尋ね、ファイルを取ってきて大きさと SHA-256 を確かめ、設定を書きます。RAM を共有する統合 GPU には SQ-10 を勧めます。
+- 推測デコードの drafter（DSpark）と画像の読み手は、モデルのファイルとエンジンの中にあります。MTP の層、pack、画像のエンコーダーは使いません。
+- API は Qwen3.8-Flash-Next と同じです。ツール呼び出しは、モデルが専用のチャンネルに書いたものをサーバーが読み替えます。
+- このモデルに思考の深さの設定はありません。モデルが自分で書いた思考は返しませんが、`max_tokens` には数えます。
+- `logprobs` と `logit_bias` は使えません。`--kv`、省 RAM モード、`--gpus` など、Qwen3.8-Flash-Next のエンジンの設定も当てはまりません。
+- 設定の `"parallel": N`（2〜64）で、複数の要求を同時に処理します。
+
+890M の SQ-10 では、512 トークンの prefill が 43.6 tok/s、decode が 12.6 tok/s でした（エンジンの `--bench`）。
+同じ PC で upstream の HIP 版は 448 tok/s と 15.2 tok/s です。prefill の行列積を、XeStrata の SYCL のカーネルがまだ行列命令で計算していないためです。
+CPU の参照実装との差（教師強制の KL）は 0.076 で、upstream の HIP 版の 0.078 と同じ程度です。
+
 ### RAM がモデルより少ないとき（省 RAM モード）
 
 Unsloth の大きさ（huihui-ai の版を含む）以外のモデルは、すべてのエキスパートを RAM に置き、GPU はよく使うもののコピーを持ちます。

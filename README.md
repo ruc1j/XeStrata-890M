@@ -518,6 +518,7 @@ permission under GPL section 7, what goes in, and how to report).
    - the [abliterated versions](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF), by huihui-ai.
    - [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones by pfeifferj), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp,
      [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);
+   - [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by Thinking Machines (the `.strata` files are upstream [Strata](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata)'s; it runs on an engine of its own: [details](docs/DETAILS.md#or-inkling-2-mini-a-model-on-an-engine-of-its-own)).
    - [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth), and the version with its refusals removed, [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive), by HauhauCS;
    - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image, and Qwen3-VL and Qwen3.5-9B as the text encoders ([IMAGE](docs/IMAGE.md#licenses)).
 
