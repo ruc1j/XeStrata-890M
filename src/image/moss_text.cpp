@@ -100,9 +100,15 @@ bool MossText::read_states(const std::string& path, std::vector<float>& rows, in
         err = "cannot open " + path;
         return false;
     }
+    f.seekg(0, std::ios::end);
+    const int64_t file_bytes = (int64_t) f.tellg();
+    f.seekg(0, std::ios::beg);
     int32_t hdr[3] = {};
     f.read(reinterpret_cast<char*>(hdr), sizeof hdr);
-    bool ok = f && hdr[0] == 0x31455453 && hdr[1] > 0 && hdr[2] > 0;
+    // the header's n x width rows are the rest of the file: checked before they size the read (a 12-byte file claiming
+    // 46341 x 46341 rows would otherwise allocate and zero 8.6 GiB first)
+    bool ok = f && hdr[0] == 0x31455453 && hdr[1] > 0 && hdr[2] > 0 &&
+              (int64_t) hdr[1] * hdr[2] * (int64_t) sizeof(float) == file_bytes - (int64_t) sizeof hdr;
     if (ok) {
         n = hdr[1];
         width = hdr[2];
