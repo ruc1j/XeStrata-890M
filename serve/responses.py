@@ -356,6 +356,18 @@ def input_messages(req: dict, keep_image=None) -> list[dict]:
                 messages.append({"role": "user", "content": note})
         elif kind == "additional_tools":
             continue                                 # #782 (Codex): tools added as an input item; see request_tools
+        elif kind == "compaction_trigger":
+            # upstream #6459 (Codex): the remote compaction's trigger item is taken, not answered with a 400, so a long
+            # session compacts instead of ending: its own content or prompt is a user message, a bare marker nothing
+            said = item.get("prompt") or item.get("text")
+            if item.get("content") not in (None, "", []):
+                open_turn = None
+                thinking.clear()
+                messages.append({"role": "user", "content": _content(item.get("content"), param + ".content")})
+            elif isinstance(said, str) and said.strip():
+                open_turn = None
+                thinking.clear()
+                messages.append({"role": "user", "content": said})
         elif kind == "item_reference":
             raise ResponsesError("item references need stored responses, and this server keeps none: send the items "
                                  "themselves", param, "unsupported_parameter")

@@ -114,6 +114,26 @@ class TestInkling2MiniTokenizer(unittest.TestCase):
             with self.assertRaises(inkling2mini_tokenizer.NotInkling2MiniTokenizer):
                 inkling2mini_tokenizer.convert(bad, "{{ messages }}", td)
 
+    def test_serve_makes_a_missing_tokenizer_again_from_the_files_beside_the_model(self):
+        # upstream 231df084a: serve/server.py rebuilds vocab.json instead of stopping with "tokenizer is missing"
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from serve import server
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "models" / "Inkling-2-Mini-SQ-20.gguf"
+            model.parent.mkdir()
+            model.write_bytes(b"")
+            (model.parent / "tokenizer.json").write_text(json.dumps(_minimal_o200k_hf_json()), encoding="utf-8")
+            (model.parent / "chat_template.jinja").write_text("{{ messages }}", encoding="utf-8")
+            cfg = {"arch": "inkling2_loop", "cwd": str(root), "args": ["--native", "models/" + model.name]}
+            tpath = root / "tokenizer"
+            self.assertTrue(server._ensure_inkling2mini_tokenizer(cfg, tpath))
+            self.assertTrue((tpath / "vocab.json").is_file())
+            # a model of another kind is left to the plain stop
+            other = root / "other"
+            self.assertFalse(server._ensure_inkling2mini_tokenizer({"args": ["--native", "qwen.strata"]}, other))
+            self.assertFalse((other / "vocab.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

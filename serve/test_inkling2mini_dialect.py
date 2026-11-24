@@ -146,6 +146,43 @@ class TestInkling2MiniDialect(unittest.TestCase):
         # Original input is not mutated
         self.assertIsInstance(msgs[1]["tool_calls"][0]["function"]["arguments"], str)
 
+    def test_feed_token_reads_only_real_special_tokens_as_tags(self):
+        # upstream #6675: ordinary tokens that spell a channel tag (an answer that quotes the format) stay text;
+        # only the special tokens move the state machine
+        toks = [
+            ("<|message_model|>", True),
+            ("<|content_thinking|>", True),
+            ("Hidden <|end_message|> thinking <|content_text|> still hidden", False),
+            ("<|end_message|>", True),
+            ("<|message_model|>", True),
+            ("<|content_text|>", True),
+            ("Literal tags: <|message_model|>, <|content_thinking|>, <|end_message|>, "
+             "<|content_model_end_sampling|>", False),
+            ("<|end_message|>", True),
+            ("<|content_model_end_sampling|>", True),
+        ]
+        d = inkling2mini_dialect.Inkling2MiniDialect()
+        chunks = []
+        for piece, special in toks:
+            chunks.extend(d.feed_token(piece, is_special=special))
+        chunks.extend(d.feed_channels("", final=True))
+        self.assertEqual("".join(c for k, c in chunks if k == "content"),
+                         "Literal tags: <|message_model|>, <|content_thinking|>, <|end_message|>, "
+                         "<|content_model_end_sampling|>")
+
+    def test_feed_token_tool_call_and_parser(self):
+        payload = json.dumps({"name": "write_file", "args": {"content": "MSG = '<|message_model|>'"}})
+        toks = [("<|message_model|>", True), ("write_file", False), ("<|content_invoke_tool_json|>", True),
+                (payload, False), ("<|end_message|>", True), ("<|content_model_end_sampling|>", True)]
+        p = frontend.Inkling2MiniOutputParser(tools=[{"name": "write_file", "parameters": {"type": "object"}}])
+        evs = []
+        for piece, special in toks:
+            evs += p.feed_token(piece, is_special=special)
+        evs += p.finish("stop")
+        calls = [e.call for e in evs if e.kind == "tool_call" and e.call is not None]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].arguments["content"], "MSG = '<|message_model|>'")
+
     def test_toolformat_detects_the_channel_form(self):
         sample = "<|message_system|>tool_declare<|content_xml|>...<|content_invoke_tool_json|>"
         self.assertEqual(toolformat.tool_format(sample), "inkling2mini")

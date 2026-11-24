@@ -892,14 +892,24 @@ void extra_sources_append(const int32_t* t, size_t n) {
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
     out.clear();
-    std::string text(s);
-    for (char& c : text) if (c == ',') c = ' ';
-    std::istringstream input(text);
-    std::string token;
-    while (input >> token) {
+    if (s == nullptr) { err = "token list was empty"; return false; }
+    // upstream f1f91d97b: scanned in place, with the same delimiters (commas and white space) and the same check as the
+    // istringstream it replaces, so a prompt line of megabytes is not copied on the heap
+    const size_t slen = std::strlen(s);
+    if (slen >= 64) out.reserve(slen / 5);
+    const char* p = s;
+    const char* const end = s + slen;
+    auto is_delim = [](unsigned char c) {
+        return c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+    };
+    while (p < end) {
+        while (p < end && is_delim((unsigned char) *p)) ++p;
+        if (p >= end) break;
+        const char* tok_start = p;
+        while (p < end && !is_delim((unsigned char) *p)) ++p;
         int32_t id = 0;
-        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), id);
-        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() || id < 0) {
+        const auto parsed = std::from_chars(tok_start, p, id);
+        if (parsed.ec != std::errc{} || parsed.ptr != p || id < 0) {
             err = "invalid token id: expected an integer in [0, 2147483647]";
             out.clear();
             return false;
@@ -9686,16 +9696,21 @@ int main(int argc, char** argv) {
             // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
             // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
             // std::exit) would hang in exit() on Linux, and the server would wait for it forever
+            // upstream f1f91d97b: a long prompt line is searched for its newline once, not again from its start at
+            // every chunk (`scanned`: where the search left off), and read in larger chunks
             std::string l, buf;
-            char chunk[4096];
+            size_t scanned = 0;
+            char chunk[65536];
             auto getline_fd = [&](std::string& out) -> bool {
                 for (;;) {
-                    const size_t nlpos = buf.find('\n');
+                    const size_t nlpos = buf.find('\n', scanned);
                     if (nlpos != std::string::npos) {
                         out.assign(buf, 0, nlpos);
                         buf.erase(0, nlpos + 1);
+                        scanned = 0;
                         return true;
                     }
+                    scanned = buf.size();
 #if defined(_WIN32)
                     const int n = _read(0, chunk, (unsigned) sizeof chunk);
 #else
@@ -9706,6 +9721,7 @@ int main(int argc, char** argv) {
                         if (buf.empty()) return false;
                         out.swap(buf);
                         buf.clear();
+                        scanned = 0;
                         return true;
                     }
                     buf.append(chunk, (size_t) n);
@@ -9715,7 +9731,7 @@ int main(int argc, char** argv) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { st->stop_req.store(true); continue; }
                 std::lock_guard<std::mutex> lk(st->mu);
-                st->lines.push_back(l);
+                st->lines.push_back(std::move(l));
                 st->cv.notify_one();
             }
             std::lock_guard<std::mutex> lk(st->mu);
@@ -11086,6 +11102,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
             admit_slot = -1;
+            bool bgen_rewritten = false, bgen_img = false;
+            char* bgen_tail = nullptr;
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;
                 char* e1 = nullptr;
@@ -11099,7 +11117,11 @@ int main(int argc, char** argv) {
                 }
                 admit_slot = (int) b;
                 admit_max_new = mn;
-                line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
+                // upstream f1f91d97b: `line` stays as it is and the GEN parse below starts at its tail `e2`, instead of
+                // a "GEN 1" + tail copy of a prompt of megabytes
+                bgen_rewritten = true;
+                bgen_img = bimg;
+                bgen_tail = e2;
             }
             // #477: every --expert-profile-save-every minutes, before the next request (at QUIT: after the loop)
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
@@ -11387,13 +11409,14 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
-            const bool geni = line.rfind("GENI ", 0) == 0;
-            if (!geni && line.rfind("GEN ", 0) != 0) {
+            const bool geni = bgen_rewritten ? bgen_img : (line.rfind("GENI ", 0) == 0);
+            const bool is_gen = bgen_rewritten || geni || line.rfind("GEN ", 0) == 0;
+            if (!is_gen) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
                 continue;
             }
-            char* endp = nullptr;
-            const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
+            char* endp = bgen_rewritten ? bgen_tail : nullptr;
+            const long long max_new = bgen_rewritten ? 1LL : std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
             // optional sampling keys between max_new and the ids: temperature=F, top_p=F, top_k=N, min_p=F,
             // penalty_last_n=N, penalty_repeat=F, penalty_freq=F, penalty_present=F, seed=N (text requests
             // only).  Absent keys keep today's behavior: greedy, no penalties.

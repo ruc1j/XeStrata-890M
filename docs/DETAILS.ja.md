@@ -945,6 +945,7 @@ server は `http://127.0.0.1:8095` で待ち受けます（setup の `--port`、
 
 `/models` と `/v1/models` は、モデルを文脈の上限と入力の種類とともに示します。
 文脈の上限は `meta.n_ctx` のほか、ほかの API が使う名前（`max_model_len`、`context_length`、`max_context_length`）でも入ります。
+答えの長さの上限は `limit.output` と `meta.llamaswap.max_output_tokens` に入ります（`limit.context` は文脈の上限です）。文脈の上限から engine の余白（8 トークン）を引いた値で、チャットの設定の `max_tokens` がそれより小さければ、その値になります。
 読み込む前と起動中も並び、`status` が `loading`（遊休で下ろしたときは `unloaded`）になります。
 OpenAI の `created`（server の起動時刻）と `owned_by`（`xestrata`）も付きます。
 `GET /v1/models/{id}`（`GET /models/{id}` でも同じです）は 1 つのモデルを返し、知らない id には 404（`model_not_found`）を返します。

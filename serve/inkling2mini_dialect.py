@@ -34,6 +34,9 @@ END_MSG = "<|end_message|>"
 END_SAMPLING = "<|content_model_end_sampling|>"
 ENDOFTEXT = "<|endoftext|>"
 
+# every structural tag: a real one is a special token of its own (feed_token)
+ALL_CHANNEL_TAGS = frozenset((MSG_MODEL, CONTENT_THINK, CONTENT_TEXT, CONTENT_TOOL_JSON, CONTENT_TOOL_TEXT, CONTENT_XML,
+                              END_MSG, END_SAMPLING, ENDOFTEXT))
 _HEADER_TAGS = (CONTENT_THINK, CONTENT_TEXT, CONTENT_TOOL_JSON, CONTENT_TOOL_TEXT, CONTENT_XML, END_MSG, END_SAMPLING,
                 ENDOFTEXT, MSG_MODEL)
 _IDLE_TAGS = (MSG_MODEL, CONTENT_THINK, CONTENT_TEXT, CONTENT_TOOL_JSON, CONTENT_TOOL_TEXT, CONTENT_XML, END_MSG,
@@ -170,6 +173,24 @@ class Inkling2MiniDialect:
             self._handle_tag_typed(tag, out)
         if final:
             self._finish_typed(out)
+        return out
+
+    def feed_token(self, piece: str, *, is_special: bool) -> list[tuple[str, str]]:
+        """upstream #6675: the token-aware entry.  An ordinary token's text (`is_special` False) is literal text in the
+        current channel, even when it spells `<|end_message|>` or `<|message_model|>` (an answer that quotes the
+        format); only a real special channel token moves the state machine.  -> what feed_channels returns."""
+        out: list[tuple[str, str]] = []
+        if not piece:
+            return out
+        if self.buf:                        # text fed as a string before (a forced call's opening): read as it was
+            out += self.feed_channels("")
+            if self.buf:
+                pending, self.buf = self.buf, ""
+                self._emit_typed(pending, out)
+        if is_special and piece in ALL_CHANNEL_TAGS:
+            self._handle_tag_typed(piece, out)
+        else:
+            self._emit_typed(piece, out)
         return out
 
     def feed(self, text: str = "", final: bool = False) -> str:

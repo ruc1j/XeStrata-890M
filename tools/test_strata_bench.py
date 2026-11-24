@@ -280,6 +280,31 @@ class ReportTests(unittest.TestCase):
             self.assertIn("chat decode tok/s", table)
             self.assertIn("+100.0%", table)
             self.assertIn("engine: 1.0 -> 9.9.9", table)
+            self.assertNotIn("agent corpus", table)                 # the same corpus: nothing to say
+
+    def test_the_agent_corpus_is_recorded_and_compared(self):
+        """upstream #6628: the agent session's corpus kind and digest go into the results, and --compare says when
+        two runs read different ones."""
+        docs = [("README.md", "a b c"), ("docs/DETAILS.md", "d e f")]
+        filler = [("generated/part0.txt", "x y z")]
+        self.assertEqual(B.agent_corpus_info(docs)["corpus"], "repo_docs")
+        self.assertEqual(B.agent_corpus_info(filler)["corpus"], "generated")
+        self.assertEqual(B.agent_corpus_info(docs + filler)["corpus"], "mixed")
+        self.assertEqual(B.agent_corpus_info(docs)["corpus_sha256"], B.agent_corpus_info(list(docs))["corpus_sha256"])
+        srv = FakeStrata()
+        self.addCleanup(srv.stop)
+        with tempfile.TemporaryDirectory() as d:
+            self.run_main(srv, d)
+            old = next(Path(d).iterdir())
+            data = json.loads((old / "results.json").read_text(encoding="utf-8"))
+            self.assertIn(data["results"]["agent"]["corpus"], ("repo_docs", "generated", "mixed"))
+            data["results"]["agent"].update(B.agent_corpus_info(filler))
+            (old / "results.json").write_text(json.dumps(data), encoding="utf-8")
+            self.run_main(srv, d)
+            new = max(Path(d).iterdir(), key=lambda p: p.name)
+            table = B.compare_table(B.load_results(old), B.load_results(new))
+            self.assertIn("agent corpus: generated (", table)
+            self.assertIn("(agent rows are not directly comparable)", table)
 
     def test_only_the_gpus_the_engine_uses_are_listed(self):
         """#1985: a PC with two cards, the engine on one: the report names that one, with its VRAM."""

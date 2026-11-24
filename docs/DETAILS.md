@@ -1037,6 +1037,7 @@ To switch between it and other model servers behind one address, see [LLAMA_SWAP
 
 `/models` and `/v1/models` list the model with its context limit and input modalities.
 The context limit is in `meta.n_ctx` and under the names other APIs use too (`max_model_len`, `context_length`, `max_context_length`).
+The answer cap is in `limit.output` and `meta.llamaswap.max_output_tokens` (`limit.context` is the context limit): the context limit less the engine's margin (8 tokens), or the Chat settings' `max_tokens` when that is smaller.
 It is listed before it is loaded and while it starts too, with `status` `loading` (`unloaded` when it was unloaded for idleness).
 OpenAI's `created` (the server's start time) and `owned_by` (`xestrata`) are included.
 `GET /v1/models/{id}` (and `GET /models/{id}`) returns one model; an unknown id is a 404 (`model_not_found`).

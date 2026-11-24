@@ -1095,6 +1095,7 @@ class StrataEngine:
         self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
         self.silent_note = None
         self.last_err = None
+        self._last_exit_code = None
         try:                            # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
@@ -1342,6 +1343,9 @@ class StrataEngine:
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
+            rc = proc.poll() if hasattr(proc, "poll") else getattr(proc, "returncode", None)
+            if rc is not None:
+                self._last_exit_code = rc
             if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
                 self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
         lines.put(None)
@@ -1374,8 +1378,7 @@ class StrataEngine:
             return ("The graphics card reported a fatal error (" + err[len("fatal GPU error:"):].strip()[:160]
                     + "), so the engine ended. The next request starts it again. If this repeats, please report it at "
                     "github.com/ruc1j/XeStrata-890M/issues with the log.")
-        proc = self.proc                                 # None while a restart has not started the next one yet
-        rc = proc.poll() if proc is not None else None
+        rc = self.exit_code()                   # the status kept while a restart has not started the next one yet
         if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
             return (f"The engine exited (code {rc}) after it reported: {self.last_err} - please report it at "
                     "github.com/MistVVK/XeStrata/issues with the log.")
@@ -1401,13 +1404,54 @@ class StrataEngine:
         proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
         return proc is not None and not getattr(self, "ended", False) and proc.poll() is None
 
-    def exit_code(self):
-        if self.proc is None:
-            return None
+    def exit_code(self, proc=None, timeout: float = 0.25):
+        """The engine's exit status, waiting briefly when poll() is still None right as its pipes close; the last one
+        seen once the process is gone (a restart that has not started the next one yet)."""
+        p = self.proc if proc is None else proc
+        if p is None:
+            return getattr(self, "_last_exit_code", None)
+        rc = p.poll() if hasattr(p, "poll") else getattr(p, "returncode", None)
+        if rc is None and hasattr(p, "wait"):
+            try:
+                rc = p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                rc = p.poll() if hasattr(p, "poll") else None
+        if rc is not None:
+            self._last_exit_code = rc
+            return rc
+        return getattr(self, "_last_exit_code", None)
+
+    def _crash_tail(self, max_lines: int = 3) -> str:
+        """Why it ended, in its own words: its last ERR on stdout, else the last lines of its log since this start."""
+        if getattr(self, "last_err", None):
+            return str(self.last_err).strip()[:280]
+        log_path = getattr(self, "log_path", None)
+        if not log_path:
+            return ""
         try:
-            return self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            return None
+            with open(log_path, "rb") as f:
+                f.seek(0, 2)
+                start = max(getattr(self, "log_start", 0) or 0, f.tell() - 8192)
+                f.seek(start)
+                text = f.read().decode("utf-8", "replace")
+        except (OSError, TypeError, ValueError):
+            return ""
+        raw = [x.strip() for x in text.splitlines() if x.strip()]
+        if not raw:
+            return ""
+        own = [x for x in raw if not x.startswith("[strata]")]
+        return " | ".join((own or raw)[-max_lines:])[:280]
+
+    def _engine_died(self, proc=None) -> EngineDied:
+        """EngineDied with the reaped exit status (never "no exit status yet" while the OS still reaps it) and the end
+        of what the engine said about it."""
+        try:
+            rc = self.exit_code(proc=proc) if proc is not None else self.exit_code()
+        except TypeError:                               # an exit_code() that takes no process (a test's stand-in)
+            rc = self.exit_code()
+        status = engine_exit_words(rc) if rc is not None else "process exited; status unavailable"
+        tail = self._crash_tail()
+        return EngineDied(f"the engine stopped unexpectedly ({status})" + (f": {tail}" if tail else ""))
 
     def unload(self):
         """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
@@ -1680,7 +1724,7 @@ class StrataEngine:
             # #6055: or close() closed stdin - a write then raises ValueError, which reached the client as a 400
             if getattr(self, "closing", False):
                 raise EngineClosing("this instance is draining; retry against the next instance") from None
-            raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
+            raise self._engine_died() from None
 
     def _send_for(self, born: int, text: str):
         """#4451: a line meant for the engine process `born`.  After a restart the same slot number belongs to another
@@ -1696,10 +1740,15 @@ class StrataEngine:
         confirms, so what it still prints can not reach a later request.  The engine silent for QUARANTINE_S more: it
         is ended.  (Only after a STOP or BSTOP, and only for silence: a generation that is still producing lines is
         never cut off.)"""
+        busy = releasing = claims = None
         if slot is not None:
-            with self.slot_cv:
-                self.slot_releasing.add(slot)           # busy stays: no request may take the slot
-                self.slot_claims.discard(slot)
+            busy, releasing, claims = self.slot_busy, self.slot_releasing, self.slot_claims
+            if self.gen != born or slot >= len(busy):   # #5657: restart() moves gen before its objects
+                slot = None
+            else:
+                with self.slot_cv:
+                    releasing.add(slot)                 # busy stays: no request may take the slot
+                    claims.discard(slot)
 
         def run():
             try:
@@ -1713,8 +1762,8 @@ class StrataEngine:
                         self._release_slot_when_done(slot, None, born)
                     else:
                         with self.slot_cv:
-                            self.slot_busy[slot] = False
-                            self.slot_releasing.discard(slot)
+                            busy[slot] = False
+                            releasing.discard(slot)
                             self.slot_cv.notify_all()
             finally:
                 if holding:
@@ -1753,7 +1802,7 @@ class StrataEngine:
                 continue
             beat = time.monotonic()
             if line is None:
-                raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})")
+                raise self._engine_died()
             if not line.startswith(("PP ", "INFO")):
                 btrace("ctl<", self._ctl_mode, line.strip()[:60])
             if line.startswith("T "):
@@ -2386,7 +2435,7 @@ class StrataEngine:
                         continue
                     if line is None:
                         phase = "none"
-                        raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})")
+                        raise self._engine_died()
                     if line.startswith("BT "):
                         t = int(line.split()[2])
                         out.append(t)
@@ -2434,9 +2483,6 @@ class StrataEngine:
         finally:
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
-            # #4451: the slot state below is this engine's; after a restart it is the NEW engine's lists and flags,
-            # which belong to other requests
-            same = self.gen == born
             undrained = None                            # the line this exchange still owes, from an engine that runs
             try:
                 if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
@@ -2444,7 +2490,7 @@ class StrataEngine:
                 if phase in ("solo", "admit") and self._ctl_erred:
                     phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
                 if phase == "solo":
-                    self._send("STOP")
+                    self._send_for(born, "STOP")
                     if (self._drain_control("DONE", born=born, lines_q=lines_q) is None and self.gen == born
                             and self.alive()):
                         undrained = "DONE"
@@ -2465,7 +2511,7 @@ class StrataEngine:
                 self._quarantine_control(undrained, born, lines_q, slot if undrained == "BADM" else None, holding)
                 holding, handed = False, True
             bdone_in = False
-            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and same:
+            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
                 bd = self._bdone_after_eos(slot, q=sq[slot])    # (#1869) the slot's figures, not the admission's
                 if bd is not None:
                     self._apply_bdone(bd.split())
@@ -2487,29 +2533,36 @@ class StrataEngine:
             if admit_wait:
                 with self.slot_cv:
                     self.admitting = max(0, self.admitting - 1)
-            if reserved is not None and same:
+            # #4451 / #5657: the slot tables are this engine's; a restart moves self.gen before it replaces them with
+            # the new engine's (whose slots belong to other requests).  So they are taken here, after the drains and
+            # waits above, and only then is self.gen checked
+            busy, claims, held, used, live_slots = (
+                self.slot_busy, self.slot_claims, self.slot_held, self.slot_used, self.slot_live,
+            )
+            same = self.gen == born
+            if reserved is not None and same and reserved < len(busy):
                 with self.slot_cv:
-                    self.slot_busy[reserved] = False
-                    self.slot_claims.discard(reserved)
+                    busy[reserved] = False
+                    claims.discard(reserved)
                     self.slot_cv.notify_all()
-            if slot is not None and same and not handed:
-                self.slot_live[slot] = None
-                self.slot_used[slot] = time.time()
+            if slot is not None and same and not handed and slot < len(busy):
+                live_slots[slot] = None
+                used[slot] = time.time()
                 if phase == "slot" and bdone_in:
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
+                    held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
                     with self.slot_cv:
-                        self.slot_busy[slot] = False
-                        self.slot_claims.discard(slot)
+                        busy[slot] = False
+                        claims.discard(slot)
                         self.slot_cv.notify_all()
                 elif phase == "slot":
-                    self.slot_held[slot] = []
+                    held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self._release_slot_when_done(slot, stream, born)    # freed at its BDONE
                 else:
                     with self.slot_cv:
-                        self.slot_busy[slot] = False
-                        self.slot_claims.discard(slot)
+                        busy[slot] = False
+                        claims.discard(slot)
                         self.slot_cv.notify_all()
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
@@ -2644,7 +2697,7 @@ class StrataEngine:
         except (OSError, ValueError, EngineDied):        # the pipe is gone (closed: ValueError): the engine died
             if getattr(self, "closing", False):         # #6055: or close() closed it (a write then raises ValueError)
                 raise EngineClosing("this instance is draining; retry against the next instance") from None
-            raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
+            raise self._engine_died(proc0) from None
         done = False
         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
         # chunk at the slowest prompt reading on top of silence_s; a PP line resets it to its own chunk's time.
@@ -2682,7 +2735,7 @@ class StrataEngine:
                     continue
                 if line is None:
                     done = True
-                    raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})")
+                    raise self._engine_died(proc0)
                 heard = time.monotonic()                  # any line is output: T, PP, RESUME, INFO ...
                 beat = heard
                 if stall_state:
@@ -2853,7 +2906,7 @@ class StrataEngine:
             proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
             proc.stdin.flush()
         except (OSError, ValueError):
-            raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})") from None
+            raise self._engine_died() from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
         want = "SAVED" if action == "save" else "RESTORED"
@@ -2887,7 +2940,7 @@ class StrataEngine:
                                    + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")
                                    ) from None
             if line is None:
-                raise EngineDied(f"the engine stopped unexpectedly ({exit_text(self.exit_code())})")
+                raise self._engine_died()
             f = line.split()
             head = f[0] if f else ""
             if head == "SESSION":                          # a large file moving: progress, and a heartbeat
@@ -2965,6 +3018,7 @@ class StrataEngine:
             pass
         finally:
             if self.proc.poll() is not None:
+                self._last_exit_code = self.proc.returncode
                 if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
                     self.pump.join(timeout=2)
                 try:
@@ -3045,7 +3099,7 @@ def vision_log_tail(log=None, limit: int = 16384) -> str:
     is none or it cannot be read)."""
     try:
         name = getattr(log, "name", None)
-        if name:
+        if isinstance(name, (str, bytes, os.PathLike)) and name:  # #6467: open(int) would wrap and close the log fd
             with open(name, "rb") as f:
                 f.seek(0, 2)
                 f.seek(max(0, f.tell() - limit))
@@ -3125,6 +3179,8 @@ class Vision:
     Every wait on it is bounded.  An encoder that stops or stops answering is marked dead: later image requests
     fail with the reason and text requests are unaffected."""
 
+    cache_batches = 0   # requests inside batch(): their encoded files stay until they have copied them
+
     @staticmethod
     def work_dir() -> Path:
         """#480: the directory for the encoder's files.  The engine reads the embeddings file named in a `GENI` line
@@ -3148,6 +3204,7 @@ class Vision:
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
         args = self.reader_args(cfg)
         self.label = vision_label(cfg)
+        self.cpu_only = not cfg.get("gpu")              # a CPU reader: its start asks the expert cache for nothing
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload (#208)
         self.proc: subprocess.Popen | None = None
@@ -3410,13 +3467,15 @@ class Vision:
             return False
 
     @staticmethod
-    def normalize(data: bytes, keep_alpha: bool = False) -> bytes:
+    def normalize(data: bytes, keep_alpha: bool = False, *, force: bool = False) -> bytes:
         """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG.
         A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow).  `keep_alpha` (an image
-        edit's reference: the image model reads the alpha): a transparent image stays RGBA, else it goes on white."""
+        edit's reference: the image model reads the alpha): a transparent image stays RGBA, else it goes on white.
+        `force` (upstream 91fb63284): converted to PNG whatever the format, for a file the reader's decoder refused
+        (a JPEG or PNG variant stb_image does not read)."""
         jpeg = data[:3] == b"\xff\xd8\xff"
-        if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
-                data[:6] in (b"GIF87a", b"GIF89a"):
+        if not force and ((jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n"
+                          or data[:2] == b"BM" or data[:6] in (b"GIF87a", b"GIF89a")):
             return data
         try:
             import io
@@ -3443,6 +3502,29 @@ class Vision:
         out = io.BytesIO()
         im.save(out, format="PNG")
         return out.getvalue()
+
+    def _trim_cache(self):
+        """The caller holds self.lock: at most 64 images are kept once no batch needs their files any more."""
+        while len(self.cache) > 64:
+            old = next(iter(self.cache))
+            self.cache.pop(old)[0].unlink(missing_ok=True)
+
+    @contextlib.contextmanager
+    def batch(self):
+        """upstream 91fb63284 (#1072): the files encoded inside it are not evicted until it ends, so a request's
+        pictures stay from their encoding until prepare() has copied them into the request's combined file (another
+        request's encode in between could evict them, the FIFO's turn being given up after the encode).  Nested and
+        concurrent batches count; the last one to end trims the cache back to 64.  The lock is held only to count, so
+        this takes no lock order with the service's FIFO."""
+        with self.lock:
+            self.cache_batches += 1
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.cache_batches -= 1
+                if not self.cache_batches:
+                    self._trim_cache()
 
     def encode_all(self, sources: list, cancel=None) -> list[tuple[Path, int]]:
         """encode() for every image of one request: the files of this request's earlier images are never evicted to
@@ -3485,6 +3567,14 @@ class Vision:
                 self.proc.stdin.write(f"ENC {img.name} {out.name}\n")      # relative to the encoder's cwd (#480)
                 self.proc.stdin.flush()
                 line = self._line(VISION_ENCODE_S)
+                if line and line.startswith("ERR cannot read the image"):
+                    # upstream 91fb63284: a picture the reader's decoder refused is sent once more as a PNG
+                    converted = self.normalize(data, force=True)
+                    if converted != data:
+                        img.write_bytes(converted)
+                        self.proc.stdin.write(f"ENC {img.name} {out.name}\n")
+                        self.proc.stdin.flush()
+                        line = self._line(VISION_ENCODE_S)
             except OSError:                         # its stdin is closed: it exited
                 line = None
             finally:                                # #352: also when the encoder's pipe is gone
@@ -3498,12 +3588,13 @@ class Vision:
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else line))
             self.cache[key] = (out, int(line.split()[1]))
             self.warn_if_over_limit(self.cache[key][1])
-            held = {str(p) for p in keep} | {str(out)}
-            for old in list(self.cache):                               # oldest first, but never one still in use
-                if len(self.cache) <= 64:
-                    break
-                if str(self.cache[old][0]) not in held:
-                    self.cache.pop(old)[0].unlink(missing_ok=True)
+            if not self.cache_batches:                                 # a batch's files stay until it ends
+                held = {str(p) for p in keep} | {str(out)}
+                for old in list(self.cache):                           # oldest first, but never one still in use
+                    if len(self.cache) <= 64:
+                        break
+                    if str(self.cache[old][0]) not in held:
+                        self.cache.pop(old)[0].unlink(missing_ok=True)
             return self.cache[key]
 
     def warn_if_over_limit(self, tokens: int) -> None:
@@ -4260,6 +4351,18 @@ class Service:
         prompt from it would send nothing, #351).  Reporting only: requests are checked in prepare()."""
         return int(getattr(self.engine, "max_context", 0) or getattr(self.engine, "known_ctx", 0) or 0)
 
+    def output_cap(self) -> int:
+        """upstream #6402: the most tokens one answer may run to, for a client that sizes a request from /v1/models.
+        That is the room the context itself leaves (ctx - CTX_SLACK, the margin prepare() enforces) - a request with
+        no max_tokens gets exactly that - lowered by the web app's Chat setting for max_tokens when that is smaller
+        (the server sends it for every request that carries none).  No prompt is counted here: a prompt shortens the
+        room at request time, and fit_max_tokens shortens a request to what is left."""
+        room = max(0, self.reported_ctx() - CTX_SLACK)
+        shared = self.shared.get("max_tokens")
+        if isinstance(shared, int) and not isinstance(shared, bool) and shared > 0:
+            room = min(room, shared)
+        return room
+
     tokenizer_dir: str | None = None     # the model's tokenizer folder (main): the engine's grammars read it
 
     def attach_grammar(self, req: dict, grammar) -> bool:
@@ -4335,9 +4438,18 @@ class Service:
         """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
         cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load
         and warm-up, a few seconds).  If the cache cannot shrink (an engine without --vram-elastic, the resident low-RAM
-        mode) the encoder starts anyway, as a non-elastic one would."""
+        mode) the encoder starts anyway, as a non-elastic one would.  A CPU reader (no "gpu" in the vision section)
+        uses no VRAM: it just starts, and the cache is not asked."""
         v = self.vision
         if not getattr(v, "elastic", False) or v.alive():
+            return
+        if getattr(v, "cpu_only", False):               # a CPU reader needs no VRAM, so the cache is not asked
+            t0 = time.time()
+            try:
+                v.restart()
+            except Exception as e:
+                raise EngineDied(f"the image encoder failed to start: {e}") from e
+            print(f"[strata] images: the image encoder started in {time.time() - t0:.1f} s, on the CPU", flush=True)
             return
         if hasattr(self.engine, "vram") and self.loaded():
             try:
@@ -4442,6 +4554,55 @@ class Service:
                              "driver, the card's temperature and power, and the log; a request after "
                              f"{minutes} minutes tries again")
 
+    CRASH_LOOP_MAX = 3           # engine deaths (of any kind) within CRASH_LOOP_WINDOW_S: then no start for a while
+    CRASH_LOOP_WINDOW_S = 600.0
+
+    def _engine_last_words(self) -> str:
+        """The last error line the engine left: its own ERR line, else the end of its log since this start; "" when
+        there is none."""
+        eng = self.engine
+        why = str(getattr(eng, "last_err", None) or "").strip()
+        if not why and hasattr(eng, "_crash_tail"):
+            try:
+                why = str(eng._crash_tail() or "").strip()
+            except Exception:           # noqa: BLE001 - a message about a crash never fails on reading the log
+                why = ""
+        lines = [x.strip() for x in why.splitlines() if x.strip()]
+        return lines[-1][:300] if lines else ""
+
+    def _crash_loop_text(self, count: int, why: str) -> str:
+        log = getattr(self.engine, "log_path", None)
+        window = f"{self.CRASH_LOOP_WINDOW_S / 60:g} minutes"
+        text = (f"The engine stopped {count} times in {window}, so it is not started again for now (restarting does "
+                f"not help when the same fault repeats). The last thing it said: {why or 'nothing (see the log)'}. ")
+        if log:
+            text += f"Its log: {log}. "
+        return text + f"A request after {window} tries again; restarting the server does too."
+
+    def _note_crash_loop(self, code) -> None:
+        """upstream #6896 #6830 #6849: an engine that dies at its start or on its first request was started again by
+        every request that found it dead, for ever (375 starts in five hours, nothing said).  Three deaths within ten
+        minutes mean another start will not help: then the server stops starting it and answers 503 with the engine's
+        last error line and its log.  One death counts once however many requests find it dead; after the window it
+        tries again.  A start with no process (the program is missing or cannot be run) is not counted: it fails at
+        once with its own plain reason.  (A fatal GPU error has its own counter above, with its own words.)"""
+        pid = getattr(getattr(self.engine, "proc", None), "pid", None)
+        seen = self.__dict__.setdefault("_crash_pids", set())
+        times = self.__dict__.setdefault("_crash_times", [])
+        now = time.time()
+        times[:] = [t for t in times if now - t < self.CRASH_LOOP_WINDOW_S]
+        if pid is None:
+            return
+        if pid not in seen:
+            seen.add(pid)
+            times.append(now)
+        if len(times) >= self.CRASH_LOOP_MAX:
+            why = self._engine_last_words()
+            print(f"[strata] the engine stopped {len(times)} times in {self.CRASH_LOOP_WINDOW_S / 60:g} minutes "
+                  f"({exit_text(code)}); not starting it again for now. The last thing it said: {why or 'nothing'}",
+                  flush=True)
+            raise EngineDied(self._crash_loop_text(len(times), why))
+
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
@@ -4513,7 +4674,13 @@ class Service:
             print("[strata] loading the model again (it was unloaded) ...", flush=True)
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-            self._note_fatal_gpu_exit(code)
+            try:
+                self._note_fatal_gpu_exit(code)
+                self._note_crash_loop(code)
+            except EngineDied:                          # refused for a while: the encoder started above goes too
+                if vision_started:
+                    self.vision.unload()
+                raise
             print(f"[strata] the engine had stopped ({exit_text(code)}); starting it again "
                   "(a minute or two) ...", flush=True)
         try:
@@ -5254,6 +5421,14 @@ class Service:
         prompt; with thinking, Service.run writes it once the thinking is over."""
         self.embeddings.path = None
         self.embeddings.keys = None
+        # upstream 91fb63284: the request's pictures stay in the encoder's cache from their encoding until they are
+        # copied into the request's combined file (Vision.batch)
+        batch = getattr(self.vision, "batch", None)
+        with batch() if batch is not None else contextlib.nullcontext():
+            return self._prepare(messages, tools, kwargs, max_new, force, req, cancel)
+
+    def _prepare(self, messages, tools, kwargs, max_new, force, req, cancel):
+        """prepare() inside the encoder's batch."""
         if self.inkling2mini:                          # no thinking, so a forced call opens the reply (forced_ids)
             kwargs = inkling2mini_dialect.template_kwargs(kwargs)
         messages, ids, encoded_ids, encoded = self.prompt_ids(messages, tools, kwargs, force, cancel)
@@ -5535,6 +5710,11 @@ class Service:
                          declared_only=declared_only,
                          # #4622: opt-in, as for a deferred tool
                          deferred=deferred or self.undeclared_tool_calls == "call"))
+        # upstream #6675: Inkling-2-Mini's channel tags move its reader only as the special tokens they are; the same
+        # text spelt by ordinary tokens (an answer that quotes the format) stays text
+        specials = getattr(self.tok, "special_tokens", None) if self.inkling2mini else None
+        channel_ids = ({specials[x] for x in inkling2mini_dialect.ALL_CHANNEL_TAGS if x in specials}
+                       if isinstance(specials, dict) and hasattr(parser, "feed_token") else None)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         # the loop guard (serve/loop_guard.py): every id goes through it before the parser; it holds back a short
@@ -5750,7 +5930,11 @@ class Service:
                                     break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
-                                evs = cut(parser.feed(piece))
+                                if channel_ids:         # an Inkling-2-Mini reader, which has feed_token
+                                    evs = cut(parser.feed_token(  # type: ignore[union-attr]
+                                        piece, is_special=t in channel_ids))
+                                else:
+                                    evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
@@ -8120,8 +8304,14 @@ def make_handler(svc: Service):
             # the context size under the names other APIs use too (vLLM's max_model_len, OpenRouter's context_length,
             # KoboldCpp's max_context_length), so a client that sizes its window from /v1/models reads it (#1882, #6116)
             ctx = svc.reported_ctx()
+            # upstream #6402: the answer cap under the names clients already look for: OpenAI-shaped tools read
+            # `limit.output` (with `limit.context` beside it), llama-swap's readers meta.llamaswap.max_output_tokens.
+            # Without them a client guesses (1,024, 32k, or its own default)
+            cap = svc.output_cap()
             model = {"id": svc.model, **common, "status": {"value": status},
-                     "max_model_len": ctx, "context_length": ctx, "max_context_length": ctx, "meta": {"n_ctx": ctx},
+                     "max_model_len": ctx, "context_length": ctx, "max_context_length": ctx,
+                     "limit": {"context": ctx, "output": cap},
+                     "meta": {"n_ctx": ctx, "llamaswap": {"max_output_tokens": cap}},
                      "architecture": {"input_modalities": (["text", "image"] if svc.vision is not None else ["text"]),
                                       "output_modalities": ["text"]}}
             if svc.aliases:
@@ -10285,6 +10475,52 @@ def main() -> int:
         return _main()
 
 
+def _ensure_inkling2mini_tokenizer(cfg: dict, tpath: Path) -> bool:
+    """upstream 231df084a: an Inkling-2-Mini model whose tokenizer folder lacks vocab.json (a folder cleared or moved,
+    a hand-made config) has it made again here, from what is on this machine (no network): the `.strata` file's own
+    Section 0 (its chat template and tokenizer), else a tokenizer.json + chat_template.jinja pair beside the model or
+    the folder.  True when vocab.json is there afterwards."""
+    if (tpath / "vocab.json").exists():
+        return True
+    given = cfg.get("args") if isinstance(cfg, dict) else None
+    args: list = given if isinstance(given, list) else []
+    model_raw = next((str(args[i + 1]) for i, x in enumerate(args)
+                      if x in ("--native", "--model") and i + 1 < len(args)), None)
+    if not inkling2mini_kind.is_inkling2mini(cfg) and not (model_raw and "inkling" in model_raw.lower()):
+        return False
+    try:
+        import inkling2mini_tokenizer as IT
+    except ImportError:
+        return False
+    model_path = None
+    if model_raw:
+        p = Path(model_raw)
+        model_path = p if p.is_absolute() else Path(str(cfg.get("cwd") or ".")) / p
+    if model_path is not None and model_path.is_file() and model_path.suffix.lower() == ".strata":
+        try:
+            IT.convert_manifest(IT.read_manifest(model_path), tpath)
+        except Exception as e:                          # noqa: BLE001 - the pair below, else the plain stop
+            print(f"[strata] the tokenizer could not be made from {model_path.name}: {e}", flush=True)
+        if (tpath / "vocab.json").exists():
+            print(f"[strata] the missing tokenizer was made again from {model_path.name} in {tpath}", flush=True)
+            return True
+    places = [model_path.parent] if model_path is not None else []
+    places += [d for d in (tpath, tpath.parent) if d not in places]
+    for d in places:
+        for name in ("tokenizer.json", "tokenizer.hf.json"):
+            tj, ct = d / name, d / "chat_template.jinja"
+            if not (tj.is_file() and ct.is_file()):
+                continue
+            try:
+                IT.convert_files(tj, ct, tpath)
+            except Exception as e:                      # noqa: BLE001 - the next pair, else the plain stop
+                print(f"[strata] the tokenizer could not be made from {tj}: {e}", flush=True)
+            if (tpath / "vocab.json").exists():
+                print(f"[strata] the missing tokenizer was made again from {tj} in {tpath}", flush=True)
+                return True
+    return False
+
+
 def _main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -10374,6 +10610,8 @@ def _main() -> int:
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
+    if a.engine == "strata" and not (tpath / "vocab.json").exists():
+        _ensure_inkling2mini_tokenizer(cfg, tpath)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
