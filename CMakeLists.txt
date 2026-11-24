@@ -1096,6 +1096,22 @@ if(STRATA_ENABLE_XE)
     if(STRATA_BUILD_TESTS)   # the program links and starts (no model file: a run on one is tools' and the records')
       add_test(NAME inkling2mini_version COMMAND strata-inkling-2-mini --version)
       set_tests_properties(inkling2mini_version PROPERTIES PASS_REGULAR_EXPRESSION "strata-inkling-2-mini ")
+      # the SYCL runner's K/V and buffers per slot, the largest --parallel that fits, and the sliding-window ring's size
+      # (upstream de1768f2b and #6878; no GPU)
+      add_executable(inkling2mini_sy_fit_test tests/core/inkling2mini_sy_fit_test.cpp)
+      target_include_directories(inkling2mini_sy_fit_test PRIVATE src/inkling2mini/sycl)
+      add_test(NAME inkling2mini_sy_fit_test COMMAND inkling2mini_sy_fit_test)
+      # the SYCL kernels' FP4 (E2M1) decode by integer ops equals its table for every code (upstream 8d98660cc; no GPU)
+      add_executable(inkling2mini_sy_e2m1_test tests/core/inkling2mini_sy_e2m1_test.cpp)
+      target_include_directories(inkling2mini_sy_e2m1_test PRIVATE src/inkling2mini)
+      add_test(NAME inkling2mini_sy_e2m1_test COMMAND inkling2mini_sy_e2m1_test)
+      # the host sampler's top-K selection in one pass leaves exactly what partial_sort left, ties included, and the
+      # sampled token streams do not change (upstream d1ca2c277, 7c3d15ed5; no GPU)
+      add_executable(inkling2mini_sample_topk_test tests/core/inkling2mini_sample_topk_test.cpp)
+      target_include_directories(inkling2mini_sample_topk_test PRIVATE include src src/inkling2mini
+                                 third_party/main/stb)
+      target_link_libraries(inkling2mini_sample_topk_test PRIVATE Threads::Threads)
+      add_test(NAME inkling2mini_sample_topk_test COMMAND inkling2mini_sample_topk_test)
     endif()
   endif()
 

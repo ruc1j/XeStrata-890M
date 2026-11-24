@@ -26,6 +26,7 @@
 #include "inkling2mini_sy_xmx.h"
 #include "inkling2mini_sy_common.h"
 #include "inkling2mini_sy_dspark.h"
+#include "inkling2mini_sy_fit.h"
 #include "inkling2mini_sy_hybrid.h"
 #include "inkling2mini_sy_ops.h"
 #include "inkling2mini_sy_vision.h"
@@ -37,6 +38,8 @@ struct Inkling2MiniSyRunner {
     int max_slots = 1;
     int max_ctx = 4096;
     int max_batch = 256;
+    int swa_ring = 1024;      // sliding-window K/V ring positions per slot (init: window + step margin, sy_fit.h)
+    int swa_span_cap = 0;     // most tokens of one slot per step so the ring margin holds (0: no limit)
     bool use_dspark = true;
 
     std::vector<int> visit_kv_stride;
@@ -209,10 +212,14 @@ struct Inkling2MiniSyRunner {
         sc_ring_k.resize(c.n_visits); sc_ring_v.resize(c.n_visits);
         sc_ring_attn.resize(c.n_visits); sc_ring_mlp.resize(c.n_visits);
 
+        // A window visit's K/V is a ring of swa_ring positions: the window plus the step's capacity, so a step that
+        // crosses the window's end does not overwrite keys its own earlier tokens still read (upstream #6878).
+        swa_ring = inkling2mini_sy_swa_ring(c.swa_win, max_batch, max_ctx, inkling2mini_sy_swa_ring_env());
+        swa_span_cap = inkling2mini_sy_swa_span_cap(c.swa_win, swa_ring, max_ctx);
         size_t kv_tot = 0, sc_tot = 0;
         for (int v = 0; v < c.n_visits; ++v) {
             const int ip = c.phys_for_visit(v);
-            const int stride = c.is_swa[ip] ? c.swa_win : max_ctx;
+            const int stride = c.is_swa[ip] ? swa_ring : max_ctx;
             visit_kv_stride[v] = stride;
             const size_t kve = (size_t)max_slots * stride * c.n_kv * c.head_dim;
             kv_k[v] = dalloc<half>(kve); kv_v[v] = dalloc<half>(kve);
@@ -241,7 +248,8 @@ struct Inkling2MiniSyRunner {
         b_blocks = dalloc<float>(6 * MB * D); b_prelude = dalloc<float>(MB * D);
         b_bank_blk = dalloc<float>(2 * MB * D); b_bank_out = dalloc<float>(MB * D);
         b_msgs = dalloc<float>(4 * MB * D); b_in3 = dalloc<float>(3 * MB * D);
-        b_cat = dalloc<float>(MB * 2 * D); b_ctrl_gate = dalloc<float>(MB * c.gate_rank);
+        // one region per controller (attn, k, v) of a visit, for the one launch of the three down linears
+        b_cat = dalloc<float>(3 * MB * 2 * D); b_ctrl_gate = dalloc<float>(3 * MB * c.gate_rank);
 
         b_q = dalloc<float>(MB * 3072); b_k_raw = dalloc<float>(MB * 1024); b_v_raw = dalloc<float>(MB * 1024);
         b_k = dalloc<float>(MB * 1024); b_v = dalloc<float>(MB * 1024); b_r = dalloc<float>(MB * 384);
@@ -278,8 +286,9 @@ struct Inkling2MiniSyRunner {
 
         wait();
         hybrid.init(m);
-        fprintf(stderr, "[inkling2mini_sycl] runner ready: slots=%d ctx=%d batch=%d dspark=%d hybrid=%d | KV=%.1f MiB SC=%.1f MiB DevAlloc=%.2f GiB\n",
-                max_slots, max_ctx, max_batch, (int)use_dspark, (int)hybrid.active,
+        fprintf(stderr, "[inkling2mini_sycl] runner ready: slots=%d ctx=%d batch=%d swa_ring=%d dspark=%d hybrid=%d | "
+                "KV=%.1f MiB SC=%.1f MiB DevAlloc=%.2f GiB\n",
+                max_slots, max_ctx, max_batch, swa_ring, (int)use_dspark, (int)hybrid.active,
                 kv_tot / (1024.0 * 1024.0), sc_tot / (1024.0 * 1024.0),
                 dev_bytes_allocated() / (1024.0 * 1024.0 * 1024.0));
         (void)err;
@@ -466,13 +475,13 @@ struct Inkling2MiniSyRunner {
             const std::string p = "model.llm.layers." + std::to_string(ip);
             const bool is_swa = (c.is_swa[ip] != 0);
 
-            d2d(b_res, b_cur, (size_t)M_stride * 4);
+            if (ip == 0) d2d(b_res, b_cur, (size_t)M_stride * 4);   // for ip > 0 the mix kernel below writes the copy
 
             // Attention-Residual mix before attention (ip > 0)
             if (ip > 0) {
                 const int nq = is_swa ? 1 : 3;
                 k_attn_res_mix_sg16(b_blocks, b_cur, tf32("model.llm.attn_res.attn_queries." + std::to_string(ip - 1)),
-                                    b_in3, n_blocks, block_stride, M, nq);
+                                    b_in3, n_blocks, block_stride, M, nq, b_res);
                 if (is_swa && has_msgs) {
                     d2d(b_in3 + M_stride, b_in3, (size_t)M_stride * 4);
                     d2d(b_in3 + 2 * M_stride, b_in3, (size_t)M_stride * 4);
@@ -485,13 +494,39 @@ struct Inkling2MiniSyRunner {
             if (has_msgs) {
                 const char* cnames[3] = {"attn", "k", "v"};
                 const char* nnames[3] = {"q_input_norm.weight", "k_input_norm.weight", "v_input_norm.weight"};
+                // The three controllers of a visit are independent (each one's concat reads only its own stream and
+                // message, each apply writes only its own stream), so: three concats, ONE launch of the three down
+                // linears, three applies; the same arithmetic as one after the other (upstream d9d585432).
+                const size_t cat_stride = (size_t)max_batch * 2 * c.hidden;
+                const size_t gate_stride = (size_t)max_batch * c.gate_rank;
+                const Inkling2MiniTensorInfo& t0 = man.get(p + ".controllers.attn.down_weight");
+                const Inkling2MiniTensorInfo& t1 = man.get(p + ".controllers.k.down_weight");
+                const Inkling2MiniTensorInfo& t2 = man.get(p + ".controllers.v.down_weight");
+                const bool fuse3 = t0.fmt == FMT_F32 && t1.fmt == FMT_F32 && t2.fmt == FMT_F32 &&
+                                   t0.rows() == t1.rows() && t0.rows() == t2.rows() &&
+                                   t0.cols() == t1.cols() && t0.cols() == t2.cols();
+                if (fuse3) {
+                    for (int j = 0; j < 3; ++j) {
+                        k_ctrl_cat_rms_sg16(b_in3 + (size_t)j * M_stride, b_msgs + (size_t)j * M_stride,
+                                            b_cat + j * cat_stride, M);
+                    }
+                    k_linear_f32x3_sg16(reinterpret_cast<const float*>(t0.dev_ptr),
+                                        reinterpret_cast<const float*>(t1.dev_ptr),
+                                        reinterpret_cast<const float*>(t2.dev_ptr), (int)t0.rows(), (int)t0.cols(),
+                                        b_cat, b_cat + cat_stride, b_cat + 2 * cat_stride,
+                                        b_ctrl_gate, b_ctrl_gate + gate_stride, b_ctrl_gate + 2 * gate_stride, M);
+                }
                 for (int j = 0; j < 3; ++j) {
                     float* inp = b_in3 + (size_t)j * M_stride;
                     const float* mp = b_msgs + (size_t)j * M_stride;
-                    k_ctrl_cat_rms_sg16(inp, mp, b_cat, M);
-                    dispatch_linear(man.get(p + ".controllers." + cnames[j] + ".down_weight"), b_cat, b_ctrl_gate, M);
+                    if (!fuse3) {
+                        k_ctrl_cat_rms_sg16(inp, mp, b_cat, M);
+                        dispatch_linear(man.get(p + ".controllers." + cnames[j] + ".down_weight"), b_cat,
+                                        b_ctrl_gate, M);
+                    }
+                    const float* gate_j = fuse3 ? (b_ctrl_gate + j * gate_stride) : b_ctrl_gate;
                     const std::string nkey = is_swa ? (p + ".attn_norm.weight") : (p + "." + nnames[j]);
-                    k_ctrl_apply_norm_sg16(inp, mp, b_ctrl_gate,
+                    k_ctrl_apply_norm_sg16(inp, mp, gate_j,
                                            tf32(p + ".controllers." + cnames[j] + ".gain_weight"),
                                            tf32(p + ".controllers." + cnames[j] + ".forget_weight"),
                                            tf32(nkey), inp, M, 1);
@@ -569,9 +604,9 @@ struct Inkling2MiniSyRunner {
 
             // ---- MoE Sublayer ----
             dump_stage(visit * 10 + 1, b_cur, (size_t)M * D);
-            d2d(b_res, b_cur, (size_t)M_stride * 4);
+            // the mix also copies b_cur to b_res (the residual of this sublayer)
             k_attn_res_mix_sg16(b_blocks, b_cur, tf32("model.llm.attn_res.mlp_queries." + std::to_string(ip)),
-                                b_mlp_in, n_blocks, block_stride, M, 1);
+                                b_mlp_in, n_blocks, block_stride, M, 1, b_res);
             if (has_msgs) {
                 const float* mp = b_msgs + 3 * M_stride;
                 k_ctrl_cat_rms_sg16(b_mlp_in, mp, b_cat, M);

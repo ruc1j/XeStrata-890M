@@ -33,6 +33,11 @@ inline const char* kv_dtype_name(KvDtype dt) noexcept {
     }
 }
 
+// The integer K/V forms (per-64 INT8 K with INT8 or 4-bit V): a backend that stores fp16 pages refuses them at init.
+inline bool kv_dtype_is_int_quant(KvDtype dt) noexcept {
+    return dt == KvDtype::K8V8 || dt == KvDtype::K8V4;
+}
+
 // ---- Scalar FP16 / BF16 / FP8 E4M3FN conversion helpers (portable across CPU & GPU host prep) ----
 inline float bf16_to_f32(uint16_t b) noexcept {
     uint32_t u = static_cast<uint32_t>(b) << 16;

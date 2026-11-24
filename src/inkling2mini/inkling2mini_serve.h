@@ -70,6 +70,26 @@ struct SampleOpts {
     bool penalties() const noexcept { return rep != 1.0f || freq != 0.0f || pres != 0.0f; }
 };
 
+// The K best token ids of lg[0..V-1], best first: larger logit first, the smaller id first on equal logits.  Exactly
+// what std::partial_sort over an iota with that order leaves in idx[0..K-1], but in one pass over the row (about
+// 0.06 ms for V = 200058 instead of 0.19 ms), since every sampled token of every slot pays it on the host (upstream
+// #6779).
+inline void inkling2mini_top_k_ids(const float* lg, int V, int K, std::vector<int>& idx) {
+    K = std::max(0, std::min(K, V));
+    idx.assign((size_t)K, 0);
+    if (K == 0) return;
+    std::vector<float> val((size_t)K);
+    int n = 0;
+    for (int i = 0; i < V; ++i) {
+        const float v = lg[i];
+        if (n == K && !(v > val[K - 1])) continue;   // a later id with an equal logit sorts after the kept ones
+        int j = (n < K) ? n++ : K - 1;
+        while (j > 0 && v > val[j - 1]) { val[j] = val[j - 1]; idx[j] = idx[j - 1]; --j; }
+        val[j] = v;
+        idx[j] = i;
+    }
+}
+
 inline int32_t sample_logits(float* lg, int V, const SampleOpts& s, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
     if (s.penalties() && s.last_n > 0) {
         size_t start = static_cast<size_t>(std::max(0, s.pen_from));
@@ -94,10 +114,8 @@ inline int32_t sample_logits(float* lg, int V, const SampleOpts& s, const std::v
         return best;
     }
     const int K = std::min(std::max(1, s.top_k), std::min(V, 128));
-    std::vector<int> idx(V);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
-                      [&](int a, int b) { return lg[a] > lg[b] || (lg[a] == lg[b] && a < b); });
+    std::vector<int> idx;
+    inkling2mini_top_k_ids(lg, V, K, idx);
     std::vector<double> p(K);
     double mx = lg[idx[0]], sum = 0.0;
     for (int i = 0; i < K; ++i) {
@@ -137,12 +155,100 @@ inline bool finite_logits(const float* lg, int V) noexcept {
     return true;
 }
 
-// Anti-loop repetition detector: detects pathological n-gram stalling (exact period 1..32 repeated >= 8x)
+// Exact lossless speculative verification sampler for DSpark (Leviathan et al., 2023):
+// Given target logits `lg[0..V-1]` and a deterministic draft token `draft_tok`:
+//   - If greedy: picks argmax and accepts iff argmax == draft_tok.
+//   - If non-greedy (temperature > 0 / top_k / min_p / top_p / penalties):
+//     Computes exact target distribution p(x), accepts `draft_tok` with probability p(draft_tok),
+//     else samples from exact residual p(x) / (1 - p(draft_tok)) over x != draft_tok.
+// The emitted tokens follow the same distribution as sample_logits().
+inline int32_t verify_draft_logits(
+    float* lg, int V, const SampleOpts& s, const std::vector<int32_t>& hist,
+    std::mt19937_64& rng, int32_t draft_tok, bool& accepted) {
+    accepted = false;
+    if (s.greedy()) {
+        const int32_t tok = sample_logits(lg, V, s, hist, rng);
+        accepted = (tok == draft_tok);
+        return tok;
+    }
+    if (s.penalties() && s.last_n > 0) {
+        size_t start = static_cast<size_t>(std::max(0, s.pen_from));
+        if (hist.size() > start) {
+            size_t from = (hist.size() - start > static_cast<size_t>(s.last_n))
+                ? (hist.size() - static_cast<size_t>(s.last_n)) : start;
+            std::unordered_map<int32_t, int> cnt;
+            for (size_t i = from; i < hist.size(); ++i) ++cnt[hist[i]];
+            for (const auto& kv : cnt) {
+                if (kv.first < 0 || kv.first >= V) continue;
+                float& x = lg[kv.first];
+                if (s.rep != 1.0f) x = (x > 0.0f) ? (x / s.rep) : (x * s.rep);
+                x -= static_cast<float>(kv.second) * s.freq + (s.pres != 0.0f ? s.pres : 0.0f);
+            }
+        }
+    }
+    const int K = std::min(std::max(1, s.top_k), std::min(V, 128));
+    std::vector<int> idx;
+    inkling2mini_top_k_ids(lg, V, K, idx);
+    std::vector<double> p(K);
+    double mx = lg[idx[0]], sum = 0.0;
+    for (int i = 0; i < K; ++i) {
+        p[i] = std::exp((lg[idx[i]] - mx) / static_cast<double>(s.temperature));
+        sum += p[i];
+    }
+    for (double& x : p) x /= sum;
+    int keep = K;
+    if (s.min_p > 0.0f) {
+        const double thr = static_cast<double>(s.min_p) * p[0];
+        keep = 1;
+        while (keep < K && p[keep] >= thr) ++keep;
+    }
+    if (s.top_p < 1.0f) {
+        double c = 0.0;
+        int k2 = 0;
+        while (k2 < keep) {
+            c += p[k2++];
+            if (c >= static_cast<double>(s.top_p)) break;
+        }
+        keep = std::max(1, k2);
+    }
+    double z = 0.0;
+    int draft_pos = -1;
+    for (int i = 0; i < keep; ++i) {
+        z += p[i];
+        if (idx[i] == draft_tok) draft_pos = i;
+    }
+    if (z <= 0.0) return idx[0];
+    const double p_draft = (draft_pos >= 0) ? (p[draft_pos] / z) : 0.0;
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    if (draft_pos >= 0 && (keep == 1 || u01(rng) < p_draft)) {
+        accepted = true;
+        return draft_tok;
+    }
+    // Rejected: sample from residual p(x) over i != draft_pos
+    const double z_rem = z - (draft_pos >= 0 ? p[draft_pos] : 0.0);
+    if (z_rem <= 0.0) {
+        accepted = (draft_pos >= 0);
+        return (draft_pos >= 0) ? draft_tok : idx[0];
+    }
+    const double r = u01(rng) * z_rem;
+    double c = 0.0;
+    int last_valid = idx[0];
+    for (int i = 0; i < keep; ++i) {
+        if (i == draft_pos) continue;
+        last_valid = idx[i];
+        c += p[i];
+        if (r <= c) return idx[i];
+    }
+    return last_valid;
+}
+
+// Anti-loop repetition detector: detects pathological n-gram stalling while avoiding false positives on structured
+// YAML/JSON (upstream #6620: a period of 1..4 repeated 24 times, a longer one 10 times, after 96 tokens)
 inline bool detect_repetition_loop(const std::vector<int32_t>& gen_ids) noexcept {
     const size_t n = gen_ids.size();
-    if (n < 64) return false;
+    if (n < 96) return false;
     for (size_t period = 1; period <= 32; ++period) {
-        const size_t need_reps = (period <= 4) ? 16 : 6;
+        const size_t need_reps = (period <= 4) ? 24 : 10;
         if (n < period * need_reps) continue;
         bool match = true;
         for (size_t k = 0; k < period * (need_reps - 1); ++k) {
@@ -330,6 +436,7 @@ struct ActiveReq {  // NOLINT(bugprone-random-generator-seed): rng is seeded whe
     std::vector<int32_t> hist;
     std::vector<int32_t> gen_ids;
     std::vector<int32_t> cached_prefix;  // tokens currently resident in slot KV
+    int reused_tokens = 0;               // prefix tokens reused for this request (DONE's ninth field)
     double t_start = 0.0;
     double prompt_ms = 0.0;
     double decode_t0 = 0.0;
@@ -355,7 +462,7 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
     const int V = c.vocab_unpadded;
     const int P = std::max(1, std::min(kMaxParallelSlots, cfg.bopts.parallel));
     const int chunk_sz = std::max(1, cfg.bopts.chunk);
-    const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present;
+    const bool use_dspark = (cfg.draft_mode != "off") && mf.m.dspark.present && backend.dspark_ready();
 
     // Probe Vision shard lazily (zero VRAM/RAM until first image request)
     bool images_ok = false;
@@ -380,11 +487,15 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
     size_t sl = base.find_last_of("/\\");
     if (sl != std::string::npos) base = base.substr(sl + 1);
 
-    proto("INFO engine=strata-inkling-2-mini-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d chunk=%d batch_slots=%d slot_read=1 kv_dtype=%s drafter=%s images=%d image_pad=%d parallel=%d",
+    // The context the backend really holds (0: the one asked for); a request reaching it ends with `length`.
+    const int eff_max_ctx = (backend.effective_max_ctx() > 0) ? backend.effective_max_ctx() : cfg.bopts.max_ctx;
+    proto("INFO engine=strata-inkling-2-mini-%s arch=inkling2_loop backend=%s model=%s layers=%d visits=%d vocab=%d "
+          "chunk=%d batch_slots=%d slot_read=1 kv_dtype=%s drafter=%s drafting=%s images=%d image_pad=%d parallel=%d",
           cfg.version.c_str(), backend.backend_name(), base.c_str(), c.n_phys, c.n_visits, V, chunk_sz,
-          P, cfg.bopts.kv_dtype == KvDtype::FP8_E4M3 ? "fp8" : "fp16",
-          use_dspark ? "dspark" : "none", images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
-    proto("READY %d stop hold holdb", cfg.bopts.max_ctx);
+          P, kv_dtype_name(backend.stats().kv_dtype),
+          mf.m.dspark.present ? "dspark" : "none", use_dspark ? "dspark" : "off",
+          images_ok ? 1 : 0, c.image_token_id, kMaxParallelSlots);
+    proto("READY %d stop hold holdb", eff_max_ctx);
 
     std::vector<ActiveReq> reqs(P);
     std::unordered_map<std::string, int> req_id_to_slot;
@@ -398,13 +509,20 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
     auto finish_req = [&](ActiveReq& rq, const char* reason) {
         const double dec_ms = (rq.decode_t0 > 0.0) ? (now_s() - rq.decode_t0) * 1000.0 : 0.0;
         if (rq.is_solo) {
-            proto("DONE %d %d %.1f %.1f %s", rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason);
+            // The nine fields server.py reads: drafts accepted, drafts offered and the reused prefix after the reason.
+            proto("DONE %d %d %.1f %.1f %s %d %d %d",
+                  rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason,
+                  rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens);
         } else if (rq.is_ext_gen) {
-            proto("DONE %s %d %d %.1f %.1f %s", rq.req_id.c_str(), rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason);
+            proto("DONE %s %d %d %.1f %.1f %s %d %d %d",
+                  rq.req_id.c_str(), rq.generated, rq.prompt_len, rq.prompt_ms, dec_ms, reason,
+                  rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens);
             req_id_to_slot.erase(rq.req_id);
         } else {
             if (!rq.admitted) {
-                proto("DONE %d %d %.1f 0.0 %s", rq.generated, rq.prompt_len, rq.prompt_ms, reason);
+                proto("DONE %d %d %.1f 0.0 %s %d %d %d",
+                      rq.generated, rq.prompt_len, rq.prompt_ms, reason,
+                      rq.drafts_accepted, rq.drafts_offered, rq.reused_tokens);
                 proto("BADM %d 0", rq.slot);
             } else {
                 char dstr[64] = "";
@@ -470,8 +588,8 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
         }
 
         rq.prompt_len = static_cast<int>(rq.prompt_ids.size());
-        if (rq.prompt_len <= 0 || rq.prompt_len >= cfg.bopts.max_ctx) {
-            err = "prompt length out of range (1.." + std::to_string(cfg.bopts.max_ctx - 1) + ")";
+        if (rq.prompt_len <= 0 || rq.prompt_len >= eff_max_ctx) {
+            err = "prompt length out of range (1.." + std::to_string(eff_max_ctx - 1) + ")";
             rq.active = false;
             return false;
         }
@@ -490,6 +608,7 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
         } else {
             proto("RESUME %d", reuse);
         }
+        rq.reused_tokens = reuse;
         rq.prefill_pos = reuse;
         rq.cur_pos = reuse;
         rq.hist = rq.prompt_ids;
@@ -503,14 +622,14 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
         if (line == "QUIT") { quit_requested = true; return false; }
         if (line == "HELLO") {
             proto("HELLO ok engine=strata-inkling-2-mini-%s arch=inkling2_loop backend=%s max_ctx=%d parallel=%d",
-                  cfg.version.c_str(), backend.backend_name(), cfg.bopts.max_ctx, P);
+                  cfg.version.c_str(), backend.backend_name(), eff_max_ctx, P);
             return true;
         }
         if (line == "STATS") {
             auto st = backend.stats();
             proto("STATS active_slots=%d max_slots=%d vram_experts=%zu ram_experts=%zu total_experts=%zu kv=%s",
                   st.active_slots, st.max_slots, st.vram_experts_loaded, st.ram_experts_loaded, st.total_experts,
-                  st.kv_dtype == KvDtype::FP8_E4M3 ? "fp8" : "fp16");
+                  kv_dtype_name(st.kv_dtype));
             return true;
         }
         if (line == "STOP") {
@@ -580,7 +699,7 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
             } else if (pg.cmd == "BGEN" && pg.slot_read && pg.max_new > 0) {
                 // Zero-HoL admission: immediately release server.py control lines so concurrent
                 // HTTP requests 1..64 all prefill and decode together in the coalesced StepBatch!
-                proto("DONE 0 %d 0.0 0.0 admit", reqs[pg.slot].prompt_len);
+                proto("DONE 0 %d 0.0 0.0 admit 0 0 %d", reqs[pg.slot].prompt_len, reqs[pg.slot].reused_tokens);
                 proto("BADM %d 1", pg.slot);
                 reqs[pg.slot].admitted = true;
             }
@@ -631,13 +750,17 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
             continue;
         }
 
-        // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree / Block-8 speculative step (when decoding)
+        // 2. Fast-path: Single-stream DSpark Adaptive Beam Tree (greedy) / Block-8 speculative step with rejection
+        //    sampling (any temperature; upstream #6633) when decoding
         if (use_dspark && n_active == 1 && reqs[sole_slot].prefill_pos >= reqs[sole_slot].prompt_len &&
-            reqs[sole_slot].s.greedy() && reqs[sole_slot].generated + 2 <= reqs[sole_slot].max_new &&
-            reqs[sole_slot].cur_pos + 8 < cfg.bopts.max_ctx) {
+            reqs[sole_slot].generated + 2 <= reqs[sole_slot].max_new &&
+            reqs[sole_slot].cur_pos + 8 < eff_max_ctx &&
+            // the speculative steps emit up to 16 tokens with no hold= check: a request with a reasoning budget takes
+            // them only while that many tokens cannot reach the cut, and the per-token path below stops at it
+            (reqs[sole_slot].s.hold_budget <= 0 || reqs[sole_slot].generated + 16 < reqs[sole_slot].s.hold_budget)) {
             auto& rq = reqs[sole_slot];
-            // 2a. Zero-D2H fused greedy Beam Tree speculative step (when no penalties and headroom >= 12)
-            if (!rq.s.penalties() && rq.cur_pos + 12 < cfg.bopts.max_ctx) {
+            // 2a. Zero-D2H fused greedy Beam Tree speculative step (when greedy, no penalties and headroom >= 12)
+            if (rq.s.greedy() && !rq.s.penalties() && rq.cur_pos + 12 < eff_max_ctx) {
                 int32_t emitted[16]{};
                 int drafted = 0;
                 std::string serr;
@@ -707,12 +830,17 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
                 for (int i = 0; i <= nd; ++i) {
                     float* lg = logits_buf.data() + static_cast<size_t>(i) * V;
                     if (!finite_logits(lg, V)) {
-                        backend.rollback_slot(rq.slot, rq.cur_pos);
+                        // Never leave a poisoned K/V and ShortConv prefix cached for a retry (upstream #879)
+                        rq.cached_prefix.clear();
+                        backend.reset_slot(rq.slot);
                         finish_req(rq, "nonfinite");
                         done = true;
                         break;
                     }
-                    int32_t tok = sample_logits(lg, V, rq.s, rq.hist, rq.rng);
+                    bool draft_ok = false;
+                    const int32_t tok = (i < nd)
+                        ? verify_draft_logits(lg, V, rq.s, rq.hist, rq.rng, draft_ids[i], draft_ok)
+                        : sample_logits(lg, V, rq.s, rq.hist, rq.rng);
                     rq.hist.push_back(tok);
                     rq.gen_ids.push_back(tok);
                     rq.cached_prefix.push_back(i == 0 ? rq.next_tok : draft_ids[i - 1]);
@@ -724,7 +852,7 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
                     if (is_stop_tok(tok)) { fin = "stop"; done = true; ++accepted; break; }
                     if (rq.generated >= rq.max_new) { fin = "length"; done = true; ++accepted; break; }
                     if (cfg.anti_loop && detect_repetition_loop(rq.gen_ids)) { fin = "stop"; done = true; ++accepted; break; }
-                    if (i < nd && tok == draft_ids[i]) {
+                    if (i < nd && draft_ok) {
                         ++accepted;
                         ++rq.drafts_accepted;
                     } else {
@@ -760,6 +888,10 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
         for (int s = 0; s < P; ++s) {
             auto& rq = reqs[s];
             if (!rq.active || rq.prefill_pos < rq.prompt_len) continue;
+            if (rq.cur_pos >= eff_max_ctx) {
+                finish_req(rq, "length");
+                continue;
+            }
             batch.push(s, rq.cur_pos, rq.next_tok, true);
             logit_slots.push_back(s);
             --token_budget;
@@ -822,6 +954,9 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
             auto& rq = reqs[s];
             float* lg = logits_buf.data() + static_cast<size_t>(wi) * V;
             if (!finite_logits(lg, V)) {
+                // Clear the poisoned K/V and ShortConv state so a retry starts clean (upstream #879)
+                rq.cached_prefix.clear();
+                backend.reset_slot(rq.slot);
                 finish_req(rq, "nonfinite");
                 continue;
             }
@@ -841,7 +976,7 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
             ++rq.generated;
 
             const bool stop = is_stop_tok(tok);
-            const bool hit_len = (rq.generated >= rq.max_new) || (rq.cur_pos + 1 >= cfg.bopts.max_ctx);
+            const bool hit_len = (rq.generated >= rq.max_new) || (rq.cur_pos + 1 >= eff_max_ctx);
             const bool hit_hold = (rq.s.hold_budget > 0 && rq.generated >= rq.s.hold_budget && tok != rq.s.hold_token_id);
             const bool hit_loop = cfg.anti_loop && detect_repetition_loop(rq.gen_ids);
 
@@ -865,7 +1000,8 @@ inline int run_serve_loop(const ServeConfig& cfg, Inkling2MiniModelFile& mf, Ink
                     const bool cont = !(stop || hit_len || hit_hold || hit_loop);
                     if (!rq.slot_read) proto("T %d", tok);
                     const char* fin = stop ? "stop" : hit_hold ? "hold" : hit_len ? "length" : hit_loop ? "stop" : "admit";
-                    proto("DONE %d %d %.1f 0.0 %s", rq.slot_read ? 0 : 1, rq.prompt_len, rq.prompt_ms, fin);
+                    proto("DONE %d %d %.1f 0.0 %s 0 0 %d", rq.slot_read ? 0 : 1, rq.prompt_len, rq.prompt_ms, fin,
+                          rq.reused_tokens);
                     proto("BADM %d %d", rq.slot, cont ? 1 : 0);
                     if (rq.slot_read) proto("BT %d %d", rq.slot, tok);
                     rq.admitted = true;

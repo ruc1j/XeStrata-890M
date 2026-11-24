@@ -276,10 +276,10 @@ struct Inkling2MiniSyHybridEngine {
     struct CpuGroup {
         int gid = 0;
         int out_base = 0;   // index into bell->cpu_pair_ids / bell->y_cpu
-        int count = 0;      // number of tokens using this cold expert
-        int tok_ids[kSyHybridMaxBatch]{};
-        int pair_ids[kSyHybridMaxBatch]{};
-        float weights[kSyHybridMaxBatch]{};
+        int count = 0;      // number of (tok, k) pairs using this cold expert (up to kSyHybridMaxPairs)
+        int tok_ids[kSyHybridMaxPairs]{};
+        int pair_ids[kSyHybridMaxPairs]{};
+        float weights[kSyHybridMaxPairs]{};
     };
 
     struct PendingProm {
@@ -617,7 +617,7 @@ struct Inkling2MiniSyHybridEngine {
             int exp_to_vg[128], exp_to_cg[128];
             std::memset(exp_to_vg, -1, sizeof(exp_to_vg));
             std::memset(exp_to_cg, -1, sizeof(exp_to_cg));
-            int v_pair_tmp[128][8];
+            int v_pair_tmp[128][16];
 
             for (int pid = 0; pid < P; ++pid) {
                 const int e = bell->topk_idx[pid]; if (e < 0 || e >= E) continue;
@@ -633,7 +633,7 @@ struct Inkling2MiniSyHybridEngine {
                         h_uexp[vg] = e;
                         h_ucnt[vg] = 0;
                     }
-                    v_pair_tmp[vg][h_ucnt[vg]++] = pid;
+                    if (h_ucnt[vg] < 16) v_pair_tmp[vg][h_ucnt[vg]++] = pid;
                 } else {
                     ++stat_cpu_hits;
                     int cg = exp_to_cg[e];
@@ -644,10 +644,12 @@ struct Inkling2MiniSyHybridEngine {
                         cur_groups[cg].count = 0;
                     }
                     auto& grp = cur_groups[cg];
-                    const int idx = grp.count++;
-                    grp.tok_ids[idx] = pid >> 3;
-                    grp.pair_ids[idx] = pid;
-                    grp.weights[idx] = bell->topk_w[pid];
+                    if (grp.count < kSyHybridMaxPairs) {
+                        const int idx = grp.count++;
+                        grp.tok_ids[idx] = pid >> 3;
+                        grp.pair_ids[idx] = pid;
+                        grp.weights[idx] = bell->topk_w[pid];
+                    }
                 }
             }
 

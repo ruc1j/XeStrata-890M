@@ -77,8 +77,10 @@ if [ ${#cpp[@]} -gt 0 ]; then
     # codecs of the .strata v1.1 files it reads): three checks are off there.  They flag the idiom of that code - bit
     # fields unpacked from signed integers, index products in int, sums narrowed to the stored width - about a
     # thousand times, and writing each one out would leave no line as upstream has it, for the next integration to
-    # carry over.  Every other check stays on there, and the code XeStrata writes elsewhere keeps all of them.
-    carried='^(src|include/strata)/(inkling2mini|quant)/'
+    # carry over.  Every other check stays on there, and the code XeStrata writes elsewhere keeps all of them.  The
+    # tests of that engine taken from upstream (tests/core/inkling2mini_*) include its headers whole, so the three are
+    # off for them as well.
+    carried='^((src|include/strata)/(inkling2mini|quant)/|tests/core/inkling2mini_)'
     relaxed=("--checks=-bugprone-signed-bitwise,-bugprone-implicit-widening-of-multiplication-result,-bugprone-narrowing-conversions")
     mapfile -t cxx < <(printf '%s\n' "${cpp[@]}" | grep '\.cpp$' | grep -v -E "$carried")
     mapfile -t cxxc < <(printf '%s\n' "${cpp[@]}" | grep '\.cpp$' | grep -E "$carried")

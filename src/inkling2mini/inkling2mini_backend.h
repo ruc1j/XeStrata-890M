@@ -54,6 +54,7 @@ public:
     virtual const char* backend_name() const noexcept = 0;
     virtual std::string device_info() const = 0;
     virtual BackendStats stats() const = 0;
+    virtual int effective_max_ctx() const { return 0; }   // the context the backend really holds (0: opts.max_ctx)
 
     // Load Section 1 trunk + DSpark + 3x loop-weighted Section 4 experts into device/host memory
     virtual bool init(const Inkling2MiniModelFile& model, const BackendOpts& opts, std::string& err) = 0;
@@ -101,6 +102,9 @@ public:
         (void)out_emitted; (void)out_drafted; (void)err;
         return 0;
     }
+
+    // Returns true when the on-device DSpark drafter is initialized and ready to serve drafts (upstream #6633).
+    virtual bool dspark_ready() const { return false; }
 
     // Optional GPU Vision ViT encoder: returns true if encoded on device, false to fall back to CPU ViT.
     virtual bool encode_image(const ImageRec& img, std::vector<float>& out_embeds, std::string& err) {

@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "inkling2mini_sy_fit.h"
 #include "inkling2mini_sy_runner.h"
 
 namespace inkling2mini {
@@ -43,30 +44,55 @@ public:
     }
 
     bool init(const Inkling2MiniModelFile& model, const BackendOpts& opts, std::string& err) override {
-        kv_dtype_ = opts.kv_dtype;
+        // The runner's K/V pages are fp16 (upstream 759ccf6c6): the integer forms are refused, fp8 is held as fp16.
+        if (kv_dtype_is_int_quant(opts.kv_dtype)) {
+            err = "sycl: --kv k8v4/k8v8 is not supported on the SYCL backend (its K/V pages are fp16); "
+                  "use --kv fp16 or fp8";
+            return false;
+        }
+        kv_dtype_ = KvDtype::FP16;
         const int par = std::max(1, std::min(64, opts.parallel));
         const int ctx = std::max(256, opts.max_ctx);
-        const int batch_cap = std::max(256, std::max(opts.chunk, par));
-        // Compute exact runner + KV + DSpark + Vision + XMX/Hybrid reserve so 8-16 GB Arc cards NEVER OOM!
-        size_t kv_est = 0;
+        const int batch_cap = inkling2mini_sycl::inkling2mini_sy_batch_cap(par, opts.chunk);
+        // Exact runner + KV + DSpark + Vision + XMX/Hybrid reserve (inkling2mini_sy_fit.h), so a card is told BEFORE
+        // the runner allocates that the --parallel / --max-context asked for does not fit (upstream de1768f2b: a start
+        // used to die with "dalloc ...: out of device memory").
         const auto& mc = model.m.c;
+        inkling2mini_sycl::Inkling2MiniSyFitGeom fit;
         const int core_len = mc.core_end - mc.core_start;
         for (int v = 0; v < mc.n_visits; ++v) {
             const int ip = (v < mc.core_start) ? v
                          : (v < mc.core_start + core_len * mc.num_passes)
                              ? (mc.core_start + (v - mc.core_start) % core_len)
                              : (mc.core_end + (v - mc.core_start - core_len * mc.num_passes));
-            const size_t stride = (size_t)(mc.is_swa[ip] ? mc.swa_win : ctx);
-            kv_est += 2ull * (size_t)par * stride * (size_t)mc.n_kv * (size_t)mc.head_dim * 2ull;
+            fit.visit_is_swa.push_back(mc.is_swa[ip] ? 1 : 0);
         }
-        const size_t dsp_kv = (opts.enable_dspark && model.m.dspark.present)
-            ? (3ull * 2ull * (size_t)par * (size_t)ctx * 1024ull * 2ull) : 0ull;
-        const size_t sc_est = (size_t)mc.n_visits * (size_t)par * 3ull * (2048ull + 2ull * (size_t)mc.hidden) * 8ull;
-        const size_t act_est = (size_t)batch_cap * 512ull * 1024ull + (128ull << 20);
-        const size_t vis_est = !opts.vision_path.empty() ? (700ull << 20) : 0ull;
-        const size_t hyb_xmx_est = (320ull << 20);  // Elastic VRAM cache ring (<=256 MiB) + XMX scratch (~32 MiB) + ping-pong
-        const size_t extra_reserve = kv_est + dsp_kv + sc_est + act_est + vis_est + hyb_xmx_est;
+        fit.swa_win = mc.swa_win;
+        fit.n_kv = mc.n_kv;
+        fit.head_dim = mc.head_dim;
+        fit.hidden = mc.hidden;
+        fit.gate_rank = mc.gate_rank;
+        fit.vocab_padded = mc.vocab_padded;
+        fit.swa_ring_override = inkling2mini_sycl::inkling2mini_sy_swa_ring_env();
+        fit.dspark = opts.enable_dspark && model.m.dspark.present;
+        fit.vision = !opts.vision_path.empty();
+        const size_t extra_reserve = inkling2mini_sycl::inkling2mini_sy_runner_reserve(fit, par, ctx, opts.chunk);
         if (!mod_.load(model.path, opts.vram_experts_gb, err, extra_reserve)) return false;
+        {
+            const auto& dc = inkling2mini_sycl::dev_caps();
+            const size_t used = inkling2mini_sycl::dev_bytes_allocated();
+            const size_t avail = dc.global_mem > used ? dc.global_mem - used : 0;
+            const std::string why = inkling2mini_sycl::inkling2mini_sy_fit_message(fit, par, ctx, opts.chunk, avail);
+            if (!why.empty()) {
+                // XeStrata: an integrated GPU's memory is the system RAM, and the size its runtime reports need not be
+                // what it can take (the Radeon 890M's HIP figure is unchecked), so there it is a warning only.
+                if (!dc.integrated) {
+                    err = why;
+                    return false;
+                }
+                std::fprintf(stderr, "[inkling2mini_sycl] warning (integrated GPU, going on): %s\n", why.c_str());
+            }
+        }
         if (!runner_.init(mod_, par, ctx, batch_cap, opts.enable_dspark, err)) {
             return false;
         }
@@ -92,6 +118,8 @@ public:
         }
     }
 
+    bool dspark_ready() const override { return runner_.use_dspark; }
+
     void reset_slot(int slot) override { runner_.reset_slot(slot); }
     void snapshot_slot(int slot) override { runner_.snapshot_slot(slot); }
     void rollback_slot(int slot, int keep_len) override { runner_.rollback_slot(slot, keep_len); }
@@ -101,7 +129,7 @@ public:
         const int M_tot = batch.n_tokens;
         const int D = mod_.man.c.hidden;
         const int V = mod_.man.c.vocab_unpadded;
-        const int cap = runner_.max_batch;
+        const int cap = batch_token_cap(batch);
 
         int dst_logit_row = 0;
         for (int off = 0; off < M_tot; off += cap) {
@@ -176,6 +204,29 @@ public:
     }
 
 private:
+    // The most tokens forward_batch hands the runner at once: its capacity, and the sliding-window ring's margin when a
+    // step could overwrite keys still in the window: some slot reaches the ring's size (the ring wraps) and its
+    // positions in this batch span more than the margin.  Sub-batches then hold at most the margin, so each slot's
+    // span stays within it (a slot's positions are consecutive in batch order).  With the default ring (window +
+    // capacity) the margin is the capacity and nothing changes; a smaller INKLING2MINI_SWA_RING splits (upstream
+    // #6878).
+    int batch_token_cap(const StepBatch& batch) const {
+        const int cap = runner_.max_batch;
+        const int span_cap = runner_.swa_span_cap;
+        if (span_cap <= 0 || span_cap >= cap || batch.n_tokens <= span_cap) return cap;
+        std::vector<int> lo((size_t)runner_.max_slots, 0x3fffffff), hi((size_t)runner_.max_slots, -1);
+        for (int b = 0; b < batch.n_tokens; ++b) {
+            const int s = batch.slot_ids[b];
+            if (s < 0 || s >= runner_.max_slots) return span_cap;
+            lo[(size_t)s] = std::min(lo[(size_t)s], batch.pos[b]);
+            hi[(size_t)s] = std::max(hi[(size_t)s], batch.pos[b]);
+        }
+        for (int s = 0; s < runner_.max_slots; ++s) {
+            if (hi[(size_t)s] >= runner_.swa_ring && hi[(size_t)s] - lo[(size_t)s] + 1 > span_cap) return span_cap;
+        }
+        return cap;
+    }
+
     inkling2mini_sycl::Inkling2MiniSyModel mod_;
     inkling2mini_sycl::Inkling2MiniSyRunner runner_;
     std::vector<uint8_t> slot_used_;

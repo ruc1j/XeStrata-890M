@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "../inkling2mini_json.h"
+#include "inkling2mini_sy_e2m1.h"
 #include "strata/artifact/strata_reader.hpp"
 #include "kernels/xe/device_target.hpp"
 #include "kernels/xe/xe_shuffle.hpp"
@@ -92,6 +93,7 @@ struct SyDevCaps {
     bool has_sg16 = false;
     bool has_xmx_sg16 = false;
     bool is_level_zero = false;
+    bool integrated = false;   // the processor's own graphics: its memory is the system RAM
 };
 
 inline const SyDevCaps& dev_caps() {
@@ -105,6 +107,16 @@ inline const SyDevCaps& dev_caps() {
         c.local_mem = dev.get_info<sycl::info::device::local_mem_size>();
         c.eu_count = dev.get_info<sycl::info::device::max_compute_units>();
         c.is_level_zero = (dev.get_backend() == sycl::backend::ext_oneapi_level_zero);
+        // XeStrata: as strata::core::integrated_gpu asks it (src/core/device.cpp): Level Zero answers the aspect, the
+        // HIP adapter only its unified host memory (asked for the aspect, it prints an error line each time)
+        if (c.is_level_zero) {
+            c.integrated = dev.has(sycl::aspect::ext_oneapi_is_integrated_gpu);
+        } else if (dev.get_backend() == sycl::backend::ext_oneapi_hip) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            c.integrated = dev.get_info<sycl::info::device::host_unified_memory>();
+#pragma clang diagnostic pop
+        }
         for (auto s : dev.get_info<sycl::info::device::sub_group_sizes>()) {
             if (s == 16) c.has_sg16 = true;
         }
@@ -218,14 +230,6 @@ inline uint16_t ld16(const uint8_t* p) {
 
 inline float h2f_bits(uint16_t b) {
     return (float)sycl::bit_cast<half>(b);
-}
-
-inline float e2m1_lut(uint32_t nib) {
-    constexpr float kLut[16] = {
-        0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
-       -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-    };
-    return kLut[nib & 15u];
 }
 
 inline float e4m3_to_f32(uint32_t c) {

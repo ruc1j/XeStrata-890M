@@ -239,8 +239,72 @@ inline void k_gemm_q8row_sg16(const uint8_t* W, int N, int K, const float* X, fl
     });
 }
 
+// One output row of an F32 linear by one 16-lane block (lane l sums the products of k = l, l + 16, ... in ascending
+// k, then sg_sum).  The loads of U consecutive products of a lane are issued together before the U multiply-adds,
+// which run in the same order as before, so the value is bit for bit the one of the plain loop; what changes is that a
+// row no longer waits for one memory round trip per product (upstream d9d585432).
+template <int U>
+inline void f32_row_dot_sg16(const sycl::nd_item<1>& it, const float* wp, const float* X, float* Y, int N, int K, int M,
+                             int row, int lane) {
+    for (int m0 = 0; m0 < M; m0 += 4) {
+        const int mm = sycl::min(4, M - m0);
+        float a[4] = {0, 0, 0, 0};
+        for (int k0 = lane; k0 < K; k0 += 16 * U) {
+            float w[U], x[4][U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int k = k0 + 16 * u;
+                if (k < K) {
+                    w[u] = wp[k];
+                    for (int i = 0; i < mm; ++i) x[i][u] = X[(size_t)(m0 + i) * K + k];
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int k = k0 + 16 * u;
+                if (k < K) {
+                    for (int i = 0; i < mm; ++i) a[i] += w[u] * x[i][u];
+                }
+            }
+        }
+        for (int i = 0; i < mm; ++i) {
+            const float v = sg_sum(it, a[i]);
+            if (lane == 0) Y[(size_t)(m0 + i) * N + row] = v;
+        }
+    }
+}
+
+// Three independent F32 linears of the same shape in one launch (the attn / k / v loop controllers of a visit; upstream
+// d9d585432): each row is one 16-lane block, two rows per work-group of 32 (one wave on AMD's 32-lane sub-groups, two
+// sub-groups on Intel's 16), so the 3 * N rows spread over the GPU.
+inline void k_linear_f32x3_sg16(const float* W0, const float* W1, const float* W2, int N, int K,
+                                const float* X0, const float* X1, const float* X2, float* Y0, float* Y1, float* Y2,
+                                int M) {
+    const int rows = 3 * N;
+    Q().parallel_for(NR(((size_t)rows + 1) / 2, 32), [=](sycl::nd_item<1> it) INKLING2MINI_REQD_SG16 {
+        const int r = (int)it.get_group(0) * 2 + sg16_block(it), lane = sg16_lane(it);
+        if (r >= rows) return;
+        const int mat = r / N, row = r % N;
+        const float* W = (mat == 0) ? W0 : (mat == 1 ? W1 : W2);
+        const float* X = (mat == 0) ? X0 : (mat == 1 ? X1 : X2);
+        float* Y = (mat == 0) ? Y0 : (mat == 1 ? Y1 : Y2);
+        f32_row_dot_sg16<8>(it, W + (size_t)row * K, X, Y, N, K, M, row, lane);
+    });
+}
+
 // F32 SG16 Linear (exact FP32 for routers, controllers, dynamic sconv weight_proj, attn_sink_proj)
 inline void k_linear_f32_sg16(const float* W, int N, int K, const float* X, float* Y, int M) {
+    if (N <= 1024) {
+        // Few rows (the loop controllers, the router, the dynamic conv taps): one 16-lane block per row and two rows
+        // per work-group of 32, so the rows spread over the whole GPU instead of N/16 work-groups; the arithmetic of a
+        // row is the code below, bit for bit (upstream 5ef71af9b, which takes one row per work-group of 16).
+        Q().parallel_for(NR(((size_t)N + 1) / 2, 32), [=](sycl::nd_item<1> it) INKLING2MINI_REQD_SG16 {
+            const int row = (int)it.get_group(0) * 2 + sg16_block(it), lane = sg16_lane(it);
+            if (row >= N) return;
+            f32_row_dot_sg16<8>(it, W + (size_t)row * K, X, Y, N, K, M, row, lane);
+        });
+        return;
+    }
     Q().parallel_for(NR((N + 15) / 16, 256), [=](sycl::nd_item<1> it) INKLING2MINI_REQD_SG16 {
         const int sg = (int)it.get_local_id(0) >> 4, lane = (int)it.get_local_id(0) & 15;
         const int row = (int)it.get_group(0) * 16 + sg;

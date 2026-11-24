@@ -119,6 +119,7 @@ struct CpuSlot {
 class CpuBackend final : public Inkling2MiniBackend {
 public:
     const char* backend_name() const noexcept override { return "cpu"; }
+    bool dspark_ready() const override { return has_dspark_; }
 
     std::string device_info() const override {
         int nth = 1;
