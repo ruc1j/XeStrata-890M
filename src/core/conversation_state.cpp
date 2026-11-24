@@ -697,10 +697,21 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
         });
     const auto p3 = Steady::now();
     const int64_t upto = (int64_t) view.ids.size();
-    // STRATA_PARK_ASYNC: the K/V bytes these saves copy (the stage they need; an over-estimate by the kept prefix)
+    // STRATA_PARK_ASYNC: the K/V bytes these saves copy (the stage they need; an over-estimate by the kept prefix).
+    // Upstream ad4c565e8: the device-resident bytes only.  A streamed layer's (--kv-resident) and the draft ring's
+    // pools are their host copies, which never go through the stage (on_device in conversation_snapshot.cpp); only
+    // part 4, the indexer rows, does.  Counting the whole K/V reserved about 9x the stage it uses - on an integrated
+    // GPU, RAM the experts and the conversations share (setup streams the K/V from a 64K context up).
     size_t kv_need = 0;
-    for (size_t j = 0; j < layers; ++j) kv_need += conversation_kv_bytes(owned(ss, j), g, upto, true);
-    kv_need += conversation_kv_bytes(draft, g, upto, false);
+    auto stage_bytes = [&](const QsaState& q, bool idx) -> size_t {
+        if (q.kv_mode == 0) return conversation_kv_bytes(q, g, upto, idx);
+        std::array<uint64_t, 5> parts{};
+        std::string ignore;
+        if (conversation_kv_part_sizes(q, g, upto, idx, parts, ignore)) return (size_t) parts[4];
+        return conversation_kv_bytes(q, g, upto, idx);
+    };
+    for (size_t j = 0; j < layers; ++j) kv_need += stage_bytes(owned(ss, j), true);
+    kv_need += stage_bytes(draft, false);
     const bool staged = conversation_park_async_begin(kv_need);
     const auto p4 = Steady::now();
     struct Abandon { bool on; ~Abandon() { if (on) conversation_park_async_abandon(); } } abandon{staged};

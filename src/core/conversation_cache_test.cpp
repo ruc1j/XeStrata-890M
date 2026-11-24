@@ -199,7 +199,8 @@ int main() {
         check(cache.best(std::vector<int64_t>{1}, {}, true).tokens == 0, "short prompt cannot match");
         check(cache.best(std::vector<int64_t>{}, {}, true).tokens == 0, "empty prompt cannot match");
         cache.put(image({1, 2, 3}));
-        check(cache.best(a, {}, true).index == 1, "ties prefer most recently parked");
+        check(cache.best(a, {}, true).index == 0 && cache.size() == 1,
+              "an equal snapshot replaces the older one (the newest serves)");
     }
     {
         auto s = image({1, 2, 3});
@@ -314,8 +315,9 @@ int main() {
         check(cache.parked_prefix_tokens({1, 2, 3, 4, 60, 70, 71}, {}, chain, true) == 5,
               "an appended tail keeps the reported depth at the parked one");
         SavedConversation no_cp = image({1, 2, 3, 9});
-        check(cache.put(std::move(no_cp)) && cache.parked_prefix_tokens({1, 2, 3, 9}, {}, {}, true) == 0,
-              "an entry without checkpoints is never reported");
+        check(cache.put(std::move(no_cp)) && cache.parked_prefix_tokens({1, 2, 3, 9}, {}, {}, true) == 4 &&
+              cache.parked_prefix_tokens({1, 2, 3, 8}, {}, {}, true) == 0,
+              "an entry without checkpoints is reported by its live length, only when the state extends it");
     }
     {
         // borrowing: a NEW conversation that starts with a checkpoint inside a parked one (a sibling subagent with
@@ -633,9 +635,13 @@ int main() {
             return std::pair<int64_t, int64_t>(a_found, b_found);
         };
         const auto baseline = replay(false, false);
-        check(baseline.first == 14 && baseline.second == 0, "baseline: A returns to its prompt-read state, B to nothing (as measured)");
+        // (measured before live-prefix supersession, upstream f87121058: B found nothing; the older parks of one
+        // conversation no longer fill the slots, so B's copy at 15 tokens survives to its third turn)
+        check(baseline.first == 14 && baseline.second == 15,
+              "baseline: A returns to its prompt-read state, B to its last park");
         const auto parks_only = replay(true, false);
-        check(parks_only.first == 17 && parks_only.second == 0, "slot parks alone: A whole, B's copy evicted by a stale initial image");
+        check(parks_only.first == 17 && parks_only.second == 17,
+              "slot parks alone: A whole, B whole (its stale initial image no longer evicts it)");
         const auto both = replay(true, true);
         check(both.first == 17 && both.second == 17, "slot parks + checkpoints back: both return whole");
         // #4420: a batch slot's chain holds one checkpoint (its admission's): parking it must not drop (#342) the main session's copy of the
@@ -661,6 +667,51 @@ int main() {
         // what drop_superseded does with the slot's chain (the park this rule prevents): the root goes
         check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
               "the slot's chain supersedes the richer copy");
+        // upstream f87121058: a copy the slot's tokens only extend (its deepest checkpoint not in the slot's chain) is
+        // dropped as well, so the same rule names it: its root would go with it
+        SavedConversation extended = image({1, 2, 3, 4, 10, 11, 12});
+        extended.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
+        check(cache.put(std::move(extended)), "park the main session's copy again");
+        const std::vector<ConversationCheckpoint> later_chain{cp({1, 2, 3, 4, 10, 11, 12, 20})};
+        check(cache.supersedes_richer(slot_ids, {}, later_chain, true),
+              "a live-prefix copy with checkpoints the slot lacks is richer");
+        check(!cache.supersedes_richer(slot_ids, {}, full_chain, true),
+              "a chain that holds its checkpoints loses nothing");
+        std::vector<size_t> gone;
+        check(cache.drop_superseded(slot_ids, {}, later_chain, true, &gone) == 1 && cache.size() == 0 &&
+              gone == std::vector<size_t>({7}), "the live-prefix copy is dropped, its token count reported");
+    }
+    {   // upstream f87121058 (#6833): successive extensions of one conversation with every slot full: one snapshot
+        // parked, nothing evicted (to the disk tier); two conversations: the evicted one still goes
+        const size_t one = image({1, 2, 3}).bytes();
+        ConversationCache c(one * 8, 3);
+        std::vector<SavedConversation> sunk;
+        std::vector<int32_t> ids = {1, 2, 3};
+        for (int turn = 0; turn < 12; ++turn) {
+            ids.push_back(100 + turn);
+            SavedConversation im = image({1});
+            im.live.ids = ids;
+            check(c.put(std::move(im), 0, &sunk), "an extension parks");
+        }
+        check(c.size() == 1 && sunk.empty() && c.evictions() == 0 && c.superseded() == 11,
+              "twelve turns of one conversation: one snapshot parked, nothing evicted");
+        ConversationCache d(one * 8, 2);
+        std::vector<SavedConversation> sunk2;
+        check(d.put(image({1, 2, 3}), 0, &sunk2) && d.put(image({4, 5, 6}), 0, &sunk2) &&
+              d.put(image({7, 8, 9}), 0, &sunk2) && sunk2.size() == 1 &&
+              sunk2[0].live.ids == std::vector<int32_t>({1, 2, 3}),
+              "different conversations: the evicted one still goes");
+        check(d.put(image({4, 5, 6, 7}), 0, &sunk2) && d.size() == 2 && sunk2.size() == 1,
+              "the extension replaces its own prefix, evicts no other");
+        check(d.parked_prefix_tokens(std::vector<int32_t>{7, 8, 9, 1}, {}, {}, true) == 3,
+              "park-gain sees the prefix entry");
+        SavedConversation pinned_copy = image({20, 21, 22});
+        pinned_copy.checkpoints.push_back(ConversationCheckpoint{});
+        pinned_copy.checkpoints.back().ids = {20, 21};
+        pinned_copy.checkpoints.back().pinned = true;
+        check(d.put(std::move(pinned_copy), 0, &sunk2), "park a copy holding a pinned shared prefix");
+        check(d.drop_superseded({20, 21, 22, 23}, {}, {}, true) == 0,
+              "a copy with a pinned prefix is never superseded");
     }
     {
         // STRATA_PARK_SEGPOOL_MIB: the segment pool's idle bytes count against the budget beside the images, are given back

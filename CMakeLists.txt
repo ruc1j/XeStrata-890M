@@ -1410,6 +1410,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
+  # the serve watchdog's limits (STRATA_WATCHDOG_S / _IO_S) fall back to the defaults on a value out of range
+  # (upstream dca06a36d, #6861: negative seconds in the log; header-only)
+  add_executable(watchdog_limits_test src/core/watchdog_limits_test.cpp)
+  target_include_directories(watchdog_limits_test PRIVATE include)
+  add_test(NAME watchdog_limits_test COMMAND watchdog_limits_test)
   # STRATA_PARK_SEGPOOL_MIB (upstream e04c4c931, b0c818ad7, 01e21ef20): the arena behind the conversation buffers'
   # segments (header-only; a fake OS counts the calls), the buffers on it, and the park pools' sizes
   foreach(pool_test conversation_segment_pool_test conversation_buffer_pool_test park_pool_policy_test)

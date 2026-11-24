@@ -100,6 +100,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/batch_telemetry.hpp"
+#include "strata/core/watchdog_limits.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/model_spec.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -7542,9 +7543,14 @@ int main(int argc, char** argv) {
             strata::core::detail::HostMemory hm;
             if (!strata::core::detail::host_available_memory(hm) || hm.available == 0) return true;
             const auto& lay = strata::kernels::cpu::expert_layout();
-            const uint64_t extra = (uint64_t) std::max<int64_t>(0, lend_slots(c) - lend_slots(8192)) * lay.max_blob;
+            const bool pinned_experts = o.resident_cpu_experts || o.resident_gib != 0;
+            // upstream 878ee1a35 (#6687): without pinned experts the lent slots' experts come from file pages already
+            // resident or reclaimable, and the whole loan overstated the RAM held 2.4x to 25x (RX 7900 XT / XTX); half
+            // of it stays counted (the worst measured ratio was 0.42), all of it with the resident modes
+            uint64_t extra = (uint64_t) std::max<int64_t>(0, lend_slots(c) - lend_slots(8192)) * lay.max_blob;
+            if (!pinned_experts) extra /= 2;
             uint64_t pin = 0;
-            if (o.resident_cpu_experts || o.resident_gib != 0) {
+            if (pinned_experts) {
                 const uint64_t cached = (uint64_t) std::max<int64_t>(0, (int64_t) xcache.bytes());
                 pin = (lay.total > cached ? lay.total - cached : 0) +
                       (uint64_t) std::max<int64_t>(0, lend_slots(8192)) * lay.max_blob;
@@ -8660,9 +8666,18 @@ int main(int argc, char** argv) {
             // stays uncapped: it counts the retained buffers' capacity and directories, which put() charges too.
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec))
-                std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
-                             "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
+            // (upstream f87121058: and the older snapshots whose live tokens this one only extends, one line each)
+            {
+                std::vector<size_t> gone;
+                const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec, &gone);
+                if (dropped)
+                    std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
+                                 "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies",
+                                 conversations.size());
+                for (const size_t n : gone)
+                    std::fprintf(stderr, "strata serve: conversation cache: dropped superseded snapshot %zu tokens "
+                                 "(extended by %zu)\n", n, src.ids.size());
+            }
             // With the segment pool, no image is dropped (make_room, the RAM gate) while the last park's background copy
             // (STRATA_PARK_ASYNC) could still write into it: its freed granules may go to this capture or back to the system
             // (upstream synchronises the device here; the capture below joins the copy anyway, so this costs nothing)
@@ -9809,14 +9824,23 @@ int main(int argc, char** argv) {
         // GPU spinning forever.  STRATA_WATCHDOG_S=0 turns it off.  Issue #31: before it does, it reports what every
         // part was doing (stall_report), so one occurrence says where the wait is.
         {
-            const char* ws = std::getenv("STRATA_WATCHDOG_S");
-            const int limit = ws ? (int) std::strtol(ws, nullptr, 10) : 60;   // one step (a prompt layer, a verify window) takes seconds
+            // upstream dca06a36d (#6861): a value outside 0 to a week (or not a number) falls back to the default, said
+            // once, instead of a garbage or negative limit (watchdog_limits.hpp)
+            bool ws_bad = false, wio_bad = false;
+            // one step (a prompt layer, a verify window) takes seconds
+            const int limit = strata::core::watchdog_seconds(std::getenv("STRATA_WATCHDOG_S"), 60, &ws_bad);
             // #1407: while the OS is still reading the file tier (major faults / bytes read advance), a silent step is
             // slow, not stuck; it gets up to STRATA_WATCHDOG_IO_S (default 10 x the limit) of such time. 0 = no allowance.
             // #44: so does a step whose layers still finish (a verify window's CPU experts at 18 s a layer on a host
             // that pages), within the same allowance.
-            const char* wio = std::getenv("STRATA_WATCHDOG_IO_S");
-            const int io_limit = wio ? (int) std::strtol(wio, nullptr, 10) : limit * 10;
+            const int io_limit =
+                strata::core::watchdog_seconds(std::getenv("STRATA_WATCHDOG_IO_S"), limit * 10, &wio_bad);
+            if (ws_bad || wio_bad)
+                std::fprintf(stderr, "strata serve: %s%s is not a whole number of seconds (0 to 604800): "
+                                     "using %d s%s\n",
+                             ws_bad ? "STRATA_WATCHDOG_S" : "",
+                             wio_bad ? (ws_bad ? " and STRATA_WATCHDOG_IO_S" : "STRATA_WATCHDOG_IO_S") : "",
+                             ws_bad ? 60 : io_limit, ws_bad && wio_bad ? " (and 10 x that for the file tier)" : "");
             if (limit > 0)
                 std::thread([limit, io_limit] {
                     strata::platform::name_this_thread("strata-watchdog");
@@ -9936,17 +9960,25 @@ int main(int argc, char** argv) {
                                   std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), tok ? "" : "!");
                     wlist += wb;
                 }
-                strata::core::session_zero(ss, g, nullptr, main_cs);
-                (void) strata::gpu::stream_sync(main_cs);
-                drive.d.layers = 0;
-                drive.d.experts = 0;
-                drive.d.failed = false;
                 const bool mem1 = mem0 && strata::gpu::mem_info(&free1, &total_b);
                 std::fprintf(stderr, "strata serve: window warm-up: ms per width %s, total %.0f ms, %lld MiB of device memory "
                                      "(STRATA_WINDOW_WARM=0 turns it off)%s%s\n", wlist.c_str(),
                              std::chrono::duration<double, std::milli>(Clock::now() - w0).count(),
                              mem1 && free0 > free1 ? (long long) ((free0 - free1) >> 20U) : 0LL,
                              wok ? "" : "; a window failed: ", wok ? "" : werr.c_str());
+                std::fflush(stderr);
+                if (!wok) {
+                    // upstream 44710df59 (#6487): the failed window's error is said (and a fatal one ends the engine)
+                    // before anything else runs on the device: session_zero() over a lost device failed in turn and
+                    // hid the first error.  A request that reuses nothing zeroes the session itself (resume == 0).
+                    exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : werr);
+                } else {
+                    strata::core::session_zero(ss, g, nullptr, main_cs);
+                    (void) strata::gpu::stream_sync(main_cs);
+                }
+                drive.d.layers = 0;
+                drive.d.experts = 0;
+                drive.d.failed = false;
             }
         }
         strata::core::progress_at("idle");
@@ -11518,11 +11550,23 @@ int main(int argc, char** argv) {
             }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
+            // upstream 534802c8d (#6493): prompt + max_new is checked before the position table below is written, in a
+            // form that cannot overflow (max_new comes from the request line)
+            if (n < 0 || max_new < 0 || o.max_context < 8 || n > o.max_context - 8 || max_new > o.max_context - 8 - n) {
+                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
+                            (long long) max_new, (long long) o.max_context);
+                continue;
+            }
             if (geni || !mrope_identity) {
                 // positions for every cell this request can reach; the identity again for a text request
                 std::string ve;
                 row_ptr.assign((size_t) n, nullptr);
                 const int64_t cells = (int64_t) mrope_host.size() / 3;
+                if (n > cells) {
+                    std::printf("ERR prompt (%lld tokens) exceeds the position table (%lld)\n", (long long) n,
+                                (long long) cells);
+                    continue;
+                }
                 auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
                     mrope_host[(size_t) c * 3] = (int32_t) t;
                     mrope_host[(size_t) c * 3 + 1] = (int32_t) h;
@@ -11609,11 +11653,6 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
-                std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
-                            (long long) max_new, (long long) o.max_context);
-                continue;
-            }
             bool bad = false;
             for (int64_t t : ids) bad = bad || t < 0 || t >= n_vocab;
             if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); continue; }
@@ -12636,8 +12675,12 @@ int main(int argc, char** argv) {
                 return e != nullptr && std::strtol(e, nullptr, 10) != 0;
             }();
             // Only add a snapshot; the existing token and image checks still decide reuse.
+            // #2518: the branch point sits at the turn before the one this prompt ends with, which is
+            // max_tail tokens further back - a long reply hides it past the default 1024, so the engine
+            // never made the checkpoint a branching follow-up needs. 16384 covers a full reply.
             const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
-                ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
+                ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token,
+                                                               8192, 16384) : -1;
             // pin=N (opt-in): one more place the prompt is read to and checkpointed.  One pinned prefix at a time: a
             // new pin replaces the old; it needs room for the root, the pin and a rotating checkpoint
             int64_t pin_at = -1;
@@ -14101,12 +14144,12 @@ int main(int argc, char** argv) {
                     }
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
-                    const ConvCheckpoint* best = nullptr;
-                    for (const ConvCheckpoint& c : checks)
-                        if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
-                            std::equal(c.ids.begin(), c.ids.end(), live.begin()))
-                            best = &c;
-                    if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                    // #2518: keep EVERY checkpoint that prefixes the conversation, not just the longest: the
+                    // message boundary between a shared context and the question is what a later request
+                    // branching inside this conversation resumes from. The longest (the turn) alone diverges
+                    // before that boundary and is useless to such a request, which then overwrites another
+                    // chat's slot instead. (The slot -> main copy at copy_from_slot already carries all of them.)
+                    sl.checks = strata::core::conversation_checkpoints_prefixing(checks, live, sl.img);
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(),
                                  std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
