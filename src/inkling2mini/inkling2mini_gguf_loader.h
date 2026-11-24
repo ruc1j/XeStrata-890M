@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -28,6 +29,9 @@
 #include "inkling2mini_safetensors_loader.h"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/strata_reader.hpp"
+#include "strata/core/inkling2mini_dspark_layout.hpp"
+#include "strata/core/inkling2mini_names.hpp"
+#include "strata/core/mapped_pages.hpp"
 #include "strata/quant/dequant.hpp"
 #include "strata/quant/sk_codecs.hpp"
 
@@ -263,6 +267,8 @@ struct GgufAdapter {
     bool has_dspark_st = false;
     SafetensorsShard dspark_st;
     bool is_rewrite_layout = false;  // true = llama.cpp master / Unsloth (blk.0.ffn_gate_up_exps.weight)
+    // true = merged mainline (#32694): rewrite names + per-block loop_msg_query & loop_*_ctrl_*
+    bool is_merged_layout = false;
 
     std::vector<uint8_t> sec1_arena; // Assembled canonical Section 1 trunk + DSpark bytes
     std::vector<strata::artifact::StrataExpertEntry> expert_dir;
@@ -335,6 +341,7 @@ struct GgufAdapter {
         }
 
         is_rewrite_layout = (model->find("blk.0.ffn_gate_up_exps.weight") != nullptr);
+        is_merged_layout  = is_rewrite_layout && (model->find("loop_res_query.weight") == nullptr);
 
         // 1. Parse Inkling2MiniCfg from GGUF metadata (supports BOTH llama.cpp master & PR #32187 keys)
         m = ManifestT{};
@@ -375,9 +382,9 @@ struct GgufAdapter {
             c.situ_lb    = static_cast<float>(get_num({"mlp_up_softcap", "activation.situ_linear_beta"}, 25.0));
             c.logit_softcap = static_cast<float>(get_num({"final_logit_softcapping"}, 30.0));
             c.vocab_unpadded = static_cast<int>(get_num({"unpadded_vocab_size", "vocab_size_unpadded"}, 200058));
-            c.num_passes = static_cast<int>(get_num({"num_loops"}, 3));
-            c.core_start = static_cast<int>(get_num({"loop.core_start"}, 6));
-            c.core_end   = static_cast<int>(get_num({"loop.core_end"}, 18));
+            c.num_passes = static_cast<int>(get_num({"num_loops", "loop.count"}, 3));
+            c.core_start = static_cast<int>(get_num({"loop.core_start", "loop.start"}, 6));
+            c.core_end   = static_cast<int>(get_num({"loop.core_end", "loop.end"}, 18));
             c.gate_rank  = static_cast<int>(get_num({"loop.gate_rank"}, 64));
             if (const auto* tok_emb = model->find("token_embd.weight")) {
                 if (tok_emb->shape.size() >= 2) c.vocab_padded = static_cast<int>(tok_emb->shape[1]);
@@ -385,14 +392,21 @@ struct GgufAdapter {
             if (const auto* eos = meta.get("tokenizer.ggml.eos_token_id")) c.eos_token_id = static_cast<int>(eos->u);
 
             const int core_len = (c.num_passes > 1) ? (c.core_end - c.core_start) : 0;
-            c.n_phys = n_visits_meta - (c.num_passes - 1) * core_len;
+            // Merged mainline (#32694, ggml-org/Inkling-2-Mini-GGUF) stores physical block_count=24 directly;
+            // Unsloth / pre-merge GGUFs store virtual visit count=48.
+            if (is_merged_layout || arch_v->s == "inkling2_loop" || n_visits_meta <= c.core_end + 6) {
+                c.n_phys = n_visits_meta;
+            } else {
+                c.n_phys = n_visits_meta - (c.num_passes - 1) * core_len;
+            }
             if (c.n_phys <= 0) c.n_phys = 24;
 
             c.is_swa.assign(c.n_phys, 1);
             if (const auto* pat = meta.get(ap + "attention.sliding_window_pattern");
-                pat && pat->type == strata::MetaType::ARRAY && static_cast<int>(pat->items.size()) >= n_visits_meta) {
+                pat && pat->type == strata::MetaType::ARRAY && static_cast<int>(pat->items.size()) >= c.n_phys) {
+                const bool phys_indexed = is_merged_layout || (static_cast<int>(pat->items.size()) == c.n_phys);
                 for (int l = 0; l < c.n_phys; ++l) {
-                    int v = (l < c.core_end) ? l : (l + (c.num_passes - 1) * core_len);
+                    int v = phys_indexed ? l : ((l < c.core_end) ? l : (l + (c.num_passes - 1) * core_len));
                     bool swa_v = false;
                     if (v < static_cast<int>(pat->items.size())) {
                         swa_v = (pat->items[v].num() != 0.0);
@@ -517,8 +531,34 @@ struct GgufAdapter {
 
         const int core_len = c.core_end - c.core_start;
         if (c.num_passes > 1 && core_len > 0) {
-            if (!copy_vec_f32("loop_res_query.weight", "model.llm.middle_cycle_cross_pass_queries", {2 * core_len, D})) return false;
-            if (!copy_vec_f32("loop_kv_res_query.weight", "model.llm.middle_cycle_cross_pass_kv_queries", {2 * core_len, D})) return false;
+            if (model->find("loop_res_query.weight")) {
+                if (!copy_vec_f32("loop_res_query.weight", "model.llm.middle_cycle_cross_pass_queries",
+                                  {2 * core_len, D})) return false;
+                if (!copy_vec_f32("loop_kv_res_query.weight", "model.llm.middle_cycle_cross_pass_kv_queries",
+                                  {2 * core_len, D})) return false;
+            } else {
+                // ggml-org GGUF layout: per-layer blk.{core_start..core_end-1}.loop_msg_query.weight [4, D]
+                // Row order verified bit-exact against Unsloth: row0=q[2i], row1=kv[2i], row2=kv[2i+1], row3=q[2i+1].
+                std::vector<float> h_q(static_cast<size_t>(2 * core_len) * D, 0.0f);
+                std::vector<float> h_kv(static_cast<size_t>(2 * core_len) * D, 0.0f);
+                for (int i = 0; i < core_len; ++i) {
+                    const std::string mn = "blk." + std::to_string(c.core_start + i) + ".loop_msg_query.weight";
+                    std::vector<float> mq;
+                    if (!read_tensor_f32(*model, mn, mq, err)) return false;
+                    if (mq.size() < static_cast<size_t>(4) * D) {
+                        err = "GGUF: short tensor " + mn;
+                        return false;
+                    }
+                    const size_t row = static_cast<size_t>(D);
+                    const size_t row_bytes = row * sizeof(float);
+                    std::memcpy(h_q.data()  + static_cast<size_t>(2 * i + 0) * row, mq.data() + 0 * row, row_bytes);
+                    std::memcpy(h_kv.data() + static_cast<size_t>(2 * i + 0) * row, mq.data() + 1 * row, row_bytes);
+                    std::memcpy(h_kv.data() + static_cast<size_t>(2 * i + 1) * row, mq.data() + 2 * row, row_bytes);
+                    std::memcpy(h_q.data()  + static_cast<size_t>(2 * i + 1) * row, mq.data() + 3 * row, row_bytes);
+                }
+                add_f32("model.llm.middle_cycle_cross_pass_queries", h_q, {2 * core_len, D});
+                add_f32("model.llm.middle_cycle_cross_pass_kv_queries", h_kv, {2 * core_len, D});
+            }
         }
 
         // Helper: load a ShortConv weight [C, 4] (lag 3..0) into raw unfolded canonical convention
@@ -547,7 +587,7 @@ struct GgufAdapter {
             if (!copy_mat_bf16(b + "attn_sink_proj.weight", p + "attn.attn_sink_proj.weight", c.n_head, D)) return false;
             if (!copy_mat_bf16(b + "attn_gate.weight", p + "attn.gate_attn.weight", q_dim, D)) return false;
             if (!copy_mat_bf16(b + "attn_output.weight", p + "attn.wo_ud.weight", D, q_dim)) return false;
-            if (!copy_mat_bf16(b + "ffn_gate_inp.weight", p + "mlp.gate.weight", c.n_experts, D)) return false;
+            if (!copy_vec_f32(b + "ffn_gate_inp.weight", p + "mlp.gate.weight", {c.n_experts, D})) return false;
             if (!copy_vec_f32(b + "exp_probs_b.bias", p + "mlp.gate.bias", {c.n_experts})) return false;
             if (!copy_vec_f32(b + "ffn_norm.weight", p + "mlp_norm.weight", {D})) return false;
 
@@ -645,22 +685,49 @@ struct GgufAdapter {
                               "model.llm.attn_res.mlp_queries." + std::to_string(il), {D})) return false;
 
             if (c.num_passes > 1 && il >= c.core_start && il < c.core_end) {
-                static const char* mods[4] = {"attn", "k", "v", "mlp"};
+                static const char* mods[4]      = {"attn", "k", "v", "mlp"};
+                static const char* ggml_mods[4] = {"q_ctrl", "k_ctrl", "v_ctrl", "ffn_ctrl"};
+                const bool use_ggml_ctrl = (model->find(b + "loop_q_ctrl_down.weight") != nullptr);
                 for (int mi = 0; mi < 4; ++mi) {
-                    const std::string gp = b + "loop_" + mods[mi] + "_";
+                    const std::string gp = b + "loop_" + (use_ggml_ctrl ? ggml_mods[mi] : mods[mi]) + "_";
                     const std::string cp = p + "controllers." + mods[mi] + ".";
-                    if (!copy_mat_bf16(gp + "down.weight", cp + "down_weight", c.gate_rank, 2 * D)) return false;
-                    if (!copy_mat_bf16(gp + "gain.weight", cp + "gain_weight", D, c.gate_rank)) return false;
-                    if (!copy_mat_bf16(gp + "forget.weight", cp + "forget_weight", D, c.gate_rank)) return false;
+                    if (!copy_vec_f32(gp + "down.weight",   cp + "down_weight",   {c.gate_rank, 2 * D})) return false;
+                    if (!copy_vec_f32(gp + "gain.weight",   cp + "gain_weight",   {D, c.gate_rank})) return false;
+                    if (!copy_vec_f32(gp + "forget.weight", cp + "forget_weight", {D, c.gate_rank})) return false;
                 }
             }
         }
 
         // 3. Optional external DSpark drafter (either mtp.safetensors or dspark-*.gguf!)
-        if (!explicit_dspark.empty()) {
-            if (explicit_dspark.size() >= 12 && explicit_dspark.substr(explicit_dspark.size() - 12) == ".safetensors") {
-                dspark_st.path = explicit_dspark;
-                std::string e = strata::image::st_read_header(explicit_dspark, dspark_st.st);
+        //    Auto-discover companion dspark-*.gguf / mtp.safetensors in the model directory when not explicitly
+        //    provided.
+        std::string dspark_file = explicit_dspark;
+        const size_t dspark_arena0 = sec1_arena.size();
+        if (dspark_file.empty()) {
+            const size_t sep = path.find_last_of("/\\");
+            const std::string dir_path = (sep != std::string::npos) ? path.substr(0, sep) : ".";
+            try {
+                if (std::filesystem::exists(dir_path) && std::filesystem::is_directory(dir_path)) {
+                    for (const auto& entry : std::filesystem::directory_iterator(dir_path)) {
+                        if (!entry.is_regular_file()) continue;
+                        const std::string fname = entry.path().filename().string();
+                        std::string fl = fname;
+                        for (char& ch : fl) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                        const bool dspark_gguf_name = fl.find("dspark") != std::string::npos && fl.size() >= 5 &&
+                                                      fl.substr(fl.size() - 5) == ".gguf";
+                        if (fl == "mtp.safetensors" || dspark_gguf_name) {
+                            dspark_file = entry.path().string();
+                            break;
+                        }
+                    }
+                }
+            } catch (...) {  // NOLINT(bugprone-empty-catch): an unreadable folder only means no drafter is found there.
+            }
+        }
+        if (!dspark_file.empty()) {
+            if (dspark_file.size() >= 12 && dspark_file.substr(dspark_file.size() - 12) == ".safetensors") {
+                dspark_st.path = dspark_file;
+                std::string e = strata::image::st_read_header(dspark_file, dspark_st.st);
                 if (!e.empty()) { err = "dspark safetensors: " + e; return false; }
                 has_dspark_st = true;
                 for (const auto& kv : dspark_st.st.tensors) {
@@ -668,61 +735,41 @@ struct GgufAdapter {
                     if (wfmt < 0) continue;
                     size_t off = align64(sec1_arena.size());
                     size_t nb = static_cast<size_t>(kv.second.end - kv.second.begin);
-                    sec1_arena.resize(off + nb, 0);
-                    if (!detail::read_slice_from_file(dspark_st.path, dspark_st.st.data_start + kv.second.begin,
-                                                      sec1_arena.data() + off, nb, err)) return false;
+                    // norm weights, biases and fuse_weight are read as F32 by the drafter (the GGUF drafter path
+                    // widens them too)
+                    const bool widen =
+                        strata::core::inkling2mini_dspark_wants_f32(kv.first, kv.second.shape.size(), wfmt);
+                    if (widen) {
+                        std::vector<uint8_t> narrow(nb);
+                        if (!detail::read_slice_from_file(dspark_st.path, dspark_st.st.data_start + kv.second.begin,
+                                                          narrow.data(), nb, err)) return false;
+                        sec1_arena.resize(off + nb * 2, 0);
+                        strata::core::inkling2mini_widen16_to_f32(narrow.data(), wfmt, nb / 2, sec1_arena.data() + off);
+                        nb *= 2;
+                    } else {
+                        sec1_arena.resize(off + nb, 0);
+                        if (!detail::read_slice_from_file(dspark_st.path, dspark_st.st.data_start + kv.second.begin,
+                                                          sec1_arena.data() + off, nb, err)) return false;
+                    }
                     TInfoT ti;
-                    ti.name = kv.first;
-                    ti.fmt = wfmt;
+                    ti.name = strata::core::inkling2mini_dspark_name(kv.first);
+                    ti.fmt = widen ? 101 : wfmt;
                     ti.shape = kv.second.shape;
                     ti.off = off;
                     ti.bytes = nb;
-                    m.dspark_tensors[kv.first] = std::move(ti);
+                    m.dspark_tensors[ti.name] = std::move(ti);
                 }
                 m.dspark.present = !m.dspark_tensors.empty();
-            } else if (gguf_detail::has_gguf_magic(explicit_dspark)) {
+            } else if (gguf_detail::has_gguf_magic(dspark_file)) {
                 try {
-                    dspark_gguf = std::make_unique<strata::GgufModel>(strata::GgufModel::open(explicit_dspark));
+                    dspark_gguf = std::make_unique<strata::GgufModel>(strata::GgufModel::open(dspark_file));
                 } catch (const std::exception& e) {
                     err = std::string("dspark GGUF open: ") + e.what();
                     return false;
                 }
                 // Map all 54 tensors from Unsloth/llama.cpp dspark-*.gguf (dflash arch) to canonical DSpark names
                 auto map_dspark_name = [](const std::string& n) -> std::string {
-                    if (n == "dspark_fuse.weight" || n == "dspark.fuse_weight" || n == "fuse_weight") return "fuse_weight";
-                    if (n == "mask_embd.weight" || n == "dspark.mask_embed" || n == "mask_embed") return "mask_embed";
-                    if (n == "output_norm.weight" || n == "dspark.output_norm.weight" || n == "norm.weight") return "norm.weight";
-                    if (n == "dspark_norm.weight") return "markov_head.dflare_norm.weight";
-                    if (n == "dspark_hidden_out.weight") return "markov_head.hidden_out.weight";
-                    if (n == "dspark_hidden_out.bias") return "markov_head.hidden_out.bias";
-                    if (n == "markov_w1.weight") return "markov_head.markov_w1.weight";
-                    if (n == "joint_proj.weight") return "markov_head.rnn_proj.weight";
-                    if (n == "joint_proj.bias") return "markov_head.rnn_proj.bias";
-                    if (n.rfind("blk.", 0) == 0) {
-                        size_t dot = n.find('.', 4);
-                        if (dot != std::string::npos) {
-                            std::string idx = n.substr(4, dot - 4);
-                            std::string rest = n.substr(dot + 1);
-                            std::string lp = "layers." + idx + ".";
-                            if (rest == "dflare_norm.weight") return lp + "dflare_norm.weight";
-                            if (rest == "attn_norm.weight") return lp + "input_layernorm.weight";
-                            if (rest == "ffn_norm.weight") return lp + "post_attention_layernorm.weight";
-                            if (rest == "ffn_down.weight") return lp + "mlp.down_proj.weight";
-                            if (rest == "ffn_gate.weight") return lp + "mlp.gate_proj.weight";
-                            if (rest == "ffn_up.weight") return lp + "mlp.up_proj.weight";
-                            if (rest == "attn_q.weight") return lp + "self_attn.q_proj.weight";
-                            if (rest == "attn_k.weight") return lp + "self_attn.k_proj.weight";
-                            if (rest == "attn_v.weight") return lp + "self_attn.v_proj.weight";
-                            if (rest == "attn_k_ctx.weight") return lp + "self_attn.k_proj_ctx.weight";
-                            if (rest == "attn_v_ctx.weight") return lp + "self_attn.v_proj_ctx.weight";
-                            if (rest == "attn_output.weight") return lp + "self_attn.o_proj.weight";
-                            if (rest == "attn_q_norm.weight") return lp + "self_attn.q_norm.weight";
-                            if (rest == "attn_k_norm.weight") return lp + "self_attn.k_norm.weight";
-                            if (rest == "attn_k_ctx_norm.weight") return lp + "self_attn.k_norm_ctx.weight";
-                        }
-                    }
-                    if (n.rfind("dspark.", 0) == 0) return n.substr(7);
-                    return n;
+                    return strata::core::inkling2mini_dspark_plain_from_gguf(n);
                 };
                 for (size_t si = 0; si < dspark_gguf->size(); ++si) {
                     for (const auto& t : dspark_gguf->shard(si).tensors()) {
@@ -735,7 +782,8 @@ struct GgufAdapter {
                         size_t nb = v.size() * sizeof(uint16_t);
                         bool keep_f32 = (sh.size() <= 1 || cn == "fuse_weight" || cn.find("norm") != std::string::npos || cn.find("bias") != std::string::npos);
                         TInfoT ti;
-                        ti.name = cn;
+                        // Backends ask for "dspark.<name>" (#6762, #6784, #6717): the drafter GGUF carries plain names.
+                        ti.name = strata::core::inkling2mini_dspark_name(cn);
                         ti.shape = sh;
                         ti.off = off;
                         if (keep_f32) {
@@ -750,12 +798,37 @@ struct GgufAdapter {
                             ti.fmt = 102;
                         }
                         ti.bytes = nb;
-                        m.dspark_tensors[cn] = std::move(ti);
+                        m.dspark_tensors[ti.name] = std::move(ti);
                     }
                 }
                 m.dspark.present = !m.dspark_tensors.empty();
             }
+            // A drafter in a layout this engine does not read (Unsloth's llama.cpp mainline "dflash" file of
+            // 2026-11-23, ...) never stops the model: say so once, drop it, and start with drafting off.
+            if (m.dspark.present) {
+                std::set<std::string> plain_names;
+                for (const auto& kv : m.dspark_tensors)
+                    plain_names.insert(strata::core::inkling2mini_dspark_plain(kv.first));
+                std::string why;
+                if (!strata::core::inkling2mini_dspark_layout_check(plain_names, &why)) {
+                    std::fprintf(stderr, "%s\n",
+                                 strata::core::inkling2mini_dspark_layout_message(dspark_file, why).c_str());
+                    m.dspark_tensors.clear();
+                    m.dspark.present = false;
+                    has_dspark_st = false;
+                    dspark_gguf.reset();
+                    sec1_arena.resize(dspark_arena0);
+                }
+            }
         }
+
+        // The trunk, drafter and vision tensors are copied into sec1_arena by now: drop their mapped pages (everything
+        // but the routed experts).
+        for (size_t si = 0; si < model->size(); ++si)
+            for (const auto& t : model->shard(si).tensors())
+                if (t.name.find("_exps") == std::string::npos)
+                    strata::core::release_mapped_pages(model->shard(si).tensor_data(t),
+                                                       static_cast<size_t>(strata::tensor_payload_bytes(t)));
 
         // 4. Index routed experts (NVFP4 -> lossless SF4 code_id=15; all other GGUF quants -> lossless GGUF_RAW code_id=20!)
         layers.assign(c.n_phys, LayerExpertMeta{});
@@ -923,6 +996,11 @@ struct GgufAdapter {
                     w2_s + r * (F / 16),
                     static_cast<int64_t>(F));
             }
+            // this expert is copied out of the mapping: give its pages back (gate and up are F rows each, down is D
+            // rows)
+            strata::core::release_mapped_pages(g_src, F * src_gu_row_b);
+            strata::core::release_mapped_pages(u_src, F * src_gu_row_b);
+            strata::core::release_mapped_pages(d_src, D * src_dn_row_b);
             return true;
         }
 
@@ -945,6 +1023,10 @@ struct GgufAdapter {
             std::memcpy(out.data() + 32 + lm.gu_stride, lm.up_base + static_cast<size_t>(e) * lm.up_stride, lm.up_stride);
         }
         std::memcpy(out.data() + lm.dn_offset, lm.dn_base + static_cast<size_t>(e) * lm.dn_stride, lm.dn_stride);
+        strata::core::release_mapped_pages(lm.gu_base + static_cast<size_t>(e) * lm.gu_stride, lm.gu_stride);
+        if (!lm.is_fused_gu)
+            strata::core::release_mapped_pages(lm.up_base + static_cast<size_t>(e) * lm.up_stride, lm.up_stride);
+        strata::core::release_mapped_pages(lm.dn_base + static_cast<size_t>(e) * lm.dn_stride, lm.dn_stride);
         return true;
     }
 };

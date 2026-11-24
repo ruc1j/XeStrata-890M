@@ -134,15 +134,31 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
     }
     BackendOpts bo = bopts;
     bo.enable_dspark = use_dspark;
+    if (prompt_len + gen_len > bo.max_ctx) {
+        bo.max_ctx = prompt_len + gen_len + 16;
+    }
     auto backend = make_default_backend(force_cpu, &bo);
     if (!backend->init(mf, bo, err)) {
         fprintf(stderr, "init: %s\n", err.c_str());
         return 1;
     }
+    // The context the slots get: the prompt and the decode steps are cut to fit it.
+    const int eff_ctx = bo.max_ctx;
+    if (prompt_len >= eff_ctx) {
+        fprintf(stderr, "[bench] clamping prompt_len %d -> %d to fit max_ctx=%d\n", prompt_len,
+                std::max(1, eff_ctx - 1), eff_ctx);
+        prompt_len = std::max(1, eff_ctx - 1);
+    }
+    const int max_dec_steps = std::max(0, eff_ctx - prompt_len);
+    if (gen_len > max_dec_steps) {
+        fprintf(stderr, "[bench] clamping gen_len %d -> %d to fit max_ctx=%d (prompt=%d)\n",
+                gen_len, max_dec_steps, eff_ctx, prompt_len);
+        gen_len = max_dec_steps;
+    }
     const int P = std::max(1, std::min(kMaxParallelSlots, bo.parallel));
     const int V = mf.m.c.vocab_unpadded;
     for (int s = 0; s < P; ++s) {
-        if (!backend->alloc_slot(s, bo.max_ctx, bo.kv_dtype, err)) {
+        if (!backend->alloc_slot(s, eff_ctx, bo.kv_dtype, err)) {
             fprintf(stderr, "alloc_slot %d: %s\n", s, err.c_str());
             return 1;
         }
@@ -179,9 +195,9 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
     int total_gen = 0;
     if (use_dspark && P == 1) {
         int cur_pos = prompt_len;
-        while (total_gen < gen_len) {
-            const int rem = gen_len - total_gen;
-            if (rem >= 2 && cur_pos + 12 < bo.max_ctx) {
+        while (total_gen < gen_len && cur_pos < eff_ctx) {
+            const int rem = std::min(gen_len - total_gen, eff_ctx - cur_pos);
+            if (rem >= 2 && cur_pos + 12 < eff_ctx) {
                 int32_t emitted[16]{};
                 int drafted = 0;
                 const int n_emit = backend->dspark_spec_step_greedy(
@@ -499,7 +515,11 @@ int main(int argc, char** argv) {
             else if (kv == "fp16" || kv == "f16") { cfg.bopts.kv_dtype = KvDtype::FP16; cfg.bopts.kv_dtype_auto = false; }
             else if (kv == "k8v8" || kv == "i8" || kv == "q8") { cfg.bopts.kv_dtype = KvDtype::K8V8; cfg.bopts.kv_dtype_auto = false; }
             else if (kv == "k8v4") { cfg.bopts.kv_dtype = KvDtype::K8V4; cfg.bopts.kv_dtype_auto = false; }
-            else { cfg.bopts.kv_dtype_auto = true; }
+            else if (kv == "auto") { cfg.bopts.kv_dtype_auto = true; }
+            else {
+                fprintf(stderr, "unknown --kv value '%s' (expected: auto, fp8, fp16, k8v8, k8v4)\n", kv.c_str());
+                return 2;
+            }
         } else if (a == "--draft") {
             cfg.draft_mode = next();
             cfg.bopts.enable_dspark = (cfg.draft_mode != "off");
@@ -540,11 +560,15 @@ int main(int argc, char** argv) {
                    "  --version\n"
                    "  --info PATH [--vision VISION] [--dspark PATH]\n"
                    "  --export-tokenizer PATH OUT_DIR\n"
-                   "  --selfcheck [--native PATH] [--verify-hash] [--cpu] [--gpus 1|2] [--kv fp16|fp8|k8v8|k8v4]\n"
-                   "  --bench --native PATH [--parallel 1..64] [--gpus 1|2] [--ep-split F] [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4] [--prompt-len N] [--gen N]\n"
+                   "  --selfcheck [--native PATH] [--verify-hash] [--cpu] [--gpu N] [--gpus 1|2]"
+                   " [--kv auto|fp16|fp8|k8v8|k8v4]\n"
+                   "  --bench --native PATH [--parallel 1..64] [--gpu N] [--gpus 1|2] [--ep-split F]"
+                   " [--vram-reserve-mib N] [--cpu-threads N] [--kv auto|fp16|fp8|k8v8|k8v4]"
+                   " [--prompt-len N] [--gen N]\n"
                    "  --kld-eval REF.bin --native PATH\n"
                    "  --ring-check STRIDE --native PATH --prompt-ids IDS [--max-context N] [--chunk N]\n"
-                   "  --serve --native PATH [--vision VISION] [--dspark PATH] [--max-context N] [--parallel 1..64] [--gpus 1|2] [--draft auto|dspark|off]\n",
+                   "  --serve --native PATH [--vision VISION] [--dspark PATH] [--max-context N] [--parallel 1..64]"
+                   " [--gpu N] [--gpus 1|2] [--kv auto|fp16|fp8|k8v8|k8v4] [--draft auto|dspark|off]\n",
                    INKLING2MINI_VERSION);
             return 0;
         } else {

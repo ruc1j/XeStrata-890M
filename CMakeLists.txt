@@ -1112,6 +1112,14 @@ if(STRATA_ENABLE_XE)
                                  third_party/main/stb)
       target_link_libraries(inkling2mini_sample_topk_test PRIVATE Threads::Threads)
       add_test(NAME inkling2mini_sample_topk_test COMMAND inkling2mini_sample_topk_test)
+      # the model loaders' parts that need no model file and no GPU: the drafter tensors reach the backends as
+      # "dspark.<name>" (upstream #6762), a BF16 / F16 drafter's vectors widen to F32, a drafter in a layout the runners
+      # do not read is dropped, and a copied GGUF tensor's mapped pages go back to the OS
+      foreach(_t inkling2mini_names_test inkling2mini_widen_test inkling2mini_dspark_layout_test mapped_pages_test)
+        add_executable(${_t} tests/core/${_t}.cpp)
+        target_include_directories(${_t} PRIVATE include)
+        add_test(NAME ${_t} COMMAND ${_t})
+      endforeach()
     endif()
   endif()
 

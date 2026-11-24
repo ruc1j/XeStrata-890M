@@ -44,6 +44,13 @@ public:
     }
 
     bool init(const Inkling2MiniModelFile& model, const BackendOpts& opts, std::string& err) override {
+        // mod_.load re-opens model.path with the .strata reader: a GGUF or safetensors model gave "Invalid .strata
+        // magic" (#6643)
+        if (!model.is_native_strata()) {
+            err = std::string("sycl: the SYCL backend reads .strata files only, this model is ") +
+                  source_kind_name(model.kind) + " (give it a .strata file, or run this one with --cpu)";
+            return false;
+        }
         // The runner's K/V pages are fp16 (upstream 759ccf6c6): the integer forms are refused, fp8 is held as fp16.
         if (kv_dtype_is_int_quant(opts.kv_dtype)) {
             err = "sycl: --kv k8v4/k8v8 is not supported on the SYCL backend (its K/V pages are fp16); "
