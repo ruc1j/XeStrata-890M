@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/quant/sk_codecs.cpp - Native .strata v1.0 S_K codecs & AVX-512 VNNI / AVX2 / Scalar dot products
 #include "strata/quant/sk_codecs.hpp"
 

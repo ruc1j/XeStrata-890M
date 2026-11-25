@@ -10,9 +10,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.2.19-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
-移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 upstream の Strata 0.2.19（エンジンの版は 0.1.65、`c6f6427`）までの変更のうち、
-この fork に当たるものを取り込んでいます（[Strata 0.1.65 の取り込み](#strata-0165-の取り込み)から [Strata 0.1.38 の取り込み](#strata-0138-の取り込み)までの各節）。
+XeStrata xe0.2.21-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 upstream の Strata 0.2.21（エンジンの版は 0.1.67、`d46f5f2`）までの変更のうち、
+この fork に当たるものを取り込んでいます（[Strata 0.1.67 の取り込み](#strata-0167-の取り込み)から [Strata 0.1.38 の取り込み](#strata-0138-の取り込み)までの各節）。
 同じ SYCL のコードを intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
 upstream の CUDA のビルドは廃止してソースも消しました。
 CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe の各ソースは移植元の CUDA のファイル名をコメントに書いています。
@@ -231,6 +231,29 @@ upstream の Strata 0.2.10 の既定の drafter、DFlash2（incoai/Qwen3.8-Flash
 1 round に受け入れるトークンの数は MTP と同じほど（約 2.5）ですが、drafter 自身が 1 round に 7.8 ms かかり（5 層の Q4_0 の重み 0.5 GB を 890M の帯域で読む時間が大半）、MTP の約 4 ms より長いので、decode は 6〜7% 遅くなります。upstream が AMD の HIP で MTP より 4〜12% 速かったのは、帯域が 2.5〜6 倍のカード（Strix Halo、R9700）です。Issue #23（2026-10-24）の見積もり（drafter の重みの読みが MTP の 4 ms を超え、+2〜3% が上限）のとおりでした。drafter は下書きを変えるだけで、答えは verify が決めます。
 
 upstream が Strata-rdna3 から取り込んだ attention のカーネル（d31256b79）も、opt-in で移してあります（`STRATA_DF2_ATTN=3`）。Q と K と転置した V を FP16 でローカルメモリーに置き、S = Q K^T と O += P V を RDNA の行列命令（WMMA）で計算します。float64 の参照との差は出力の RMS の 0.2〜0.4% です（`dflash2_attention_parity`）。890M の交互 3 周（6 チャット、greedy、400 トークン）で、drafter は 7.89 / 7.72 / 7.72 ms から 7.61 / 7.57 / 7.56 ms/round になり、decode は 36.23 / 36.96 / 36.92 対 36.75 / 37.01 / 37.01 tok/s でした。同じ周の MTP は 40.81 / 42.27 / 42.02 tok/s です。答えは 3 周とも MTP と同じでした。drafter の時間の大半は重みを読む時間なので、attention を速くしても MTP との差は埋まりません。既定は FP32 のカーネルのままです。
+
+## Strata 0.1.67 の取り込み
+
+upstream の Strata 0.2.19 から 0.2.21（エンジンの版は 0.1.67、2026-11-24）までの 293 コミット（merge を除きます）を 1 件ずつ見て、エンジン・serve・setup・tools の層に当たるものを XeStrata-890M に移しました。一覧は `.upstream-0167.md`（リポジトリの根、git の外）です。
+大半は NVIDIA、Intel の Battlemage と Panther Lake、Windows、複数 GPU 向けの変更と、app と Terminal と Control の層、Hy4-Flash のエンジンで、この節で移したものには入っていません。
+
+移したものは次のとおりです。
+
+- エンジン: batch のスロットに入る会話は、接頭辞になる checkpoint をすべて持ちます（1f1057b3f）。会話の途中から分かれる後続の要求が、メッセージの境目から再開します。
+- エンジン: 新しい ids の接頭辞になっている古いスナップショットも、会話キャッシュから落とします（f87121058）。park の stage は、ストリームの K/V では索引の行だけを数えます（ad4c565e8 の一部）。890M でストリームの K/V を使う起動では、stage が共有の RAM を 9 倍ほど多く取っていました。
+- エンジン: `STRATA_WATCHDOG_S` と `STRATA_WATCHDOG_IO_S` の値を確かめ、範囲の外なら既定値に戻します（dca06a36d）。prompt と `max_new` が文脈に収まるかは、桁あふれしない形で先に確かめます（534802c8d の #6493）。GGUF の数の配列は 1,024 要素まで読みます（3319f9e27）。
+- serve: engine が死んだときの 503 に、終了コードと最後の ERR の行を載せます（f1f91d97b）。10 分に 3 回死んだ engine は起動し直しません（264b155dd、6a6e56d55）。
+- serve: 要求の画像は、結合ファイルに写し終えるまでキャッシュから追い出しません（91fb63284）。読み手が読めなかった画像は、PNG に直して 1 回だけ送り直します。`/v1/models` は答えの長さの上限も返します（f5ab600d5）。
+- Inkling-2-Mini: SYCL の窓の K/V リングを、窓と 1 回の step の容量を足した大きさに広げました（64c224f3c）。リングが窓ちょうどの大きさだったので、窓をまたぐ prefill の塊が、同じ塊のトークンがまだ読む key を上書きしていました。収まらない `--parallel` は起動時に断ります（de1768f2b ほか）。
+- Inkling-2-Mini: ggml-org 版の GGUF、drafter のテンソルの名前と型、写し終えた mmap のページの返却（a8e30004a、de3cb634a、d528772fc、8c2afbc2b ほか）。GGUF と safetensors のモデルを動かせるのは CPU の backend だけで、SYCL の backend は .strata 以外を起動時に断ります（1178074aa）。
+
+入れていないものは次のとおりです。
+
+- Inkling-2-Mini の新しい機能（思考の段階、slot の振り分け、drafting の調整、SYCL で GGUF を直接読むこと、診断の道具など、36 件）。この fork の目標は Qwen3.8-Flash-Next なので、取り込まないことにしました（2026-11-25）。
+- CPU のエキスパートの AVX-512 化（4414c2988）。890M のふつうの起動では、エキスパート 24,576 個がすべて GPU のキャッシュに入るので、CPU のエキスパートは動きません。
+- upstream の HIP の Unsloth の量子化カーネル（9e3ad2778、5ea521afe）。890M で upstream の HIP 版を測ると、v0.2.21 の decode は v0.2.19 より速くなっていました（22.0〜22.2 対 19.9 tok/s、交互に 3 周）。伸びの一部は、gfx1150 でも既定になった expert の mode 8 で、`STRATA_HIP_EXP8=0` で切ると 20.9〜21.7 tok/s でした。XeStrata は mode 8 を前から既定にしています。同じ回の XeStrata は 41.7〜42.5 tok/s でした。
+- MTP のとき、sampling の値のない要求を貪欲にする変更（d35353903）。upstream の engine は sampling の要求で MTP を止めますが、XeStrata は止めません。取ると既定の要求の答えが変わります。890M では、モデルカードの sampling の decode は貪欲より約 9% 遅くなりました（37.8〜38.5 対 41.7〜42.5 tok/s、交互に 3 周）。速さを取るなら、設定の sampling に temperature 0 を書きます。
+- `--batch` の複数スロット向けの MTP の融合と QSA（0f1738e61、CUDA）、鍵ごとの同時実行数（7bff4c47a）、アラビア文字の draft vocab（2a8265942）、別のサイズのモデル ID の 404（fba071562）。
 
 ## Strata 0.1.65 の取り込み
 
