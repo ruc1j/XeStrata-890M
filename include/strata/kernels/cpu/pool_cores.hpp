@@ -145,7 +145,7 @@ inline PoolCoresCheck check_pool_cores(const std::vector<int>& list, const std::
     return r;
 }
 
-/// The start-up line about where the workers run, without the "strata generate: " prefix:
+/// The start-up line about where the workers run, without the "xestrata generate: " prefix:
 ///   "CPU workers on logical processors 2,4,...,30 (15 workers, one per physical core; host on 0)".
 /// `layout` empty or a worker/host processor not in it: the OS did not say which processors are SMT siblings, and the
 /// line says so instead of claiming "one per physical core".  `list_given`: the workers are the person's --pool-cores.

@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/hadamard.cpp - see include/strata/kernels/cpu/hadamard.hpp.
 #include "strata/kernels/cpu/hadamard.hpp"
 
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -34,7 +36,11 @@ bool hadamard_parse(const std::string& path, int64_t n_layers, HadamardSpec& h, 
         if (line[0] == '#') {
             static const char tag[] = "# strata hadamard v";
             if (line.compare(0, sizeof tag - 1, tag) == 0) {
-                if (std::atoi(line.c_str() + sizeof tag - 1) != 1) {
+                std::istringstream version(line.substr(sizeof tag - 1));
+                int n = 0;
+                if (!(version >> n) || n != 1 ||
+                    (version.peek() != std::char_traits<char>::eof() && version.peek() != ':' &&
+                     !std::isspace(static_cast<unsigned char>(version.peek())))) {
                     err = path + ": an unknown hadamard.txt version (this engine reads v1)";
                     return false;
                 }
@@ -48,7 +54,7 @@ bool hadamard_parse(const std::string& path, int64_t n_layers, HadamardSpec& h, 
         if (key == "block") {
             long long b = 0;
             if (!(ss >> b) || b < 2 || b > 4096 || (b & (b - 1)) != 0 || h.block) {
-                err = path + ": a bad or repeated block line: " + line;
+                err = path; err += ": a bad or repeated block line: "; err += line;
                 return false;
             }
             h.block = (int) b;
@@ -71,7 +77,7 @@ bool hadamard_parse(const std::string& path, int64_t n_layers, HadamardSpec& h, 
             long long l = -1;
             int g = -1, u = -1, d = -1;
             if (!(ss >> l >> g >> u >> d) || l < 0 || l >= n_layers || (g | u | d) & ~1 || seen[(size_t) l]) {
-                err = path + ": a bad or repeated layer line: " + line;
+                err = path; err += ": a bad or repeated layer line: "; err += line;
                 return false;
             }
             if (g != u) {   // gate and up read one activation: a transform for one of them only is not runnable
@@ -81,7 +87,7 @@ bool hadamard_parse(const std::string& path, int64_t n_layers, HadamardSpec& h, 
             seen[(size_t) l] = 1;
             h.roles[(size_t) l] = (uint8_t) (g | (u << 1) | (d << 2));
         } else {
-            err = path + ": an unknown line: " + line;
+            err = path; err += ": an unknown line: "; err += line;
             return false;
         }
     }

@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <algorithm>
 
+#include "strata/kernels/window_limits.hpp"
+
 namespace strata::spec {
 
 struct WindowRuleIn {
@@ -33,6 +35,31 @@ struct WindowRuleIn {
 /// The cost-aware MTP window applies only to the MTP chain's own candidates.
 inline bool cost_window_applies(bool use_mtp, bool spec_cost, bool df2_active, bool first_window) {
     return use_mtp && spec_cost && !df2_active && !first_window;
+}
+
+/// The same rule under upstream XeStrata's name (its loops call this one).
+inline bool mtp_cost_applies(bool use_mtp, bool spec_cost, bool df2_active, bool first_window) {
+    return cost_window_applies(use_mtp, spec_cost, df2_active, first_window);
+}
+
+/// DFlash2's window: 1 + the drafts whose selector-probability product stays at or above `conf` (up to `cap`).
+/// conf <= 0: the whole cap (every draft made).  probs[j] is draft j's probability (the window's row j + 1).
+inline int df2_window(const float* probs, int cap, double conf) {
+    if (conf <= 0.0 || probs == nullptr) return cap;
+    int t = 1;
+    double chain = 1.0;
+    while (t < cap && (chain *= (double) probs[t - 1]) >= conf) ++t;
+    return t;
+}
+
+/// --draft-conf 0: DFlash2's window confidence from the expert slots the card holds beside the drafter (both engines).
+/// The steps are upstream's CUDA measurement (CONF_STEPS, 6140ce1f3) as the starting point; XeStrata's 3-GPU sweep
+/// replaces them (the Arc A-series measured 0.6 best, upstream b1f4c9296).
+inline double df2_default_conf(long long slots) {
+    if (slots >= 12000) return 0.35;
+    if (slots >= 7500) return 0.5;
+    if (slots >= 3000) return 0.7;
+    return 0.8;
 }
 
 /// The MTP's q lists (STRATA_SPEC_PROB) are the proposal law only for candidates the MTP drew.
@@ -79,7 +106,8 @@ inline int choose_window(const WindowRuleIn& in) {
 /// prior of C^1.3, and extends the window to row j+1 while  survival * (ms per committed token) >= row_ms  (what one more verify row costs).
 struct AdaptiveGate {
     static constexpr int NB = 6;
-    double n[8][NB] = {}, h[8][NB] = {};
+    static constexpr int NJ = strata::kernels::kWindowMaxT;   // the widest verify window (the wide window: 16 rows)
+    double n[NJ][NB] = {}, h[NJ][NB] = {};
     double ms_per_tok = 0.0;       // EMA of the round's wall ms per committed token
     double row_ms = 3.0;           // one more verify row (M5 Max: 2.65-3.3 ms)
     double prior_n = 3.0;
@@ -94,7 +122,7 @@ struct AdaptiveGate {
         int T = 1;
         double chain = 1.0;
         const double v = ms_per_tok > 0.0 ? ms_per_tok : 9.0;
-        while (T < cap) {
+        while (T < cap && T < NJ) {
             chain *= (double) dprob[T - 1];
             if (survival(T, chain) * v < row_ms) break;
             ++T;
@@ -104,7 +132,7 @@ struct AdaptiveGate {
     /// after a DFlash2 round of T rows, a drafts accepted: drafts 1..T-1 were offered, draft j survived when a >= j
     void observe(const float* dprob, int T, int a) {
         double chain = 1.0;
-        for (int j = 1; j < T && j < 8; ++j) {
+        for (int j = 1; j < T && j < NJ; ++j) {
             chain *= (double) dprob[j - 1];
             const int b = bucket(chain);
             n[j][b] += 1.0;

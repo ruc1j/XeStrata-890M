@@ -20,7 +20,12 @@
 // finite, non-zero scales, and the blob at a DIFFERENT layer must be different data - which is what a wrong
 // stride would break.
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/cpu/tq_cpu.hpp"
+#include "synth_q2_blob.hpp"
 
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -79,23 +84,101 @@ float f16_at(const std::vector<uint8_t>& b, size_t off) {
     return o;
 }
 
+// Different K and blob sizes in one pool batch must use each job's own format.
+int check_bih3_pool() {
+    using namespace strata::kernels::cpu;
+    constexpr int ne = 2, nt = 3, h = 256, ff = 128;
+    NativeFmt fmt[ne];
+    float p2[3][4];
+    for (auto& table : p2) for (float& v : table) v = 1.f;
+    std::string err;
+    if (!native_r1q2_fmt(182, 183, h, ff, p2, fmt[0], err) ||
+        !native_r1q2_fmt(190, 191, h, ff, p2, fmt[1], err)) {
+        std::printf("bih3 pool: %s\n", err.c_str()); return 1;
+    }
+    std::mt19937 rng(5167);   // NOLINT(bugprone-random-generator-seed): repeatable fixture
+    std::vector<uint8_t> blobs[ne], acts[ne][nt], hq[ne][nt];
+    std::vector<float> expected[ne][nt], result[ne][nt], intermediate[ne][nt];
+    ExpertJobMulti jobs[ne] = {};
+    auto scales = [](const NativeFmt& f, const uint8_t* blob, int m) {
+        const size_t nr = (size_t) (m < 2 ? f.n_ff : f.n_embd);
+        const size_t nb = (size_t) (m < 2 ? f.n_embd : f.n_ff) / 128;
+        const uint8_t* p = blob + f.sc_off + native_r1q2_scale_offset(f, m);
+        return TqR1q2Scales{p, p + nr * 2, p + nr * 2 + nb * 2, (nb + 3) / 4,
+                           {f.p2[m][0], f.p2[m][1], f.p2[m][2], f.p2[m][3]}};
+    };
+    for (int e = 0; e < ne; ++e) {
+        const NativeFmt& f = fmt[e];
+        blobs[e].resize(f.bytes);
+        for (uint8_t& v : blobs[e]) v = (uint8_t) rng();
+        for (int m = 0; m < 3; ++m) {
+            const size_t nr = (size_t) (m < 2 ? f.n_ff : f.n_embd);
+            const size_t nb = (size_t) (m < 2 ? f.n_embd : f.n_ff) / 128;
+            uint8_t* p = blobs[e].data() + f.sc_off + native_r1q2_scale_offset(f, m);
+            const uint16_t value = 0x3000;   // FP16 0.125
+            for (size_t i = 0; i < nr + nb; ++i) std::memcpy(p + 2 * i, &value, 2);
+        }
+        jobs[e].blob = blobs[e].data(); jobs[e].fmt = &fmt[e]; jobs[e].nt = nt;
+        for (int t = 0; t < nt; ++t) {
+            acts[e][t].resize(kNativeActBytes); hq[e][t].resize(kNativeHBytes);
+            expected[e][t].resize(h); result[e][t].resize(h); intermediate[e][t].resize(ff);
+            std::vector<float> x(h);
+            for (float& v : x) v = (float) ((int) (rng() % 2001) - 1000) / 1000.f;
+            native_quant_act(f, x.data(), acts[e][t].data());
+            jobs[e].nact[t] = acts[e][t].data(); jobs[e].out[t] = result[e][t].data();
+            const void* a[] = {acts[e][t].data()};
+            float* mid[] = {intermediate[e][t].data()};
+            tq_bih3_r1q2_gu_rows_isa(Bih3Isa::scalar, f.gu_type, blobs[e].data(), f.gu_row, f.up_off, h,
+                                     a, 1, mid, 0, ff, scales(f, blobs[e].data(), 0), scales(f, blobs[e].data(), 1));
+            native_quant_h(f, mid[0], hq[e][t].data());
+            const void* a2[] = {hq[e][t].data()}; float* out[] = {expected[e][t].data()};
+            tq_bih3_r1q2_rows_isa(Bih3Isa::scalar, f.d_type, blobs[e].data() + f.down_off, f.d_row, ff,
+                                  a2, 1, out, 0, h, scales(f, blobs[e].data(), 2));
+        }
+    }
+    ExpertPool pool(2, false, true);
+    pool.run_split_multi_native(fmt[0], jobs, ne);
+    int failures = 0;
+    for (int e = 0; e < ne; ++e) for (int t = 0; t < nt; ++t)
+        for (int i = 0; i < h; ++i)
+            if (std::bit_cast<uint32_t>(expected[e][t][(size_t) i]) != std::bit_cast<uint32_t>(result[e][t][(size_t) i]))
+                ++failures;
+    if (pool.multi_bytes != (int64_t) (fmt[0].bytes + fmt[1].bytes)) ++failures;
+    std::printf("bih3 pool: 2 formats x 3 tokens x 256 rows: %d failures\n", failures);
+    return failures;
+}
+
 }  // namespace
+
+// A malformed argument must be an error, not a silently accepted zero.
+static bool parse_i64(const char* s, long long& out) {
+    char* end = nullptr;
+    const long long v = std::strtoll(s, &end, 10);
+    if (end == s || *end != '\0') return false;
+    out = v;
+    return true;
+}
 
 int main(int argc, char** argv) {
     bool selftest = false;
     const char* path = "pack/full/experts.bin";
+    bool path_given = false;
     long long layer = 0, expert = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
-        else if (a == "--file" && i + 1 < argc) path = argv[++i];
-        else if (a == "--layer" && i + 1 < argc) layer = std::atoll(argv[++i]);
-        else if (a == "--expert" && i + 1 < argc) expert = std::atoll(argv[++i]);
+        else if (a == "--file" && i + 1 < argc) { path = argv[++i]; path_given = true; }
+        else if (a == "--layer" && i + 1 < argc) {
+            if (!parse_i64(argv[++i], layer)) { std::fprintf(stderr, "expert_parity: invalid --layer value\n"); return 2; }
+        }
+        else if (a == "--expert" && i + 1 < argc) {
+            if (!parse_i64(argv[++i], expert)) { std::fprintf(stderr, "expert_parity: invalid --expert value\n"); return 2; }
+        }
         else { std::fprintf(stderr, "usage: expert_parity [--selftest] [--file P] [--layer N] [--expert N]\n");
                return 2; }
     }
 
-    int bad = 0;
+    int bad = check_bih3_pool();
 
     // ---- the CPU must be able to run the kernel, and the report must say WHICH feature is missing
     const cpu::CpuFeatures feat = cpu::cpu_features();
@@ -104,14 +187,26 @@ int main(int argc, char** argv) {
     if (!feat.usable()) {
         std::printf("      the VNNI path cannot run here; only the scalar oracle can be exercised.\n");
         std::printf("      P2.S3's kernel check is SKIPPED, not passed.\n");
-        std::printf("\nexpert_parity: 0 failures, 1 SKIPPED\n");
-        return 0;
+        std::printf("\nexpert_parity: %d failures, 1 SKIPPED\n", bad);
+        return bad ? 1 : 0;
     }
 
+    // the pack's Q2_0 experts, or (no --file and no pack/full here) seeded blobs of the same form
+    bool synth = false;
+    if (!path_given) {
+        if (std::FILE* f = std::fopen(path, "rb")) std::fclose(f);
+        else synth = true;
+    }
+    if (synth) std::printf("  %-44s %s\n", "experts", "pack/full/experts.bin is not here: seeded Q2_0 blobs");
+    auto blob_at = [&](long long index, std::vector<uint8_t>& out) {
+        if (!synth) return read_blob(path, index, out);
+        cpu::test::synth_q2_blob(index, out);
+        return true;
+    };
     // ---- a real blob out of the pack: layer stride is 512 experts
     const long long idx = layer * 512 + expert;
     std::vector<uint8_t> blob;
-    if (!read_blob(path, idx, blob)) {
+    if (!blob_at(idx, blob)) {
         std::fprintf(stderr, "cannot read expert %lld (layer %lld) from %s\n", expert, layer, path);
         return 2;
     }
@@ -135,7 +230,7 @@ int main(int argc, char** argv) {
     }
     {
         std::vector<uint8_t> other;
-        if (read_blob(path, (layer * 512 + expert) + 1, other)) {
+        if (blob_at((layer * 512 + expert) + 1, other)) {
             long long diff = 0;
             for (size_t i = 0; i < blob.size(); ++i) if (blob[i] != other[i]) ++diff;
             const double frac = (double) diff / (double) blob.size();
@@ -147,7 +242,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- a realistic activation
-    std::mt19937 rng(4242);
+    std::mt19937 rng(4242);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     std::vector<float> x(cpu::H);
     for (auto& v : x) v = gauss(rng);

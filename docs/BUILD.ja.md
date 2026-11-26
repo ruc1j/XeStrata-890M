@@ -28,11 +28,15 @@ setup は GPU と RAM と CPU を確かめ、SYCL のコンパイラを選んで
   contrib-llvm は自由ソフトウェアでない部品（oneMKL、NVIDIA の GPU には CUDA ツールキット）を使います。
   `--license free` で自由ソフトウェアだけ（Intel と AMD の GPU）のビルドにします。
 - 時間: 初回はダウンロード（60〜110 GB）とビルドに時間がかかります。途中で止めても、次は続きから始まります。
-- 置き場所: モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data`、モデルの設定（`xestrata-<モデル>.json`）とログは
-  XeStrata のフォルダーに置きます。
+- 置き場所: モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data`、モデルの設定（`xestrata-<モデル>.json`）は
+  `~/.config/xestrata`、ログは `~/.local/state/xestrata` に置きます（パッケージ版と同じ）。
 
 **次からは** `./setup.sh` を実行すると、すぐに起動します。
 README にある `xestrata` のオプションは `./setup.sh` でも同じです。端末での会話は `.venv/bin/python chat.py` です。
+
+**窓**: `./setup.sh gui` で窓を開きます。
+.NET 10 の SDK（Ubuntu は `sudo apt install dotnet-sdk-10.0`、Fedora は `sudo dnf install dotnet-sdk-10.0`）で `launcher/` を `build/launcher` にビルドしてから開きます。
+SDK がなければ入れ方を言って止まります。ほかの使い方では .NET を使いません。
 
 **更新**: `./update.sh` を実行します。git で取得したものなら `git pull` してから、エンジンと Python のパッケージと
 モデルの設定を更新します（モデルは起動しません）。新しい版をダウンロードして別の場所に展開し、そこで `./setup.sh` を
@@ -46,7 +50,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
 
 - free（`-DSTRATA_LICENSE=free`）: intel/llvm の DPC++ 7 以降（SYCL ランタイムが libsycl 9）でビルドします。
   自由ソフトウェアだけで済み、oneAPI の環境は使いません。
-  `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.2.0。v7.1.1 でも）で確かめています（[setup](#setup) を参照）。
+  `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.2.1）で確かめています（[setup](#setup) を参照）。
   ディストリビューションのパッケージも 7 以降なら使えます。それより古いもの（Ubuntu 26.04 の `dpclang++` 6.2）は、CMake と setup が断ります。
   6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、prefill の経路が約 1.6 倍遅くなっていました。
   ROCm の HIP 付きでビルドした intel/llvm なら、`STRATA_HIP_ARCHS`（例 `gfx1200`）で AMD の GPU（RDNA2 以降: gfx103x、gfx11xx、gfx12xx）向けのコードも作ります。
@@ -64,7 +68,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   `STRATA_CUDA_ARCHS`（例 `sm_89`）で NVIDIA の GPU 向けのコードも作ります。
   XeStrata のソースは free のときと同じで、自由ソフトウェアのままです。
   ただし、ビルドに NVIDIA の CUDA ツールキット、実行に NVIDIA のドライバが要り、どちらも自由ソフトウェアではありません（XeStrata には含めません）。
-  Ubuntu 26.04 の `nvidia-cuda-toolkit` 12.4 と intel/llvm v7.2.0 で、sm_89 向けのビルドが通ることを確かめています。
+  Ubuntu 26.04 の `nvidia-cuda-toolkit` 12.4 と intel/llvm v7.2.1 で、sm_89 向けのビルドが通ることを確かめています。
   RTX 4070（sm_89）で動くことを確かめています。
   エンジンはメーカーのドライバーのライブラリを直接リンクせず、SYCL のランタイムと oneMath が、あるものだけを実行時に開きます。
   そのため、Intel の GPU だけの PC では NVIDIA のドライバーと CUDA がなくても、NVIDIA の GPU だけの PC では Level Zero がなくても動きます
@@ -93,7 +97,7 @@ NVIDIA のコードの PTX は既定ではツールキットの版です（CUDA 
 PTX 7.8 で作ったものは RTX 4070 で CTest 52 件が通りました。
 ドライバーには、intel/llvm の CUDA のアダプタが使う関数（SYCL のグラフの `cuGraphAddKernelNode_v2`）のため、CUDA 12.0 以上（525 以降）が要ります。
 どちらの変数も既定は `auto` で、指定すればそれを使います（別の機械向けに作るとき）。
-oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-12`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt、rocBLAS と cuBLAS の後端の int8 の積、cuBLAS と rocBLAS の後端を 1 つのビルドで作れるようにするターゲットの指定の分離、rocBLAS の後端からの HIP と SYCL の非推奨の API の除去、Windows のクロスビルドの GNU 形の clang++ への対応と、そこでの cuBLAS と rocBLAS の後端と Windows の import library、Windows での oneMKL の SYCL のリンクの `-fsycl-allow-device-image-dependencies` の除去）が入り、本家の `develop` をマージした oneMath です。
+oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-13`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt、rocBLAS と cuBLAS の後端の int8 の積、cuBLAS と rocBLAS の後端を 1 つのビルドで作れるようにするターゲットの指定の分離、rocBLAS の後端からの HIP と SYCL の非推奨の API の除去、Windows のクロスビルドの GNU 形の clang++ への対応と、そこでの cuBLAS と rocBLAS の後端と Windows の import library、Windows での oneMKL の SYCL のリンクの `-fsycl-allow-device-image-dependencies` の除去、rocBLAS の後端の SYCL のグラフへの記録）が入り、本家の `develop` をマージした oneMath です。
 ネットワークのない機械では、同じアーカイブを `STRATA_ONEMATH_SOURCE`（手元のファイルか URL）で渡します。
 変更の一覧は [third_party/main/README.md](../third_party/main/README.md) にあります。
 oneMath が GPU の後端を持たないときは、自前のカーネルを使います。
@@ -104,62 +108,67 @@ coder-iq1_m の 997 トークンのプリフィルは、B70 で 1421 ms から 1
 それもなければ DP4a の経路を選び、どちらになったかを一度だけ表示します。
 Arc A シリーズが `mma_gemm` を使うのは、その SYCL ランタイムが XMX のカーネルの使う Intel の拡張（joint_matrix の prefetch と境界つきの読み込み・書き込み）を受け付けないためです。
 A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくなります（0.53% に対して 0.0001%）。
-`STRATA_NO_XMX=1` を付けると、行列エンジンがあっても DP4a の経路を選びます。
-`STRATA_MMA=1` を付けると、`mma_gemm` が扱う形（Xe2 の 8 x 16 x 16 など）を GPU が報告していれば、XMX があってもそれを選びます（その経路を確かめるためのものです）。
-`STRATA_NO_BF16_MMA=1` は BF16 の、`STRATA_NO_INT8_MMA=1` は int8 の行列の組み合わせを、GPU の報告から除きます（`src/kernels/xe/matrix_report.cpp`）。
+`XESTRATA_NO_XMX=1` を付けると、行列エンジンがあっても DP4a の経路を選びます。
+`XESTRATA_MMA=1` を付けると、`mma_gemm` が扱う形（Xe2 の 8 x 16 x 16 など）を GPU が報告していれば、XMX があってもそれを選びます（その経路を確かめるためのものです）。
+`XESTRATA_NO_BF16_MMA=1` は BF16 の、`XESTRATA_NO_INT8_MMA=1` は int8 の行列の組み合わせを、GPU の報告から除きます（`src/kernels/xe/matrix_report.cpp`）。
 行列エンジンにその型がない GPU（NVIDIA の sm_80 より前は BF16、sm_72 より前は int8 がない）を、持っている GPU で模すためのものです。
-`STRATA_NO_BF16_MMA=1` のときは、contrib-llvm のモードでも BF16 の積を oneMath に任せず、FP16 の行列エンジンがあれば下の FP16 を経由する経路になります。
-`STRATA_NO_BLAS=1` は、contrib-llvm のモードでも密な行列積を自前のカーネルで計算します（比べるためのものです）。
+`XESTRATA_NO_BF16_MMA=1` のときは、contrib-llvm のモードでも BF16 の積を oneMath に任せず、FP16 の行列エンジンがあれば下の FP16 を経由する経路になります。
+`XESTRATA_NO_BLAS=1` は、contrib-llvm のモードでも密な行列積を自前のカーネルで計算します（比べるためのものです）。
+`mma_gemm` が行列エンジンで動く GPU（RDNA3・RDNA4 の WMMA、NVIDIA のテンソルコア）では、密な FP16・BF16 の積と、学習の dgrad の形（W をそのまま読む積）を、最初に使うときに自前のカーネルとメーカーのライブラリーの両方で 1024 x 4096 x 4096 の積を測り、速い方を選びます（選んだ方を一度だけ表示します）。
+`XESTRATA_BLAS=1` は、測らずにメーカーのライブラリーを選びます。
 RTX 4070 で、それぞれの組み合わせでも CTest は変わらず、16 トークンの最上位はすべて一致しました。
 oneMath がある GPU の BF16 の積で失敗したとき（起動時に小さな積で試します）は、BF16 の積だけを自前のカーネルに任せます。
 行列エンジンが FP16 を扱い BF16 を扱わない GPU（NVIDIA の sm_80 より前、Volta と Turing）では、prefill の経路の BF16 の積を、両方を FP16 に変換して FP16 の積として計算します（`src/prefill/gemm.cpp`、upstream の f2fb7c1・ff6f9f1）。
 そのような GPU の BF16 の積を、cuBLAS は Tensor Core を使わずに計算し、自前のカーネルでは DP4a に落ちるためです。
 変換は FP16 の正規数の範囲では正確で、それを超える有限の値は ±65504 に飽和させます。累積する積と出力が 1 行の積は BF16 のままです。
-RTX 4070 で sm_70 のコードを動かし `STRATA_NO_BF16_MMA=1` で模すと、FP64 との相対誤差は 2e-6 以下で、DP4a の経路（0.7%）より 2.5〜3.2 倍速くなりました。
-`STRATA_BF16_TC=0` で止まります。
-`tools/xmx_probe.cpp` は、エンジンをビルドせずに、同じ問い合わせをすべての GPU にします。
+RTX 4070 で sm_70 のコードを動かし `XESTRATA_NO_BF16_MMA=1` で模すと、FP64 との相対誤差は 2e-6 以下で、DP4a の経路（0.7%）より 2.5〜3.2 倍速くなりました。
+`XESTRATA_BF16_TC=0` で止まります。
+`tools/xmx_probe.cpp` は、エンジンをビルドせずに、FP16 と BF16 の行列エンジンを XMX のカーネルの形か `mma_gemm` の Intel の形（8 x 8 x 16）で報告するかを、すべての GPU に問い合わせます。
 
 prefill の経路のエキスパートの積は、GPU が int8 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core）、int8 の行列エンジンで計算します（`src/kernels/xe/iq_mmq.cpp`、llama.cpp の MMQ を `joint_matrix` で書き直したもの）。
 重みは GGUF のブロックのまま読み、活性は 32 値ごとに int8 に丸めます。
 FP16 に展開してから掛ける経路より読み書きが少なく、FP64 との相対誤差は約 0.4% です（活性を int8 に丸めた分）。
 対象は IQ1_M を除く i-quant と Q2_0 で、それ以外の型の層は FP16 の経路のままです。
 
-prefill の注意は XMX のない GPU でも FP16 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core、sm_70 から）、`joint_matrix` の標準の API で書いた版で計算します（`src/kernels/xe/qsa_prompt_attn.cpp`）。
+prefill の注意は、XMX のない GPU でも FP16 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core、sm_70 から）、`joint_matrix` の標準の API で書いた版で計算します（`src/kernels/xe/flash_attn.cpp` の選択の形）。
 KV は FP16・INT8・K8V4 で、Q4_0 は FP32 のカーネルのままです（upstream の Volta のカーネル 06a90a2 と同じ範囲）。
 INT8 と Q4_0 の符号は FP16 で正確に表せるのでそのまま行列エンジンに渡し、尺度は FP32 で掛けます。
 RTX 4070 で sm_70 のコードを動かすと、`qsa_prompt_attn_parity` の FP64 との誤差は FP32 のカーネルの 3 倍以内で、2,048 クエリ・32K セルの塊が INT8 で 1.6 倍、FP16 と K8V4 で 1.5 倍速くなりました。
 Intel の GPU はこの形を報告しないので、これまでどおり XMX の FP16 の経路を使います。
-Qwen3.8 の prefill のエキスパートの積は、int8 と FP16 の経路の速い方を、チャンクの層ごとにエキスパートの平均の行数で選びます。境目は起動時に GPU ごとに、モデルの最初の層の形で両方を 16〜256 行で測って決め、ログに出します（B70 は 181 行、RTX 4070 はどの行数でも int8）。`STRATA_PREFILL_MMQ=0` で FP16 の経路、`1` で int8 に決めます。
+Qwen3.8 の prefill のエキスパートの積は、int8 と FP16 の経路の速い方を、チャンクの層ごとにエキスパートの平均の行数で選びます。境目は起動時に GPU ごとに、モデルの最初の層の形で両方を 16〜256 行で測って決め、ログに出します（B70 は 181 行、RTX 4070 はどの行数でも int8）。`XESTRATA_PREFILL_MMQ=0` で FP16 の経路、`1` で int8 に決めます。
+RDNA3・RDNA4 の int8 の積は、エキスパートの平均が 256 行を超えるまとまり（長い prompt の大きなチャンク）で、重みを FP16 に展開して WMMA で積む形も起動時に測り、5% 以上速い型と行数で使います（RX 9060 XT の 32K の prompt で +4%、出力の末尾のビットが変わります）。`XESTRATA_IQ_MMQ_F16=0` で使わず、`1` でどの行数でも使います。
 
 Pascal（sm_60・sm_61。P100、P40、GTX 10 系）にも、CUDA 12 のツールキットでコードを作ります。
 Tensor Core がないので、行列エンジンの経路は選ばれず、DP4a と FP32 の経路で動きます。
 sm_60 には dp4a の命令がないので、その積だけを 1 バイトずつの計算にしていて、和は同じ整数です（`src/kernels/xe/cuda_intrinsics.hpp`、upstream の e200e08f）。
 Tensor Core を使うカーネルは、sm_70 より前のコードでは空の本体になり、そのような GPU では起動されません。
 sm_60 だけのコードを作って RTX 4070 で動かすと（ドライバーが PTX をコンパイル）、CTest 59 件が通り、
-`STRATA_NO_XMX=1` で行列エンジンを外して IQ2_XS で答えさせると、sm_89 のコードと 8 問すべて同じ答えになりました（エキスパートのキャッシュの大きさを固定、decode の速さは 3〜5% 遅い）。
-compute capability 6.0 の GPU（GP100: P100）では、`STRATA_DOWN_WS=1` で、ルーティングされたエキスパートの IQ4_NL と Q2_0 の down の重みの行を、作業グループのローカルメモリに写してから積を取ります（upstream の 6a6d58ad0、opt-in。出力はビット単位で同じで、ほかの GPU では何もしません）。
+`XESTRATA_NO_XMX=1` で行列エンジンを外して IQ2_XS で答えさせると、sm_89 のコードと 8 問すべて同じ答えになりました（エキスパートのキャッシュの大きさを固定、decode の速さは 3〜5% 遅い）。
+compute capability 6.0 の GPU（GP100: P100）では、`XESTRATA_DOWN_WS=1` で、ルーティングされたエキスパートの IQ4_NL と Q2_0 の down の重みの行を、作業グループのローカルメモリに写してから積を取ります（upstream の 6a6d58ad0、opt-in。出力はビット単位で同じで、ほかの GPU では何もしません）。
 Maxwell 以前（compute capability 6.0 未満）では動きません。NVIDIA の GPU の SYCL のランタイムは 5.3 未満の GPU に FP16 を報告せず、エンジンは FP16 を報告しない GPU を使いません（`xestrata --setup` もそう知らせます）。
 
-Volta（sm_70）では、upstream が V100 で測った出力のカーネル 2 つを `STRATA_SM70_TABLE=1` で使います（upstream の c85b7c87 と同じく、確認が済むまで opt-in）。
+Volta（sm_70）では、upstream が V100 で測った出力のカーネル 2 つを `XESTRATA_SM70_TABLE=1` で使います（upstream の c85b7c87 と同じく、確認が済むまで opt-in）。
 ひとつはルーティングされたエキスパートの「モード 8」で、gate/up の積と SwiGLU・q8_1 への量子化を 1 回で行い、格子の表と活性を作業グループのローカルメモリに置きます（`src/kernels/xe/iq_kernels.cpp`、upstream の f6330507: V100 で 227 → 159 µs）。
 もうひとつはハイパーコネクションの読み出しの norm と up の積で、重みを先に読んで遅延を隠します（`src/kernels/xe/fused_gr.cpp`、upstream の aaa323fe: V100 で 1 回 50.9 → 46.7 µs）。
-どちらも出力は既定のカーネルとビット単位で同じで、`STRATA_GR_FAST=1` でほかの GPU でも使えます。
-モード 8 はローカルメモリに入るすべての GPU で既定です（B70 の decode が 1K・32K で +0.8〜1.1%、RTX 4070 は同等。upstream の f7eaf2de の STRATA_EXPDEC と同じ考え）。`STRATA_EXP_MODE=0` で従来のカーネルです。
+どちらも出力は既定のカーネルとビット単位で同じです。
+読み出しの norm と up は、すべての GPU で既定です（Qwen3.8-Flash-Next の decode が RTX 4070 で 23.75 → 24.8 tok/s、B70 と RX 9060 XT は同等）。`XESTRATA_GR_FAST=0` で従来のカーネルです。
+モード 8 は、ローカルメモリに入るすべての GPU で既定です（B70 の decode が 1K・32K で +0.8〜1.1%、RTX 4070 は同等。upstream の f7eaf2de の STRATA_EXPDEC と同じ考え）。`XESTRATA_EXP_MODE=0` で従来のカーネルです。
 sm_70 だけのコードを作って RTX 3070 で動かすと、既定でも両方を使っても CTest 71 件が通り、エキスパートと読み出しの出力は既定とビット単位で同じでした（RX 9060 XT でも同じ）。
 
 ### エンジンの部品とテスト
 
 モデルを使わない部品とテストは、llama.cpp なしでビルドできます（`STRATA_NATIVE_EXPERTS=OFF`）。
 free の方式では次のとおりです（intel/llvm は `.tools/intel-llvm/install`）。
+生成器はどのコマンドでも Ninja です（`-G Ninja`。setup・パッケージ・Windows のクロスビルドと同じです。Make では SYCL の装置側のコードの依存がつながらないので、Ninja を先に入れます: Fedora は `sudo dnf install ninja-build`、Ubuntu は `sudo apt install ninja-build`、Arch は `sudo pacman -S --needed ninja`）。
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/free \
+cmake -S . -B build/free -G Ninja \
   -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_LICENSE=free \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
-cmake --build build/free --target strata-device strata-load elementwise_parity \
+cmake --build build/free --target xestrata-device xestrata-load elementwise_parity \
   gguf_reader_test suffix_drafter_test controller_test draft_policy_test conv_cache_test \
   platform_memory_test ple_reader_test -j4
 ```
@@ -177,13 +186,13 @@ cmake --build build/free --target strata-device strata-load elementwise_parity \
 
 ### エンジン本体
 
-エンジン本体（実行ファイル `strata`）は、ネイティブの i-quant のエキスパートに llama.cpp を使います。
+エンジン本体（実行ファイル `xestrata-engine`）は、ネイティブの i-quant のエキスパートに llama.cpp を使います。
 llama.cpp は固定したコミット（`3cf03257f219afbe7334045ff7c6a06ac68c627d`）のものを `third_party/main/llama.cpp` に置きます。
 setup.py が取ってきます。画像のエンコーダーはその `tools/mtmd` も使います。
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/free -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
+cmake -S . -B build/free -G Ninja -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_LICENSE=free -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/free --target strata -j6
 ```
@@ -192,11 +201,11 @@ NVIDIA の GPU 向け（contrib-llvm）では、`tools/intel_llvm_build.py --con
 
 ```bash
 C=$PWD/.tools/intel-llvm-contrib/install
-cmake -S . -B build/contrib-llvm -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
+cmake -S . -B build/contrib-llvm -G Ninja -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
   -DSTRATA_LICENSE=contrib \
   -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/contrib-llvm --target strata -j6
-LD_LIBRARY_PATH=$C/lib build/contrib-llvm/strata-device
+LD_LIBRARY_PATH=$C/lib build/contrib-llvm/xestrata-device
 ```
 
 別の機械向けには `STRATA_CUDA_ARCHS` に GPU のアーキテクチャを並べます（RTX 40 は `sm_89`、RTX 30 は `sm_86`）。
@@ -227,6 +236,7 @@ AMD の GPU は `STRATA_HIP_ARCHS` に並べます（RX 6800 は `gfx1030`、RX 
    amdgpu につながった AMD の GPU は、カーネルの KFD のトポロジーから gfx（`gfx1200` など）を読み、`/dev/kfd` の権限も確かめます。
    RDNA2 より前の GPU と、ディストリビューションの rocBLAS（パッケージではそのエンジン）がコードを持たない GPU は、使えないと表示します（[README](../README.ja.md#amd-の-gpu)）。
 1. RAM と CPU を調べ、質問をします。
+   画像モデルを選んだ後、LoRA 学習の土台も用意するか選べます。コマンドでは `--images qwen-image-turbo --image-lora-training` のように指定します。推論だけなら後者は不要です。
 1. SYCL のコンパイラを選び（[下](#sycl-のコンパイラ)）、エンジンを `build-xe` でコンパイルします。
 
 エンジンは `engine/` に置き、`BUILD.json`（`"backend": "xe"` と、使ったコンパイラ）を添えます。
@@ -304,37 +314,37 @@ v7.1.1 のビルドは開発機（28 スレッド）で 13 分かかり、3.5 GB
 setup.py は OS のパッケージを入れず、パッケージマネージャーも sudo も実行しません。
 setup.sh は、venv の使える Python 3 がないときだけ、それを `sudo apt-get`（Fedora では `sudo dnf`、Arch では `sudo pacman -S`）で入れます。
 ほかのパッケージは先に自分で入れておきます。
+足りないものがあると、setup は最初の段で止まり、それを全部入れるコマンドを 1 回で出します（Intel の oneAPI や NVIDIA の CUDA のリポジトリがまだなければ、それを足すコマンドも先に出します）。
 
 次の表から、使うモードの共通の行と、PC にある GPU のメーカーの行（いくつでも）を選び、`sudo apt install`（Fedora は `sudo dnf install`、Arch は `sudo pacman -S`）の後ろに並べます。
 `./setup.sh --packages` は、この PC のディストリビューションと GPU、`--license` のモード（既定は contrib-llvm）に合わせて、その 1 行を出します。
-`./setup.sh --packages fedora44/intel,amd --license free` のように、ほかの組み合わせも出せます。
+`./setup.sh --packages fedora45/intel,amd --license free` のように、ほかの組み合わせも出せます。
 
-| 選択 | Ubuntu 26.04 | Fedora 44 | Arch |
+| 選択 | Ubuntu 26.04 | Fedora 44 / 45 | Arch |
 | --- | --- | --- | --- |
-| 共通（free、contrib-llvm） | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc spirv-headers opencl-headers blosc2` |
-| Intel の GPU | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime vulkan-intel` |
+| 共通（free、contrib-llvm） | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev opencl-headers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static opencl-headers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd opencl-headers blosc2` |
+| Intel の GPU | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime` |
 | Intel の GPU（contrib-llvm） | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` | なし（oneMKL は Arch のリポジトリにありません） |
-| AMD の GPU（free、contrib-llvm） | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon` |
-| NVIDIA の GPU（contrib-llvm） | `nvidia-cuda-toolkit` と NVIDIA のドライバー | `cuda-toolkit-13-4`（NVIDIA の CUDA のリポジトリ）と NVIDIA のドライバー | `cuda` と NVIDIA のドライバー |
+| AMD の GPU（free、contrib-llvm） | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common` |
+| NVIDIA の GPU（contrib-llvm） | `nvidia-cuda-toolkit` と NVIDIA のドライバー | `cuda-toolkit-13-4`（44）/ `cuda-toolkit-13-5`（45）（NVIDIA の CUDA のリポジトリ）と NVIDIA のドライバー | `cuda` と NVIDIA のドライバー |
 
 - `intel-oneapi-` で始まるものは Intel の oneAPI のリポジトリにあります（追加のしかたは Intel の手順: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html)、[DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)）。
 - Intel の GPU のドライバー（`libze-intel-gpu1` ほか）は、Ubuntu 24.04/26.04 では古いものが配布されます（26.04 は compute-runtime 26.05 と IGC 2.28）。
   compute-runtime 26.22 未満には、VRAM に空きがあっても確保を断る状態になる不具合があります（Intel の [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916)。xe カーネルのバグ（Linux 7.1 で修正）に 26.22 のドライバーが対応したもの。XeStrata では[#34](https://github.com/MistVVK/XeStrata/issues/34)）。
   Ubuntu 24.04/26.04 で HWE カーネルを使っているとき、setup は [Intel の graphics PPA](https://launchpad.net/~kobuk-team/+archive/ubuntu/intel-graphics)（compute-runtime と IGC が新しい）への更新を勧めて、更新まで起動を止めます（`--old-driver` でそのまま起動もできます）。
-  GA カーネルでは、HWE カーネルにして PPA を入れるか、Fedora 44 / Podman（IGC も 2.32 以降。[困ったとき](DETAILS.ja.md#困ったとき)）を勧めます。
-- 共通の行の Vulkan のもの（`libvulkan-dev` ほか）は GPU の画像エンコーダーのため、`libblosc2-dev`（`blosc2-devel`）は保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話を再起動後も使う任意)）のためです。
+  GA カーネルでは、HWE カーネルにして PPA を入れるか、Fedora 44 か 45 / Podman（IGC も 2.32 以降。[困ったとき](DETAILS.ja.md#困ったとき)）を勧めます。
+- 共通の行の `libblosc2-dev`（`blosc2-devel`）は保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話をディスクにも置く)）のためです。
 - AMD の行の `clang-21` と `libclang-rt-21-dev`（Fedora は `rocm-clang` と `rocm-clang-runtime-devel`、ROCm の clang とその実行時）は、コンパイルには使いません（コンパイルは intel/llvm がします）。
   oneMath の rocBLAS の後端が読む HIP の CMake のパッケージが、clang の実行時の builtins（`libclang_rt.builtins`）をリンクに足すためにコンパイラに尋ねます。
   intel/llvm にはその builtins がないので、ROCm の clang を `HIP_CXX_COMPILER` にしてそれに答えさせています（`cmake/StrataHip.cmake` の `strata_hip_cxx`）。
   要るのはビルドのときだけで、実行には要りません。
-- Arch では、Vulkan の ICD は GPU のメーカーのパッケージです（Intel は `vulkan-intel`、AMD は `vulkan-radeon`。1 つの `mesa-vulkan-drivers` が両方を持つ Ubuntu と Fedora とは違います）。
 - Arch の `zstd` には `libzstd.a` がありません（`zstd-static` は AUR のパッケージです）。
   intel/llvm の `configure.py` は静的な zstd（`LLVM_USE_STATIC_ZSTD=ON`）を要求するので、`tools/intel_llvm_build.py` はそれがないとき OFF にし、共有の zstd をリンクします（intel/llvm は v7.1.1 からそれを扱います: [intel/llvm#22294](https://github.com/intel/llvm/pull/22294)）。
 - Arch の ROCm の clang は `/opt/rocm/lib/llvm` にあり、その実行時の builtins（`libclang_rt.builtins`）も同じ `rocm-llvm` に入っています（AMD の行の `clang-21` と `libclang-rt-21-dev` にあたるものが 1 つのパッケージです）。
 - Arch の ROCm は AMD 自身の入れ方と同じ `/opt/rocm` にあります（CMake のパッケージは `/opt/rocm/lib/cmake`、ライブラリは `/opt/rocm/lib`）。
   CMake の既定の探索にも ld.so の既定にも入らないので、`cmake/StrataHip.cmake` が `/opt/rocm` を `CMAKE_PREFIX_PATH` に足し、setup は `/opt/rocm/lib` をエンジンのライブラリのフォルダーに記録します。
-- Arch では `opencl-headers` も入れます。intel/llvm のビルドは SYCL の道具（`sycl-ls`）もインストールし、それは `sycl/detail/cl.h` から `CL/cl.h` を読みますが、そのターゲットには構成が取ってくる OpenCL のヘッダーの include が付きません（あれはランタイム自身のオブジェクトのものです）。
-  Ubuntu と Fedora のビルドではそのヘッダーが入っています（コンパイラーが連れてきます）が、Arch の clang は連れてきません。
+- どのディストリビューションでも `opencl-headers` を入れます。intel/llvm のビルドは SYCL の道具（`sycl-ls`）もインストールし、それは `sycl/detail/cl.h` から `CL/cl.h` を読みますが、そのターゲットには構成が取ってくる OpenCL のヘッダーの include が付きません（あれはランタイム自身のオブジェクトのものです）。
+  コンパイラーはこのヘッダーを連れてきません（入れたばかりの Fedora（44・45）にも、Arch にもありません）。
 - oneMKL は Arch のリポジトリにないので、要るなら Intel のオフラインインストーラーで入れます。
   contrib-llvm のモードは Intel の GPU の密な積を oneMKL に任せるので、Intel の GPU では oneMKL が要ります。
   入れない場合は free のモードを使います。intel/llvm をソースからビルドし、Intel の GPU の密な積は XeStrata 自身のカーネルが行います。
@@ -364,6 +374,8 @@ tools/package/build.sh ubuntu26.04 cuda13.1   # xestrata-contrib-cuda13.1
 tools/package/build.sh ubuntu26.04 cuda12.4   # xestrata-contrib-cuda12.4
 tools/package/build.sh fedora44 free
 tools/package/build.sh fedora44 cuda13.4
+tools/package/build.sh fedora45 free
+tools/package/build.sh fedora45 cuda13.5
 ```
 
 - 入力はコミットだけ: `git archive` で、コミットの中身だけをコンテナに渡します。
@@ -371,10 +383,14 @@ tools/package/build.sh fedora44 cuda13.4
   `build-xe`、`.tools`、`.venv` など、作業ツリーのものは使いません。
 - 毎回キレイなコンテナ: イメージは `build.sh` にダイジェストで固定しています。
   コンテナの中でビルドの道具とディストリビューションの ROCm を入れ、intel/llvm（`tools/intel_llvm_build.py`、HIP のターゲット付き、cuda の版では CUDA のターゲットも）、
-  画像のエンコーダー（CPU と Vulkan）、エンジンをビルドし、CPack でパッケージにします（`tools/package/container.sh`、`cmake/packaging.cmake`）。
+  画像のエンコーダー（CPU）とエンジン（GPU の読み手も一緒）をビルドし、CPack でパッケージにします（`tools/package/container.sh`、`cmake/packaging.cmake`）。
   コンテナは終わると消えます。intel/llvm を毎回ビルドするので時間がかかります。
-  ビルドの間に残すのはコンパイラのキャッシュ（ccache、`build/pkg-ccache/<distro>/`、上限は `XESTRATA_CCACHE_MAX`、既定 30G）だけで、
-  同じディストリビューションの 2 つ目からは intel/llvm とエンジンのほとんどをそこから取ります。フォルダを消すと、次は全部コンパイルし直します。
+  ビルドの間には、コンパイラのキャッシュ（ccache、`build/pkg-ccache/<distro>/`、上限は `XESTRATA_CCACHE_MAX`、既定 30G）を残し、
+  同じディストリビューションの 2 つ目からは intel/llvm とエンジンのほとんどをそこから取ります。
+  `build/pkg-cache/<distro>/` には、apt と dnf が取ったパッケージと、できあがった intel/llvm も残します（版・パッチ・ベースのイメージ・CUDA と ROCm の版が同じ間だけ使います）。
+  `XESTRATA_PKG_CLEAN=1` を付けると後の 2 つを使わず、ビルドの道具を取り直して intel/llvm も作り直します（リリースのビルドはこれです）。
+  フォルダを消すと、次はそれなしで始めます。
+  パッケージは全部のスレッドで圧縮します（deb は zstd、rpm は zstd 19）。
   `XESTRATA_JOBS=16 tools/package/build.sh …` のように、同時にコンパイルするファイルの数を決められます（既定はスレッドの数。intel/llvm のリンクは、空いている RAM に収まる数まで）。
 - GPU なしでビルドできます: コンテナには GPU も手元の PC のものも渡しません。
   手元の GPU や CPU から決まる CMake の値（`STRATA_CUDA_ARCHS`、`STRATA_HIP_ARCHS`、`STRATA_ONEMKL`、`STRATA_CUDA_PATH`、`STRATA_CUDA_PTX` の `auto`、
@@ -387,20 +403,23 @@ tools/package/build.sh fedora44 cuda13.4
 
 | 版 | ディストリビューション | CUDA ツールキット | NVIDIA のコード |
 | --- | --- | --- | --- |
-| free | Ubuntu 26.04、Fedora 44 | — | — |
+| free | Ubuntu 26.04、Fedora 44・45 | — | — |
 | cuda13.1 | Ubuntu 26.04 | multiverse の `cuda-toolkit-13-1` | sm_75、sm_80、sm_86、sm_89、sm_90 |
 | cuda13.4 | Fedora 44 | NVIDIA のリポジトリの `cuda-toolkit-13-4` | sm_75、sm_80、sm_86、sm_89、sm_90 |
+| cuda13.5 | Fedora 45 | NVIDIA のリポジトリの `cuda-toolkit-13-5` | sm_75、sm_80、sm_86、sm_89、sm_90 |
 | cuda12.4 | Ubuntu 26.04 | `nvidia-cuda-toolkit` | sm_60、sm_61、sm_70、sm_75、sm_80、sm_86、sm_89、sm_90 |
 
-AMD のコードはどの版にも、そのディストリビューションの rocBLAS（ROCm 7.1）がコードを持つ GPU の分を入れます（intel/llvm 7.2.0 にターゲットのない gfx1152 と gfx1153 を除きます）。
+AMD のコードは、どの版にも、そのディストリビューションの rocBLAS（Ubuntu は 7.1、Fedora 44 は 7.1、45 は 7.2）がコードを持つ GPU の分を入れます（intel/llvm 7.2.0 にターゲットのない gfx1152 と gfx1153 を除きます）。
 
 | ディストリビューション | AMD のコード |
 | --- | --- |
 | Ubuntu 26.04 | gfx1030、gfx1100、gfx1101、gfx1151、gfx1200、gfx1201 |
 | Fedora 44 | gfx1030、gfx1031、gfx1035、gfx1036、gfx1100、gfx1101、gfx1102、gfx1103、gfx1150、gfx1151、gfx1200、gfx1201 |
+| Fedora 45 | gfx1030、gfx1031、gfx1035、gfx1036、gfx1100、gfx1101、gfx1102、gfx1103、gfx1150、gfx1151、gfx1200、gfx1201 |
 
-- cuda の版の名前はビルドに使った CUDA の版です。
-  Fedora 44 向けの NVIDIA のリポジトリには CUDA 13.3 と 13.4 しかないので、Fedora では 13.4 を使います。CUDA 12 もないので、cuda12.4 は Ubuntu だけです。
+- cuda の版の名前は、ビルドに使った CUDA の版です。Fedora 44 の rpm は 13.4、45 の rpm は 13.5 です。
+  NVIDIA のリポジトリは fedora44 用しかないので、Fedora 45 でもそれを使います（NVIDIA が fedora45 用の置き場を出したら切り替えます。2026-11-18 時点で fedora45 用には DCGM しかありません）。
+  Fedora に CUDA 12 は無いので、cuda12.4 は Ubuntu だけです。
 - CUDA 13 は Pascal（sm_60・sm_61）と Volta（sm_70）のコードを作らないので、P100、P40、V100 などは cuda12.4 を使います。
 - intel/llvm 7.2.0 の SYCL には sm_90 より上の名前がないので、RTX 50 などの新しい GPU は sm_90 の PTX をドライバーがコンパイルして動かします。
 - PTX はツールキットの版なので、ドライバーはその CUDA の版に対応している必要があります。
@@ -413,26 +432,48 @@ Windows 版の 7z も同じ `tools/package/build.sh` で、Ubuntu 26.04 の使�
 tools/package/build.sh windows cuda12.4      # XeStrata-<版>-windows-x64.7z
 ```
 
-- すべて Linux の上で Windows 向けにクロスビルドします。intel/llvm（Linux 版の contrib と、Windows 版の SYCL のランタイム）、エンジン（contrib-llvm のモード、NVIDIA のコードは cuda12.4 の deb と同じ）、CPU の画像のエンコーダー（`strata-vision-cpu.exe`。GPU の Vulkan のものは入れず、画像は CPU で読みます）、.NET の入口（`dotnet-sdk-10.0`）、Python の embeddable 版と wheel を作り、`tools/package/windows_bundle.py` がフォルダーと 7z にします。
+- すべて Linux の上で Windows 向けにクロスビルドします。intel/llvm（Linux 版の contrib と、Windows 版の SYCL のランタイム）、エンジン（contrib-llvm のモード、NVIDIA のコードは cuda12.4 の deb と同じ）、画像の読み手（`xestrata-vision.exe`）、.NET の入口（`dotnet-sdk-10.0`）、Python の embeddable 版と wheel を作り、`tools/package/windows_bundle.py` がフォルダーと 7z にします。
 - MSVC の CRT と Windows SDK は xwin で Microsoft から取り、ライセンスに同意します（自由ソフトウェアではなく、7z には入れません）。CUDA の Windows 版のヘッダーとインポートライブラリも 7z には入れません。
 - Ubuntu 26.04 のパッケージと同じ ccache（`build/pkg-ccache/ubuntu26.04/`）を使い、xwin と NuGet の取得物は `build/pkg-cache/windows/` に残します。
 - 7z の中の exe・DLL・Python のパッケージは、どれも `windows_bundle.py` の部品の一覧にあるものでなければならず、Visual C++ のランタイムや NVIDIA のライブラリが入っていると止まります。
   `THIRD-PARTY-NOTICES.md` に部品・版・ライセンス・入手元を書き、`licenses/` にライセンスの全文を置きます。
 - 出てくるものは `build/pkg/windows-cuda12.4/` の 7z と `BUILDINFO` です。
 
+### 窓のパッケージ（xestrata-gui）
+
+Linux の窓（`launcher/`）も、同じ `tools/package/build.sh` で、そのディストリビューションの使い捨てのコンテナの中で作ります（`tools/package/gui.sh`）。
+
+```bash
+tools/package/build.sh ubuntu26.04 gui   # xestrata-gui_<版>_amd64.deb
+tools/package/build.sh fedora44 gui      # xestrata-gui-<版>-<Release>.fc44.x86_64.rpm
+tools/package/build.sh fedora45 gui      # xestrata-gui-<版>-<Release>.fc45.x86_64.rpm
+```
+
+- ディストリビューションの `dotnet-sdk-10.0`（Ubuntu はアーカイブ、Fedora は updates）で、窓を linux-x64 のフレームワーク依存で publish します。
+  .NET のランタイムは同梱せず、ディストリビューションの `dotnet-runtime-10.0` に依存します。.NET に依存するのはこのパッケージだけです。
+- NuGet の部品は nuget.org からだけ取り（`launcher/nuget.config`）、版とハッシュは各プロジェクトの `packages.lock.json` で固定します。
+  パッケージと Windows の 7z は `RestoreLockedMode` で復元し、ロックにない部品は取りません。版を変えたら `dotnet restore launcher/Tests --force-evaluate` でロックを作り直します。
+  取った部品は `build/pkg-cache/<distro>/nuget/` に残します。
+- 中身は `/usr/lib/xestrata/launcher/`（`xestrata-gui` と dll、`libSkiaSharp.so`・`libHarfBuzzSharp.so`）、メニューのエントリーとアイコン、`/usr/share/doc/xestrata-gui/` の `THIRD-PARTY-NOTICES.md` と `licenses/`（`tools/package/launcher_notices.py`。窓のフォルダーのライブラリがどの部品にも入っていなければ止まります）です。
+- 窓は setup の `--describe` から欄を描くので、同じ版の本体に依存します。本体の各版は `xestrata-engine` を版つきで提供し、`xestrata-gui` はそれに依存します。
+  本体は `xestrata-gui` を提案（Suggests）するだけで、.NET にも窓にも依存しません。
+- 部品はどれも自由ソフトウェアなので（libSkiaSharp.so に入る Adobe の DNG SDK はコードだけで、条項が自由でない文書は入れません）、free と contrib-llvm の本体のどちらにも同じ 1 つのパッケージです。
+
 ### パッケージの中身
 
 どの版（`xestrata-free`、`xestrata-contrib-cuda<版>`）も、1 つのパッケージに次のものを入れます。
 パッケージの版は Debian の付け方にならい、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）です。
-xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）です。
+xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1 に Fedora のタグを付けた `1.fc44`・`1.fc45`）です。
+  タグは、Fedora 44 と 45 の同じ版の名前（gui と free）が、リリースの集め先で重ならないようにするためです。
 
 | 中身 | 置き場所 |
 | --- | --- |
 | `xestrata` のコマンド（setup.py）、サーバー、Web アプリ、setup が使う道具、llama.cpp の gguf-py、データ、systemd の user unit | `/usr/share/xestrata`、`/usr/bin/xestrata`、`/usr/lib/systemd/user/xestrata.service` |
-| エンジン（`strata`）、画像のエンコーダー、intel/llvm の SYCL の実行時（`libsycl.so.9`、UR のローダーと Level Zero と HIP（AMD）のアダプター、cuda の版では CUDA のアダプターも、`libumf`）、oneMath（rocBLAS の後端、cuda の版では oneMKL と cuBLAS の後端も） | `<libdir>/xestrata/engine` |
+| エンジン（`xestrata-engine`）、画像のエンコーダー、intel/llvm の SYCL の実行時（`libsycl.so.9`、UR のローダーと Level Zero と HIP（AMD）のアダプター、cuda の版では CUDA のアダプターも、`libumf`）、oneMath（rocBLAS の後端、cuda の版では oneMKL と cuBLAS の後端も） | `<libdir>/xestrata/engine` |
 
-- パッケージは `xestrata-engine` を提供し、互いに衝突します。一度に 1 つだけ入り、別のものを入れると入れ替わります。
-- libsycl 9 は Ubuntu 26.04（`dpclang` 6 まで）にも Fedora 44 にもないので、パッケージに同梱します。
+- パッケージは `xestrata-engine` を版つきで提供し、互いに衝突します。一度に 1 つだけ入り、別のものを入れると入れ替わります。
+  窓のパッケージ `xestrata-gui` は提案（Suggests）だけです（[窓のパッケージ](#窓のパッケージxestrata-gui)）。
+- libsycl 9 は Ubuntu 26.04（`dpclang` 6 まで）にも Fedora（44・45）にもないので、パッケージに同梱します。
   intel/llvm の `libsycl-jit`（157 MB）は、ソースからカーネルをコンパイルするときだけ開かれ、エンジンはそれをしないので入れません。
 - 依存はディストリビューションにあるものを使います。
   Python のパッケージは pip の固定版（`requirements.txt`）ではなく、ディストリビューションの版です。
@@ -447,6 +488,7 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 - どの版のビルドでも、ディストリビューションの ROCm（Ubuntu の universe と Fedora の公式にある 7.1）で intel/llvm の HIP のターゲットと
   アダプターを作り、アダプターを同梱します。エンジンが持つ AMD のコードは `BUILD.json` の `hip_archs` に記録し、setup はそれで GPU が使えるかを判断します。
 - 推奨と提案に入れたメーカーのものは、メーカーごとに `BUILD.json` の `runtime` にも記録します。setup は使う GPU のメーカーのもので入っていないものを apt か dnf に尋ねて調べ、入れ方（要るならリポジトリの登録から）を表示します。GPU のランタイムがなければ止まり、oneMKL と cuBLAS がなければ表示だけして続けます。
+  AMD の ROCm を AMD 自身のパッケージ（amdrocm、`/opt/rocm/core-<版>`）で入れているときは、エンジンのリンクするライブラリ（その実行物の NEEDED）と使う GPU のコードがその木に揃っていれば、ディストリビューションの ROCm は求めず、エンジンのライブラリの道をそちらに向けて起動します。
 - `third_party/nonfree/` は入れません。チャットテンプレートは、setup がモデルの pack に書いたものを使います。
   実験的な速度向上用の射影のベクトルは、有効にしたときに setup が版のタグから GitHub でダウンロードします。
 - Python はビルドのときにバイトコンパイルし、`xestrata` は `PYTHONDONTWRITEBYTECODE=1` で動かします。`/usr` に後から何も書かず、
@@ -475,6 +517,7 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 | `XESTRATA_VERSION` | `latest` | Releases から取るときのタグ |
 | `XESTRATA_VARIANT` | `free` | 入れる rpm の版（このフォークのビルドは free だけです） |
 | `XESTRATA_NONFREE` | `0` | `1` で、rpm の `BUILD.json` が oneMKL や NVIDIA の cuBLAS・cuDNN を記録していればそれも入れます（元の XeStrata の contrib の rpm を置いたときのもの。このフォークの rpm は記録しません） |
+| `XESTRATA_ROCM` | `fedora` | AMD の GPU の ROCm。既定は Fedora のものです。`10.1` にすると、AMD の Radeon 向けのリポジトリ（RHEL 10 版）の ROCm 10.1 の HIP の実行時と rocBLAS と hipBLASLt を入れます。その hipBLASLt は、Fedora のものにない gfx1150 のコードも持ちます。どちらも自由ソフトウェアです |
 
 - GPU: `/dev/dri` と、ROCm が使う `/dev/kfd` を渡し、`userns_mode: keep-id` と `group_add: keep-groups` で、ホストのユーザーの uid と render グループの権限のまま開きます
   （`keep-groups` には crun のランタイムが要ります）。
@@ -496,4 +539,5 @@ services:
 
 - SELinux（Fedora など）: ホストのフォルダーのラベルを書き換えないよう、コンテナは `label=disable` で動かします。ビルドのときだけ、`container/` を読めるようにラベルを付けます（`relabel=shared`）。
 - memlock: rootless のコンテナはホストのユーザーの上限を超えられません。setup が上限が足りないと言ったら、ホストで上げます。
+- seccomp: Podman の既定の seccomp のプロファイルは io_uring を禁じています。compose は、それに io_uring の 3 つのシステムコールを許す項目を足したプロファイル（`third_party/main/containers-common/seccomp-io_uring.json`）でコンテナを動かします。エンジンは、Intel の GPU のためにエキスパートのアリーナを io_uring で固定します（#42）。プロファイルのパスは `container/` から見たものなので、`podman compose` は `container/` で実行します。
 - 止め方: `podman compose down` です。`init` の PID 1 が止める合図を setup とサーバーに渡し、エンジンが止まるのを最大 60 秒待ちます。

@@ -11,7 +11,6 @@ import tempfile
 import threading
 import time
 import unittest
-import threading
 import json
 import urllib.request
 import urllib.error

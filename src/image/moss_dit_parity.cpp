@@ -9,10 +9,13 @@
 //   2. the block's output over the context's rows, the image's then the text's (the time's shared modulation, the
 //      four-axis RoPE, one attention over every row, the gates);
 //   3. the velocity (the head over the image's rows), and a second context's that skips the block;
+//   4. the velocity with the color and depth control's input projection (set_control: an adapter's video_embedder
+//      over the latent's, a color map's and a depth map's channels side by side);
 // each with the blocks in FP16 and in 8 bits (W8A8 where the GPU's library takes int8 products, else Q8_0).
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/moss_dit.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 
 #include <algorithm>
 #include <array>
@@ -312,11 +315,20 @@ std::vector<float> fetch(const float* d, size_t n) {
     return h;
 }
 
+// BF16 rows (the DiT's residual stream) as floats
+std::vector<float> fetch(const uint16_t* d, size_t n) {
+    std::vector<uint16_t> b(n);
+    strata::gpu::copy(b.data(), d, n * 2);
+    std::vector<float> h(n);
+    for (size_t i = 0; i < n; ++i) h[i] = strata::kernels::f32_from_bf16(b[i]);
+    return h;
+}
+
 }  // namespace
 
 int main() {
     const Model m = make_model();
-    const auto path = std::filesystem::temp_directory_path() / "strata_moss_dit_parity.safetensors";
+    const auto path = std::filesystem::temp_directory_path() / "xestrata_moss_dit_parity.safetensors";
     m.write(path);
     std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): the same inputs each run.
     std::normal_distribution<float> nd;
@@ -345,6 +357,24 @@ int main() {
     }
     block(m, "layers.0.", x0, kHW + kRows, at, mod.data(), "proj.q", "proj.k", "proj.v", "proj.o", false);
     const Rows v0 = head_out(m, x0, head), v1 = head_out(m, context(ntxt), head);   // context 1 skips it
+    // the control's adapter: the input projection over three latents' channels, the color's and the depth's after
+    Model ctl;
+    ctl.linear("video_embedder", kC, 3 * kLat, true);
+    const auto ctl_path = std::filesystem::temp_directory_path() / "xestrata_moss_dit_parity_control.safetensors";
+    ctl.write(ctl_path);
+    const Rows col = rnd(kHW * kLat), dep = rnd(kHW * kLat);
+    Rows wide((size_t) (kHW * 3 * kLat));
+    for (int64_t t = 0; t < kHW; ++t)
+        for (int64_t c = 0; c < kLat; ++c) {
+            wide[(size_t) (t * 3 * kLat + c)] = lat[(size_t) (t * kLat + c)];
+            wide[(size_t) (t * 3 * kLat + kLat + c)] = col[(size_t) (t * kLat + c)];
+            wide[(size_t) (t * 3 * kLat + 2 * kLat + c)] = dep[(size_t) (t * kLat + c)];
+        }
+    Rows xc = lin(ctl, "video_embedder", wide, kHW);
+    xc.insert(xc.end(), txt.begin(), txt.end());
+    block(m, "layers.0.", xc, kHW + kRows, at, mod.data(), "proj.q", "proj.k", "proj.v", "proj.o", false);
+    const Rows vc = head_out(m, xc, head);
+    std::vector<float> fc(col.begin(), col.end()), fd(dep.begin(), dep.end());
 
     std::vector<float> fs(states.begin(), states.end()), fn(neg.begin(), neg.end()), fl(lat.begin(), lat.end());
     try {
@@ -366,17 +396,34 @@ int main() {
             d.forward(x, kTime, kH, kW, 2, out);
             strata::gpu::stream_sync(s);
             // FP16 products: within 3e-3 of the largest value (about 3.5e-4 on the B70 and the RTX 4070); the 8-bit
-            // block's 5e-3 (8.4e-4)
-            const double tol = q8 ? 5e-3 : 3e-3;
+            // block's 5e-3 (8.4e-4).  The residual stream is BF16: the rows read from it (1, 2)
+            // take two of its roundings more, 2^-7 of the largest (6.7e-3 and 8.5e-3 on the RTX 4070, 2026-11-06),
+            // and the velocity, the head over them, 5e-3 in either form (3.0e-3 in FP16)
+            const double tol = q8 ? 5e-3 : 3e-3, bf = 0x1p-7;
             double e = rel(fetch(d.text_rows(0), (size_t) (kRows * kC)), txt);
-            check(e <= 3e-3, "1. the text embedder's rows (FP16)", e, 3e-3);
+            check(e <= 3e-3 + bf, "1. the text embedder's rows (FP16)", e, 3e-3 + bf);
             e = rel(fetch(d.block0(), (size_t) ((kHW + kRows) * kC)), x0);
-            check(e <= tol, "2. the block's output over the image's and the text's rows", e, tol);
+            check(e <= tol + bf, "2. the block's output over the image's and the text's rows", e, tol + bf);
             const auto o = fetch(out, fl.size() * 2);
             e = rel(std::vector<float>(o.begin(), o.begin() + kHW * kLat), v0);
-            check(e <= tol, "3. the velocity", e, tol);
+            check(e <= 5e-3, "3. the velocity", e, 5e-3);
             e = rel(std::vector<float>(o.begin() + kHW * kLat, o.end()), v1);
             check(e <= 3e-3, "3. a second context's, skipping the block", e, 3e-3);
+            float *dc = nullptr, *dd = nullptr;
+            if (!strata::gpu::alloc_device(&dc, fc.size() * 4) || !strata::gpu::alloc_device(&dd, fd.size() * 4))
+                throw std::runtime_error("GPU memory");
+            strata::gpu::copy(dc, fc.data(), fc.size() * 4);
+            strata::gpu::copy(dd, fd.data(), fd.size() * 4);
+            d.set_control(ctl_path.string());
+            d.set_control_input(dc, dd, 1.f, 1.f);
+            d.forward(x, kTime, kH, kW, 1, out);
+            strata::gpu::stream_sync(s);
+            e = rel(fetch(out, (size_t) (kHW * kLat)), vc);
+            check(e <= 5e-3, "4. the velocity with the color and depth control's input projection", e, 5e-3);
+            d.set_control_input(nullptr, nullptr, 1.f, 1.f);
+            d.set_control("");
+            strata::gpu::free(dc);
+            strata::gpu::free(dd);
             strata::gpu::free(x);
             strata::gpu::free(out);
         }
@@ -385,6 +432,7 @@ int main() {
         ++g_fail;
     }
     std::filesystem::remove(path);
+    std::filesystem::remove(ctl_path);
     std::printf("moss_dit_parity: %d failures\n", g_fail);
     return g_fail ? 1 : 0;
 }

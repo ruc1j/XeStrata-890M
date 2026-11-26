@@ -6,14 +6,31 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace strata::core {
+
+/// The pairs several helpers fill from (--expert-cache-device1..3): `profile` first, then every other (layer, expert)
+/// expert by expert, each layer in turn, so that the tail spreads over the layers instead of piling on layer zero (the
+/// shipped profile names a third of Qwen3.8-Flash-Next's experts).
+std::vector<std::pair<int32_t, int32_t>> remote_ranking(const std::vector<std::pair<int32_t, int32_t>>& profile,
+                                                        int64_t layers, int64_t experts);
+
+/// --expert-cache-remote-placement: the pairs each helper r fills (caps[r] its slots; helpers 1 and 2 count while
+/// their caps are > 0), from `ranked` without those `held` (a primary cache's).  "stripe" deals them out in turn for
+/// parallel work on the helpers; "layer" (`by_layer`) gives each layer one helper (layer % helpers), as far as it has
+/// room, to cut switches and transfers over a shared link (USB4).  Both engines' (generate.cpp, PlainModel).
+std::array<std::vector<std::pair<int32_t, int32_t>>, 3>
+remote_placement(const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t layers, int64_t experts,
+                 const std::array<int, 3>& caps, bool by_layer, const std::function<bool(int32_t, int32_t)>& held);
 
 /// A static, profile-filled expert tier on another GPU. GPU 0 keeps all
 /// dense weights and state; results return through the existing pinned CPU rows.
@@ -24,13 +41,19 @@ public:
     RemoteExperts(const RemoteExperts&) = delete;
     RemoteExperts& operator=(const RemoteExperts&) = delete;
 
+    /// Whether a helper computes the experts of the process's layout: every native format but BF16 experts, whose rows
+    /// take FP32 activations (native_expert_grouped_bf16) that begin() does not run.  `why` says which it does not.
+    /// open() refuses those, and a role choice (--layer-split auto) leaves the helper out for them.
+    static bool computes_layout(std::string& why);
     /// Initialise the device before the host expert arena registers
     /// tens of GiB of portable mapped memory with CUDA.
     static bool preflight(int device, double& free_gib, std::string& err);
+    /// `fit`: up to `slots` as far as the device's free memory takes them (HELPER on, after an image job that kept
+    /// part of the card), instead of refusing when they do not all fit.
     bool open(int device, int slots, int64_t layers, int64_t experts,
               const std::vector<std::pair<int32_t, int32_t>>& ranked,
               const ExpertCache& primary, ExpertSource& source,
-              std::vector<uint8_t>& claimed, std::string& err);
+              std::vector<uint8_t>& claimed, std::string& err, bool fit = false);
     void close();
 
     /// `kind` is the primary verifier's classification (-1 = CPU candidate),
@@ -72,10 +95,13 @@ private:
     int64_t n_expert_ = 0;
     int32_t groups_ = 0;
     int64_t computed_ = 0;
+    int64_t h_ = 0, ff_ = 0;   ///< the rows' width and the experts' inner size (open)
     int64_t launched_layers_ = 0;
     uint64_t returned_bytes_ = 0;
     uint64_t full_row_bytes_ = 0;
     double ms_begin_ = 0, ms_wait_ = 0;
+    std::chrono::steady_clock::time_point launched_at_;   ///< begin()'s last launch
+    double run_avg_ms_ = 0;    ///< launch to done, a moving average: how long finish() polls before it blocks
     ExpertCache cache_;
     void* stream_ = nullptr;
     void* read_stream_ = nullptr;   ///< STRATA_PREFILL_HELPER_SOURCE: cache -> host copies
@@ -89,6 +115,7 @@ private:
     uint8_t* d_q8_ = nullptr;
     float* d_scales_ = nullptr;
     void* d_scratch_ = nullptr;
+    uint8_t* d_types_ = nullptr;   ///< a mixed pack: each expert's (gate/up K, down K), layer by layer
     void* d_meta_ = nullptr;  ///< one upload of the grouped indices, instead of five small copies
     int32_t* d_start_ = nullptr;
     int32_t* d_dst_ = nullptr;
@@ -149,6 +176,7 @@ public:
     double cached_share(int64_t samples) const override { return fallback_.cached_share(samples); }
     bool register_on(int device, std::string& err) override { return fallback_.register_on(device, err); }
     bool registered_on(int device) const override { return fallback_.registered_on(device); }
+    void hold_registration(int device) override { fallback_.hold_registration(device); }
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override {
         return fallback_.advise_pairs(pairs, n);

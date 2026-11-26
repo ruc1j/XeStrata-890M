@@ -8,6 +8,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/platform/env.hpp"
 
 #include <array>
 #include <chrono>
@@ -146,7 +147,7 @@ struct VramKv {
 VramKv& vram_kv() { static VramKv v; return v; }
 size_t park_vram_budget() {
     static const size_t b = [] {
-        const char* v = std::getenv("STRATA_PARK_VRAM_MIB");
+        const char* v = strata::env_get("PARK_VRAM_MIB");
         const long long mib = v != nullptr ? std::strtoll(v, nullptr, 10) : 0;
         return mib > 0 ? (size_t) mib << 20 : (size_t) 0;
     }();
@@ -232,7 +233,7 @@ struct ParkAsync {
 ParkAsync& park_async() { static ParkAsync a; return a; }
 constexpr size_t kParkPiece = (size_t) 4 << 20;
 bool park_async_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
+    static const bool on = [] { const char* v = strata::env_get("PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
 // Whether part `i` of a layer is device memory, which the stage takes: the K/V pools of a resident layer (kv_mode 0)
@@ -245,7 +246,7 @@ bool on_device(const QsaState& st, const void* p) {
 struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; };
 KvSaveTrace& kv_save_trace() { static KvSaveTrace t; return t; }
 bool park_trace_on() {
-    static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr;
+    static const bool on = strata::env_get("PARK_TRACE") != nullptr;
     return on;
 }
 
@@ -256,6 +257,21 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     if (strata::gpu::copy(dst, src, n)) return true;
     error = std::string("conversation snapshot copy: ") + strata::gpu::last_error();
     return false;
+}
+
+// One endpoint is a ConversationBuffer (ordinary host memory), the other is a state pool.  Do not infer that an
+// unknown pointer is host memory: virtual device allocations need not be reported as USM.  A host USM pool can be
+// copied by the CPU after the compute queue is drained, preserving transfer's ordering without using a copy engine.
+bool transfer_host(void* dst, const void* src, const void* pool, size_t n, std::string& error) {
+    if (!n) return true;
+    if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
+    if (!strata::gpu::is_host_usm(pool)) return transfer(dst, src, n, error);
+    if (!strata::gpu::stream_sync(nullptr)) {
+        error = std::string("conversation snapshot copy: ") + strata::gpu::last_error();
+        return false;
+    }
+    std::memcpy(dst, src, n);
+    return true;
 }
 } // namespace
 
@@ -335,7 +351,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                 } else {
                     dst[i]->resize(sizes[i]);
                     if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                            return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                            return transfer_host(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, src[i], n, error);
                         })) return false;
                 }
                 if (reused_bytes) *reused_bytes += keep;
@@ -356,7 +372,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const auto t2 = tick();
         const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
-                if (!staged) return transfer(p, s, n, error);
+                if (!staged) return transfer_host(p, s, src[i], n, error);
                 if (!strata::gpu::copy_async(a.stage + a.used, s, n, a.stream)) {
                     error = std::string("conversation snapshot stage copy: ") + strata::gpu::last_error();
                     return false;
@@ -430,7 +446,7 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     } else {
         for (size_t i = 0; i < src.size(); ++i)
             if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
-                    return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                    return transfer_host(static_cast<uint8_t*>(dst[i]) + at, p, dst[i], n, error);
                 })) return false;
     }
     // VRAM slots still contain the outgoing conversation. Resolve must refill
@@ -469,7 +485,7 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     auto why = std::make_shared<std::string>();
     s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
         if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
-        return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
+        return transfer_host(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, src[part], n, *why);
     };
     s.error = [why] { return *why; };
     out = std::move(s);
@@ -485,7 +501,7 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     auto compare = [&](const void* device, const uint8_t* expected, size_t bytes, bool include_hash) {
         for (size_t offset = 0; offset < bytes;) {
             const size_t n = std::min(buffer.size(), bytes - offset);
-            if (!transfer(buffer.data(), static_cast<const uint8_t*>(device) + offset, n, error)) return false;
+            if (!transfer_host(buffer.data(), static_cast<const uint8_t*>(device) + offset, device, n, error)) return false;
             if (std::memcmp(buffer.data(), expected + offset, n) != 0) {
                 error = "conversation snapshot: restored K/V bytes differ";
                 return false;
@@ -525,7 +541,7 @@ void conversation_park_join() {
     std::lock_guard<std::mutex> lk(a.mu);
     if (a.pending.valid()) {
         const std::string e = a.pending.get();
-        if (!e.empty()) std::fprintf(stderr, "strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", e.c_str());
+        if (!e.empty()) std::fprintf(stderr, "xestrata: XESTRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", e.c_str());
     }
 }
 
@@ -552,9 +568,9 @@ bool conversation_park_async_begin(size_t need) {
     a.slot_tag = a.slot != nullptr ? a.slot->tag : 0;
     if (park_trace_on() && park_vram_budget() != 0) {
         if (a.slot != nullptr)
-            std::fprintf(stderr, "strata parktrace: kv slot %zu MB tag %llu\n", need >> 20, (unsigned long long) a.slot_tag);
+            std::fprintf(stderr, "xestrata parktrace: kv slot %zu MB tag %llu\n", need >> 20, (unsigned long long) a.slot_tag);
         else
-            std::fprintf(stderr, "strata parktrace: kv slot: none (%s)\n", why);
+            std::fprintf(stderr, "xestrata parktrace: kv slot: none (%s)\n", why);
     }
     if (a.dev != dev || (a.stage != nullptr && a.slot == nullptr && a.cap < need)) {
         if (a.stage) strata::gpu::free(a.stage);
@@ -693,7 +709,7 @@ void conversation_park_join_for(const SavedConversation& image) {
     size_t hits = 0;
     for (const auto& k : image.kv) hits += vram_kv_find(k.dev_tag) != nullptr ? 1 : 0;
     if (park_trace_on() && park_vram_budget() != 0)
-        std::fprintf(stderr, "strata parktrace: kv restore: %zu of %zu layers from the slot\n", hits, image.kv.size());
+        std::fprintf(stderr, "xestrata parktrace: kv restore: %zu of %zu layers from the slot\n", hits, image.kv.size());
     if (hits < image.kv.size()) conversation_park_join();
 }
 

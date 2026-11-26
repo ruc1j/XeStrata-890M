@@ -107,7 +107,7 @@ class StreamErrors(unittest.TestCase):
                     error = read_error(failure)
                 self.assertIn("server's log", error["message"])
                 self.assertNotIn("secret", error["message"])
-                self.assertIn("[strata] error in a started stream", log.getvalue())
+                self.assertIn("[xestrata] error in a started stream", log.getvalue())
                 self.assertIn("RuntimeError: a secret detail", log.getvalue())
 
     def test_a_client_that_left_gets_no_frame(self):
@@ -125,7 +125,19 @@ class StreamErrors(unittest.TestCase):
     def test_a_frame_the_client_cannot_take_is_a_disconnect(self):
         def refuses(_data):
             raise BrokenPipeError()
-        for send in (lambda h, s: h._chat_failed(s, "x"), lambda h, s: h._anthropic_failed(s, "x", "api_error")):
+
+        def chat_failed(h, s):
+            # the chat stream's error frame comes from _openai_sse; the handler writes its lines and takes an OSError
+            # for a client that left
+            def chunks():
+                raise ValueError("x")
+                yield
+            try:
+                for line in h._openai_sse(s, chunks(), None):
+                    s.wfile.write(line)
+            except OSError:
+                s._note(outcome="disconnected")
+        for send in (chat_failed, lambda h, s: h._anthropic_failed(s, "x", "api_error")):
             noted = {}
             fake = types.SimpleNamespace(wfile=types.SimpleNamespace(write=refuses),
                                          _note=lambda **values: noted.update(values))

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/cpu/native_expert.hpp - plan v0.3 P6: one routed expert in its GGUF form on the CPU.
 //
@@ -59,6 +60,14 @@ struct NativeFmt {
     bool had_gu = false, had_d = false;
     const float* gu_signs = nullptr;    ///< n_embd signs for x (nullptr: identity)
     const float* d_signs = nullptr;     ///< n_ff signs for h (nullptr: identity)
+    /// The latent MoE's Q3_K shared column scales (native_experts.txt v6, scales/l*.f32): the gate/up rows are
+    /// A*diag(s), so the D stage's rows take 1/s before any consumer reads them (the vector is the reciprocals,
+    /// n_embd floats, layer-major in the layout's storage).  nullptr: the pack has no column scales.
+    const float* gu_colscale = nullptr;
+    /// R1Q2 stores codes first, then per-matrix row bases, column scales and packed two-bit indices.
+    bool r1q2 = false;
+    size_t sc_off = 0;
+    float p2[3][4] = {};
 };
 
 /// Whether the layer's gate and up rows are of different types (a NativeFmt filled by native_fmt; one built another
@@ -72,11 +81,29 @@ bool native_experts_available() noexcept;
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
                 int up_type = -1);
 
-/// One row of `n` values of a GGUF tensor of ggml type `type` to floats, by ggml's own dequantizer (a model's
-/// embedding row read on the host).  False when ggml has none for the type or `n` is not whole blocks.
+/// Build a bih3 R1Q2 format from types 182..194 and the gate, up and down scale tables.
+bool native_r1q2_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const float (&p2)[3][4],
+                      NativeFmt& f, std::string& err);
+/// Offset of a projection's scales from sc_off, m = 0 (gate), 1 (up), 2 (down).
+size_t native_r1q2_scale_offset(const NativeFmt& f, int m);
+
+/// One row of `n` values of a GGUF tensor of ggml type `type` to floats, by ggml's own dequantizer (F32 copied): the
+/// one host lookup of an embedding row, for every table that stays in host memory (the plain models' and the image
+/// engine's text readers').  False when ggml has none for the type or `n` is not whole blocks.
 bool native_row_to_float(int type, const void* src, float* dst, int64_t n);
 /// Bytes of one row of `n` values of ggml type `type` (0 when `n` is not whole blocks).
 size_t native_row_bytes(int type, int64_t n);
+
+/// A dense matrix's rows of ggml type `type` read where they are (a GGUF tensor), as ggml-cpu multiplies them: the
+/// activation quantized to the type's vec_dot format, each row's dot by ggml-cpu's own vec_dot (the K-quants' AVX2 and
+/// AVX-VNNI kernels).  native_vec_act_bytes: the bytes of one activation of `n` values in that format (0: ggml-cpu
+/// has no vec_dot for the type).
+size_t native_vec_act_bytes(int type, int64_t n);
+/// x (n floats) to the activation native_vec_rows reads for `type`, in `dst` (native_vec_act_bytes bytes).
+void native_vec_quant(int type, const float* x, void* dst, int64_t n);
+/// y[r] = row r . act for the rows [r0, r1) of `rows` (row_bytes apart, n values each).
+void native_vec_rows(int type, const uint8_t* rows, size_t row_bytes, int64_t n, int64_t r0, int64_t r1,
+                     const void* act, float* y);
 
 /// x (n_embd floats) -> the gate/up activation the layer's rows read (act_bytes), rotated first when the layer is
 /// Hadamard-folded: a Q2_0 layer's is Strata's ActQ, any other layer's its vec_dot_type.  Every caller gets the right one from here, so none chooses by type.  `dst` is

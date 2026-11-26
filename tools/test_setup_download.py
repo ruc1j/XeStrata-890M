@@ -768,8 +768,8 @@ class ProxyHint(unittest.TestCase):
 
 
 class ReadOnlyModelFolderMark(unittest.TestCase):
-    """0.2.9.1: a model folder Strata cannot write to (a read-only disk) keeps its finish marks under Strata's own
-    folder, so the SHA-256 of the 110 GB Engram is not computed again on every launch."""
+    """0.2.9.1: a model folder Strata cannot write to (a read-only disk) keeps its finish marks under the user's state
+    folder (STATE), so the SHA-256 of the 110 GB Engram is not computed again on every launch."""
 
     def test_the_mark_is_kept_elsewhere_and_the_hash_is_not_repeated(self):
         real_write = Path.write_text
@@ -791,7 +791,7 @@ class ReadOnlyModelFolderMark(unittest.TestCase):
                 hashed.append(path)
                 return sha
 
-            with mock.patch.object(setup, "ROOT", root), mock.patch.object(Path, "write_text", write), \
+            with mock.patch.object(setup, "STATE", root), mock.patch.object(Path, "write_text", write), \
                     mock.patch.object(setup, "_hash_file", fake_hash):
                 setup.verify_sha256(f, 30, sha)
                 self.assertEqual(len(hashed), 1)

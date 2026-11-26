@@ -8,13 +8,25 @@
 //   2. lookup drafts that are mostly rejected stop being taken (their bucket's rate falls);
 //   3. lookup drafts that are always accepted are taken, and the window grows with them;
 //   4. match-length buckets learn separately (short matches failing does not stop long ones);
-//   5. the policy never proposes a window beyond its cap.
+//   5. the policy never proposes a window beyond its cap;
+//   6. XESTRATA_SPEC_COST is opt-in (upstream's auto is not taken): unset, one cost table at every depth; 1, a table
+//      per context bucket and a far round cut at a quarter above the cost; 0, off;
+//   7. --draft-costs: a fixed table is not moved by round times; the table file reads back what was written and
+//      refuses another key or a cut file; a table built from real rounds takes over once every size has kCalibN
+//      of them, priced at their median, and a start that reads it uses it at once; a table loaded without real
+//      sizes is held back (live costs) until kCalibReqs requests have run;
+//   8. at the take-over a size without real rounds is priced between the nearest real sizes, monotone up to the ends,
+//      and a context bucket with no table of its own copies a monotone one.
 #include "strata/spec/draft_policy.hpp"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 
+using strata::spec::CostFile;
 using strata::spec::DraftPolicy;
 
 namespace {
@@ -24,6 +36,15 @@ void check(bool ok, const char* what) {
     if (!ok) ++g_fail;
 }
 double cost(int t) { return 19.0 + 10.5 * (t - 1); }   // ms per round, measured shape
+// XESTRATA_SPEC_COST for the policies below ("" = its auto, the default)
+void set_cost_env(const char* value) {
+#if defined(_WIN32)
+    _putenv_s("XESTRATA_SPEC_COST", value);
+#else
+    if (*value) setenv("XESTRATA_SPEC_COST", value, 1);
+    else unsetenv("XESTRATA_SPEC_COST");
+#endif
+}
 }  // namespace
 
 int main() {
@@ -276,6 +297,189 @@ int main() {
             check(chain_rows(rich, {0.99f, 0.99f, 0.99f}) == 4, "rate: sure drafts are taken at any rate");
         }
     }
+    {
+        // XESTRATA_SPEC_COST: opt-in (the engine turns the rule on by default on the HIP integrated GPU, set_robust);
+        // unset, one table at every depth
+        set_cost_env("");
+        DraftPolicy p(6);
+        p.set_context(1000);
+        for (int i = 0; i < 20; ++i) p.observe(false, 4, 2, 0, 40.0);
+        check(p.cost_ms(4) < 45.0, "unset at 1K: the rounds' cost");
+        p.set_context(32768);
+        for (int i = 0; i < 20; ++i) p.observe(false, 4, 2, 0, 120.0);
+        check(p.cost_ms(4) > 100.0, "unset at 32K: the deep rounds move the one table");
+        p.set_context(1000);
+        check(p.cost_ms(4) > 100.0, "unset back at 1K: the same table");
+        // 1: a table per context bucket
+        set_cost_env("1");
+        DraftPolicy d(6);
+        d.set_context(1000);
+        for (int i = 0; i < 20; ++i) d.observe(false, 4, 2, 0, 40.0);
+        d.set_context(32768);
+        for (int i = 0; i < 20; ++i) d.observe(false, 4, 2, 0, 120.0);
+        check(d.cost_ms(4) > 100.0, "on at 32K: a table of its own");
+        d.set_context(1000);
+        check(d.cost_ms(4) < 45.0, "on back at 1K: the shallow table again");
+        // 1: a far round is cut at a quarter above the cost (set_robust's clamp)
+        DraftPolicy q(6);
+        q.set_context(1000);
+        for (int i = 0; i < 20; ++i) q.observe(false, 4, 2, 0, 40.0);
+        q.observe(false, 4, 2, 0, 400.0);
+        check(q.cost_ms(4) < 50.0, "on at 1K: a far round moves the cost by little");
+        // 0: the plain window everywhere, every round weighed alike and one table for every depth
+        set_cost_env("0");
+        DraftPolicy r(6);
+        r.set_context(1000);
+        for (int i = 0; i < 20; ++i) r.observe(false, 4, 2, 0, 40.0);
+        r.observe(false, 4, 2, 0, 400.0);
+        check(r.cost_ms(4) > 60.0, "off: the far round weighs as much as any");
+        r.set_context(32768);
+        check(r.cost_ms(4) > 60.0, "off: one table at every depth");
+        set_cost_env("");
+    }
+    {
+        DraftPolicy p(4);
+        const double tab[4] = {20.0, 25.0, 30.0, 35.0};
+        p.set_fixed_costs(tab, 4, 0);
+        for (int i = 0; i < 30; ++i) p.observe(false, 3, 2, 0, 90.0);
+        check(p.fixed() && p.cost_ms(3) == 30.0, "fixed costs: round times move no cost");
+        check(p.cost_ms(4) == 35.0 && p.cost_ms(1) == 20.0, "fixed costs: every size of the table");
+    }
+    const std::string path = (std::filesystem::temp_directory_path() / "xestrata-draft-policy-test" / "t.costs").string();
+    {
+        CostFile c;
+        c.key = "devices B70|args x";
+        c.n[0] = 3;
+        c.table[0][1] = 20.0; c.table[0][2] = 25.5; c.table[0][3] = 31.25;
+        c.reqs = 7;
+        c.real[0] = 1u;
+        c.real_cost[0][1] = 19.5;
+        c.cal[0][2].n = c.cal[0][2].nv = 2;
+        c.cal[0][2].vals[0] = 24.0; c.cal[0][2].vals[1] = 26.0; c.cal[0][2].sum = 50.0;
+        std::string why;
+        check(strata::spec::write_cost_file(path, c, why), "table file: written");
+        CostFile r;
+        const bool ok = strata::spec::read_cost_file(path, c.key, r, why);
+        check(ok && r.n[0] == 3 && r.table[0][3] == 31.25 && r.reqs == 7 && r.real[0] == 1u && r.real_cost[0][1] == 19.5 &&
+                  r.cal[0][2].n == 2 && r.cal[0][2].vals[1] == 26.0 && !r.fresh, "table file: read back as written");
+        check(!strata::spec::read_cost_file(path, "devices RTX|args x", r, why), "table file: another key is refused");
+        std::ifstream in(path);
+        std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::ofstream(path, std::ios::trunc) << all.substr(0, all.rfind("end"));
+        check(!strata::spec::read_cost_file(path, c.key, r, why), "table file: a cut file is refused");
+    }
+    {
+        DraftPolicy p(4);
+        CostFile cf;
+        cf.key = "k";
+        cf.fresh = true;
+        p.start_passive(cf, p.top_size());
+        p.request_start();
+        for (int t = 1; t <= 4; ++t) p.observe(false, t, t - 1, 0, cost(t));   // the live policy's first round of a size
+        CostFile out = cf;
+        std::string rep;
+        p.calibrate(out, rep);
+        check(p.table_held() && !p.fixed() && out.fresh, "built from real rounds: held while sizes lack rounds");
+        p.request_start();
+        for (int i = 0; i < DraftPolicy::kCalibN; ++i)
+            for (int t = 1; t <= 4; ++t) p.observe(false, t, t - 1, 0, cost(t) + (i == 3 ? 4.0 : 0.0) - (i == 5 ? 1.0 : 0.0));
+        p.request_end();
+        const bool wrote = p.calibrate(out, rep);
+        check(wrote && p.fixed() && !p.table_held() && !out.fresh && out.n[0] == 4, "built from real rounds: the table takes over");
+        check(std::fabs(p.cost_ms(3) - cost(3)) < 1e-9, "built from real rounds: a size's price is its rounds' median");
+        p.observe(false, 3, 2, 0, 500.0);
+        check(std::fabs(p.cost_ms(3) - cost(3)) < 1e-9, "built from real rounds: fixed after the take-over");
+        std::string why;
+        check(strata::spec::write_cost_file(path, out, why), "built from real rounds: written");
+        CostFile r;
+        DraftPolicy q(4);
+        if (strata::spec::read_cost_file(path, "k", r, why))
+            for (int k = 0; k < CostFile::kCtxBuckets; ++k)
+                if (r.n[(size_t) k] > 0) q.set_fixed_costs(r.table[(size_t) k].data() + 1, r.n[(size_t) k], k);
+        q.start_calibration(r);
+        bool same = q.fixed() && !q.calibrating();
+        for (int t = 1; t <= 4; ++t) same = same && std::fabs(q.cost_ms(t) - p.cost_ms(t)) < 1e-3;
+        check(same, "built from real rounds: the next start uses the same table at once");
+    }
+    {
+        DraftPolicy p(4);
+        const double tab[4] = {20.0, 25.0, 30.0, 35.0};
+        p.set_fixed_costs(tab, 4, 0);
+        CostFile cf;
+        cf.key = "k";
+        p.start_calibration(cf);
+        check(p.table_held() && !p.fixed(), "a table without real sizes: held back, live costs decide");
+        std::string rep;
+        for (int i = 0; i < DraftPolicy::kCalibReqs && p.table_held(); ++i) {
+            p.request_start();
+            p.calibrate(cf, rep);
+        }
+        check(p.fixed() && p.cost_ms(2) == 25.0 && cf.reqs == DraftPolicy::kCalibReqs, "a held table: used after kCalibReqs requests");
+    }
+    {
+        // A live stretch priced size 3 above the measured size 4 (B70 33.66 / 33.50 ms, RTX 66.88 / 60.28 ms):
+        // a take-over must not put that guess in the table.  Sizes 2 and 4 have real rounds; 1, 3, 5 and 6 do not.
+        // (XESTRATA_SPEC_COST=1: the context buckets of the cost-aware rule, for the filled bucket below)
+        set_cost_env("1");
+        DraftPolicy p(6);
+        CostFile cf;
+        cf.key = "k";
+        cf.fresh = true;
+        p.start_passive(cf, p.top_size());
+        p.request_start();
+        for (int i = 0; i < 20; ++i) {
+            p.observe(false, 2, 1, 0, 30.0);
+            p.observe(false, 4, 3, 0, 50.0);
+        }
+        for (int i = 0; i < 5; ++i) p.observe(false, 3, 2, 0, 120.0);   // live, not real
+        for (int i = 0; i < 5; ++i) p.observe(false, 5, 4, 0, 200.0);
+        for (int i = 0; i < 5; ++i) p.observe(false, 6, 5, 0, 250.0);
+        std::string rep;
+        for (int i = 0; i < DraftPolicy::kCalibReqs && p.table_held(); ++i) {
+            p.request_start();
+            p.calibrate(cf, rep);
+        }
+        check(p.fixed() && !p.table_held() && !cf.fresh && cf.n[0] == 6, "take-over: the table is used and saved");
+        bool mono = true, live_mono = true;
+        for (int t = 1; t < 6; ++t) {
+            mono &= cf.table[0][(size_t) t + 1] >= cf.table[0][(size_t) t];
+            live_mono &= p.cost_ms(t + 1) >= p.cost_ms(t);
+        }
+        check(mono, "take-over: costs do not fall as the window grows");
+        check(live_mono, "take-over: the policy's fixed costs do not fall as the window grows");
+        check(std::fabs(cf.table[0][3] - 40.0) < 1e-6, "take-over: an unmeasured size interpolates its real neighbours");
+        check(std::fabs(cf.table[0][1] - 30.0) < 1e-6, "take-over: below the first real size takes its price");
+        check(std::fabs(cf.table[0][5] - 50.0) < 1e-6 && std::fabs(cf.table[0][6] - 50.0) < 1e-6,
+              "take-over: past the last real size takes its price");
+        p.set_context(70000);   // this bucket has no table of its own and copies the nearest one
+        bool filled_mono = true;
+        for (int t = 1; t < 6; ++t) filled_mono &= p.cost_ms(t + 1) >= p.cost_ms(t);
+        check(filled_mono, "a filled bucket keeps the table monotone");
+        set_cost_env("");
+    }
+    {
+        // No size reached 16 real rounds: every price is a live guess.  The guesses fell with the window; the table
+        // still starts at a price and never falls.
+        DraftPolicy p(6);
+        CostFile cf;
+        cf.key = "k";
+        cf.fresh = true;
+        p.start_passive(cf, p.top_size());
+        p.request_start();
+        for (int t = 1; t <= 3; ++t)
+            for (int i = 0; i < 3; ++i) p.observe(false, t, t - 1, 0, 40.0 - 10.0 * (t - 1));
+        std::string rep;
+        for (int i = 0; i < DraftPolicy::kCalibReqs && p.table_held(); ++i) {
+            p.request_start();
+            p.calibrate(cf, rep);
+        }
+        bool mono = cf.table[0][1] > 0.0;
+        for (int t = 1; t < 6; ++t) mono &= cf.table[0][(size_t) t + 1] >= cf.table[0][(size_t) t];
+        check(mono, "take-over with no real sizes: a priced first size and no fall");
+        check(std::fabs(cf.table[0][1] - 40.0) < 1e-6 && std::fabs(cf.table[0][6] - 40.0) < 1e-6,
+              "take-over with no real sizes: guesses are clamped to the highest one");
+    }
+    std::filesystem::remove_all(std::filesystem::path(path).parent_path());
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

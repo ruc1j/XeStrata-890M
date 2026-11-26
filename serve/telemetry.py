@@ -6,8 +6,10 @@
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: the Intel GPU on the xe or i915 driver, from Linux (temperature and power from hwmon, the PCIe link, the load
   of this user's processes from their DRM fdinfo) and its VRAM from Level Zero's sysman through ctypes, so no pip
-  package is needed.  An NVIDIA GPU (the contrib build): NVIDIA's NVML library (libnvidia-ml.so.1, installed with
-  the driver) through ctypes: load, VRAM, temperature, power, PCIe link and throughput.
+  package is needed.  An NVIDIA GPU (the contrib build): NVIDIA's NVML library (libnvidia-ml.so.1, nvml.dll on
+  Windows, installed with the driver) through ctypes: load, VRAM, temperature, power, PCIe link and throughput.
+  Windows has no sysfs: any other GPU there is read as Task Manager reads it, load and VRAM in use from the
+  performance counters, name, address, VRAM and temperature from the kernel's graphics interface (_WinGpu).
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   Linux /proc and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -17,13 +19,18 @@ from __future__ import annotations
 import collections
 import ctypes
 import glob
+import functools
 import os
 import platform
+import re
 import sys
 import threading
 import time
 
+from serve import hardware
+
 HISTORY = 60
+WIN = sys.platform == "win32"
 
 
 # ------------------------------------------------------------------------------------------------ the Intel GPU
@@ -100,6 +107,24 @@ class _Zes:
         return (total - free, total) if total else (None, None)
 
 
+def _xe_vram(pci):
+    """(used, total) VRAM bytes, or (None, None) when unavailable or its usage is hidden."""
+    for node in sorted(glob.glob(f"/sys/bus/pci/devices/{pci}/drm/renderD*")):
+        try:
+            fd = os.open("/dev/dri/" + os.path.basename(node), os.O_RDWR | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            regions = hardware.xe_regions(fd, truncate=True)
+            total, used = sum(r[0] for r in regions), sum(r[1] for r in regions)
+            return (used, total) if total and used else (None, None)
+        except (OSError, ValueError):
+            return None, None
+        finally:
+            os.close(fd)
+    return None, None
+
+
 def _read(path, conv=int):
     try:
         with open(path, encoding="ascii") as f:
@@ -131,6 +156,31 @@ def _pci_ids_name(dev):
                         in_vendor = line.startswith(vendor + " ")
                     elif in_vendor and line.startswith(f"\t{device} "):
                         return line.strip()[len(device):].strip() or None
+        except OSError:
+            continue
+    return None
+
+
+AMDGPU_IDS = ("/usr/share/libdrm/amdgpu.ids", "/opt/amdgpu/share/libdrm/amdgpu.ids",
+              "/opt/rocm/lib/rocm_sysdeps/share/libdrm/amdgpu.ids", "/opt/rocm/share/libdrm/amdgpu.ids")
+
+
+def _amdgpu_ids_name(dev):
+    """The card's marketing name in libdrm's amdgpu.ids ("AMD Radeon AI PRO R9700") from its sysfs folder's device
+    ID and revision, or None: the list ROCm's runtime names a card by, where amdgpu gives no product_name (the board
+    has no FRU EEPROM) and the system has no PCI ID list (a container)."""
+    device = _read(os.path.join(dev or "", "device"), str)
+    revision = _read(os.path.join(dev or "", "revision"), str)
+    if not device or not revision:
+        return None
+    key = (device.upper().replace("0X", ""), revision.upper().replace("0X", "").zfill(2))
+    for path in AMDGPU_IDS:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    fields = [x.strip() for x in line.split(",", 2)]
+                    if len(fields) == 3 and (fields[0].upper(), fields[1].upper()) == key and fields[2]:
+                        return fields[2]
         except OSError:
             continue
     return None
@@ -215,7 +265,9 @@ class _XeGpu:
         if not self.ok():
             return None
         device = (_read(os.path.join(self.dev, 'device'), str) or '').replace('0x', '')
-        name = _pci_ids_name(self.dev) or f"GPU {device}"
+        vendor = _read(os.path.join(self.dev, 'vendor'), str)
+        name = (hardware.pci_product_name(vendor, device) if vendor and device else None) or \
+            _pci_ids_name(self.dev) or f"GPU {device}"
         return f"Intel {name} at {self.pci}"
 
     def _link(self):
@@ -301,6 +353,8 @@ class _XeGpu:
         # load's; github.com/hugs7/intel-xe-battlemage-hwmon-fix): the web app marks the reading while nothing runs
         out["temp_may_be_stale"] = self.driver == "xe" and out["util"] is not None and out["util"] < 1.0
         out["mem_used"], out["mem_total"] = self.zes.read()
+        if out["mem_total"] is None and self.driver == "xe":
+            out["mem_used"], out["mem_total"] = _xe_vram(self.pci)
         out["pcie_gen"], out["pcie_width"], out["pcie_gen_max"] = self._link()
         out["pcie_rx_mb"] = out["pcie_tx_mb"] = None   # no counters for the link's traffic
         return out
@@ -337,7 +391,8 @@ class _AmdGpu:
         if not self.ok():
             return None
         listed = _pci_ids_name(self.dev)
-        return _read(os.path.join(self.dev, "product_name"), str) or (f"AMD {listed}" if listed else "AMD Radeon")
+        return (_read(os.path.join(self.dev, "product_name"), str) or _amdgpu_ids_name(self.dev)
+                or (f"AMD {listed}" if listed else "AMD Radeon"))
 
     _gen = staticmethod(_gen)
     _bdf = staticmethod(_bdf)
@@ -370,6 +425,37 @@ class _AmdGpu:
         return out
 
 
+@functools.lru_cache(maxsize=16)
+def _nv_process_device(pci: str):
+    return _NvGpu(pci)
+
+
+def nvml_process_memory_mib(pid: int, pci: str) -> int | None:
+    """The process's device memory via NVML's compute list (gpu.cpp's process and MIG rules)."""
+    class Process(ctypes.Structure):
+        _fields_ = [("pid", ctypes.c_uint), ("used", ctypes.c_ulonglong),
+                    ("gpu_instance", ctypes.c_uint), ("compute_instance", ctypes.c_uint)]
+
+    gpu = _nv_process_device(pci)
+    if not gpu.ok():
+        return None
+    try:
+        fn = gpu.lib.nvmlDeviceGetComputeRunningProcesses_v3
+        n = ctypes.c_uint(0)
+        rc = fn(gpu.dev, ctypes.byref(n), None)
+        if rc not in (0, 7) or not n.value:
+            return None
+        rows = (Process * n.value)()
+        if fn(gpu.dev, ctypes.byref(n), rows) != 0:
+            return None
+        matches = [row.used for row in rows[:n.value] if row.pid == pid]
+        if not matches or any(v == 0xffffffffffffffff for v in matches):
+            return None
+        return sum(matches) >> 20
+    except (AttributeError, OSError):
+        return None
+
+
 # ------------------------------------------------------------------------------------------------ an NVIDIA GPU
 class _NvGpu:
     """An NVIDIA GPU through NVML, with _XeGpu's interface.  `pci` is the card's address as the config gives it
@@ -384,7 +470,7 @@ class _NvGpu:
     def __init__(self, pci=None):
         self.lib = self.dev = None
         self.pci = pci
-        for n in ("libnvidia-ml.so.1", "libnvidia-ml.so"):
+        for n in ("nvml.dll",) if WIN else ("libnvidia-ml.so.1", "libnvidia-ml.so"):
             try:
                 self.lib = ctypes.CDLL(n)
                 break
@@ -447,7 +533,7 @@ class _NvGpu:
         lim = self._uint("nvmlDeviceGetEnforcedPowerLimit")
         out["power_limit"] = lim / 1000.0 if lim is not None else None
         own = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")       # drops at idle (power saving)
-        link = _path_link(os.path.join(SYSFS, "bus", "pci", "devices", self.pci)) if self.pci else {}
+        link = _path_link(os.path.join(SYSFS, "bus", "pci", "devices", self.pci)) if self.pci and not WIN else {}
         if link.get("pcie_gen"):   # the link the card gets, as for AMD: the same meaning in every maker's panel
             out.update(link)
             out["pcie_own_gen"] = own
@@ -459,13 +545,250 @@ class _NvGpu:
         tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
         out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
         out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
+        if WIN and out.get("util") is None and self.pci:
+            # a laptop's NVIDIA GPU at rest: NVML answers the load once, then NVML_ERROR_UNKNOWN (RTX 3050 Laptop,
+            # driver 555.99); Windows' counters still have it
+            if getattr(self, "win", None) is None:
+                self.win = _WinGpu(self.pci)
+            if self.win.ok():
+                out["util"] = self.win.read()["util"]
         return out
+
+
+# ------------------------------------------------------------------------------------------------ a GPU on Windows
+class _Luid(ctypes.Structure):
+    _fields_ = [("LowPart", ctypes.c_uint32), ("HighPart", ctypes.c_int32)]
+
+
+class _KmtAdapterInfo(ctypes.Structure):          # D3DKMT_ADAPTERINFO
+    _fields_ = [("hAdapter", ctypes.c_uint32), ("AdapterLuid", _Luid), ("NumOfSources", ctypes.c_uint32),
+                ("bPrecisePresentRegionsPreferred", ctypes.c_int32)]
+
+
+class _KmtEnumAdapters2(ctypes.Structure):        # D3DKMT_ENUMADAPTERS2
+    _fields_ = [("NumAdapters", ctypes.c_uint32), ("pAdapters", ctypes.POINTER(_KmtAdapterInfo))]
+
+
+class _KmtQuery(ctypes.Structure):                # D3DKMT_QUERYADAPTERINFO
+    _fields_ = [("hAdapter", ctypes.c_uint32), ("Type", ctypes.c_int32), ("pPrivateDriverData", ctypes.c_void_p),
+                ("PrivateDriverDataSize", ctypes.c_uint32)]
+
+
+class _KmtAddress(ctypes.Structure):              # D3DKMT_ADAPTERADDRESS
+    _fields_ = [("BusNumber", ctypes.c_uint32), ("DeviceNumber", ctypes.c_uint32), ("FunctionNumber", ctypes.c_uint32)]
+
+
+class _KmtSegments(ctypes.Structure):             # D3DKMT_SEGMENTSIZEINFO
+    _fields_ = [("DedicatedVideoMemorySize", ctypes.c_uint64), ("DedicatedSystemMemorySize", ctypes.c_uint64),
+                ("SharedSystemMemorySize", ctypes.c_uint64)]
+
+
+class _KmtRegistry(ctypes.Structure):             # D3DKMT_ADAPTERREGISTRYINFO
+    _fields_ = [("AdapterString", ctypes.c_wchar * 260), ("BiosString", ctypes.c_wchar * 260),
+                ("DacType", ctypes.c_wchar * 260), ("ChipType", ctypes.c_wchar * 260)]
+
+
+class _KmtPerf(ctypes.Structure):                 # D3DKMT_ADAPTER_PERFDATA
+    _fields_ = [("PhysicalAdapterIndex", ctypes.c_uint32), ("MemoryFrequency", ctypes.c_uint64),
+                ("MaxMemoryFrequency", ctypes.c_uint64), ("MaxMemoryFrequencyOC", ctypes.c_uint64),
+                ("MemoryBandwidth", ctypes.c_uint64), ("PCIEBandwidth", ctypes.c_uint64), ("FanRPM", ctypes.c_uint32),
+                ("Power", ctypes.c_uint32), ("Temperature", ctypes.c_uint32), ("PowerStateOverride", ctypes.c_ubyte)]
+
+
+# KMTQUERYADAPTERINFOTYPE (d3dkmthk.h)
+KMT_SEGMENT_SIZE, KMT_ADDRESS, KMT_REGISTRY, KMT_PERF = 3, 6, 8, 62
+
+
+def _kmt_query(gdi, handle, kind, out):
+    q = _KmtQuery(handle, kind, ctypes.cast(ctypes.byref(out), ctypes.c_void_p), ctypes.sizeof(out))
+    try:
+        return gdi.D3DKMTQueryAdapterInfo(ctypes.byref(q)) == 0
+    except (AttributeError, OSError):
+        return False
+
+
+def _kmt_adapters():
+    """The GPUs Windows' graphics kernel lists that have a PCI address (not its software renderer), each
+    {"handle", "luid" (high, low), "pci" ("0000:01:00.0", as the engine writes it), "name", "vram" (dedicated bytes)};
+    [] where gdi32 does not have the call."""
+    try:
+        gdi = ctypes.WinDLL("gdi32")
+        e = _KmtEnumAdapters2()
+        if gdi.D3DKMTEnumAdapters2(ctypes.byref(e)) != 0 or not e.NumAdapters:
+            return []
+        arr = (_KmtAdapterInfo * e.NumAdapters)()
+        e.pAdapters = arr
+        if gdi.D3DKMTEnumAdapters2(ctypes.byref(e)) != 0:
+            return []
+    except (AttributeError, OSError):
+        return []
+    found: list[dict] = []
+    for a in arr[:e.NumAdapters]:
+        addr, seg, reg = _KmtAddress(), _KmtSegments(), _KmtRegistry()
+        luid = (a.AdapterLuid.HighPart & 0xFFFFFFFF, a.AdapterLuid.LowPart)
+        if not _kmt_query(gdi, a.hAdapter, KMT_ADDRESS, addr) or addr.BusNumber == 0xFFFFFFFF or \
+                any(f["luid"] == luid for f in found):     # the software renderer answers with no bus
+            continue
+        _kmt_query(gdi, a.hAdapter, KMT_SEGMENT_SIZE, seg)
+        _kmt_query(gdi, a.hAdapter, KMT_REGISTRY, reg)
+        found.append({"handle": a.hAdapter, "luid": luid, "name": reg.AdapterString.strip() or None,
+                      "pci": f"0000:{addr.BusNumber:02x}:{addr.DeviceNumber:02x}.{addr.FunctionNumber:x}",
+                      "vram": seg.DedicatedVideoMemorySize, "gdi": gdi})
+    return found
+
+
+class _PdhValue(ctypes.Structure):                # PDH_FMT_COUNTERVALUE, read as a double
+    _fields_ = [("CStatus", ctypes.c_uint32), ("doubleValue", ctypes.c_double)]
+
+
+class _PdhItem(ctypes.Structure):                 # PDH_FMT_COUNTERVALUE_ITEM_W
+    _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _PdhValue)]
+
+
+class _Pdh:
+    """Every GPU's load and dedicated memory in use from Windows' performance counters, the ones Task Manager shows:
+    the load of an adapter is that of its busiest engine (the sum over the processes of each engine's share), as
+    Task Manager's GPU column.  Collected at most twice a second for all the cards together."""
+    PATHS = ("\\GPU Engine(*)\\Utilization Percentage", "\\GPU Adapter Memory(*)\\Dedicated Usage")
+    ENGINE = re.compile(r"luid_0x([0-9a-f]+)_0x([0-9a-f]+)_phys_(\d+)_eng_(\d+)", re.I)
+    ADAPTER = re.compile(r"luid_0x([0-9a-f]+)_0x([0-9a-f]+)", re.I)
+    MORE_DATA = 0x800007D2
+    FORMAT = 0x00000200 | 0x00008000             # PDH_FMT_DOUBLE | PDH_FMT_NOCAP100
+
+    def __init__(self):
+        self.lib = None
+        self.lock = threading.Lock()
+        self.at = 0.0
+        self.util: dict = {}
+        self.used: dict = {}
+        try:
+            lib = ctypes.WinDLL("pdh")
+            lib.PdhGetFormattedCounterArrayW.restype = ctypes.c_uint32
+            q = ctypes.c_void_p()
+            if lib.PdhOpenQueryW(None, None, ctypes.byref(q)) != 0:
+                return
+            self.counters = []
+            for path in self.PATHS:
+                c = ctypes.c_void_p()
+                if lib.PdhAddEnglishCounterW(q, path, None, ctypes.byref(c)) != 0:
+                    return
+                self.counters.append(c)
+            lib.PdhCollectQueryData(q)                # a rate needs two collections: the first one is the start
+            self.lib, self.query = lib, q
+        except (AttributeError, OSError):
+            self.lib = None
+
+    def _array(self, counter):
+        size, count = ctypes.c_uint32(0), ctypes.c_uint32(0)
+        get = self.lib.PdhGetFormattedCounterArrayW
+        if get(counter, self.FORMAT, ctypes.byref(size), ctypes.byref(count), None) != self.MORE_DATA:
+            return []
+        buf = ctypes.create_string_buffer(size.value)
+        if get(counter, self.FORMAT, ctypes.byref(size), ctypes.byref(count), buf) != 0:
+            return []
+        items = ctypes.cast(buf, ctypes.POINTER(_PdhItem * count.value)).contents
+        return [(i.szName or "", i.FmtValue.doubleValue) for i in items if i.FmtValue.CStatus in (0, 1)]
+
+    def read(self, luid):
+        """(load %, dedicated memory in use in bytes) of the adapter `luid` (high, low), None for one not read."""
+        if self.lib is None:
+            return None, None
+        with self.lock:
+            if time.time() - self.at >= 0.5:
+                self.at = time.time()
+                try:
+                    if self.lib.PdhCollectQueryData(self.query) == 0:
+                        engines: dict = {}
+                        for name, v in self._array(self.counters[0]):
+                            m = self.ENGINE.search(name)
+                            if m:
+                                key = (int(m[1], 16), int(m[2], 16))
+                                eng = engines.setdefault(key, {})
+                                eng[(m[3], m[4])] = eng.get((m[3], m[4]), 0.0) + v
+                        self.util = {k: min(100.0, max(e.values())) for k, e in engines.items()}
+                        used: dict = {}
+                        for name, v in self._array(self.counters[1]):
+                            m = self.ADAPTER.search(name)
+                            if m:
+                                key = (int(m[1], 16), int(m[2], 16))
+                                used[key] = used.get(key, 0.0) + v
+                        self.used = used
+                except (AttributeError, OSError):
+                    pass
+            u = self.used.get(luid)
+            return self.util.get(luid, 0.0 if self.used else None), int(u) if u is not None else None
+
+
+class _WinGpu:
+    """A GPU on Windows of any maker, with _XeGpu's interface: its name, address, VRAM and temperature from the
+    graphics kernel (D3DKMT, gdi32), its load and VRAM in use from the performance counters (_Pdh).  The temperature
+    is there where the driver reports it (WDDM 2.4's adapter performance data); power is not (Windows gives it as a
+    share of the card's limit only).  `pci` is the card's address as the engine writes it ("0000:01:00.0"); without
+    one, the first card with memory of its own."""
+    adapters: list | None = None
+    pdh: _Pdh | None = None
+
+    def __init__(self, pci=None):
+        self.a = None
+        if _WinGpu.adapters is None:
+            _WinGpu.adapters = _kmt_adapters() if WIN else []
+        for a in _WinGpu.adapters:
+            if (a["pci"] == str(pci).lower()) if pci else a["vram"] > 0:
+                self.a = a
+                break
+        if self.a is not None:
+            self.pci = self.a["pci"]
+            if _WinGpu.pdh is None:
+                _WinGpu.pdh = _Pdh()
+
+    def ok(self):
+        return self.a is not None
+
+    def name(self):
+        return f"{self.a['name'] or 'GPU'} at {self.pci}" if self.ok() else None
+
+    def read(self):
+        out = {"util": None, "mem_used": None, "mem_total": self.a["vram"] or None, "temp": None}
+        if _WinGpu.pdh is not None:
+            out["util"], out["mem_used"] = _WinGpu.pdh.read(self.a["luid"])
+        perf = _KmtPerf()
+        if _kmt_query(self.a["gdi"], self.a["handle"], KMT_PERF, perf) and perf.Temperature:
+            out["temp"] = perf.Temperature / 10.0
+        out["pcie_rx_mb"] = out["pcie_tx_mb"] = None   # no counters for the link's traffic
+        return out
+
+
+class _NvPciInfo(ctypes.Structure):   # nvmlPciInfo_t
+    _fields_ = [("busIdLegacy", ctypes.c_char * 16), ("domain", ctypes.c_uint), ("bus", ctypes.c_uint),
+                ("device", ctypes.c_uint), ("pciDeviceId", ctypes.c_uint), ("pciSubSystemId", ctypes.c_uint),
+                ("busId", ctypes.c_char * 32)]
+
+
+def nvidia_pci(index):
+    """The PCI address ("0000:09:00.0", as sysfs writes it) of the NVIDIA GPU nvidia-smi numbers `index` (NVML numbers
+    them the same way), or None without NVML or that card: the config's "gpu" names the cards so."""
+    n = _NvGpu(None)
+    if n.lib is None:
+        return None
+    h = ctypes.c_void_p()
+    info = _NvPciInfo()
+    try:
+        if n.lib.nvmlDeviceGetHandleByIndex_v2(ctypes.c_uint(index), ctypes.byref(h)) != 0 or \
+                n.lib.nvmlDeviceGetPciInfo_v3(h, ctypes.byref(info)) != 0:
+            return None
+    except (AttributeError, OSError):
+        return None
+    return f"{info.domain:04x}:{info.bus:02x}:{info.device:02x}.0"
 
 
 def _gpu(pci=None):
     """The card the engine runs on: the Intel GPU at `pci` (or the first on the xe driver), else the AMD one (amdgpu),
-    else the NVIDIA one, else (without `pci`) the first on the i915 driver.  Without `pci` an i915 card comes last: it is
-    most often the processor's graphics beside the card the engine runs on."""
+    else the NVIDIA one, else (without `pci`) the first on the i915 driver.  Without `pci` an i915 card comes last:
+    it is most often the processor's graphics beside the card the engine runs on.  On Windows: the NVIDIA one through
+    NVML, else any maker's through _WinGpu."""
+    if WIN:
+        n = _NvGpu(pci)
+        return n if n.ok() else _WinGpu(pci)
     g = _XeGpu(pci, ("xe", "i915") if pci else ("xe",))
     if g.ok():
         return g
@@ -491,13 +814,27 @@ def free_vram_mib(gpu_pci=None):
     return int((r["mem_total"] - r["mem_used"]) >> 20)
 
 
+def total_vram_mib(gpu_pci=None):
+    """Total VRAM on the selected card in MiB, or None when it cannot be read."""
+    g = _gpu(gpu_pci)
+    if not g.ok():
+        return None
+    total = g.read().get("mem_total")
+    return int(total >> 20) if total is not None else None
+
+
+def ram_gb() -> float:
+    """The RAM the machine has, in GB (0.0 when it cannot be read): serve/autotune.py's choices and the panels."""
+    return hardware.ram_gb()
+
+
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
     if os.path.exists("/proc/cpuinfo"):
-        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                if line.startswith("model name"):
-                    return line.split(":", 1)[1].strip()
+        text = hardware.proc_text("cpuinfo", encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
     return platform.processor() or None
 
 
@@ -509,7 +846,7 @@ class _CpuRamFallback:
 
     def _times(self):
         try:
-            with open("/proc/stat") as fh:
+            with open("/proc/stat") as fh:      # closed after reading: no ResourceWarning on every sample
                 f = [int(x) for x in fh.readline().split()[1:]]
             return f[3] + f[4], sum(f)
         except (OSError, ValueError):
@@ -525,8 +862,7 @@ class _CpuRamFallback:
     @staticmethod
     def ram():
         try:
-            with open("/proc/meminfo") as fh:
-                info = dict(line.split(":", 1) for line in fh)
+            info = dict(line.split(":", 1) for line in hardware.proc_text("meminfo").splitlines())
             total = int(info["MemTotal"].split()[0]) * 1024
             avail = int(info["MemAvailable"].split()[0]) * 1024
             return total - avail, total
@@ -536,26 +872,35 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_pci=None, split_pci=None):
-        """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_pci`: the PCI address
-        of the card the engine runs on (setup's gpu_pci), or None for the card _gpu chooses; `split_pci`: a layer
-        split's other cards (setup's split_pci), read beside it."""
+    # a card's readings kept as a history of their own (history["gpus"]), for the Monitor's tab of that card
+    CARD_SERIES = ("util", "mem_used", "temp", "power", "pcie_rx_mb")
+
+    def __init__(self, extra=None, gpus=None):
+        """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpus`: the cards to read,
+        [{"pci": address or None, "roles": [...], ...}] (serve.server's gpu_roles: the text engine's cards and the
+        image engine's), numbered in that order; None: the one card _gpu chooses, the text engine's.  The flat gpu_*
+        readings and their history are the text engine's cards' (the frozen-engine check reads them, and an image
+        job on a card of its own must not hide a frozen text engine); "gpus" has every card's, the keys of its entry
+        in `gpus` beside them."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
-        self.gpus = [(i, _gpu(pci)) for i, pci in enumerate([gpu_pci, *(split_pci or [])])]
-        self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
-        self.gpu = self.gpus[0][1]
+        cards = gpus or [{"pci": None, "roles": ["text"]}]
+        found = [(i, c, _gpu(c.get("pci"))) for i, c in enumerate(cards)]
+        self.gpus = [x for x in found if x[2].ok()] or found[:1]
+        self.gpu = self.gpus[0][2]
+        self.text = [x for x in self.gpus if "text" in (x[1].get("roles") or ())] or self.gpus[:1]
+        self.card_hist = [collections.defaultdict(lambda: collections.deque(maxlen=HISTORY)) for _ in self.gpus]
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
         except ImportError:
             self.ps = None
         self.fallback = _CpuRamFallback()
-        self.names = [g.name() for _, g in self.gpus]
+        self.names = [g.name() for _, _, g in self.gpus]
         self.static = {
-            "gpu_name": " + ".join(g.name() or "?" for _, g in self.gpus) if self.gpu.ok() else None,
+            "gpu_name": " + ".join(n or "?" for n in self.names) if self.gpu.ok() else None,
             "gpu_count": len(self.gpus),
             "cpu_name": _cpu_name(),
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
@@ -586,11 +931,12 @@ class Telemetry:
     def sample(self):
         s = {}
         if self.gpu.ok():
-            reads = [(i, g.read()) for i, g in self.gpus]
-            g = dict(reads[0][1])
-            if len(reads) > 1:
+            reads = [g.read() for _, _, g in self.gpus]
+            text = [r for r, x in zip(reads, self.gpus) if x in self.text]
+            g = dict(text[0])
+            if len(text) > 1:
                 def vals(k):
-                    return [r[k] for _, r in reads if r.get(k) is not None]
+                    return [r[k] for r in text if r.get(k) is not None]
                 for k in ("mem_used", "mem_total", "power", "power_limit", "pcie_rx_mb", "pcie_tx_mb"):
                     v = vals(k)
                     g[k] = sum(v) if v else None
@@ -600,11 +946,10 @@ class Telemetry:
                 g["temp"] = max(t) if t else None
                 t = vals("mem_temp")
                 g["mem_temp"] = max(t) if t else None
-                s["gpus"] = [{"index": i, "name": n, "util": r.get("util"), "mem_used": r.get("mem_used"),
-                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "mem_temp": r.get("mem_temp"),
-                              "power": r.get("power")}
-                             for (i, r), n in zip(reads, self.names)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
+            s["gpus"] = [{"index": i, **{k: v for k, v in c.items() if k != "pci"}, "pci": c.get("pci") or
+                          getattr(dev, "pci", None), "name": n, **r}
+                         for (i, c, dev), n, r in zip(self.gpus, self.names, reads)]
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)
@@ -638,19 +983,25 @@ class Telemetry:
                 s = self.sample()
             except Exception as e:                    # noqa: BLE001 - a monitor must outlive its source
                 if not complained:                    # once, not once a second
-                    print(f"[strata] metrics: a sample failed ({e}); the sampler keeps trying", flush=True)
+                    print(f"[xestrata] metrics: a sample failed ({e}); the sampler keeps trying", flush=True)
                     complained = True
                 self._stop.wait(1.0)
                 continue
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                          "disk_read_mb", "tok_s", "prefill_tok_s_mean", "image_step_s"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
+                for h, card in zip(self.card_hist, s.get("gpus") or ()):
+                    for k in self.CARD_SERIES:
+                        v = card.get(k)
+                        h[k].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)
 
     def snapshot(self):
         with self.lock:
-            return {"now": dict(self.now), "history": {k: list(v) for k, v in self.hist.items()},
-                    "static": dict(self.static)}
+            history: dict = {k: list(v) for k, v in self.hist.items()}
+            if self.now.get("gpus"):
+                history["gpus"] = [{k: list(v) for k, v in h.items()} for h in self.card_hist]
+            return {"now": dict(self.now), "history": history, "static": dict(self.static)}

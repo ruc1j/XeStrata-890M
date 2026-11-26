@@ -17,6 +17,8 @@
 // Coder exceeds, while registering an ordinary 51 GB mapping works and copies at the same rate as host USM.
 #pragma once
 
+#include "strata/core/on_device.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -55,7 +57,7 @@ struct PinnedArena {
     uint64_t capacity = 0;
     PageBacking backing = PageBacking::NormalPages;
     std::string note;              // why the backing is what it is, for the startup print
-    uint64_t locked_bytes = 0;     // explicitly mlocked bytes; registration does not use mlock
+    uint64_t locked_bytes = 0;     // mlocked bytes (hold_in_place); registration does not use mlock
     uint64_t registered_bytes = 0; // bytes registered for device copies (the whole arena, or the constructor throws)
     uint64_t slice_bytes = 0;      // 0: one registration covers the arena
     int registered_slices = 0;
@@ -75,8 +77,20 @@ struct PinnedArena {
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes,
                 const std::string& shared_file, uint64_t pack_hash, const std::vector<uint64_t>& cuts = {});
     /// Holds the shared file's population lock until publish_shared() or destruction. False: already complete.
+    /// True with shared_missing() not empty: only those units (mark_shared_dropped's) are to be loaded again.
     bool begin_shared_population();
     void publish_shared();
+    /// The units (one bit each, 1: not in the arena) begin_shared_population found dropped; empty: load it all.
+    const std::vector<uint8_t>& shared_missing() const { return shared_missing_; }
+    /// Records in the shared file's header that the units set in `bits` are no longer in the arena (the server takes
+    /// their pages away once this engine has ended), so the next engine that maps it loads only those.  False (and
+    /// `err`) without a shared file, or when `bits` does not fit the header.
+    bool mark_shared_dropped(const std::vector<uint8_t>& bits, std::string& err);
+    /// Where the arena starts in the shared file (its header before it).
+    static uint64_t shared_header_bytes();
+    /// Whether the shared arena `file` (a path, or on Windows "section:<name>", a page-file-backed section the server
+    /// holds) holds an arena already: an engine filled it, or dropped part of it.  False: new and empty, or absent.
+    static bool shared_filled(const std::string& file);
     std::vector<uint64_t> slice_starts;
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;
@@ -87,6 +101,9 @@ struct PinnedArena {
     /// of the rate, blocking the host.  Released by the destructor.  False (and `err`) when the device refuses; the
     /// copies are then correct, only slower.
     bool register_on(int device, std::string& err);
+    /// register_on's registration on `device` is kept (a layer split's later GPU, which copies from the arena for as
+    /// long as the engine runs): to_host_usm refuses where that GPU is of another runtime
+    void hold_registration(int device) { held_.push_back(device); }
     /// Whether register_on registered it on engine device `device` (and it is still so).
     bool registered_on(int device) const {
         for (const auto& o : other_reg_)
@@ -101,6 +118,12 @@ struct PinnedArena {
     /// `ram_available` (issue #10): the RAM available now, read before each layer; a layer moves only while it leaves
     /// STRATA_HOST_USM_RESERVE_MIB (default 1024) of it.
     bool to_host_usm(uint64_t pad, std::string& err, const std::function<uint64_t()>& ram_available = {});
+    /// #42: keeps the filled mapping's pages where they are while a Level Zero GPU has it registered for copies (an xe
+    /// or i915 userptr): memory compaction moving one page made the driver map the whole registration again for the
+    /// GPU, and with the IOMMU translating that ran past the driver's limit and faulted the copy engine.  Locked in RAM
+    /// where vm.compact_unevictable_allowed is 0, else (a private mapping) pinned with io_uring's fixed buffers; a
+    /// shared mapping (memfd) is moved even when pinned.  Says which in `note` (when `say`); Linux only.
+    void hold_in_place(bool say = true);
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }   // one mapping only: null for host USM blocks
     /// The byte at arena offset `off` (one mapping, or the host USM block of the layer that holds it).
@@ -109,14 +132,33 @@ struct PinnedArena {
 
 private:
     void unmap(bool file_view);   // the mapping, if any; `file_view`: it maps the shared backing file
+    bool release_hold();          // hold_in_place's lock or pins, gone; true when there was one
+#if !defined(_WIN32)
+    int pin_ring_ = -1;           // the io_uring whose fixed buffers pin the mapping (hold_in_place)
+#endif
     int shared_fd_ = -1;
     bool shared_locked_ = false;
+    std::vector<uint8_t> shared_missing_;
+    // Windows' "section:<name>": a page-file-backed section the server made (serve/server.py's KeptArena), mapped
+    // with its header; the header is read and written in the view, under a named mutex
+    bool section_ = false;
+#if defined(_WIN32)
+    void* section_lock_ = nullptr;
+#endif
+    bool shared() const { return shared_fd_ >= 0 || section_; }
+    bool header_io(void* p, uint64_t n, uint64_t off, bool write);
+    void header_lock();
+    void header_unlock();
     std::vector<uint64_t> bounds_;
     void* map_ = nullptr;          // the mapping `base` is aligned inside
     size_t map_bytes_ = 0;
     std::vector<void*> reg_;       // the starts of the mapping's registrations for device copies
     std::vector<std::pair<void*, size_t>> pieces_;   // what is registered (or host USM) on the first device
     std::vector<std::pair<int, std::vector<void*>>> other_reg_;   // register_on: a device, its registrations
+    // the GPU whose runtime made the arena: its registrations, its host USM and their release are that runtime's,
+    // whichever GPU is current when a later stage calls in (to_host_usm, the destructor)
+    int owner_ = current_device();
+    std::vector<int> held_;   // hold_registration's devices
 };
 
 struct LoadStats {

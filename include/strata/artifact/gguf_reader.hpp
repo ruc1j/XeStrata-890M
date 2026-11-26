@@ -37,18 +37,7 @@
 #include <limits>
 #include <memory>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#ifndef NOMINMAX
-#define NOMINMAX   // windows.h's min/max macros would break std::min/std::max in every file that includes this one
-#endif
-#include <windows.h>
-#else
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
+#include "strata/platform/mapped_file.hpp"
 
 namespace strata {
 
@@ -216,6 +205,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 24:   // I8: raw bytes (the FP8 PLE table of tools/ple_fp8_pack.py)
         elems = 1;
         bytes = 1;
+        return true;
+    case 40:   // NVFP4: 64 values = 4 UE4M3 scales (one for each 16) + 32 bytes of E2M1 codes (kernels/nvfp4.hpp)
+        elems = 64;
+        bytes = 36;
         return true;
     case 42:
         elems = 64;
@@ -387,11 +380,11 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
 
 class GgufFile {
 public:
-    explicit GgufFile(const std::string& path) : path_(path) {
-        try { open(); }
-        catch (...) { close(); throw; }
+    explicit GgufFile(const std::string& path) : path_(path), file_(path) {
+        base_ = file_.data();
+        size_ = file_.size();
+        parse();
     }
-    ~GgufFile() { close(); }
     GgufFile(const GgufFile&) = delete;
     GgufFile& operator=(const GgufFile&) = delete;
 
@@ -442,54 +435,33 @@ public:
         }
         return -1;
     }
+    /// The whole string array `key` (a vocabulary's tokens), read from the header again; empty when there is none.
+    std::vector<std::string> string_array(const std::string& key) const {
+        Cursor c(base_, size_);
+        c.read<uint32_t>();
+        c.read<uint32_t>();
+        c.read<uint64_t>();
+        const uint64_t n_kv = c.read<uint64_t>();
+        for (uint64_t i = 0; i < n_kv; ++i) {
+            const std::string k = c.str();
+            const MetaType t = (MetaType)c.read<uint32_t>();
+            if (k != key || t != MetaType::ARRAY) {
+                read_value(c, t);
+                continue;
+            }
+            const MetaType e = (MetaType)c.read<uint32_t>();
+            const uint64_t n = c.read<uint64_t>();
+            if (e != MetaType::STRING) return {};
+            std::vector<std::string> out;
+            out.reserve((size_t)n);
+            for (uint64_t j = 0; j < n; ++j) out.push_back(c.str());
+            return out;
+        }
+        return {};
+    }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 
 private:
-    void open() {
-#ifdef _WIN32
-        HANDLE h = CreateFileA(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path_);
-        LARGE_INTEGER li{};
-        GetFileSizeEx(h, &li);
-        size_ = (uint64_t)li.QuadPart;
-        HANDLE m = CreateFileMappingA(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!m) {
-            CloseHandle(h);
-            throw std::runtime_error("CreateFileMapping failed");
-        }
-        base_ = (const uint8_t*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
-        if (!base_) {
-            CloseHandle(m);
-            CloseHandle(h);
-            throw std::runtime_error("MapViewOfFile failed");
-        }
-        map_ = m;
-        file_ = h;
-#else
-        int fd = ::open(path_.c_str(), O_RDONLY);
-        if (fd < 0) throw std::runtime_error("cannot open " + path_);
-        fd_ = fd;
-        struct stat st{};
-        if (fstat(fd, &st) != 0) throw std::runtime_error("fstat failed");
-        size_ = (uint64_t)st.st_size;
-        void* p = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (p == MAP_FAILED) throw std::runtime_error("mmap failed");
-        base_ = (const uint8_t*)p;
-#endif
-        parse();
-    }
-    void close() {
-#ifdef _WIN32
-        if (base_) UnmapViewOfFile(base_);
-        if (map_) CloseHandle((HANDLE)map_);
-        if (file_) CloseHandle((HANDLE)file_);
-#else
-        if (base_) munmap((void*)base_, size_);
-        if (fd_ >= 0) ::close(fd_);
-#endif
-    }
-
     void parse() {
         Cursor c(base_, size_);
         const uint32_t magic = c.read<uint32_t>();
@@ -544,12 +516,7 @@ private:
     const uint8_t* base_ = nullptr;
     uint64_t size_ = 0, data_start_ = 0, alignment_ = 32;
     uint32_t version_ = 0;
-#ifdef _WIN32
-    void* file_ = nullptr;
-    void* map_ = nullptr;
-#else
-    int fd_ = -1;
-#endif
+    platform::MappedFile file_;
     std::vector<TensorInfo> tensors_;
     std::map<std::string, MetaValue> meta_;
 };

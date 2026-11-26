@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/conversation_file.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -338,7 +339,7 @@ bool free_space(const std::string& path, uint64_t& out) {
 #endif
 
 bool buffered_forced() {
-    const char* e = std::getenv("STRATA_SESSION_BUFFERED");
+    const char* e = strata::env_get("SESSION_BUFFERED");
     return e != nullptr && e[0] == '1';
 }
 
@@ -1128,12 +1129,14 @@ std::vector<ConversationCheckpoint> session_checkpoints_to_save(const std::vecto
 const ConversationCheckpoint* session_deepest_checkpoint(const std::vector<ConversationCheckpoint>& chain) {
     // A pinned shared prefix (pin=N) is the resume point the next queries want, so with one in the chain the file
     // keeps the deepest PINNED checkpoint, not a deeper periodic one a long private suffix made past it.  No pin:
-    // the deepest, as before.
+    // the deepest turn-boundary checkpoint; a reply checkpoint is kept only when there is no boundary.
     const ConversationCheckpoint* deepest = nullptr;
     bool any_pinned = false;
     for (const auto& c : chain) any_pinned = any_pinned || c.pinned;
     for (const auto& c : chain)
-        if ((!any_pinned || c.pinned) && (!deepest || c.ids.size() > deepest->ids.size())) deepest = &c;
+        if ((!any_pinned || c.pinned) &&
+            (!deepest || (!c.reply && deepest->reply) ||
+             (c.reply == deepest->reply && c.ids.size() > deepest->ids.size()))) deepest = &c;
     return deepest;
 }
 
@@ -1204,7 +1207,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
     std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
-    if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
+    if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not an XeStrata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
     if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
     if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }

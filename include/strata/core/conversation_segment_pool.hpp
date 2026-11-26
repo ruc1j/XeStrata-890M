@@ -243,7 +243,7 @@ private:
     static bool is_free(uint8_t s) { return s == kFreeCold || s == kFreeWarm; }
     static size_t granules_for(size_t bytes) { return (bytes + granule - 1) / granule; }
     [[noreturn]] static void fatal(const char* what) {
-        std::fprintf(stderr, "strata: conversation segment pool: %s\n", what);
+        std::fprintf(stderr, "xestrata: conversation segment pool: %s\n", what);
         std::abort();
     }
     SegmentPoolOs& os_;

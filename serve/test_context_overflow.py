@@ -89,8 +89,36 @@ class ContextOverflow(unittest.TestCase):
                             self.assertEqual(error["param"], "input")
                         elif path == "/v1/messages":
                             self.assertEqual(set(error), {"type", "message"})
-                        else:                    # OpenAI's error: param and code are null when there is none
-                            self.assertEqual(error, {**error, "param": None, "code": None})
+                        else:                    # OpenAI's Chat Completions says it with the same code
+                            self.assertEqual(error["code"], "context_length_exceeded")
+                            self.assertEqual(error["param"], "messages")
+
+    def test_the_anthropic_route_says_it_the_way_anthropic_does_and_keeps_xestrata_s_sentence(self):
+        # #4838: Claude Code decides from the words of a 400: "prompt is too long" makes it compact, "input length and
+        # `max_tokens` exceed context limit" makes it shorten max_tokens.  XeStrata's own sentence stays after it, so
+        # the other clients' phrase is still in the message.
+        for stream in (False, True):
+            with self.subTest(stream=stream, case="prompt alone"):
+                status, _, body = self.post("/v1/messages", "max_tokens", 150722, 16, stream)
+                self.assertEqual(status, 400, body)
+                message = body["error"]["message"]
+                self.assertTrue(message.startswith(f"prompt is too long: 150722 tokens > {CTX - CTX_SLACK - 1} "
+                                                   "maximum; "), message)
+                self.assertIn("request exceeds the context window", message)
+                self.assertEqual(body["error"]["type"], "invalid_request_error")
+            with self.subTest(stream=stream, case="prompt plus max_tokens"):
+                status, _, body = self.post("/v1/messages", "max_tokens", 1024, CTX, stream)
+                self.assertEqual(status, 400, body)
+                message = body["error"]["message"]
+                self.assertTrue(message.startswith("input length and `max_tokens` exceed context limit: "
+                                                   f"1024 + {CTX} > {CTX - CTX_SLACK}; "), message)
+                self.assertIn("request exceeds the context window", message)
+        for path, key in (("/v1/chat/completions", "max_tokens"), ("/v1/responses", "max_output_tokens")):
+            with self.subTest(path=path):
+                status, _, body = self.post(path, key, 150722, 16)
+                self.assertEqual(status, 400, body)
+                # the other dialects are unchanged
+                self.assertTrue(body["error"]["message"].startswith("request exceeds the context window"), body)
 
     def test_the_anthropic_route_says_it_the_way_anthropic_does_and_keeps_strata_s_sentence(self):
         # #4838: Claude Code decides from the words of a 400: "prompt is too long" makes it compact, "input length and

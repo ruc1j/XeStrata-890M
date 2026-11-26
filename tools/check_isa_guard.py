@@ -43,8 +43,26 @@ WIDE_PUBLIC = {
     # upstream 0.2.5 (iq_avx512.cpp): the exact rows and the window-invariant reference rows, reached only behind
     # cpu_avx512_ok (native_expert.cpp's `avx512`)
     "iq512x_rows", "iq512_reference_gu_rows",
+    "nvfp4_512_gu_rows", "nvfp4_512_rows",   # NVFP4's rows (native_expert.cpp: both behind cpu_avx512_ok())
+    # the int8 product's copies (i8_gemm.hpp): reached only through i8_gemm_isa_ok (cpu_avxvnni_ok, cpu_avx512vnni_ok)
+    "i8_gemm_rows_x86", "i8_gemm_rows_avx512",
+    # the BF16 row kernels (bf16_gemm_avx512.cpp, vision_cpu_avx512.cpp): reached only through cpu_avx512_ok
+    # (bf16_gemm_isa's Bf16GemmIsa::avx512, the vision row loops' own dispatch)
+    "bf16_gemm_rows_avx512", "add_span", "gelu_tanh_span", "layer_norm_row", "qkv_rope_rows", "softmax_row",
+    # the image resize's rows (resize_rows_avx2.cpp): reached only through resize_rows_isa (cpu_avxvnni_ok,
+    # cpu_avx512_ok)
+    "resize_rows_avxvnni", "resize_rows_avx512",
 }
-WIDE_OBJECTS = ("expert.cpp", "iq_avx512.cpp", "iq_avx2.cpp", "q2_avx2.cpp", "kq_avx2.cpp", "tq_avx512.cpp")
+WIDE_OBJECTS = ("expert.cpp", "iq_avx512.cpp", "iq_avx2.cpp", "q2_avx2.cpp", "kq_avx2.cpp", "tq_avx2.cpp",
+                "tq_avx512.cpp",
+                "nvfp4_avx512.cpp",
+                "i8_gemm_vnni.cpp", "i8_gemm_avx512.cpp", "bf16_gemm_avx512.cpp", "vision_cpu_avx512.cpp",
+                "resize_rows_avx2.cpp",
+                # the latent MoE's CPU U rows (latent_rows.hpp): the VNNI / AVX-512 VNNI copies are target-attribute
+                # functions in the anonymous namespace, reached only through latent_u_row's cpu_avx512_latent_ok /
+                # cpu_avxvnni_ok / cpu_avx2_ok; the file itself stays on the baseline so the dispatcher and the
+                # scalar form run on any x86-64
+                "latent_rows.cpp")
 
 # An instruction is "wide" if it is EVEX encoded (first byte 0x62 in 64-bit mode), or one of these VEX / legacy
 # extensions that an AVX2 CPU may lack.  AVX-VNNI is VEX encoded (vpdpbusd, vpdpwssd ...).

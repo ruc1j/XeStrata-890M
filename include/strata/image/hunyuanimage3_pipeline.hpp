@@ -61,6 +61,8 @@ namespace strata::image {
 /// no conversion, no text encoder.
 class HunyuanImage3Pipeline : public ImagePipeline {
 public:
+    const char* no_loras_message() const override { return "image engine: HunyuanImage 3.0 takes no adapters"; }
+
     /// Reads the two files for their sizes; the parts go on the GPU with the first request.  `max_layers`: fewer
     /// than the file holds - a smaller run for a check on a small card, and not a comparison against the golden.
     /// `vision`: the file with the model's `vision_model.*` tensors (SigLIP2), which opens the edits - with it the
@@ -74,13 +76,10 @@ public:
     bool edits() const { return !vision_path_.empty(); }
 
     void set_budget(uint64_t bytes) override;
-    /// The budget in force: the one set, else the free VRAM's at open.
-    uint64_t budget() const override { return budget_ > 0 ? budget_ : auto_budget_; }
     /// Frees the sequence's buffers and the VAE's, and lets every streamed bank's region go (the dense weights
     /// stay: the next request loads banks, not the model).  `all`: the parts themselves - the next request opens
     /// them again, which for this model means re-dequantizing its dense products.
     void release(bool all = false) override;
-    void fit(uint64_t reserve) override;
     uint64_t held() const override;
 
     /// The model's own warm-up: a 64 x 64 image of one step, the sequence its trim and positions take - the
@@ -105,7 +104,7 @@ public:
     /// generate that follows.
     int choose_ratio(const QiRequest& r, double* seconds = nullptr) override;
     /// The last choice's 37 logits (a check's: `strata-image --ratio` prints them against the CPU golden's).
-    const std::vector<double>& ratio_logits() const { return ratio_logits_; }
+    const std::vector<double>& ratio_logits() const override { return ratio_logits_; }
 
     /// RGBA8 [height][width][4] of the request (every pixel opaque: the VAE decodes three planes).  `step`: the
     /// sampling's progress over the sigmas' steps, false to stop (QiStopped).  `stage`: "text" as the sequence is
@@ -169,7 +168,7 @@ private:
     std::unique_ptr<HunyuanImage3Dit> dit_size_;
     std::unique_ptr<HunyuanImage3Vae> vae_size_;
     std::unique_ptr<HunyuanImage3EntryExit> around_size_;
-    uint64_t budget_ = 0, auto_budget_ = 0, banks_set_ = 0;
+    uint64_t banks_set_ = 0;
     // the text rows of the last request's sequence: `wte` does not change between a request's steps, so they are
     // gathered once and copied back in, and the same ids coming again do not pay for it twice
     std::vector<int32_t> text_ids_;

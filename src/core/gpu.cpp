@@ -8,6 +8,7 @@
 #include "strata/platform/memory.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_gpu
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/ext/oneapi/experimental/profiling_tag.hpp>
@@ -25,6 +26,13 @@
 #include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
 
 namespace strata::gpu {
 
@@ -54,6 +62,7 @@ std::mutex g_live_mu;
 std::map<const void*, std::pair<size_t, int>> g_live;   // the block's bytes and engine device
 size_t g_live_bytes = 0;
 std::map<int, size_t> g_live_on;                        // per engine device
+std::map<int, size_t> g_live_peak;                      // high-water mark per engine device
 
 std::string refusal_state() {
     size_t held = 0, n = 0;
@@ -65,8 +74,7 @@ std::string refusal_state() {
     std::string free_mib = "unknown (set ZES_ENABLE_SYSMAN=1)";
     try {
         const auto& d = strata::core::Runtime::get().device();
-        if (d.has(sycl::aspect::ext_intel_free_memory))
-            free_mib = std::to_string(d.get_info<sycl::ext::intel::info::device::free_memory>() >> 20) + " MiB";
+        if (uint64_t free = 0; core::device_free_memory(d, free)) free_mib = std::to_string(free >> 20) + " MiB";
     } catch (const std::exception& e) { free_mib = std::string("unreadable: ") + e.what(); }
     std::string ram;
     // the xe driver gives VRAM only with RAM free beside it, and the file cache does not count as free there: a big
@@ -128,10 +136,12 @@ const char* last_error() { return g_error.c_str(); }
 
 std::string failure_report(const std::exception& e) {
     std::string r = e.what();
+    bool out_of_host_memory = false;
     if (const auto* se = dynamic_cast<const sycl::exception*>(&e)) {
+        const int32_t ur = sycl::detail::get_ur_error(*se);
+        out_of_host_memory = ur == UR_RESULT_ERROR_OUT_OF_HOST_MEMORY;
         char buf[96];
-        std::snprintf(buf, sizeof buf, " [SYCL code %d, UR result %d]", se->code().value(),
-                      (int) sycl::detail::get_ur_error(*se));
+        std::snprintf(buf, sizeof buf, " [SYCL code %d, UR result %d]", se->code().value(), (int) ur);
         r += buf;
     }
     try {
@@ -149,6 +159,16 @@ std::string failure_report(const std::exception& e) {
     } catch (const std::exception&) {
         r += "; the GPU: unknown";
     }
+    if (out_of_host_memory) {
+        // Issue #77: a graph submission on a small first card reported UR 38 with tens of GiB of RAM free.  The
+        // driver's command buffers, the graph's events and the card's own space are sized from the same log's
+        // figures; the name of the UR result alone sends a user to the wrong place.  Say what to check, without
+        // claiming that RAM or the card was short here (no reproduction on this machine).
+        r += "; OUT_OF_HOST_MEMORY can be the RAM or the room a command graph needs for its buffers, events and "
+             "driver command space: check the RAM available and the sizes at start (expert cache, --prefill, "
+             "--max-context, --spec, --vram-reserve-mib); on a small card raise --vram-reserve-mib (and "
+             "--vram-reserve-later-mib on later cards), shrink the cache or context, or put a larger card first";
+    }
     return r;
 }
 
@@ -163,8 +183,10 @@ Stream stream_create_copy() {
 }
 
 void stream_destroy(Stream s) {
-    try { rt_of(s).destroy_stream(static_cast<sycl::queue*>(s)); }
-    catch (const std::exception& e) { fail("stream_destroy", e); }
+    try {
+        if (s != nullptr) abandon_capture(s);   // an open recording goes with its queue (destroy_stream refuses one)
+        rt_of(s).destroy_stream(static_cast<sycl::queue*>(s));
+    } catch (const std::exception& e) { fail("stream_destroy", e); }
 }
 
 bool stream_sync(Stream s) {
@@ -195,8 +217,161 @@ void* alloc_device(size_t bytes) {
         g_live[p] = {bytes, rt().ordinal()};
         g_live_bytes += bytes;
         g_live_on[rt().ordinal()] += bytes;
+        g_live_peak[rt().ordinal()] = std::max(g_live_peak[rt().ordinal()], g_live_on[rt().ordinal()]);
         return p;
     } catch (const std::exception& e) { fail("alloc_device", e); return nullptr; }
+}
+
+size_t device_held() {
+    std::lock_guard<std::mutex> lock(g_live_mu);
+    const auto it = g_live_on.find(rt().ordinal());
+    return it != g_live_on.end() ? it->second : 0;
+}
+
+size_t device_peak_held() {
+    std::lock_guard<std::mutex> lock(g_live_mu);
+    const auto it = g_live_peak.find(rt().ordinal());
+    return it != g_live_peak.end() ? it->second : 0;
+}
+
+void device_peak_reset() {
+    std::lock_guard<std::mutex> lock(g_live_mu);
+    const auto it = g_live_on.find(rt().ordinal());
+    g_live_peak[rt().ordinal()] = it != g_live_on.end() ? it->second : 0;
+}
+
+namespace {
+// Linux DRM fdinfo is per client, not per fd. The runtime may hold several fds for one client; count it once.
+bool drm_process_memory(const std::string& pci, size_t& bytes) {
+#if defined(__linux__)
+    std::map<std::string, uint64_t> clients;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/proc/self/fdinfo", ec)) {
+        std::ifstream in(e.path());
+        std::string line, driver, device, client;
+        uint64_t xe_vram = 0, amd_vram = 0;
+        bool found_xe = false, found_amd = false;
+        while (std::getline(in, line)) {
+            const size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            const std::string key = line.substr(0, colon);
+            std::istringstream value(line.substr(colon + 1));
+            if (key == "drm-driver") value >> driver;
+            else if (key == "drm-pdev") value >> device;
+            else if (key == "drm-client-id") value >> client;
+            else if (key.rfind("drm-total-vram", 0) == 0 || key == "drm-memory-vram") {
+                const bool xe_field = key.rfind("drm-total-vram", 0) == 0;
+                uint64_t n = 0;
+                std::string unit;
+                if (!(value >> n)) continue;
+                value >> unit;
+                if (unit == "KiB") n *= 1024;
+                else if (unit == "MiB") n *= uint64_t{1024} * 1024;
+                else if (!unit.empty() && unit != "B") continue;
+                if (xe_field) { xe_vram += n; found_xe = true; }
+                else { amd_vram += n; found_amd = true; }
+            }
+        }
+        if (device != pci) continue;
+        // amdgpu exposes both names for the same allocations; adding them would count every byte twice.
+        if ((driver == "xe" && !found_xe) || (driver == "amdgpu" && !found_amd) ||
+            (driver != "xe" && driver != "amdgpu")) continue;
+        const uint64_t vram = driver == "xe" ? xe_vram : amd_vram;
+        if (client.empty()) client = e.path().filename().string();
+        clients[client] = std::max(clients[client], vram);
+    }
+    if (clients.empty()) return false;
+    uint64_t total = 0;
+    for (const auto& [client, n] : clients) { (void) client; total += n; }
+    bytes = (size_t) total;
+    return true;
+#else
+    (void) pci;
+    (void) bytes;
+    return false;
+#endif
+}
+// The optional contrib-llvm NVIDIA driver API reports this process directly, including its primary context and
+// runtime pools. Load it at runtime; the free build has no path through the non-free library.
+bool nvml_process_memory(const std::string& pci, size_t& bytes) {
+#if defined(__linux__) && defined(STRATA_NVML)
+    // nvmlProcessInfo_t as used by nvmlDeviceGetComputeRunningProcesses_v3 (the stable v2 record layout).
+    struct Process { unsigned int pid; unsigned long long used; unsigned int gpu_instance, compute_instance; };
+    struct Api {
+        void* lib = nullptr;
+        int (*init)() = nullptr;
+        int (*handle)(const char*, void**) = nullptr;
+        int (*processes)(void*, unsigned int*, Process*) = nullptr;
+        Api() {
+            lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
+            if (lib == nullptr) return;
+            init = reinterpret_cast<decltype(init)>(dlsym(lib, "nvmlInit_v2"));
+            handle = reinterpret_cast<decltype(handle)>(dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2"));
+            processes = reinterpret_cast<decltype(processes)>(dlsym(lib, "nvmlDeviceGetComputeRunningProcesses_v3"));
+            if (init == nullptr || handle == nullptr || processes == nullptr || init() != 0) processes = nullptr;
+        }
+    };
+    static const Api api;
+    if (api.processes == nullptr) return false;
+    void* device = nullptr;
+    if (api.handle(pci.c_str(), &device) != 0) return false;
+    unsigned int count = 0;
+    constexpr int kInsufficientSize = 7;
+    const int first = api.processes(device, &count, nullptr);
+    if (first != 0 && first != kInsufficientSize) return false;
+    if (count == 0) return false;
+    std::vector<Process> rows(count);
+    if (api.processes(device, &count, rows.data()) != 0) return false;
+    bool found = false;
+    unsigned long long total = 0;
+    for (unsigned int i = 0; i < count; ++i) {
+        if (rows[i].pid != static_cast<unsigned int>(getpid())) continue;
+        if (rows[i].used == ~0ULL || total > ~0ULL - rows[i].used) return false;
+        total += rows[i].used;
+        found = true;
+    }
+    if (!found || total > SIZE_MAX) return false;
+    bytes = static_cast<size_t>(total);
+    return true;
+#else
+    (void) pci;
+    (void) bytes;
+    return false;
+#endif
+}
+}  // namespace
+
+bool process_memory(size_t* bytes, const char** source) {
+    auto& runtime = rt();
+    const size_t live = device_held();
+    size_t reported = 0;
+    const std::string pci = core::device_info(runtime.ordinal()).pci;
+    if (drm_process_memory(pci, reported)) {
+        *bytes = std::max(reported, live);
+        *source = "fdinfo";
+        return true;
+    }
+    if (nvml_process_memory(pci, reported)) {
+        *bytes = std::max(reported, live);
+        *source = "nvml";
+        return true;
+    }
+    size_t free = 0, total = 0, short_b = 0;
+    if (!mem_info(&free, &total, &short_b)) return false;
+    if (auto before = runtime.free_before_context()) {
+        // mem_info may cap total at XESTRATA_VRAM_LIMIT_MIB; short_b restores any use above that cap.
+        const uint64_t physical = runtime.device().get_info<sycl::info::device::global_mem_size>();
+        const uint64_t occupied = (uint64_t) total - free + short_b;
+        const uint64_t now_free = physical > occupied ? physical - occupied : 0;
+        const uint64_t used = *before > now_free ? *before - now_free : 0;
+        // The report can move by a fraction of a MiB as kernels load; round the estimate up, never down.
+        *bytes = std::max(live, (size_t) ((used + ((uint64_t{1} << 20) - 1)) & ~((uint64_t{1} << 20) - 1)));
+        *source = "delta";
+        return true;
+    }
+    *bytes = std::max(live, total - free + short_b);
+    *source = "global";
+    return true;
 }
 
 namespace {
@@ -221,7 +396,7 @@ void* alloc_host(size_t bytes) {
             }
             if (hard != nullptr) {
                 free(hard);
-                std::fprintf(stderr, "strata: pinned memory: %zu bytes refused, the reserve given back for them\n", bytes);
+                std::fprintf(stderr, "xestrata: pinned memory: %zu bytes refused, the reserve given back for them\n", bytes);
                 p = sycl::malloc_host(bytes, rt().context());
             }
         }
@@ -271,14 +446,14 @@ void* alloc_host_cached(size_t bytes) {
             g_nc[p] = bytes;
             return p;
         }
-        std::fprintf(stderr, "strata: hipHostMalloc(NonCoherent) of %zu bytes failed: host USM instead\n", bytes);
+        std::fprintf(stderr, "xestrata: hipHostMalloc(NonCoherent) of %zu bytes failed: host USM instead\n", bytes);
     }
     return alloc_host(bytes);
 }
 
 void pin_reserve_take() {
     uint64_t mib = 0;
-    if (const char* e = std::getenv("STRATA_PIN_RESERVE_MIB"); e != nullptr && *e != '\0') {
+    if (const char* e = strata::env_get("PIN_RESERVE_MIB"); e != nullptr && *e != '\0') {
         mib = std::strtoull(e, nullptr, 10);
     } else {
 #if defined(_WIN32)
@@ -338,9 +513,109 @@ void free(const void* p) {
     (owner ? *owner : rt()).free(const_cast<void*>(p));
 }
 
+namespace {
+
+// Whether a range mapped again reaches its new memory on the current device, from the copies as from the kernels.
+// On AMD GPUs Linux leaves a range's old translations in the GPU's TLB after an unmap (intel/llvm's patch
+// hip-virtual-mem-unmap drops them): a copy into the range mapped again lands in the memory it had, which is
+// another's by then, and a kernel reads that memory or the new one, by what its TLB still holds.
+// Segment A is mapped at a range, written by a copy and read by a kernel, so both have reached the range; A moves to
+// a second range and segment B takes its place; a copy into the first range must then be read from it by a kernel,
+// and A must still hold its bytes.  Everything is allocated before the unmap: an allocation is a mapping of the
+// driver's own, which drops the stale translations and would hide them.
+bool vmem_remaps(std::string& why) {
+    auto& runtime = rt();
+    auto& queue = runtime.compute();
+    const size_t gran = vmem_granularity();
+    if (gran == 0) { why = "no granularity: " + g_error; return false; }
+    const size_t bytes = (65536 + gran - 1) / gran * gran, words = bytes / 4;
+    void* v0 = vmem_reserve(bytes);
+    void* v1 = vmem_reserve(bytes);
+    VmemSegment* a = vmem_new(bytes);
+    VmemSegment* b = vmem_new(bytes);
+    auto* host = static_cast<uint32_t*>(host_usm(2 * bytes));   // the pattern to write, what was read
+    auto* dev = static_cast<uint32_t*>(alloc_device(bytes));
+    bool at0 = false, at1 = false;
+    auto pattern = [](size_t i, uint32_t salt) { return (uint32_t) i * 2654435761u ^ salt; };
+    // what a kernel reads at `va`: every word the pattern of `salt`
+    auto reads = [&](const void* va, uint32_t salt) {
+        const auto* src = static_cast<const uint32_t*>(va);
+        uint32_t* dst = dev;
+        runtime.wait(queue.parallel_for(sycl::range<1>(words), [=](sycl::id<1> i) { dst[i] = src[i]; }),
+                     "virtual memory check");
+        if (!copy(host + words, dev, bytes)) return false;
+        for (size_t i = 0; i < words; ++i)
+            if (host[words + i] != pattern(i, salt)) return false;
+        return true;
+    };
+    auto writes = [&](void* va, uint32_t salt) {
+        for (size_t i = 0; i < words; ++i) host[i] = pattern(i, salt);
+        return copy(va, host, bytes);
+    };
+    // A to the second range, B in its place
+    auto moves = [&] {
+        if (!device_sync() || !vmem_detach(v0, bytes)) return false;
+        at0 = false;
+        at1 = vmem_attach(a, v1, bytes);
+        if (at1) at0 = vmem_attach(b, v0, bytes);
+        return at0;
+    };
+    bool ok = false;
+    try {
+        if (v0 != nullptr && v1 != nullptr && a != nullptr && b != nullptr && host != nullptr && dev != nullptr)
+            at0 = vmem_attach(a, v0, bytes);
+        if (!at0) {
+            why = "its memory or its mapping was refused: " + g_error;
+        } else if (!writes(v0, 1) || !reads(v0, 1)) {
+            why = "a mapped range does not read back what a copy wrote: " + g_error;
+        } else if (!moves()) {
+            why = "a range was not mapped again: " + g_error;
+        } else if (!writes(v0, 2) || !reads(v0, 2) || !reads(v1, 1)) {
+            why = "a range mapped again is still reached through the mapping it had (on an AMD GPU: the SYCL runtime "
+                  "lacks tools/intel_llvm_build.py's fix hip-virtual-mem-unmap)";
+        } else {
+            ok = true;
+        }
+        device_sync();
+    } catch (const std::exception& e) { why = e.what(); }
+    if (at0) vmem_detach(v0, bytes);
+    if (at1) vmem_detach(v1, bytes);
+    vmem_delete(a);
+    vmem_delete(b);
+    if (v0 != nullptr) vmem_free(v0, bytes);
+    if (v1 != nullptr) vmem_free(v1, bytes);
+    if (host != nullptr) runtime.free(host);
+    if (dev != nullptr) free(dev);
+    return ok;
+}
+
+std::mutex g_vmem_mu;
+std::map<int, bool> g_vmem_ok;   // per engine device: vmem_usable's answer, found once
+
+}  // namespace
+
 bool vmem_supported() {
     try { return rt().device().has(sycl::aspect::ext_oneapi_virtual_mem); }
     catch (const std::exception& e) { return fail("vmem_supported", e); }
+}
+
+bool vmem_usable() {
+    try {
+        auto& runtime = rt();
+        std::lock_guard<std::mutex> lock(g_vmem_mu);
+        if (const auto it = g_vmem_ok.find(runtime.ordinal()); it != g_vmem_ok.end()) return it->second;
+        bool ok = runtime.device().has(sycl::aspect::ext_oneapi_virtual_mem);
+        if (ok) {
+            std::string why;
+            ok = vmem_remaps(why);
+            if (!ok)
+                std::fprintf(stderr, "xestrata: virtual memory is not used on %s: %s. --vram-elastic, --kv-grow and "
+                                     "the draft head parked for a prompt do without it\n",
+                             runtime.device().get_info<sycl::info::device::name>().c_str(), why.c_str());
+        }
+        g_vmem_ok[runtime.ordinal()] = ok;
+        return ok;
+    } catch (const std::exception& e) { return fail("vmem_usable", e); }
 }
 
 size_t vmem_granularity() {
@@ -367,14 +642,38 @@ VmemSegment* vmem_map(void* va, size_t bytes) {
             delete seg;
             throw;
         }
+        {
+            std::lock_guard<std::mutex> lock(g_live_mu);
+            g_live[va] = {bytes, rt().ordinal()};
+            g_live_bytes += bytes;
+            g_live_on[rt().ordinal()] += bytes;
+            g_live_peak[rt().ordinal()] = std::max(g_live_peak[rt().ordinal()], g_live_on[rt().ordinal()]);
+        }
         return seg;
     } catch (const std::exception& e) { fail("vmem_map", e); return nullptr; }
 }
 
-void vmem_unmap(void* va, size_t bytes, VmemSegment* seg) {
+bool vmem_unmap(void* va, size_t bytes, VmemSegment* seg) {
     try { sx::unmap(va, bytes, rt().context()); }
-    catch (const std::exception& e) { fail("vmem_unmap", e); }
+    catch (const std::exception& e) { return fail("vmem_unmap", e); }
+    {
+        std::lock_guard<std::mutex> lock(g_live_mu);
+        if (auto it = g_live.find(va); it != g_live.end()) {
+            g_live_bytes -= it->second.first;
+            g_live_on[it->second.second] -= it->second.first;
+            g_live.erase(it);
+        }
+    }
     delete seg;
+    return true;
+}
+
+bool vmem_unmap_returns(void* va, size_t bytes, VmemSegment* seg, bool* returned) {
+    size_t before = 0, after = 0, total = 0;
+    const bool read = device_sync() && mem_info(&before, &total);
+    if (!vmem_unmap(va, bytes, seg)) return false;
+    *returned = read && device_sync() && mem_info(&after, &total) && after >= before + bytes / 2;
+    return true;
 }
 
 VmemSegment* vmem_new(size_t bytes) {
@@ -404,32 +703,45 @@ bool is_host_usm(const void* p) {
         const core::Runtime* owner = core::Runtime::owner(p);
         return owner && sycl::get_pointer_type(p, owner->context()) == sycl::usm::alloc::host;
     }
-    catch (const std::exception& e) { return fail("is_host_usm", e); }
+    catch (const std::exception&) { return false; }   // a query the runtime refuses: not host USM (the copy path)
 }
 
 bool kernels_read_host(const void* p) {
     if (!p) return false;
     try { return core::Runtime::owner(p) == &rt() && sycl::get_pointer_type(p, rt().context()) == sycl::usm::alloc::host; }
-    catch (const std::exception& e) { return fail("kernels_read_host", e); }
+    catch (const std::exception&) { return false; }
 }
 
 bool kernels_read_registered() { return rt().device().get_backend() != sycl::backend::ext_oneapi_level_zero; }
 
+bool copies_read_mapped_files() { return rt().device().get_backend() == sycl::backend::ext_oneapi_cuda; }
+
 bool copy(void* dst, const void* src, size_t bytes) {
     if (bytes == 0) return true;
-    try { rt().wait(rt().compute().memcpy(dst, src, bytes), "synchronous copy"); return true; }
+    try {
+        auto& runtime = rt();
+        sycl::event event;
+        { core::Runtime::CopyWatch watch(runtime, "synchronous copy", bytes);
+          event = runtime.compute().memcpy(dst, src, bytes); }
+        runtime.wait(event, "synchronous copy"); return true;
+    }
     catch (const std::exception& e) { return fail("copy", e); }
 }
 
-bool copy_async(void* dst, const void* src, size_t bytes, Stream s) {
+bool copy_async(void* dst, const void* src, size_t bytes, Stream s, const char* what, int layer) {
     if (bytes == 0) return true;
-    try { q(s).memcpy(dst, src, bytes); return true; }
+    try {
+        auto& queue = q(s);
+        core::Runtime::CopyWatch watch(rt_of(s), what, bytes, layer);
+        queue.memcpy(dst, src, bytes); return true;
+    }
     catch (const std::exception& e) { return fail("copy_async", e); }
 }
 
 bool copy_async_after(void* dst, const void* src, size_t bytes, Stream s, const Event* after, Event* done) {
     try {
         auto& queue = q(s);
+        core::Runtime::CopyWatch watch(rt_of(s), "dependent GPU copy", bytes);
         const sycl::event e = queue.submit([&](sycl::handler& h) {
             if (after != nullptr && after->ev) h.depends_on(*after->ev);
             if (bytes > 0) h.memcpy(dst, src, bytes);
@@ -473,28 +785,38 @@ bool memset_async(void* dst, int value, size_t bytes, Stream s) {
     catch (const std::exception& e) { return fail("memset_async", e); }
 }
 
-bool mem_info(size_t* free_bytes, size_t* total_bytes) {
+bool mem_info(size_t* free_bytes, size_t* total_bytes, size_t* short_bytes) {
     try {
         const auto& d = rt().device();
-        if (!d.has(sycl::aspect::ext_intel_free_memory)) {
+        uint64_t free = 0;
+        if (!core::device_free_memory(d, free)) {
             g_error = "mem_info: the device does not report free memory (set ZES_ENABLE_SYSMAN=1)";
             return false;
         }
-        uint64_t free = d.get_info<sycl::ext::intel::info::device::free_memory>();
-        uint64_t total = d.get_info<sycl::info::device::global_mem_size>();
-        if (core::integrated_gpu(d)) core::apply_uma_limit(free);   // its memory is the system RAM
+        uint64_t total = d.get_info<sycl::info::device::global_mem_size>(), margin = 0;
+        if (core::integrated_gpu(d)) core::apply_uma_limit(free, total);   // its memory is the system RAM
         else if (d.has(sycl::aspect::ext_intel_pci_address)) {
             std::string pci = d.get_info<sycl::ext::intel::info::device::pci_address>();
             for (auto& c : pci) c = (char) std::tolower((unsigned char) c);
             core::apply_os_budget(pci, free);
+            margin = core::unreported_vram_margin(pci, total);
         }
         size_t held = 0;
         {
             std::lock_guard<std::mutex> lock(g_live_mu);
             if (auto it = g_live_on.find(rt().ordinal()); it != g_live_on.end()) held = it->second;
         }
-        core::apply_vram_limit(free, total, held);
+        // i915 reports an A380's free memory as all of its 5783 MiB however much is allocated (2026-11-03), so the
+        // expert cache was sized past the card, and i915 took the allocations past it and lost their contents (a GPU
+        // hang, a router reading garbage, OUT_OF_HOST_MEMORY at the next submission).  There the free memory is the
+        // total less what this process holds and the runtime's and the driver's own (unreported_vram_margin).  Not
+        // elsewhere: the B70 reports its total 1.7 GiB under its 32 GiB and its free memory from the 32 GiB, which
+        // the cache has used
+        if (margin > 0) free = std::min<uint64_t>(free, total > held + margin ? total - held - margin : 0);
+        uint64_t short_b = 0;
+        core::apply_vram_limit(free, total, held, &short_b);
         if (free_bytes) *free_bytes = (size_t) free;
+        if (short_bytes) *short_bytes = (size_t) short_b;
         if (total_bytes) *total_bytes = (size_t) total;
         return true;
     } catch (const std::exception& e) { return fail("mem_info", e); }
@@ -710,6 +1032,13 @@ bool graph_launch(const Graph* g, Stream s) {
     if (!g) { g_error = "graph_launch: null graph"; return false; }
     try { q(s).ext_oneapi_graph(g->exec); return true; }
     catch (const std::exception& e) { return fail("graph_launch", e); }
+}
+
+bool graph_branches_may_wait_for_host() {
+    // HIP launches a graph without branches as one batch of packets, one with branches a node at a time from the
+    // launching thread: a verify window with the mixer's side branches hung there on an RX 9060 XT, its launch
+    // waiting for the kernel-argument ring behind the window's first wait for the CPU's rows (2026-11-16)
+    return rt().device().get_backend() != sycl::backend::ext_oneapi_hip;
 }
 
 size_t graph_nodes(const Graph* g) { return g ? g->nodes : 0; }

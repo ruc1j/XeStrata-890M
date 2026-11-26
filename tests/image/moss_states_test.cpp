@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// MossText::read_states takes a states file only when its header's n x width rows are the rest of the file
+// TextEncoder::read_states takes a states file only when its header's n x width rows are the rest of the file
 // (Issue #83): a header claiming more rows than the file holds is refused before anything is allocated.  CPU only.
-#include "strata/image/moss_text.hpp"
+#include "strata/image/text_encoder.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -28,7 +28,7 @@ void write_states(int32_t n, int32_t width, size_t floats) {
 
 bool read(std::vector<float>& rows, int64_t& n, int64_t& width) {
     std::string err;
-    return strata::image::MossText::read_states(kPath, rows, n, width, err);
+    return strata::image::TextEncoder::read_states(kPath, rows, n, width, err);
 }
 
 }  // namespace

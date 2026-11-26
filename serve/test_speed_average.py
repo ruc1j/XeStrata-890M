@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""The run average of the speed cards (community patch: keinebenutzer/STRATA-average-patch, MIT, made against v0.1.55
-c62d5e3a; ported by hand onto rc1).
+"""The run average of the speed cards (community patch: keinebenutzer/STRATA-average-patch, MIT, made against
+v0.1.55 c62d5e3a; ported by hand).
 
-serve/web/app.js (the Monitor tab's Decode and Prefill cards), serve/web/monitor.js and monitor.html (the API monitor
-page) show, when the server is idle, the token-weighted average of the run instead of the last request's speed. Live
-values stay live. This file runs the browser code the way a page would (a few lines of node, no browser, no network)
-and checks that what was added is display only."""
+serve/web/app.js (the Monitor tab's Decode and Prefill cards) and serve/web/monitor.js and monitor.html (the API
+monitor page) show, when the server is idle, the token-weighted average of the run instead of the last request's
+speed.  Live values stay live.  This file runs the browser code the way a page would (a few lines of node, no
+browser, no network) and checks that what was added is display only.
+"""
 import json
 import re
 import shutil
@@ -20,7 +21,7 @@ NODE = shutil.which("node")
 
 
 def run_node(source: str) -> object:
-    done = subprocess.run([str(NODE), "-e", source], capture_output=True, text=True, timeout=60, check=True)
+    done = subprocess.run([NODE or "node", "-e", source], capture_output=True, text=True, timeout=60, check=True)
     return json.loads(done.stdout)
 
 
@@ -42,14 +43,20 @@ class MonitorTab(unittest.TestCase):
     """serve/web/app.js: the two cards, run with stand-ins for the page's helpers."""
 
     def cards(self, live, last, totals):
-        block = cards_block((WEB / "app.js").read_text(encoding="utf-8"))
-        script = ("const calls = []; const setMetric = (...a) => calls.push(a); const fmt = (n, d = 0) => Number(n).toFixed(d);\n"  # noqa: E501
-                  f"function run(live, last, totals) {{\n{block}\n}}\nrun({json.dumps(live)}, {json.dumps(last)}, {json.dumps(totals)});\nconsole.log(JSON.stringify(calls));")  # noqa: E501
-        script = script.replace("spark(", "(() => {})(")
+        text = (WEB / "app.js").read_text(encoding="utf-8")
+        block = cards_block(text)
+        script = ("const calls = []; const setMetric = (...a) => calls.push(a);\n"
+                  "const fmt = (n, d = 0) => Number(n).toFixed(d);\n"
+                  "const tr = (key, english) => english; const image = null; const spark = () => {};\n"
+                  f"{function_source(text, 'avgSpeed')}\n"
+                  f"function run(live, last, totals) {{\n{block}\n}}\n"
+                  f"run({json.dumps(live)}, {json.dumps(last)}, {json.dumps(totals)});\n"
+                  "console.log(JSON.stringify(calls));")
         calls = run_node(script)
         return {c[0]: (c[1], c[3]) for c in calls}
 
-    TOTALS = {"requests": 12, "prompt_tokens": 90000, "reused": 5000, "output_tokens": 40000, "prompt_ms": 120000.0, "decode_ms": 1000000.0}  # noqa: E501
+    TOTALS = {"requests": 12, "prompt_tokens": 90000, "reused": 5000, "output_tokens": 40000, "prompt_ms": 120000.0,
+              "decode_ms": 1000000.0}
     LAST = {"decode_tok_s": 50.5, "prompt_ms": 2000.0, "prompt_tokens": 1000, "reused": 0}
 
     def test_idle_shows_the_run_average_for_both_cards(self):
@@ -58,9 +65,11 @@ class MonitorTab(unittest.TestCase):
         self.assertEqual(cards["prefill"], ("708", "Prefill · run average"), "(90000 - 5000 reused) tokens in 120 s")
 
     def test_live_values_stay_live(self):
-        self.assertEqual(self.cards({"state": "generating", "tok_s": 31.5, "prefill_tok_s_mean": 600}, self.LAST, self.TOTALS)["speed"], ("31.5", "Decode now"))  # noqa: E501
-        self.assertEqual(self.cards({"state": "generating", "tok_s": 31.5, "prefill_tok_s_mean": 600}, self.LAST, self.TOTALS)["prefill"], ("600", "Prefill this request"))  # noqa: E501
-        self.assertEqual(self.cards({"state": "reading", "prefill_tok_s_mean": 820}, self.LAST, self.TOTALS)["prefill"], ("820", "Prefill now"))  # noqa: E501
+        live = {"state": "generating", "tok_s": 31.5, "prefill_tok_s_mean": 600}
+        self.assertEqual(self.cards(live, self.LAST, self.TOTALS)["speed"], ("31.5", "Decode now"))
+        self.assertEqual(self.cards(live, self.LAST, self.TOTALS)["prefill"], ("600", "Prefill this request"))
+        reading = {"state": "reading", "prefill_tok_s_mean": 820}
+        self.assertEqual(self.cards(reading, self.LAST, self.TOTALS)["prefill"], ("820", "Prefill now"))
 
     def test_without_totals_it_is_the_last_request_and_never_an_invented_zero(self):
         for totals in (None, {}, {"output_tokens": 0, "decode_ms": 0, "prompt_tokens": 0, "prompt_ms": 0}):
@@ -82,11 +91,13 @@ class MonitorPage(unittest.TestCase):
         long_one = {"timings": {"predicted_n": 19511, "predicted_ms": 386000}}
         short_one = {"timings": {"predicted_n": 11, "predicted_ms": 410}}
         self.assertAlmostEqual(self.average([long_one, short_one]), (19511 + 11) / (386410 / 1000), places=6)
-        self.assertGreater(self.average([long_one, short_one]), 50, "a plain mean of the two (about 38) would let the short one count as much as the long one")  # noqa: E501
+        self.assertGreater(self.average([long_one, short_one]), 50,
+                           "a plain mean of the two (about 38) would let the short one count as much as the long one")
 
     def test_requests_without_timings_or_with_one_token_are_left_out(self):
         self.assertIsNone(self.average([]))
-        self.assertIsNone(self.average([{}, {"timings": None}, {"timings": {"predicted_n": 1, "predicted_ms": 10}}, {"timings": {"predicted_n": 5, "predicted_ms": 0}},  # noqa: E501
+        self.assertIsNone(self.average([{}, {"timings": None}, {"timings": {"predicted_n": 1, "predicted_ms": 10}},
+                                        {"timings": {"predicted_n": 5, "predicted_ms": 0}},
                                         {"timings": {"predicted_n": "9", "predicted_ms": 5}}]))
         self.assertEqual(self.average([{"timings": {"predicted_n": 100, "predicted_ms": 2000}}, {}]), 50)
 
@@ -104,9 +115,12 @@ class AddedCodeIsDisplayOnly(unittest.TestCase):
     no markup, no address."""
 
     def test_nothing_but_arithmetic_and_text(self):
-        pieces = [cards_block((WEB / "app.js").read_text(encoding="utf-8")), function_source((WEB / "monitor.js").read_text(encoding="utf-8"), "averageDecodeSpeed")]  # noqa: E501
-        forbidden = re.compile(r"\b(fetch|XMLHttpRequest|WebSocket|sendBeacon|eval|Function|import|require|innerHTML|insertAdjacentHTML|document\.write|"  # noqa: E501
-                               r"subprocess|socket|urllib|requests|os\.system|open)\s*\(|https?://|\.src\s*=|new Image")
+        pieces = [cards_block((WEB / "app.js").read_text(encoding="utf-8")),
+                  function_source((WEB / "app.js").read_text(encoding="utf-8"), "avgSpeed"),
+                  function_source((WEB / "monitor.js").read_text(encoding="utf-8"), "averageDecodeSpeed")]
+        forbidden = re.compile(r"\b(fetch|XMLHttpRequest|WebSocket|sendBeacon|eval|Function|import|require|innerHTML|"
+                               r"insertAdjacentHTML|document\.write|subprocess|socket|urllib|requests|os\.system|"
+                               r"open)\s*\(|https?://|\.src\s*=|new Image")
         for piece in pieces:
             self.assertIsNone(forbidden.search(piece), forbidden.search(piece) and forbidden.search(piece).group(0))
         self.assertIn("textContent", (WEB / "monitor.js").read_text(encoding="utf-8"))

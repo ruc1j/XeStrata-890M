@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/prefill/kva_test.cpp - the KVA switch, the automatic tail and the reasons a read is turned away (no GPU needed).
 #include "strata/kernels/window_start.hpp"
 #include "strata/prefill/kva.hpp"
@@ -48,7 +49,7 @@ int main() {
         CHECK(c.mode == KvaConfig::Mode::Identity && c.only == KvaConfig::Only::All && !c.capture);
         KvaEngine eng;
         CHECK(!c.wants_cell_floor(eng, true));
-        CHECK(is(c.decline(eng, 0, 30000, 0, -1, 48), "off (STRATA_KVA is not 1)"));   // a 30K cold prompt is read exactly
+        CHECK(is(c.decline(eng, 0, 30000, 0, -1, 48), "off (XESTRATA_KVA is not 1)"));   // a 30K cold prompt is read exactly
     }
     put("STRATA_KVA", "0");
     { const KvaConfig c = kva_config_from_env(); CHECK(!c.on && !c.explicit_on); }
@@ -83,7 +84,7 @@ int main() {
         // a continuation (turn 2 of a chat, a resumed prompt): routine
         CHECK(is(c.decline(eng, 9000, 14600, 0, -1, 48, false, false, &routine), "a continuation read (pos0 != 0)") && routine);
         // short prompts and a prompt the tail would swallow: routine
-        CHECK(is(c.decline(eng, 0, 3000, 0, -1, 48, false, false, &routine), "the prompt is shorter than STRATA_KVA_MIN_PROMPT") && routine);
+        CHECK(is(c.decline(eng, 0, 3000, 0, -1, 48, false, false, &routine), "the prompt is shorter than XESTRATA_KVA_MIN_PROMPT") && routine);
         CHECK(c.decline(eng, 0, 4096, 0, -1, 48) == nullptr);   // 4096 is the first prompt that is long enough
         put("STRATA_KVA_SUFFIX", "5000");   // a longer tail swallows a prompt of 5000 and not one of 5065
         { const KvaConfig s = kva_config_from_env();
@@ -102,7 +103,7 @@ int main() {
         // a model whose shape KVA was not measured on (not 48 layers / 512 experts) is turned away, not warned about;
         // the routine reasons (a short prompt, a continuation) still come first
         CHECK(is(c.decline(eng, 0, 14600, 0, -1, 40, false, false, &routine, true), kKvaShapeReason) && !routine);
-        CHECK(is(c.decline(eng, 0, 3000, 0, -1, 40, false, false, &routine, true), "the prompt is shorter than STRATA_KVA_MIN_PROMPT") && routine);
+        CHECK(is(c.decline(eng, 0, 3000, 0, -1, 40, false, false, &routine, true), "the prompt is shorter than XESTRATA_KVA_MIN_PROMPT") && routine);
         CHECK(c.decline(eng, 0, 14600, 0, -1, 48, false, false, &routine, false) == nullptr);   // the measured shape applies
         put("STRATA_KVA_ANY_MODEL", "1");   // the research override allows it (prefill.cpp then warns once)
         { const KvaConfig a = kva_config_from_env(); CHECK(a.any_model && a.decline(eng, 0, 14600, 0, -1, 40, false, false, nullptr, true) == nullptr); }

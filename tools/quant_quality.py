@@ -14,14 +14,14 @@ to 30K tokens for the long-context positions: a novel, third_party/main/aozora-b
         third_party/main/aozora-bunko --seg-tokens 0 --out data/quant_quality/long/set.ids.json).
     python tools/quant_quality.py run --config CFG.json --out RUN.tsv [--ids set.ids.json] [--env K=V ...]
         [--gpu-experts] [--route-dump ROUTES.bin | --route-lock ROUTES.bin]
-        one `strata --serve` engine (the config's exe and args), every segment one request whose tokens are all read
-        through the decode windows (--short-read), where STRATA_LOGPOS / STRATA_LOGPOS_TOPK=64 write, per position,
-        the log-probability of the text's next token and the 64 most likely tokens.  Fixed: the experts on the CPU
-        (one VRAM slot, --expert-cache 1: the verify windows need a profile-filled tier, so the config must have
+        one `xestrata-engine --serve` engine (the config's exe and args), every segment one request whose tokens are all
+        read through the decode windows (--short-read), where XESTRATA_LOGPOS / XESTRATA_LOGPOS_TOPK=64 write, per
+        position, the log-probability of the text's next token and the 64 most likely tokens.  Fixed: the experts on the
+        CPU (one VRAM slot, --expert-cache 1: the verify windows need a profile-filled tier, so the config must have
         --expert-profile; --gpu-experts: 1500 slots), no expert adaptation, no PCIe share, no suffix drafts, no prompt
-        cache, FP16 K/V, STRATA_ROUTE_TAIL_SKIP=0, STRATA_PREFILL_CPU_SHARE=0.  RUN.tsv + RUN.tsv.seg.json (line
-        ranges).  --route-dump writes the run's routed experts and weights (STRATA_ROUTE_DUMP); --route-lock reads a
-        reference run's and routes every position as it did (STRATA_ROUTE_REPLAY, the same --ids), so the KL of a
+        cache, FP16 K/V, XESTRATA_ROUTE_TAIL_SKIP=0, XESTRATA_PREFILL_CPU_SHARE=0.  RUN.tsv + RUN.tsv.seg.json (line
+        ranges).  --route-dump writes the run's routed experts and weights (XESTRATA_ROUTE_DUMP); --route-lock reads a
+        reference run's and routes every position as it did (XESTRATA_ROUTE_REPLAY, the same --ids), so the KL of a
         locked run against that reference is the quant's rounding alone and the free run's excess is the routing it
         flipped.
     python tools/quant_quality.py compare REF.tsv RUN.tsv [...]   (REF = the reference run)
@@ -29,7 +29,7 @@ to 30K tokens for the long-context positions: a novel, third_party/main/aozora-b
         tokens (both renormalized to that set; a token RUN does not list gets RUN's 64th log-probability), the
         perplexity of the text under each, and the run's NLL against the reference's in percent.
 
-The RUN.tsv rows are the engine's STRATA_LOGPOS format: pos, target id, logp(target), argmax id, logp(argmax),
+The RUN.tsv rows are the engine's XESTRATA_LOGPOS format: pos, target id, logp(target), argmax id, logp(argmax),
 argmax==target, logp(<|im_end|>), logp(target without <|im_end|>), then 64 `id:logp` fields (natural log).
 """
 from __future__ import annotations
@@ -49,7 +49,7 @@ SEGMENTS = ["code", "docs", "english", "multilingual", "agent"]
 TOPK = 64
 FIXED = ["--expert-cache", "1", "--adapt-every", "100000", "--pcie-frac", "0", "--suffix-draft", "0",
          "--prompt-cache", "0", "--kv", "fp16"]
-FIXED_ENV = {"STRATA_ROUTE_TAIL_SKIP": "0", "STRATA_PREFILL_CPU_SHARE": "0", "STRATA_PCIE_FRAC_DEFAULT": "old"}
+FIXED_ENV = {"XESTRATA_ROUTE_TAIL_SKIP": "0", "XESTRATA_PREFILL_CPU_SHARE": "0", "XESTRATA_PCIE_FRAC_DEFAULT": "old"}
 # config args the yardstick replaces (value-taking) or drops (flags)
 DROP_VALUE = {"--expert-cache", "--adapt-every", "--pcie-frac", "--suffix-draft", "--prompt-cache", "--max-context",
               "--prefill", "--prompt-cache-every", "--short-read", "--conversation-cache-mib", "--eos-ids",
@@ -81,7 +81,8 @@ def cmd_ids(a) -> int:
         print(f"{name}: {len(ids)} tokens, kept {keep}")
     out = pathlib.Path(a.out or (sd / "set.ids.json"))
     # seg_tokens: the longest segment (the run's context and short-read size)
-    out.write_text(json.dumps({"version": sd.name, "seg_tokens": max(len(s["ids"]) for s in segs), "segments": segs}))
+    out.write_text(json.dumps({"version": sd.name, "seg_tokens": max(len(s["ids"]) for s in segs),
+                               "vocab_size": len(toks), "segments": segs}))
     print(f"wrote {out}")
     return 0
 
@@ -116,9 +117,30 @@ def engine_args(cfg: dict, gpu_experts, seg_tokens: int) -> list[str]:
             "--short-read", str(seg_tokens + 64), "--prefill", "512"]
 
 
+def check_ids_vocab(st: dict, cfg: dict, ids_path: str) -> None:
+    """A wrong ids file fails here, loudly: every id must be inside the model's vocabulary (the vocabulary of the
+    config's tokenizer folder when it names one, else the size the ids file recorded when `ids` made it), or the run
+    reads nonsense - an ids file made with another model's tokenizer has ids the engine cannot read."""
+    vocab = None
+    tdir = cfg.get("tokenizer")
+    if tdir and (pathlib.Path(tdir) / "vocab.json").is_file():
+        vocab = len(json.loads((pathlib.Path(tdir) / "vocab.json").read_text(encoding="utf-8")))
+    elif st.get("vocab_size"):
+        vocab = int(st["vocab_size"])
+    if not vocab:
+        return
+    for s in st["segments"]:
+        mx = max(s["ids"]) if s["ids"] else -1
+        if mx >= vocab:
+            raise SystemExit(f"{ids_path}: segment '{s['name']}' has token id {mx} >= the model's vocabulary "
+                             f"({vocab}): this ids file was made with another tokenizer; make one with "
+                             "`quant_quality.py ids --tokenizer <the model's tokenizer folder>`")
+
+
 def cmd_run(a) -> int:
     cfg = json.load(open(a.config, encoding="utf-8-sig"))
     st = json.load(open(a.ids))
+    check_ids_vocab(st, cfg, a.ids)
     out = pathlib.Path(a.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
@@ -131,16 +153,16 @@ def cmd_run(a) -> int:
     for kv in a.env or []:
         k, _, v = kv.partition("=")
         env[k] = v
-    env["STRATA_LOGPOS"] = str(out)
-    env["STRATA_LOGPOS_TOPK"] = str(TOPK)
+    env["XESTRATA_LOGPOS"] = str(out)
+    env["XESTRATA_LOGPOS_TOPK"] = str(TOPK)
     if a.route_dump and a.route_lock:
         raise SystemExit("--route-dump and --route-lock: one of them")
     if a.route_dump:
-        env["STRATA_ROUTE_DUMP"] = str(pathlib.Path(a.route_dump).resolve())
+        env["XESTRATA_ROUTE_DUMP"] = str(pathlib.Path(a.route_dump).resolve())
     if a.route_lock:
         if not pathlib.Path(a.route_lock).is_file():
             raise SystemExit(f"--route-lock {a.route_lock}: no such file (a reference run's --route-dump)")
-        env["STRATA_ROUTE_REPLAY"] = str(pathlib.Path(a.route_lock).resolve())
+        env["XESTRATA_ROUTE_REPLAY"] = str(pathlib.Path(a.route_lock).resolve())
     if mem_available_gb() < a.min_free_gb:
         raise SystemExit(f"only {mem_available_gb():.0f} GB available (< {a.min_free_gb}): not starting an engine")
     args = engine_args(cfg, a.gpu_experts, st["seg_tokens"])
@@ -202,7 +224,7 @@ PROMPT_LENS = (256, 512, 768, 1000)
 
 def cmd_prompt(a) -> int:
     """The batched prompt path's answer: every segment's first 256 / 512 / 768 / 1000 tokens as a prompt (one request
-    each, no prompt cache), and the logits after it (STRATA_DUMP_FIRST_LOGITS: float32, the whole vocabulary)."""
+    each, no prompt cache), and the logits after it (XESTRATA_DUMP_FIRST_LOGITS: float32, the whole vocabulary)."""
     cfg = json.load(open(a.config, encoding="utf-8-sig"))
     st = json.load(open(a.ids))
     out = pathlib.Path(a.out).resolve()
@@ -217,7 +239,7 @@ def cmd_prompt(a) -> int:
     for kv in a.env or []:
         k, _, v = kv.partition("=")
         env[k] = v
-    env["STRATA_DUMP_FIRST_LOGITS"] = str(out / "first")
+    env["XESTRATA_DUMP_FIRST_LOGITS"] = str(out / "first")
     if mem_available_gb() < a.min_free_gb:
         raise SystemExit(f"only {mem_available_gb():.0f} GB available (< {a.min_free_gb}): not starting an engine")
     args = engine_args(cfg, a.gpu_experts, max(PROMPT_LENS))

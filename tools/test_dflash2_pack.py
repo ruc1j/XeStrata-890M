@@ -1,15 +1,12 @@
-#!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
-"""tools/dflash2_pack.py reads a .safetensors file with numpy alone (the person's PC has neither torch nor the safetensors package) and writes
-the same runtime file the torch-based version wrote.
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+"""tools/dflash2_pack.py: the pack's header, the ggml quantization of the widened values, and the selector conversion.
 
-    python tools/test_dflash2_pack.py
+    python -m unittest tools.test_dflash2_pack
 """
-import importlib.util
 import json
 import struct
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -19,26 +16,29 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import dflash2_pack as new  # noqa: E402
+import dflash2_pack as pk  # noqa: E402
 
 L, H, INTER, HEADS, KV, HD, RANK, VOCAB = 2, 64, 96, 2, 1, 32, 32, 128
-CFG = {"num_hidden_layers": L, "hidden_size": H, "num_attention_heads": HEADS, "num_key_value_heads": KV, "head_dim": HD,
-       "intermediate_size": INTER, "sliding_window": 128, "rope_parameters": {"rope_theta": 1000000.0}, "rms_norm_eps": 1e-6, "vocab_size": VOCAB,
-       "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2, "mask_token_id": 7, "selector_rank": RANK, "selector_top_k": 4,
-                         "target_layer_ids": [1, 2, 3]}}
+CFG = {"num_hidden_layers": L, "hidden_size": H, "num_attention_heads": HEADS, "num_key_value_heads": KV,
+       "head_dim": HD, "intermediate_size": INTER, "sliding_window": 128,
+       "rope_parameters": {"rope_theta": 1000000.0}, "rms_norm_eps": 1e-6, "vocab_size": VOCAB,
+       "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2, "mask_token_id": 7,
+                         "selector_rank": RANK, "selector_top_k": 4, "target_layer_ids": [1, 2, 3]}}
 
 
 def bf16(a):
-    """float32 -> BF16 bytes by truncation (what torch's .to(bfloat16) does for these values up to rounding; the test only needs a valid BF16 file)."""
+    """float32 -> BF16 bits by truncation (a valid BF16 file for the reader; the widening is exact)."""
     return (np.ascontiguousarray(a, np.float32).view(np.uint32) >> 16).astype(np.uint16)
 
 
 def tensors():
     rng = np.random.default_rng(7)
-    r = lambda *shape: rng.standard_normal(shape).astype(np.float32) * 0.1
+
+    def r(*shape):
+        return rng.standard_normal(shape).astype(np.float32) * 0.1
     t = {"fc.weight": r(H, H * 3), "hidden_norm.weight": r(H), "norm.weight": r(H)}
-    for l in range(L):
-        p = "layers.%d." % l
+    for ly in range(L):
+        p = "layers.%d." % ly
         t[p + "self_attn.q_proj.weight"] = r(HEADS * HD, H)
         t[p + "self_attn.k_proj.weight"] = r(KV * HD, H)
         t[p + "self_attn.v_proj.weight"] = r(KV * HD, H)
@@ -59,7 +59,7 @@ def tensors():
 
 
 def write_safetensors(path, arrays):
-    """A BF16 safetensors file written by hand (the format is documented: u64 header length, JSON header, raw data)."""
+    """A BF16 safetensors file written by hand (u64 header length, JSON header, raw data)."""
     header, blobs, at = {}, [], 0
     for name, a in arrays.items():
         data = bf16(a).tobytes()
@@ -72,7 +72,14 @@ def write_safetensors(path, arrays):
         fh.write(struct.pack("<Q", len(js)) + js + b"".join(blobs))
 
 
-class PackWithoutTorch(unittest.TestCase):
+def index_of(data):
+    index_len = struct.unpack("<I", data[8:12])[0]
+    base = 12 + index_len
+    rows = {ln.split()[1]: ln.split() for ln in data[12:base].decode().splitlines() if ln.startswith("t ")}
+    return base, rows
+
+
+class PackTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
@@ -85,11 +92,12 @@ class PackWithoutTorch(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def pack(self, out):
-        return new.pack(str(self.dir / "model.safetensors"), str(self.dir / "config.json"), str(out), say=lambda *_: None)
+    def pack(self, out, **kw):
+        return pk.pack(str(self.dir / "model.safetensors"), str(self.dir / "config.json"), str(out),
+                       say=lambda *_: None, **kw)
 
     def test_reader_widens_bf16_exactly(self):
-        f = new.SafeTensors(str(self.dir / "model.safetensors"))
+        f = pk.SafeTensors(str(self.dir / "model.safetensors"))
         got = f.get_float32("fc.weight")
         want = (bf16(self.arrays["fc.weight"]).astype(np.uint32) << 16).view(np.float32)
         self.assertTrue(np.array_equal(got, want))
@@ -105,9 +113,10 @@ class PackWithoutTorch(unittest.TestCase):
         self.assertEqual(version, 1)
         self.assertEqual((12 + index_len) % 4096, 0, "the data starts on a 4096 multiple")
         index = data[12:12 + index_len].decode().splitlines()
-        self.assertTrue(any(l.startswith("cfg hidden %d" % H) for l in index))
-        self.assertIn("end", [l.strip() for l in index])
-        names = [l.split()[1] for l in index if l.startswith("t ")]
+        self.assertTrue(any(ln.startswith("cfg hidden %d" % H) for ln in index))
+        self.assertTrue(any(ln.startswith("cfg taps 1,2,3") for ln in index))
+        self.assertIn("end", [ln.strip() for ln in index])
+        names = [ln.split()[1] for ln in index if ln.startswith("t ")]
         self.assertIn("fc.weight", names)
         self.assertIn("candidate_selector.successor_codebook", names)
         self.assertEqual(len(data), size)
@@ -116,26 +125,20 @@ class PackWithoutTorch(unittest.TestCase):
         out = self.dir / "q8.pack"
         self.pack(out)
         data = out.read_bytes()
-        index_len = struct.unpack("<I", data[8:12])[0]
-        base = 12 + index_len
-        row = next(l.split() for l in data[12:base].decode().splitlines() if l.startswith("t fc.weight "))
-        _t, _name, dtype, rows, cols, off, nbytes = row
+        base, rows = index_of(data)
+        _t, _name, dtype, _rows, _cols, off, nbytes = rows["fc.weight"]
         self.assertEqual(dtype, "q8_0")
         got = data[base + int(off): base + int(off) + int(nbytes)]
         widened = (bf16(self.arrays["fc.weight"]).astype(np.uint32) << 16).view(np.float32)
-        self.assertEqual(got, new.quant_q8_0(widened))
+        self.assertEqual(got, pk.quant_q8_0(widened))
 
     def test_q4_0_blocks_are_ggml_q4_0_and_only_the_matrices_change(self):
         q8, q4 = self.dir / "q8b.pack", self.dir / "q4.pack"
         self.pack(q8)
-        new.pack(str(self.dir / "model.safetensors"), str(self.dir / "config.json"), str(q4), say=lambda *_: None, q4=True)
-        rows = {}
-        for path in (q8, q4):
-            data = path.read_bytes()
-            index_len = struct.unpack("<I", data[8:12])[0]
-            rows[path] = (data, 12 + index_len, {l.split()[1]: l.split() for l in data[12:12 + index_len].decode().splitlines() if l.startswith("t ")})
-        d8, b8, t8 = rows[q8]
-        d4, b4, t4 = rows[q4]
+        self.pack(q4, q4=True)
+        d8, d4 = q8.read_bytes(), q4.read_bytes()
+        b8, t8 = index_of(d8)
+        b4, t4 = index_of(d4)
         self.assertEqual(set(t8), set(t4))
         for name, r in t4.items():
             dtype4, nbytes4 = r[2], int(r[6])
@@ -143,36 +146,38 @@ class PackWithoutTorch(unittest.TestCase):
                 self.assertEqual(dtype4, "q4_0", name)
                 self.assertEqual(nbytes4, int(r[3]) * int(r[4]) // 32 * 18, name)
             else:   # norms, conv kernels and the codebooks are byte for byte the same
-                self.assertEqual(d4[b4 + int(r[5]): b4 + int(r[5]) + nbytes4], d8[b8 + int(t8[name][5]): b8 + int(t8[name][5]) + int(t8[name][6])], name)
-        # one matrix: dequantize the blocks and check the error is within one step of each block scale (the +8 end is clamped to 7)
+                self.assertEqual(d4[b4 + int(r[5]): b4 + int(r[5]) + nbytes4],
+                                 d8[b8 + int(t8[name][5]): b8 + int(t8[name][5]) + int(t8[name][6])], name)
+        # one matrix: dequantize the blocks; the error is within one step of each block scale (the +8 end clamps to 7)
         w = (bf16(self.arrays["fc.weight"]).astype(np.uint32) << 16).view(np.float32)
         r = t4["fc.weight"]
-        blocks = np.frombuffer(d4[b4 + int(r[5]): b4 + int(r[5]) + int(r[6])], np.uint8).reshape(w.shape[0], w.shape[1] // 32, 18)
+        raw = d4[b4 + int(r[5]): b4 + int(r[5]) + int(r[6])]
+        blocks = np.frombuffer(raw, np.uint8).reshape(w.shape[0], w.shape[1] // 32, 18)
         d = blocks[..., :2].copy().view(np.float16)[..., 0].astype(np.float32)
         q = np.concatenate([blocks[..., 2:] & 15, blocks[..., 2:] >> 4], axis=-1).astype(np.float32) - 8
         deq = (q * d[..., None]).reshape(w.shape)
         step = np.abs(d)[..., None].repeat(32, -1).reshape(w.shape)
         self.assertTrue(np.all(np.abs(deq - w) <= 1.01 * step + 1e-6))
 
-    def test_it_matches_the_torch_version_when_torch_is_here(self):
-        try:
-            import torch  # noqa: F401
-            import safetensors  # noqa: F401
-        except ImportError:
-            self.skipTest("torch or safetensors is not installed here (the point of the change)")
-        old_src = subprocess.run(["git", "show", "f1b6a2144:tools/dflash2_pack.py"], cwd=HERE, capture_output=True, text=True)
-        if old_src.returncode != 0:
-            self.skipTest("the earlier version is not in this clone")
-        old_path = self.dir / "old_pack.py"
-        old_path.write_text(old_src.stdout)
-        spec = importlib.util.spec_from_file_location("old_pack", old_path)
-        old = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(old)
-        a, b = self.dir / "a.pack", self.dir / "b.pack"
-        sys.argv = ["x", str(self.dir / "model.safetensors"), str(self.dir / "config.json"), str(a)]
-        old.main()
-        self.pack(b)
-        self.assertEqual(a.read_bytes(), b.read_bytes(), "byte for byte the same file")
+    def test_selector_conversion_is_byte_identical_to_packing_with_q4_selector(self):
+        a, b, c = self.dir / "sel_a.pack", self.dir / "sel_b.pack", self.dir / "sel_c.pack"
+        self.pack(a, q4=True)
+        pk.convert_selector_q4(str(a), str(b), say=lambda *_: None)
+        self.pack(c, q4=True, q4_selector=True)
+        self.assertEqual(b.read_bytes(), c.read_bytes(), "the conversion writes the pack --q4_0-selector writes")
+        # converting twice is refused (the codebooks are no longer bf16)
+        with self.assertRaises(ValueError):
+            pk.convert_selector_q4(str(b), str(self.dir / "sel_d.pack"), say=lambda *_: None)
+
+    def test_read_index_round_trip(self):
+        out = self.dir / "idx.pack"
+        self.pack(out, q4=True)
+        cfg_lines, tensors, base = pk.read_index(str(out))
+        self.assertTrue(any(ln == "cfg hidden %d" % H for ln in cfg_lines))
+        self.assertEqual(base % 4096, 0)
+        fc = next(t for t in tensors if t["name"] == "fc.weight")
+        self.assertEqual(fc["dtype"], "q4_0")
+        self.assertEqual(fc["bytes"], fc["rows"] * fc["cols"] // 32 * 18)
 
 
 if __name__ == "__main__":

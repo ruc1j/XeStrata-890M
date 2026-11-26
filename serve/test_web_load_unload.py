@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/test_web_load_unload.py - the web page's header carries the Load / Unload control (#3550, by sakuumomo).
 
 Pins, as text: index.html holds the header button and the Monitor's "Unloaded" badge; app.js wires the button to POST /load
@@ -29,7 +30,8 @@ class WebLoadUnloadMarkup(unittest.TestCase):
     def test_header_button_and_monitor_badge(self):
         self.assertIn('id="unload-btn"', self.html)
         self.assertIn('data-s="unloaded"', self.html)
-        self.assertLess(self.html.index('id="unload-btn"'), self.html.index('id="theme-btn"'))   # in the header row
+        # XeStrata moved the button from the header row to About's "Model and engine" card (1864872af)
+        self.assertLess(self.html.index('id="about-overview"'), self.html.index('id="unload-btn"'))
 
     def test_button_posts_load_and_unload(self):
         self.assertIn('$("unload-btn").onclick', self.js)
@@ -49,8 +51,8 @@ class WebLoadUnloadMarkup(unittest.TestCase):
         self.assertIn("function metricsAgree(live, state)", self.js)
 
     def test_header_refits_only_on_changed_text(self):
-        # The per-second poll re-sets the pill; the fit runs when its text actually changed.
-        self.assertIn("if (text !== lastPillText) { lastPillText = text; fitHeader(); }", self.js)
+        # The per-second poll re-sets the pill; the fit runs when its text (with XeStrata's marks) actually changed.
+        self.assertIn("if (text + marks !== lastPillText) { lastPillText = text + marks; fitHeader(); }", self.js)
 
     def test_the_header_row_keeps_the_buttons_on_a_phone(self):
         self.assertIn("#unload-btn", self.css)

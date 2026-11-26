@@ -53,7 +53,7 @@ void check(bool ok, const char* what) {
 int main() {
     constexpr int64_t L = 48, N = strata::core::kCompiledGeometry.n_embd, HC = strata::core::kCompiledGeometry.hc, LR = strata::core::kCompiledGeometry.hc_lr, T = 5, D = HC * N;   // the compiled shape (Q4-SYCL)
     constexpr int64_t kLayer = 7, kOff = 3;   // steered / not steered
-    std::mt19937 rng(1234);
+    std::mt19937 rng(1234);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     std::normal_distribution<float> nd(0.0f, 1.0f);
 
     // a unit direction at kLayer with a norm-2 scaled one's s = 2; nothing at kOff

@@ -533,7 +533,8 @@ class ToolLoop(unittest.TestCase):
 class NoServers(unittest.TestCase):
     def test_opt_in_without_servers_is_a_plain_chat(self):
         tok = ByteTokenizer()
-        svc = Service(ScriptedEngine(tok, ["</think>\n\nhi"]), tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        svc = Service(ScriptedEngine(tok, ["</think>\n\nhi"]), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         httpd = serve(svc, port=0)
         try:
             base = f"http://127.0.0.1:{httpd.server_address[1]}"

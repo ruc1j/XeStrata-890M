@@ -11,6 +11,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -50,15 +51,18 @@ struct PcieFetchProbe {
     int32_t* d_n = nullptr;
     uint8_t* d_dst = nullptr;
     int64_t bytes = 0;
+    int ring = kRing;   // the experts the launches take from (the start's 32; a 2-expert probe, 2)
     int turn = 0;
     strata::gpu::Stream s = nullptr;
-    bool open(const strata::core::ExpertDispatch& d, int64_t layer, std::string& why) {
+    bool open(const strata::core::ExpertDispatch& d, int64_t layer, std::string& why, int want = kRing) {
         bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
         unsigned long long src[kRing] = {};
         int n = 0, aliased = 0;
-        for (int64_t e = 0; e < d.n_expert && n < kRing; ++e) {
+        for (int64_t e = 0; e < d.n_expert && n < want; ++e) {
             if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] >= 0 || !d.src->pinned(layer, e)) continue;
-            const uint8_t* a = d.src->device_alias(layer, e);
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            // A mixed expert can be shorter than the fixed-width fetch. Copy it into padded host USM.
+            const uint8_t* a = lay.mixed() ? nullptr : d.src->device_alias(layer, e);
             if (a == nullptr) {
                 const uint8_t* b = d.src->blob(layer, e);
                 if (b == nullptr) continue;
@@ -66,14 +70,21 @@ struct PcieFetchProbe {
                     why = "no host USM for the timing";
                     return false;
                 }
-                std::memcpy(host + (size_t) n * (size_t) bytes, b, (size_t) bytes);
+                uint8_t* slot = host + (size_t) n * (size_t) bytes;
+                const size_t actual = lay.blob_bytes(layer, e);
+                std::memcpy(slot, b, actual);
+                if (actual < (size_t) bytes) std::memset(slot + actual, 0, (size_t) bytes - actual);
                 a = host + (size_t) n * (size_t) bytes;
             } else {
                 ++aliased;
             }
             src[n++] = (unsigned long long) a;
         }
-        if (n < kRing || (aliased > 0 && aliased < n)) { why = "no layer part with 32 experts to time over PCIe"; return false; }
+        if (n < want || n == 0 || (aliased > 0 && aliased < n)) {
+            why = "no layer part with " + std::to_string(want) + " experts to time over PCIe";
+            return false;
+        }
+        ring = n;
         if (!strata::gpu::alloc_device(&buf, (size_t) (16 + 8 * kRing + 2 * bytes + 256))) { why = "no device memory for the timing"; return false; }
         d_n = reinterpret_cast<int32_t*>(buf);
         d_src = reinterpret_cast<unsigned long long*>(buf + 16);
@@ -85,7 +96,7 @@ struct PcieFetchProbe {
     bool launch(int count, int times) {
         if (!strata::gpu::copy(d_n, &count, sizeof count)) return false;
         for (int i = 0; i < times; ++i, ++turn)
-            strata::kernels::fetch_blobs(d_src + (size_t) ((2 * turn) % kRing), d_n, d_dst, bytes, 2, s);
+            strata::kernels::fetch_blobs(d_src + (size_t) ((2 * turn) % ring), d_n, d_dst, bytes, 2, s);
         return strata::gpu::stream_sync(s);
     }
     // `mean`: the mean of 6 rounds instead of the best of 3 - beside a load that comes and goes the best round is one
@@ -120,25 +131,39 @@ struct PcieFetchProbe {
 // best of 3 rounds after a warm-up.
 bool measure_gpu_expert_ms(const strata::core::ExpertDispatch& d, int64_t layer, double& q0, double& q, std::string& why) {
     namespace sk = strata::kernels;
-    const auto& f = sk::cpu::expert_layout().fmt[(size_t) layer];
+    const auto& lay = sk::cpu::expert_layout();
+    const auto& f = lay.fmt[(size_t) layer];
+    const bool mixed = lay.mixed();
     const sk::NativeExpertLayout L = sk::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
     constexpr int kRing = 16, kCap = 8;
     const int64_t bytes = (int64_t) sk::cpu::expert_layout().blob_bytes(layer);
-    const size_t scratch = sk::native_expert_scratch_bytes(kCap, f.n_ff);
+    const size_t scratch = mixed ? sk::bih3_r1q2_grouped_scratch_bytes(kCap, f.n_embd, f.n_ff)
+                                 : sk::native_expert_scratch_bytes(kCap, f.n_ff);
     const size_t xq = (size_t) (f.n_embd / 32) * 36, out = (size_t) kCap * (size_t) f.n_embd * 4;
     const size_t off_ptr = 0, off_i32 = 256, off_x = 1024, off_out = off_x + ((xq + 255) / 256) * 256;
     const size_t off_scr = off_out + ((out + 255) / 256) * 256, off_blob = off_scr + ((scratch + 255) / 256) * 256;
+    const size_t off_types = off_blob + (size_t) kRing * (size_t) bytes;
+    const size_t off_ids = (off_types + (size_t) 2 * kRing + 3) & ~(size_t) 3;
+    const size_t off_signs = off_ids + (size_t) 2 * kRing * sizeof(int32_t);
     uint8_t* buf = nullptr;
-    if (!strata::gpu::alloc_device(&buf, off_blob + (size_t) kRing * (size_t) bytes)) { why = "no device memory for the GPU timing"; return false; }
+    if (!strata::gpu::alloc_device(&buf, off_signs + (size_t) f.n_ff * sizeof(float))) { why = "no device memory for the GPU timing"; return false; }
     bool ok = strata::gpu::memset_async(buf, 0, off_blob, nullptr) && strata::gpu::stream_sync(nullptr);
     unsigned long long ptr[2 * kRing] = {};
+    uint8_t types[2 * kRing] = {};
+    int32_t ids[2 * kRing] = {};
     int n = 0;
     for (int64_t e = 0; ok && e < d.n_expert && n < kRing; ++e) {
         if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] >= 0 || !d.src->pinned(layer, e)) continue;
         const uint8_t* b = d.src->blob(layer, e);
         if (b == nullptr) continue;
         uint8_t* dst = buf + off_blob + (size_t) n * (size_t) bytes;
-        ok = strata::gpu::copy(dst, b, (size_t) bytes);
+        ok = strata::gpu::copy(dst, b, lay.blob_bytes(layer, e));
+        if (mixed) {
+            const auto& ef = lay.format(layer, e);
+            types[(size_t) 2 * n] = (uint8_t) (ef.gu_type - 180);
+            types[(size_t) 2 * n + 1] = (uint8_t) (ef.d_type - 180);
+            ids[n] = ids[n + kRing] = n;
+        }
         ptr[n] = ptr[n + kRing] = (unsigned long long) dst;   // twice: a launch's 8 groups read on from any start
         ++n;
     }
@@ -151,6 +176,19 @@ bool measure_gpu_expert_ms(const strata::core::ExpertDispatch& d, int64_t layer,
     for (int g = 0; g <= kCap; ++g) start[g] = g;
     for (int g = 0; g < kCap; ++g) dst[g] = g;
     ok = ok && strata::gpu::copy(buf + off_ptr, ptr, sizeof ptr);
+    sk::Bih3R1q2Layer B;
+    if (mixed) {
+        B.n_embd = (int) f.n_embd; B.n_ff = (int) f.n_ff; B.n_expert = kRing;
+        B.k_pairs = buf + off_types; B.route_ids = reinterpret_cast<const int32_t*>(buf + off_ids);
+        B.had_block = f.had_d ? f.had_block : 0;
+        if (f.had_d && f.d_signs) {
+            ok = ok && strata::gpu::copy(buf + off_signs, f.d_signs, (size_t) f.n_ff * sizeof(float));
+            B.d_signs = reinterpret_cast<const float*>(buf + off_signs);
+        }
+        std::memcpy(B.p2, f.p2, sizeof B.p2);
+        ok = ok && strata::gpu::copy(buf + off_types, types, sizeof types) &&
+                   strata::gpu::copy(buf + off_ids, ids, sizeof ids);
+    }
     strata::gpu::Stream s = ok ? strata::gpu::stream_create() : nullptr;
     ok = ok && s != nullptr;
     auto* d_ptr = reinterpret_cast<unsigned long long*>(buf + off_ptr);
@@ -162,9 +200,18 @@ bool measure_gpu_expert_ms(const strata::core::ExpertDispatch& d, int64_t layer,
             cnt[0] = w == 0 ? 1 : kCap;
             ok = strata::gpu::copy(d_i32, i32, sizeof i32);
             auto run = [&](int times) {
-                for (int i = 0; i < times; ++i, turn = (turn + kCap) % kRing)
-                    sk::native_expert_grouped(L, d_ptr + turn, d_i32 + 1, d_i32, d_i32 + 1 + kCap + 1, d_i32 + 1 + kCap + 1 + kCap,
-                                              kCap, kCap, buf + off_x, buf + off_scr, reinterpret_cast<float*>(buf + off_out), s);
+                for (int i = 0; i < times; ++i, turn = (turn + kCap) % kRing) {
+                    if (mixed) {
+                        B.route_ids = reinterpret_cast<const int32_t*>(buf + off_ids) + turn;
+                        sk::bih3_r1q2_grouped(B, d_ptr + turn, d_i32 + 1, d_i32, d_i32 + 1 + kCap + 1,
+                                               d_i32 + 1 + kCap + 1 + kCap, kCap, kCap, buf + off_x,
+                                               buf + off_scr, reinterpret_cast<float*>(buf + off_out), s);
+                    } else {
+                        sk::native_expert_grouped(L, d_ptr + turn, d_i32 + 1, d_i32, d_i32 + 1 + kCap + 1,
+                                                  d_i32 + 1 + kCap + 1 + kCap, kCap, kCap, buf + off_x,
+                                                  buf + off_scr, reinterpret_cast<float*>(buf + off_out), s);
+                    }
+                }
                 return strata::gpu::stream_sync(s);
             };
             ok = ok && run(4);
@@ -247,6 +294,15 @@ std::vector<const uint8_t*> split_blobs(const strata::core::ExpertDispatch& d, i
     return blobs;
 }
 
+// Each read must stay in its own expert even when the pack uses variable sizes.
+size_t split_read_bytes(int64_t layer) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    size_t bytes = (size_t) lay.blob_bytes(layer);
+    if (lay.mixed()) for (int64_t e = 0; e < lay.n_expert; ++e)
+        bytes = std::min(bytes, (size_t) lay.blob_bytes(layer, e));
+    return bytes;
+}
+
 // the fastest of five readings 100 ms apart: one beside other work (the machine's, not the engine's) read the rate up
 // to 3x low on the RX 9060 XT's machine
 double split_memory_rate(const strata::core::ExpertDispatch& d, const std::vector<const uint8_t*>& blobs, size_t bytes) {
@@ -263,11 +319,10 @@ double split_memory_rate(const strata::core::ExpertDispatch& d, const std::vecto
 void read_memory_rate_before(const strata::core::ExpertDispatch& d, int64_t n_layers) {
     if (d.src == nullptr || d.host_res == nullptr) return;
     strata::core::Runtime::get().wait_preload();
-    const auto& lay = strata::kernels::cpu::expert_layout();
     for (int64_t layer = 0; layer < n_layers; ++layer) {
         const std::vector<const uint8_t*> blobs = split_blobs(d, layer);
         if (blobs.size() < 16) continue;
-        g_memory_rate_before = split_memory_rate(d, blobs, (size_t) lay.blob_bytes(layer));
+        g_memory_rate_before = split_memory_rate(d, blobs, split_read_bytes(layer));
         return;
     }
 }
@@ -289,12 +344,41 @@ bool measure_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, strat
     // the link's rates together pass it, both slow down by the same factor.
     const auto& lay = strata::kernels::cpu::expert_layout();
     const double bytes = (double) lay.blob_bytes(layer);
-    const double mem = std::max(g_memory_rate_before, split_memory_rate(d, split_blobs(d, layer), (size_t) bytes));
+    const double mem = std::max(g_memory_rate_before, split_memory_rate(d, split_blobs(d, layer), split_read_bytes(layer)));
     const double cpu_rate = bytes / t.c, link_rate = bytes / t.p;   // bytes a ms
     const double factor = mem > 0.0 ? std::max(1.0, (cpu_rate + link_rate) / mem) : 1.0;
     t.cb0 = t.c0; t.cb = t.c * factor;
     t.pb0 = t.p0; t.pb = t.p * factor;
     return true;
+}
+
+namespace {
+// STRATA_PCIE_MIN1's auto decision: -1 not probed yet, 0/1 the pick (one process: the machine's answer)
+std::atomic<int> g_pcie_min1{-1};
+}  // namespace
+
+bool pcie_min1_on() {
+    static const int fixed = strata::env_auto("PCIE_MIN1");
+    if (fixed >= 0) return fixed == 1;
+    return g_pcie_min1.load(std::memory_order_relaxed) > 0;
+}
+
+bool pcie_min1_worth(ExpertDispatch& d, int64_t n_layers, std::string& why) {
+    double c = 0.0, q = 0.0, q0 = 0.0, p = 0.0, p0 = 0.0;
+    int64_t layer = -1;
+    if (!measure_cpu_expert_one_ms(d, n_layers, c, layer, why)) return false;
+    if (!measure_gpu_expert_ms(d, layer, q0, q, why)) return false;
+    PcieFetchProbe probe;
+    if (!probe.open(d, layer, why, 2) || !probe.time(p0, p, why, /*mean=*/true)) return false;
+    PcieSplitTimes t;
+    t.c0 = 0.0; t.c = c; t.cb0 = 0.0; t.cb = c;   // alone, as the CPU's one miss of two
+    t.p0 = p0; t.p = p; t.pb0 = p0; t.pb = p;
+    t.q0 = q0; t.q = q;
+    const bool on = pcie_split_m(t, false, 2, 0) >= 1;
+    std::fprintf(stderr, "xestrata: the PCIe lane with two misses a layer: one expert %.3f ms on the CPU, %.3f ms over "
+                         "PCIe and %.3f ms on the GPU: %s (XESTRATA_PCIE_MIN1=0/1 picks one)\n",
+                 c, p, q, on ? "one goes over PCIe" : "the CPU takes both");
+    return on;
 }
 
 bool setup_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, bool overlap, const char* keep, double frac,
@@ -303,6 +387,15 @@ bool setup_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, bo
     if (keep == nullptr && !measure_pcie_split(d, n_layers, t, why)) keep = why.c_str();
     if (keep != nullptr) {
         std::fprintf(stderr, "%s: PCIe split: the share %.2f of the missed experts (%s)\n", who, frac, keep);
+        // a fixed share rounds to 0 at one or two misses a layer: decide once whether the lane's floor pays
+        if (frac > 0.0 && g_pcie_min1.load(std::memory_order_relaxed) < 0 && strata::env_auto("PCIE_MIN1") < 0) {
+            why.clear();
+            const bool on = pcie_min1_worth(d, n_layers, why);
+            if (!on && !why.empty())
+                std::fprintf(stderr, "xestrata: PCIE_MIN1: the timing did not run (%s): the CPU takes the misses\n",
+                             why.c_str());
+            g_pcie_min1.store(on ? 1 : 0, std::memory_order_relaxed);
+        }
         return false;
     }
     d.pcie_split = &t;

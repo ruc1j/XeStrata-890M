@@ -36,7 +36,8 @@ struct Graph;
 const char* last_error();
 /// Issue #10: one line on an exception that left the engine: its text, the SYCL error code and Unified Runtime result
 /// when it is a SYCL exception (error 40 is also what a kernel launch refused for device memory reports), the VRAM
-/// free if it can still be read, and whether the GPU still answers (Runtime::device_status).
+/// free if it can still be read, and whether the GPU still answers (Runtime::device_status).  Issue #77: a UR
+/// OUT_OF_HOST_MEMORY adds what to check (RAM, the graph's sizes, the startup reserve) and how to make room.
 std::string failure_report(const std::exception& e);
 
 /// `high_priority`: a stream the device may run ahead of the others (Runtime::create_stream).
@@ -56,6 +57,16 @@ bool stream_idle(Stream s);
 bool device_sync();
 
 void* alloc_device(size_t bytes);
+/// The bytes this process holds through alloc_device on the current device.
+size_t device_held();
+/// The maximum live device bytes on the current device since this process started, or since device_peak_reset.
+size_t device_peak_held();
+/// The high-water mark of the current device set to what this process holds now (a run's own peak measured from it).
+void device_peak_reset();
+/// This process's device memory, including runtime allocations. `source`: fdinfo, nvml, delta, or global (the conservative
+/// device-wide fallback). False only when none of them can read the device. The free-memory delta can include another
+/// process's changes since this runtime's context was created.
+bool process_memory(size_t* bytes, const char** source);
 /// Host USM.  A refusal while the pinned memory's hard reserve is held (pin_reserve_take) gives the reserve back and
 /// tries once more.
 void* alloc_host(size_t bytes);
@@ -89,10 +100,21 @@ inline bool device_pointer(void** d, const void* h) {
 /// nor a registration, which is for copies only.
 bool kernels_read_host(const void* p);
 bool kernels_read_registered();
+/// Whether the current GPU's copies can read a mapped file's pages in place (neither USM nor registered).  Not a Level
+/// Zero GPU's: the B70's copies of HunyuanImage 3.0's streamed layers from the model file's pages hung on the compute
+/// queue and faulted the copy engine (bcs: Engine memory CAT error, DEVICE_LOST; compute-runtime 26.31 on Linux 7.0's
+/// xe, 2026-11-05), where the same layers from page-locked memory passed.  Nor a HIP GPU's: HIP pins a pageable
+/// source's pages for the DMA, and when the kernel reclaims or moves them under RAM pressure the amdgpu driver stops
+/// all of the process's queues until it pins them again; the RX 9060 XT's copies of Qwen-Image's streamed blocks from
+/// the file's pages waited 80 s to over 50 minutes in hipMemcpyAsync beside a text engine's 40 GiB expert arena
+/// (62 GiB RAM, zram swap; the process evicted 88 and 124 s at a time, 2026-11-24).  A CUDA GPU's copies stage
+/// pageable memory through the driver's own buffers.
+bool copies_read_mapped_files();
 
 /// Synchronous copy, ordered after the work already on the compute queue (the CUDA legacy stream).
 bool copy(void* dst, const void* src, size_t bytes);
-bool copy_async(void* dst, const void* src, size_t bytes, Stream s);
+// `what` must outlive the call; layer is -1 when the copy has no layer number.
+bool copy_async(void* dst, const void* src, size_t bytes, Stream s, const char* what = "GPU copy", int layer = -1);
 /// stream_wait_event(s, after), copy_async and event_record(done, s) as one submission: the copy waits for `after`
 /// (null or not recorded: for nothing) and `done` marks the copy (an event without timing; null: not kept).  Three
 /// submissions a copy filled the RTX 4070's stream when the prompt path queued its ring's 384 copies, and each copy
@@ -103,21 +125,35 @@ bool copy2d_async(void* dst, size_t dpitch, const void* src, size_t spitch, size
 bool memset(void* dst, int value, size_t bytes);
 bool memset_async(void* dst, int value, size_t bytes, Stream s);
 
-bool mem_info(size_t* free_bytes, size_t* total_bytes);
+/// `short_bytes` (when given): how far the memory in use is past STRATA_VRAM_LIMIT_MIB (0 otherwise), where the free
+/// memory reads 0.
+bool mem_info(size_t* free_bytes, size_t* total_bytes, size_t* short_bytes = nullptr);
 
-/// Virtual memory (sycl_ext_oneapi_virtual_mem; the Level Zero and CUDA adapters, not HIP in intel/llvm 7.1.1): one
-/// address range reserved once and backed by physical segments that can be given back to the driver and taken again,
-/// every address staying the same (#533).  vmem_supported is the device's report; the sizes are multiples of
-/// vmem_granularity().
+/// Virtual memory (sycl_ext_oneapi_virtual_mem; the Level Zero and CUDA adapters, and HIP's with the hip-virtual-mem
+/// patches of third_party/main/intel-llvm: intel/llvm's own implementation and XeStrata's fixes to it): one address
+/// range reserved once and backed by physical segments that can be given back to the driver and taken again, every
+/// address staying the same (#533).
+/// vmem_supported is the device's report; the sizes are multiples of vmem_granularity().  A range mapped again after
+/// an unmap must reach its new memory from every engine, the copies' as the kernels': on AMD GPUs that is the patch
+/// hip-virtual-mem-unmap's doing (Linux leaves the old translations in the GPU's TLB).  vmem_usable is the report and
+/// that check, made with a small range the first time a device is asked and kept (a line on stderr says so when it
+/// fails): what uses virtual memory (the expert cache's segments, the elastic K/V's ranges, the parked draft head)
+/// asks it first.
 struct VmemSegment;
 bool vmem_supported();
+bool vmem_usable();
 size_t vmem_granularity();
 void* vmem_reserve(size_t bytes);
 void vmem_free(void* va, size_t bytes);
 /// A new physical segment of `bytes` mapped read-write at `va`; null when the device has no memory for it.
 VmemSegment* vmem_map(void* va, size_t bytes);
 /// Unmaps `seg` from `va` and gives its memory back (the device must not be using it).
-void vmem_unmap(void* va, size_t bytes, VmemSegment* seg);
+bool vmem_unmap(void* va, size_t bytes, VmemSegment* seg);
+/// vmem_unmap, and in `returned` whether the device has the memory again, not only this process: the device drained,
+/// its free memory read before and after, half the segment more free taken for given back (false as well where the
+/// free memory cannot be read).  ROCm 7.1 and 7.2 kept it until the range was freed, which hip-virtual-mem-release
+/// mends; what gives VRAM up by unmapping (the expert cache's segments, the parked draft head) measures it once.
+bool vmem_unmap_returns(void* va, size_t bytes, VmemSegment* seg, bool* returned);
 /// The chunk form (the elastic K/V, vmm.hpp): a physical segment of `bytes` not mapped anywhere (null: no memory),
 /// mapped read-write at a reserved `va`, unmapped from it (it keeps its bytes and can be mapped elsewhere), freed.
 VmemSegment* vmem_new(size_t bytes);
@@ -175,6 +211,10 @@ bool stream_fork(Stream from, Stream to);
 bool stream_join(Stream into, Stream from);
 bool is_capturing(Stream s);
 bool graph_launch(const Graph* g, Stream s);
+/// Whether a graph with branches may hold a kernel that waits for the host: false where the launch itself submits
+/// the graph's nodes from the host and blocks once its queue is full, so a wait the host serves after the launch
+/// never ends (HIP: the branched graph's nodes go through hip::Graph::RunOneNode, a kernel-argument ring).
+bool graph_branches_may_wait_for_host();
 size_t graph_nodes(const Graph* g);
 /// Destroys a graph after draining the runtime's queues (null is a no-op).
 void graph_destroy(Graph* g);

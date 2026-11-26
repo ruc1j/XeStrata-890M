@@ -133,6 +133,16 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 /// pair), every output the two calls' bits.  Returns false, launching nothing, where that layout does not apply.
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream);
+/// Times the two layouts of native_mmvq's rows (a sub-group a row, a work-group a row) for this matrix on the stream's
+/// GPU and keeps the faster for every product of its format and shape there (native_mmvq_pair's too).  A shape not
+/// tuned is timed on its first product outside a graph's capture, or, first met in a capture, takes the fixed rule;
+/// a shape keeps its layout for the process.  Call it after the weights are on the GPU and before any capture that
+/// uses them.  It synchronizes.  Nothing for the formats with one layout; STRATA_MMVQ_TUNE=0: never.  `regions`
+/// (count of them, pointers and bytes): VRAM it may read the launches' weights from (the model's weights, on the
+/// device already), as the decode reads a matrix after the others; where they are too few, or none are given, it
+/// allocates a span for them and frees it (a GPU's driver may keep what is freed, which its free memory then misses).
+void native_mmvq_tune(int ggml_type, const void* weights, int n_in, int n_out, void* stream, int regions = 0,
+                      const void* const* region_ptrs = nullptr, const uint64_t* region_bytes = nullptr);
 
 // Q6_K with each row's blocks split into four arrays: the row's ql (128 bytes a block), then its qh (64), its
 // scales (16) and its d (2), each in block order.  A Q6_K block is 210 bytes, so in GGUF order every other block

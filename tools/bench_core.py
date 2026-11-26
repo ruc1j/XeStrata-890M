@@ -5,13 +5,13 @@ place: what is measured and how the runs are made, alternated and read.
 
 Three ways of running an engine:
 
-- generate: `strata --tokens-file`, one new process a run, 256 greedy tokens after a tier's code-agent prompt; with two
-  engines, upstream's first run of a tier writes the text every later run follows (--spec-follow).
-- serve: `strata --serve` over stdin (GEN, DONE), one new process a run: a chat of four turns, the tier's prompt and
-  three follow-ups, 256 tokens a turn, greedy or at a temperature (t07 = 0.7, the default).
+- generate: `xestrata-engine --tokens-file`, one new process a run, 256 greedy tokens after a tier's code-agent
+  prompt; with two engines, upstream's first run of a tier writes the text every later run follows (--spec-follow).
+- serve: `xestrata-engine --serve` over stdin (GEN, DONE), one new process a run: a chat of four turns, the tier's
+  prompt and three follow-ups, 256 tokens a turn, greedy or at a temperature (t07 = 0.7, the default).
 - usage: the engine's own serve/server.py, streamed /v1/chat/completions: two short chats and a coding agent, at
   the temperature Qwen recommends (0.7) or another.
-- image: the engine's image generator as its server runs it (its serve/images.py: XeStrata's resident strata-image,
+- image: the engine's image generator as its server runs it (its serve/images.py: XeStrata's resident xestrata-image,
   measured warm; upstream's sd-cli, a process a request), one 1024x1024 image of the model card's 8 steps from a
   fixed prompt and seed.
 
@@ -42,6 +42,74 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
+WIN = os.name == "nt"
+
+# ---- Windows: the tree a run starts ends through a job object (upstream 8431dde5d, #4260)
+# Windows has no process group to signal: the run's tree used to be ended with `taskkill /T`, which Windows refused
+# ("Access is denied") for a tree this very user started, and the engine then kept the GPU for the next run.  A job
+# object this process owns ends every process in it in one call, which cannot be refused for one member; it is made
+# kill-on-close, so a bench that dies takes its engines with it.  Elsewhere, and when the job cannot be made, nothing
+# changes.
+if WIN:
+    import ctypes
+    from ctypes import wintypes
+
+    class _BasicLimits(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in ("ReadOperationCount", "WriteOperationCount",
+                                                      "OtherOperationCount", "ReadTransferCount",
+                                                      "WriteTransferCount", "OtherTransferCount")]
+
+    class _ExtendedLimits(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", _BasicLimits), ("IoInfo", _IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    _KILL_ON_JOB_CLOSE, _EXTENDED_LIMITS = 0x2000, 9
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    _k32.CreateJobObjectW.restype = wintypes.HANDLE
+    _k32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+    _k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    _k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    _k32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+
+    def _make_job() -> int:
+        job = _k32.CreateJobObjectW(None, None)       # no security attributes: the handle is not inherited
+        if not job:
+            return 0
+        info = _ExtendedLimits()
+        info.BasicLimitInformation.LimitFlags = _KILL_ON_JOB_CLOSE
+        if not _k32.SetInformationJobObject(job, _EXTENDED_LIMITS, ctypes.byref(info), ctypes.sizeof(info)):
+            _k32.CloseHandle(job)
+            return 0
+        return job
+
+    _JOB = _make_job()                                # one for the run: every child of this bench is in it
+else:
+    _JOB = 0
+
+
+def contain(proc) -> bool:
+    """Put a started process in the run's job, so the run can end it and what it starts in one call that cannot be
+    refused for one member.  False: no job (not Windows, or it could not be made)."""
+    if not _JOB or proc is None:
+        return False
+    try:
+        return bool(_k32.AssignProcessToJobObject(_JOB, int(proc._handle)))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def end_job() -> bool:
+    """End every process in the run's job now.  False: no job."""
+    return bool(_JOB) and bool(_k32.TerminateJobObject(_JOB, 1))
+
 
 CORPUS = ROOT / "data" / "bench-corpus.json.xz"
 COMMIT = "58dbbe5"
@@ -243,7 +311,7 @@ class Engine:
 
 def model_args(pack: str, native: str | None, ple: str | None, extra: list[str]) -> list[str]:
     """The model's files (the pack, the GGUF's first shard, the shard with per_layer_token_embd) and EXTRA."""
-    a = ["--pack", pack]
+    a = ["--pack", pack] if pack else []   # PACK= (empty): a plain model's engine takes no pack at all
     if native:
         a += ["--native", native]
     if ple:
@@ -352,7 +420,8 @@ def output_ids(text: str) -> str | None:
 
 def engine_error(text: str) -> str | None:
     lines = [x.strip() for x in text.splitlines() if x.strip() and not x.startswith(("#", "PP ", "T "))]
-    return next((x for x in reversed(lines) if x.startswith(("strata", "ERR"))), lines[-1] if lines else None)
+    heads = ("xestrata", "strata", "ERR")   # upstream's engine says strata
+    return next((x for x in reversed(lines) if x.startswith(heads)), lines[-1] if lines else None)
 
 
 def generate_row(text: str) -> dict:
@@ -370,11 +439,22 @@ def generate_row(text: str) -> dict:
     if stopped == "output" and pp and pp[-1][0] == pp[-1][1]:
         row["prefill_tok_s"] = float(pp[-1][2])
     elif stopped == "output" and not pp:
-        row["prefill_tok_s"] = grab(r"^strata generate: prefill \d+ tokens in .*?\(([\d.]+) tok/s\)", text)
+        row["prefill_tok_s"] = grab(r"^(?:xe)?strata generate: prefill \d+ tokens in .*?\(([\d.]+) tok/s\)", text)
     return row
 
 
 # ------------------------------------------------------------------------------------------------ one run
+def stop(p: subprocess.Popen) -> None:
+    """Ends `p` as the server ends an engine: SIGTERM, on which the engine drains its GPU queues (at most 5 s), then
+    SIGKILL after 10 s.  A SIGKILL alone leaves the GPU work it queued behind it, and the next engine's queue can hang
+    on the xe driver (issue #62)."""
+    p.terminate()
+    try:
+        p.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        p.kill()
+
+
 def watch_generate(p: subprocess.Popen, log: Path, slow: float, owner: str) -> str | None:
     """Stops `p` once it is plainly at `slow` tok/s or less (0: never): its prompt when the PP progress line says so
     after 30 s, its output when 256 tokens at `slow` tok/s and a minute have passed since the prompt was read (an
@@ -391,18 +471,18 @@ def watch_generate(p: subprocess.Popen, log: Path, slow: float, owner: str) -> s
             continue
         pp = re.findall(r"^PP (\d+) (\d+) (\d+) ([\d.]+)$", text, re.M)
         if not pp:
-            if not re.search(r"^strata generate: prefill \d+ tokens in", text, re.M):
+            if not re.search(r"^(?:xe)?strata generate: prefill \d+ tokens in", text, re.M):
                 continue
             pp = [("1", "1", "0", "0")]
         done, total, ms, rate = int(pp[-1][0]), int(pp[-1][1]), int(pp[-1][2]), pp[-1][3]
         if done < total:
             if ms >= 30000 and float(rate) <= slow:
-                p.kill()
+                stop(p)
                 return f"bench: stopped, {owner} prompt at {rate} tok/s after {ms // 1000} s"
         elif t_done is None:
             t_done = time.monotonic()
         elif time.monotonic() - t_done > MAX_NEW // slow + 60:
-            p.kill()
+            stop(p)
             return (f"bench: stopped, {owner} output under {slow:g} tok/s ({time.monotonic() - t_done:.0f} s after "
                     "the prompt)")
     return None
@@ -420,7 +500,7 @@ def run_generate(e: Engine, args: list[str], ids: Path, log: Path, follow: Path 
     with open(log, "w", encoding="utf-8") as f:
         p = subprocess.Popen(cmd, cwd=e.cwd, env={**e.env, **(extra_env or {})}, stdout=f, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL)
-        timer = threading.Timer(DEADLINE, p.kill)       # bench.sh's `timeout 2400`
+        timer = threading.Timer(DEADLINE, stop, (p,))   # bench.sh's `timeout 2400`
         timer.start()
         why = watch_generate(p, log, slow, "upstream's" if e.arm == "up" else "XeStrata's")
         rc = p.wait()
@@ -540,7 +620,7 @@ def run_serve(e: Engine, args: list[str], ids: dict, tier: str, mode: str, rnd: 
         try:
             p.wait(timeout=60)
         except subprocess.TimeoutExpired:
-            p.kill()
+            stop(p)
             p.wait()
         if why:
             f.write(f"bench: {why}\n")
@@ -557,8 +637,11 @@ def free_port() -> int:
 def usage_post(port: int, body: dict, timeout: float = 1200, temperature: float = TEMPERATURE) -> tuple:
     """One streamed chat completion: (the assistant message, time to the first token, the server's timings)."""
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", method="POST",
+                                 # never the script guard (serve/script_guard.py): the config setup wrote may ask
+                                 # for it, and it changes the answers; upstream's server ignores the field
                                  data=json.dumps({"model": "bench", "stream": True, "max_tokens": USAGE_MAX_TOKENS,
-                                                  **usage_sampling(temperature), **body}).encode(),
+                                                  "script_guard": "off", **usage_sampling(temperature),
+                                                  **body}).encode(),
                                  headers={"Content-Type": "application/json"})
     t0, first, text, timings = time.monotonic(), None, "", None
     calls: dict[int, dict] = {}
@@ -629,15 +712,19 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
     cfg = {**{k: v for k, v in cfg.items() if k not in ("api_key", "host", "port", "args")}, "port": port,
            "args": e.run_args(cfg["args"])}
     cpath = stem.with_name(stem.name + ".config.json")
-    cmd = [e.py, str(Path(e.root or ROOT) / e.server), "--engine", "strata", "--config", str(cpath),
+    # upstream's server takes strata only, XeStrata's both
+    cmd = [e.py, str(Path(e.root or ROOT) / e.server), "--engine", "strata", "--config", str(cpath),  # upstream
            "--port", str(port), "--host", "127.0.0.1"]
     if dry:
         print("DRY usage " + shlex.join(cmd) + " | " + json.dumps(cfg, sort_keys=True), flush=True)
         return {"turns": [], "why": None}
     cpath.write_text(json.dumps(cfg, indent=1) + "\n", encoding="utf-8")
     log = open(stem.with_name(stem.name + ".txt"), "w", encoding="utf-8")
+    group: dict = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WIN else {  # type: ignore[attr-defined]
+        "start_new_session": True}
     srv = subprocess.Popen(cmd, cwd=e.root, env=e.env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                           start_new_session=True)
+                           **group)
+    contain(srv)                               # the run's job owns the tree it starts (Windows; upstream 8431dde5d)
     turns, why = [], None
     try:
         end = time.monotonic() + 900
@@ -669,15 +756,26 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
         why = str(err)
     finally:
         try:
-            try:
-                os.killpg(srv.pid, signal.SIGTERM)
-                srv.wait(timeout=120)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
+            if WIN:                            # the whole tree at once, as setup's end_process_group (#48)
+                end_job()                      # upstream 8431dde5d: the job ends the tree, and cannot be refused
                 try:
-                    os.killpg(srv.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                    srv.wait(timeout=10)
+                except subprocess.TimeoutExpired:
                     pass
-                srv.wait()
+                if srv.poll() is None:         # no job, or it did not take the tree: taskkill of the tree, then it
+                    subprocess.run(["taskkill", "/PID", str(srv.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=60)
+                    srv.wait()
+            else:
+                try:
+                    os.killpg(srv.pid, signal.SIGTERM)
+                    srv.wait(timeout=120)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    try:
+                        os.killpg(srv.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    srv.wait()
             end_group(srv.pid, f"{label or e.arm}: its server's")
         finally:
             log.close()
@@ -694,8 +792,18 @@ GROUP_END = 120   # s: for the processes left in a run's group to end, and again
 
 def group_left(pgid: int) -> list[str]:
     """The processes of process group `pgid` that still run, as "PID name" (zombies left out: they hold no memory,
-    and one a container's init does not reap would stay for good)."""
+    and one a container's init does not reap would stay for good).  Windows has no process groups: the processes
+    descended from `pgid` by their parent ids (which outlive a parent that ended), the root among them (#48)."""
     left = []
+    if WIN:
+        import psutil
+        procs = list(psutil.process_iter(["pid", "ppid", "name"]))
+        tree, grew = {pgid}, True
+        while grew:
+            more = {p.info["pid"] for p in procs if p.info["ppid"] in tree} - tree
+            grew = bool(more)
+            tree |= more
+        return [f"{p.info['pid']} {p.info['name']}" for p in procs if p.info["pid"] in tree and p.is_running()]
     for p in Path("/proc").iterdir():
         if not p.name.isdigit():
             continue
@@ -724,10 +832,18 @@ def end_group(pgid: int, what: str) -> None:
                                  "was stopped, and keeps its GPU memory: the next run would start beside it, so the "
                                  "measurements stop here. The GPU's driver log (sudo dmesg) may say why; a reboot "
                                  "frees the GPU")
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if WIN:
+                import psutil
+                for pid in (int(x.split()[0]) for x in left):
+                    try:
+                        psutil.Process(pid).kill()
+                    except psutil.Error:
+                        pass
+            else:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             killed = True
             deadline = time.monotonic() + GROUP_END
         time.sleep(1)
@@ -875,7 +991,7 @@ IMAGE_REQUEST = {"prompt": "A red fox sitting in a snowy forest at dawn, photogr
 # Run by the engine tree's own Python with its tools/image/qimage.py and serve/images.py (both trees have modules of
 # those names, so each in a process of its own).  "make": the config section its setup writes for this GPU (with
 # setup's timed choices where the tree makes them, qimage.tune); "run": one image as its server makes it.  A tree whose
-# server keeps a resident image engine (XeStrata's strata-image) starts it and makes a warm-up image of another prompt
+# server keeps a resident image engine (XeStrata's xestrata-image) starts it and makes a warm-up image of another prompt
 # first, so the image measured is one the server makes while it runs ("cold_s": the warm-up's, with the start); one
 # whose server runs sd-cli for each request (upstream's) runs that command once.
 IMAGE_RUNNER = r"""
@@ -926,7 +1042,7 @@ if hasattr(IM, "ImageEngine"):
     Path(job["log"]).write_text(json.dumps(fig, indent=1) + "\n")
     print(json.dumps({"rc": 0, "seconds": round(wall, 2), "cold_s": round(cold, 2),
                       "text_s": round(fig["text_encode_ms"] / 1000, 3), "sampling_s": fig["sampling_s"],
-                      "decode_s": fig["vae_decode_s"], "backend": "strata-image"}))
+                      "decode_s": fig["vae_decode_s"], "backend": "xestrata-image"}))
     sys.exit(0)
 cmd = IM.sd_cli_args(cfg, IM.parse_request(dict(job["request"]), cfg), job["png"])
 t0 = time.monotonic()
@@ -1093,7 +1209,7 @@ def collect(out: Path, names: dict[str, str], say: Callable = print) -> None:
             steps = next(r["steps"] for r in image if (r["gpu"], r["model"]) == (gpu, model))
             say(f"\n### {gpu} image generation, {model} (1024x1024, {steps} steps)\n\n| Engine | backend | image (s) | "
                 "sampling (s) | VAE (s) |\n| --- | --- | ---: | ---: | ---: |")
-            # the named arms first, then any other (bench_comfy.py's ComfyUI arms)
+            # the named arms first, then any other (bench_comfy.py's arms)
             for name in dict.fromkeys([*names.values(), *sorted(r["engine"] for r in image)]):
                 c = [r for r in image if (r["gpu"], r["model"], r["engine"]) == (gpu, model, name)]
                 if not c:

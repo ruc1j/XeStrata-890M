@@ -28,8 +28,8 @@ from __future__ import annotations
 
 import json
 import pathlib
-import struct
 import sys
+from typing import Any
 
 import numpy as np
 
@@ -72,7 +72,7 @@ def build(n_layers: int, out_path: pathlib.Path) -> dict:
     g = GGUFFile(SHARD1)
     by_name = {t.name: t for t in g.tensors}
     src = open(SHARD1, "rb")
-    manifest = {"blob_bytes": BLOB_BYTES, "offsets": OFF, "layers": [], "n_layers": n_layers}
+    manifest: dict[str, Any] = {"blob_bytes": BLOB_BYTES, "offsets": OFF, "layers": [], "n_layers": n_layers}
     total = n_layers * NE * BLOB_BYTES
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -89,6 +89,7 @@ def build(n_layers: int, out_path: pathlib.Path) -> dict:
             layer_off = out.tell()
             # vectorized over the layer's 512 experts (the same bytes the per-block loop wrote; tools/strata_pack.py
             # verify checks them): each role is (512 experts, rows, blocks per row, 18 bytes)
+
             def role_blocks(role, rows, per_row):
                 t = roles[role]
                 n = NE * ROLE_BYTES

@@ -4,13 +4,15 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/timer_marks.hpp"
 #include "strata/prefill/prefill.hpp"
-#include "strata/prefill/kva.hpp"   // STRATA_KVA: the approximate late-layer prompt read (opt-in, upstream 0.2.7)
+#include "strata/core/auto_pick.hpp"
 #include "strata/core/expert_tier.hpp"
+#include "strata/core/kv_host_dma.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/stream_watch.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/platform/thread_name.hpp"
 #include "strata/core/per_device.hpp"
@@ -26,33 +28,44 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/nvfp4.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/canon_expert.hpp"
+#include "strata/core/latent.hpp"
+#include "strata/core/latent_share.hpp"
+#include "strata/kernels/latent.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/dflash2.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
-#include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/flash_attn.hpp"
+#include "strata/kernels/qsa_prompt_attn.hpp"   // XeStrata-890M: the HIP integrated GPU's prompt attention
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/matrix_report.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/exact.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the approximate late-layer prompt read (opt-in)
+#include "strata/prefill/timer_marks.hpp"   // upstream 4006: a mark that repeats its phase is not recorded
 
 #include "strata/core/gpu.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -97,25 +110,22 @@ constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_s
 // path's bits) stay as before; STRATA_EMB_REUSE_ACCOUNT=1 lets it use the saved bytes: a larger chunk or more borrowed
 // slots where VRAM is the limit (upstream, RTX 3060, IQ3_XXS: chunk 6400 -> 6656, prompt +3.9%).
 inline bool emb_reuse_account() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_EMB_REUSE_ACCOUNT"); return v != nullptr && v[0] == '1'; }();
+    static const bool on = [] { const char* v = strata::env_get("EMB_REUSE_ACCOUNT"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
 inline bool force_pageable() {
-    static const bool v = [] { const char* e = std::getenv("STRATA_TEST_PAGEABLE"); return e != nullptr && e[0] == '1'; }();
+    static const bool v = [] { const char* e = strata::env_get("TEST_PAGEABLE"); return e != nullptr && e[0] == '1'; }();
     return v;
 }
-// STRATA_PLE_COMPACT=1 (opt-in, upstream 17b08c963): the prompt chunk's PLE rows go up raw and are dequantized on the
-// device (IQ4_NL tables held in memory); the same floats as the host dequant, 7x fewer bytes over the host link
-inline bool ple_compact_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_PLE_COMPACT"); return v != nullptr && v[0] == '1'; }();
-    return on;
-}
-// STRATA_PLE_COPY_STREAM=1 (opt-in with PLE_COMPACT, upstream d6428bf29): the raw rows go up on a stream of their own
-// instead of the compute stream, which otherwise idles for the copy; the same bytes and kernels
-inline bool ple_copy_stream_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_PLE_COPY_STREAM"); return v != nullptr && v[0] == '1'; }();
-    return on;
-}
+// STRATA_PLE_COMPACT (upstream 17b08c963): the prompt chunk's PLE rows go up raw and are dequantized on the device
+// (IQ4_NL tables held in memory); the same floats as the host dequant, 7x fewer bytes over the host link.
+// STRATA_PLE_COPY_STREAM (upstream d6428bf29): the raw rows go up on a stream of their own instead of the compute
+// stream, which otherwise idles for the copy; the same bytes and kernels.
+// 0/1 forces each; unset/auto times the first chunk's landing both ways at the first init (ple_landing_probe).
+int ple_compact_pick = -1;       // -1: not decided, 0/1: off/on
+int ple_copy_stream_pick = -1;
+inline bool ple_compact_on() { return ple_compact_pick == 1; }
+inline bool ple_copy_stream_on() { return ple_compact_pick == 1 && ple_copy_stream_pick == 1; }
 // A host table the GPU reads or writes every layer (the routing ids, the row maps, the group bounds): USM host
 // memory that a kernel reads and writes in place (to_device / from_device: copy_i32_from_mapped), so these small copies
 // never queue behind the streamed experts on the copy engine (upstream 1b3bb8f8).  A copy from or to pageable memory
@@ -160,15 +170,53 @@ private:
     size_t cap_ = 0, n_ = 0;
 };
 
+// XeStrata-890M: an integrated GPU on the HIP backend (the current device), where the fork keeps its measured defaults
+inline bool hip_igpu() {
+    static core::PerDevice<bool> on;
+    const sycl::device d = core::Runtime::get().device();
+    return on.get(d, [&d] { return d.get_backend() == sycl::backend::ext_oneapi_hip && core::integrated_gpu(d); });
+}
 // The smallest chunk that takes the streamed walk (every non-resident expert of a layer streamed in id order, the
 // products on gathered groups); a smaller one takes the per-layer walk with the staging ring.  STRATA_STREAM_ALL_MIN
-// overrides the 2048 (Issue #71: Indigoshores/Strata runs the streamed walk from 16 tokens on a Strix Halo).
+// overrides it (Issue #71: Indigoshores/Strata runs the streamed walk from 16 tokens on a Strix Halo).  Unset: 2048 on
+// an integrated GPU on the HIP backend (XeStrata-890M: its experts sit in the host-USM cache, so the share's staged walk
+// has nothing to win); elsewhere upstream XeStrata's rule: the staged walk lets the CPU pool share missed experts up to
+// 3072 rows (keep the existing threshold until the staged walk has been measured against streaming on the target
+// device).
+inline double cpu_share_env();
+// set_cpu_share_rule (share_rules::link_rule): on a slow link the staged walk with the share pays up to a longer chunk,
+// with wider experts on the CPU
+int64_t g_share_limit = 0;   // 0: the plain 3,072
+int g_share_nt = 0;          // 0: the pool's MAXT
 inline int64_t stream_all_min() {
-    static const int64_t v = [] {
-        const char* e = std::getenv("STRATA_STREAM_ALL_MIN");
-        return e != nullptr && *e != '\0' ? std::max<int64_t>(1, std::strtoll(e, nullptr, 10)) : (int64_t) 2048;
+    static const int64_t env = [] {
+        const char* e = strata::env_get("STREAM_ALL_MIN");
+        return e != nullptr && *e != '\0' ? std::max<int64_t>(1, std::strtoll(e, nullptr, 10)) : (int64_t) 0;
     }();
-    return v;
+    if (env > 0) return env;
+    if (hip_igpu()) return 2048;
+    const int mode = strata::core::cpu_share_staged_3k_mode();
+    return cpu_share_env() != 0.0 && mode != 0 ? std::max<int64_t>(3073, g_share_limit + 1) : 2048;
+}
+// the most rows one expert may route and still be the CPU share's (a wider one runs as jobs of MAXT rows)
+inline int64_t share_nt() { return std::max<int64_t>(strata::kernels::cpu::MAXT, g_share_nt); }
+// XESTRATA_PREFILL_EQUAL (upstream 7104c8b8e, 51e5e7adc, idea own-prompt-plan): a prompt longer than its chunk is read
+// in n = ceil(tokens / chunk) chunks of equal size (the first n - 1 of ceil(tokens / n) tokens) instead of full chunks
+// and a remainder (20,931 tokens at 10,240: 3 x 6,977, not 10,240 + 10,240 + 451): the same number of chunks, and no
+// short last chunk under the stream floor, whose staged walk costs close to a full pass where most experts stream.
+// Upstream measured 0.923-1.001 of the time at 14,000-32,000 tokens (RTX 5070 12 GB); a chunk more than needed was
+// slower, so the count stays.  Only on one GPU (a layer split's stages and a helper GPU keep the cut: evening out a
+// short tail added a full pass there, two RTX 4090: 25% slower), and only where the equal chunk is at or above the
+// stream floor.  Opt-in here (1; unset and 0: full chunks and a remainder): this path's short tail is staged with the
+// CPU share, cheaper than the full pass the equal cut gives it.  Measured 2026-11-23, Qwen3.8-Flash-Next IQ3_XXS, 3
+// alternating rounds: RTX 4070, 16,999 tokens in 2 chunks 17,947 ms cut as today against 18,983 ms equal (+5.8%; the
+// tail of 615 tokens took 1,371 experts on the CPU); B70, 33,500 tokens 16,679 against 16,652 ms (equal).  The cut
+// changes the answer's bits (the chunks' rows differ), so neither A/B kept the same greedy text.
+inline int64_t equal_step(int64_t n, int64_t cap, bool one_gpu) {
+    static const core::Pick pick = core::pick_from_env("PREFILL_EQUAL");
+    if (pick != core::Pick::On || !one_gpu || cap <= 0 || n <= cap) return cap;
+    const int64_t c = (n + cap - 1) / cap, step = (n + c - 1) / c;
+    return step >= stream_all_min() ? step : cap;
 }
 // STRATA_PREFILL_CPU_SHARE (set_cpu_pool, upstream 978d3558, opt-in there): a chunk below STREAM_ALL_MIN hands the
 // decode CPU pool - idle while a prompt is read - the non-resident experts few of its tokens route to, instead of
@@ -176,13 +224,16 @@ inline int64_t stream_all_min() {
 // streamed expert, events around its expert work read after the next layer's routing sync, as running means): the
 // next layers hand the CPU g / (c + g), where both sides end together, so a GPU that streams faster than the CPU
 // computes gives it little.  x: a fixed x.  0: every expert on the GPU.  The CPU rounds differently from the GPU, so
-// an answer can differ slightly from the GPU-only one.  Unset, --prefill-cpu-share (set_cpu_share) fixes the share
-// where the default arms it: the measured one moves from run to run, and which experts the CPU takes with it, so two
-// greedy runs of one prompt parted (2026-10-16, an RTX 4070: logits up to 1.5 apart at the first generated token).
+// an answer can differ slightly from the GPU-only one.  The measured share also moves from run to run (the B70,
+// 2026-11-13: 0.53 to 0.83 over five runs, and five greedy 256-token runs of one prompt gave five answers), so a run
+// whose answer must not move needs a fixed share: setup's warm-up measures it once per PC and model with `auto` and
+// writes the value into the run config (--prefill-cpu-share), and 0 is the GPU-only answer every time.  A share fixed
+// where the cache's tier does not move keeps a reply too (the RTX 4070's 0.84: 8 runs alike; its 0.5 moved in 3 runs
+// of 2 answers).
 double g_cpu_share_fixed = -1.0;   // set_cpu_share: -1 measured
 inline double cpu_share_env() {   // -1: measured
     static const double v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE");
+        const char* e = strata::env_get("PREFILL_CPU_SHARE");
         if (e == nullptr) return g_cpu_share_fixed;
         if (std::strcmp(e, "auto") == 0) return -1.0;
         return std::clamp(std::strtod(e, nullptr), 0.0, 1.0);
@@ -190,6 +241,9 @@ inline double cpu_share_env() {   // -1: measured
     return v;
 }
 inline bool cpu_share_on() { return cpu_share_env() != 0.0; }
+// XESTRATA_PREFILL_CPU_SHARE_BATCH: a batch slot is decoding beside this read (Prefill::set_share_blocked): the pool
+// is its windows'
+std::atomic<bool> g_share_blocked{false};
 double g_pinned_share = 1.0;
 int g_ring_override = 0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
@@ -202,10 +256,25 @@ int g_ring_override = 0;
 // slots 1296 tok/s, 512 1364, 768 1376; IQ3_XXS's 2.3 MB blobs, 64K: 384 1043, 512 1034, the ring's slots taken from
 // the cache's resident experts).
 constexpr uint64_t kRingBigBytes = 800ull << 20;
+// XESTRATA_PREFILL_RING_DEPTH (upstream a1e6ef324): the pinned read's ring is 192 slots, not 384, below 8192-token
+// chunks - a short chunk's attention half is short and the deeper ring's staging only waits longer.  Measured on the
+// RTX 4070 at a 4K prompt: +1.2% and then +1.6% with 192, the B70 the same; a 32K prompt in one 16384-token chunk
+// loses 12.5% with it, so the chunk's size decides.  Upstream's boundary is 12K-token chunks; this path's big-ring
+// rule starts at 8192-token chunks and measured better there (384 slots 1296 tok/s, 512 1364 at 8192-token chunks),
+// so the shallow ring stops at it.  auto (unset): the chunk's size; 0: 384 everywhere; 1: 192 everywhere.
+// STRATA_PREFILL_RING's exact count still wins over all three (the A/B's switch).
+constexpr int64_t kRingShallowT = 8192;
+inline core::Pick ring_depth_pick() {
+    static const core::Pick v = core::pick_from_env("PREFILL_RING_DEPTH");
+    return v;
+}
 inline int ring_slots(size_t T) {
-    const char* v = std::getenv("STRATA_PREFILL_RING");
+    const char* v = strata::env_get("PREFILL_RING");
     const uint64_t blob_b = (uint64_t) std::max<int64_t>(MAXBLOB(), 1);
-    const int pinned = (int64_t) T >= 8192 ? (int) std::clamp<uint64_t>(kRingBigBytes / blob_b, 384, 512) : 384;
+    const int big_ring = (int) std::clamp<uint64_t>(kRingBigBytes / blob_b, 384, 512);
+    const core::Pick depth = ring_depth_pick();
+    const bool shallow = depth == core::Pick::On || (depth == core::Pick::Auto && (int64_t) T < kRingShallowT);
+    const int pinned = shallow ? 192 : (int64_t) T >= 8192 ? big_ring : 384;
     int r = v ? (int) std::strtol(v, nullptr, 10)
               : (g_ring_override > 0 ? g_ring_override : g_pinned_share >= 0.9 ? pinned : 96);
     if (!v) {
@@ -226,7 +295,7 @@ inline int ring_slots(size_t T) {
 // wide and its up projection writes as much: slower); 0 (the default: it changes the prompt path's numbers) = off.
 inline int bf16x2_mode() {
     static const int v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_BF16X2");
+        const char* e = strata::env_get("PREFILL_BF16X2");
         return e != nullptr ? (int) std::strtol(e, nullptr, 10) : 0;
     }();
     return v;
@@ -240,24 +309,45 @@ inline bool bf16x2_hc() { return bf16x2_mode() == 1; }
 // own place); the FP16 experts' input rows (Xs) live in the upper half of their down outputs' rows (Dm), each group's
 // down written after its gate/up read them, the rows in ascending order (STRATA_PREFILL_XS_IN_DM=0: their own place).
 inline bool env_off(const char* name) {
-    const char* v = std::getenv(name);
+    const char* v = strata::env_get(name);
     return v != nullptr && std::strtol(v, nullptr, 10) == 0;
 }
 inline bool env_on(const char* name) {
-    const char* v = std::getenv(name);
+    const char* v = strata::env_get(name);
     return v != nullptr && std::strtol(v, nullptr, 10) != 0;
 }
-inline bool hc_in_region() { static const bool v = !env_off("STRATA_PREFILL_HC_IN_REGION"); return v; }
-inline bool xs_in_dm() { static const bool v = !env_off("STRATA_PREFILL_XS_IN_DM"); return v; }
+inline bool hc_in_region() { static const bool v = !env_off("PREFILL_HC_IN_REGION"); return v; }
+inline bool xs_in_dm() { static const bool v = !env_off("PREFILL_XS_IN_DM"); return v; }
 // Experts dequantized (FP16) before one grouped product: G of them take G x 9.4 MiB (--prefill-experts)
 int g_expert_group = 16;
 constexpr int64_t GU_ELEMS = (int64_t) kFF2 * N, D_ELEMS = N * kFF;
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
+// upstream 4084979c: XESTRATA_PF_ALLOC_TRACE=1 (diagnostic, no behaviour change): the free-memory figure around the
+// prompt path's allocations, against what the code asked for, to see what `bytes_needed` does not count.
+inline bool pf_alloc_trace() {
+    static const bool on = [] { const char* e = strata::env_get("PF_ALLOC_TRACE"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+inline int64_t pf_free_mib() {
+    size_t f = 0, t = 0;
+    return strata::gpu::mem_info(&f, &t) ? (int64_t) (f >> 20) : -1;
+}
+inline void pf_mark(const char* what, int64_t& last, uint64_t asked_bytes = 0) {
+    if (!pf_alloc_trace()) return;
+    const int64_t now = pf_free_mib();
+    if (now < 0) return;
+    std::fprintf(stderr, "prefill alloc trace: %-44s free %7lld MiB, dropped %7lld MiB, asked %7lld MiB\n", what,
+                 (long long) now, (long long) (last - now), (long long) (asked_bytes >> 20));
+    last = now;
+}
+
 // Either cudaMalloc (owned, freed with the object) or a bump allocation from a borrowed region; with no base and
 // no region it only counts, which is how `bytes_needed` sizes the region.
 struct Alloc {
+    uint64_t tr_asked = 0, tr_n = 0;   ///< XESTRATA_PF_ALLOC_TRACE: the device takes' sizes, and how far the free figure fell over them
+    int64_t tr_drop = 0;
     uint8_t* base = nullptr;
     uint64_t cap = 0, used = 0;
     uint64_t failed_bytes = 0;          ///< the take that could not be allocated; the failure message names it
@@ -273,7 +363,14 @@ struct Alloc {
             return p;
         }
         void* p = nullptr;
+        const int64_t tr0 = pf_alloc_trace() ? pf_free_mib() : 0;
         if (!strata::gpu::alloc_device(&p, bytes)) { ok = false; failed_bytes = bytes; return nullptr; }
+        if (pf_alloc_trace()) {
+            const int64_t tr1 = pf_free_mib();
+            if (tr0 >= 0 && tr1 >= 0) tr_drop += tr0 - tr1;
+            tr_asked += bytes;
+            ++tr_n;
+        }
         owned->push_back(p);
         used += bytes;
         return (T*) p;
@@ -294,6 +391,10 @@ std::string fit_failure(const Alloc& o) {
 
 void set_cpu_share(double share) { g_cpu_share_fixed = share < 0.0 ? -1.0 : std::min(share, 1.0); }
 double cpu_share_setting() { return cpu_share_env(); }
+void set_cpu_share_rule(int64_t limit, int nt) {
+    g_share_limit = limit;
+    g_share_nt = nt;
+}
 
 // Step 4 of the prompt-speed plan: the experts the arena could not pin (a third of the streamed ones on IQ3_S) are
 // copied into pinned buffers by these threads, ahead of the launches.  Copied in line by the launching thread they
@@ -302,7 +403,7 @@ double cpu_share_setting() { return cpu_share_env(); }
 // j - kRing (recorded by the launching thread, `issued`) is done.
 bool stager_sleep() {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_STAGER_SLEEP");
+        const char* v = strata::env_get("STAGER_SLEEP");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     return on;
@@ -336,7 +437,7 @@ struct Stager {
     int device = 0;
 
     bool init(size_t blob_bytes, int nthreads) {
-        if (const char* v = std::getenv("STRATA_STAGER_RING")) kRing = (int) std::clamp<long>(std::strtol(v, nullptr, 10), 2, 256);
+        if (const char* v = strata::env_get("STAGER_RING")) kRing = (int) std::clamp<long>(std::strtol(v, nullptr, 10), 2, 256);
         buf.assign((size_t) kRing, nullptr);
         pinned.assign((size_t) kRing, 0);
         dma_done.assign((size_t) kRing, nullptr);
@@ -349,13 +450,15 @@ struct Stager {
             }
             if (!strata::gpu::event_create(&dma_done[i])) return false;
         }
+        std::fprintf(stderr, "prefill: stager: pinned %d of %d buffers, %d threads, ring %d\n",
+                     (int) std::count(pinned.begin(), pinned.end(), (char) 1), kRing, nthreads, kRing);
         device = strata::core::current_device();
         for (int t = 0; t < nthreads; ++t)
             threads.emplace_back([this] {
                 strata::platform::name_this_thread("strata-stage");
                 // --aux-cpus: the copy threads go to the spare CPUs with the other helpers; STRATA_AUX_STAGER=0 leaves them where
                 // they were created (a small spare set would then hold all of them: it limits the copy rate of a long read)
-                static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::strtol(v, nullptr, 10) == 0; }();
+                static const bool keep = [] { const char* v = strata::env_get("AUX_STAGER"); return v != nullptr && std::strtol(v, nullptr, 10) == 0; }();
                 if (keep) strata::aux_cpus::note_owned_thread();
                 else strata::aux_cpus::pin_current_thread();
                 work();
@@ -583,7 +686,7 @@ struct PrefillWarmer {
 static constexpr int kHandPiecesMax = 16;
 static int handoff_pipe_pieces() {
     static const int v = [] {
-        const char* e = std::getenv("STRATA_HANDOFF_PIPE");
+        const char* e = strata::env_get("HANDOFF_PIPE");
         const int p = e ? (int) std::strtol(e, nullptr, 10) : 8;
         return p >= 2 ? std::min(p, kHandPiecesMax) : 0;
     }();
@@ -595,7 +698,7 @@ static int handoff_pipe_pieces() {
 // thread per chunk again, for an A/B of the two halves.
 static bool handoff_pipe_worker() {
     static const bool v = [] {
-        const char* e = std::getenv("STRATA_HANDOFF_PIPE_WORKER");
+        const char* e = strata::env_get("HANDOFF_PIPE_WORKER");
         return !e || std::strtol(e, nullptr, 10) != 0;
     }();
     return handoff_pipe_pieces() > 0 && v;
@@ -642,6 +745,13 @@ struct Prefill::Impl {
     // step 2b (MMQ): the activations quantized per layer, H in FP32 and its group's quantized rows, the identity
     // row map, the group bounds, the group buffers of gathered experts
     void *Xq = nullptr, *Hq = nullptr;
+    void *bih3_xq = nullptr, *bih3_scratch = nullptr;
+    float* bih3_rotated = nullptr;
+    // the resident experts' direct products in one call a layer: their blob pointers (two words each), row bounds and
+    // K (gate/up | down << 8), n_expert each (start one more)
+    int32_t* bih3_meta = nullptr;
+    HostVec<int32_t> bih3_meta_host;
+    uint8_t* bih3_w = nullptr;   // kBih3PassExperts experts' codes for the matrix passes (bih3_r1q2_prompt_mmq)
     float* H = nullptr;
     int32_t *ids_identity = nullptr, *bounds_dev = nullptr;
     int32_t* ids_rel = nullptr;               // row r of the chunk -> r - its group's first row (the gate/up's dst rows)
@@ -691,6 +801,85 @@ struct Prefill::Impl {
     strata::gpu::Event *copied[RING_MAX] = {}, *used[RING_MAX] = {};
     int used_of[RING_MAX] = {};              // the slot whose `used` event releases this one (a gathered group's last)
     bool stage_live[RING_MAX] = {};
+    // the latent MoE (Edge0): the experts at the latent width, D/U the shell's projections (latent_prefill arm)
+    bool latent_ = false;
+    int64_t lat_ELL_ = 0, lat_I_ = 0;
+    int lat_G_ = 8, lat_fmt_ = 8;
+    const uint8_t* lat_d_ = nullptr;         // the session's D/U pair on the device (latent_share.hpp)
+    const uint8_t* lat_u_ = nullptr;
+    int64_t lat_layer0_ = 0;                 // the first layer the pair holds (a layer-split stage's first; 0: all)
+    // streamed D/U layers (LatentShared::stream): a ring of two in the chunk's buffers (carve), the next streamed
+    // layer landing on `copy` while this one is read.  No copy outlives the chunk: its buffers may be lent slots.
+    strata::core::LatentShared lat_sh_;
+    uint8_t* lat_ring_ = nullptr;
+    strata::gpu::Event* lat_ring_copied_[2] = {};
+    strata::gpu::Event* lat_ring_free_[2] = {};
+    int64_t lat_ring_layer_[2] = {-1, -1};
+    int64_t lat_ring_last_ = -1;   // the last layer lat_stream_in saw (a smaller one starts a chunk)
+    uint8_t* lat_ring_slot(int64_t l) const {
+        return lat_ring_ + (size_t) (lat_sh_.stream_index(l) % 2) * (lat_sh_.d_bytes + lat_sh_.u_bytes);
+    }
+    const uint8_t* lat_d_at(int64_t l, size_t d_bytes) const {
+        if (lat_sh_.ring > 0) return lat_sh_.streamed(l) ? lat_ring_slot(l) : lat_sh_.res_d(l);
+        return lat_d_ + (size_t) (l - lat_layer0_) * d_bytes;
+    }
+    const uint8_t* lat_u_at(int64_t l, size_t u_bytes) const {
+        if (lat_sh_.ring > 0) return lat_sh_.streamed(l) ? lat_ring_slot(l) + lat_sh_.d_bytes : lat_sh_.res_u(l);
+        return lat_u_ + (size_t) (l - lat_layer0_) * u_bytes;
+    }
+    // before layer l's D: a streamed layer's copy landed (or made now), and the next streamed layer of the chunk
+    // starts landing in the other slot once the layer that held it is done (its U is on cs already)
+    bool lat_stream_in(int64_t l) {
+        if (lat_sh_.ring <= 0) return true;
+        if (l <= lat_ring_last_) lat_ring_layer_[0] = lat_ring_layer_[1] = -1;   // a new chunk: nothing in the ring
+        lat_ring_last_ = l;
+        if (!lat_sh_.streamed(l)) return true;
+        const uint64_t bytes = lat_sh_.d_bytes + lat_sh_.u_bytes;
+        auto land = [&](int64_t layer) {
+            const int s = (int) (lat_sh_.stream_index(layer) % 2);
+            lat_ring_layer_[s] = layer;
+            return strata::gpu::event_record(lat_ring_free_[s], cs) &&
+                   strata::gpu::stream_wait_event(copy, lat_ring_free_[s]) &&
+                   strata::gpu::copy_async(lat_ring_slot(layer), lat_sh_.host_du(layer), bytes, copy, "latent D/U",
+                                           (int) layer) &&
+                   strata::gpu::event_record(lat_ring_copied_[s], copy);
+        };
+        const int s = (int) (lat_sh_.stream_index(l) % 2);
+        if (lat_ring_layer_[s] != l && !land(l)) return false;
+        if (!strata::gpu::stream_wait_event(cs, lat_ring_copied_[s])) return false;
+        const int64_t next = lat_sh_.streamed_after(l);
+        return next < 0 || land(next);
+    }
+    std::vector<int32_t> lat_labels_;
+    int32_t* lat_labels_dev_ = nullptr;
+    float* lat_xl_ = nullptr;                // the dp4a arm's buffers: in the MoE stage's set (latent_set_sizes, carve)
+    uint8_t* lat_xlq_ = nullptr;
+    uint8_t* lat_xq_ = nullptr;
+    float* lat_yl_ = nullptr;
+    uint8_t* lat_ylq_ = nullptr;
+    uint8_t* lat_scratch_ = nullptr;
+    uint8_t* lat_blobs_ = nullptr;           // a batch of staged expert blobs
+    // the batch tables, double-buffered: batch b uploads set b&1 on m.cs while batch b-1's kernel still reads
+    // set (b-1)&1, so no stream_sync between batches.  The host source is double-buffered too; a per-set event
+    // (recorded after the upload) is waited on before the host rewrites that set two batches later.
+    unsigned long long* lat_ptrs_[2] = {};
+    int32_t* lat_start_[2] = {};
+    int32_t* lat_ng_[2] = {};
+    int32_t* lat_dst_[2] = {};
+    int32_t* lat_tok_[2] = {};
+    HostVec<int32_t> lat_h_ptrs[2];   // ng*2 int32: the device pointers' bytes (pinned, fast copy kernel)
+    HostVec<int32_t> lat_h_start[2], lat_h_dst[2], lat_h_tok[2], lat_h_ng[2];
+    strata::gpu::Event* lat_tbl_ev[2] = {};
+    bool lat_events_ = false;                // lat_tbl_ev made
+    // the latent experts on the standard path's int8 products (latent_mmq_d / latent_mmq_u), in the MoE stage's set
+    uint8_t* lmmq_xq_ = nullptr;               // D input (q8, T rows of N)
+    float* lmmq_xl_ = nullptr;                 // D output (T*G rows of ELL), the experts' rows
+    float* lmmq_yl_ = nullptr;                 // the experts' outputs (T*K expert-order rows of ELL)
+    uint8_t* lmmq_ylq_ = nullptr;              // U input (q8, T*K group-order rows of ELL)
+    int32_t* lmmq_ids_ = nullptr;              // U's row map: group-order row -> its yl row
+    int32_t* lmmq_bounds_ = nullptr;           // D's {0, T} | U's group bounds (G + 1)
+    HostVec<int32_t> lmmq_ids_h_, lmmq_bnd_h_; // their pinned host tables, built and uploaded once a layer
+    bool lmmq_forms_ = false;                  // the D and U products' forms chosen
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -716,27 +905,18 @@ struct Prefill::Impl {
     std::vector<strata::kernels::cpu::NativeAct> cpu_nact;
     std::vector<strata::kernels::cpu::ExpertJobMulti> cpu_jobs;
     // the measured share: running means of the CPU's ms per expert and the GPU's per streamed expert
-    double cpu_c_ms = 0, cpu_g_ms = 0, cpu_share_now = 0.5;
+    strata::core::CpuShareMeter cpu_meter;
     strata::gpu::Event* cpu_ev[2] = {};   // the GPU's expert work of the last CPU-sharing layer
     bool cpu_pend = false;
     double pend_cpu_ms = 0;
     int64_t pend_n_cpu = 0, pend_n_gpu = 0;
-    // ... and whether sharing pays at all (auto, upstream f2a3b946, #1282): an eligible layer's wall time per
-    // non-resident expert, from before its routing sync to its combine (events, two sets: a layer's start is recorded
-    // before the last one's is read); two adjacent layers of the two arms give a ratio (with / without), and the median
-    // of the last CPU_RATIOS decides.  Layers differ up to 8x in that cost, the same in every run, which is why adjacent
-    // layers are compared rather than a running mean per arm.
-    static constexpr int CPU_RATIOS = 5;
-    int64_t cpu_layers = 0;     // the eligible layers so far (the arms' schedule)
-    int64_t cpu_first_l = -1;   // the model's first eligible layer: 2x the others' cost in both arms, never read
+    // the staged 3K share's own schedule: an eligible layer's wall time per non-resident expert, from before its
+    // routing sync to its combine (events, two sets: a layer's start is recorded before the last one's is read)
+    int64_t cpu_layers = 0;     // the eligible layers so far (the schedule's index)
     strata::gpu::Event* cpu_wall[4] = {};
     int pend_wall = 0, pend_set = 0, pend_l = 0;   // pend_wall 1: the last eligible layer ran without the share, 2: with
     int64_t pend_wall_n = 0;
-    int last_arm = 0, last_l = 0;
-    double last_w = 0;
-    double cpu_ratio[CPU_RATIOS] = {};
-    int cpu_nratio = 0;
-    bool cpu_gate = false;   // the median ratio is below 1: the layers that share are the cheaper ones
+    strata::core::PromptShareChoice share_3k;
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn).
     // LAYER SPLIT, same process only: allocated in this stage's context, the next stage reads them where they are
     int device = -1;
@@ -788,7 +968,7 @@ namespace {
 // STRATA_KV_STAGE_OWN (A/B only): the staging pool gets its own allocation instead of borrowed expert slots, so a
 // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
 // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
-bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
+bool stage_own() { static const bool v = strata::env_get("KV_STAGE_OWN") != nullptr; return v; }
 void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
                 strata::kernels::KvHostPools& st, bool& ok) {
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
@@ -821,6 +1001,22 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
     p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
     p.page_table = table;
     return p;
+}
+// The attention stage is shared by chunk-major and layer-major prefill.
+void qsa_attention(const float* q, const strata::kernels::QsaAttnPools& pools, const int32_t* ids,
+                   const int32_t* steps, int64_t cap, const strata::kernels::QsaShapes& shapes,
+                   float* scratch, float* out, int64_t n, int64_t batch, bool rotate, gpu::Stream stream) {
+    // XeStrata-890M: an integrated GPU on the HIP backend keeps qsa_prompt_attn's kernels (gfx1150's single-FP16 form,
+    // STRATA_PA_FAST: the fork's measured default); elsewhere flash_attn_select, then the decode kernel
+    if (!(hip_igpu() && strata::kernels::qsa_prompt_attn_batch(q, pools, ids, steps, cap, shapes, out, n, stream)) &&
+        !strata::kernels::flash_attn_select(q, pools, ids, steps, cap, shapes, out, n, stream))
+        for (int64_t t = 0; t < n; t += batch) {
+            const int64_t nb = std::min(batch, n - t);
+            strata::kernels::qsa_decode_attn_batch(q + t * kQW, pools, ids + t * cap,
+                                                   steps + t * strata::kernels::kStepCount, cap,
+                                                   shapes, scratch, out + t * kQW, nb, stream);
+        }
+    if (rotate) strata::kernels::fwht256_inplace_cuda(out, n * kNHead, stream);
 }
 }  // namespace
 
@@ -946,36 +1142,65 @@ bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::str
 }
 
 Prefill::Prefill() : impl_(new Impl) {}
-Prefill::~Prefill() {
-    clear_taps();
-    release();
-}
 
-// DFlash2 prompt taps (single stage): staging for the completed output of each tapped layer for the last prompt rows
-// (include/strata/prefill/prefill.hpp)
+// DFlash2 prompt taps: the staging is made before init by reserve_taps (so the expert cache is sized around it) or by
+// init itself (set_taps), resized by set_tap_rows and freed by taps_off (clear_taps) or release
 bool Prefill::reserve_taps(const std::vector<int>& layers, int64_t cap_rows, int64_t n_embd, std::string& err) {
     tap_layers_ = layers;
     tap_cap_ = cap_rows;
+    if (!tap_slot_.empty()) {   // after init: this stage's share of the layers, as init works it out
+        const int64_t nl = (int64_t) tap_slot_.size(), le = stage_le_ < 0 ? nl : stage_le_;
+        tap_local_.clear();
+        std::fill(tap_slot_.begin(), tap_slot_.end(), -1);
+        for (int l : tap_layers_)
+            if (l >= stage_lb_ && l < le && l < nl - 1) {
+                tap_slot_[(size_t) l] = (int) tap_local_.size();
+                tap_local_.push_back(l);
+            }
+    }
     if (tap_dev_ != nullptr) return true;
     if (!strata::gpu::alloc_device(&tap_dev_, (size_t) cap_rows * layers.size() * (size_t) n_embd * sizeof(float))) {
         err = "the prompt staging of the DFlash2 taps does not fit in VRAM";
         return false;
     }
+    tap_alloc_ = cap_rows;
     return true;
 }
 
-void Prefill::clear_taps() {
-    if (tap_dev_ != nullptr) {
-        strata::gpu::free(tap_dev_);
-        tap_dev_ = nullptr;
+void Prefill::clear_taps() { taps_off(); }
+
+bool Prefill::set_tap_rows(int64_t cap_rows, std::string& err) {
+    tap_cap_ = cap_rows;
+    if (tap_local_.empty() || cap_rows == tap_alloc_) return true;
+    if (impl_ && impl_->cs) strata::gpu::stream_sync(impl_->cs);
+    strata::gpu::free(tap_dev_);
+    tap_dev_ = nullptr;
+    tap_alloc_ = 0;
+    if (!strata::gpu::alloc_device(&tap_dev_, (size_t) cap_rows * tap_local_.size() * (size_t) tap_n_ * 4)) {
+        err = "prefill: the DFlash2 tap staging does not fit";
+        return false;
     }
+    tap_alloc_ = cap_rows;
+    return true;
+}
+
+void Prefill::taps_off() {
+    if (impl_ && impl_->cs) strata::gpu::stream_sync(impl_->cs);
+    strata::gpu::free(tap_dev_);
+    tap_dev_ = nullptr;
     tap_layers_.clear();
+    tap_local_.clear();
+    std::fill(tap_slot_.begin(), tap_slot_.end(), -1);
+    tap_cap_ = tap_alloc_ = 0;
     on_taps = nullptr;
 }
+Prefill::~Prefill() { release(); }
 void Prefill::reset() { release(); impl_ = std::make_unique<Impl>(); stats_ = {}; }
 void Prefill::release() {
     if (!impl_) return;
     lm_release();
+    if (tap_dev_) { strata::gpu::free(tap_dev_); tap_dev_ = nullptr; }
+    tap_alloc_ = 0;
     impl_->stager.reset();
     if (impl_->cs) strata::gpu::stream_sync(impl_->cs);
     if (impl_->copy) strata::gpu::stream_sync(impl_->copy);
@@ -996,6 +1221,9 @@ void Prefill::release() {
     }
     for (int b = 0; b < 2; ++b) {
         if (impl_->mgrp_used[b]) strata::gpu::event_destroy(impl_->mgrp_used[b]);
+        if (impl_->lat_tbl_ev[b]) strata::gpu::event_destroy(impl_->lat_tbl_ev[b]);
+        if (impl_->lat_ring_copied_[b]) strata::gpu::event_destroy(impl_->lat_ring_copied_[b]);
+        if (impl_->lat_ring_free_[b]) strata::gpu::event_destroy(impl_->lat_ring_free_[b]);
         if (impl_->hand[b]) strata::gpu::free(impl_->hand[b]);
         if (impl_->hand_done[b]) strata::gpu::event_destroy(impl_->hand_done[b]);
         for (strata::gpu::Event* e : impl_->hand_ev[b])
@@ -1054,7 +1282,7 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch
 // always.
 bool g_group_cap = false;
 inline int64_t mmq_group_rows_cap(size_t T) {
-    static const int env = [] { const char* v = std::getenv("STRATA_MMQ_GROUP_CAP"); return v == nullptr ? -1 : (*v != '0' ? 1 : 0); }();
+    static const int env = [] { const char* v = strata::env_get("MMQ_GROUP_CAP"); return v == nullptr ? -1 : (*v != '0' ? 1 : 0); }();
     const bool on = env < 0 ? g_group_cap : env != 0;
     return on ? std::max<int64_t>((int64_t) T, ((int64_t) T * K + 7) / 8) : (int64_t) T * K;
 }
@@ -1069,7 +1297,7 @@ constexpr int MMQ_RING = 2 * MMQ_GROUP;
 constexpr int MMQ_GROUP_MIN = 4, MMQ_GROUP_MAX = 64;
 inline int inplace_group() {
     static const int g = [] {
-        const char* v = std::getenv("STRATA_PREFILL_MMQ_GROUP");
+        const char* v = strata::env_get("PREFILL_MMQ_GROUP");
         return v == nullptr ? MMQ_GROUP : std::clamp((int) std::strtol(v, nullptr, 10), MMQ_GROUP_MIN, MMQ_GROUP_MAX);
     }();
     return g;
@@ -1087,15 +1315,57 @@ inline size_t MMQ_SLOT() { return ((size_t) MAXBLOB() + 255) & ~(size_t) 255; }
 // STRATA_MMQ_DIRECT; XeStrata's int8 products read no byte past a matrix, so no guard): it is no longer copied into
 // the group's buffer or ring slot first.  The same bytes are read, so the same answers.  STRATA_MMQ_TAB=0: copied, as
 // before.
+// The int8 products' launch takes its tile from the group's rows (iq_mmq's by_rows: 16 rows where no expert has more,
+// 64, or 128 where they average more than 64), and each of an expert's row tiles decodes its weights again; a group of
+// experts in id order mixes a 300-row expert with 20-row ones, whose work-groups past their rows are empty.  So a
+// layer with streamed experts takes its resident ones first, in falling row count (as a layer with none streamed
+// already did: MMQ_GROUP_SORT), and the streamed walk takes the stream a window at a time (stream_window_on).  Each
+// row's bits are the same whatever its group (no stream-k split).  B70, Qwen3.8-Flash-Next IQ3_XXS, a 3,560-token
+// chunk (13.4K of its 24.3K routed experts resident), read ms: 2,115 in id order, 2,018 with the resident ones sorted;
+// 14,243 tokens (the FP16 products) 6,008 / 6,009.  RTX 4070 (staged, the CPU share) 1K 1,851 / 1,863, 3.6K 4,006 /
+// 4,081 (within the runs' spread), 8K streamed 6,861 / 6,871.  XESTRATA_MMQ_GROUP_SORT_MIXED=0: id order.
+// Both only where the layer's experts average kSortMeanRows rows or fewer: the tiles are 64 and 128 rows, so larger
+// experts waste little of them, and a window's slots go back together, which holds the copy stream back where the
+// link is the limit (RTX 4070, read ms in id order / sorted and by windows: 7,999 tokens, 156 rows an expert, 6,865 /
+// 6,889; the 32K prompt's 16K-token chunks, 320 rows, 21,602 / 22,134; B70: 70 rows 2,115 / 1,934, 117 rows 3,209 /
+// 2,987).
+constexpr int64_t kSortMeanRows = 128;
+inline bool group_sort_mixed() {
+    static const bool on = [] {
+        const char* v = strata::env_get("MMQ_GROUP_SORT_MIXED");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+// The streamed walk's int8 layers a window at a time: half the ring's entries.  A window whose copies have all landed
+// when the layer's routing is read (the copy stream is ahead of the products: the B70's 28 GB/s link) has its routed
+// experts taken in falling row count, and the products read each expert where its copy landed, in its ring slot,
+// through the pointer table (as a resident expert in its cache slot: mmq_tab_on) - no gather into the group's buffer,
+// which was a device copy of every streamed expert (B70: 6 us an expert, 10.9K of them a 3.6K-token chunk).  Its
+// slots, the unrouted entries' too, go back with one event after its last group.  A window still on its way (the
+// link is the limit: the RTX 4070's 6.4 GB/s) is taken as before, an entry at a time in id order, gathered, a group's
+// slots back as it is gathered: waiting for a whole window's copies there cost the RTX 4070's 32K prompt 21,602 ->
+// 22,180 ms.  The groups end with the windows.  The same bytes are multiplied, so the same answers.  B70,
+// Qwen3.8-Flash-Next IQ3_XXS, read ms: 3,560 tokens 2,018 (the resident experts sorted) -> 1,934, 5,999 tokens 3,209
+// (id order) -> 2,987.  XESTRATA_PREFILL_STREAM_WINDOW=0: every window as before.
+inline bool stream_window_on() {
+    static const bool on = [] {
+        const char* v = strata::env_get("PREFILL_STREAM_WINDOW");
+        const char* g = strata::env_get("PREFILL_GROUP_GATHER");
+        return (v == nullptr || std::strtol(v, nullptr, 10) != 0) && (g == nullptr || std::strtol(g, nullptr, 10) != 0);
+    }();
+    return on;
+}
 inline bool mmq_tab_on() {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_MMQ_TAB");
+        const char* v = strata::env_get("MMQ_TAB");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     return on;
 }
 struct MmqPlan {
     bool any = false, fallback = true;
+    bool canon = false;                        // a layer takes the fixed-point products (canon_prefill_layer)
     std::vector<char> layer;                   // per layer: MMQ
     size_t gu_max = 0, d_max = 0;
     int64_t int8_below = INT64_MAX;            // a layer of a chunk takes MMQ while its experts average fewer rows
@@ -1103,140 +1373,33 @@ struct MmqPlan {
 // STRATA_PREFILL_MMQ: 0 the FP16 path, 1 the int8 products in every layer that takes them; unset, each chunk's layer
 // by its experts' rows against what this GPU measured (int8_rows_below).
 int mmq_env() {
-    const char* env = std::getenv("STRATA_PREFILL_MMQ");
+    const char* env = strata::env_get("PREFILL_MMQ");
     return env == nullptr || env[0] == '\0' ? -1 : (int) std::strtol(env, nullptr, 10);
 }
 bool mmq_wanted() { return mmq::chosen() && mmq_env() != 0; }
-
-// From how many rows an expert the FP16 path beats the int8 products on this GPU, timed once at the start on 8 experts
-// of the model's first int8 layer (its types and shape, synthetic blocks: any bits time alike) at 16 to 1024 rows an
-// expert (256 where the device cannot hold the larger buffers), in the calls a chunk makes: the int8 products from the blocks, against the experts dequantized to FP16 and
-// their grouped products.  The geometric middle of the last row count int8 won and the first it lost; INT64_MAX where
-// it won at every count, 0 where it lost at 16.  The int8 products were a fixed choice before (FP16 where Intel's XMX
-// take it): B70, Qwen3.8 IQ3_XXS, the int8 form 1K 923 -> 1074 tok/s, 4K 1594 -> 1604, 32K 2526 -> 2075.  Where the
-// timing cannot run, that fixed choice.  The int8 time grows with the rows and the FP16 one hardly does, so a type whose
-// int8 products are cheap crosses later: B70, IQ3_S's IQ4_XS and UD-Q4_K_XL's K-quants still won at 256 rows
-// (487/609, 592/669 us), and a 32K chunk, about 600 rows an expert, ran its int8 products: 32K prompt 2,318 -> 1,896
-// and 2,125 -> 1,721 tok/s.
-int64_t int8_rows_below(const strata::kernels::cpu::NativeFmt& f, size_t blob) {
-    namespace k = strata::kernels;
-    const int64_t fixed = k::xmx_available(k::XmxType::f16) ? 0 : INT64_MAX;
-    constexpr int G = 8;
-    constexpr int64_t RS[] = {16, 32, 64, 128, 256, 512, 1024};
-    const int64_t FF = f.n_ff, NE = f.n_embd;
-    std::vector<void*> owned;
-    struct FreeAll {
-        std::vector<void*>& o;
-        ~FreeAll() { for (void* p : o) strata::gpu::free(p); }
-    } free_all{owned};
-    auto dev = [&](size_t bytes) {
-        void* p = strata::gpu::alloc_device(bytes);
-        if (p != nullptr) owned.push_back(p);
-        return p;
-    };
-    // the row buffers for the most rows timed: 1024 an expert, else 256 (a device short of memory)
-    int64_t r_top = 1024;
-    if (void* probe = strata::gpu::alloc_device((size_t) r_top * G * (NE * 10 + FF * 13 + 4) + mmq::q8_bytes(r_top * G, NE) * 2))
-        strata::gpu::free(probe);
-    else
-        r_top = 256;
-    const int64_t RMAX = r_top * G;
-    auto* w = static_cast<uint8_t*>(dev((size_t) G * blob));
-    auto* dq_gu = static_cast<uint16_t*>(dev((size_t) G * 2 * FF * NE * 2));
-    auto* dq_d = static_cast<uint16_t*>(dev((size_t) G * NE * FF * 2));
-    auto* x16 = static_cast<uint16_t*>(dev((size_t) RMAX * NE * 2));
-    auto* h16 = static_cast<uint16_t*>(dev((size_t) RMAX * FF * 2));
-    auto* gu = static_cast<float*>(dev((size_t) RMAX * 2 * FF * 4));
-    auto* dn = static_cast<float*>(dev((size_t) RMAX * NE * 4));
-    auto* zx = static_cast<float*>(dev((size_t) RMAX * NE * 4));
-    void* xq = dev(mmq::q8_bytes(RMAX, NE) * 2);
-    void* hq = dev(mmq::q8_bytes(RMAX, FF) * 2);
-    auto* bounds = static_cast<int32_t*>(dev((size_t) (G + 1) * 4));
-    auto* ident = static_cast<int32_t*>(dev((size_t) RMAX * 4));
-    auto* wtab = static_cast<const uint8_t**>(dev((size_t) G * sizeof(void*)));
-    auto give_up = [&](const char* why) {
-        std::fprintf(stderr, "strata: timing the experts' prompt products: %s (%s); %s\n", why, strata::gpu::last_error(),
-                     fixed == 0 ? "the FP16 path" : "the int8 products");
-        return fixed;
-    };
-    for (const void* p : {(const void*) w, (const void*) dq_gu, (const void*) dq_d, (const void*) x16, (const void*) h16,
-                          (const void*) gu, (const void*) dn, (const void*) zx, (const void*) xq, (const void*) hq, (const void*) bounds,
-                          (const void*) ident, (const void*) wtab})
-        if (p == nullptr) return give_up("no device memory for it");
-    try {
-        void* s = nullptr;   // the compute queue
-        const uint8_t* tab[G];
-        for (int e = 0; e < G; ++e) tab[e] = w + (size_t) e * blob;
-        if (!strata::gpu::memset_async(w, 0x11, (size_t) G * blob, s) || !strata::gpu::memset_async(zx, 0, (size_t) RMAX * NE * 4, s) ||
-            !strata::gpu::memset_async(x16, 0, (size_t) RMAX * NE * 2, s) || !strata::gpu::memset_async(h16, 0, (size_t) RMAX * FF * 2, s) ||
-            !strata::gpu::copy(static_cast<void*>(wtab), static_cast<const void*>(tab), sizeof tab))
-            return give_up("its buffers could not be set");
-        mmq::quantize(zx, nullptr, xq, f.gu_type, NE, NE, RMAX, s);
-        mmq::quantize(zx, nullptr, hq, f.d_type, FF, FF, RMAX, s);
-        mmq::iota(ident, RMAX, s);
-        mmq::Context ctx;
-        auto time_us = [&](const std::function<void()>& run) {
-            run();
-            strata::gpu::stream_sync(s);
-            double best = 1e30;
-            for (int t = 0; t < 3; ++t) {
-                const auto t0 = Clock::now();
-                for (int i = 0; i < 5; ++i) run();
-                strata::gpu::stream_sync(s);
-                best = std::min(best, std::chrono::duration<double, std::micro>(Clock::now() - t0).count() / 5);
-            }
-            return best;
-        };
-        int64_t won = 0;
-        std::string said;
-        for (const int64_t r : RS) {
-            if (r > r_top) break;
-            std::vector<int32_t> hb(G + 1);
-            for (int e = 0; e <= G; ++e) hb[(size_t) e] = (int32_t) (e * r);
-            if (!strata::gpu::copy(bounds, hb.data(), hb.size() * 4)) return give_up("its row bounds could not be set");
-            const int64_t R = G * r;
-            const double us8 = time_us([&] {
-                mmq::Product a;
-                a.type = f.gu_type; a.w_rows = 2 * FF; a.w_cols = NE; a.n = G; a.xq = xq; a.bounds = bounds; a.ids = ident;
-                a.total_rows = R; a.max_rows = r; a.rows = R; a.dst = gu; a.ld_dst = 2 * FF; a.wtab = wtab; a.woff = 0;
-                ctx.run(a, s);
-                mmq::Product b;
-                b.type = f.d_type; b.w_rows = NE; b.w_cols = FF; b.n = G; b.xq = hq; b.bounds = bounds; b.ids = ident;
-                b.total_rows = R; b.max_rows = r; b.rows = R; b.dst = dn; b.ld_dst = NE; b.wtab = wtab; b.woff = f.down_off;
-                ctx.run(b, s);
-            });
-            const double us16 = time_us([&] {
-                for (int e = 0; e < G; ++e)
-                    k::iq_dequant_expert_f16(f.gu_type, tab[e], tab[e] + f.up_off, FF, NE, dq_gu + (size_t) e * 2 * FF * NE,
-                                             f.d_type, tab[e] + f.down_off, dq_d + (size_t) e * NE * FF, s);
-                if (!Gemm::f16_groups(x16, dq_gu, 2 * FF * NE, gu, hb.data(), G, 2 * FF, NE, s))
-                    k::xmx_gemm_grouped(x16, dq_gu, 2 * FF * NE, gu, bounds, G, r, 2 * FF, NE, s);
-                if (!Gemm::f16_groups(h16, dq_d, NE * FF, dn, hb.data(), G, NE, FF, s))
-                    k::xmx_gemm_grouped(h16, dq_d, NE * FF, dn, bounds, G, r, NE, FF, s);
-            });
-            char buf[64];
-            std::snprintf(buf, sizeof buf, "%s%lld: %.0f/%.0f", said.empty() ? "" : ", ", (long long) r, us8, us16);
-            said += buf;
-            // FP16 only when it is 3% faster: above the crossover the int8 group scratch no longer bounds the chunk, so
-            // --prefill auto takes a smaller one.  The RTX 4070's 1024 rows are within 1% either way (int8 1972-1982 us,
-            // FP16 1957-1976), and a run that took FP16 there read a 32K serve prompt in 8192-token chunks: 1,687 -> 1,162 tok/s.
-            if (us16 * 1.03 < us8) {
-                const int64_t below = won == 0 ? 0 : (int64_t) std::llround(std::sqrt((double) won * (double) r));
-                std::fprintf(stderr, "strata: the experts' prompt products: int8 below %lld rows an expert, FP16 from "
-                                     "there (us int8/FP16 at rows %s)\n", (long long) below, said.c_str());
-                return below;
-            }
-            won = r;
-        }
-        std::fprintf(stderr, "strata: the experts' prompt products: int8 at every size (us int8/FP16 at rows %s)\n",
-                     said.c_str());
-        return INT64_MAX;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata: timing the experts' prompt products: %s; %s\n", e.what(),
-                     fixed == 0 ? "the FP16 path" : "the int8 products");
-        return fixed;
-    }
+// The layers whose experts the CPU computes in the canonical rows (canon_expert.hpp) and whose every part has the
+// fixed-point int8 products (kernels::iq_mmq_fx), with the fixed-point sums on (kernels::exact_sums, XESTRATA_EXACT=1):
+// a chunk the CPU may share takes those products, with the canonical activations and SwiGLU, for such a layer on the
+// GPU, so an expert gives the same bits on either side and the share the chunk measures leaves the answer as it is
+// (the measured share moved from run to run, and the greedy text with it).
+bool canon_prefill_on() { return strata::kernels::exact_sums(); }
+bool canon_prefill_layer(const strata::kernels::cpu::NativeFmt& f) {
+    const int up = f.up_type < 0 ? f.gu_type : f.up_type;
+    return canon_prefill_on() && strata::kernels::cpu::canon_layer(f) && !f.had_gu && !f.had_d && up == f.gu_type &&
+           strata::kernels::iq_mmq_fx(f.gu_type) != 0 && strata::kernels::iq_mmq_fx(f.d_type) != 0;
 }
+
+// A latent pack (Edge0): its experts' width is not the shell's.  Their products take the int8 path only (the FP16
+// path's dequantized groups are the shell's width).
+bool lay_latent(const strata::kernels::cpu::ExpertLayout& lay) {
+    return lay.native && !lay.fmt.empty() && lay.fmt[0].n_embd != N;
+}
+
+const MmqPlan& mmq_plan();
+// The latent experts on the standard path's int8 products, where this GPU takes them for every layer
+// (XESTRATA_LATENT_FUSED=0: the dp4a arm, Prefill::latent_experts)
+bool latent_on_standard_path() { return strata::env_auto("LATENT_FUSED") != 0 && mmq_plan().any && !mmq_plan().fallback; }
+
 const MmqPlan& mmq_plan() {
     // per GPU (the current device's): a layer split's stages can differ, and a stage that took the first GPU's plan
     // ran int8 products its own GPU lacks (B70 + RTX 4070: the 4070's prompt chunk stopped at its first layer)
@@ -1252,24 +1415,56 @@ const MmqPlan& mmq_plan() {
             const int gt = lay.fmt[(size_t) l].gu_type, dt = lay.fmt[(size_t) l].d_type;
             // and gate's rows right before up's (the products read them as one matrix)
             // APR: a Hadamard-folded layer takes the FP16 path, which rotates its rows (the int8 products do not)
-            if (!mmq::supported(gt) || !mmq::supported(dt) || lay.fmt[(size_t) l].up_off != mmq::matrix_bytes(gt, kFF, N) ||
+            // the experts' width: the shell's, or a latent pack's (Edge0: its experts take the D stage's rows); the
+            // products below are written for experts of the compiled width (kFF)
+            const int64_t ew = lay.fmt[(size_t) l].n_embd;
+            if (!mmq::supported(gt) || !mmq::supported(dt) || lay.fmt[(size_t) l].n_ff != kFF ||
+                lay.fmt[(size_t) l].up_off != mmq::matrix_bytes(gt, kFF, ew) ||
                 lay.fmt[(size_t) l].had_gu || lay.fmt[(size_t) l].had_d) {
                 p.fallback = true;
                 continue;
             }
             p.layer[(size_t) l] = 1;
             p.any = true;
-            p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, kFF2, N));
-            p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, kFF));
+            p.canon = p.canon || canon_prefill_layer(lay.fmt[(size_t) l]);
+            p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, kFF2, ew));
+            // NVFP4: each expert's down slot keeps the blob's tail after its rows (mmq::TailAt)
+            const size_t tail = lay.fmt[(size_t) l].tail_off ? strata::kernels::nvfp4::kTailBytes : 0;
+            p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, ew, kFF) + tail);
         }
-        if (p.any && mmq_env() < 0) {   // by the rows a layer's experts average, against this GPU's timing
+        // the products' forms timed for each layer's types (Intel's XMX take two), before the int8 and FP16 paths are
+        // timed against each other below
+        for (int64_t l = 0; l < layers; ++l)
+            if (p.layer[(size_t) l]) {
+                const int64_t ew = lay.fmt[(size_t) l].n_embd;
+                mmq::choose_forms(lay.fmt[(size_t) l].gu_type, kFF2, ew, 16, nullptr);
+                mmq::choose_forms(lay.fmt[(size_t) l].d_type, ew, kFF, 16, nullptr);
+                if (canon_prefill_layer(lay.fmt[(size_t) l])) {
+                    mmq::choose_forms(strata::kernels::iq_mmq_fx(lay.fmt[(size_t) l].gu_type), kFF2, ew, 16, nullptr);
+                    mmq::choose_forms(strata::kernels::iq_mmq_fx(lay.fmt[(size_t) l].d_type), ew, kFF, 16, nullptr);
+                }
+            }
+        // by the rows a layer's experts average, against this GPU's timing (a latent pack's experts have no FP16 path,
+        // nor NVFP4's: the FP16 dequantizers do not apply the experts' tail scales)
+        bool tails = false;
+        for (const auto& f : lay.fmt) tails = tails || f.tail_off != 0;
+        if (p.any && mmq_env() < 0 && !lay_latent(lay) && !tails) {
             int64_t first = 0;
             while (!p.layer[(size_t) first]) ++first;
-            p.int8_below = int8_rows_below(lay.fmt[(size_t) first], (size_t) lay.blob_bytes(first));
-            if (p.int8_below == 0) {   // FP16 at every size
+            // as a chunk's layer launches them: MMQ_GROUP experts an int8 launch, each gathered into the group's
+            // buffer first; the FP16 path's groups of g_expert_group (MMQ_GROUP at most)
+            mmq::ExpertLaunches launches;
+            launches.n_expert = lay.n_expert;
+            launches.int8_group = MMQ_GROUP;
+            launches.f16_group = std::min(MMQ_GROUP, g_expert_group);
+            launches.int8_gathers = true;
+            p.int8_below = mmq::int8_rows_below(lay.fmt[(size_t) first], (size_t) lay.blob_bytes(first),
+                                                 strata::kernels::has_form(strata::kernels::MatrixForm::f16_grouped) ? 0 : INT64_MAX,
+                                                 launches);
+            if (p.int8_below == 0 && !p.canon) {   // FP16 at every size
                 p = MmqPlan{};
                 p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
-            } else if (p.int8_below != INT64_MAX) {
+            } else if (p.int8_below != INT64_MAX) {   // (with canon: the int8 products for the shared chunks only)
                 p.fallback = true;   // both kinds of layer: their scratch at one place (moe_set_bytes)
             }
         }
@@ -1281,6 +1476,61 @@ const MmqPlan& mmq_plan() {
 // its types: UD-Q4_K_XL) keeps the larger set's room, not both: 0.42 and 0.40 GB at an 8192-token chunk.  Their sum
 // (with the expert groups', expert_group_bytes) cost an RTX 4070 the 8192 chunk at a 32K UD-Q4_K_XL prompt: 6144-token
 // chunks streamed 36% more experts, 615 -> 460 tok/s.
+// The latent MoE's (Edge0) prompt buffers, in carve's order: the int8 arm's (latent_mmq_d / latent_mmq_u) or the dp4a
+// arm's (Prefill::latent_experts), sized by the chunk.  They live while the MoE stage runs (D, the experts, U) and
+// nowhere else, so they are part of the stage's set (moe_set_bytes, carve): the prompt path's size (bytes_needed),
+// what it borrows from the expert cache and how long a chunk it takes count them.  Allocated apart, they were not
+// counted, and the cache's automatic size took their VRAM: the RX 9060 XT stopped a 32K prompt with "the latent
+// scratch does not fit" at the default reserve (Edge0-120B-q3k, 2026-11-16).  Empty for a pack that is not latent.
+constexpr int kLatentBatch = 32;   // the dp4a arm's staged blobs a batch
+std::vector<size_t> latent_set_sizes(size_t T) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay_latent(lay)) return {};
+    const size_t ELL = (size_t) lay.fmt[0].n_embd, I = (size_t) lay.fmt[0].n_ff, TK = T * K;
+    const size_t G = (size_t) strata::core::kLatentGroups, lq_row = ELL / 32 * 36;
+    // the int8 arm: D's input rows, U's row map and bounds.  Its large rows share the stage's buffers that are not
+    // live while they are (carve): xl and yl in Dm, U's int8 rows in Xq.  Their own place cost the RTX 4070's 32K prompt
+    // its 4096-token chunk (3072 in 1.21 GiB of lent slots: 664 -> 480 tok/s, Edge0-120B-NVFP4, 2026-11-16).
+    if (latent_on_standard_path()) return {mmq::q8_bytes((int64_t) T, N), TK * 4, (G + 3) * 4};
+    size_t blob = 0;
+    for (int64_t l = 0; l < (int64_t) lay.fmt.size(); ++l) blob = std::max(blob, (size_t) lay.blob_bytes(l));
+    return {T * G * ELL * 4, T * G * lq_row, T * (N / 32) * 36, TK * ELL * 4, TK * lq_row,
+            strata::kernels::native_expert_scratch_bytes((int64_t) TK, (int64_t) I), kLatentBatch * blob,
+            (size_t) kLatentBatch * 8, (size_t) kLatentBatch * 8, ((size_t) kLatentBatch + 1) * 4,
+            ((size_t) kLatentBatch + 1) * 4, 4, 4,
+            TK * 4, TK * 4, TK * 4, TK * 4};
+}
+
+// A mixed (bih3 R1Q2) layer's resident experts in the prompt: in passes of whole experts whose rows fit the chunk,
+// through the direct products (bih3_r1q2_prompt_groups) or the matrix ones (bih3_r1q2_prompt_mmq, at most
+// kBih3PassExperts experts' codes a pass).  Their table a layer (bih3_meta, int32): the experts' blob pointers (two
+// words each), K, row bounds (a pass's own, one more a pass) and the passes' routed rows.
+constexpr size_t kBih3PassExperts = 32;
+// The matrix passes from this many rows an expert on (a layer's average): the B70's Sync-S prompt of 1K (20 rows an
+// expert) took 558 tok/s direct against 450 in the matrix passes, of 3.5K (70 rows) 579 against 685 (2026-11-20);
+// the codes are decoded in the tile once a plane, three times a state, which the direct products' few rows do not pay.
+constexpr int64_t kBih3MatrixRows = 48;
+// A mixed layer whose experts average this many rows or more takes the shared FP16 path (each expert dequantized by
+// bih3_r1q2_dequant_f16, the FP16 grouped products, as every native pack without int8 products), where the device has
+// FP16 matrix engines.  16 is the fastest on the B70, the RTX 4070 and the RX 9060 XT (ROCm 7.2 and 10.1) alike, 8 the
+// same: 1K prompts' layers average 21.5 to 37 rows an expert, and their prefill runs against 48 +19 to 35% on the B70,
+// +27 to 60% on the RTX and +4 to 20% on the RX; the 4K prompt the same (2026-11-21).  XESTRATA_BIH3_F16_ROWS sets the
+// rows, XESTRATA_BIH3_PROMPT_F16=0|1 fixes the choice (A/B).
+constexpr int64_t kBih3F16Rows = 16;
+bool bih3_prompt_f16(int64_t rows, int64_t experts) {
+    static const int env = [] {
+        const char* v = strata::env_get("BIH3_PROMPT_F16");
+        return v == nullptr || v[0] == '\0' ? -1 : (int) std::strtol(v, nullptr, 10);
+    }();
+    if (env >= 0) return env != 0;
+    static const int64_t min_rows = [] {
+        const char* v = strata::env_get("BIH3_F16_ROWS");
+        return v == nullptr || v[0] == '\0' ? kBih3F16Rows : (int64_t) std::strtol(v, nullptr, 10);
+    }();
+    return strata::kernels::has_form(strata::kernels::MatrixForm::f16_grouped) && rows >= min_rows * experts;
+}
+size_t bih3_meta_ints(size_t T, int64_t k, int64_t n_expert) { return (size_t) (6 * n_expert + 2) + T * (size_t) k; }
+
 uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     const MmqPlan& mp = mmq_plan();
     Alloc a; a.count_only = true; bool ok = true;
@@ -1300,7 +1550,17 @@ uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
         q8.take<float>(GR * kFF, ok);
         q8.take<uint8_t>(mmq::q8_bytes((int64_t) GR, kFF), ok);
     }
-    return std::max(a.used, q8.used);
+    Alloc all = a;   // carve's order: the larger of the two sets, then the latent buffers
+    all.used = std::max(a.used, q8.used);
+    for (const size_t bytes : latent_set_sizes(T)) all.take<uint8_t>(bytes, ok);
+    if (strata::kernels::cpu::expert_layout().mixed()) {
+        all.take<float>(T * N, ok);
+        all.take<uint8_t>(T * (N / 32) * 36, ok);
+        all.take<uint8_t>(strata::kernels::bih3_r1q2_prompt_scratch_bytes((int64_t) T, N, 640), ok);
+        all.take<int32_t>(bih3_meta_ints(T, K, n_expert), ok);
+        all.take<uint8_t>(kBih3PassExperts * strata::kernels::bih3_r1q2_code_bytes(N, 640), ok);
+    }
+    return all.used;
 }
 // The experts' group a layer's products read: G experts dequantized to FP16 (dq_gu, dq_d; 157 MB at 16) where some
 // layer keeps the FP16 path, MMQ_GROUP experts' int8 blocks (grp_gu, grp_d) where some layer takes the int8 one and the
@@ -1331,6 +1591,295 @@ uint64_t expert_group_bytes(size_t T) {
 }
 }
 
+// XESTRATA_PLE_COMPACT=auto: one 512-token chunk's PLE landing, the host gather included, timed in turn at the first
+// init - the host dequant and 10,240 floats a token over the link against the raw IQ4_NL rows (1,440 bytes a token)
+// and the device's dequant.  The compact form is taken when it is 3% faster: upstream's reporters had +1.0..1.7% of a
+// prompt on a PCIe Gen2 x4 link, and a Gen4 x16 link is where it saves nothing.  The copy stream goes with it: the same
+// bytes and kernels, the upload moved off the compute stream.
+void ple_landing_probe(void* stream, strata::kernels::PleTable& table, int64_t chunk) {
+    constexpr int64_t kTokens = 512, kRounds = 2;
+    const int64_t T = std::min<int64_t>(chunk, kTokens);
+    const uint64_t nrows = table.rows();
+    std::vector<uint32_t> rows((size_t) T * strata::kernels::PLE_N_HEADS);
+    for (size_t i = 0; i < rows.size(); ++i) rows[i] = (uint32_t) ((i * 2654435761u) % (nrows != 0 ? nrows : 1));
+    std::vector<float> floats((size_t) T * N);
+    std::vector<uint8_t> raw((size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES);
+    void* fdev = nullptr;
+    void* rdev = nullptr;
+    const bool alloc = strata::gpu::alloc_device(&fdev, floats.size() * 4) && strata::gpu::alloc_device(&rdev, raw.size());
+    if (!alloc) {
+        if (fdev != nullptr) strata::gpu::free(fdev);
+        if (rdev != nullptr) strata::gpu::free(rdev);
+        std::fprintf(stderr, "prefill: the PLE landing's timing: no device memory for 512 tokens: the host dequant\n");
+        ple_compact_pick = 0;
+        ple_copy_stream_pick = 0;
+        return;
+    }
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    std::string e;
+    auto time_of = [&](bool compact) {
+        const auto t0 = now();
+        if (compact) {
+            if (!table.gather_raw_iq4nl(rows.data(), (size_t) T, raw.data())) return -1.0;
+            if (!strata::gpu::copy_async(rdev, raw.data(), raw.size(), stream)) return -1.0;
+            strata::kernels::ple_iq4nl_dequant((const uint8_t*) rdev, T * strata::kernels::PLE_N_HEADS, (float*) fdev, stream);
+        } else {
+            if (!table.gather_batch(rows.data(), (size_t) T, floats.data(), e)) return -1.0;
+            if (!strata::gpu::copy_async(fdev, floats.data(), floats.size() * 4, stream)) return -1.0;
+        }
+        if (!strata::gpu::stream_sync(stream)) return -1.0;
+        return std::chrono::duration<double, std::milli>(now() - t0).count();
+    };
+    double host = 1e30, compact = 1e30;
+    for (int r = 0; r < kRounds; ++r) {
+        if (const double t = time_of(false); t >= 0.0) host = std::min(host, t);
+        if (const double t = time_of(true); t >= 0.0) compact = std::min(compact, t);
+    }
+    strata::gpu::free(fdev);
+    strata::gpu::free(rdev);
+    const bool on = compact >= 0.0 && host < 1e29 && compact <= 0.97 * host;
+    ple_compact_pick = on ? 1 : 0;
+    ple_copy_stream_pick = on ? 1 : 0;
+    auto text = [](double ms) {
+        if (ms >= 1e29) return std::string("did not run");
+        char b[48];
+        std::snprintf(b, sizeof b, "%.2f ms", ms);
+        return std::string(b);
+    };
+    std::fprintf(stderr, "prefill: the PLE landing of %lld tokens: the host dequant %s, the raw rows and the device's "
+                         "dequant %s: the %s (XESTRATA_PLE_COMPACT=0/1 picks one)\n", (long long) T,
+                 text(host).c_str(), text(compact).c_str(), on ? "raw rows" : "host dequant");
+}
+
+// The latent MoE's prompt arm (Edge0): the chunk's rows through D, the grouped native experts at the latent width
+// over the staged blobs, U back to the shell's width, the combine.  All routed experts on the GPU (the CPU share
+// and the helper are the decode's; the prompt path's int8 MMQ machinery is the non-latent arm).  The experts are
+// taken in batches of kLatBatch: a batch's non-resident blobs DMA into the batch's buffers, the grouped kernel
+// reads them where they are (a resident expert in its cache slot), the buffers go back to the next batch once the
+// kernel has read them.  The rows stay in routing order (ent_dst = the route), so U and the combine read them as
+// the router gave them.  Written after edge0-strata's prefill latent arm, on XeStrata's grouped native kernel.
+// The latent MoE's prompt arm on the int8 matrix units (iq_mmq): D, the experts (Q3_K gate/up, IQ4_NL down at the
+// latent width), U, each a grouped MMQ product.  The same implementation the standard experts take (Intel's XMX,
+// NVIDIA's mma, RDNA's WMMA, dp4a where no matrix unit), so the fast path is not a second copy.  The latent-specific
+// glue is only the row maps: D's group rows, the experts' token*G+label activation rows, U's bucketing by group.
+// gu reads the absolute expert-order bounds (the whole xlq), down the group's relative ones (its own hq); U treats
+// the G groups as experts.  Written after edge0-strata's moe_fused, on XeStrata's mmq.
+// The latent MoE (Edge0) on the standard expert path's int8 products: the experts are an ordinary MoE layer at the
+// latent width ELL, whose rows are the D stage's (row token*G + label of the expert's group) and whose outputs (yl,
+// ELL wide) U takes back to the shell's width.  latent_mmq_d runs before the experts (D, its column scales, the U
+// stage's tables, the combine's slots); latent_mmq_u after them.  The experts themselves are the standard path's:
+// its staging, in-place reads and groups.
+bool Prefill::latent_mmq_d(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err) {
+    using namespace strata::kernels;
+    const int64_t ELL = m.lat_ELL_;
+    const int G = m.lat_G_, E = (int) m.g->n_expert;
+    const int du_t = m.lat_fmt_ == 4 ? 2 : 8;   // ggml's Q4_0 / Q8_0 (the latent pack codes Q4_0 as fmt 4)
+    const size_t row_b = m.lat_fmt_ == 4 ? 18 : 34;
+    const size_t d_bytes = (size_t) G * (size_t) ELL * (size_t) (N / 32) * row_b;
+    if (!m.lmmq_forms_) {   // the buffers are the MoE stage's (carve)
+        mmq::choose_forms(du_t, G * ELL, N, 1, m.cs);
+        mmq::choose_forms(du_t, N, ELL, G, m.cs);
+        m.lmmq_forms_ = true;
+    }
+    // U's tables: the routes bucketed by their expert's group (U takes the G groups as experts), each bucket in the
+    // experts' row order; idsU maps a bucket row to its yl row, and the combine reads a route's U row (slot)
+    const int32_t* labels = m.lat_labels_.data() + (size_t) l * E;
+    m.lmmq_ids_h_.resize((size_t) (T * K));
+    m.lmmq_bnd_h_.resize(static_cast<size_t>(G) + 3);
+    std::vector<int32_t> route_of((size_t) (T * K));
+    for (int64_t i = 0; i < T * K; ++i) route_of[(size_t) m.slot_host[(size_t) i]] = (int32_t) i;
+    m.lmmq_bnd_h_[0] = 0;
+    m.lmmq_bnd_h_[1] = (int32_t) T;
+    {
+        int64_t u = 0;
+        m.lmmq_bnd_h_[2] = 0;
+        for (int gg = 0; gg < G; ++gg) {
+            for (int64_t r = 0; r < T * K; ++r) {
+                const int32_t i = route_of[(size_t) r];
+                if (labels[m.ids_host[(size_t) i]] != gg) continue;
+                m.lmmq_ids_h_[(size_t) u] = (int32_t) r;
+                m.slot_host[(size_t) i] = (int32_t) u;
+                ++u;
+            }
+            m.lmmq_bnd_h_[static_cast<size_t>(gg) + 3] = (int32_t) u;
+        }
+    }
+    m.lmmq_ids_h_.to_device(m.lmmq_ids_, m.cs);
+    m.lmmq_bnd_h_.to_device(m.lmmq_bounds_, m.cs);
+    m.slot_host.to_device(m.slot_dev, m.cs);
+    // D: the chunk's rows through the layer's D, then the column scales
+    if (!m.lat_stream_in(l)) {
+        err = "prefill: the latent D/U copy of layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+        return false;
+    }
+    mmq::quantize(m.mixed, nullptr, m.lmmq_xq_, du_t, N, N, T, m.cs);
+    mmq::Product d;
+    d.w = m.lat_d_at(l, d_bytes); d.type = du_t; d.w_rows = G * ELL; d.w_cols = N;
+    d.expert_bytes = mmq::matrix_bytes(du_t, G * ELL, N); d.n = 1; d.xq = m.lmmq_xq_;
+    d.bounds = m.lmmq_bounds_; d.ids = m.ids_identity; d.total_rows = T; d.max_rows = T; d.rows = T;
+    d.dst = m.lmmq_xl_; d.ld_dst = G * ELL;
+    m.mmq_ctx->run(d, m.cs);   // the column scales: in the experts' quantize (run_impl)
+    return true;
+}
+
+bool Prefill::latent_mmq_u(int64_t l, int64_t T, int64_t K, Impl& m, std::string&) {
+    const int64_t ELL = m.lat_ELL_;
+    const int G = m.lat_G_;
+    const int du_t = m.lat_fmt_ == 4 ? 2 : 8;
+    const size_t row_b = m.lat_fmt_ == 4 ? 18 : 34;
+    const size_t u_bytes = (size_t) G * (size_t) N * (size_t) (ELL / 32) * row_b;
+    mmq::quantize(m.lmmq_yl_, m.lmmq_ids_, m.lmmq_ylq_, du_t, ELL, ELL, T * K, m.cs);
+    int64_t maxr = 0;
+    for (int gg = 0; gg < G; ++gg)
+        maxr = std::max<int64_t>(maxr, m.lmmq_bnd_h_[static_cast<size_t>(gg) + 3] - m.lmmq_bnd_h_[static_cast<size_t>(gg) + 2]);
+    mmq::Product up;
+    up.w = m.lat_u_at(l, u_bytes); up.type = du_t; up.w_rows = N; up.w_cols = ELL;
+    up.expert_bytes = mmq::matrix_bytes(du_t, N, ELL); up.n = G; up.xq = m.lmmq_ylq_;
+    up.bounds = m.lmmq_bounds_ + 2; up.ids = m.ids_identity; up.total_rows = T * K; up.max_rows = maxr; up.rows = T * K;
+    up.dst = m.Dm; up.ld_dst = N;
+    m.mmq_ctx->run(up, m.cs);
+    return true;
+}
+
+bool Prefill::latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err) {
+    using namespace strata::kernels;
+    const int64_t N = m.g->n_embd, ELL = m.lat_ELL_, I = m.lat_I_;
+    const int G = m.lat_G_, E = (int) m.g->n_expert;
+    const auto& lay = cpu::expert_layout();
+    const auto& f = lay.fmt[(size_t) l];
+    const size_t row_b = m.lat_fmt_ == 4 ? 18 : 34;
+    const size_t d_bytes = (size_t) G * (size_t) ELL * (size_t) (N / 32) * row_b;
+    const size_t u_bytes = (size_t) G * (size_t) N * (size_t) (ELL / 32) * row_b;
+    const size_t blob_bytes = (size_t) lay.blob_bytes(l);
+    constexpr int kLatBatch = kLatentBatch;
+    if (!m.lat_events_) {   // the buffers are the MoE stage's (carve)
+        bool ok = true;
+        for (int s = 0; s < 2 && ok; ++s) ok = strata::gpu::event_create(&m.lat_tbl_ev[s]);
+        if (!ok) { err = "prefill: the latent arm's events could not be made"; return false; }
+        m.lat_events_ = true;
+        strata::gpu::event_record(m.used[0], m.cs);   // a valid marker: the first batch's DMA may wait on it
+    }
+    // D: the chunk's rows through the layer's D, the column scales, the experts' q8_1 image
+    if (!m.lat_stream_in(l)) {
+        err = "prefill: the latent D/U copy of layer " + std::to_string(l) + ": " + strata::gpu::last_error();
+        return false;
+    }
+    quantize_q8_1_rows(m.mixed, T, N, m.lat_xq_, m.cs);
+    iq_mmvq(m.lat_fmt_ == 4 ? 2 : 8, m.lat_d_at(l, d_bytes), m.lat_xq_, m.lat_xl_, (int) N, (int) (G * ELL),
+            (int) T, m.cs);
+    latent_colscale_rows(m.lat_xl_, T * G, (int) ELL, latent_colscale_dev((int) l, (int) ELL), m.cs);
+    quantize_q8_1_rows(m.lat_xl_, T * G, ELL, m.lat_xlq_, m.cs);
+    // the routes of each expert (routing order), and the experts this layer routes to
+    std::vector<std::vector<int32_t>> routes((size_t) E);
+    for (int64_t i = 0; i < T * K; ++i) routes[(size_t) m.ids_host[(size_t) i]].push_back((int32_t) i);
+    std::vector<int32_t> order;
+    for (int32_t e = 0; e < E; ++e) if (!routes[(size_t) e].empty()) order.push_back(e);
+    const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, ELL, I, f.up_type);
+    const int32_t* labels = m.lat_labels_.data() + (size_t) l * E;
+    // The experts neither the cache nor page-locked RAM holds go through the stager's pinned ring, as on the standard
+    // path: a copy straight from pageable memory (the model file's mapping, a RAM copy the PC could not lock) hands the
+    // GPU's runtime the caller's pages, and where the OS takes those back the GPU's queues are suspended.  On a PC
+    // whose RAM is smaller than the experts the chunk stopped there for good (RX 9060 XT, 15 GiB of RAM, Edge0-120B,
+    // 2026-11-21: one expert's copy did not return in 16 minutes; through the ring the same reads finish).
+    std::vector<int> job_of(order.size(), -1);
+    {
+        std::vector<Stager::Job> js;
+        for (size_t j = 0; j < order.size(); ++j) {
+            const int32_t e = order[j];
+            if (m.host_res && m.cache && m.host_res[(size_t) l * E + e] >= 0) continue;
+            const bool tr = m.src->transient(l, e);   // copied by the source (never pinned)
+            if (!tr && m.src->pinned(l, e)) continue;
+            const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
+            if (!tr && !b) { err = "prefill: expert source has no blob"; return false; }
+            job_of[j] = (int) js.size();
+            js.push_back({b, blob_bytes, tr ? m.src : nullptr, (int32_t) l, e});
+        }
+        m.stager->start(std::move(js));
+    }
+    struct StagerDone {
+        Stager* st;
+        ~StagerDone() { st->finish(); }
+    } stager_done{m.stager.get()};
+    int bi = 0;
+    for (size_t b0 = 0; b0 < order.size(); b0 += kLatBatch, ++bi) {
+        const size_t b1 = std::min(order.size(), b0 + kLatBatch);
+        const int ng = (int) (b1 - b0);
+        const int s = bi & 1;
+        // set s's host source was last read by batch bi-2's upload: wait for that copy before rewriting it here
+        if (bi >= 2) strata::gpu::event_sync(m.lat_tbl_ev[s]);
+        auto& ptrs = m.lat_h_ptrs[s];
+        auto& start = m.lat_h_start[s];
+        auto& dst = m.lat_h_dst[s];
+        auto& tok = m.lat_h_tok[s];
+        ptrs.resize((size_t) ng * 2);
+        start.resize((size_t) ng + 1);
+        dst.resize((size_t) (T * K));
+        tok.resize((size_t) (T * K));
+        m.lat_h_ng[s].resize(1);
+        // the batch's blobs: a resident expert in its cache slot, the others DMA into the batch's buffers
+        bool dma = false;
+        for (size_t j = b0; j < b1; ++j) {
+            const int32_t e = order[j];
+            const int32_t slot = (m.host_res && m.cache) ? m.host_res[(size_t) l * E + e] : -1;
+            unsigned long long p;
+            if (slot >= 0) {
+                p = (unsigned long long) m.cache->device_slot(slot);
+            } else {
+                // page-locked RAM is read in place; the others from the stager's pinned buffer (it waits if behind)
+                const uint8_t* b = job_of[j] < 0 ? m.src->blob(l, e) : m.stager->wait(job_of[j]);
+                if (b == nullptr) { err = "prefill: expert source has no blob"; return false; }
+                if (m.stager->failed.exchange(false)) { err = "prefill: the expert source could not copy a blob"; return false; }
+                strata::gpu::stream_wait_event(m.copy, m.used[0]);   // the last batch's kernel has read the buffers
+                strata::gpu::copy_async(m.lat_blobs_ + (j - b0) * blob_bytes, b, blob_bytes, m.copy);
+                if (job_of[j] >= 0) m.stager->issued_one(job_of[j], m.copy);
+                p = (unsigned long long) (m.lat_blobs_ + (j - b0) * blob_bytes);
+                dma = true;
+            }
+            std::memcpy(&ptrs[2 * (j - b0)], &p, 8);
+        }
+        if (dma) {
+            strata::gpu::event_record(m.copied[0], m.copy);
+            strata::gpu::stream_wait_event(m.cs, m.copied[0]);
+        }
+        // the batch's entry tables: the routes in expert order, ent_dst = the route, ent_tok = its xl row
+        start[0] = 0;
+        int64_t nd = 0;
+        for (size_t j = b0; j < b1; ++j) {
+            const int32_t e = order[j];
+            const int32_t g = labels[e];
+            for (const int32_t i : routes[(size_t) e]) {
+                dst[nd] = i;
+                tok[nd] = (i / (int32_t) K) * G + g;
+                ++nd;
+            }
+            start[j - b0 + 1] = (int32_t) nd;
+        }
+        dst.resize((size_t) nd); tok.resize((size_t) nd);
+        // upload set s on m.cs through the pinned copy kernel (fast, not the pageable copy engine), ordered with
+        // the kernels: batch bi-1's kernel reads set (bi-1)&1, and batch bi+1's upload of this set is ordered after
+        // this batch's kernel, so the device tables never race.  No stream_sync between batches: the host runs
+        // ahead, bounded only by the per-set event above.
+        m.lat_h_ng[s][0] = ng;
+        ptrs.to_device((int32_t*) m.lat_ptrs_[s], m.cs);
+        start.to_device(m.lat_start_[s], m.cs);
+        m.lat_h_ng[s].to_device(m.lat_ng_[s], m.cs);
+        dst.to_device(m.lat_dst_[s], m.cs);
+        tok.to_device(m.lat_tok_[s], m.cs);
+        strata::gpu::event_record(m.lat_tbl_ev[s], m.cs);
+        native_expert_grouped(L, m.lat_ptrs_[s], m.lat_start_[s], m.lat_ng_[s], m.lat_dst_[s], m.lat_tok_[s], ng, nd,
+                              m.lat_xlq_, m.lat_scratch_, m.lat_yl_, m.cs, ng);
+        strata::gpu::event_record(m.used[0], m.cs);   // the batch's blobs read: the next batch may reuse them
+    }
+    // U: each route's latent output back to the shell's width, then the combine (the rows are in routing order)
+    quantize_q8_1_rows(m.lat_yl_, T * K, ELL, m.lat_ylq_, m.cs);
+    latent_u_grouped(m.lat_u_at(l, u_bytes), m.lat_ylq_, m.ids, m.lat_labels_dev_ + (size_t) l * E, E, T * K,
+                     (int) ELL, (int) N, m.Dm, m.cs, m.lat_fmt_);
+    for (int64_t i = 0; i < T * K; ++i) m.slot_host[(size_t) i] = (int32_t) i;   // the identity: the rows are in routing order
+    m.slot_host.to_device(m.slot_dev, m.cs);
+    moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+    return true;
+}
+
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
                    void* stream, std::string& err, void* borrow, uint64_t borrow_bytes) {
@@ -1341,10 +1890,36 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: geometry differs from the artifact's"; return false;
     }
     m.device = strata::core::current_device();
+    {   // NVFP4 experts carry per-expert scales that only the int8 products apply (mmq::swiglu_tails)
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l)
+            if (lay.fmt[l].tail_off != 0 && (l >= mmq_plan().layer.size() || !mmq_plan().layer[l])) {
+                err = "prefill: NVFP4 experts need the int8 products (XESTRATA_PREFILL_MMQ=0, or a GPU without them)";
+                return false;
+            }
+    }
+    int64_t tr_last = pf_alloc_trace() ? pf_free_mib() : 0;
+    pf_mark("init: start (host sides, then the chunk's buffers)", tr_last);
     if (stage_le_ < 0) stage_le_ = g.n_layers;
     if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
         err = "prefill: the stage's layer range is wrong";
         return false;
+    }
+    // the DFlash2 drafter's taps (set_taps): this stage's share of the layers, below the last
+    tap_local_.clear();
+    tap_slot_.assign((size_t) g.n_layers, -1);
+    for (int l : tap_layers_)
+        if (l >= stage_lb_ && l < stage_le_ && l < g.n_layers - 1) {
+            tap_slot_[(size_t) l] = (int) tap_local_.size();
+            tap_local_.push_back(l);
+        }
+    tap_n_ = N;
+    if (!tap_local_.empty() && tap_dev_ == nullptr) {
+        if (tap_cap_ < 1 || !strata::gpu::alloc_device(&tap_dev_, (size_t) tap_cap_ * tap_local_.size() * N * 4)) {
+            err = "prefill: the DFlash2 tap staging does not fit";
+            return false;
+        }
+        tap_alloc_ = tap_cap_;
     }
     for (int b = 0; next_ != nullptr && b < 2; ++b)
         if (!m.hand[b] && !strata::gpu::alloc_host((void**) &m.hand[b], (size_t) chunk * D * 4)) {
@@ -1358,7 +1933,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             ok = ok && make(m.hand_done[b]);
             for (int i = 0; ok && i < handoff_pipe_pieces(); ++i) ok = make(m.hand_ev[b][i]);
         }
-        if (!ok) { err = "prefill: the layer split's hand-off events (STRATA_HANDOFF_PIPE)"; return false; }
+        if (!ok) { err = "prefill: the layer split's hand-off events (XESTRATA_HANDOFF_PIPE)"; return false; }
         m.hand_pieces = handoff_pipe_pieces();
     }
     if (m.tok_dev == nullptr) {
@@ -1386,7 +1961,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (!m.stager) {
         m.stager = std::make_unique<Stager>();
         const int hw = (int) std::thread::hardware_concurrency();
-        const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
+        const char* stv = strata::env_get("STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
         // The GGUF read in place (the low-RAM mode): most of a chunk's blobs are page faults on the SSD, so the copies
         // need many reads in flight (upstream 361537b: 32 threads and a 128-deep ring, measured on an RTX 5070 / NVMe
         // PC).  Here as many threads as the CPU has, up to 32, and a ring 4 x as deep; every other source keeps
@@ -1400,7 +1975,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         // ask the OS: the SSD profile only when fewer than 90% of a sample of the blobs' pages are resident (-1: it
         // cannot tell, keep it).
         if (files && !stv) {
-            const char* ev = std::getenv("STRATA_STAGER_SSD");   // 1 / 0: force the profile (A/B, support)
+            const char* ev = strata::env_get("STAGER_SSD");   // 1 / 0: force the profile (A/B, support)
             if (ev != nullptr && ev[0] != '\0') files = ev[0] != '0';
             else if (const double warm = src->cached_share(256); warm >= 0.9) {
                 files = false;
@@ -1410,18 +1985,18 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         const int threads = stv ? std::clamp((int) std::strtol(stv, nullptr, 10), 1, 32)
                           : files ? std::clamp(hw, 4, 32) : std::max(2, std::min(4, hw / 4));
-        if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
+        if (files && strata::env_get("STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
     }
-    if (!m.warmer && src != nullptr && src->warms() && env_on("STRATA_PREFILL_WARM")) {
+    if (!m.warmer && src != nullptr && src->warms() && env_on("PREFILL_WARM")) {
         m.warmer = std::make_unique<PrefillWarmer>(src);
         m.warm_prev.assign((size_t) g.n_layers, {});
-        std::fprintf(stderr, "prefill: STRATA_PREFILL_WARM=1: the per-layer walk warms this layer's and the next layer's "
+        std::fprintf(stderr, "prefill: XESTRATA_PREFILL_WARM=1: the per-layer walk warms this layer's and the next layer's "
                              "file-tier experts\n");
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.steps_up.init(T * strata::kernels::kStepCount);
-    m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
+    m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     for (int b = 0; b < 2; ++b) {
         if (!m.ple_emb_host[b] &&
             (force_pageable() || !strata::gpu::alloc_host((void**) &m.ple_emb_host[b], (size_t) T * N * 4))) {
@@ -1431,6 +2006,18 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (!m.ple_copied[b] && !strata::gpu::event_create(&m.ple_copied[b]))
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
+    }
+    // STRATA_PLE_COMPACT/PLE_COPY_STREAM: the environment, else the first chunk's landing timed once
+    if (ple_compact_pick < 0) {
+        const int c = strata::env_auto("PLE_COMPACT");
+        const int s = strata::env_auto("PLE_COPY_STREAM");
+        if (c >= 0) {
+            ple_compact_pick = c;
+            ple_copy_stream_pick = s >= 0 ? s : 0;
+        } else if (ss.ple.table != nullptr && ss.ple.table->is_open()) {
+            ple_landing_probe(m.cs, *ss.ple.table, chunk);
+            if (s >= 0) ple_copy_stream_pick = s;
+        }
     }
     // STRATA_PLE_COMPACT: without the buffer (no VRAM for it) the rows take the host dequant as before
     if (ple_compact_on() && m.ple_raw_dev == nullptr &&
@@ -1444,7 +2031,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (m.ple_copy == nullptr || (!m.ple_raw_free && !strata::gpu::event_create(&m.ple_raw_free))) {
             // an optional optimization: the raw rows go up on the compute stream as with STRATA_PLE_COMPACT alone
             if (m.ple_copy) { strata::gpu::stream_destroy(m.ple_copy); m.ple_copy = nullptr; }
-            std::fprintf(stderr, "prefill: STRATA_PLE_COPY_STREAM=1: the upload stream could not be created, the PLE "
+            std::fprintf(stderr, "prefill: XESTRATA_PLE_COPY_STREAM=1: the upload stream could not be created, the PLE "
                                  "rows go up on the compute stream\n");
         }
     }
@@ -1482,28 +2069,81 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             if (m.cpu_ev[0] != nullptr) strata::gpu::event_destroy(m.cpu_ev[0]);
             m.cpu_ev[0] = m.cpu_ev[1] = nullptr;   // the first sharing layer makes them, or says it cannot
         }
-        if (std::getenv("STRATA_TRACE") != nullptr)
-            std::fprintf(stderr, "strata trace: kfd quiet: the CPU prompt share's buffers made at init (%lld-token chunks)%s\n",
+        if (strata::env_get("TRACE") != nullptr)
+            std::fprintf(stderr, "xestrata trace: kfd quiet: the CPU prompt share's buffers made at init (%lld-token chunks)%s\n",
                          (long long) ts, m.cpu_x != nullptr && m.cpu_rows != nullptr ? "" : "; one was refused");
     }
+    pf_mark("init: host buffers, PLE rows, identity table", tr_last);
     Alloc o;
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
     o.owned = &m.owned;
     {
         uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
-        // STRATA_DEQUANT_SIDE: the second dequant scratch (counted by bytes_needed, retaken by relayout)
+        // XESTRATA_DEQUANT_SIDE: the second dequant scratch (counted by bytes_needed, retaken by relayout)
         uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         m.gemm.init_external(stream, gs, GEMM_SCRATCH);
         if (std::string side_err; !m.gemm.set_dequant_side(gs2, side_err))
-            std::fprintf(stderr, "prefill: STRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
+            std::fprintf(stderr, "prefill: XESTRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
                                  "front of their products\n", side_err.c_str());
+        pf_mark("init: GEMM scratch + workspace (Alloc takes so far)", tr_last, o.tr_asked);
     }
     if (!carve(T, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit" +
               fit_failure(o);
         return false;
+    }
+    pf_mark("init: carve (all buffers of the chunk)", tr_last, o.tr_asked);
+    if (pf_alloc_trace())
+        std::fprintf(stderr, "prefill alloc trace: Alloc takes: %llu device allocations, asked %lld MiB, free fell %lld MiB "
+                             "over them (bytes_needed counts %lld MiB for this chunk's own buffers; o.used %lld MiB)\n",
+                     (unsigned long long) o.tr_n, (long long) (o.tr_asked >> 20), (long long) o.tr_drop,
+                     (long long) (Prefill::bytes_needed(g, ss, chunk) >> 20), (long long) (o.used >> 20));
+    // the latent MoE (Edge0): detected from the expert layout (the experts' width differs from the shell's); the
+    // session's D/U pair is the driver's (latent_share.hpp), the labels are labels.bin beside the A pack
+    {
+        const auto& lay0 = strata::kernels::cpu::expert_layout();
+        m.latent_ = lay0.native && !lay0.fmt.empty() && lay0.fmt[0].n_embd != g.n_embd;
+        if (m.latent_) {
+            m.lat_ELL_ = lay0.fmt[0].n_embd;
+            m.lat_I_ = lay0.fmt[0].n_ff;
+            const auto& sh = strata::core::latent_shared();   // this device's pair (a layer-split stage: its layers)
+            m.lat_d_ = sh.d;
+            m.lat_u_ = sh.u;
+            m.lat_fmt_ = sh.fmt;
+            m.lat_layer0_ = sh.layer0;
+            m.lat_sh_ = sh;
+            if (sh.ring > 0) {   // streamed layers: their ring is in the chunk's buffers (carve)
+                for (int s = 0; s < 2; ++s)
+                    if ((m.lat_ring_copied_[s] == nullptr && !strata::gpu::event_create(&m.lat_ring_copied_[s])) ||
+                        (m.lat_ring_free_[s] == nullptr && !strata::gpu::event_create(&m.lat_ring_free_[s]))) {
+                        err = "prefill: the streamed D/U layers' events could not be made";
+                        return false;
+                    }
+                if (m.lat_ring_ == nullptr) {
+                    err = "prefill: the streamed D/U layers' ring is not in the chunk's buffers";
+                    return false;
+                }
+            } else if (m.lat_d_ == nullptr || m.lat_u_ == nullptr) {
+                err = "prefill: the latent D/U pair is not on the device (the driver uploads it before the prompt path)";
+                return false;
+            }
+            const char* apack = strata::env_get("LATENT_A");
+            if (apack == nullptr || apack[0] == '\0') {
+                err = "prefill: the latent layout needs XESTRATA_LATENT_A=<experts.bin>";
+                return false;
+            }
+            const std::string labels_path = strata::core::latent_labels_path(apack);
+            if (!strata::core::latent_labels_read(labels_path, g.n_layers, g.n_expert, m.lat_G_, m.lat_labels_, err))
+                return false;
+            if (!strata::gpu::alloc_device((void**) &m.lat_labels_dev_, m.lat_labels_.size() * sizeof(int32_t)) ||
+                !strata::gpu::copy(m.lat_labels_dev_, m.lat_labels_.data(), m.lat_labels_.size() * sizeof(int32_t))) {
+                err = "prefill: the latent labels upload failed";
+                return false;
+            }
+            m.owned.push_back(m.lat_labels_dev_);
+        }
     }
     return true;
 }
@@ -1575,6 +2215,26 @@ bool Prefill::carve(size_t T, void* alloc) {
         // GU, H and Hq: one group's rows where every layer takes the int8 products (mmq_group_rows_cap); the chunk's
         // where some layer's FP16 products write GU by the chunk's rows
         const size_t GR = mp.any && !mp.fallback ? (size_t) mmq_group_rows_cap(T) : T * K;
+        // XESTRATA_MMQ_GROUP_CAP: once per chunk layout, say that the int8 group scratch took effect (the rows it
+        // holds), and once why it is ignored where the layout cannot use it
+        if (!o.count_only) {
+            static int64_t said_chunk = -1;
+            static bool said_ignored = false;
+            const bool mmq_only = mp.any && !mp.fallback;
+            const char* v = strata::env_get("MMQ_GROUP_CAP");
+            const bool forced = v != nullptr && std::strtol(v, nullptr, 10) != 0;
+            if (mmq_only && (int64_t) GR < (int64_t) T * K && (int64_t) T != said_chunk) {
+                said_chunk = (int64_t) T;
+                std::fprintf(stderr, "xestrata prefill: chunk %zu tokens: the int8 group scratch holds one group's rows "
+                                     "(%zu of %zu; XESTRATA_MMQ_GROUP_CAP)\n", T, GR, T * K);
+            }
+            if (forced && !mmq_only && !said_ignored) {
+                said_ignored = true;
+                std::fprintf(stderr, "xestrata prefill: XESTRATA_MMQ_GROUP_CAP=1 is ignored: %s\n",
+                             !mp.any ? "the prompt path runs the FP16 path here, not the int8 products"
+                                     : "a layer takes the FP16 fallback");
+            }
+        }
         m.GU = c.take<float>(GR * kFF2, ok);
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * kFF, ok); m.sup = c.take<float>(T * kFF, ok); m.sh_h = c.take<uint16_t>(T * kFF, ok);
@@ -1591,6 +2251,43 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.Hq = q8.take<uint8_t>(mmq::q8_bytes((int64_t) GR, kFF), ok);
         }
         c.used = std::max(c.used, q8.used);
+        {   // the latent MoE's buffers (latent_set_sizes' order)
+            const std::vector<size_t> ls = latent_set_sizes(T);
+            std::vector<uint8_t*> p;
+            p.reserve(ls.size());
+            for (const size_t bytes : ls) p.push_back(c.take<uint8_t>(bytes, ok));
+            if (ls.size() == 3) {
+                m.lmmq_xq_ = p[0];
+                m.lmmq_ids_ = reinterpret_cast<int32_t*>(p[1]);
+                m.lmmq_bounds_ = reinterpret_cast<int32_t*>(p[2]);
+                // in the stage's order, each read before the one that shares its place is written: xl (D's rows,
+                // T*G*ELL floats) is read by the experts' quantize into Xq; yl (the experts' rows, T*K*ELL floats)
+                // is written by their down products and read by U's quantize into U's int8 rows (Xq's place: the
+                // experts' int8 rows are dead after their gate/up products); then U writes Dm.  Dm holds T*K*N
+                // floats: both fit (ELL < N, G <= K)
+                m.lmmq_xl_ = m.Dm;
+                m.lmmq_yl_ = m.Dm;
+                m.lmmq_ylq_ = static_cast<uint8_t*>(m.Xq);
+            } else if (ls.size() == 17) {
+                m.lat_xl_ = reinterpret_cast<float*>(p[0]); m.lat_xlq_ = p[1]; m.lat_xq_ = p[2];
+                m.lat_yl_ = reinterpret_cast<float*>(p[3]); m.lat_ylq_ = p[4];
+                m.lat_scratch_ = p[5]; m.lat_blobs_ = p[6];
+                for (int s = 0; s < 2; ++s) {
+                    m.lat_ptrs_[s] = reinterpret_cast<unsigned long long*>(p[7 + s]);
+                    m.lat_start_[s] = reinterpret_cast<int32_t*>(p[9 + s]);
+                    m.lat_ng_[s] = reinterpret_cast<int32_t*>(p[11 + s]);
+                    m.lat_dst_[s] = reinterpret_cast<int32_t*>(p[13 + s]);
+                    m.lat_tok_[s] = reinterpret_cast<int32_t*>(p[15 + s]);
+                }
+            }
+        }
+        if (strata::kernels::cpu::expert_layout().mixed()) {
+            m.bih3_rotated = c.take<float>(T * N, ok);
+            m.bih3_xq = c.take<uint8_t>(T * (N / 32) * 36, ok);
+            m.bih3_scratch = c.take<uint8_t>(strata::kernels::bih3_r1q2_prompt_scratch_bytes((int64_t) T, N, 640), ok);
+            m.bih3_meta = c.take<int32_t>(bih3_meta_ints(T, K, m.g->n_expert), ok);
+            m.bih3_w = c.take<uint8_t>(kBih3PassExperts * strata::kernels::bih3_r1q2_code_bytes(N, 640), ok);
+        }
         if (base == nullptr) ok = false;
     }
     // the experts' group: FP16 (dq_gu, dq_d) and int8 (grp_gu, grp_d) at one place (see expert_group_bytes)
@@ -1647,9 +2344,17 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.used_of[i] = i;
         }
     }
+    m.lat_ring_ = nullptr;
+    if (const uint64_t lr = strata::core::latent_prefill_ring_bytes()) m.lat_ring_ = o.take<uint8_t>((size_t) lr, ok);
+    m.lat_ring_layer_[0] = m.lat_ring_layer_[1] = -1;
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
     take_stage(o, ss, s, m.stage, ok);
+    // the host row tables copy their whole length (HostVec::to_device): keep them at this layout's rows, as the
+    // device tables above are.  A relayout to a smaller chunk left them at the init chunk's length, and the slot
+    // upload wrote past slot_dev into src_dev (the row map the FP16 and latent paths read), the src upload past
+    // src_dev into the scratch after it
+    m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K);
     m.T = (int64_t) T;
     return ok;
 }
@@ -1670,10 +2375,10 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     o.cap = borrow_bytes;
     o.owned = &m.owned;
     uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
-    uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;   // STRATA_DEQUANT_SIDE
+    uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;   // XESTRATA_DEQUANT_SIDE
     if (ok) m.gemm.rebind(gs, GEMM_SCRATCH);
     if (std::string side_err; ok && !m.gemm.set_dequant_side(gs2, side_err))
-        std::fprintf(stderr, "prefill: STRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
+        std::fprintf(stderr, "prefill: XESTRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
                              "front of their products\n", side_err.c_str());
     if (!ok || !carve((size_t) chunk, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit" +
@@ -1693,7 +2398,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         return false;
     };
     static const bool off = [] {
-        const char* v = std::getenv("STRATA_MTP_BATCH");
+        const char* v = strata::env_get("MTP_BATCH");
         return v != nullptr && v[0] == '0';
     }();
     // A ring (KV streaming: the drafter's window, page p in slot p % n_slots over a host copy) takes the same appends
@@ -1701,14 +2406,14 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     // still reach (r0 below), which the ring holds, so no two of them share a slot.  STRATA_MTP_BATCH_RING=0: the
     // drafter's own pass for a ring (the A/B).
     static const bool ring_ok = [] {
-        const char* v = std::getenv("STRATA_MTP_BATCH_RING");
+        const char* v = strata::env_get("MTP_BATCH_RING");
         return v == nullptr || v[0] != '0';
     }();
     core::QsaState& st = mtp.kv_state_rw();
-    if (off) return decline("STRATA_MTP_BATCH=0");
+    if (off) return decline("XESTRATA_MTP_BATCH=0");
     if (n <= 0 || m.g == nullptr || m.region == nullptr) return decline("no prompt scratch region on this path");
     if (st.kv_mode != 0 && !(st.kv_mode == 2 && ring_ok))
-        return decline(st.kv_mode == 2 ? "the drafter's K/V is a ring and STRATA_MTP_BATCH_RING=0"
+        return decline(st.kv_mode == 2 ? "the drafter's K/V is a ring and XESTRATA_MTP_BATCH_RING=0"
                                        : "the drafter's K/V mode is not paged or a ring");
     if (mtp.device() != m.device) return decline("the drafter is on another device than this prompt path");
     const core::OnDevice on_device(m.device);
@@ -1729,10 +2434,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     const float* w_kn = mtp.tensor_f32("self_attn.k_norm.weight");
     if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn)
         return decline("a drafter tensor is missing (Q8_0 projections or norms)");
-    const core::NativeEmbed* nemb = core::native_embed();
-    const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
-    if (!nemb && (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
-                  (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
+    strata::kernels::EmbedTable emb_table;
+    if (std::string why; !core::embed_table(*m.wt, g, m.cs, emb_table, why))
         return decline("the token embedding is not gatherable on this path");
     // the cells the drafter's window can still reach
     const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);
@@ -1766,7 +2469,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     auto* Vc = (float*) carve((size_t) B * KV * 4);
     auto* tok = (int32_t*) carve((size_t) B * 4);
     if ((uint64_t) (q - m.region) > m.region_bytes) return decline("the batch buffers do not fit the scratch region");
-    static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
+    static const bool timing = strata::env_get("DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
     if (timing) strata::gpu::stream_sync(m.cs);
     const auto ti0 = Clock::now();
     if (!mtp.idle(err)) return false;   // the drafter's own stream (its graph uploads) before this writes its K/V
@@ -1785,20 +2488,9 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             return false;
         }
         // the input branches: the next token's embedding, and this cell's final residual rows
-        if (nemb) {
-            nemb->gather_dev(tok, nb, emb, m.cs);
-        } else {
-            const auto* codes = (const uint8_t*) wemb->data;
-            const auto* scales = (const float*) (codes + wemb->codes_bytes);
-            const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
-                                                   : nullptr;
-            strata::kernels::embedding_gather_dev(codes, scales, offsets, tok, (int) nb, wemb->ne0, wemb->code_bits,
-                                                  wemb->code_bias, wemb->group_elems,
-                                                  (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
-                                                  (uint64_t) (wemb->ne0 / wemb->group_elems), emb, m.cs);
-        }
+        strata::kernels::embed_rows(emb_table, tok, 0, nb, emb, m.cs);
         rms_rows(emb, w_ne, nb, Nn, Nn, EPS, m.cs);
-        to_f16(emb, en16, nb * Nn, m.cs);
+        kernels::f32_to_f16_bulk(emb, en16, nb * Nn, m.cs);
         m.gemm.native(en16, mtp.tensor_q8_type("fc_embedding.weight"), w_fe, e2, nb, Nn, Nn);
         if (!strata::gpu::copy_async(hn, R_rows + (size_t) b0 * HCN, (size_t) nb * HCN * 4, m.cs)) {
             err = "prefill: the draft rows' copy failed";
@@ -1808,7 +2500,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             strata::kernels::native_qsa_rms_norm_grouped(hn, w_nh, hn, (int) Nn, (int) g.hc, (int) (nb * g.hc), EPS, m.cs);
         else
             rms_rows(hn, w_nh, nb, HCN, HCN, EPS, m.cs);
-        to_f16(hn, hn16, nb * HCN, m.cs);
+        kernels::f32_to_f16_bulk(hn, hn16, nb * HCN, m.cs);
         m.gemm.native(hn16, mtp.tensor_q8_type("fc_hidden.weight"), w_fh, h2, nb * g.hc, Nn, Nn);   // every stream through fc_hidden
         strata::kernels::add_streams_broadcast(h2, e2, Rm, Nn, (int) g.hc, (int) nb, m.cs);
         // the attention hyper-connection's read (its mixed input only: this pass writes nothing back)
@@ -1839,7 +2531,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     }
     mtp.ms_prefill += ms_since(t0);
     if (timing)
-        std::fprintf(stderr, "strata draft kv: %lld cells from %lld (first needed %lld), batch %lld: drafter idle %.1f ms, "
+        std::fprintf(stderr, "xestrata draft kv: %lld cells from %lld (first needed %lld), batch %lld: drafter idle %.1f ms, "
                      "the batches %.1f ms, all %.1f ms\n", (long long) n, (long long) cell0,
                      (long long) cell0 + (long long) r0, (long long) B, ms_idle, ms_since(tl0), ms_since(t0));
     return true;
@@ -1847,6 +2539,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
 void Prefill::set_ring_override(int slots) { g_ring_override = std::clamp(slots,0,RING_MAX); }
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_group_cap(bool on) { g_group_cap = on; }
+void Prefill::set_share_blocked(bool blocked) { g_share_blocked.store(blocked, std::memory_order_release); }
 bool Prefill::group_cap() { return g_group_cap; }
 void Prefill::set_expert_group(int g) { g_expert_group = std::clamp(g, 1, 64); }
 int Prefill::expert_group() { return g_expert_group; }
@@ -1859,7 +2552,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     Alloc o;
     o.count_only = true;
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
-    if (gemm_dequant_side()) o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);   // STRATA_DEQUANT_SIDE: the second scratch
+    if (gemm_dequant_side()) o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);   // XESTRATA_DEQUANT_SIDE: the second scratch
     auto f = [&](size_t n) { o.take<float>(n, ok); };
     f(T * N); f(T * D); f(T * HC);
     if (!hc_in_region()) o.take<uint8_t>((size_t) hc_set_bytes(T), ok);
@@ -1890,6 +2583,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
         if ((int64_t) T < stream_all_min()) o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
     }
     for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
+    if (const uint64_t lr = strata::core::latent_prefill_ring_bytes()) o.take<uint8_t>((size_t) lr, ok);
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;
@@ -1913,7 +2607,7 @@ namespace {
 // comes from the int8 products on this GPU (no CPU share, no helper GPU): those others write FP32 rows into Dm.
 bool pf_dm16_on() {
     static const int env = [] {
-        const char* e = std::getenv("STRATA_PF_DM16");
+        const char* e = strata::env_get("PF_DM16");
         return e != nullptr && e[0] != '\0' ? (int) std::strtol(e, nullptr, 10) : -1;
     }();
     if (env >= 0) return env > 0;
@@ -1923,7 +2617,7 @@ bool pf_dm16_on() {
 }
 bool dense_mmq_on() {
     static const int v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_DENSE_MMQ");
+        const char* e = strata::env_get("PREFILL_DENSE_MMQ");
         return e != nullptr ? (int) std::strtol(e, nullptr, 10) : -1;
     }();
     return v > 0 || (v < 0 && mmq_plan().any);
@@ -1936,7 +2630,7 @@ bool dense_mmq_on() {
 // 10,240 values a token cost a write pass the BF16 image already pays.
 bool hc_mmq_on() {
     static const bool v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_HC_MMQ");
+        const char* e = strata::env_get("PREFILL_HC_MMQ");
         return e != nullptr && std::strtol(e, nullptr, 10) > 0;
     }();
     return v && dense_mmq_on();
@@ -1952,7 +2646,9 @@ const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::s
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                  std::string& err, int64_t ldy) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
-    gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy);
+    // dense=false: this engine's models have experts (Prefill::init rejects n_expert < 1), so the W8A8 form is
+    // their opt-in (XESTRATA_LLM_W8A8=1), never the timed default
+    gm.native_llm(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, /*dense=*/false, ldy);
     return true;
 }
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
@@ -2055,16 +2751,23 @@ const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa pr
                                         "gdn recurrence", "gdn out proj", "hc write", "hc read: down+silu", "hc read: up",
                                         "hc read: inject", "hc read: mix"};
 struct PfTimer {
-    bool on = env_on("STRATA_PREFILL_TIMING");
+    bool on = env_on("PREFILL_TIMING");
+    // XESTRATA_PREFILL_TIMING=2: the experts' four phases (wait copy, dequant, gemm gate/up, gemm down) as one, under
+    // 'dequant'.  Where a mark is a kernel of its own (Level Zero has no timestamp command: a B70's 4K chunk took
+    // 4,118 ms with the ~600 marks a layer of =1 against 2,081 ms without, 2026-11-25), the experts' groups keep
+    // their launches back to back and the other phases' times are the untimed run's.
+    bool coarse = [] { const char* v = strata::env_get("PREFILL_TIMING"); return v != nullptr && v[0] == '2'; }();
     std::vector<strata::gpu::Event*> ev;
     std::vector<int> ph;
     size_t used = 0;
     double ms[kPfCount] = {};
     void mark(int phase, strata::gpu::Stream s) {
         if (!on) return;
-        // a mark in the phase already running adds nothing to the totals (the gap is charged to the earlier mark's
-        // phase either way), but each record is an event on the stream: compute() marks "dequant" once per expert
-        // (upstream a5b820a41, PR #4006).  The same totals, a fraction of the records.
+        if (coarse && (phase == kPfWaitCopy || phase == kPfGemmGU || phase == kPfGemmD)) phase = kPfDequant;
+        // a mark in the phase already running adds nothing to the totals (the gaps are charged to the earlier mark's
+        // phase either way), but every event record is a submission of its own under WDDM (~80 us on a 6900 XT,
+        // Windows 11): compute() marks "dequant" once per expert, which put ~16 records per MMQ group on the stream
+        // and charged the launch gaps they made to "dequant".  The same totals, a fraction of the records.
         if (strata::prefill::timer_mark_repeats(ph.data(), used, phase)) return;
         if (used == ev.size()) {
             strata::gpu::Event* e = nullptr;
@@ -2210,10 +2913,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    // upstream 711a7e937: the stall report asks this stream (the one the waits below block on) whether its work is done
+    const core::WatchedStream watched("the prompt path's compute stream", (void*) m.cs, m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
+    // XESTRATA_PREFILL_EQUAL: the chunks this prompt is read in (equal_step); m.T stays the buffers' size
+    const int64_t step = equal_step(n, m.T, next_ == nullptr && hand_in_ == nullptr && !helper_);
     // STRATA_KVA (upstream 0.2.7, opt-in): the approximate-prefix plan of this read, if it qualifies (a cold read of one
     // long prompt, one stage, no pictures).  Positions [0, kva_frontier) are approximated in the layers at and after
     // the split: only their state advances (the GDN recurrence, the K/V and indexer pages), their outputs and their MoE
@@ -2229,10 +2936,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         static bool warned = false;
         if (!warned) {
             warned = true;
-            std::fprintf(stderr, "strata prefill: WARNING: STRATA_KVA_ANY_MODEL=1: KVA was only measured on Qwen3.8-Flash-Next "
+            std::fprintf(stderr, "xestrata prefill: WARNING: XESTRATA_KVA_ANY_MODEL=1: KVA was only measured on Qwen3.8-Flash-Next "
                                  "(48 layers, 512 experts); this model has %lld layers and %lld experts\n",
                          (long long) g.n_layers, (long long) g.n_expert);
-        }
+    }
     }
     const bool kva_run = kva_why_not == nullptr;
     const int64_t kva_split = std::min<int64_t>(std::max<int64_t>(kva.split, 1), g.n_layers);
@@ -2275,15 +2982,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // the PLE block batched over the chunk: the pinned postops and a BF16 or GGUF-native key (else token by token);
     // STRATA_PLE_BATCH=0 keeps the per-token block (the A/B)
     static const bool ple_batch_env = [] {
-        const char* v = std::getenv("STRATA_PLE_BATCH");
+        const char* v = strata::env_get("PLE_BATCH");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
+    const bool ple_batch = ple_on && ple_batch_env &&
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / (((uint64_t) 3 * strata::kernels::NG_HC_DIM + (uint64_t) N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = std::min(m.T, n - c0);
+    auto ple_gather = [&m, &ss, tokens, n, prev0, step](int64_t c0, int buf, std::string& e) -> bool {
+        const int64_t T = std::min(step, n - c0);
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
@@ -2307,31 +3014,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
-    // DFlash2 prompt taps (set_taps): on a single stage, the slot of each tapped layer and the staging
-    std::vector<int> tap_slot;
-    if (!tap_layers_.empty() && stage_lb_ == 0 && (stage_le_ < 0 || stage_le_ == m.g->n_layers)) {
-        if (tap_dev_ == nullptr &&
-            !strata::gpu::alloc_device(&tap_dev_, (size_t) tap_cap_ * tap_layers_.size() * (size_t) m.g->n_embd * sizeof(float))) {
-            err = "prefill: the DFlash2 tap staging does not fit in VRAM";
-            return false;
-        }
-        tap_slot.assign((size_t) m.g->n_layers, -1);
-        for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot[(size_t) tap_layers_[i]] = (int) i;
-    }
-    for (int64_t c0 = 0; c0 < n; c0 += m.T) {
+    for (int64_t c0 = 0; c0 < n; c0 += step) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
-        if (std::getenv("STRATA_TRACE")) {   // the stage and the time, one clock for the process (upstream 14d076ee2, 3a2675302)
+        if (strata::env_get("TRACE")) {   // the stage and the time, one clock for the process (upstream 14d076ee2, 3a2675302)
             static const Clock::time_point t0 = Clock::now();
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld stage [%lld,%lld) %.1f ms\n", (long long) c0,
+            std::fprintf(stderr, "xestrata trace: prompt chunk %lld of %lld stage [%lld,%lld) %.1f ms\n", (long long) c0,
                          (long long) n, (long long) stage_lb_, (long long) stage_le_, ms);
             std::fflush(stderr);
         }
-        const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
-        // DFlash2 prompt taps: the rows of this chunk at positions >= tap_first_ (the drafter looks back one window)
-        const int64_t tap_t0 = !tap_slot.empty() ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : T;
-        const int64_t tap_rows = T - tap_t0;
-        if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
+        const int64_t T = std::min(step, n - c0), p0 = pos0 + c0;
+        // the DFlash2 taps of this chunk: the rows at or after tap_first_ (the ring's window)
+        const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
+        const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
+        if (tap_rows > std::min(tap_cap_, tap_alloc_)) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);
         // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
         // before the frontier (a chunk is never split into two regimes)
@@ -2367,7 +3063,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             if (ok && !whole) ok = strata::gpu::copy_async(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, m.cs);
             if (!ok) {
-                err = std::string("prefill: the layer split's hand-off upload failed (STRATA_HANDOFF_PIPE): ") +
+                err = std::string("prefill: the layer split's hand-off upload failed (XESTRATA_HANDOFF_PIPE): ") +
                       strata::gpu::last_error();
                 return false;
             }
@@ -2379,16 +3075,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
         // same bits); a chunk with picture rows, or a token outside the table, takes the per-token path
-        bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
-        const core::NativeEmbed* nemb = core::native_embed();
-        const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
-        if (batched && nemb == nullptr &&
-            (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
-             (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
-            batched = false;
+        strata::kernels::EmbedTable emb_table;
+        std::string why;
+        bool batched = hand_in_ == nullptr && m.tok_dev != nullptr && core::embed_table(*m.wt, g, m.cs, emb_table, why);
         for (int64_t t = 0; batched && t < T; ++t) {
             const int64_t tok = tokens[c0 + t];
-            if ((embd_rows && embd_rows[p0 + t]) || tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
+            if ((embd_rows && embd_rows[p0 + t]) || tok < 0 || tok >= emb_table.n_rows) batched = false;
             else m.tok_host[(size_t) t] = (int32_t) tok;
         }
         if (batched) {
@@ -2396,18 +3088,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 err = "prefill: the token id upload failed";
                 return false;
             }
-            if (nemb) {
-                nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
-            } else {
-                const auto* codes = (const uint8_t*) wemb->data;
-                const auto* scales = (const float*) (codes + wemb->codes_bytes);
-                const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
-                                                       : nullptr;
-                strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
-                                                      wemb->code_bits, wemb->code_bias, wemb->group_elems,
-                                                      (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
-                                                      (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
-            }
+            strata::kernels::embed_rows(emb_table, m.tok_dev, 0, T, m.emb, m.cs);
         }
         // the picture rows go up from one pinned buffer (upstream #1996: from the caller's pageable memory a later
         // prompt on gfx1100 read stale rows); without one, from the caller's memory with the stream waited for
@@ -2435,7 +3116,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     err = "prefill: the image embedding upload failed";
                     return false;
                 }
-            } else if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, m.cs, err)) {
+            } else if (!core::embed_rows(*m.wt, g, nullptr, tokens[c0 + t], 1, m.emb + t * N, m.cs, err)) {
                 return false;
             }
         }
@@ -2482,9 +3163,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // the pageable fallback (no pinned RAM): waited for, as a pageable source can be read out of order
             // (upstream #1996)
             if (!m.ple_pageable[ple_buf].empty()) strata::gpu::stream_sync(m.cs);
-            if (c0 + m.T < n) {
+            if (c0 + step < n) {
                 strata::gpu::event_sync(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
-                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
+                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + step, b = ple_buf ^ 1] {
                     strata::aux_cpus::pin_current_thread();
                     return ple_gather(c1, b, ple_next_err);
                 });
@@ -2507,7 +3188,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
+        // the latent MoE's dp4a arm (Prefill::latent_experts) copies its own blobs and gives no ring entry back: its
+        // chunks take no stream (one did not finish: the stream waited for slots the arm never released)
+        const bool lat_arm = m.latent_ && !latent_on_standard_path();
+        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr && !lat_arm;
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
@@ -2526,7 +3210,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     int job = -1;
                     if (tr || !m.src->pinned(l, e)) {
                         job = (int) js.size();
-                        js.push_back({b, (size_t) lay0.blob_bytes(l), tr ? m.src : nullptr, (int32_t) l, e});
+                        js.push_back({b, (size_t) lay0.blob_bytes(l, e), tr ? m.src : nullptr, (int32_t) l, e});
                     }
                     seq.push_back({(int32_t) l, e, b, job});
                 }
@@ -2544,7 +3228,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const StreamEntry& en = seq[issued];
                 const int sl = (int) (issued % (size_t) m.ring);
                 const auto th = Clock::now();
-                const size_t bytes = (size_t) lay0.blob_bytes(en.l);
+                const size_t bytes = (size_t) lay0.blob_bytes(en.l, en.e);
                 // the slot's last reader, the copy and its mark in one submission (copy_async_after)
                 const strata::gpu::Event* after = m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr;
                 if (en.job < 0) {
@@ -2566,7 +3250,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // i-quant prompts).  The same copies in the same order into the same slots, and a slot is refilled only once
         // the compute stream has recorded that it is done with it: the same results.  STRATA_PREFILL_ISSUER=0: inline.
         static const bool issuer_on = [] {
-            const char* v = std::getenv("STRATA_PREFILL_ISSUER");
+            const char* v = strata::env_get("PREFILL_ISSUER");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
         std::atomic<size_t> a_issued{0}, a_consumed{0};
@@ -2592,7 +3276,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const StreamEntry& en = seq[idx];
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
-                    const size_t bytes = (size_t) lay0.blob_bytes(en.l);
+                    const size_t bytes = (size_t) lay0.blob_bytes(en.l, en.e);
                     // the slot's last reader, the copy and its mark in one submission (copy_async_after)
                     const strata::gpu::Event* after = m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr;
                     if (en.job < 0) {
@@ -2656,7 +3340,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
                         if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, true);
                     } else {
-                        to_f16(emb, e16, nb * N, m.cs);
+                        kernels::f32_to_f16_bulk(emb, e16, nb * N, m.cs);
                         m.gemm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
                         to_bf16(emb, e16, nb * N, m.cs, e16_lo);
                     }
@@ -2730,7 +3414,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 pt.mark(kPfHcMix, cs);
                 // STRATA_DUMP_HC=<path> (XeStrata-890M, a diagnostic): the completed output of layers 5, 15, 25, 35 and 45
                 // averaged over the HC streams (what DFlash2 reads, issue #23), appended as [int32 l, T, N][T * N f32]
-                if (static const char* dump = std::getenv("STRATA_DUMP_HC"); dump != nullptr && (l % 10) == 6) {
+                if (static const char* dump = strata::env_get("DUMP_HC"); dump != nullptr && (l % 10) == 6) {
                     static std::FILE* df = std::fopen(dump, "wb");
                     if (df != nullptr) {
                         std::vector<float> hr((size_t) T * D), mean((size_t) T * N);
@@ -2811,6 +3495,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
                     const bool staged = st.kv_mode == 1;
+                    // the chunk's cells reach the host copy by DMA from the staging pool, not by the append kernel's stores
+                    // over the link (core/kv_host_dma.hpp, XESTRATA_KV_HOST_DMA)
+                    const bool host_by_dma = core::kv_host_dma_use(core::kv_host_dma(), staged, m.stage.present());
                     if (staged) {
                         pt.mark(kPfKvStage, cs);
                         strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
@@ -2825,7 +3512,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                            hv = strata::kernels::kv_hybrid_v_half(st.host),
                                                            sk = strata::kernels::kv_hybrid_k_half(m.stage),
                                                            sv = strata::kernels::kv_hybrid_v_half(m.stage);
-                        const bool mirror = st.host.present();
+                        const bool mirror = st.host.present() && !host_by_dma;
                         kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
                                   st.k_q, st.k_q, st.k_scale, st.k_scale, m.cs, mirror ? &hk : nullptr,
                                   staged ? &sk : nullptr);
@@ -2838,12 +3525,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         if (st.kv_q4)
                             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
-                                                          &st.host, staged ? &m.stage : nullptr);
+                                                          host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                         else
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
-                                      &st.host, staged ? &m.stage : nullptr);
+                                      host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                     }
+                    if (host_by_dma)
+                        strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host, core::qsa_kv_format(st),
+                                                            p0 / s.page_size, (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     if (!kva_state_only) {   // (KVA: no queries when only the state advances)
                         split_q(m.Qf, m.q, T, m.cs);
                         rms_rows(m.q, (const float*) wqn->data, T * kNHead, kHeadDim, kHeadDim, EPS, m.cs);
@@ -2857,20 +3547,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     pt.mark(kPfQsaIdx, cs);
                     // C-2: the chunk's appends in three launches instead of one per token (the same end state:
-                    // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
+                    // the queries below read it only after the whole chunk is appended)
                     try {
-                        static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
-                        if (!per_token) {
-                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
-                                                                             EPS, ib, s, st.max_cells,
-                                                                             strata::kernels::rope_scaling(), m.cs);
-                        }
-                        for (int64_t t = 0; per_token && t < T; ++t) {
-                            const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
-                            strata::kernels::native_qsa_indexer_append(m.idx_raw + t * kIdxK, step_t + strata::kernels::kStepPos, 0,
-                                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                                       strata::kernels::rope_scaling(), m.cs);
-                        }
+                        strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                         EPS, ib, s, st.max_cells,
+                                                                         strata::kernels::rope_scaling(), m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     // KVA: the KV pages and the indexer's keys/pool are complete for this chunk.  Nothing that follows
                     // (the selection, the attention, the output) has a consumer when only the state advances.
@@ -2882,11 +3563,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
                         const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
                                                                                 strata::kernels::kStepNBid)] + 1;
-                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise); STRATA_SELECT_OLD=1: the warp kernel
-                        static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
-                        if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * kIdxQW,
-                                                                             steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                             m.cs, active))
+                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise); the warp kernel where that form
+                        // cannot run
+                        if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * kIdxQW,
+                                                                  steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                  m.cs, active))
                             strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * kIdxQW, steps0, nb,
                                                               m.max_blocks, s, m.sel_scores, m.cs, active);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
@@ -2894,7 +3575,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
                     // Per tile of 16 queries: the union of their selected cells against the sum of their widths.
-                    if (static const bool ovl = std::getenv("STRATA_SEL_OVERLAP") != nullptr; ovl && qsa_index == 0) {
+                    if (static const bool ovl = strata::env_get("SEL_OVERLAP") != nullptr; ovl && qsa_index == 0) {
                         std::vector<int32_t> ids((size_t) (T * m.cap));
                         strata::gpu::copy_async(ids.data(), m.sel_ids, ids.size() * 4, m.cs);
                         strata::gpu::stream_sync(m.cs);
@@ -2909,14 +3590,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             std::sort(u.begin(), u.end());
                             sum_u += (double) (std::unique(u.begin(), u.end()) - u.begin());
                         }
-                        std::fprintf(stderr, "strata prefill: selection overlap at %lld: 16-query tiles read %.1f%% of the "
+                        std::fprintf(stderr, "xestrata prefill: selection overlap at %lld: 16-query tiles read %.1f%% of the "
                                              "cells one query at a time does\n", (long long) p0, sum_w > 0 ? 100.0 * sum_u / sum_w : 0.0);
                     }
                     // STRATA_IDX_FP16_CHECK: would FP16 pooled indexer keys select the same cells? (the KV-streaming
                     // design's last question). Every query is selected again from the pooled keys and `dead` rounded
                     // to fp16 (exactly what an fp16 store reads back); the agreement with the fp32 selection is
                     // printed cumulatively after each chunk's last QSA layer. Debug: syncs per layer.
-                    if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr; f16chk) {
+                    if (static const bool f16chk = strata::env_get("IDX_FP16_CHECK") != nullptr; f16chk) {
                         static float *pooled16 = nullptr, *dead16 = nullptr;
                         static int32_t* ids16 = nullptr;
                         static double shared = 0, cells = 0;
@@ -2926,7 +3607,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             (!strata::gpu::alloc_device((void**) &pooled16, (size_t) rows * s.idx_dim * 4) ||
                              !strata::gpu::alloc_device((void**) &dead16, (size_t) s.idx_dim * 4) ||
                              !strata::gpu::alloc_device((void**) &ids16, (size_t) (m.T * m.cap) * 4))) {
-                            err = "STRATA_IDX_FP16_CHECK: no room for its buffers";
+                            err = "XESTRATA_IDX_FP16_CHECK: no room for its buffers";
                             return false;
                         }
                         round_f16(st.idx_pooled, pooled16, rows * s.idx_dim, m.cs);
@@ -2955,16 +3636,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (p0 + t + 1 > m.cap) { ++sel_queries; shared += (double) c; cells += (double) w; }
                         }
                         if (qsa_index + 1 == g.n_qsa_layers())
-                            std::fprintf(stderr, "strata prefill: FP16 indexer keys: %lld of %lld selections identical; "
+                            std::fprintf(stderr, "xestrata prefill: FP16 indexer keys: %lld of %lld selections identical; "
                                                  "where the selection is sparse, %.4f%% of cells shared (%lld queries)\n",
                                          same, queries, cells > 0 ? 100.0 * shared / cells : 100.0, sel_queries);
                     }
                     // STRATA_QSA_DUMP=<file>: append every QSA layer's selected cells for the prompt's last
                     // STRATA_QSA_DUMP_LAST (4096) positions - records of int32 {qsa layer, pos0, T, cap} + T*cap cells,
                     // for tools/qsa_locality.py (how local the sparse attention's reads are: the KV-streaming question)
-                    if (static const char* dump = std::getenv("STRATA_QSA_DUMP"); dump != nullptr) {
-                        static const long long last = std::getenv("STRATA_QSA_DUMP_LAST")
-                                                          ? std::strtoll(std::getenv("STRATA_QSA_DUMP_LAST"), nullptr, 10) : 4096;
+                    if (static const char* dump = strata::env_get("QSA_DUMP"); dump != nullptr) {
+                        static const long long last = strata::env_get("QSA_DUMP_LAST")
+                                                          ? std::strtoll(strata::env_get("QSA_DUMP_LAST"), nullptr, 10) : 4096;
                         if (p0 + T > pos0 + n - last) {
                             std::vector<int32_t> h((size_t) (T * m.cap));
                             strata::gpu::copy_async(h.data(), m.sel_ids, h.size() * 4, m.cs);
@@ -2980,21 +3661,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                        : core::qsa_attn_pools(st);
                     pt.mark(kPfQsaAttn, cs);
-                    // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
-                    // accuracy but not bitwise (qsa_prompt_attn.hpp). The pools it has no kernel for on this device,
-                    // or STRATA_PROMPT_ATTN_OLD=1: the decode kernel, 32 queries at a time
-                    static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
-                    if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
-                                                                            m.attn, T, m.cs))
-                        for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
-                            const int64_t nb = std::min(m.attn_batch, T - t0);
-                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * kQW, pools, m.sel_ids + t0 * m.cap,
-                                                                   m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
-                                                                   s, m.attn_scratch, m.attn + t0 * kQW, nb, m.cs);
-                        }
-                    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * kNHead, m.cs);
+                    qsa_attention(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn_scratch, m.attn,
+                                  T, m.attn_batch, st.kv_rot || st.kv_hybrid, m.cs);
                     pt.mark(kPfQsa, cs);
-                    gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
+                    kernels::native_qsa_gate_apply(m.attn, m.Qf, nullptr, (int) (T * kNHead), kHeadDim, m.cs, m.attn_h);
                     if (!m.dense_proj(wo, nullptr, m.attn_h, true, m.bo, T, v.name("attn_output.weight"), err)) return false;
                     ++qsa_index;
                 } else {
@@ -3023,7 +3693,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     m.ids_host.from_device(m.ids, m.cs);
                     // STRATA_DUMP_MOE=<path> (XeStrata-890M, a diagnostic): every layer's MoE input rows, routed ids
                     // and weights, appended as [int32 l, T, N, K][ids T*K][w T*K f32][x T*N f32] (issue #14's estimate)
-                    if (static const char* dump = std::getenv("STRATA_DUMP_MOE"); dump != nullptr) {
+                    if (static const char* dump = strata::env_get("DUMP_MOE"); dump != nullptr) {
                         static std::FILE* df = std::fopen(dump, "wb");
                         if (df != nullptr) {
                             std::vector<float> hw((size_t) T * K), hx((size_t) T * N);
@@ -3040,7 +3710,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     const strata::kernels::cpu::ExpertLayout& lay_c = strata::kernels::cpu::expert_layout();
                     bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr && !m.cpu_dead &&
-                                     lay_c.native && !lay_c.fmt.empty();
+                                     !m.latent_ &&
+                                     !g_share_blocked.load(std::memory_order_acquire) &&
+                                     lay_c.native && !lay_c.mixed() && !lay_c.fmt.empty();
                     // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
                     // nothing left (upstream 04dbe561, 0.1.41 report: tight RAM, chats failing).  A buffer that cannot be
                     // had ends the share for this engine - the GPU takes every expert, as with STRATA_PREFILL_CPU_SHARE=0
@@ -3051,26 +3723,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::fprintf(stderr, "prefill: the CPU share is off for this run: the host could not give %s "
                                              "(RAM is short); the GPU streams every expert\n", what);
                     };
-                    bool cpu_arm = true;     // auto: this layer may share (false: the arm without)
-                    int cpu_set = -1;        // auto: the wall events' set, -1 when not measured
-                    bool cpu_cold = false;   // auto: one-time costs in the window (no reading)
-                    // auto shares only while the layers that share cost less per non-resident expert than their
-                    // neighbours that do not.  #1282 (upstream, RX 7900 GRE + 5700X3D): every share lost, auto's 0.47 by
-                    // 4.5%, the host's issue time per streamed expert rising 107 -> 200 us with the CPU busy - a cost
-                    // g / (c + g) cannot see, as both sides are measured with the share on.  The first eligible layers
-                    // alternate, without first, until CPU_MIN_RATIOS ratios are in; then the cheaper arm, and every
-                    // CPU_PROBE-th layer the other one (a prime: the probes move across the layers from one chunk to the
-                    // next), so both stay measured.  Opt-in (STRATA_PREFILL_CPU_GATE=1): the arms without the share cost
-                    // more than the gate saved on XeStrata's GPUs, 1K IQ3_XXS prompts 844 -> 833 tok/s on a B70 and
-                    // 296 -> 283 on an RTX 4070 (2026-10-11, four interleaved rounds).
-                    static const bool cpu_gate_on = [] { const char* e = std::getenv("STRATA_PREFILL_CPU_GATE"); return e != nullptr && e[0] == '1'; }();
-                    if (cpu_maybe && cpu_share_env() < 0.0 && cpu_gate_on) {
-                        constexpr int64_t CPU_PROBE = 29;
-                        constexpr int CPU_MIN_RATIOS = 3;
+                    bool cpu_arm = true;     // this layer may share (the schedule says so)
+                    int cpu_set = -1;        // the wall events' set, -1 when not measured
+                    bool cpu_cold = false;   // one-time costs in the window (no reading)
+                    const bool tune_3k = strata::core::cpu_share_staged_3k_mode() < 0 &&
+                                         strata::core::cpu_share_batched(T, true);
+                    if (cpu_maybe && tune_3k) {
                         const int64_t i = m.cpu_layers++;
-                        cpu_arm = m.cpu_nratio < CPU_MIN_RATIOS ? (i & 1) != 0 : (i % CPU_PROBE == 0) != m.cpu_gate;
-                        if (m.cpu_first_l < 0) m.cpu_first_l = l;
-                        cpu_cold = l == m.cpu_first_l;
+                        cpu_arm = m.share_3k.next();
                         if (m.cpu_wall[0] == nullptr)
                             for (strata::gpu::Event*& e : m.cpu_wall)
                                 if (!strata::gpu::event_create(&e, true)) {
@@ -3104,16 +3764,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.cpu_pend) {   // auto: the last CPU-sharing layer's GPU time is final now
                         m.cpu_pend = false;
                         float g_ms = 0;
-                        if (strata::gpu::event_elapsed_ms(&g_ms, m.cpu_ev[0], m.cpu_ev[1])) {
-                            constexpr double a = 0.25;
-                            const double c = m.pend_cpu_ms / (double) m.pend_n_cpu, gm = g_ms / (double) m.pend_n_gpu;
-                            m.cpu_c_ms = m.cpu_c_ms > 0 ? m.cpu_c_ms + a * (c - m.cpu_c_ms) : c;
-                            m.cpu_g_ms = m.cpu_g_ms > 0 ? m.cpu_g_ms + a * (gm - m.cpu_g_ms) : gm;
-                            m.cpu_share_now = std::clamp(m.cpu_g_ms / (m.cpu_c_ms + m.cpu_g_ms), 0.05, 0.9);
-                        }
+                        if (strata::gpu::event_elapsed_ms(&g_ms, m.cpu_ev[0], m.cpu_ev[1]))
+                            m.cpu_meter.add(m.pend_cpu_ms, m.pend_n_cpu, g_ms, m.pend_n_gpu);
                     }
-                    if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
-                        const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
+                    if (cpu_maybe) {   // the rows buffer, once, at its largest for this chunk
+                        const size_t cap = (size_t) (strata::core::cpu_share_batched(T, true) ? T * K :
+                            std::min<int64_t>(T * K, share_nt() * m.g->n_expert)) * N;
                         if (m.cpu_rows_n < cap) {
                             cpu_cold = true;
                             if (m.cpu_rows) strata::gpu::free(m.cpu_rows);
@@ -3127,27 +3783,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                     }
-                    if (m.pend_wall) {   // the last eligible layer's wall, and its ratio to the one before it
+                    if (m.pend_wall) {   // the last eligible layer's wall, for the staged share's schedule
                         float w_ms = 0;
                         if (strata::gpu::event_elapsed_ms(&w_ms, m.cpu_wall[(size_t) 2 * m.pend_set], m.cpu_wall[(size_t) 2 * m.pend_set + 1])) {
-                            const double w = w_ms / (double) m.pend_wall_n;
-                            if (m.last_arm != 0 && m.last_arm != m.pend_wall && m.pend_l > m.last_l) {   // same chunk
-                                std::rotate(m.cpu_ratio, m.cpu_ratio + 1, m.cpu_ratio + Impl::CPU_RATIOS);
-                                m.cpu_ratio[Impl::CPU_RATIOS - 1] = m.pend_wall == 2 ? w / m.last_w : m.last_w / w;
-                                m.cpu_nratio = std::min(m.cpu_nratio + 1, Impl::CPU_RATIOS);
-                                double v[Impl::CPU_RATIOS];
-                                std::copy(m.cpu_ratio + Impl::CPU_RATIOS - m.cpu_nratio, m.cpu_ratio + Impl::CPU_RATIOS, v);
-                                std::nth_element(v, v + m.cpu_nratio / 2, v + m.cpu_nratio);   // even: the upper one
-                                m.cpu_gate = v[m.cpu_nratio / 2] < 1.0;
-                            }
-                            // debug: STRATA_DBG_CPU_GATE=1 prints each reading and what the next layers do
-                            if (static const bool dbg = std::getenv("STRATA_DBG_CPU_GATE") != nullptr; dbg)
-                                std::fprintf(stderr, "cpu gate: layer %d %s, %lld non-resident, %.2f ms (%.4f a expert) -> %s\n",
-                                             m.pend_l, m.pend_wall == 2 ? "shared" : "not shared", (long long) m.pend_wall_n,
-                                             w_ms, w, m.cpu_gate ? "share" : "do not share");
-                            m.last_arm = m.pend_wall;
-                            m.last_l = m.pend_l;
-                            m.last_w = w;
+                            m.share_3k.add(m.pend_wall == 2, m.pend_l, m.pend_wall_n, w_ms, "Qwen3.8");
                         }
                         m.pend_wall = 0;
                     }
@@ -3164,846 +3803,1140 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
                     int64_t routed = 0;   // the experts this layer routes to: a chunk's layer takes MMQ by their mean rows
                     for (int32_t e = 0; e < m.g->n_expert; ++e) routed += m.cnt[(size_t) e] > 0;
-                    const int64_t below = mmq_plan().int8_below;
-                    const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l] &&
-                                         (below == INT64_MAX || T * K < below * std::max<int64_t>(routed, 1));
-                    // set_helper: the experts the helper GPU computes this layer, the ones it holds that this GPU
-                    // would stream and at most max_rows tokens route to (their rows last, after the CPU's)
-                    std::vector<char> on_help;
-                    int64_t rows_help = 0, n_help = 0;
-                    if (helper_ && !stream_all && lay_c.native) {
-                        HelperShare& hs = *helper_;
-                        for (int32_t e = 0; e < m.g->n_expert; ++e) {
-                            const int32_t c = m.cnt[(size_t) e];
-                            if (c == 0 || c > hs.max_rows || rows_help + c > hs.cap ||
-                                (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
-                                !hs.h->holds(l, e))
-                                continue;
-                            if (on_help.empty()) on_help.assign((size_t) m.g->n_expert, 0);
-                            on_help[(size_t) e] = 1;
-                            rows_help += c;
-                            ++n_help;
-                        }
-                    }
-                    auto helped = [&](int32_t e) { return !on_help.empty() && on_help[(size_t) e]; };
-                    // set_cpu_pool: the experts the CPU computes this layer (their rows after the GPU's, before the
-                    // helper's: [rows_gpu, rows_gpu + rows_cpu))
-                    std::vector<char> on_cpu;
-                    std::vector<const uint8_t*> cpu_blob;   // their blobs, taken here (the CPU thread calls no ExpertSource)
-                    int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0;
-                    if (cpu_maybe) {
-                        // the candidates (core/expert_tier, as the other models' prompt path takes them)
-                        const strata::core::CpuShareCandidates cc = strata::core::cpu_share_candidates(
-                            m.cnt.data(), m.g->n_expert, l, *m.src,
-                            [&](int32_t e) {
-                                return m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                            },
-                            helped);
-                        const std::vector<std::pair<int32_t, int32_t>>& cand = cc.cand;   // (tokens, expert)
-                        n_stream = cc.missed;
-                        const double share = cpu_share_env() >= 0.0 ? cpu_share_env() : cpu_arm ? m.cpu_share_now : 0.0;
-                        const size_t take = std::min(cand.size(), (size_t) std::llround(share * (double) n_stream));
-                        // the MoE input for the CPU's experts, only when it takes some (a layer whose experts all have
-                        // more rows than the CPU takes, MAXT, copied the whole input for nothing: 323 MB at 32K tokens)
-                        if (take > 0 && (!strata::gpu::copy_async(m.cpu_x, m.mixed, (size_t) T * N * sizeof(float), m.cs) ||
-                                         !strata::gpu::stream_sync(m.cs))) {
-                            err = std::string("prefill: the CPU share's input: ") + strata::gpu::last_error();
-                            return false;
-                        }
-                        // an expert without a blob stays on the GPU
-                        for (size_t i = 0; i < cand.size() && n_cpu < (int64_t) take; ++i) {
-                            const int32_t e = cand[i].second;
-                            const uint8_t* b = m.src->blob(l, e);
-                            if (b == nullptr) continue;
-                            if (on_cpu.empty()) {
-                                on_cpu.assign((size_t) m.g->n_expert, 0);
-                                cpu_blob.assign((size_t) m.g->n_expert, nullptr);
-                            }
-                            on_cpu[(size_t) e] = 1;
-                            cpu_blob[(size_t) e] = b;
-                            rows_cpu += cand[i].first;
-                            ++n_cpu;
-                        }
-                    }
-                    auto gpu_side = [&](int32_t e) { return (on_cpu.empty() || !on_cpu[(size_t) e]) && !helped(e); };
-                    // The experts, in id order: resident ones from VRAM, the others through the staging ring.  F8:
-                    // first, out of that order, the resident experts of at most kIqGemmTileRows rows, whose products
-                    // iq_gemm_grouped_f16 takes straight from their GGUF blocks in the cache (dequantized in local
-                    // memory to the same FP16 values: the same bits as dequantizing and multiplying, without writing
-                    // 9.4 MiB an expert; more rows than one work-group's would decode the weights again per group).
-                    // The rows are laid out in this order, so the others' groups stay contiguous.
-                    // STRATA_PREFILL_FUSED=0: every expert dequantized.
-                    static const bool fused_on = [] {
-                        const char* v = std::getenv("STRATA_PREFILL_FUSED");
-                        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-                    }();
-                    const strata::kernels::cpu::NativeFmt* ffmt = lay.native ? &lay.fmt[(size_t) l] : nullptr;
-                    const bool fuse_res = fused_on && !use_mmq && ffmt != nullptr && m.host_res && m.cache &&
-                                          strata::kernels::xmx_available(strata::kernels::XmxType::f16) &&
-                                          ffmt->up_off == (size_t) ffmt->n_ff * ffmt->gu_row &&
-                                          strata::kernels::iq_gemm_grouped_ok(ffmt->gu_type, 2 * ffmt->n_ff, ffmt->n_embd) &&
-                                          strata::kernels::iq_gemm_grouped_ok(ffmt->d_type, ffmt->n_embd, ffmt->n_ff);
-                    auto fusable = [&](int32_t e) {
-                        return fuse_res && m.cnt[(size_t) e] <= strata::kernels::kIqGemmTileRows &&
-                               m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                    };
-                    std::vector<int32_t> order;
-                    for (int32_t e = 0; e < m.g->n_expert; ++e)
-                        if (m.cnt[(size_t) e] > 0 && gpu_side(e) && fusable(e)) order.push_back(e);
-                    const size_t nf = order.size();
-                    for (int32_t e = 0; e < m.g->n_expert; ++e)
-                        if (m.cnt[(size_t) e] > 0 && gpu_side(e) && !fusable(e)) order.push_back(e);
-                    // upstream 62fc7c8a (STRATA_MMQ_GROUP_SORT): an MMQ group's launch covers its largest expert's
-                    // rows (max_rows), so a layer whose GPU experts are all resident takes them in falling row count:
-                    // the groups' padding shrinks.  XeStrata's int8 products give each row the same bits whatever its
-                    // group-mates (no stream-k split), so the order changes no answer.  The streamed walk reads its
-                    // entries in id order: only a layer with nothing streamed.  STRATA_MMQ_GROUP_SORT=0: id order.
-                    static const bool group_sort = [] {
-                        const char* v = std::getenv("STRATA_MMQ_GROUP_SORT");
-                        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-                    }();
-                    if (group_sort && use_mmq && nf == 0 && m.host_res && m.cache && order.size() > (size_t) MMQ_GROUP &&
-                        std::all_of(order.begin(), order.end(), [&](int32_t e) {
-                            return m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                        }))
-                        std::stable_sort(order.begin(), order.end(),
-                                         [&](int32_t a, int32_t b) { return m.cnt[(size_t) a] > m.cnt[(size_t) b]; });
-                    {
-                        int32_t at = 0;
-                        for (const int32_t e : order) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
-                        for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)   // the CPU's block
-                            if (on_cpu[(size_t) e]) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
-                        for (int32_t e = 0; e < m.g->n_expert && !on_help.empty(); ++e)   // the helper's, last
-                            if (on_help[(size_t) e]) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
-                        m.off[(size_t) m.g->n_expert] = at;
-                    }
-                    const int64_t rows_gpu = T * K - rows_cpu - rows_help;
-                    std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
-                    for (int64_t i = 0; i < T * K; ++i) {
-                        const int32_t e = m.ids_host[(size_t) i];
-                        const int32_t p = fill[(size_t) e]++;
-                        m.slot_host[(size_t) i] = p;
-                        m.src_host[(size_t) p] = (int32_t) (i / K);
-                    }
-                    m.slot_host.to_device(m.slot_dev, m.cs);
-                    m.src_host.to_device(m.src_dev, m.cs);
-                    // set_helper: its rows' tokens gathered here and copied to the shared host rows (the host waits
-                    // for them: the helper's stream cannot wait on this GPU's), then its products, queued on its own
-                    // stream; the results come back at the combine
-                    if (rows_help > 0) {
-                        HelperShare& hs = *helper_;
-                        const auto& hf = lay.fmt[(size_t) l];
-                        const int64_t r0 = rows_gpu + rows_cpu;
-                        if (hs.tok_of.size() < (size_t) T) hs.tok_of.resize((size_t) T);
-                        hs.toks.clear();
-                        int32_t* src = hs.h_meta;
-                        int32_t* bounds = hs.h_meta + hs.cap;
-                        int64_t ne = 0, maxr = 0;
-                        for (int32_t e = 0; e < m.g->n_expert; ++e) {
-                            if (!helped(e)) continue;
-                            bounds[ne] = m.off[(size_t) e] - (int32_t) r0;
-                            hs.h_wtab[ne++] = hs.h->blob_on_device(l, e);
-                            maxr = std::max<int64_t>(maxr, m.cnt[(size_t) e]);
-                        }
-                        bounds[ne] = (int32_t) rows_help;
-                        for (int64_t p = 0; p < rows_help; ++p) {
-                            const int32_t t = m.src_host[(size_t) (r0 + p)];
-                            if (hs.tok_of[(size_t) t] < 0) {
-                                hs.tok_of[(size_t) t] = (int32_t) hs.toks.size();
-                                hs.toks.push_back(t);
-                            }
-                            src[p] = hs.tok_of[(size_t) t];
-                        }
-                        for (const int32_t t : hs.toks) hs.tok_of[(size_t) t] = -1;
-                        const int64_t U = (int64_t) hs.toks.size();
-                        if (!strata::gpu::copy_async(hs.tok_dev, hs.toks.data(), (size_t) U * sizeof(int32_t), m.cs)) {
-                            err = std::string("prefill: the helper's tokens: ") + strata::gpu::last_error();
-                            return false;
-                        }
-                        gather_rows(m.mixed, hs.tok_dev, hs.xg, U, N, m.cs);
-                        if (!strata::gpu::copy_async(hs.x_ex, hs.xg, (size_t) U * N * sizeof(float), m.cs) ||
-                            !strata::gpu::stream_sync(m.cs)) {
-                            err = std::string("prefill: the helper's rows: ") + strata::gpu::last_error();
-                            return false;
-                        }
-                        try {
-                            const core::OnDevice on(hs.dev);
-                            const strata::gpu::Stream q = hs.s;
-                            int32_t* d_src = hs.meta;
-                            int32_t* d_bounds = hs.meta + hs.cap;
-                            const int32_t* d_ident = hs.meta + 2 * hs.cap + 1;
-                            const bool up_mixed = strata::kernels::cpu::native_mixed_gu(hf);
-                            const int up_type = up_mixed ? hf.up_type : hf.gu_type;
-                            const bool up_xq2 = strata::kernels::iq_mmq_type_dup(up_type) != strata::kernels::iq_mmq_type_dup(hf.gu_type);
-                            if (!strata::gpu::copy_async(hs.x, hs.x_ex, (size_t) U * N * sizeof(float), q) ||
-                                !strata::gpu::copy_async(d_src, src, (size_t) rows_help * sizeof(int32_t), q) ||
-                                !strata::gpu::copy_async(d_bounds, bounds, (size_t) (ne + 1) * sizeof(int32_t), q) ||
-                                (hs.live == false && !strata::gpu::copy_async(const_cast<int32_t*>(d_ident), hs.h_meta + 2 * hs.cap + 1,
-                                                                              (size_t) hs.cap * sizeof(int32_t), q)) ||
-                                !strata::gpu::copy_async(static_cast<void*>(hs.wtab), static_cast<const void*>(hs.h_wtab),
-                                                         (size_t) ne * sizeof(void*), q)) {
-                                err = std::string("prefill: the helper's tables: ") + strata::gpu::last_error();
-                                return false;
-                            }
-                            mmq::quantize(hs.x, d_src, hs.xq, hf.gu_type, N, N, rows_help, q);
-                            if (up_mixed && up_xq2) mmq::quantize(hs.x, d_src, hs.xq2, up_type, N, N, rows_help, q);
-                            const int64_t ff = hf.n_ff;
-                            mmq::Product gu;
-                            gu.type = hf.gu_type; gu.w_rows = 2 * ff; gu.w_cols = N; gu.n = (int) ne; gu.xq = hs.xq;
-                            gu.bounds = d_bounds; gu.ids = d_ident; gu.total_rows = rows_help; gu.max_rows = maxr;
-                            gu.rows = rows_help; gu.dst = hs.gu; gu.ld_dst = 2 * ff; gu.wtab = hs.wtab; gu.woff = 0;
-                            if (up_mixed) {   // the gate rows, then the up rows in their own type
-                                gu.w_rows = ff;
-                                hs.ctx->run(gu, q);
-                                gu.type = up_type; gu.xq = up_xq2 ? hs.xq2 : hs.xq; gu.dst = hs.gu + ff; gu.woff = hf.up_off;
-                            }
-                            hs.ctx->run(gu, q);
-                            mmq::swiglu(hs.gu, hs.hh, rows_help, ff, /*interleaved=*/false, q);
-                            mmq::quantize(hs.hh, nullptr, hs.hq, hf.d_type, ff, ff, rows_help, q);
-                            mmq::Product dn;
-                            dn.type = hf.d_type; dn.w_rows = N; dn.w_cols = ff; dn.n = (int) ne; dn.xq = hs.hq;
-                            dn.bounds = d_bounds; dn.ids = d_ident; dn.total_rows = rows_help; dn.max_rows = maxr;
-                            dn.rows = rows_help; dn.dst = hs.d; dn.ld_dst = N; dn.wtab = hs.wtab; dn.woff = hf.down_off;
-                            hs.ctx->run(dn, q);
-                            if (!strata::gpu::copy_async(hs.d_ex, hs.d, (size_t) rows_help * N * sizeof(float), q)) {
-                                err = std::string("prefill: the helper's results: ") + strata::gpu::last_error();
-                                return false;
-                            }
-                        } catch (const std::exception& e) {
-                            err = std::string("prefill: the helper GPU: ") + e.what();
-                            return false;
-                        }
-                        hs.live = true;
-                        hs.rows = rows_help;
-                    }
-                    // set_cpu_pool: the CPU's experts on a thread while this one streams and runs the GPU's; their
-                    // unweighted rows land in Dm's row order, so the combine weights them as any other row.  The
-                    // blobs are taken here: the thread calls no ExpertSource (upstream 667f2eca)
-                    std::future<bool> cpu_fut;
-                    double cpu_ms = 0;
-                    if (rows_cpu > 0) {
-                        // (the rows buffer was had at its largest after the routing sync)
-                        const strata::kernels::cpu::NativeFmt& cf = lay.fmt[(size_t) l];
-                        m.cpu_jobs.clear();
-                        for (int32_t e = 0; e < m.g->n_expert; ++e) {
-                            if (!on_cpu[(size_t) e]) continue;
-                            strata::kernels::cpu::ExpertJobMulti j;
-                            j.blob = cpu_blob[(size_t) e];
-                            j.nt = m.cnt[(size_t) e];
-                            for (int r = 0; r < j.nt; ++r)   // the activations are set on the thread
-                                j.out[r] = m.cpu_rows + (size_t) ((int64_t) m.off[(size_t) e] + r - rows_gpu) * N;
-                            m.cpu_jobs.push_back(j);
-                        }
-                        if (cpu_share_env() < 0.0) {
-                            if (m.cpu_ev[0] == nullptr &&
-                                (!strata::gpu::event_create(&m.cpu_ev[0], true) || !strata::gpu::event_create(&m.cpu_ev[1], true))) {
-                                err = "prefill: CPU share events";
-                                return false;
-                            }
-                            strata::gpu::event_record(m.cpu_ev[0], m.cs);
-                        }
-                        cpu_fut = std::async(std::launch::async, [&m, &cf, &cpu_ms, T, rows_gpu, rows_cpu, pool = cpu_pool_]() -> bool {
-                            const auto t0 = std::chrono::steady_clock::now();
-                            if (m.cpu_nact.size() < (size_t) T) m.cpu_nact.resize((size_t) T);
-                            std::vector<char> need((size_t) T, 0);   // the tokens the CPU's experts read
-                            for (int64_t p = rows_gpu; p < rows_gpu + rows_cpu; ++p) need[(size_t) m.src_host[(size_t) p]] = 1;
-                            for (int64_t t = 0; t < T; ++t) {
-                                if (!need[(size_t) t]) continue;
-                                strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact[(size_t) t].bytes);
-                            }
-                            for (auto& j : m.cpu_jobs)
-                                for (int r = 0; r < j.nt; ++r) {
-                                    const int64_t p = rows_gpu + (int64_t) (j.out[r] - m.cpu_rows) / N;
-                                    const int64_t tok = m.src_host[(size_t) p];
-                                    j.nact[r] = m.cpu_nact[(size_t) tok].bytes;
-                                }
-                            pool->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
-                            cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                            return true;
-                        });
-                    }
-                    struct CpuJoin {   // an early return waits for the thread (it reads this layer's tables)
-                        std::future<bool>& f;
-                        ~CpuJoin() { if (f.valid()) f.wait(); }
-                    } cpu_join{cpu_fut};
-                    const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
-                    const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-                    // APR (prism.hadamard): folded gate/up take H (s * x), folded down H (s * h), on the FP16 path
-                    // (mmq_plan gives such a layer no int8 products); the CPU's rows rotate in native_quant_act
-                    const bool had_gu = lay.native && lay.fmt[(size_t) l].had_gu;
-                    const bool had_d = lay.native && lay.fmt[(size_t) l].had_d;
-                    const int had_block = lay.native ? lay.fmt[(size_t) l].had_block : 0;
-                    const float* had_sx = had_gu ? strata::kernels::hadamard_device_signs(lay.fmt[(size_t) l].gu_signs,
-                                                                                          (int) lay.fmt[(size_t) l].n_embd)
-                                                 : nullptr;
-                    // the sign vectors at the layout's widths (upstream dd32704d4), this device's copies made once
-                    const float* had_sh = had_d ? strata::kernels::hadamard_device_signs(lay.fmt[(size_t) l].d_signs,
-                                                                                         (int) lay.fmt[(size_t) l].n_ff)
-                                                : nullptr;
-                    const bool dm16 = pf_dm16_on() && use_mmq && rows_cpu == 0 && rows_help == 0;
-                    const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, kFF2, N) : 0;
-                    const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, kFF) : 0;
-                    host_group_ms += ms_since(t_group);
-                    // XeStrata-890M: when every expert the layer routes is in the cache (a GPU whose cache holds them
-                    // all, the host-USM cache of the 890M among them), the int8 products read the blobs where they lie,
-                    // through a table of their addresses (wtab), instead of gathering each group into the group buffers
-                    // (a launch and 1.5 MB of copies an expert) or copying each into the MMQ ring (chunks below
-                    // STREAM_ALL_MIN).  The products then read host USM, which the GPU does not cache, a little slower,
-                    // but less than the copies cost: on the 890M a varied 3,481-token prompt 16.8 -> 16.4 s, a
-                    // 523-token one 3.5 -> 3.2 s.  The same products of the same bytes: the same results.
-                    // STRATA_PREFILL_MMQ_INPLACE=0: as before.
-                    static const bool inplace_env = [] {
-                        const char* v = std::getenv("STRATA_PREFILL_MMQ_INPLACE");
-                        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-                    }();
-                    bool in_place = use_mmq && inplace_env && m.wtab_dev != nullptr && m.host_res && m.cache;
-                    for (size_t j = 0; in_place && j < order.size(); ++j)
-                        if (m.host_res[(size_t) l * m.g->n_expert + order[j]] < 0) in_place = false;
-                    const int GRP = in_place ? inplace_group() : MMQ_GROUP;   // experts a launch
-                    if (in_place) {
-                        m.wtab_host.resize(2 * order.size());
-                        for (size_t j = 0; j < order.size(); ++j) {
-                            const uint8_t* b = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + order[j]]);
-                            const uint64_t a = (uint64_t) (uintptr_t) b;
-                            m.wtab_host[2 * j] = (int32_t) (uint32_t) (a & 0xffffffffu);
-                            m.wtab_host[2 * j + 1] = (int32_t) (uint32_t) (a >> 32);
-                        }
-                        m.wtab_host.to_device(reinterpret_cast<int32_t*>(m.wtab_dev), m.cs);
-                    }
-                    pt.mark(kPfGather, cs);
-                    if (use_mmq) {
-                        // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
-                        mmq::quantize_scatter(m.mixed, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs);
-                        // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
-                        // reads the group's own quantized H)
-                        // the groups: up to GRP experts in `order`, ended early when the rows would pass the
-                        // group scratch's cap (mmq_group_rows_cap)
-                        const size_t n = order.size(), G = (size_t) GRP;
-                        const int64_t cap = mmq_group_rows_cap(T);
-                        m.grp_start.clear();
-                        m.grp_of.assign(n, 0);
-                        m.grp_pos.assign(n, 0);
-                        for (size_t j = 0, rows = 0; j < n; ++j) {
-                            const int64_t c = m.cnt[(size_t) order[j]];
-                            if (m.grp_start.empty() || j - (size_t) m.grp_start.back() >= G ||
-                                (int64_t) rows + c > cap) {
-                                m.grp_start.push_back((int32_t) j);
-                                rows = 0;
-                            }
-                            m.grp_of[j] = (int32_t) (m.grp_start.size() - 1);
-                            m.grp_pos[j] = (int32_t) (j - (size_t) m.grp_start.back());
-                            rows += (size_t) c;
-                        }
-                        m.grp_start.push_back((int32_t) n);
-                        const size_t ng = m.grp_start.size() - 1;
-                        m.bounds_host.resize(n + 1 + ng * (G + 1));
-                        for (size_t j = 0; j < n; ++j) m.bounds_host[j] = m.off[(size_t) order[j]];
-                        m.bounds_host[n] = (int32_t) rows_gpu;
-                        m.ids_rel_host.resize((size_t) (T * K));
-                        for (size_t g = 0; g < ng; ++g) {
-                            const size_t j0 = (size_t) m.grp_start[g], j1 = (size_t) m.grp_start[g + 1];
-                            for (size_t i = 0; i <= G; ++i)
-                                m.bounds_host[n + 1 + g * (G + 1) + i] =
-                                    m.bounds_host[std::min(j1, j0 + i)] - m.bounds_host[j0];
-                            // the gate/up product writes a group's rows from 0 (GU holds one group): row r -> r - first
-                            for (int32_t r = m.bounds_host[j0]; r < m.bounds_host[j1]; ++r)
-                                m.ids_rel_host[(size_t) r] = r - m.bounds_host[j0];
-                        }
-                        m.bounds_host.to_device(m.bounds_dev, m.cs);
-                        m.ids_rel_host.to_device(m.ids_rel, m.cs);
+                    // a mixed (bih3 R1Q2) layer: its own products, or dequantized into the FP16 path below
+                    const bool bih3_own = lay.mixed() && !bih3_prompt_f16(T * K, routed);
+                    // ---- the latent MoE (Edge0): the experts run at the latent width on the GPU, D and U the
+                    // shell's projections around them.  Where this layer takes the int8 products, its experts are the
+                    // standard path's below (latent_mmq_d before them, latent_mmq_u after); else the dp4a arm
+                    // (Prefill::latent_experts).  XESTRATA_LATENT_FUSED=0 takes the dp4a arm.
+                    const bool lat_std = m.latent_ && latent_on_standard_path() && mmq_plan().layer[(size_t) l];
+                    if (m.latent_ && !lat_std) {
+                        if (!latent_experts(l, T, K, m, err)) return false;
                     } else {
-                        gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
-                        // APR: Hadamard-folded gate/up take H (s * x); Xs is this layer's own gathered copy (rotated in
-                        // FP16 storage, in float arithmetic)
-                        if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, T * K, N, had_block, had_sx, m.cs);
-                        // the grouped products' row bounds, `order`'s first rows and the total
-                        m.xb_host.resize(order.size() + 1);
-                        for (size_t j = 0; j < order.size(); ++j) m.xb_host[j] = m.off[(size_t) order[j]];
-                        m.xb_host[order.size()] = (int32_t) rows_gpu;
-                        m.xb_host.to_device(m.xb_dev, m.cs);
-                        // F8: the fusable resident experts, kIqGemmGroup a launch
-                        std::vector<const void*> fgu, fd;
-                        for (size_t j0 = 0; j0 < nf; j0 += (size_t) strata::kernels::kIqGemmGroup) {
-                            const size_t j1 = std::min(nf, j0 + (size_t) strata::kernels::kIqGemmGroup);
-                            fgu.clear();
-                            fd.clear();
-                            int64_t maxr = 0;
-                            for (size_t j = j0; j < j1; ++j) {
-                                const int32_t e = order[j];
-                                const uint8_t* b = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
-                                fgu.push_back(b);
-                                fd.push_back(b + ffmt->down_off);
+                        const int64_t below = mmq_plan().int8_below;
+                        // a chunk the CPU may share: the canonical layers' experts on the GPU in the CPU's bits (not a
+                        // latent pack's: its D stage's rows are quantized column-scaled, without the canonical rule)
+                        const bool canon_l = cpu_maybe && !m.latent_ && lay.native && mmq_plan().any &&
+                                             mmq_plan().layer[(size_t) l] && canon_prefill_layer(lay.fmt[(size_t) l]);
+                        const bool use_mmq =
+                            canon_l || (mmq_plan().any && mmq_plan().layer[(size_t) l] &&
+                                        (below == INT64_MAX || T * K < below * std::max<int64_t>(routed, 1)));
+                        // set_helper: the experts the helper GPU computes this layer, the ones it holds that this GPU
+                        // would stream and at most max_rows tokens route to (their rows last, after the CPU's)
+                        std::vector<char> on_help;
+                        int64_t rows_help = 0, n_help = 0;
+                        if (helper_ && !stream_all && lay_c.native && !lay_c.mixed() && !m.latent_) {
+                            HelperShare& hs = *helper_;
+                            for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                                const int32_t c = m.cnt[(size_t) e];
+                                if (c == 0 || c > hs.max_rows || rows_help + c > hs.cap ||
+                                    (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) ||
+                                    !hs.h->holds(l, e))
+                                    continue;
+                                if (on_help.empty()) on_help.assign((size_t) m.g->n_expert, 0);
+                                on_help[(size_t) e] = 1;
+                                rows_help += c;
+                                ++n_help;
+                            }
+                        }
+                        auto helped = [&](int32_t e) { return !on_help.empty() && on_help[(size_t) e]; };
+                        // set_cpu_pool: the experts the CPU computes this layer (their rows after the GPU's, before the
+                        // helper's: [rows_gpu, rows_gpu + rows_cpu))
+                        std::vector<char> on_cpu;
+                        std::vector<const uint8_t*> cpu_blob;   // their blobs, taken here (the CPU thread calls no ExpertSource)
+                        int64_t rows_cpu = 0, n_cpu = 0, n_stream = 0;
+                        if (cpu_maybe) {
+                            // the candidates (core/expert_tier, as the other models' prompt path takes them)
+                            const strata::core::CpuShareCandidates cc = strata::core::cpu_share_candidates(
+                                m.cnt.data(), m.g->n_expert, l, *m.src,
+                                [&](int32_t e) {
+                                    return m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                                },
+                                helped, strata::core::cpu_share_batched(T, true) ? T : share_nt());
+                            const std::vector<std::pair<int32_t, int32_t>>& cand = cc.cand;   // (tokens, expert)
+                            n_stream = cc.missed;
+                            // how many: core's rule (the share measured on this prompt's layers; the gate's arm without
+                            // the share takes none)
+                            const int64_t take = std::min<int64_t>(
+                                (int64_t) cand.size(),
+                                !cpu_arm
+                                    ? 0
+                                    : strata::core::cpu_share_count(n_stream, 0, cpu_share_env(), &m.cpu_meter, nullptr));
+                            // the MoE input for the CPU's experts, only when it takes some (a layer whose experts all have
+                            // more rows than the CPU takes, MAXT, copied the whole input for nothing: 323 MB at 32K tokens)
+                            if (take > 0 && (!strata::gpu::copy_async(m.cpu_x, m.mixed, (size_t) T * N * sizeof(float), m.cs) ||
+                                             !strata::gpu::stream_sync(m.cs))) {
+                                err = std::string("prefill: the CPU share's input: ") + strata::gpu::last_error();
+                                return false;
+                            }
+                            n_cpu = strata::core::cpu_share_take(
+                                cand, take, INT64_MAX, [&](int32_t e) { return m.src->blob(l, e); },
+                                [&](int32_t e, int32_t rows, const uint8_t* b) {
+                                    if (on_cpu.empty()) {
+                                        on_cpu.assign((size_t) m.g->n_expert, 0);
+                                        cpu_blob.assign((size_t) m.g->n_expert, nullptr);
+                                    }
+                                    on_cpu[(size_t) e] = 1;
+                                    cpu_blob[(size_t) e] = b;
+                                    rows_cpu += rows;
+                                });
+                        }
+                        auto gpu_side = [&](int32_t e) { return (on_cpu.empty() || !on_cpu[(size_t) e]) && !helped(e); };
+                        // The experts, in id order: resident ones from VRAM, the others through the staging ring.  F8:
+                        // first, out of that order, the resident experts of at most kIqGemmTileRows rows, whose products
+                        // iq_gemm_grouped_f16 takes straight from their GGUF blocks in the cache (dequantized in local
+                        // memory to the same FP16 values: the same bits as dequantizing and multiplying, without writing
+                        // 9.4 MiB an expert; more rows than one work-group's would decode the weights again per group).
+                        // The rows are laid out in this order, so the others' groups stay contiguous.
+                        // STRATA_PREFILL_FUSED=0: every expert dequantized.
+                        static const bool fused_on = [] {
+                            const char* v = strata::env_get("PREFILL_FUSED");
+                            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+                        }();
+                        const strata::kernels::cpu::NativeFmt* ffmt = lay.native ? &lay.fmt[(size_t) l] : nullptr;
+                        // A mixed (R1Q2) layer on the FP16 path takes its resident experts the same way
+                        // (bih3_r1q2_gemm_grouped_f16: the codes decoded in the tile to bih3_r1q2_dequant_f16's values).
+                        const bool fuse_bih3 = lay.mixed() && !bih3_own && ffmt != nullptr && ffmt->n_embd % 128 == 0 &&
+                                               ffmt->n_ff % 128 == 0;
+                        const bool fuse_res = fused_on && !use_mmq && ffmt != nullptr && m.host_res && m.cache &&
+                                              strata::kernels::has_form(strata::kernels::MatrixForm::f16_from_blocks) &&
+                                              (fuse_bih3 ||
+                                               (!lay.mixed() && ffmt->up_off == (size_t) ffmt->n_ff * ffmt->gu_row &&
+                                                strata::kernels::iq_gemm_grouped_ok(ffmt->gu_type, 2 * ffmt->n_ff, ffmt->n_embd) &&
+                                                strata::kernels::iq_gemm_grouped_ok(ffmt->d_type, ffmt->n_embd, ffmt->n_ff)));
+                        auto fusable = [&](int32_t e) {
+                            return fuse_res && m.cnt[(size_t) e] <= strata::kernels::kIqGemmTileRows &&
+                                   m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                        };
+                        std::vector<int32_t> order;
+                        for (int32_t e = 0; e < m.g->n_expert; ++e)
+                            if (m.cnt[(size_t) e] > 0 && gpu_side(e) && fusable(e)) order.push_back(e);
+                        const size_t nf = order.size();
+                        for (int32_t e = 0; e < m.g->n_expert; ++e)
+                            if (m.cnt[(size_t) e] > 0 && gpu_side(e) && !fusable(e)) order.push_back(e);
+                        // upstream 62fc7c8a (STRATA_MMQ_GROUP_SORT): an MMQ group's launch covers its largest expert's
+                        // rows (max_rows), so a layer whose GPU experts are all resident takes them in falling row count:
+                        // the groups' padding shrinks.  XeStrata's int8 products give each row the same bits whatever its
+                        // group-mates (no stream-k split), so the order changes no answer.  The streamed walk reads its
+                        // entries in id order: only a layer with nothing streamed.  STRATA_MMQ_GROUP_SORT=0: id order.
+                        static const bool group_sort = [] {
+                            const char* v = strata::env_get("MMQ_GROUP_SORT");
+                            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+                        }();
+                        // (a layer with streamed experts: only where the experts average kSortMeanRows rows or fewer)
+                        int64_t order_rows = 0;
+                        for (const int32_t e : order) order_rows += m.cnt[(size_t) e];
+                        const bool few_rows = order_rows <= kSortMeanRows * (int64_t) order.size();
+                        if (group_sort && use_mmq && nf == 0 && m.host_res && m.cache && order.size() > (size_t) MMQ_GROUP &&
+                            ((group_sort_mixed() && few_rows) || std::all_of(order.begin(), order.end(), [&](int32_t e) {
+                                return m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            }))) {
+                            const auto streamed_from = std::stable_partition(order.begin(), order.end(), [&](int32_t e) {
+                                return m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            });
+                            std::stable_sort(order.begin(), streamed_from,
+                                             [&](int32_t a, int32_t b) { return m.cnt[(size_t) a] > m.cnt[(size_t) b]; });
+                        }
+                        // stream_window_on: the streamed experts by the stream's windows, each in falling row count;
+                        // stream_k[j]: order[j]'s entry of the stream (-1: resident), grp_cut[j]: a group ends before j
+                        const bool window_walk = stream_all && use_mmq && m.mring == nullptr && !bih3_own && nf == 0 &&
+                                                 few_rows && stream_window_on() && m.host_res && m.cache;
+                        const size_t win_entries = (size_t) std::max(m.ring / 2, 1);
+                        std::vector<int64_t> stream_k;
+                        std::vector<char> grp_cut, win_landed;   // win_landed[w]: window w's copies had landed here
+                        if (window_walk) {
+                            const auto streamed_from = std::stable_partition(order.begin(), order.end(), [&](int32_t e) {
+                                return m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            });
+                            const size_t n_res = (size_t) (streamed_from - order.begin());
+                            std::vector<char> routed_gpu((size_t) m.g->n_expert, 0);
+                            for (size_t j = n_res; j < order.size(); ++j) routed_gpu[(size_t) order[j]] = 1;
+                            stream_k.assign(order.size(), -1);
+                            grp_cut.assign(order.size(), 0);
+                            const size_t k0 = seq_start[(size_t) l], k1 = seq_start[(size_t) l + 1];
+                            size_t j = n_res;
+                            for (size_t w0 = k0; w0 < k1; w0 += win_entries) {
+                                const size_t jw = j;
+                                for (size_t kk = w0; kk < std::min(k1, w0 + win_entries); ++kk)
+                                    if (routed_gpu[(size_t) seq[kk].e]) {
+                                        order[j] = seq[kk].e;
+                                        stream_k[j++] = (int64_t) kk;
+                                    }
+                                if (j > jw && jw > 0) grp_cut[jw] = 1;
+                                // its last copy issued (the copy queue is in order) and done
+                                const size_t klast = std::min(k1, w0 + win_entries) - 1;
+                                const bool landed = (threaded_issue ? a_issued.load(std::memory_order_acquire) > klast
+                                                                    : klast < issued) &&
+                                                    strata::gpu::event_query(m.copied[klast % (size_t) m.ring]);
+                                win_landed.push_back((char) landed);
+                                if (!landed) continue;
+                                // (order and stream_k together: the pairs sorted by the rows, the stream's order kept)
+                                std::vector<size_t> idx(j - jw);
+                                for (size_t i = 0; i < idx.size(); ++i) idx[i] = jw + i;
+                                std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+                                    return m.cnt[(size_t) order[a]] > m.cnt[(size_t) order[b]];
+                                });
+                                std::vector<int32_t> oe(idx.size());
+                                std::vector<int64_t> ok(idx.size());
+                                for (size_t i = 0; i < idx.size(); ++i) { oe[i] = order[idx[i]]; ok[i] = stream_k[idx[i]]; }
+                                for (size_t i = 0; i < idx.size(); ++i) { order[jw + i] = oe[i]; stream_k[jw + i] = ok[i]; }
+                            }
+                            if (j != order.size()) { err = "prefill: a streamed expert is not in the chunk's stream"; return false; }
+                        }
+                        {
+                            int32_t at = 0;
+                            for (const int32_t e : order) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
+                            for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)   // the CPU's block
+                                if (on_cpu[(size_t) e]) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
+                            for (int32_t e = 0; e < m.g->n_expert && !on_help.empty(); ++e)   // the helper's, last
+                                if (on_help[(size_t) e]) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
+                            m.off[(size_t) m.g->n_expert] = at;
+                        }
+                        const int64_t rows_gpu = T * K - rows_cpu - rows_help;
+                        std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
+                        for (int64_t i = 0; i < T * K; ++i) {
+                            const int32_t e = m.ids_host[(size_t) i];
+                            const int32_t p = fill[(size_t) e]++;
+                            m.slot_host[(size_t) i] = p;
+                            m.src_host[(size_t) p] = m.latent_ ? (int32_t) (i / K) * m.lat_G_ + m.lat_labels_[(size_t) (l * m.g->n_expert + e)]
+                                                               : (int32_t) (i / K);
+                        }
+                        m.src_host.to_device(m.src_dev, m.cs);
+                        // latent: D, and U's tables (the combine's slots are U's rows, latent_mmq_d uploads them)
+                        if (m.latent_) {
+                            if (!latent_mmq_d(l, T, K, m, err)) return false;
+                        } else {
+                            m.slot_host.to_device(m.slot_dev, m.cs);
+                        }
+                        // set_helper: its rows' tokens gathered here and copied to the shared host rows (the host waits
+                        // for them: the helper's stream cannot wait on this GPU's), then its products, queued on its own
+                        // stream; the results come back at the combine
+                        if (rows_help > 0) {
+                            HelperShare& hs = *helper_;
+                            const auto& hf = lay.fmt[(size_t) l];
+                            const int64_t r0 = rows_gpu + rows_cpu;
+                            if (hs.tok_of.size() < (size_t) T) hs.tok_of.resize((size_t) T);
+                            hs.toks.clear();
+                            int32_t* src = hs.h_meta;
+                            int32_t* bounds = hs.h_meta + hs.cap;
+                            int64_t ne = 0, maxr = 0;
+                            for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                                if (!helped(e)) continue;
+                                bounds[ne] = m.off[(size_t) e] - (int32_t) r0;
+                                hs.h_wtab[ne++] = hs.h->blob_on_device(l, e);
                                 maxr = std::max<int64_t>(maxr, m.cnt[(size_t) e]);
                             }
-                            const int G = (int) (j1 - j0);
-                            const int64_t r0 = m.xb_host[j0], nr = m.xb_host[j1] - r0;
-                            pt.mark(kPfGemmGU, cs);
-                            strata::kernels::iq_gemm_grouped_f16(ffmt->gu_type, m.Xs, fgu.data(), ffmt->n_ff, m.GU, kFF2,
-                                                                 m.xb_dev + j0, G, maxr, kFF2, N, m.cs);
-                            swiglu_interleaved(m.GU + r0 * kFF2, m.Hh + r0 * kFF, nr, m.cs);
-                            if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + r0 * kFF, nr, kFF, had_block, had_sh, m.cs);
-                            pt.mark(kPfGemmD, cs);
-                            strata::kernels::iq_gemm_grouped_f16(ffmt->d_type, m.Hh, fd.data(), 0, m.Dm, N,
-                                                                 m.xb_dev + j0, G, maxr, N, kFF, m.cs);
-                            stats_.experts_resident += G;
+                            bounds[ne] = (int32_t) rows_help;
+                            for (int64_t p = 0; p < rows_help; ++p) {
+                                const int32_t t = m.src_host[(size_t) (r0 + p)];
+                                if (hs.tok_of[(size_t) t] < 0) {
+                                    hs.tok_of[(size_t) t] = (int32_t) hs.toks.size();
+                                    hs.toks.push_back(t);
+                                }
+                                src[p] = hs.tok_of[(size_t) t];
+                            }
+                            for (const int32_t t : hs.toks) hs.tok_of[(size_t) t] = -1;
+                            const int64_t U = (int64_t) hs.toks.size();
+                            if (!strata::gpu::copy_async(hs.tok_dev, hs.toks.data(), (size_t) U * sizeof(int32_t), m.cs)) {
+                                err = std::string("prefill: the helper's tokens: ") + strata::gpu::last_error();
+                                return false;
+                            }
+                            gather_rows(m.mixed, hs.tok_dev, hs.xg, U, N, m.cs);
+                            if (!strata::gpu::copy_async(hs.x_ex, hs.xg, (size_t) U * N * sizeof(float), m.cs) ||
+                                !strata::gpu::stream_sync(m.cs)) {
+                                err = std::string("prefill: the helper's rows: ") + strata::gpu::last_error();
+                                return false;
+                            }
+                            try {
+                                const core::OnDevice on(hs.dev);
+                                const strata::gpu::Stream q = hs.s;
+                                int32_t* d_src = hs.meta;
+                                int32_t* d_bounds = hs.meta + hs.cap;
+                                const int32_t* d_ident = hs.meta + 2 * hs.cap + 1;
+                                const bool up_mixed = strata::kernels::cpu::native_mixed_gu(hf);
+                                const int up_type = up_mixed ? hf.up_type : hf.gu_type;
+                                const bool up_xq2 = strata::kernels::iq_mmq_type_dup(up_type) != strata::kernels::iq_mmq_type_dup(hf.gu_type);
+                                if (!strata::gpu::copy_async(hs.x, hs.x_ex, (size_t) U * N * sizeof(float), q) ||
+                                    !strata::gpu::copy_async(d_src, src, (size_t) rows_help * sizeof(int32_t), q) ||
+                                    !strata::gpu::copy_async(d_bounds, bounds, (size_t) (ne + 1) * sizeof(int32_t), q) ||
+                                    (hs.live == false && !strata::gpu::copy_async(const_cast<int32_t*>(d_ident), hs.h_meta + 2 * hs.cap + 1,
+                                                                                  (size_t) hs.cap * sizeof(int32_t), q)) ||
+                                    !strata::gpu::copy_async(static_cast<void*>(hs.wtab), static_cast<const void*>(hs.h_wtab),
+                                                             (size_t) ne * sizeof(void*), q)) {
+                                    err = std::string("prefill: the helper's tables: ") + strata::gpu::last_error();
+                                    return false;
+                                }
+                                mmq::quantize(hs.x, d_src, hs.xq, hf.gu_type, N, N, rows_help, q);
+                                if (up_mixed && up_xq2) mmq::quantize(hs.x, d_src, hs.xq2, up_type, N, N, rows_help, q);
+                                const int64_t ff = hf.n_ff;
+                                mmq::Product gu;
+                                gu.type = hf.gu_type; gu.w_rows = 2 * ff; gu.w_cols = N; gu.n = (int) ne; gu.xq = hs.xq;
+                                gu.bounds = d_bounds; gu.ids = d_ident; gu.total_rows = rows_help; gu.max_rows = maxr;
+                                gu.rows = rows_help; gu.dst = hs.gu; gu.ld_dst = 2 * ff; gu.wtab = hs.wtab; gu.woff = 0;
+                                if (up_mixed) {   // the gate rows, then the up rows in their own type
+                                    gu.w_rows = ff;
+                                    hs.ctx->run(gu, q);
+                                    gu.type = up_type; gu.xq = up_xq2 ? hs.xq2 : hs.xq; gu.dst = hs.gu + ff; gu.woff = hf.up_off;
+                                }
+                                hs.ctx->run(gu, q);
+                                mmq::Product dn;
+                                dn.type = hf.d_type; dn.w_rows = N; dn.w_cols = ff; dn.n = (int) ne; dn.xq = hs.hq;
+                                dn.bounds = d_bounds; dn.ids = d_ident; dn.total_rows = rows_help; dn.max_rows = maxr;
+                                dn.rows = rows_help; dn.dst = hs.d; dn.ld_dst = N; dn.wtab = hs.wtab; dn.woff = hf.down_off;
+                                // NVFP4: the experts' tail scales (s_gate / s_up into the SwiGLU, s_down on the down
+                                // rows), as the main path's: without them the helper's rows combine unscaled
+                                const bool nv_tail = hf.tail_off != 0;
+                                const mmq::TailAt tails = mmq::tails_of(dn, mmq::matrix_bytes(hf.d_type, N, ff));
+                                if (nv_tail) mmq::swiglu_tails(hs.gu, hs.hh, rows_help, ff, d_bounds, (int) ne, tails, q);
+                                else mmq::swiglu(hs.gu, hs.hh, rows_help, ff, /*interleaved=*/false, q);
+                                mmq::quantize(hs.hh, nullptr, hs.hq, hf.d_type, ff, ff, rows_help, q);
+                                hs.ctx->run(dn, q);
+                                if (nv_tail) mmq::scale_rows_tails(hs.d, N, N, rows_help, d_bounds, (int) ne, tails, q);
+                                if (!strata::gpu::copy_async(hs.d_ex, hs.d, (size_t) rows_help * N * sizeof(float), q)) {
+                                    err = std::string("prefill: the helper's results: ") + strata::gpu::last_error();
+                                    return false;
+                                }
+                            } catch (const std::exception& e) {
+                                err = std::string("prefill: the helper GPU: ") + e.what();
+                                return false;
+                            }
+                            hs.live = true;
+                            hs.rows = rows_help;
                         }
-                    }
-                    // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
-                    int stage_next = 0;
-                    std::vector<int> stage_of(order.size(), -1);
-                    // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
-                    std::vector<int> job_of(order.size(), -1);
-                    if (!stream_all) {
-                        std::vector<Stager::Job> js;
-                        for (size_t j = 0; j < order.size(); ++j) {
+                        // set_cpu_pool: the CPU's experts on a thread while this one streams and runs the GPU's; their
+                        // unweighted rows land in Dm's row order, so the combine weights them as any other row.  The
+                        // blobs are taken here: the thread calls no ExpertSource (upstream 667f2eca)
+                        std::future<bool> cpu_fut;
+                        double cpu_ms = 0;
+                        if (rows_cpu > 0) {
+                            // (the rows buffer was had at its largest after the routing sync)
+                            const strata::kernels::cpu::NativeFmt& cf = lay.fmt[(size_t) l];
+                            m.cpu_jobs.clear();
+                            for (int32_t e = 0; e < m.g->n_expert; ++e) {
+                                if (!on_cpu[(size_t) e]) continue;
+                                for (int start = 0; start < m.cnt[(size_t) e]; start += strata::kernels::cpu::MAXT) {
+                                    strata::kernels::cpu::ExpertJobMulti j;
+                                    j.blob = cpu_blob[(size_t) e];
+                                    j.nt = std::min(strata::kernels::cpu::MAXT, m.cnt[(size_t) e] - start);
+                                    for (int r = 0; r < j.nt; ++r)   // the activations are set on the thread
+                                        j.out[r] = m.cpu_rows + (size_t) ((int64_t) m.off[(size_t) e] + start + r - rows_gpu) * N;
+                                    m.cpu_jobs.push_back(j);
+                                }
+                            }
+                            if (cpu_share_env() < 0.0) {
+                                if (m.cpu_ev[0] == nullptr &&
+                                    (!strata::gpu::event_create(&m.cpu_ev[0], true) || !strata::gpu::event_create(&m.cpu_ev[1], true))) {
+                                    err = "prefill: CPU share events";
+                                    return false;
+                                }
+                                strata::gpu::event_record(m.cpu_ev[0], m.cs);
+                            }
+                            cpu_fut = std::async(std::launch::async, [&m, &cf, &cpu_ms, T, rows_gpu, rows_cpu, pool = cpu_pool_]() -> bool {
+                                const auto t0 = std::chrono::steady_clock::now();
+                                if (m.cpu_nact.size() < (size_t) T) m.cpu_nact.resize((size_t) T);
+                                std::vector<char> need((size_t) T, 0);   // the tokens the CPU's experts read
+                                std::vector<int32_t> toks;
+                                for (int64_t p = rows_gpu; p < rows_gpu + rows_cpu; ++p) {
+                                    const int32_t t = m.src_host[(size_t) p];
+                                    if (!need[(size_t) t]) { need[(size_t) t] = 1; toks.push_back(t); }
+                                }
+                                // upstream 431a26db1: each token's activation quantized on the pool, 32 tokens a piece
+                                pool->run_items((int) toks.size(), 32, 64, [&](int i) {
+                                    const int64_t t = toks[(size_t) i];
+                                    strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact[(size_t) t].bytes);
+                                });
+                                for (auto& j : m.cpu_jobs)
+                                    for (int r = 0; r < j.nt; ++r) {
+                                        const int64_t p = rows_gpu + (int64_t) (j.out[r] - m.cpu_rows) / N;
+                                        const int64_t tok = m.src_host[(size_t) p];
+                                        j.nact[r] = m.cpu_nact[(size_t) tok].bytes;
+                                    }
+                                pool->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
+                                cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                                return true;
+                            });
+                        }
+                        struct CpuJoin {   // an early return waits for the thread (it reads this layer's tables)
+                            std::future<bool>& f;
+                            ~CpuJoin() { if (f.valid()) f.wait(); }
+                        } cpu_join{cpu_fut};
+                        const int mmq_gt = canon_l ? strata::kernels::iq_mmq_fx(lay.fmt[(size_t) l].gu_type)
+                                                   : lay.native ? lay.fmt[(size_t) l].gu_type : 42;
+                        const int mmq_dt = canon_l ? strata::kernels::iq_mmq_fx(lay.fmt[(size_t) l].d_type)
+                                                   : lay.native ? lay.fmt[(size_t) l].d_type : 42;
+                        // APR (prism.hadamard): folded gate/up take H (s * x), folded down H (s * h), on the FP16 path
+                        // (mmq_plan gives such a layer no int8 products); the CPU's rows rotate in native_quant_act
+                        const bool had_gu = lay.native && lay.fmt[(size_t) l].had_gu;
+                        const bool had_d = lay.native && lay.fmt[(size_t) l].had_d;
+                        const int had_block = lay.native ? lay.fmt[(size_t) l].had_block : 0;
+                        const float* had_sx = had_gu ? strata::kernels::hadamard_device_signs(lay.fmt[(size_t) l].gu_signs,
+                                                                                              (int) lay.fmt[(size_t) l].n_embd)
+                                                     : nullptr;
+                        // the sign vectors at the layout's widths (upstream dd32704d4), this device's copies made once
+                        const float* had_sh = had_d ? strata::kernels::hadamard_device_signs(lay.fmt[(size_t) l].d_signs,
+                                                                                             (int) lay.fmt[(size_t) l].n_ff)
+                                                    : nullptr;
+                        // the experts' width: the shell's, or the latent one (their rows are the D stage's, their
+                        // outputs U's rows)
+                        const int64_t ew = lay.native ? lay.fmt[(size_t) l].n_embd : N;
+                        float* const ex_out = m.latent_ ? m.lmmq_yl_ : m.Dm;
+                        const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, kFF2, ew) : 0;
+                        // NVFP4: a down slot keeps the expert's tail after its rows (the gathers copy it with them)
+                        const size_t mmq_dmat = use_mmq ? mmq::matrix_bytes(mmq_dt, ew, kFF) : 0;
+                        const bool nv_tail = use_mmq && lay.native && lay.fmt[(size_t) l].tail_off != 0;
+                        const size_t mmq_db = mmq_dmat + (nv_tail ? strata::kernels::nvfp4::kTailBytes : 0);
+                        // STRATA_PF_DM16 (pf_dm16_on): the down products' rows as FP16 - not for a latent pack's (its
+                        // rows go to U's product) nor NVFP4's (their tail scales are applied to FP32 rows)
+                        const bool dm16 = pf_dm16_on() && use_mmq && rows_cpu == 0 && rows_help == 0 && !m.latent_ &&
+                                          !nv_tail;
+                        host_group_ms += ms_since(t_group);
+                        // XeStrata-890M: when every expert the layer routes is in the cache (a GPU whose cache holds them
+                        // all, the host-USM cache of the 890M among them), the int8 products read the blobs where they lie,
+                        // through a table of their addresses (wtab), instead of gathering each group into the group buffers
+                        // (a launch and 1.5 MB of copies an expert) or copying each into the MMQ ring (chunks below
+                        // STREAM_ALL_MIN).  The products then read host USM, which the GPU does not cache, a little slower,
+                        // but less than the copies cost: on the 890M a varied 3,481-token prompt 16.8 -> 16.4 s, a
+                        // 523-token one 3.5 -> 3.2 s.  The same products of the same bytes: the same results.
+                        // STRATA_PREFILL_MMQ_INPLACE=0: as before.
+                        static const bool inplace_env = [] {
+                            const char* v = strata::env_get("PREFILL_MMQ_INPLACE");
+                            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+                        }();
+                        bool in_place = use_mmq && inplace_env && !m.latent_ && m.wtab_dev != nullptr && m.host_res && m.cache;
+                        for (size_t j = 0; in_place && j < order.size(); ++j)
+                            if (m.host_res[(size_t) l * m.g->n_expert + order[j]] < 0) in_place = false;
+                        const int GRP = in_place ? inplace_group() : MMQ_GROUP;   // experts a launch
+                        if (in_place) {
+                            m.wtab_host.resize(2 * order.size());
+                            for (size_t j = 0; j < order.size(); ++j) {
+                                const uint8_t* b = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + order[j]]);
+                                const uint64_t a = (uint64_t) (uintptr_t) b;
+                                m.wtab_host[2 * j] = (int32_t) (uint32_t) (a & 0xffffffffu);
+                                m.wtab_host[2 * j + 1] = (int32_t) (uint32_t) (a >> 32);
+                            }
+                            m.wtab_host.to_device(reinterpret_cast<int32_t*>(m.wtab_dev), m.cs);
+                        }
+                        pt.mark(kPfGather, cs);
+                        if (bih3_own) {
+                            const float* x = m.mixed;
+                            if (had_gu) {
+                                strata::kernels::hadamard_rows(x, m.bih3_rotated, T, N, had_block, had_sx, m.cs);
+                                x = m.bih3_rotated;
+                            }
+                            strata::kernels::quantize_q8_1_rows(x, T, N, m.bih3_xq, m.cs);
+                        } else if (use_mmq) {
+                            // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
+                            if (m.latent_)   // the D stage's rows, each route's of its expert's group, column-scaled
+                                mmq::quantize(m.lmmq_xl_, m.src_dev, m.Xq, mmq_gt, ew, ew, T * K, m.cs, 0,
+                                              strata::kernels::latent_colscale_dev((int) l, (int) ew));
+                            else
+                                mmq::quantize_scatter(m.mixed, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K,
+                                                      m.cs, canon_l ? 256 : 0);
+                            // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
+                            // reads the group's own quantized H)
+                            // the groups: up to GRP experts in `order`, ended early when the rows would pass the
+                            // group scratch's cap (mmq_group_rows_cap)
+                            const size_t n = order.size(), G = (size_t) GRP;
+                            const int64_t cap = mmq_group_rows_cap(T);
+                            m.grp_start.clear();
+                            m.grp_of.assign(n, 0);
+                            m.grp_pos.assign(n, 0);
+                            for (size_t j = 0, rows = 0; j < n; ++j) {
+                                const int64_t c = m.cnt[(size_t) order[j]];
+                                if (m.grp_start.empty() || j - (size_t) m.grp_start.back() >= G ||
+                                    (int64_t) rows + c > cap || (window_walk && grp_cut[j])) {
+                                    m.grp_start.push_back((int32_t) j);
+                                    rows = 0;
+                                }
+                                m.grp_of[j] = (int32_t) (m.grp_start.size() - 1);
+                                m.grp_pos[j] = (int32_t) (j - (size_t) m.grp_start.back());
+                                rows += (size_t) c;
+                            }
+                            m.grp_start.push_back((int32_t) n);
+                            const size_t ng = m.grp_start.size() - 1;
+                            m.bounds_host.resize(n + 1 + ng * (G + 1));
+                            for (size_t j = 0; j < n; ++j) m.bounds_host[j] = m.off[(size_t) order[j]];
+                            m.bounds_host[n] = (int32_t) rows_gpu;
+                            m.ids_rel_host.resize((size_t) (T * K));
+                            for (size_t g = 0; g < ng; ++g) {
+                                const size_t j0 = (size_t) m.grp_start[g], j1 = (size_t) m.grp_start[g + 1];
+                                for (size_t i = 0; i <= G; ++i)
+                                    m.bounds_host[n + 1 + g * (G + 1) + i] =
+                                        m.bounds_host[std::min(j1, j0 + i)] - m.bounds_host[j0];
+                                // the gate/up product writes a group's rows from 0 (GU holds one group): row r -> r - first
+                                for (int32_t r = m.bounds_host[j0]; r < m.bounds_host[j1]; ++r)
+                                    m.ids_rel_host[(size_t) r] = r - m.bounds_host[j0];
+                            }
+                            m.bounds_host.to_device(m.bounds_dev, m.cs);
+                            m.ids_rel_host.to_device(m.ids_rel, m.cs);
+                        } else {
+                            gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
+                            // APR: Hadamard-folded gate/up take H (s * x); Xs is this layer's own gathered copy (rotated in
+                            // FP16 storage, in float arithmetic)
+                            if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, T * K, N, had_block, had_sx, m.cs);
+                            // the grouped products' row bounds, `order`'s first rows and the total
+                            m.xb_host.resize(order.size() + 1);
+                            for (size_t j = 0; j < order.size(); ++j) m.xb_host[j] = m.off[(size_t) order[j]];
+                            m.xb_host[order.size()] = (int32_t) rows_gpu;
+                            m.xb_host.to_device(m.xb_dev, m.cs);
+                            // F8: the fusable resident experts, kIqGemmGroup a launch
+                            std::vector<const void*> fgu, fd;
+                            std::vector<int32_t> fk;
+                            strata::kernels::Bih3R1q2Layer bl;
+                            if (fuse_bih3) {
+                                bl.n_embd = (int) ffmt->n_embd; bl.n_ff = (int) ffmt->n_ff;
+                                std::memcpy(bl.p2, lay.format(l, 0).p2, sizeof bl.p2);
+                            }
+                            for (size_t j0 = 0; j0 < nf; j0 += (size_t) strata::kernels::kIqGemmGroup) {
+                                const size_t j1 = std::min(nf, j0 + (size_t) strata::kernels::kIqGemmGroup);
+                                fgu.clear();
+                                fd.clear();
+                                fk.clear();
+                                int64_t maxr = 0;
+                                for (size_t j = j0; j < j1; ++j) {
+                                    const int32_t e = order[j];
+                                    const uint8_t* b = m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]);
+                                    fgu.push_back(b);
+                                    if (fuse_bih3) {
+                                        const auto& f = lay.format(l, e);
+                                        fk.push_back((f.gu_type - 180) | (f.d_type - 180) << 8);
+                                    } else {
+                                        fd.push_back(b + ffmt->down_off);
+                                    }
+                                    maxr = std::max<int64_t>(maxr, m.cnt[(size_t) e]);
+                                }
+                                const int G = (int) (j1 - j0);
+                                const int64_t r0 = m.xb_host[j0], nr = m.xb_host[j1] - r0;
+                                pt.mark(kPfGemmGU, cs);
+                                if (fuse_bih3)
+                                    strata::kernels::bih3_r1q2_gemm_grouped_f16(bl, false, m.Xs, fgu.data(), fk.data(), m.GU,
+                                                                                kFF2, m.xb_dev + j0, G, maxr, m.cs);
+                                else
+                                    strata::kernels::iq_gemm_grouped_f16(ffmt->gu_type, m.Xs, fgu.data(), ffmt->n_ff, m.GU,
+                                                                         kFF2, m.xb_dev + j0, G, maxr, kFF2, N, m.cs);
+                                swiglu_interleaved(m.GU + r0 * kFF2, m.Hh + r0 * kFF, nr, m.cs);
+                                if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + r0 * kFF, nr, kFF, had_block, had_sh, m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                if (fuse_bih3)
+                                    strata::kernels::bih3_r1q2_gemm_grouped_f16(bl, true, m.Hh, fgu.data(), fk.data(), m.Dm, N,
+                                                                                m.xb_dev + j0, G, maxr, m.cs);
+                                else
+                                    strata::kernels::iq_gemm_grouped_f16(ffmt->d_type, m.Hh, fd.data(), 0, m.Dm, N,
+                                                                         m.xb_dev + j0, G, maxr, N, kFF, m.cs);
+                                stats_.experts_resident += G;
+                            }
+                        }
+                        // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
+                        int stage_next = 0;
+                        std::vector<int> stage_of(order.size(), -1);
+                        // the unpinned ones are copied to pinned buffers by the stager's threads, in this order
+                        std::vector<int> job_of(order.size(), -1);
+                        if (!stream_all) {
+                            std::vector<Stager::Job> js;
+                            for (size_t j = 0; j < order.size(); ++j) {
+                                const int32_t e = order[j];
+                                if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                                const bool tr = m.src->transient(l, e);   // copied by the source (never pinned)
+                                if (!tr && m.src->pinned(l, e)) continue;
+                                const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
+                                if (!tr && !b) { err = "prefill: expert source has no blob"; return false; }
+                                job_of[j] = (int) js.size();
+                                js.push_back({b, (size_t) lay.blob_bytes(l, e), tr ? m.src : nullptr, (int32_t) l, e});
+                            }
+                            if (m.warmer) {   // STRATA_PREFILL_WARM: this layer's list, and the next layer's of the last chunk
+                                std::vector<int64_t> cur;
+                                for (size_t j = 0; j < order.size(); ++j)
+                                    if (job_of[j] >= 0) cur.push_back(order[j]);
+                                m.warm_prev[(size_t) l] = cur;
+                                m.warmer->submit(l, std::move(cur));
+                                if (l + 1 < m.g->n_layers) {
+                                    std::vector<int64_t> nxt;
+                                    for (const int64_t e : m.warm_prev[(size_t) (l + 1)]) {
+                                        if (m.host_res && m.cache && m.host_res[(size_t) (l + 1) * m.g->n_expert + e] >= 0) continue;
+                                        if (m.src->pinned(l + 1, (int32_t) e)) continue;
+                                        nxt.push_back(e);
+                                    }
+                                    m.warmer->submit(l + 1, std::move(nxt));
+                                }
+                            }
+                            m.stager->start(std::move(js));
+                        }
+                        StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
+                        // MMQ in place (MMQ_RING): expert j's blob in ring slot j % MMQ_RING, its group's slots released
+                        // together; else the STAGE ring, a slot at a time
+                        const bool mmq_direct = use_mmq && m.mring != nullptr;
+                        auto slot_ptr = [&](int sl) { return mmq_direct ? m.mring + (size_t) sl * MMQ_SLOT() : m.stage_dev[sl]; };
+                        // mmq_tab_on: the products' pointer tables, a resident expert's entries in its cache slot (`direct`,
+                        // when 16-byte aligned) and every other one's where it is copied (its ring slot, or its group buffer)
+                        const bool mtab = !in_place && use_mmq && mmq_tab_on() && m.tab_dev != nullptr && m.host_res && m.cache;
+                        std::vector<char> direct(mtab ? order.size() : 0, 0);
+                        if (mtab) {
+                            const auto& f = lay.fmt[(size_t) l];
+                            const size_t n = order.size();
+                            m.tab_host.resize(4 * n);
+                            auto put = [&](size_t i, const uint8_t* p) {
+                                std::memcpy(m.tab_host.data() + 2 * i, static_cast<const void*>(&p), sizeof p);
+                            };
+                            for (size_t j = 0; j < n; ++j) {
+                                const int32_t s = m.host_res[(size_t) l * m.g->n_expert + order[j]];
+                                const uint8_t* gu = s >= 0 ? m.cache->device_slot(s) : nullptr;
+                                const uint8_t* dn = nullptr;
+                                if (gu == nullptr && window_walk &&
+                                    win_landed[((size_t) stream_k[j] - seq_start[(size_t) l]) / win_entries])
+                                    gu = m.stage_dev[(size_t) stream_k[j] % (size_t) m.ring];
+                                direct[j] = (char) (gu != nullptr && ((uintptr_t) gu | f.down_off) % 16 == 0);
+                                if (direct[j]) {
+                                    dn = gu + f.down_off;
+                                } else if (mmq_direct) {
+                                    gu = slot_ptr((int) (j % MMQ_RING));
+                                    dn = gu + f.down_off;
+                                } else {
+                                    gu = m.grp_gu + (size_t) m.grp_pos[j] * mmq_gub;
+                                    dn = m.grp_d + (size_t) m.grp_pos[j] * mmq_db;
+                                }
+                                put(j, gu);
+                                put(n + j, dn);
+                            }
+                            m.tab_host.to_device(m.tab_dev, m.cs);
+                        }
+                        auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];
-                            if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
-                            const bool tr = m.src->transient(l, e);   // copied by the source (never pinned)
-                            if (!tr && m.src->pinned(l, e)) continue;
+                            const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
+                            if (resident) return true;
+                            int sl = (int) (j % MMQ_RING);
+                            if (!mmq_direct) {
+                                sl = stage_next;
+                                stage_next = (stage_next + 1) % STAGE;
+                            }
+                            const int par = (int) (j / MMQ_GROUP % 2);
+                            auto wait_slot = [&] {
+                                if (mmq_direct) {
+                                    if (m.mgrp_live[par]) strata::gpu::stream_wait_event(m.copy, m.mgrp_used[par]);
+                                } else if (m.stage_live[sl]) {
+                                    strata::gpu::stream_wait_event(m.copy, m.used[m.used_of[sl]]);
+                                }
+                            };
+                            const auto th = Clock::now();
+                            const bool tr = m.src->transient(l, e);
                             const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
                             if (!tr && !b) { err = "prefill: expert source has no blob"; return false; }
-                            job_of[j] = (int) js.size();
-                            js.push_back({b, (size_t) lay.blob_bytes(l), tr ? m.src : nullptr, (int32_t) l, e});
-                        }
-                        if (m.warmer) {   // STRATA_PREFILL_WARM: this layer's list, and the next layer's of the last chunk
-                            std::vector<int64_t> cur;
-                            for (size_t j = 0; j < order.size(); ++j)
-                                if (job_of[j] >= 0) cur.push_back(order[j]);
-                            m.warm_prev[(size_t) l] = cur;
-                            m.warmer->submit(l, std::move(cur));
-                            if (l + 1 < m.g->n_layers) {
-                                std::vector<int64_t> nxt;
-                                for (const int64_t e : m.warm_prev[(size_t) (l + 1)]) {
-                                    if (m.host_res && m.cache && m.host_res[(size_t) (l + 1) * m.g->n_expert + e] >= 0) continue;
-                                    if (m.src->pinned(l + 1, (int32_t) e)) continue;
-                                    nxt.push_back(e);
-                                }
-                                m.warmer->submit(l + 1, std::move(nxt));
-                            }
-                        }
-                        m.stager->start(std::move(js));
-                    }
-                    StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
-                    // MMQ in place (MMQ_RING): expert j's blob in ring slot j % MMQ_RING, its group's slots released
-                    // together; else the STAGE ring, a slot at a time
-                    const bool mmq_direct = use_mmq && m.mring != nullptr;
-                    auto slot_ptr = [&](int sl) { return mmq_direct ? m.mring + (size_t) sl * MMQ_SLOT() : m.stage_dev[sl]; };
-                    // mmq_tab_on: the products' pointer tables, a resident expert's entries in its cache slot (`direct`,
-                    // when 16-byte aligned) and every other one's where it is copied (its ring slot, or its group buffer)
-                    const bool mtab = !in_place && use_mmq && mmq_tab_on() && m.tab_dev != nullptr && m.host_res && m.cache;
-                    std::vector<char> direct(mtab ? order.size() : 0, 0);
-                    if (mtab) {
-                        const auto& f = lay.fmt[(size_t) l];
-                        const size_t n = order.size();
-                        m.tab_host.resize(4 * n);
-                        auto put = [&](size_t i, const uint8_t* p) {
-                            std::memcpy(m.tab_host.data() + 2 * i, static_cast<const void*>(&p), sizeof p);
-                        };
-                        for (size_t j = 0; j < n; ++j) {
-                            const int32_t s = m.host_res[(size_t) l * m.g->n_expert + order[j]];
-                            const uint8_t* gu = s >= 0 ? m.cache->device_slot(s) : nullptr;
-                            const uint8_t* dn = nullptr;
-                            direct[j] = (char) (gu != nullptr && ((uintptr_t) gu | f.down_off) % 16 == 0);
-                            if (direct[j]) {
-                                dn = gu + f.down_off;
-                            } else if (mmq_direct) {
-                                gu = slot_ptr((int) (j % MMQ_RING));
-                                dn = gu + f.down_off;
+                            if (!tr && m.src->pinned(l, e)) {
+                                // DMA straight from the page-locked arena: the copy stream only waits for the slot
+                                wait_slot();
+                                strata::gpu::copy_async(slot_ptr(sl), b, (size_t) lay.blob_bytes(l, e), m.copy);
+                                ++stats_.experts_dma;
                             } else {
-                                gu = m.grp_gu + (size_t) m.grp_pos[j] * mmq_gub;
-                                dn = m.grp_d + (size_t) m.grp_pos[j] * mmq_db;
+                                // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
+                                const uint8_t* hb = m.stager->wait(job_of[j]);
+                                if (m.stager->failed.exchange(false)) { err = "prefill: the expert source could not copy a blob"; return false; }
+                                wait_slot();
+                                strata::gpu::copy_async(slot_ptr(sl), hb, (size_t) lay.blob_bytes(l, e), m.copy);
+                                m.stager->issued_one(job_of[j], m.copy);
                             }
-                            put(j, gu);
-                            put(n + j, dn);
-                        }
-                        m.tab_host.to_device(m.tab_dev, m.cs);
-                    }
-                    auto stage_one = [&](size_t j) -> bool {
-                        const int32_t e = order[j];
-                        const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                        if (resident) return true;
-                        int sl = (int) (j % MMQ_RING);
-                        if (!mmq_direct) {
-                            sl = stage_next;
-                            stage_next = (stage_next + 1) % STAGE;
-                        }
-                        const int par = (int) (j / MMQ_GROUP % 2);
-                        auto wait_slot = [&] {
-                            if (mmq_direct) {
-                                if (m.mgrp_live[par]) strata::gpu::stream_wait_event(m.copy, m.mgrp_used[par]);
-                            } else if (m.stage_live[sl]) {
-                                strata::gpu::stream_wait_event(m.copy, m.used[m.used_of[sl]]);
-                            }
-                        };
-                        const auto th = Clock::now();
-                        const bool tr = m.src->transient(l, e);
-                        const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
-                        if (!tr && !b) { err = "prefill: expert source has no blob"; return false; }
-                        if (!tr && m.src->pinned(l, e)) {
-                            // DMA straight from the page-locked arena: the copy stream only waits for the slot
-                            wait_slot();
-                            strata::gpu::copy_async(slot_ptr(sl), b, (size_t) lay.blob_bytes(l), m.copy);
-                            ++stats_.experts_dma;
-                        } else {
-                            // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
-                            const uint8_t* hb = m.stager->wait(job_of[j]);
-                            if (m.stager->failed.exchange(false)) { err = "prefill: the expert source could not copy a blob"; return false; }
-                            wait_slot();
-                            strata::gpu::copy_async(slot_ptr(sl), hb, (size_t) lay.blob_bytes(l), m.copy);
-                            m.stager->issued_one(job_of[j], m.copy);
-                        }
-                        strata::gpu::event_record(m.copied[sl], m.copy);
-                        if (!mmq_direct) m.stage_live[sl] = true;
-                        stage_of[j] = sl;
-                        stats_.ms_experts_host += ms_since(th);
-                        ++stats_.experts_streamed;
-                        return true;
-                    };
-                    // The streamed walk gathers an MMQ group in one launch, after one wait on its last streamed copy
-                    // (the copy queue is in order), and releases its ring slots with one event (upstream b3096357,
-                    // e8de49eb): a wait, a gather and a mark an expert were three submissions each, and the RTX 4070's
-                    // copy engine stood idle behind them.  Its slots go back to the issuer only then; a skipped ring
-                    // entry first flushes the open group (`flush`), so at most a group's entries are held back.
-                    // STRATA_PREFILL_GROUP_GATHER=0: one wait, gather and mark an expert.
-                    static const bool group_env = [] {
-                        const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
-                        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-                    }();
-                    const bool group_gather = group_env && stream_all && use_mmq && !mmq_direct;
-                    mmq::GatherGroup gg;
-                    int gg_slots[MMQ_GROUP];
-                    int gg_nslots = 0;            // ring slots gathered by the next flush
-                    size_t gg_consumed = consumed;   // what the issuer may have back after the next flush
-                    auto flush = [&]() {
-                        if (gg.n > gg.first) {
-                            const auto& f = lay.fmt[(size_t) l];
-                            if (gg_nslots > 0) {
-                                pt.mark(kPfWaitCopy, cs);
-                                strata::gpu::stream_wait_event(m.cs, m.copied[gg_slots[gg_nslots - 1]]);
-                                pt.mark(kPfDequant, cs);
-                            }
-                            if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
-                                                          m.grp_d, mmq_db, m.cs)) {
-                                for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
-                                    const uint8_t* b = gg.blob[i];
-                                    if (b == nullptr) continue;   // read in its cache slot (mmq_tab_on)
-                                    mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
-                                                       m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs);
-                                }
-                            }
-                            if (gg_nslots > 0) {
-                                const int rel = gg_slots[gg_nslots - 1];
-                                strata::gpu::event_record(m.used[rel], m.cs);
-                                for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
-                            }
-                            gg_nslots = 0;
-                            gg.first = gg.n;
-                        }
-                        if (gg_consumed > consumed) {
-                            consumed = gg_consumed;
-                            give_back(consumed);
-                        }
-                    };
-                    // the MMQ group's last streamed copy into its ring slot (the copy queue is in order): the products
-                    // wait for it once, not each copy for its own (upstream 653f0113's grouped staged walk); -1: none yet
-                    int grp_last_copy = -1;
-                    int64_t grp_rows_last = 0;   // the rows of the last int8 group (GU and H hold that group's)
-                    // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
-                    // expert) is released once the blob is read
-                    auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
-                        pt.mark(kPfDequant, cs);
-                        if (use_mmq) {
-                            const size_t q = (size_t) m.grp_pos[j];
-                            const bool last_of_group = j + 1 >= (size_t) m.grp_start[(size_t) m.grp_of[j] + 1];
-                            const auto& f = lay.fmt[(size_t) l];
-                            const bool in_slot = !in_place && mtab && direct[j];   // read in its cache slot: not copied
-                            if (in_place) {
-                                // the group's products read the blob where it lies (wtab): nothing to move
-                            } else if (mmq_direct) {
-                                // a resident expert into its ring slot (the slot's last group is done: same stream)
-                                if (slot < 0 && !in_slot)
-                                    strata::gpu::copy_async(slot_ptr((int) (j % MMQ_RING)), blob_dev,
-                                                            (size_t) lay.blob_bytes(l), m.cs);
-                            } else if (group_gather) {
-                                gg.blob[q] = in_slot ? nullptr : blob_dev;
-                                gg.n = (int) q + 1;
-                                if (slot >= 0) gg_slots[gg_nslots++] = slot;
-                                if (!last_of_group) return true;
-                                flush();
-                                gg = mmq::GatherGroup{};
-                            } else if (!in_slot) {
-                                // gather the expert into its group slot (its GGUF blocks; mmq_plan takes native packs)
-                                mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
-                                                   mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
-                                if (slot >= 0) { strata::gpu::event_record(m.used[slot], m.cs); m.used_of[slot] = slot; }
-                            }
-                            if (!last_of_group) return true;
-                            // the group's products: gate/up, swiglu, the group's H to int8, down
-                            const size_t j0 = j - q, g = (size_t) m.grp_of[j], n = order.size();
-                            const int ngx = (int) (q + 1);
-                            const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
-                            int64_t maxr = 0;
-                            for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
-                            if (grp_last_copy >= 0) {
-                                pt.mark(kPfWaitCopy, cs);
-                                strata::gpu::stream_wait_event(m.cs, m.copied[grp_last_copy]);
-                                grp_last_copy = -1;
-                            }
-                            pt.mark(kPfGemmGU, cs);
-                            const uint8_t* ring0 = mmq_direct ? slot_ptr((int) (j0 % MMQ_RING)) : nullptr;
-                            mmq::Product gu;
-                            gu.w = mmq_direct ? ring0 : m.grp_gu; gu.type = mmq_gt; gu.w_rows = kFF2; gu.w_cols = N;
-                            gu.expert_bytes = mmq_direct ? MMQ_SLOT() : mmq_gub;
-                            // the chunk's rows read (absolute bounds), the group's rows written from 0 (ids_rel)
-                            gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_rel;
-                            gu.total_rows = T * K; gu.max_rows = maxr; gu.rows = nr; gu.dst = m.GU; gu.ld_dst = kFF2;
-                            const auto* tabs = reinterpret_cast<const uint8_t* const*>(m.tab_dev);
-                            if (in_place) { gu.w = nullptr; gu.expert_bytes = 0; gu.wtab = m.wtab_dev + j0; gu.woff = 0; }
-                            else if (mtab) { gu.wtab = tabs + j0; gu.woff = 0; }
-                            m.mmq_ctx->run(gu, m.cs);
-                            // STRATA_SWIGLU_QUANT=1: swiglu and the down product's int8 rows in one kernel, the same
-                            // bytes (upstream dd97421d3).  Opt-in: 32K prompt equal on the B70 and the RTX 4070, 5%
-                            // slower on the RX 9060 XT (2026-10-28)
-                            static const bool sq = [] {
-                                const char* e = std::getenv("STRATA_SWIGLU_QUANT");
-                                return e != nullptr && e[0] == '1';
-                            }();
-                            if (sq) {
-                                pt.mark(kPfGemmD, cs);
-                                mmq::swiglu_quantize(m.GU, m.Hq, mmq_dt, nr, kFF, !lay.native, m.cs);
-                            } else {
-                                mmq::swiglu(m.GU, m.H, nr, kFF, !lay.native, m.cs);
-                                pt.mark(kPfGemmD, cs);
-                                mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, kFF, kFF, nr, m.cs);
-                            }
-                            grp_rows_last = nr;
-                            mmq::Product dn;
-                            dn.w = mmq_direct ? ring0 + f.down_off : m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = kFF;
-                            dn.expert_bytes = mmq_direct ? MMQ_SLOT() : mmq_db;
-                            dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * ((size_t) GRP + 1);
-                            dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
-                            dn.ld_dst = N;
-                            if (dm16) {   // STRATA_PF_DM16: halves, the same row order
-                                dn.dst = reinterpret_cast<float*>(reinterpret_cast<uint16_t*>(m.Dm) + r0 * N);
-                                dn.half_dst = true;
-                            }
-                            if (in_place) { dn.w = nullptr; dn.expert_bytes = 0; dn.wtab = m.wtab_dev + j0; dn.woff = f.down_off; }
-                            else if (mtab) { dn.wtab = tabs + n + j0; dn.woff = 0; }
-                            m.mmq_ctx->run(dn, m.cs);
-                            if (mmq_direct) {
-                                const int par = (int) (g % 2);
-                                strata::gpu::event_record(m.mgrp_used[par], m.cs);
-                                m.mgrp_live[par] = true;
-                            }
+                            strata::gpu::event_record(m.copied[sl], m.copy);
+                            if (!mmq_direct) m.stage_live[sl] = true;
+                            stage_of[j] = sl;
+                            stats_.ms_experts_host += ms_since(th);
+                            ++stats_.experts_streamed;
                             return true;
-                        }
-                        // dequantize into the group's slot q; the group's products once it is full (or the last)
-                        const int G = g_expert_group, q = (int) ((j - nf) % (size_t) G);   // groups from nf on
-                        uint16_t *gu16 = m.dq_gu + q * GU_ELEMS, *d16 = m.dq_d + q * D_ELEMS;
-                        if (lay.native) {
-                            // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
-                            const auto& f = lay.fmt[(size_t) l];
-                            // STRATA_PF_DQ_FUSED=0: the two launches (upstream 75109596 fused them)
-                            static const bool dq_fused = [] {
-                                const char* v = std::getenv("STRATA_PF_DQ_FUSED");
-                                return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-                            }();
-                            if (dq_fused) {
-                                strata::kernels::iq_dequant_expert_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
-                                                                       f.n_embd, gu16, f.d_type, blob_dev + f.down_off,
-                                                                       d16, m.cs);
-                            } else {
-                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
-                                                                   f.n_embd, gu16, m.cs);
-                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, d16,
-                                                                m.cs);
-                            }
-                        } else {
-                            blob_dequant_f16(blob_dev, gu16, d16, m.cs);
-                        }
-                        if (slot >= 0) { strata::gpu::event_record(m.used[slot], m.cs); m.used_of[slot] = slot; }
-                        if (q + 1 < G && j + 1 < order.size()) return true;
-                        const size_t j0 = j - (size_t) q;
-                        int64_t maxr = 0;
-                        for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
-                        const int64_t r0 = m.xb_host[j0], nr = m.xb_host[j + 1] - r0;
-                        pt.mark(kPfGemmGU, cs);
-                        if (!Gemm::f16_groups(m.Xs, m.dq_gu, GU_ELEMS, m.GU, m.xb_host.data() + j0, q + 1, kFF2, N, m.cs))
-                            strata::kernels::xmx_gemm_grouped(m.Xs, m.dq_gu, GU_ELEMS, m.GU, m.xb_dev + j0, q + 1, maxr,
-                                                              kFF2, N, m.cs);
-                        swiglu_interleaved(m.GU + r0 * kFF2, m.Hh + r0 * kFF, nr, m.cs);
-                        if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + r0 * kFF, nr, kFF, had_block, had_sh, m.cs);
-                        pt.mark(kPfGemmD, cs);
-                        if (!Gemm::f16_groups(m.Hh, m.dq_d, D_ELEMS, m.Dm, m.xb_host.data() + j0, q + 1, N, kFF, m.cs))
-                            strata::kernels::xmx_gemm_grouped(m.Hh, m.dq_d, D_ELEMS, m.Dm, m.xb_dev + j0, q + 1, maxr, N,
-                                                              kFF, m.cs);
-                        return true;
-                    };
-                    if (!stream_all) {
-                        size_t staged = nf;
-                        const size_t lookahead = mmq_direct ? (size_t) MMQ_GROUP : (size_t) STAGE - 1;
-                        for (size_t j = nf; j < order.size(); ++j) {
-                            while (staged < order.size() && staged <= j + lookahead) {
-                                if (!stage_one(staged)) return false;
-                                ++staged;
-                            }
-                            const int32_t e = order[j];
-                            if (stage_of[j] < 0) {
-                                ++stats_.experts_resident;
-                                if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
-                            } else {
-                                if (mmq_direct && group_env) {
-                                    grp_last_copy = stage_of[j];   // waited for once, before the group's products
-                                } else {
+                        };
+                        // The streamed walk gathers an MMQ group in one launch, after one wait on its last streamed copy
+                        // (the copy queue is in order), and releases its ring slots with one event (upstream b3096357,
+                        // e8de49eb): a wait, a gather and a mark an expert were three submissions each, and the RTX 4070's
+                        // copy engine stood idle behind them.  Its slots go back to the issuer only then; a skipped ring
+                        // entry first flushes the open group (`flush`), so at most a group's entries are held back.
+                        // STRATA_PREFILL_GROUP_GATHER=0: one wait, gather and mark an expert.
+                        static const bool group_env = [] {
+                            const char* v = strata::env_get("PREFILL_GROUP_GATHER");
+                            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+                        }();
+                        const bool group_gather = group_env && stream_all && use_mmq && !mmq_direct;
+                        mmq::GatherGroup gg;
+                        bool ring_in_place = false;   // a landed window's (stream_window_on): its slots are the walk's
+                        int gg_slots[MMQ_GROUP];
+                        int gg_nslots = 0;            // ring slots gathered by the next flush
+                        size_t gg_consumed = consumed;   // what the issuer may have back after the next flush
+                        auto flush = [&]() {
+                            if (gg.n > gg.first) {
+                                const auto& f = lay.fmt[(size_t) l];
+                                if (gg_nslots > 0) {
                                     pt.mark(kPfWaitCopy, cs);
-                                    strata::gpu::stream_wait_event(m.cs, m.copied[stage_of[j]]);
+                                    strata::gpu::stream_wait_event(m.cs, m.copied[gg_slots[gg_nslots - 1]]);
+                                    pt.mark(kPfDequant, cs);
                                 }
-                                if (!compute(j, slot_ptr(stage_of[j]), stage_of[j])) return false;
+                                if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
+                                                              m.grp_d, mmq_db, m.cs)) {
+                                    for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
+                                        const uint8_t* b = gg.blob[i];
+                                        if (b == nullptr) continue;   // read in its cache slot (mmq_tab_on)
+                                        mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
+                                                           m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs);
+                                    }
+                                }
+                                if (gg_nslots > 0) {
+                                    const int rel = gg_slots[gg_nslots - 1];
+                                    strata::gpu::event_record(m.used[rel], m.cs);
+                                    for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
+                                }
+                                gg_nslots = 0;
+                                gg.first = gg.n;
                             }
-                        }
-                    } else {
-                        // the streamed walk: this layer's entries [k, kend) in id order; an entry the routing did not
-                        // pick only gives its slot back
-                        size_t k = seq_start[(size_t) l];
-                        const size_t kend = seq_start[(size_t) l + 1];
-                        auto release_to = [&](int32_t e_stop) {
-                            if (group_gather && k < kend && seq[k].e < e_stop) flush();
-                            while (k < kend && seq[k].e < e_stop) {
-                                strata::gpu::event_record(m.used[k % (size_t) m.ring], m.cs);
-                                m.used_of[k % (size_t) m.ring] = (int) (k % (size_t) m.ring);
-                                consumed = ++k;
+                            if (gg_consumed > consumed) {
+                                consumed = gg_consumed;
                                 give_back(consumed);
                             }
                         };
-                        for (size_t j = nf; j < order.size(); ++j) {   // from nf on: id order again
-                            const int32_t e = order[j];
-                            release_to(e);
-                            if (k < kend && seq[k].e == e) {
-                                const int sl = (int) (k % (size_t) m.ring);
-                                pt.mark(kPfWaitCopy, cs);
-                                wait_issued(k);
-                                if (group_gather) {
-                                    gg_consumed = k + 1;   // given back by the flush that gathers it
-                                } else {
-                                    strata::gpu::stream_wait_event(m.cs, m.copied[sl]);
+                        // the MMQ group's last streamed copy into its ring slot (the copy queue is in order): the products
+                        // wait for it once, not each copy for its own (upstream 653f0113's grouped staged walk); -1: none yet
+                        int grp_last_copy = -1;
+                        int64_t grp_rows_last = 0;   // the rows of the last int8 group (GU and H hold that group's)
+                        // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
+                        // expert) is released once the blob is read
+                        // a mixed layer's resident experts: computed together after the walk (bih3_r1q2_prompt_groups),
+                        // the streamed ones as each lands
+                        std::vector<const uint8_t*> bih3_res(bih3_own ? order.size() : 0, nullptr);
+                        auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
+                            if (bih3_own && slot < 0) { bih3_res[j] = blob_dev; return true; }
+                            pt.mark(kPfDequant, cs);
+                            if (bih3_own) {
+                                const int32_t e = order[j];
+                                const auto& f = lay.format(l, e);
+                                strata::kernels::Bih3R1q2Layer layer;
+                                layer.n_embd = (int) f.n_embd; layer.n_ff = (int) f.n_ff;
+                                layer.had_block = f.had_d ? f.had_block : 0; layer.d_signs = had_sh;
+                                std::memcpy(layer.p2, f.p2, sizeof layer.p2);
+                                strata::kernels::bih3_r1q2_prompt(layer, blob_dev, f.gu_type - 180, f.d_type - 180,
+                                    m.src_dev + m.off[(size_t) e], m.cnt[(size_t) e], T, m.bih3_xq,
+                                    m.bih3_scratch, ex_out + (size_t) m.off[(size_t) e] * N, m.cs);
+                                if (slot >= 0) { strata::gpu::event_record(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                return true;
+                            }
+                            if (use_mmq) {
+                                const size_t q = (size_t) m.grp_pos[j];
+                                const bool last_of_group = j + 1 >= (size_t) m.grp_start[(size_t) m.grp_of[j] + 1];
+                                const auto& f = lay.fmt[(size_t) l];
+                                const bool in_slot = !in_place && mtab && direct[j];   // read in its cache slot: not copied
+                                if (in_place) {
+                                    // the group's products read the blob where it lies (wtab): nothing to move
+                                } else if (mmq_direct) {
+                                    // a resident expert into its ring slot (the slot's last group is done: same stream)
+                                    if (slot < 0 && !in_slot)
+                                        strata::gpu::copy_async(slot_ptr((int) (j % MMQ_RING)), blob_dev,
+                                                                (size_t) lay.blob_bytes(l, order[j]), m.cs);
+                                } else if (group_gather) {
+                                    gg.blob[q] = in_slot ? nullptr : blob_dev;
+                                    gg.n = (int) q + 1;
+                                    if (slot >= 0 && !ring_in_place) gg_slots[gg_nslots++] = slot;
+                                    if (!last_of_group) return true;
+                                    flush();
+                                    gg = mmq::GatherGroup{};
+                                } else if (!in_slot) {
+                                    // gather the expert into its group slot (its GGUF blocks; mmq_plan takes native packs)
+                                    mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
+                                                       mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
+                                    if (slot >= 0) { strata::gpu::event_record(m.used[slot], m.cs); m.used_of[slot] = slot; }
                                 }
-                                if (!compute(j, m.stage_dev[sl], sl)) return false;
-                                ++k;
-                                if (!group_gather) {
-                                    consumed = k;
-                                    give_back(consumed);
+                                if (!last_of_group) return true;
+                                // the group's products: gate/up, swiglu, the group's H to int8, down
+                                const size_t j0 = j - q, g = (size_t) m.grp_of[j], n = order.size();
+                                const int ngx = (int) (q + 1);
+                                const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
+                                int64_t maxr = 0;
+                                for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                                if (grp_last_copy >= 0) {
+                                    pt.mark(kPfWaitCopy, cs);
+                                    strata::gpu::stream_wait_event(m.cs, m.copied[grp_last_copy]);
+                                    grp_last_copy = -1;
+                                }
+                                pt.mark(kPfGemmGU, cs);
+                                const uint8_t* ring0 = mmq_direct ? slot_ptr((int) (j0 % MMQ_RING)) : nullptr;
+                                mmq::Product gu;
+                                gu.w = mmq_direct ? ring0 : m.grp_gu; gu.type = mmq_gt; gu.w_rows = kFF2; gu.w_cols = ew;
+                                gu.expert_bytes = mmq_direct ? MMQ_SLOT() : mmq_gub;
+                                // the chunk's rows read (absolute bounds), the group's rows written from 0 (ids_rel)
+                                gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_rel;
+                                gu.total_rows = T * K; gu.max_rows = maxr; gu.rows = nr; gu.dst = m.GU; gu.ld_dst = kFF2;
+                                const auto* tabs = reinterpret_cast<const uint8_t* const*>(m.tab_dev);
+                                if (in_place) { gu.w = nullptr; gu.expert_bytes = 0; gu.wtab = m.wtab_dev + j0; gu.woff = 0; }
+                                else if (mtab) { gu.wtab = tabs + j0; gu.woff = 0; }
+                                m.mmq_ctx->run(gu, m.cs);
+                                mmq::Product dn;
+                                dn.w = mmq_direct ? ring0 + f.down_off : m.grp_d; dn.type = mmq_dt; dn.w_rows = ew; dn.w_cols = kFF;
+                                dn.expert_bytes = mmq_direct ? MMQ_SLOT() : mmq_db;
+                                dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * ((size_t) GRP + 1);
+                                dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = ex_out + r0 * ew;
+                                dn.ld_dst = ew;
+                                if (dm16) {   // STRATA_PF_DM16: halves, the same row order
+                                    dn.dst = reinterpret_cast<float*>(reinterpret_cast<uint16_t*>(m.Dm) + r0 * N);
+                                    dn.half_dst = true;
+                                }
+                                if (in_place) { dn.w = nullptr; dn.expert_bytes = 0; dn.wtab = m.wtab_dev + j0; dn.woff = f.down_off; }
+                                else if (mtab) { dn.wtab = tabs + n + j0; dn.woff = 0; }
+                                // NVFP4: the experts' s_gate / s_up into the SwiGLU, s_down on the down rows (after
+                                // each expert's down matrix in every slot form: mmq::TailAt)
+                                const mmq::TailAt tails = mmq::tails_of(dn, mmq_dmat);
+                                if (nv_tail) mmq::swiglu_tails(m.GU, m.H, nr, kFF, gu.bounds, ngx, tails, m.cs);
+                                else mmq::swiglu(m.GU, m.H, nr, kFF, !lay.native, m.cs, canon_l);
+                                pt.mark(kPfGemmD, cs);
+                                mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, kFF, kFF, nr, m.cs, canon_l ? 32 : 0);
+                                grp_rows_last = nr;
+                                m.mmq_ctx->run(dn, m.cs);
+                                if (nv_tail) mmq::scale_rows_tails(dn.dst, ew, ew, nr, dn.bounds, ngx, tails, m.cs);
+                                if (mmq_direct) {
+                                    const int par = (int) (g % 2);
+                                    strata::gpu::event_record(m.mgrp_used[par], m.cs);
+                                    m.mgrp_live[par] = true;
+                                }
+                                return true;
+                            }
+                            // dequantize into the group's slot q; the group's products once it is full (or the last)
+                            const int G = g_expert_group, q = (int) ((j - nf) % (size_t) G);   // groups from nf on
+                            uint16_t *gu16 = m.dq_gu + q * GU_ELEMS, *d16 = m.dq_d + q * D_ELEMS;
+                            if (lay.mixed()) {
+                                const auto& f = lay.format(l, order[j]);
+                                strata::kernels::Bih3R1q2Layer layer;
+                                layer.n_embd = (int) f.n_embd; layer.n_ff = (int) f.n_ff;
+                                std::memcpy(layer.p2, f.p2, sizeof layer.p2);
+                                strata::kernels::bih3_r1q2_dequant_f16(layer, blob_dev, f.gu_type - 180, f.d_type - 180,
+                                                                       gu16, d16, m.cs);
+                            } else if (lay.native) {
+                                // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
+                                const auto& f = lay.fmt[(size_t) l];
+                                // STRATA_PF_DQ_FUSED=0: the two launches (upstream 75109596 fused them)
+                                static const bool dq_fused = [] {
+                                    const char* v = strata::env_get("PF_DQ_FUSED");
+                                    return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+                                }();
+                                if (dq_fused) {
+                                    strata::kernels::iq_dequant_expert_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
+                                                                           f.n_embd, gu16, f.d_type, blob_dev + f.down_off,
+                                                                           d16, m.cs);
+                                } else {
+                                    strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
+                                                                       f.n_embd, gu16, m.cs);
+                                    strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, d16,
+                                                                    m.cs);
                                 }
                             } else {
-                                ++stats_.experts_resident;
-                                if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
+                                blob_dequant_f16(blob_dev, gu16, d16, m.cs);
                             }
-                        }
-                        release_to((int32_t) m.g->n_expert);
-                    }
-                    pt.mark(kPfCombine, cs);
-                    if (rows_help > 0) {   // set_helper: its rows into Dm's tail, once its stream is done
-                        HelperShare& hs = *helper_;
-                        bool ok = false;
-                        {
-                            const core::OnDevice on(hs.dev);
-                            ok = strata::gpu::stream_sync(hs.s);
-                        }
-                        if (!ok || !strata::gpu::copy_async(m.Dm + (size_t) (rows_gpu + rows_cpu) * N, hs.d_ex,
-                                                            (size_t) rows_help * N * sizeof(float), m.cs)) {
-                            err = std::string("prefill: the helper GPU's rows: ") + strata::gpu::last_error();
-                            return false;
-                        }
-                        stats_.experts_helper += n_help;
-                        if (static bool said = false; !said) {
-                            said = true;
-                            std::fprintf(stderr, "strata: the helper GPU computes the prompt's experts it holds that at "
-                                                 "most %lld tokens route to (%lld of a layer's, %lld rows)\n",
-                                         (long long) hs.max_rows, (long long) n_help, (long long) rows_help);
-                        }
-                    }
-                    if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail
-                        if (cpu_share_env() < 0.0) strata::gpu::event_record(m.cpu_ev[1], m.cs);   // after the GPU's experts
-                        if (!cpu_fut.get()) { err = "prefill: the CPU experts failed"; return false; }
-                        if (cpu_share_env() < 0.0 && n_stream > n_cpu) {
-                            m.cpu_pend = true;
-                            m.pend_cpu_ms = cpu_ms;
-                            m.pend_n_cpu = n_cpu;
-                            m.pend_n_gpu = n_stream - n_cpu;
-                        }
-                        stats_.cpu_share = cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_share_now;
-                        strata::gpu::copy_async(m.Dm + (size_t) rows_gpu * N, m.cpu_rows, (size_t) rows_cpu * N * sizeof(float),
-                                                m.cs);
-                        stats_.experts_cpu += n_cpu;
-                        if (static bool said = false; !said) {
-                            said = true;
-                            std::fprintf(stderr, "strata: STRATA_PREFILL_CPU_SHARE: the CPU pool computes %lld of a layer's "
-                                         "%lld streamed experts (share %.2f)\n", (long long) n_cpu, (long long) n_stream,
-                                         stats_.cpu_share);
-                        }
-                    }
-                    // no reading from a layer the share could not change (nothing taken) or with one-time costs
-                    if (cpu_set >= 0 && n_stream > 0 && (!cpu_arm || n_cpu > 0) && !cpu_cold) {
-                        strata::gpu::event_record(m.cpu_wall[(size_t) 2 * cpu_set + 1], m.cs);
-                        m.pend_wall = cpu_arm ? 2 : 1;
-                        m.pend_set = cpu_set;
-                        m.pend_l = (int) l;
-                        m.pend_wall_n = n_stream;
-                    }
-                    if (dm16)
-                        moe_combine_h(reinterpret_cast<const uint16_t*>(m.Dm), m.slot_dev, m.w, m.shared, m.sg, m.bo, T,
-                                      m.cs);
-                    else moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
-                    // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
-                    if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
-                        strata::gpu::stream_sync(m.cs);
-                        auto bad = [&](const float* d, int64_t n) {
-                            std::vector<float> h((size_t) n);
-                            strata::gpu::copy(h.data(), d, (size_t) n * 4);
-                            int64_t c = 0;
-                            for (float v : h) c += !std::isfinite(v);
-                            return c;
+                            if (slot >= 0) { strata::gpu::event_record(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                            if (q + 1 < G && j + 1 < order.size()) return true;
+                            const size_t j0 = j - (size_t) q;
+                            int64_t maxr = 0;
+                            for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
+                            const int64_t r0 = m.xb_host[j0], nr = m.xb_host[j + 1] - r0;
+                            pt.mark(kPfGemmGU, cs);
+                            if (!Gemm::f16_groups(m.Xs, m.dq_gu, GU_ELEMS, m.GU, m.xb_host.data() + j0, q + 1, kFF2, N, m.cs))
+                                strata::kernels::xmx_gemm_grouped(m.Xs, m.dq_gu, GU_ELEMS, m.GU, m.xb_dev + j0, q + 1, maxr,
+                                                                  kFF2, N, m.cs);
+                            swiglu_interleaved(m.GU + r0 * kFF2, m.Hh + r0 * kFF, nr, m.cs);
+                            if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + r0 * kFF, nr, kFF, had_block, had_sh, m.cs);
+                            pt.mark(kPfGemmD, cs);
+                            if (!Gemm::f16_groups(m.Hh, m.dq_d, D_ELEMS, m.Dm, m.xb_host.data() + j0, q + 1, N, kFF, m.cs))
+                                strata::kernels::xmx_gemm_grouped(m.Hh, m.dq_d, D_ELEMS, m.Dm, m.xb_dev + j0, q + 1, maxr, N,
+                                                                  kFF, m.cs);
+                            return true;
                         };
-                        // (the CPU's rows of GU and H are never written by the GPU: not counted, upstream 4322e241)
-                        // (the int8 path's GU and H hold the last group's rows only)
-                        const int64_t bgu = bad(m.GU, (use_mmq ? grp_rows_last : rows_gpu) * kFF2),
-                                      bdm = dm16 ? 0 : bad(m.Dm, T * K * N),
-                                      bbo = bad(m.bo, T * N);
-                        const int64_t bh = use_mmq && m.H ? bad(m.H, grp_rows_last * kFF) : -1;
-                        static int64_t reported = -1;
-                        if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
-                            reported = stats_.chunks;
-                            std::fprintf(stderr, "strata dbg: layer %lld (mmq %d, types %d/%d, %zu experts): non-finite GU %lld "
-                                         "H %lld Dm %lld bo %lld of T %lld\n", (long long) l, (int) use_mmq, mmq_gt, mmq_dt,
-                                         order.size(), (long long) bgu, (long long) bh, (long long) bdm, (long long) bbo,
-                                         (long long) T);
-                        }
-                    }
-                    // debug: STRATA_DBG_DM_MAX=1 reports each layer's largest |value| of the down products' rows (Dm,
-                    // FP16 under STRATA_PF_DM16) and how many are not finite: the margin to FP16's largest, 65504
-                    if (static const bool dbg_dm = std::getenv("STRATA_DBG_DM_MAX") != nullptr; dbg_dm) {
-                        strata::gpu::stream_sync(m.cs);
-                        const size_t n_dm = (size_t) (T * K * N);
-                        float mx = 0.0f;
-                        int64_t nonfin = 0;
-                        if (dm16) {
-                            std::vector<sycl::half> h(n_dm);
-                            strata::gpu::copy(h.data(), m.Dm, n_dm * 2);
-                            for (sycl::half v : h) {
-                                const float f = (float) v;
-                                if (!std::isfinite(f)) ++nonfin;
-                                else mx = std::max(mx, std::fabs(f));
+                        if (!stream_all) {
+                            size_t staged = nf;
+                            const size_t lookahead = mmq_direct ? (size_t) MMQ_GROUP : (size_t) STAGE - 1;
+                            for (size_t j = nf; j < order.size(); ++j) {
+                                while (staged < order.size() && staged <= j + lookahead) {
+                                    if (!stage_one(staged)) return false;
+                                    ++staged;
+                                }
+                                const int32_t e = order[j];
+                                if (stage_of[j] < 0) {
+                                    ++stats_.experts_resident;
+                                    if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
+                                } else {
+                                    if (mmq_direct && group_env) {
+                                        grp_last_copy = stage_of[j];   // waited for once, before the group's products
+                                    } else {
+                                        pt.mark(kPfWaitCopy, cs);
+                                        strata::gpu::stream_wait_event(m.cs, m.copied[stage_of[j]]);
+                                    }
+                                    if (!compute(j, slot_ptr(stage_of[j]), stage_of[j])) return false;
+                                }
+                            }
+                        } else if (window_walk) {
+                            // the resident experts, then the stream a window at a time (stream_window_on)
+                            size_t j = 0;
+                            for (; j < order.size() && stream_k[j] < 0; ++j) {
+                                ++stats_.experts_resident;
+                                if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + order[j]]), -1))
+                                    return false;
+                            }
+                            const size_t kend = seq_start[(size_t) l + 1];
+                            size_t wi = 0;
+                            for (size_t w0 = seq_start[(size_t) l]; w0 < kend; w0 += win_entries, ++wi) {
+                                const size_t w1 = std::min(kend, w0 + win_entries);
+                                if (!win_landed[wi]) {
+                                    // still on its way: an entry at a time in id order, gathered, as before
+                                    size_t k = w0;
+                                    auto skip_to = [&](size_t kstop) {   // unrouted entries only give their slots back
+                                        if (k < kstop) flush();
+                                        while (k < kstop) {
+                                            strata::gpu::event_record(m.used[k % (size_t) m.ring], m.cs);
+                                            m.used_of[k % (size_t) m.ring] = (int) (k % (size_t) m.ring);
+                                            consumed = ++k;
+                                            give_back(consumed);
+                                        }
+                                    };
+                                    for (; j < order.size() && (size_t) stream_k[j] < w1; ++j) {
+                                        const size_t kk = (size_t) stream_k[j];
+                                        skip_to(kk);
+                                        pt.mark(kPfWaitCopy, cs);
+                                        wait_issued(kk);
+                                        gg_consumed = kk + 1;   // given back by the flush that gathers it
+                                        const int sl = (int) (kk % (size_t) m.ring);
+                                        if (!compute(j, m.stage_dev[sl], sl)) return false;
+                                        k = kk + 1;
+                                    }
+                                    skip_to(w1);
+                                    continue;
+                                }
+                                ring_in_place = true;
+                                if (j < order.size() && (size_t) stream_k[j] < w1) {
+                                    // the window's last copy (the copy queue is in order), once for its groups
+                                    pt.mark(kPfWaitCopy, cs);
+                                    wait_issued(w1 - 1);
+                                    strata::gpu::stream_wait_event(m.cs, m.copied[(w1 - 1) % (size_t) m.ring]);
+                                    for (; j < order.size() && (size_t) stream_k[j] < w1; ++j) {
+                                        const int sl = (int) ((size_t) stream_k[j] % (size_t) m.ring);
+                                        if (!compute(j, m.stage_dev[sl], sl)) return false;
+                                    }
+                                }
+                                ring_in_place = false;
+                                // its groups are launched (a group ends with its window): every slot of it goes back,
+                                // on its last entry's event (recorded again only once the entry a ring later is issued)
+                                const int rel = (int) ((w1 - 1) % (size_t) m.ring);
+                                strata::gpu::event_record(m.used[rel], m.cs);
+                                for (size_t kk = w0; kk < w1; ++kk) m.used_of[kk % (size_t) m.ring] = rel;
+                                consumed = w1;
+                                give_back(consumed);
                             }
                         } else {
-                            std::vector<float> h(n_dm);
-                            strata::gpu::copy(h.data(), m.Dm, n_dm * 4);
-                            for (float f : h) {
-                                if (!std::isfinite(f)) ++nonfin;
-                                else mx = std::max(mx, std::fabs(f));
+                            // the streamed walk: this layer's entries [k, kend) in id order; an entry the routing did not
+                            // pick only gives its slot back
+                            size_t k = seq_start[(size_t) l];
+                            const size_t kend = seq_start[(size_t) l + 1];
+                            auto release_to = [&](int32_t e_stop) {
+                                if (group_gather && k < kend && seq[k].e < e_stop) flush();
+                                while (k < kend && seq[k].e < e_stop) {
+                                    strata::gpu::event_record(m.used[k % (size_t) m.ring], m.cs);
+                                    m.used_of[k % (size_t) m.ring] = (int) (k % (size_t) m.ring);
+                                    consumed = ++k;
+                                    give_back(consumed);
+                                }
+                            };
+                            for (size_t j = nf; j < order.size(); ++j) {   // from nf on: the streamed ones in id order
+                                const int32_t e = order[j];
+                                const bool streamed = !(m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0);
+                                if (streamed) release_to(e);
+                                if (streamed && k < kend && seq[k].e == e) {
+                                    const int sl = (int) (k % (size_t) m.ring);
+                                    pt.mark(kPfWaitCopy, cs);
+                                    wait_issued(k);
+                                    if (group_gather) {
+                                        gg_consumed = k + 1;   // given back by the flush that gathers it
+                                    } else {
+                                        strata::gpu::stream_wait_event(m.cs, m.copied[sl]);
+                                    }
+                                    if (!compute(j, m.stage_dev[sl], sl)) return false;
+                                    ++k;
+                                    if (!group_gather) {
+                                        consumed = k;
+                                        give_back(consumed);
+                                    }
+                                } else {
+                                    ++stats_.experts_resident;
+                                    if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
+                                }
+                            }
+                            release_to((int32_t) m.g->n_expert);
+                        }
+                        if (bih3_own && std::any_of(bih3_res.begin(), bih3_res.end(), [](const uint8_t* b) { return b; })) {
+                            pt.mark(kPfDequant, cs);
+                            const size_t n = order.size(), E = (size_t) m.g->n_expert;
+                            const auto& f = lay.format(l, order[0]);
+                            strata::kernels::Bih3R1q2Layer layer;
+                            layer.n_embd = (int) f.n_embd; layer.n_ff = (int) f.n_ff;
+                            layer.had_block = f.had_d ? f.had_block : 0; layer.d_signs = had_sh;
+                            std::memcpy(layer.p2, f.p2, sizeof layer.p2);
+                            auto kpack = [&](int32_t e) {
+                                const auto& fe = lay.format(l, e);
+                                return (int32_t) ((fe.gu_type - 180) | ((fe.d_type - 180) << 8));
+                            };
+                            size_t n_res = 0, rows_res = 0;
+                            for (size_t j = 0; j < n; ++j)
+                                if (bih3_res[j]) { ++n_res; rows_res += (size_t) m.cnt[(size_t) order[j]]; }
+                            m.bih3_meta_host.resize(bih3_meta_ints((size_t) T, K, (int64_t) E));
+                            int32_t* mh = m.bih3_meta_host.data();
+                            if ((int64_t) rows_res >= kBih3MatrixRows * (int64_t) n_res &&
+                                strata::kernels::iq_mmq_path(strata::core::Runtime::get().compute()) != nullptr) {
+                                // the matrix passes: the resident experts in order, their rows packed
+                                int32_t* k_h = mh + 2 * E;
+                                int32_t* bnd_h = k_h + E;          // a pass's bounds, one more a pass
+                                int32_t* rows_h = bnd_h + 2 * E;   // the passes' routed rows
+                                struct Pass { size_t e0, e1, b0, r0, r1; int64_t max_rows; };
+                                std::vector<Pass> passes;
+                                size_t ne = 0, nb = 0, nr = 0;
+                                for (size_t j = 0; j < n; ++j) {
+                                    if (!bih3_res[j]) continue;
+                                    const int32_t e = order[j];
+                                    const int64_t c = m.cnt[(size_t) e];
+                                    if (passes.empty() || passes.back().e1 - passes.back().e0 >= kBih3PassExperts ||
+                                        (int64_t) (nr - passes.back().r0) + c > T) {
+                                        if (!passes.empty()) bnd_h[nb++] = (int32_t) (nr - passes.back().r0);
+                                        passes.push_back({ne, ne, nb, nr, nr, 0});
+                                    }
+                                    Pass& p = passes.back();
+                                    std::memcpy(mh + 2 * ne, static_cast<const void*>(&bih3_res[j]), sizeof bih3_res[j]);
+                                    k_h[ne] = kpack(e);
+                                    bnd_h[nb++] = (int32_t) (nr - p.r0);
+                                    for (int64_t i = 0; i < c; ++i) rows_h[nr++] = m.off[(size_t) e] + (int32_t) i;
+                                    p.e1 = ++ne;
+                                    p.r1 = nr;
+                                    p.max_rows = std::max<int64_t>(p.max_rows, c);
+                                }
+                                bnd_h[nb++] = (int32_t) (nr - passes.back().r0);
+                                m.bih3_meta_host.to_device(m.bih3_meta, m.cs);
+                                const auto* ptr_d = reinterpret_cast<const unsigned long long*>(m.bih3_meta);
+                                const int32_t* k_d = m.bih3_meta + 2 * E;
+                                const int32_t* bnd_d = k_d + E;
+                                const int32_t* rows_d = bnd_d + 2 * E;
+                                for (const Pass& p : passes)
+                                    strata::kernels::bih3_r1q2_prompt_mmq(
+                                        layer, (int) (p.e1 - p.e0), ptr_d + p.e0, k_d + p.e0, bnd_d + p.b0, p.max_rows,
+                                        rows_d + p.r0, m.src_dev, (int64_t) (p.r1 - p.r0), m.bih3_xq, m.bih3_scratch,
+                                        m.bih3_w, ex_out, m.cs);
+                            } else {
+                                // the direct products: every expert of `order` a group, the streamed ones without a blob
+                                int32_t* start_h = mh + 2 * E;
+                                int32_t* k_h = start_h + E + 1;
+                                for (size_t j = 0; j < n; ++j) {
+                                    const int32_t e = order[j];
+                                    std::memcpy(mh + 2 * j, static_cast<const void*>(&bih3_res[j]), sizeof bih3_res[j]);
+                                    start_h[j] = m.off[(size_t) e];
+                                    k_h[j] = kpack(e);
+                                }
+                                start_h[n] = m.off[(size_t) order[n - 1]] + m.cnt[(size_t) order[n - 1]];
+                                m.bih3_meta_host.to_device(m.bih3_meta, m.cs);
+                                strata::kernels::bih3_r1q2_prompt_groups(
+                                    layer, reinterpret_cast<const unsigned long long*>(m.bih3_meta), m.bih3_meta + 2 * E,
+                                    m.bih3_meta + 3 * E + 1, start_h, (int) n, m.src_dev, m.bih3_xq, m.bih3_scratch, T,
+                                    ex_out, m.cs);
                             }
                         }
-                        std::fprintf(stderr, "strata dbg dm: chunk %lld layer %lld dm16 %d T %lld max %.1f nonfinite %lld\n",
-                                     (long long) stats_.chunks, (long long) l, (int) dm16, (long long) T, mx,
-                                     (long long) nonfin);
+                        pt.mark(kPfCombine, cs);
+                        if (rows_help > 0) {   // set_helper: its rows into Dm's tail, once its stream is done
+                            HelperShare& hs = *helper_;
+                            bool ok = false;
+                            {
+                                const core::OnDevice on(hs.dev);
+                                ok = strata::gpu::stream_sync(hs.s);
+                            }
+                            if (!ok || !strata::gpu::copy_async(m.Dm + (size_t) (rows_gpu + rows_cpu) * N, hs.d_ex,
+                                                                (size_t) rows_help * N * sizeof(float), m.cs)) {
+                                err = std::string("prefill: the helper GPU's rows: ") + strata::gpu::last_error();
+                                return false;
+                            }
+                            stats_.experts_helper += n_help;
+                            if (static bool said = false; !said) {
+                                said = true;
+                                std::fprintf(stderr, "xestrata: the helper GPU computes the prompt's experts it holds that at "
+                                                     "most %lld tokens route to (%lld of a layer's, %lld rows)\n",
+                                             (long long) hs.max_rows, (long long) n_help, (long long) rows_help);
+                            }
+                        }
+                        if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail
+                            if (cpu_share_env() < 0.0) strata::gpu::event_record(m.cpu_ev[1], m.cs);   // after the GPU's experts
+                            if (!cpu_fut.get()) { err = "prefill: the CPU experts failed"; return false; }
+                            if (cpu_share_env() < 0.0 && n_stream > n_cpu) {
+                                m.cpu_pend = true;
+                                m.pend_cpu_ms = cpu_ms;
+                                m.pend_n_cpu = n_cpu;
+                                m.pend_n_gpu = n_stream - n_cpu;
+                            }
+                            stats_.cpu_share = cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_meter.share;
+                            strata::gpu::copy_async(m.Dm + (size_t) rows_gpu * N, m.cpu_rows, (size_t) rows_cpu * N * sizeof(float),
+                                                    m.cs);
+                            stats_.experts_cpu += n_cpu;
+                            if (static bool said = false; !said) {
+                                said = true;
+                                std::fprintf(stderr, "xestrata: XESTRATA_PREFILL_CPU_SHARE: the CPU pool computes %lld of a layer's "
+                                             "%lld streamed experts (share %.2f)\n", (long long) n_cpu, (long long) n_stream,
+                                             stats_.cpu_share);
+                            }
+                        }
+                        // no reading from a layer the share could not change (nothing taken) or with one-time costs
+                        if (cpu_set >= 0 && n_stream > 0 && (!cpu_arm || n_cpu > 0) && !cpu_cold &&
+                            (!tune_3k || !m.share_3k.decided())) {
+                            strata::gpu::event_record(m.cpu_wall[(size_t) 2 * cpu_set + 1], m.cs);
+                            m.pend_wall = cpu_arm ? 2 : 1;
+                            m.pend_set = cpu_set;
+                            m.pend_l = (int) l;
+                            m.pend_wall_n = n_stream;
+                        }
+                        if (m.latent_ && !latent_mmq_u(l, T, K, m, err)) return false;   // yl -> Dm at U's rows
+                        if (dm16)
+                            moe_combine_h(reinterpret_cast<const uint16_t*>(m.Dm), m.slot_dev, m.w, m.shared, m.sg, m.bo,
+                                          T, m.cs);
+                        else moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                        // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
+                        if (static const bool dbg = strata::env_get("DBG_NAN") != nullptr; dbg) {
+                            strata::gpu::stream_sync(m.cs);
+                            auto bad = [&](const float* d, int64_t n) {
+                                std::vector<float> h((size_t) n);
+                                strata::gpu::copy(h.data(), d, (size_t) n * 4);
+                                int64_t c = 0;
+                                for (float v : h) c += !std::isfinite(v);
+                                return c;
+                            };
+                            // (the CPU's rows of GU and H are never written by the GPU: not counted, upstream 4322e241)
+                            // (the int8 path's GU and H hold the last group's rows only)
+                            const int64_t bgu = bad(m.GU, (use_mmq ? grp_rows_last : rows_gpu) * kFF2),
+                                          bdm = dm16 ? 0 : bad(m.Dm, T * K * N),
+                                          bbo = bad(m.bo, T * N);
+                            const int64_t bh = use_mmq && m.H ? bad(m.H, grp_rows_last * kFF) : -1;
+                            static int64_t reported = -1;
+                            if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
+                                reported = stats_.chunks;
+                                std::fprintf(stderr, "xestrata dbg: layer %lld (mmq %d, types %d/%d, %zu experts): non-finite GU %lld "
+                                             "H %lld Dm %lld bo %lld of T %lld\n", (long long) l, (int) use_mmq, mmq_gt, mmq_dt,
+                                             order.size(), (long long) bgu, (long long) bh, (long long) bdm, (long long) bbo,
+                                             (long long) T);
+                            }
+                        }
+                        // debug: STRATA_DBG_DM_MAX=1 reports each layer's largest |value| of the down products' rows (Dm,
+                        // FP16 under STRATA_PF_DM16) and how many are not finite: the margin to FP16's largest, 65504
+                        if (static const bool dbg_dm = strata::env_get("DBG_DM_MAX") != nullptr; dbg_dm) {
+                            strata::gpu::stream_sync(m.cs);
+                            const size_t n_dm = (size_t) (T * K * N);
+                            float mx = 0.0f;
+                            int64_t nonfin = 0;
+                            if (dm16) {
+                                std::vector<sycl::half> h(n_dm);
+                                strata::gpu::copy(h.data(), m.Dm, n_dm * 2);
+                                for (sycl::half v : h) {
+                                    const float f = (float) v;
+                                    if (!std::isfinite(f)) ++nonfin;
+                                    else mx = std::max(mx, std::fabs(f));
+                                }
+                            } else {
+                                std::vector<float> h(n_dm);
+                                strata::gpu::copy(h.data(), m.Dm, n_dm * 4);
+                                for (float f : h) {
+                                    if (!std::isfinite(f)) ++nonfin;
+                                    else mx = std::max(mx, std::fabs(f));
+                                }
+                            }
+                            std::fprintf(stderr, "xestrata dbg dm: chunk %lld layer %lld dm16 %d T %lld max %.1f nonfinite %lld\n",
+                                         (long long) stats_.chunks, (long long) l, (int) dm16, (long long) T, mx,
+                                         (long long) nonfin);
+                        }
                     }
                 }
                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
@@ -4014,7 +4947,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // a steered layer's write, vector and next norm as one pass too (upstream 6448f0f7; the same bits);
                 // STRATA_CVEC_FUSE=0: gr_write, cvec_apply, then the next half's own norm
                 static const bool cvec_fuse = [] {
-                    const char* e = std::getenv("STRATA_CVEC_FUSE");
+                    const char* e = strata::env_get("CVEC_FUSE");
                     return e == nullptr || std::strtol(e, nullptr, 10) != 0;
                 }();
                 const bool steered = half == 1 && strata::kernels::cvec().covers(l);
@@ -4040,14 +4973,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (steered)   // --control-vector-scaled
                         strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
                 }
-                if (half == 1 && tap_rows > 0 && tap_slot[(size_t) l] >= 0)   // DFlash2: this layer's completed output, mean of the streams
-                    strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D, tap_dev_ + (size_t) tap_slot[(size_t) l] * N,
-                                                  (int64_t) tap_layers_.size() * N, N, (int) HC, (int) tap_rows, m.cs);
+                // the DFlash2 tap: this layer's completed output (the GR write has landed), the mean of the streams
+                if (half == 1 && tap_rows > 0 && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
+                    strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D,
+                                                  tap_dev_ + (size_t) tap_slot_[(size_t) l] * N,
+                                                  (int64_t) tap_local_.size() * N, N, (int) HC, (int) tap_rows, m.cs);
+                }
             }
         }
         // STRATA_DUMP_RFINAL=<path> (XeStrata-890M, a diagnostic): every chunk's final residual (after the last layer,
         // the MTP layer's input), the T rows of HC * N floats as bf16, after [int32 T, HC, N] (issue #10)
-        if (static const char* dump = std::getenv("STRATA_DUMP_RFINAL"); dump != nullptr && LE == m.g->n_layers) {
+        if (static const char* dump = strata::env_get("DUMP_RFINAL"); dump != nullptr && LE == m.g->n_layers) {
             static std::FILE* df = std::fopen(dump, "wb");
             if (df != nullptr) {
                 std::vector<float> hr((size_t) T * D);
@@ -4112,7 +5048,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             hand_buf ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
         }
-        if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
+        if (const char* dump = strata::env_get("PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
             strata::gpu::stream_sync(m.cs);                                  // position (A/B quality of this path)
             if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
                 std::vector<float> row((size_t) D);
@@ -4125,7 +5061,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fclose(f);
             }
         }
-        if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
+        if (const char* dump = strata::env_get("PREFILL_DUMP_R_ALL")) {
             // draft-layer distillation data (opt-in, upstream 48d10a49): every position's final multi-stream residual
             // as BF16 (round-to-nearest-even), rows in position order, appended across chunks and requests:
             // [n][hc*n_embd]
@@ -4152,14 +5088,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fclose(f);
             }
         }
-        if (tap_rows > 0 && on_taps) {   // DFlash2: the chunk's tapped rows to the drafter, the stream drained first
-            if (!strata::gpu::stream_sync(m.cs)) {
-                err = std::string("prefill: ") + strata::gpu::last_error();
-                return false;
-            }
-            if (!on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
-        }
-        if (on_chunk || on_stage_chunk) {
+        if (on_chunk || on_stage_chunk || (on_taps && tap_rows > 0)) {
             const auto toc = Clock::now();
             if (!strata::gpu::stream_sync(m.cs)) {
                 err = std::string("prefill: ") + strata::gpu::last_error();
@@ -4167,6 +5096,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             const auto toc2 = Clock::now();
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+            if (on_taps && tap_rows > 0 && !on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
             if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
@@ -4175,7 +5105,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     if (next_ != nullptr && !next_->wait(err)) return false;
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
-    if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
+    if (strata::env_get("DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
         strata::gpu::stream_sync(m.cs);
         auto bad = [&](const float* d, int64_t n) {
             std::vector<float> h((size_t) n);
@@ -4185,8 +5115,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             for (float v : h) { c += !std::isfinite(v); if (std::isfinite(v)) mx = std::max(mx, (double) std::fabs(v)); }
             std::fprintf(stderr, " %lld non-finite (max |x| %.3g)", (long long) c, mx);
         };
-        const int64_t last = (n - 1) % m.T;
-        std::fprintf(stderr, "strata dbg: prompt end: last residual row");
+        const int64_t last = (n - 1) % step;
+        std::fprintf(stderr, "xestrata dbg: prompt end: last residual row");
         bad(m.R + last * D, D);
         if (ss.ple.ready()) { std::fprintf(stderr, "; PLE history"); bad(ss.ple.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM); }
         std::fprintf(stderr, "; GDN state 0");
@@ -4199,21 +5129,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }
     stats_.ms_total += ms_since(t_start);
     if (kva_run) {
-        std::fprintf(stderr, "strata prefill: KVA %s: split %lld, suffix %lld, approximated %lld of %lld positions in %lld chunk%s%s\n",
+        std::fprintf(stderr, "xestrata prefill: KVA %s: split %lld, suffix %lld, approximated %lld of %lld positions in %lld chunk%s%s\n",
                      kva.skip == strata::prefill::KvaConfig::Skip::Moe ? "on (moe-skip)" : "on (state-only)",
                      (long long) kva_split, (long long) kva_suffix, (long long) kva_positions, (long long) n,
                      (long long) kva_chunks, kva_chunks == 1 ? "" : "s",
                      kva.only == strata::prefill::KvaConfig::Only::Gdn ? ", gdn layers only"
                      : kva.only == strata::prefill::KvaConfig::Only::Qsa ? ", qsa layers only" : "");
         if (kva_positions > 0)
-            std::fprintf(stderr, "strata prefill: KVA: the late layers (%lld and up) hold approximated cells for %lld positions of "
-                                 "this conversation; the answers of its later turns are those of this read (STRATA_KVA=0 reads "
+            std::fprintf(stderr, "xestrata prefill: KVA: the late layers (%lld and up) hold approximated cells for %lld positions of "
+                                 "this conversation; the answers of its later turns are those of this read (XESTRATA_KVA=0 reads "
                                  "every prompt exactly)\n", (long long) kva_split, (long long) kva_positions);
     } else if (kva.on && (kva.explicit_on || (n >= kva.min_prompt && !kva_routine && kva_eng.blocked.empty()))) {
         // a run that was configured for KVA but fell back completely says so and why (else an operator cannot tell it
         // apart from a run where the feature was never asked for)
         if (!kva_routine)
-            std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: %s\n", kva_why_not);
+            std::fprintf(stderr, "xestrata prefill: KVA configured but NOT applied: %s\n", kva_why_not);
     }
     if (pt.on) {
         pt.fold();
@@ -4226,9 +5156,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::snprintf(b, sizeof b, " %s %.0f (%.1f%%)", kPfNames[i], pt.ms[i], total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
             line += b;
         }
-        std::fprintf(stderr, "strata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s\n",
+        std::fprintf(stderr, "xestrata prefill timing: %lld tokens, GPU timeline %.0f ms, wall %.0f ms, host staging %.0f ms:%s\n",
                      (long long) n, total, ms_since(t_start), stats_.ms_experts_host, line.c_str());
-        std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
+        std::fprintf(stderr, "xestrata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms; at each MoE layer: the routing's sync %.0f ms, folding these marks %.0f ms "
                              "(the timing's own cost, charged to 'host grouping'), the grouping %.0f ms\n",
@@ -4240,37 +5170,37 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          : kva.mode == KvaConfig::Mode::Linear ? "linear" : "identity";
         const char* only = kva.only == KvaConfig::Only::Gdn ? ", gdn layers only"
                          : kva.only == KvaConfig::Only::Qsa ? ", qsa layers only" : "";
-        std::fprintf(stderr, "strata prefill: KVA %s: split %lld, suffix %lld, approximated %lld of %lld positions "
+        std::fprintf(stderr, "xestrata prefill: KVA %s: split %lld, suffix %lld, approximated %lld of %lld positions "
                              "in %lld of %lld chunks, mode %s%s%s\n",
                      kva_run ? "on" : "off (capture)", (long long) kva_split, (long long) kva_suffix,
                      (long long) kva_positions, (long long) n, (long long) kva_chunks,
-                     (long long) (n > 0 && m.T > 0 ? (n + m.T - 1) / m.T : 0), mode, only,
+                     (long long) (n > 0 && step > 0 ? (n + step - 1) / step : 0), mode, only,
                      kva.capture ? ", capturing the late layers' inputs" : "");
         if (kva_positions > 0) {
             // What a later turn does with this state (serve): it continues from the live session or a checkpoint of
             // it and reads only the new tokens, exactly, over the cells this read left; nothing is approximated twice.
             static std::atomic<bool> said{false};
             if (!said.exchange(true))
-                std::fprintf(stderr, "strata prefill: KVA: the late layers (%lld and up) hold approximated cells for "
+                std::fprintf(stderr, "xestrata prefill: KVA: the late layers (%lld and up) hold approximated cells for "
                                      "the first %lld positions of this prompt; a follow-up turn that continues from "
                                      "this state reads its new tokens exactly on top of them (nothing is approximated "
-                                     "twice); STRATA_KVA=0 reads every prompt exactly\n",
+                                     "twice); XESTRATA_KVA=0 reads every prompt exactly\n",
                              (long long) kva_split, (long long) kva_positions);
         }
     } else if (kva.on) {
         // a run that was configured for KVA but read exactly says so and why, or an operator cannot tell it apart
         // from a run where the feature was never asked for (KVA runs only when STRATA_KVA=1 asked for it)
         if (kva_why_not == kKvaShapeReason)
-            std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: this model's shape (%lld layers, %lld experts) "
-                                 "is not one KVA was measured on (STRATA_KVA_ANY_MODEL=1 allows it)\n",
+            std::fprintf(stderr, "xestrata prefill: KVA configured but NOT applied: this model's shape (%lld layers, %lld experts) "
+                                 "is not one KVA was measured on (XESTRATA_KVA_ANY_MODEL=1 allows it)\n",
                          (long long) g.n_layers, (long long) g.n_expert);
         else
-            std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: %s (prompt %lld positions, "
+            std::fprintf(stderr, "xestrata prefill: KVA configured but NOT applied: %s (prompt %lld positions, "
                                  "min_prompt %lld, suffix %lld, split %lld)\n",
                          kva_why_not != nullptr ? kva_why_not : "not applicable", (long long) n, (long long) kva.min_prompt,
                          (long long) kva_suffix, (long long) kva_split);
     }
-    if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
+    if (strata::env_get("STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
         strata::gpu::stream_sync(m.cs);
         std::vector<uint8_t> b((size_t) gdn_floats * 4);
         std::string line;
@@ -4282,7 +5212,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::snprintf(h, sizeof(h), "%04llx ", (unsigned long long) (x & 0xffff));
             line += h;
         }
-        std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
+        std::fprintf(stderr, "xestrata prefill: GDN_HASH %s\n", line.c_str());
     }
     return true;
 }
@@ -4311,25 +5241,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 namespace {
 bool lm_on() {
     static const bool v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_LAYER_MAJOR");
+        const char* e = strata::env_get("PREFILL_LAYER_MAJOR");
         return e != nullptr && std::strtol(e, nullptr, 10) != 0;
     }();
     return v;
 }
 bool lm_even_env() {   // even super-chunks (STRATA_PREFILL_LM_EVEN=0: the largest that fits, then the rest)
-    static const bool v = [] { const char* e = std::getenv("STRATA_PREFILL_LM_EVEN"); return !(e && e[0] == '0'); }();
+    static const bool v = [] { const char* e = strata::env_get("PREFILL_LM_EVEN"); return !(e && e[0] == '0'); }();
     return v;
 }
 int64_t lm_tokens_env() {   // the super-chunk's target size (0: the default)
     static const int64_t v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_LM_TOKENS");
+        const char* e = strata::env_get("PREFILL_LM_TOKENS");
         return e ? (int64_t) std::strtoll(e, nullptr, 10) : (int64_t) 0;
     }();
     return v;
 }
 int lm_r_env() {            // 0 auto, 1 vram, 2 host
     static const int v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_LM_R");
+        const char* e = strata::env_get("PREFILL_LM_R");
         if (!e) return 0;
         return std::strcmp(e, "vram") == 0 ? 1 : std::strcmp(e, "host") == 0 ? 2 : 0;
     }();
@@ -4390,13 +5320,16 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
         return 0;
     }
     if (helper_ != nullptr) { why = "a helper GPU's expert share"; return 0; }
+    if (strata::kernels::cpu::expert_layout().mixed()) { why = "mixed R1Q2 experts"; return 0; }
     if (embd_rows != nullptr) { why = "an image prompt"; return 0; }
     // KVA's approximate late layers have no layer-major form: a prompt that wants them reads chunk-major (upstream 0.2.7)
-    if (kva_config().on) { why = "STRATA_KVA is on"; return 0; }
+    if (kva_config().on) { why = "XESTRATA_KVA is on"; return 0; }
     // the default path's debug dump of every row has no layer-major form
-    if (std::getenv("STRATA_PREFILL_DUMP_R_ALL")) { why = "a row debug dump (STRATA_PREFILL_DUMP_R_ALL)"; return 0; }
+    if (strata::env_get("PREFILL_DUMP_R_ALL")) { why = "a row debug dump (XESTRATA_PREFILL_DUMP_R_ALL)"; return 0; }
     const MmqPlan& mp = mmq_plan();
     if ((int64_t) mp.layer.size() < g.n_layers) { why = "the expert plan has fewer layers than the model"; return 0; }
+    for (const auto& f : strata::kernels::cpu::expert_layout().fmt)   // swiglu_tails is the chunk-major path's
+        if (f.tail_off != 0) { why = "NVFP4 experts (their tail scales)"; return 0; }
     // each layer's experts on the int8 products, or on the FP16 path (a type they lack, or a layer whose experts average
     // more rows than this GPU's int8 products win at: int8_rows_below); the buffers each one needs
     int64_t n_mmq = 0;
@@ -4520,8 +5453,11 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
 
 // A layer split: every stage gets the same super-chunk (the smallest any of them fits), re-sized until they agree.
 int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
-    for (Prefill* p = this; p != nullptr; p = p->lm_next())
+    for (Prefill* p = this; p != nullptr; p = p->lm_next()) {
         if (p->lm_next_run_.valid()) { why = "a layer split's hand-off is in flight"; return 0; }
+        // the layer-major walk has no D / U stage around the experts
+        if (p->impl_ && p->impl_->latent_) { why = "a latent MoE pack (Edge0)"; return 0; }
+    }
     // a later stage's hand_in_ still points at the last chunk a chunk-major prompt handed it (run_impl never clears it):
     // with no hand-off in flight that is stale, not in use (upstream e7318fa23)
     for (Prefill* p = lm_next(); p != nullptr; p = p->lm_next()) {
@@ -4599,6 +5535,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    // upstream 711a7e937: as the default path
+    const core::WatchedStream watched("the prompt path's compute stream", (void*) m.cs, m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
@@ -4619,10 +5557,10 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     // ---- the PLE rows, read per chunk on a thread as the default path does (the same state machine, in chunk order)
     const bool ple_on = ss.ple.ready() && LB <= 1 && 1 < LE;
     static const bool ple_batch_env = [] {
-        const char* v = std::getenv("STRATA_PLE_BATCH");
+        const char* v = strata::env_get("PLE_BATCH");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
+    const bool ple_batch = ple_on && ple_batch_env &&
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / (((uint64_t) 3 * strata::kernels::NG_HC_DIM + (uint64_t) N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
@@ -4674,7 +5612,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     // every streamed expert of layer l, in id order, to the stager - started with the layer's attention halves, so the
     // SSD / page-cache reads overlap them (at a super-chunk's size nearly every expert is routed).  STRATA_LM_PREFETCH=0:
     // the routed ones only, once the routing is known.
-    static const bool pf_on = [] { const char* e = std::getenv("STRATA_LM_PREFETCH"); return e == nullptr || e[0] != '0'; }();
+    static const bool pf_on = [] { const char* e = strata::env_get("LM_PREFETCH"); return e == nullptr || e[0] != '0'; }();
     auto resident_at = [&](int64_t l, int32_t e) { return m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0; };
     auto lm_prefetch = [&](int64_t l) -> bool {
         std::fill(pf_job.begin(), pf_job.end(), -1);
@@ -4685,9 +5623,13 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             const bool tr = m.src->transient(l, e);   // copied by the source in the stager (never pinned)
             if (!tr && m.src->pinned(l, e)) continue;
             const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
-            if (!tr && !b) { err = "prefill (layer-major): expert source has no blob"; return false; }
+            if (!tr && !b) {   // upstream 08e8770c (#4695): no contiguous mapped blob (the mapping dropped): the source copies it itself
+                pf_job[(size_t) e] = (int) js.size();
+                js.push_back({nullptr, (size_t) lay.blob_bytes(l, e), m.src, (int32_t) l, e});
+                continue;
+            }
             pf_job[(size_t) e] = (int) js.size();
-            js.push_back({b, (size_t) lay.blob_bytes(l), tr ? m.src : nullptr, (int32_t) l, e});
+            js.push_back({b, (size_t) lay.blob_bytes(l, e), tr ? m.src : nullptr, (int32_t) l, e});
         }
         m.stager->start(std::move(js));
         return true;
@@ -4759,9 +5701,13 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 const bool tr = m.src->transient(l, e);
                 if (!tr && m.src->pinned(l, e)) continue;
                 const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
-                if (!tr && !b) { err = "prefill (layer-major): expert source has no blob"; return false; }
+                if (!tr && !b) {   // upstream 08e8770c (#4695): as in lm_prefetch
+                    job_of[u] = (int) js.size();
+                    js.push_back({nullptr, (size_t) lay.blob_bytes(l, e), m.src, (int32_t) l, e});
+                    continue;
+                }
                 job_of[u] = (int) js.size();
-                js.push_back({b, (size_t) lay.blob_bytes(l), tr ? m.src : nullptr, (int32_t) l, e});
+                js.push_back({b, (size_t) lay.blob_bytes(l, e), tr ? m.src : nullptr, (int32_t) l, e});
             }
             m.stager->start(std::move(js));
         }
@@ -4885,13 +5831,13 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             if (m.stage_live[sl]) strata::gpu::stream_wait_event(m.copy, m.used[m.used_of[sl]]);
             if (pinned) {
                 // DMA straight from the page-locked arena
-                strata::gpu::copy_async(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), m.copy);
+                strata::gpu::copy_async(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l, e), m.copy);
                 ++stats_.experts_dma;
             } else {
                 m.stager->pass(job_of[u]);   // the prefetched jobs below it the routing skipped get no DMA
                 const uint8_t* hb = m.stager->wait(job_of[u]);
                 if (m.stager->failed.exchange(false)) { err = "prefill: the expert source could not copy a blob"; return false; }
-                strata::gpu::copy_async(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), m.copy);
+                strata::gpu::copy_async(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l, e), m.copy);
                 m.stager->issued_one(job_of[u], m.copy);
             }
             strata::gpu::event_record(m.copied[sl], m.copy);
@@ -4900,7 +5846,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             stats_.ms_experts_host += ms_since(tq);
             ++stats_.experts_streamed;
             ++lm_streamed;
-            lm_bytes += (uint64_t) lay.blob_bytes(l);
+            lm_bytes += (uint64_t) lay.blob_bytes(l, e);
             return true;
         };
         const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
@@ -4908,7 +5854,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, kFF2, N) : 0;
         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, kFF) : 0;
         static const bool dq_fused = [] {   // STRATA_PF_DQ_FUSED=0: the two launches, as the default path
-            const char* v = std::getenv("STRATA_PF_DQ_FUSED");
+            const char* v = strata::env_get("PF_DQ_FUSED");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
         size_t staged = 0, u = 0;
@@ -5040,6 +5986,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 const int64_t c0 = sc0 + c * m.T;          // in this run's tokens
                 const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
                 const int64_t t0 = c * m.T;                // in the super-chunk
+                const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
+                const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
+                // the staging holds the super-chunk's tapped rows: each sub-chunk writes at its own offset (the
+                // layer loop overwrites a shared row 0 with the next sub-chunk's rows before this one's upload)
+                const int64_t tap_off = tap_rows > 0 ? p0 + tap_t0 - std::max<int64_t>(tap_first_, pos0 + sc0) : 0;
+                if (tap_off + tap_rows > std::min(tap_cap_, tap_alloc_)) { err = "prefill: the DFlash2 tap staging is smaller than the super-chunk's tapped rows"; return false; }
                 m.R = lb.r_dev ? lb.R + t0 * D : r_buf(c);
                 if (lb.r_dev && l == LB && LB > 0 &&
                     !strata::gpu::copy_async(m.R, lb.R_in + (size_t) t0 * D, (size_t) T * D * 4, cs)) {
@@ -5064,16 +6016,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     // ---- embeddings, broadcast to the four streams (the default path's C-4 batched gather, else per
                     // token)
                     pt.mark(kPfStart, cs);
-                    bool batched = m.tok_dev != nullptr;
-                    const core::NativeEmbed* nemb = core::native_embed();
-                    const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
-                    if (batched && nemb == nullptr &&
-                        (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
-                         (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
-                        batched = false;
+                    strata::kernels::EmbedTable emb_table;
+                    std::string why;
+                    bool batched = m.tok_dev != nullptr && core::embed_table(*m.wt, g, cs, emb_table, why);
                     for (int64_t t = 0; batched && t < T; ++t) {
                         const int64_t tok = tokens[c0 + t];
-                        if (tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
+                        if (tok < 0 || tok >= emb_table.n_rows) batched = false;
                         else m.tok_host[(size_t) t] = (int32_t) tok;
                     }
                     if (batched) {
@@ -5081,21 +6029,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             err = "prefill: the token id upload failed";
                             return false;
                         }
-                        if (nemb) {
-                            nemb->gather_dev(m.tok_dev, T, m.emb, cs);
-                        } else {
-                            const auto* codes = (const uint8_t*) wemb->data;
-                            const auto* scales = (const float*) (codes + wemb->codes_bytes);
-                            const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
-                                                                   : nullptr;
-                            strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
-                                                                  wemb->code_bits, wemb->code_bias, wemb->group_elems,
-                                                                  (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
-                                                                  (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, cs);
-                        }
+                        strata::kernels::embed_rows(emb_table, m.tok_dev, 0, T, m.emb, cs);
                     }
                     for (int64_t t = 0; !batched && t < T; ++t)
-                        if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, cs, err)) return false;
+                        if (!core::embed_rows(*m.wt, g, nullptr, tokens[c0 + t], 1, m.emb + t * N, cs, err))
+                            return false;
                     gr_broadcast(m.emb, m.R, T, cs);
                     if (ple_on && !ple_next.valid())
                         ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {
@@ -5108,6 +6046,13 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     gr_write(m.R, acc, m.inj, HC, T, cs);
                     if (strata::kernels::cvec().covers(l - 1))   // --control-vector-scaled
                         strata::kernels::cvec_apply(m.R, l - 1, T, D, nullptr, 0, nullptr, 0, false, cs);
+                    // the DFlash2 tap of layer l - 1: its completed output, the mean of the streams
+                    if (tap_rows > 0 && l - 1 < (int64_t) tap_slot_.size() && tap_slot_[(size_t) (l - 1)] >= 0) {
+                        strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D,
+                                                      tap_dev_ + ((size_t) tap_off * tap_local_.size() +
+                                                                  (size_t) tap_slot_[(size_t) (l - 1)]) * N,
+                                                      (int64_t) tap_local_.size() * N, N, (int) HC, (int) tap_rows, cs);
+                    }
                 }
                 if (l == LE && next_ != nullptr) {
                     // ---- a layer split: this sub-chunk's rows into R_out (on the copy stream, as the per-layer
@@ -5132,7 +6077,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         strata::gpu::event_record(lb.ev_done[c & 1], cs);
                         strata::gpu::stream_wait_event(m.copy, lb.ev_done[c & 1]);
                     }
-                    if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the default path's format
+                    if (const char* dump = strata::env_get("PREFILL_DUMP_R")) {   // debug: the default path's format
                         strata::gpu::stream_sync(cs);
                         if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
                             std::vector<float> row((size_t) D);
@@ -5145,12 +6090,15 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             std::fclose(f);
                         }
                     }
-                    if (on_chunk || on_stage_chunk) {
+                    if (on_chunk || on_stage_chunk || (on_taps && tap_rows > 0)) {
                         if (!strata::gpu::stream_sync(cs)) {
                             err = std::string("prefill: ") + strata::gpu::last_error();
                             return false;
                         }
                         lm_mid_ = c + 1 < nc;
+                        if (on_taps && tap_rows > 0 &&
+                            !on_taps(tap_dev_ + (size_t) tap_off * tap_local_.size() * N, tap_rows, p0 + tap_t0, err))
+                            return false;
                         if (on_stage_chunk && !lm_mid_ && !on_stage_chunk(p0 + T, err)) return false;
                         if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
                     }
@@ -5183,7 +6131,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
                             if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, true);
                         } else {
-                            to_f16(emb, e16, nb * N, cs);
+                            kernels::f32_to_f16_bulk(emb, e16, nb * N, cs);
                             m.gemm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
                             to_bf16(emb, e16, nb * N, cs, e16_lo);
                         }
@@ -5233,17 +6181,21 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     core::WeightRef wdv = *wd, wuv = *wu;
                     if (wd->data == nullptr) wdv.data = core::hc_bf16_view(wd, 0, cs);
                     if (wu->data == nullptr) wuv.data = core::hc_bf16_view(wu, 1, cs);
+                    pt.mark(kPfHcDown, cs);   // (as the default path: the hyper-connection read's parts on their own lines)
                     if (!bf16_proj(m.gemm, &wdv, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
                     gr_silu(m.lo, m.lo16, T, cs, m.lo16_lo);
+                    pt.mark(kPfHcUp, cs);
                     const bool upmix = wuv.kind == core::WeightKind::Bf16InF32 && wuv.data != nullptr && gr_upmix_on(cs);
                     if (!upmix && !bf16_proj(m.gemm, &wuv, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                    pt.mark(kPfHcInj, cs);
                     if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
+                    pt.mark(kPfHcMix, cs);
                     if (upmix)
                         gr_upmix(m.lo16, m.lo16_lo, (const uint16_t*) wuv.data, m.R, m.xn, (const float*) wn->data,
                                  m.mixed, m.mixed_bf, T, cs, m.mixed_h, m.mixed_bf_lo);
                     else
-                        gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h,
-                                 m.mixed_bf_lo);
+                    gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h,
+                             m.mixed_bf_lo);
                     if (half == 0 && !core::is_qsa_layer(g, l)) {
                         // ======================= GDN (the default path's) =======================
                         const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
@@ -5287,6 +6239,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         rms_rows(m.Kc, (const float*) wkn->data, T * kNKv, kHeadDim, kHeadDim, EPS, cs);
                         rope(m.Kc, T, kNKv, kHeadDim, kKvW, p0, strata::kernels::rope_scaling(), cs);
                         const bool staged = st.kv_mode == 1;
+                        // the chunk's cells reach the host copy by DMA from the staging pool, not by the append kernel's stores
+                        // over the link (core/kv_host_dma.hpp, XESTRATA_KV_HOST_DMA)
+                        const bool host_by_dma = core::kv_host_dma_use(core::kv_host_dma(), staged, m.stage.present());
                         if (staged) {
                             pt.mark(kPfKvStage, cs);
                             strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
@@ -5300,7 +6255,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                                                hv = strata::kernels::kv_hybrid_v_half(st.host),
                                                                sk = strata::kernels::kv_hybrid_k_half(m.stage),
                                                                sv = strata::kernels::kv_hybrid_v_half(m.stage);
-                            const bool mirror = st.host.present();
+                            const bool mirror = st.host.present() && !host_by_dma;
                             kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
                                       st.k_q, st.k_q, st.k_scale, st.k_scale, cs, mirror ? &hk : nullptr,
                                       staged ? &sk : nullptr);
@@ -5313,12 +6268,15 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             }
                             if (st.kv_q4)
                                 strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, cs,
-                                                              &st.host, staged ? &m.stage : nullptr);
+                                                              host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                             else
                                 kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                           st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, cs,
-                                          &st.host, staged ? &m.stage : nullptr);
+                                          host_by_dma ? nullptr : &st.host, staged ? &m.stage : nullptr);
                         }
+                        if (host_by_dma)
+                            strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host, core::qsa_kv_format(st),
+                                                                p0 / s.page_size, (p0 + T + s.page_size - 1) / s.page_size, s, cs);
                         split_q(m.Qf, m.q, T, cs);
                         rms_rows(m.q, (const float*) wqn->data, T * kNHead, kHeadDim, kHeadDim, EPS, cs);
                         rope(m.q, T, kNHead, kHeadDim, kQW, p0, strata::kernels::rope_scaling(), cs);
@@ -5328,18 +6286,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         pt.mark(kPfQsaIdx, cs);
                         try {
-                            static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
-                            if (!per_token) {
-                                strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
-                                                                                 EPS, ib, s, st.max_cells,
-                                                                                 strata::kernels::rope_scaling(), cs);
-                            }
-                            for (int64_t t = 0; per_token && t < T; ++t) {
-                                const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
-                                strata::kernels::native_qsa_indexer_append(m.idx_raw + t * kIdxK, step_t + strata::kernels::kStepPos, 0,
-                                                                           (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                                           strata::kernels::rope_scaling(), cs);
-                            }
+                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                             EPS, ib, s, st.max_cells,
+                                                                             strata::kernels::rope_scaling(), cs);
                         } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                         pt.mark(kPfQsaSel, cs);
                         for (int64_t q0 = 0; q0 < T; q0 += m.sel_batch) {
@@ -5347,10 +6296,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             const int32_t* steps0 = m.steps_dev + q0 * strata::kernels::kStepCount;
                             const int64_t active = (int64_t) m.steps_host[(size_t) ((q0 + nb - 1) * strata::kernels::kStepCount +
                                                                                     strata::kernels::kStepNBid)] + 1;
-                            static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
-                            if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * kIdxQW,
-                                                                                 steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                                 cs, active))
+                            if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * kIdxQW,
+                                                                      steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                      cs, active))
                                 strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + q0 * kIdxQW, steps0, nb,
                                                                   m.max_blocks, s, m.sel_scores, cs, active);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
@@ -5359,18 +6307,10 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                            : core::qsa_attn_pools(st);
                         pt.mark(kPfQsaAttn, cs);
-                        static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
-                        if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
-                                                                                m.attn, T, cs))
-                            for (int64_t q0 = 0; q0 < T; q0 += m.attn_batch) {
-                                const int64_t nb = std::min(m.attn_batch, T - q0);
-                                strata::kernels::qsa_decode_attn_batch(m.q + q0 * kQW, pools, m.sel_ids + q0 * m.cap,
-                                                                       m.steps_dev + q0 * strata::kernels::kStepCount, m.cap,
-                                                                       s, m.attn_scratch, m.attn + q0 * kQW, nb, cs);
-                            }
-                        if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * kNHead, cs);
+                        qsa_attention(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn_scratch, m.attn,
+                                      T, m.attn_batch, st.kv_rot || st.kv_hybrid, cs);
                         pt.mark(kPfQsa, cs);
-                        gate_attn(m.attn, m.Qf, m.attn_h, T, cs);
+                        kernels::native_qsa_gate_apply(m.attn, m.Qf, nullptr, (int) (T * kNHead), kHeadDim, cs, m.attn_h);
                         if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
                         ++qsa_index;
                     } else {
@@ -5446,7 +6386,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         return false;
     }
     stats_.ms_total += ms_since(t_start);
-    std::fprintf(stderr, "strata prefill: layer-major (layers %lld..%lld): %lld tokens in %lld super-chunk(s) of up to %lld "
+    std::fprintf(stderr, "xestrata prefill: layer-major (layers %lld..%lld): %lld tokens in %lld super-chunk(s) of up to %lld "
                          "(R in %s, %lld MiB VRAM free before), %lld expert blobs streamed (%.1f MB), %lld resident, %lld "
                          "expert groups (%lld on the FP16 path); %.0f ms (host: enqueueing the attention halves %.0f, the "
                          "experts %.0f: waiting for the attention halves %.0f, the routing tables %.0f)\n",
@@ -5465,7 +6405,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             std::snprintf(b, sizeof b, " %s %.0f (%.1f%%)", kPfNames[i], pt.ms[i], total > 0 ? 100.0 * pt.ms[i] / total : 0.0);
             line += b;
         }
-        std::fprintf(stderr, "strata prefill timing (layer-major): %lld tokens, GPU timeline %.0f ms:%s\n",
+        std::fprintf(stderr, "xestrata prefill timing (layer-major): %lld tokens, GPU timeline %.0f ms:%s\n",
                      (long long) n, total, line.c_str());
     }
     return true;
@@ -5490,7 +6430,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         static std::string said;
         if (why != said) {
             said = why;
-            std::fprintf(stderr, "strata prefill: layer-major off for this prompt: %s\n", why.c_str());
+            std::fprintf(stderr, "xestrata prefill: layer-major off for this prompt: %s\n", why.c_str());
         }
     }
     return run_impl(tokens, n, pos0, err);

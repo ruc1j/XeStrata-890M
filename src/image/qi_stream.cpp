@@ -6,6 +6,7 @@
 
 #include "strata/core/expert_source.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -90,6 +91,20 @@ void LayerStream::drop_homes() {
     homes_pending_ = streaming_;   // taken again at the next streamed layer
 }
 
+void LayerStream::reload() {
+    drop_homes();
+    for (Layer& l : layers_) {
+        if (l.d != nullptr) gpu::free(l.d);
+        l.d = nullptr;
+        l.loaded = false;
+    }
+    for (Slot& s : slots_) {
+        s.layer = -1;
+        s.issued = false;
+        s.prepared = false;
+    }
+}
+
 void LayerStream::free_homes(int lo, int hi) {
     for (int i = lo; i < hi; ++i) {
         Layer& l = layers_[(size_t) i];
@@ -127,6 +142,20 @@ uint64_t LayerStream::vram() const {
     return t;
 }
 
+uint64_t LayerStream::pending_vram() const {
+    uint64_t n = 0;
+    for (int i = 0; i < resident_; ++i)
+        if (layers_[(size_t) i].d == nullptr) n += layers_[(size_t) i].bytes;
+    return n;
+}
+
+uint64_t LayerStream::pending_physical() const {
+    uint64_t n = 0;
+    for (int i = 0; i < resident_; ++i)
+        if (layers_[(size_t) i].d == nullptr) n += layers_[(size_t) i].bytes + allocation_extra_;
+    return n;
+}
+
 void LayerStream::drop() {
     {   // the worker's queue drained
         std::unique_lock<std::mutex> l(mu_);
@@ -160,12 +189,14 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
     const uint64_t all = total();
     int R = (int) layers_.size();
     bool streaming = false;
+    int slots = 0;
     if (all > budget) {
         streaming = true;
-        if (budget < 2 * max_bytes_)
-            throw std::runtime_error("image engine (layers): the budget is below two layers (" +
+        if (budget < min_budget())
+            throw std::runtime_error("image engine (layers): the budget is below the streaming minimum (" +
                                      std::to_string(budget >> 20) + " MiB)");
-        uint64_t used = 2 * max_bytes_;
+        slots = budget >= 2 * max_bytes_ ? 2 : 1;
+        uint64_t used = (uint64_t) slots * max_bytes_;
         R = 0;
         while (R < (int) layers_.size() && used + layers_[(size_t) R].bytes <= budget) used += layers_[(size_t) R++].bytes;
     }
@@ -184,19 +215,20 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
         l.d = nullptr;
         l.loaded = false;
     }
-    // a layer resident now has no use for its home, nor any once nothing streams; the rest keep theirs
-    free_homes(0, streaming ? R : (int) layers_.size());
-    if (!streaming) {
-        for (Slot& s : slots_) {
+    // the homes stay where the layers become resident: a budget that grows and shrinks between uses (an encoder beside
+    // a DiT, all its layers resident for a prompt's plan and then streamed again) loads them from their homes, DMA
+    // alone and the prepared bytes as they are, not from the file's pages again (MOSS-Image's text encoder on the RX
+    // 9060 XT: its pages pushed out of the page cache between prompts, read from the disk at about 90 ms a layer,
+    // 3 to 4 s of a 30-token prompt's encode, 2026-11-07); drop_homes gives their RAM back
+    for (int k = 0; k < 2; ++k) {
+        Slot& s = slots_[k];
+        if (k >= slots) {
             if (s.d != nullptr) gpu::free(s.d);
             if (s.ready != nullptr) gpu::event_destroy(s.ready);
             if (s.used != nullptr) gpu::event_destroy(s.used);
             s = Slot{};
-        }
-        if (relay_[1] != nullptr) gpu::free(relay_[1]);
-        relay_[1] = nullptr;
-    } else {
-        for (Slot& s : slots_) {
+            if (k == 1 && relay_[k] != nullptr) { gpu::free(relay_[k]); relay_[k] = nullptr; }
+        } else {
             if (s.d == nullptr) check(gpu::alloc_device(&s.d, max_bytes_), "a slot");
             if (s.ready == nullptr) check(gpu::event_create(&s.ready), "an event");
             if (s.used == nullptr) {
@@ -207,7 +239,10 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
             s.issued = false;
         }
     }
-    for (int k = 0; k < (streaming ? 2 : 1); ++k) {
+    slot_count_ = slots;
+    next_slot_ = 0;
+    in_use_ = -1;
+    for (int k = 0; k < (streaming ? slots : 1); ++k) {
         if (relay_[k] == nullptr && (streaming || R > 0)) check(gpu::alloc_host(&relay_[k], max_bytes_), "the relay");
         if (relay_free_[k] == nullptr) {
             check(gpu::event_create(&relay_free_[k]), "an event");
@@ -219,7 +254,8 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
     if (streaming) {
         size_t vfree = 0, vtotal = 0;
         gpu::mem_info(&vfree, &vtotal);
-        home_headroom_ = (8ull << 30) + (uint64_t) vtotal;
+        // at least the RAM the user asked to leave free (STRATA_RAM_RESERVE_MIB, from the server)
+        home_headroom_ = core::detail::ram_headroom((8ull << 30) + (uint64_t) vtotal);
         choose_source(slots_[0]);
         homes_pending_ = true;   // taken once a streamed layer is first begun: a budget set ahead of its use (the
                                  // DiT's, before the text encoder runs) does not take RAM and the copies' time early
@@ -227,7 +263,7 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
 }
 
 void LayerStream::choose_source(Slot& s) {
-    if (const char* e = std::getenv("STRATA_IMAGE_STREAM_SOURCE")) {
+    if (const char* e = strata::env_get("IMAGE_STREAM_SOURCE")) {
         const std::string v = e;
         if (v == "relay" || v == "home" || v == "file") {
             source_ = v == "relay" ? Source::relay : v == "home" ? Source::home : Source::file;
@@ -235,6 +271,11 @@ void LayerStream::choose_source(Slot& s) {
         }
     }
     std::lock_guard<std::mutex> g(g_from_file_mu);
+    if (g_from_file < 0 && !gpu::copies_read_mapped_files()) {   // not measured: the measurement's copy is the fault
+        g_from_file = 0;
+        std::fprintf(stderr, "image engine (layers): a streamed layer is copied from page-locked memory (this GPU's "
+                             "copies do not read the file's pages)\n");
+    }
     if (g_from_file < 0) {
         // the largest streamed layer, both ways, the best of two each: its pages read first (the relay's fill), so
         // the copy from the file's pages finds them in the cache as a pass does
@@ -259,7 +300,8 @@ void LayerStream::choose_source(Slot& s) {
         }
         check(gpu::event_record(relay_free_[0], copy_), "an event");
         // the file's pages when their copies run within a fifth of page-locked memory's: nothing held in RAM for a
-        // little speed (the RX 9060 XT: 25 against 26 GB/s; the B70: 4.7 against 27)
+        // little speed (the B70: 4.7 against 27; the RX 9060 XT: 25 against 26, before gpu::copies_read_mapped_files
+        // left HIP out)
         g_from_file = file <= 1.25 * locked ? 1 : 0;
         std::fprintf(stderr, "image engine (layers): a streamed layer's copy from the file's pages %.1f GB/s, from "
                              "page-locked memory %.1f GB/s: %s\n", (double) l.bytes / file / 1e9,
@@ -309,12 +351,12 @@ uint8_t* LayerStream::take_home(uint64_t bytes) {
     // beside the pinned memory), less the CMA no pinned page can use, faulted the GPU's copies (#11).
     // STRATA_RESIDENT_PIN=0: never, 1: whatever the RAM, as the experts' RAM copy
     static const int pin = [] {
-        const char* v = std::getenv("STRATA_RESIDENT_PIN");
+        const char* v = strata::env_get("RESIDENT_PIN");
         return v == nullptr ? -1 : std::strtol(v, nullptr, 10) != 0 ? 1 : 0;
     }();
     if (homes_full_) return nullptr;
     core::detail::HostMemory hm;
-    std::string why = pin == 0 ? "STRATA_RESIDENT_PIN=0" : "";
+    std::string why = pin == 0 ? "XESTRATA_RESIDENT_PIN=0" : "";
     bool fits = pin != 0 && (pin == 1 || core::detail::host_available_memory(hm));
     if (fits && pin != 1) {
         const uint64_t cma = platform::cma_free_bytes();
@@ -337,11 +379,54 @@ uint8_t* LayerStream::take_home(uint64_t bytes) {
 
 void LayerStream::load_resident(int i) {
     Layer& l = layers_[(size_t) i];
-    if (l.d == nullptr) check(gpu::alloc_device(&l.d, l.bytes), "a layer");
+    if (l.d == nullptr) {
+        // Measure the device's allocation cost, not a maker-specific page size. Qwen-Image's blocks have the
+        // same shape; the free-memory difference includes the allocator's rounding. Every resident layer is
+        // measured and the smallest difference kept: another process's allocation inside the window only adds to
+        // the difference, so one contaminated measurement must not stand for every layer after it (the smallest
+        // of the layers' own is the allocator's cost; a window where memory came back reads 0).
+        size_t before = 0, after = 0, total = 0;
+        const bool measure = gpu::mem_info(&before, &total);
+        check(gpu::alloc_device(&l.d, l.bytes), "a layer");
+        if (measure && gpu::mem_info(&after, &total)) {
+            const uint64_t extra = before > after + l.bytes ? before - after - l.bytes : 0;
+            allocation_extra_ = allocation_measured_ ? std::min(allocation_extra_, extra) : extra;
+            allocation_measured_ = true;
+        }
+    }
+    uint8_t* home;
+    bool prepped;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        home = l.home;
+        prepped = l.prepped || (l.homed && !prepare_);
+    }
+    if (home != nullptr && prepped) {   // a home a streamed pass left: the layer as it is used
+        std::lock_guard<std::mutex> lk(relay_mu_[0]);
+        check(gpu::copy_async(l.d, home, l.bytes, copy_, "resident", i), "a layer's copy");
+        check(gpu::event_record(relay_free_[0], copy_), "an event");
+        check(gpu::stream_wait_event(compute_, relay_free_[0]), "a wait");
+        l.loaded = true;
+        return;
+    }
+    // straight from the file's pages where the streamed layers' measured choice is so (or STRATA_IMAGE_STREAM_SOURCE
+    // says file): through the relay, each layer's memcpy waited for the last one's DMA, and the GPU idled through it
+    // (MOSS-Image's text encoder's blocks made resident again for an edit on the RTX 4070: 1.2 of its 3.3 s,
+    // 2026-11-06)
+    bool from_file = source_ == Source::file;
+    if (!from_file) {
+        std::lock_guard<std::mutex> g(g_from_file_mu);
+        from_file = g_from_file == 1;
+    }
     std::lock_guard<std::mutex> lk(relay_mu_[0]);
-    gpu::event_sync(relay_free_[0]);
-    copy_spans(relay_[0], l.spans, l.bytes);
-    check(gpu::copy_async(l.d, relay_[0], l.bytes, copy_), "a layer's copy");
+    if (from_file) {
+        for (const Span& sp : l.spans)
+            check(gpu::copy_async(l.d + sp.offset, sp.host, sp.bytes, copy_, "resident", i), "a layer's copy");
+    } else {
+        gpu::event_sync(relay_free_[0]);
+        copy_spans(relay_[0], l.spans, l.bytes);
+        check(gpu::copy_async(l.d, relay_[0], l.bytes, copy_, "resident", i), "a layer's copy");
+    }
     check(gpu::event_record(relay_free_[0], copy_), "an event");
     // the compute stream waits for the copy where it uses the layer
     check(gpu::stream_wait_event(compute_, relay_free_[0]), "a wait");
@@ -358,9 +443,11 @@ int LayerStream::slot_of(int i) const {
 void LayerStream::request(int i) {
     std::lock_guard<std::mutex> lk(mu_);
     if (slot_of(i) >= 0) return;
-    // the slot not holding the layer in use (the one begun last): the two alternate
+    // the slot not holding the layer in use (the one begun last): the two alternate on a walk one way, and a walk that
+    // turns back (a training step's backward after its forward) asks again for a layer whose slot is in use
+    if (slot_count_ == 2 && in_use_ >= 0 && slots_[next_slot_].layer == in_use_) next_slot_ ^= 1;
     Slot& s = slots_[next_slot_];
-    next_slot_ ^= 1;
+    if (slot_count_ == 2) next_slot_ ^= 1;
     s.layer = i;
     s.issued = false;
     s.prepared = false;
@@ -418,7 +505,10 @@ void LayerStream::worker() {
         {
             std::unique_lock<std::mutex> l(mu_);
             cv_.wait(l, [this] { return stop_ || !queue_.empty(); });
-            if (stop_) return;
+            // a layer still queued at the stop is filled first: the destructor's drop() waits for the queue to drain
+            // (the prefetch the last begin() queued, not yet taken by this thread when the stop came, hung it: the
+            // parallel CTest's moss_text_parity, 2026-11-24)
+            if (stop_ && queue_.empty()) return;
             i = queue_.front();
             const int k = slot_of(i);
             s = k >= 0 ? &slots_[k] : nullptr;
@@ -442,7 +532,15 @@ void LayerStream::worker() {
 }
 
 const uint8_t* LayerStream::begin(int i) {
+    // the next streamed layer, wrapping to the first streamed one (the DiT's next step)
+    int j = i + 1;
+    if (j >= (int) layers_.size()) j = resident_;
+    return begin(i, j);
+}
+
+const uint8_t* LayerStream::begin(int i, int j) {
     if (i < resident_) {
+        if (slot_count_ == 2 && j >= resident_ && j < (int) layers_.size()) request(j);   // a streamed one after a resident one
         Layer& l = layers_[(size_t) i];
         if (!l.loaded) load_resident(i);
         return l.d;
@@ -466,6 +564,10 @@ const uint8_t* LayerStream::begin(int i) {
         }
     }
     if (k < 0 || k > 1) throw std::logic_error("image engine (layers): a begun layer has no slot");
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        in_use_ = i;
+    }
     Slot* s = &slots_[k];
     check(gpu::stream_wait_event(compute_, s->ready), "a wait");
     if (prepare_) {
@@ -495,10 +597,7 @@ const uint8_t* LayerStream::begin(int i) {
             }
         }
     }
-    // the next streamed layer, wrapping to the first streamed one (the DiT's next step)
-    int j = i + 1;
-    if (j >= (int) layers_.size()) j = resident_;
-    if (j != i && j >= resident_) request(j);
+    if (slot_count_ == 2 && j != i && j >= resident_ && j < (int) layers_.size()) request(j);
     return s->d;
 }
 

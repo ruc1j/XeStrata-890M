@@ -31,7 +31,8 @@ The decode row is at temperature 0.7 with 400 tokens a chat; greedy, with 200 to
 
 > **Contents:** [About XeStrata-890M](#about-xestrata-890m) · [What you need](#what-you-need) · [The model](#the-model) ·
 > [Install](#install) ([Releases](https://github.com/ruc1j/XeStrata-890M/releases)) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
-> [How it works](#how-it-works) · [For developers](#for-developers) · [All the details](docs/DETAILS.md) · [Image generation](docs/IMAGE.md)
+> [How it works](#how-it-works) · [For developers](#for-developers) · [All the details](docs/DETAILS.md) · [Models](docs/MODELS.md) ·
+> [Image generation](docs/IMAGE.md) · [Translation](docs/TRANSLATE.md)
 
 ## About XeStrata-890M
 
@@ -41,8 +42,11 @@ fork rebuilds that AMD path for the Radeon 890M. The models, the install flow, t
 XeStrata's as they are.
 
 The build is the free build only, of free software only (ROCm is free software). oneMKL and CUDA are not used.
-The fork carries in the original XeStrata's changes up to xe0.2.8-1 (its main of 2026-10-30) and the engine, serve and
-setup changes of upstream Strata 0.2.22 (engine 0.1.69) ([docs/XE.md](docs/XE.md)).
+The fork carries in the original XeStrata's changes up to its main of 2026-11-25 (after xe0.2.20-1) and the engine,
+serve and setup changes of upstream Strata 0.2.22 (engine 0.1.69) ([docs/XE.md](docs/XE.md)).
+What came with the original XeStrata is here too: image generation, video upscaling, translation, LoRA training
+and other text models (Inkling-2-Mini (QSA) among them). The fork tunes the speed on the 890M for
+Qwen3.8-Flash-Next alone.
 
 **What an 890M is, and how to use this fork**
 
@@ -192,7 +196,7 @@ setup changes of upstream Strata 0.2.22 (engine 0.1.69) ([docs/XE.md](docs/XE.md
   - on AMD's device compilation the workgroup size each kernel needs is attached to it (`STRATA_AMD_REQD_WG`), and
     the patch to intel/llvm, `hip-reqd-work-group-size`, hands it to the backend's register budget (before it every
     kernel spilled at 128 VGPR). Because of this the dense products take 64 x 128 tiles for the large products of
-    long prompts (`STRATA_MMA_SHAPE=5`, e.g. 2048 rows and 2048 columns or more), and MMQ splits the decoder into
+    long prompts (`STRATA_MMA_SHAPE=7`, e.g. 2048 rows and 2048 columns or more), and MMQ splits the decoder into
     load and decode, issues a step's loads up front, keeps the lattice table in local memory and multiplies the
     scales with a single fma.
   - the host USM of the experts' cache is taken on HIP from the memory the GPU can cache (`hipHostMalloc`'s
@@ -246,6 +250,24 @@ The model run and measured in this fork is Qwen3.8-Flash-Next at **IQ2_XS**, the
 (a 68 GB download). `--expert-cache 24576` puts all the experts in RAM, using about 34 GiB. No other size or
 version has been run in this fork. If all the experts cannot go in the RAM, lower `--expert-cache` (decide by the
 free memory in the startup log).
+The other text models the original XeStrata takes (SC117 Swift, Signal-2, Sync, Inkling-2-Mini (QSA),
+SenseNova-Loop-9B and more) can be chosen in setup too. They have not been run in this fork. The list is in
+[docs/MODELS.md](docs/MODELS.md).
+
+### Image generation (optional)
+
+A model that makes images (Qwen-Image-2.1, Mage-Flow, MageTrail, HunyuanImage 3.0, MOSS-Image or Anima) can be
+installed with the text model: choose it in `xestrata --setup`, or name it, as in `--images qwen-image-turbo`.
+The image model needs 16-20 GB of RAM besides the text model's (HunyuanImage 3.0 about 50 GB).
+LoRA training works from the browser too ([LORA_TRAIN](docs/LORA_TRAIN.md#training-from-the-browser)).
+The default combinations are -uncensored versions.
+Choosing one, using it and the API: [docs/IMAGE.md](docs/IMAGE.md).
+
+### Translation (optional)
+
+With PLaMo 3 Translate (2B, 0.8B or 8B), the same server translates through DeepL's and LibreTranslate's APIs,
+the OpenAI-compatible API and the web page's Translate tab. The default is the 2B or the 0.8B, by the RAM
+([docs/TRANSLATE.md](docs/TRANSLATE.md)).
 
 ## Install
 
@@ -274,6 +296,9 @@ In each, setup looks at the GPU and writes [the settings for the 890M](#the-sett
    - The model and its size: Qwen3.8-Flash-Next at IQ2_XS.
    - The context: how much text it can keep in mind at once. Enter takes this PC's recommendation (128K with 64 GB).
    - Images: whether it should also read pictures.
+   - Image models: which models that make images to install, none for none ([Image generation](docs/IMAGE.md)).
+   - Translation model: auto by default (PLaMo 3 Translate's 2B or 0.8B, by the RAM), no for none
+     ([Translation](docs/TRANSLATE.md)).
    - The experimental speed projection: an experimental feature that changes how it answers, off by default. Read
      [what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) before you use it.
 1. Next time, run `xestrata`. Close its window to stop it.
@@ -328,7 +353,7 @@ podman compose up -d                         # http://127.0.0.1:8095 (podman com
    ./setup.sh --license free
    ```
 
-   setup checks the GPU, the RAM and the CPU, asks whether to build intel/llvm (v7.2.0, with ROCm's HIP target)
+   setup checks the GPU, the RAM and the CPU, asks whether to build intel/llvm (v7.2.1, with ROCm's HIP target)
    here, builds the engine, downloads the model, starts it and opens `http://127.0.0.1:8095` in your browser. The
    questions are the rpm's.
 
@@ -336,7 +361,7 @@ podman compose up -d                         # http://127.0.0.1:8095 (podman com
   it, the next run continues where it stopped. The driver compiles the GPU code the first time it is used, so it
   ends by running the model once to get that done.
 - **Where things go:** the model files in `XeStrata-data` next to XeStrata's folder; the model's settings
-  (`xestrata-<model>.json`) and the logs in XeStrata's folder.
+  (`xestrata-<model>.json`) in `~/.config/xestrata` and the logs in `~/.local/state/xestrata` (as with the rpm).
 - **Next time**, run `./setup.sh`: it starts right away. Close its window to stop it. The chat in the terminal is
   `.venv/bin/python chat.py`.
 - **Updating:** after `git pull`, run `./update.sh`: it updates the engine, the Python packages and the model's
@@ -350,8 +375,7 @@ Details of the build (the free build, building intel/llvm, what setup does) are 
 
 setup writes the settings for the 890M from what the GPU reports, not from its name. On an integrated AMD GPU whose
 BIOS carve-out (VRAM) does not hold the experts, in a PC whose RAM holds the model (this 890M PC), the model's
-settings `xestrata-iq2_xs.json` (in `~/.config/xestrata/` for the rpm and Podman, in XeStrata's folder for the
-source) get this:
+settings `xestrata-iq2_xs.json` (in `~/.config/xestrata/`) get this:
 
 ```json
 "args": [ ..., "--expert-cache", "24576", ..., "--mmap-experts", "--no-prefill-borrow" ],
@@ -381,6 +405,7 @@ original path stays.
 
 **Running it while you are logged in:** `systemctl --user enable --now xestrata` keeps the model set up last
 running (no browser opens). Set it up once first.
+Starting that model again (`xestrata`) starts no second server: it connects to the one running.
 
 **Fitting it to your PC:** `xestrata --calibrate` (`./setup.sh --calibrate` from the source) measures some of the
 engine's settings on this PC and keeps the fastest (about 5-10 minutes).
@@ -388,30 +413,36 @@ engine's settings on this PC and keeps the fastest (about 5-10 minutes).
 **Measuring its speed:** `xestrata --bench` measures the speed on this PC of the installed model (give it with
 `--model IQ2_XS` and the like) and where the time goes, and writes a record to the data folder's
 `records/bench-<date-time>/` (about 40 minutes; stop a running XeStrata first). What it measures and what the
-record holds: [docs/BENCH.md](docs/BENCH.md).
+record holds: [docs/BENCH.md](docs/BENCH.md). The record is not sent anywhere.
 
 ## Using it
 
-- **In the browser:** `http://127.0.0.1:8095` (it opens by itself when the model starts): **Chat**, the **Monitor**
-  of the model and the GPU, CPU and RAM, **About** with the settings and addresses, and **Images** when image
-  generation is installed.
-- **Chat in the terminal:** `.venv/bin/python chat.py`
+- **In the browser:** `http://127.0.0.1:8095` (it opens by itself when the model starts): **Chat**, **Images**,
+  **Tools**, **Video**, **Translate**, **Monitor** (the model and the GPU, CPU and RAM) and **About**
+  (the settings and addresses).
+- **Chat in the terminal:** `xestrata chat` (`.venv/bin/python chat.py` when installed from the source)
 - **Apps and coding agents:** add it as an "OpenAI-compatible" provider with the base URL
   **`http://127.0.0.1:8095/v1`**. Any API key and model name work. Apps that use Anthropic's API:
-  `http://127.0.0.1:8095/v1/messages`.
+  `http://127.0.0.1:8095/v1/messages`. The Responses API (`/v1/responses`) is there too.
 - **Thinking:** the model thinks before it answers. The depth is chosen from **Off, Low, Medium or High** in the
   chat page's menu, with `/think low` in `chat.py`, or with your app's "reasoning effort" setting. Off is fastest;
   High suits hard questions.
 - **Showing it a picture:** press **Picture** in the chat page; in `chat.py`, type `/image <path>`; in apps, attach
   it.
 - **Making a picture:** in the Images tab, or ask in the chat ([Image generation](docs/IMAGE.md)).
+- **Images, video and translation:** `/v1/images/generations`, `/v1/videos` and `/v2/translate`; LoRA training
+  through `/v1/lora/jobs` ([IMAGE](docs/IMAGE.md#api), [TRANSLATE](docs/TRANSLATE.md),
+  [LORA_TRAIN](docs/LORA_TRAIN.md)).
+- **Skills and MCP:** read the bundled skills from outside with `GET /v1/skills` and `GET /v1/skills/<name>`;
+  XeStrata calls MCP tools and also runs as an MCP server ([DETAILS](docs/DETAILS.md#using-it)).
 - **From a phone or another PC:** run `./setup.sh --host 0.0.0.0 --api-key <secret>` and open the address the
   server window prints ([details](docs/DETAILS.md#streaming-and-connecting)).
 
-**Good to know:** it answers one request at a time (to answer several at once, `"parallel": 2`,
-[BATCHING](docs/BATCHING.md)). The first message of a conversation is read in full; after that it keeps the
-conversation and reads only what is new, so follow-ups start right away. The API in full, MCP tools and
-llama-swap: [DETAILS](docs/DETAILS.md#using-it) and [LLAMA_SWAP](docs/LLAMA_SWAP.md).
+**Good to know:** it answers one request at a time (several at once with `"parallel": N`,
+[BATCHING](docs/BATCHING.md)). The first message of a conversation is read in full; after that only what is new
+is read, so follow-ups start right away. With a SearXNG-compatible search server set, the API and the web page
+can search the web ([Web search](docs/DETAILS.md#web-search)). llama-swap is covered in
+[LLAMA_SWAP](docs/LLAMA_SWAP.md).
 
 ## When something goes wrong
 
@@ -457,8 +488,8 @@ See the [full troubleshooting table](docs/DETAILS.md#troubleshooting) (for image
 [IMAGE](docs/IMAGE.md#when-something-goes-wrong)).
   You can hand an LLM agent that can drive a terminal the [recovery and diagnosis instructions](docs/DIAGNOSE.md)
   and the symptoms.
-Open an [issue](https://github.com/ruc1j/XeStrata-890M/issues) and attach XeStrata's folder's
-`xestrata-<model>.log`.
+Open an [issue](https://github.com/ruc1j/XeStrata-890M/issues) and attach
+`xestrata-<model>.log` from `~/.local/state/xestrata`.
 
 ## How it works
 
@@ -477,14 +508,16 @@ GPU share one RAM, so **XeStrata-890M uses the whole RAM as the GPU's memory**.
 - **Long texts are read in large pieces** (up to 32,768 tokens at a time). prefill's dense matrix products run on
   the 890M's WMMA, and the experts' products on int8 WMMA.
 
+The two text engines and the image engine's DiTs and VAEs share their parts: the matrix products, the attention,
+the experts' placement and the rest.
 Each part is explained in [docs/DETAILS.md](docs/DETAILS.md#how-it-works) (the original XeStrata's explanation).
 
 ## For developers
 
-Before sending a report or a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md) (no dependence on the model number, the licenses, the additional
-permission under GPL section 7, what goes in, and how to report).
+Before sending a report or a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md) (no dependence on the model
+number, the licenses, the additional permission under GPL section 7, what goes in, and how to report).
 
-- **Building:** the free build only (`build/free`, `-DSTRATA_LICENSE=free`, intel/llvm v7.2.0 built with HIP by
+- **Building:** the free build only (`build/free`, `-DSTRATA_LICENSE=free`, intel/llvm v7.2.1 built with HIP by
   `tools/intel_llvm_build.py`). The steps are in [docs/BUILD.md](docs/BUILD.md). This machine's facts (paths,
   settings, tools) are written in `LOCAL.md` (not in git).
 - **Measuring a kernel alone:** `build/free/gemm_bench` (dense products), `iq_mmq_parity --bench` (the experts'
@@ -500,6 +533,8 @@ permission under GPL section 7, what goes in, and how to report).
   (an integrated GPU, the HIP backend, whether WMMA is present) or an environment-variable opt-in, not from the
   GPU's name. The lints (`tools/lint/run.sh`), the tests (CTest, `python -m unittest`) and the license notices are
   there too. Measurement records are not put in git.
+- **The models' information:** the versions, sizes and recommendations are in [docs/MODELS.md](docs/MODELS.md)
+  (the original XeStrata's).
 - **The README and docs:** the Japanese ones (README.ja.md, docs/*.ja.md) are written first, and the English ones
   (README.md, docs/*.md) are their translations. `docs/` is the original XeStrata's.
 
@@ -520,6 +555,9 @@ permission under GPL section 7, what goes in, and how to report).
      [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);
    - [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by Thinking Machines (the `.strata` files are upstream [Strata](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata)'s; it runs on an engine of its own: [details](docs/DETAILS.md#or-inkling-2-mini-a-model-on-an-engine-of-its-own)).
    - [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth), and the version with its refusals removed, [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive), by HauhauCS;
+   - the other models that came with the original XeStrata: hiruhiru2005, SC117, SenseNova, Preferred Networks
+     (PLaMo 3 Translate), CircleStone Labs and others. Their names and licenses one by one are in the
+     [model list](docs/MODELS.md) and [DETAILS' credits](docs/DETAILS.md#credits-and-licenses);
    - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image, and Qwen3-VL and Qwen3.5-9B as the text encoders ([IMAGE](docs/IMAGE.md#licenses)).
 
   Each model's own license applies to its files.
@@ -537,6 +575,11 @@ permission under GPL section 7, what goes in, and how to report).
      [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) package (Expat);
    - the image engine's attention: [oneDNN](https://github.com/uxlfoundation/oneDNN) (Apache-2.0, Intel GPUs), [AOTriton](https://github.com/ROCm/aotriton) (MIT, AMD GPUs)
      and [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend) (Apache-2.0, parts MIT, NVIDIA GPUs); for reading reference images, [stb_image](https://github.com/nothings/stb) (MIT or the Unlicense);
+   - [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen), by Comfy Org (Apache-2.0): the int8 products and
+     attention on AMD GPUs;
+   - [py3langid](https://github.com/adbar/py3langid) (BSD-3-Clause): the translation's language detection;
+     [mermaid](https://mermaid.js.org/) (MIT): the chat's diagrams;
+   - YASAKANI, Sync-Strata, vLLM-Omni and others the original XeStrata took in ([NOTICE](NOTICE));
    - [quantscope](https://github.com/1872183316/quantscope) (MIT or Apache-2.0): what `setup.py --inspect` reads a GGUF's contents with;
    - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1);
    - [KaTeX](https://katex.org/) (MIT), which draws the math in the chat.
@@ -571,16 +614,23 @@ the code that comes from Strata and ggml / llama.cpp (MIT) and the components li
 - **Exceptions:** these, in `third_party/`, stay under their own licenses, one folder per project with its license text.
    - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
    - XeStrata's changes to oneMath (its fork, `third_party/main/oneMath/`): Apache-2.0.
+   - The patches applied to oneDNN (`third_party/main/oneDNN/patches/`, oneDNN's pull requests backported to the tag
+     CMake fetches): Apache-2.0.
+   - XeStrata's patches to comfy-kitchen (`third_party/main/comfy-kitchen/patches/`): comfy-kitchen's license (Apache-2.0).
    - XeStrata's patch for building AOTriton for Windows (`third_party/main/aotriton/`): AOTriton's license (MIT).
+   - Podman's seccomp profile with io_uring added (`third_party/main/containers-common/`): Apache-2.0.
    - Unmodified copies: ggml's `ggml-common.h` and agentionai's llama.cpp's `ggml-common-tq.h` (`third_party/main/ggml/`, MIT),
-     `quantscope.py` (`third_party/main/quantscope/`, MIT or Apache-2.0), `stb_image.h` (`third_party/main/stb/`, MIT or the Unlicense).
+     `quantscope.py` (`third_party/main/quantscope/`, MIT or Apache-2.0), `stb_image.h` (`third_party/main/stb/`, MIT or the Unlicense),
+     py3langid (`third_party/main/py3langid/`, BSD-3-Clause), mermaid's `mermaid.min.js` (`third_party/main/mermaid/`, MIT;
+     the licenses of the packages it bundles are in `BUNDLED.md`).
    - The app's font Outfit (`third_party/main/outfit/`): SIL Open Font License 1.1.
    - KaTeX, which draws the math in the chat (`third_party/main/katex/`): MIT.
    - `third_party/nonfree/`: what is not free software. The original model's chat template and the experimental
      speed projection's vector, both under the Qwen Community License 1.0.
 - **Without `third_party/nonfree/`,** XeStrata still builds and runs. The packages leave it out.
 - **What else the packages carry:** intel/llvm's SYCL runtime (Apache-2.0 WITH LLVM-exception), llama.cpp's gguf-py
-  (MIT), oneMath (Apache-2.0), oneDNN (Apache-2.0), and AOTriton's library and kernels (MIT; the kernels can carry parts of aiter (MIT), FlyDSL (Apache-2.0) and Triton (MIT)), each with its license text.
+  (MIT), oneMath (Apache-2.0), oneDNN (Apache-2.0), AOTriton's library and kernels (MIT; the kernels can carry parts of aiter (MIT), FlyDSL (Apache-2.0) and Triton (MIT)),
+  comfy-kitchen's module for AMD GPUs (Apache-2.0), py3langid (BSD-3-Clause) and mermaid (MIT and others), each with its license text.
   The code for AMD GPUs carries parts of ROCm's device libraries (NCSA), and the image engine stb_image (MIT) and, in the contrib-llvm packages, cuDNN Frontend (Apache-2.0, parts MIT), so their license texts are there too.
   In the contrib-llvm packages the code for NVIDIA GPUs can contain parts of NVIDIA's libdevice, which are under the NVIDIA CUDA Toolkit End User License Agreement.
   Nothing else that is not free software (oneMKL, cuBLAS, cuDNN, NVIDIA's driver) is in them.

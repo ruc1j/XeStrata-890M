@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Request inspection through HTTP; no native model or GPU is required."""
 import json
+import tempfile
 import threading
 import time
 import unittest
@@ -31,21 +32,29 @@ class ReloadableEngine(MockEngine):
         self.running, self.unloaded = True, False
 
 
-class MonitorOff(unittest.TestCase):
-    """#332 is opt-in: by default no prompt or answer is kept, and the monitor's endpoints do not exist."""
+class MonitorDisabled(unittest.TestCase):
+    """An explicit "api_monitor": false keeps #332 off: no prompt or answer is kept, no endpoint."""
 
-    def test_off_by_default(self):
+    @staticmethod
+    def service():
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "Hello.", max_context=4096), tok,
-                      ChatTemplate(Path(__file__).parent / "test_chat_template.jinja"))
+        return Service(MockEngine(tok, "Hello.", max_context=4096), tok,
+                       ChatTemplate(Path(__file__).parent / "test_chat_template.jinja"))
+
+    def chat(self, base):
+        req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
+                                     data=json.dumps({"messages": [{"role": "user",
+                                                                    "content": "secret"}]}).encode())
+        with urllib.request.urlopen(req, timeout=10) as r:
+            self.assertEqual(r.status, 200)
+
+    def test_off_when_disabled(self):
+        svc = self.service()
+        svc.api_monitor = False
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
         try:
-            req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
-                                         data=json.dumps({"messages": [{"role": "user",
-                                                                        "content": "secret"}]}).encode())
-            with urllib.request.urlopen(req, timeout=10) as r:
-                self.assertEqual(r.status, 200)
+            self.chat(base)
             self.assertEqual(len(svc.api_requests), 0)
             for path in ("/api/requests", "/api-monitor"):
                 with self.assertRaises(urllib.error.HTTPError) as e:
@@ -56,6 +65,51 @@ class MonitorOff(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_on_by_default(self):
+        svc = self.service()
+        self.assertTrue(svc.api_monitor)
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            self.chat(base)
+            self.assertEqual(len(svc.api_requests), 1)
+            with urllib.request.urlopen(base + "/api/requests", timeout=10) as r:
+                self.assertEqual(r.status, 200)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class ApiMonitorConfig(unittest.TestCase):
+    """The run config is read from JSON the same way as at startup."""
+
+    def test_default_and_explicit_false(self):
+        from serve.server import api_monitor_of, read_config
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "xestrata-test.json"
+            for body, want in (("{}", True), ('{"api_monitor": true}', True), ('{"api_monitor": false}', False)):
+                path.write_text(body, encoding="utf-8")
+                with self.subTest(body=body):
+                    self.assertEqual(api_monitor_of(read_config(path), False), want)
+            path.write_text('{"api_monitor": false}', encoding="utf-8")
+            self.assertTrue(api_monitor_of(read_config(path), True))   # --api-monitor still turns it on
+
+
+class MonitorLinks(unittest.TestCase):
+    """The chat page's Settings and /api-monitor point at each other."""
+
+    def test_chat_settings_link_to_api_monitor(self):
+        web = Path(__file__).parent / "web"
+        html = (web / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<a href="/api-monitor" data-i18n="about.monitorLink">', html)
+        for code in ("en", "ja", "de", "es", "fr", "ko", "pt", "ru", "zh"):
+            catalog = json.loads((web / "locales" / f"{code}.json").read_text(encoding="utf-8"))
+            self.assertIn("about.monitorLink", catalog, code)
+
+    def test_api_monitor_link_to_chat(self):
+        html = (Path(__file__).parent / "web" / "monitor.html").read_text(encoding="utf-8")
+        self.assertIn('<a href="/" class="back"', html)
+
 
 class Monitor(unittest.TestCase):
     def setUp(self):
@@ -63,7 +117,7 @@ class Monitor(unittest.TestCase):
         self.engine = ReloadableEngine(self.tok, "Thought.</think>\nHello <script>alert(1)</script>.",
                                        max_context=16384)
         self.svc = Service(self.engine, self.tok, ChatTemplate(Path(__file__).parent / "test_chat_template.jinja"))
-        self.svc.api_monitor = True                       # opt-in ("api_monitor": true / --api-monitor)
+        self.svc.api_monitor = True                       # on by default; true in the config / --api-monitor too
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
@@ -192,6 +246,16 @@ class Monitor(unittest.TestCase):
             release.set()
             self.assertEqual(first.result()[0], 200)
             self.assertEqual(second.result()[0], 200)
+        # the server writes the final state in the handler's finally, which can run just after the HTTP answer:
+        # errors and disconnects get a state too, and a stream is only done when its last line was written.  A reader
+        # of the monitor therefore sees a brief lag; wait for it rather than asking the server to report "completed"
+        # before the request is actually over.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            records = list(self.svc.api_requests)
+            if len(records) == 2 and all(r["state"] == "completed" for r in records):
+                break
+            time.sleep(0.01)
         records = list(self.svc.api_requests)
         self.assertGreater(records[0]["load_s"], 0.02)
         self.assertGreater(records[1]["queue_s"], 0.02)
@@ -213,13 +277,14 @@ class ConversationCacheCard(unittest.TestCase):
     """#596: /metrics' "conversation_cache": the parked conversations from the engine's log lines, the budget and
     slots from its INFO line, and how much of the prompts the cache gave back."""
 
-    PARK = ("strata serve: conversation cache: parked 5000 tokens in 12.0 ms; parked=1 bytes=104857600 evictions=0 "
+    PARK = ("xestrata serve: conversation cache: parked 5000 tokens in 12.0 ms; parked=1 bytes=104857600 evictions=0 "
             "snapshot_bytes=104857600 reused_kv_bytes=0\n")
-    RESTORE = "strata serve: conversation cache: restored 4000 tokens (exact) in 30.0 ms; parked=2 bytes=209715200\n"
+    RESTORE = "xestrata serve: conversation cache: restored 4000 tokens (exact) in 30.0 ms; parked=2 bytes=209715200\n"
 
     def test_the_log(self):
-        from serve.server import ConvCacheLog
         import tempfile
+
+        from serve.server import ConvCacheLog
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "strata.log"
             log.write_text("an earlier run\n" + self.PARK, encoding="utf-8")
@@ -227,7 +292,8 @@ class ConversationCacheCard(unittest.TestCase):
             c = ConvCacheLog()
             self.assertEqual(c.poll(str(log), start)["parked"], 0)
             with open(log, "a", encoding="utf-8") as f:
-                f.write("strata serve: something else\n" + self.PARK + self.RESTORE + "strata serve: conversation ca")
+                f.write("xestrata serve: something else\n" + self.PARK + self.RESTORE
+                        + "xestrata serve: conversation ca")
             st = c.poll(str(log), start)
             self.assertEqual((st["parked"], st["bytes"], st["parks"], st["restores"]), (2, 209715200, 1, 1))
             self.assertEqual((st["last_event"], st["last_tokens"]), ("restored", 4000))
@@ -329,6 +395,25 @@ class ConversationCacheCard(unittest.TestCase):
         for el in ("cc-card", "cc-slots-text", "cc-mem-text", "cc-facts", "cc-note"):
             self.assertIn(f'id="{el}"', html)
             self.assertIn(f'"{el}"', js)
+
+    SKIPS = [  # noqa: RUF012
+        "strata serve: conversation cache: skip parking (12 tokens, below the 512 minimum ...)\n",
+        "strata serve: conversation cache: skip parking (snapshot 9000 MiB exceeds available budget)\n",
+        ("strata serve: conversation cache: skip parking (physical RAM admission; need 4000 MiB plus 2560 MiB floor, "
+         "MemAvailable 5000 MiB; evicted 4, 0 still parked)\n"),
+        ("strata serve: conversation cache: skip parking (physical RAM admission; need 4000 MiB plus 2560 MiB floor, "
+         "MemAvailable 5000 MiB; evicted 1, 3 still parked; the last eviction gave no memory back, so the rest "
+         "stay parked)\n"),
+        ("strata serve: conversation cache: skip parking (RAM floor after capture: 2560 MiB needed, "
+         "MemAvailable 2000 MiB)\n"),
+        "strata serve: conversation cache: allocation failed; skip parking\n",
+        "strata serve: conversation cache: allocation failed; skip parking slot 2\n",
+        "strata serve: conversation cache: skip parking (stage CUDA1: invalid session running-state targets)\n",
+        "strata serve: conversation cache: skip parking (conversation snapshot: invalid live token/image metadata)\n",
+        ("strata serve: conversation cache: skipped 5000 tokens in 3.0 ms; parked=0 bytes=0 "
+         "evictions=2 snapshot_bytes=1 "
+         "reused_kv_bytes=0\n"),
+    ]
 
 
 if __name__ == "__main__":

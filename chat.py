@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 
 from highlight import StreamHighlighter
+from serve import envvars
 
 
 class ServerError(Exception):
@@ -44,7 +45,7 @@ def http_error_text(e):
 
 
 def stream(url, messages, think, max_tokens, api_key=None):
-    body = {"model": "strata", "messages": messages, "stream": True, "max_tokens": max_tokens,
+    body = {"model": "xestrata", "messages": messages, "stream": True, "max_tokens": max_tokens,
             "reasoning_effort": think}
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -78,8 +79,8 @@ def main() -> int:
     ap.add_argument("--think", default="medium", choices=["none", "low", "medium", "high"],
                     help="how long the model thinks before answering (none = answer directly)")
     ap.add_argument("--no-think", action="store_true", help="same as --think none")
-    ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY"),
-                    help="the server's API key, sent as a Bearer token (default: $STRATA_API_KEY)")
+    ap.add_argument("--api-key", default=envvars.get("API_KEY"),
+                    help="the server's API key, sent as a Bearer token (default: $XESTRATA_API_KEY)")
     ap.add_argument("--max-tokens", type=int, default=4096)
     a = ap.parse_args()
     url = f"http://{a.host}:{a.port}/v1/chat/completions"
@@ -88,7 +89,7 @@ def main() -> int:
     messages: list = []
     pending: list = []
     think = "none" if a.no_think else a.think
-    print(f"Strata chat ({url}).  /image <path> = attach a picture, /think none|low|medium|high (now: {think}), "
+    print(f"XeStrata chat ({url}).  /image <path> = attach a picture, /think none|low|medium|high (now: {think}), "
           f"/reset = new conversation, /quit = leave.")
     while True:
         try:

@@ -7,6 +7,10 @@
 #include "strata/core/gpu.hpp"
 #include "strata/image/hunyuanimage3_kernels.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/router_top10.hpp"
+#include "strata/prefill/kernels.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -73,7 +77,6 @@ uint64_t hunyuanimage3_scratch_bytes(int64_t T, const HunyuanImage3Dims& d) {
     f32(T * d.experts);                       // logits
     f32(2 * T * d.hidden);                    // xn32, xn232 (the norms, FP32 up to the rotation)
     f32(T * (d.head_dim / 2));                // ang
-    f32(rows * d.heads * d.head_dim);         // attn_scratch: the plain attention's FP32 output
     f32(2 * T * d.topk);                      // d_w, d_tw
     b += (uint64_t) std::max<int64_t>(2 * T * d.topk, 1) * sizeof(int32_t);   // d_rows, d_idx
     b += (uint64_t) (2 * d.experts + 1) * sizeof(int32_t);                 // d_bounds, d_cursor
@@ -113,7 +116,6 @@ bool hunyuanimage3_scratch_alloc(int64_t T, const HunyuanImage3Dims& d, HunyuanI
         sc.xn32 = take_as<float>(owned, T * d.hidden, "xn32");
         sc.xn232 = take_as<float>(owned, T * d.hidden, "xn232");
         sc.ang = take_as<float>(owned, T * (d.head_dim / 2), "ang");
-        sc.attn_scratch = take_as<float>(owned, hdots, "attn_scratch");
         sc.d_rows = take_as<int32_t>(owned, T * d.topk, "d_rows");
         sc.d_w = take_as<float>(owned, T * d.topk, "d_w");
         sc.d_tw = take_as<float>(owned, T * d.topk, "d_tw");
@@ -132,7 +134,7 @@ bool hunyuanimage3_scratch_alloc(int64_t T, const HunyuanImage3Dims& d, HunyuanI
 void hunyuanimage3_scratch_free(HunyuanImage3Scratch& sc) {
     const void* ps[] = {sc.xr16, sc.ar16, sc.xr216, sc.a16, sc.gx16, sc.q16, sc.k16, sc.v16, sc.act16, sc.gact16,
                         sc.egu16, sc.edn16, sc.qkv32, sc.o32, sc.gu32, sc.eg32, sc.ed32, sc.logits, sc.ang,
-                        sc.attn_scratch, sc.d_rows, sc.d_w, sc.xn32, sc.xn232, sc.d_tw, sc.d_idx, sc.d_bounds, sc.d_cursor};
+                        sc.d_rows, sc.d_w, sc.xn32, sc.xn232, sc.d_tw, sc.d_idx, sc.d_bounds, sc.d_cursor};
     for (const void* p : ps)
         if (p != nullptr) gpu::free(p);
     sc = HunyuanImage3Scratch{};
@@ -168,7 +170,7 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
     }
     try {
         // --- attention: the norm, the save's rotation, qkv, the rope and the qk-norm, the block's mask, o
-        hunyuanimage3_rms_norm32(x, w.n_in, T, d.hidden, d.eps, sc.xn32, stream);
+        kernels::rms_norm_rows(x, w.n_in, 1, sc.xn32, nullptr, (int) (d.hidden), (int) (T), d.eps, stream);
         hunyuanimage3_rotate16_from32(sc.xn32, T, d.hidden, d.rotate, sc.xr16, stream);
         gemm.f16(sc.xr16, w.qkv, sc.qkv32, T, w.qkv_n, w.qkv_k);
         hunyuanimage3_rope_angles(pos_y, pos_x, T, d.head_dim, d.theta, sc.ang, stream);
@@ -176,15 +178,15 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
                            sc.v16, stream);
         // the rows T .. qi_attn_rows(T) of q, k and v are the attention's padding: hunyuanimage3_scratch_alloc zeroed them,
         // and a sequence changes T only by going through a new scratch
-        qi_attention(sc.q16, sc.k16, sc.v16, T, d.heads, d.head_dim, T - n_img, sc.a16, sc.attn_scratch, stream,
-                     key_lim);
+        qi_attention(sc.q16, sc.k16, sc.v16, T, d.heads, d.head_dim, T - n_img, sc.a16, stream,
+                     key_lim, 0, true);
         hunyuanimage3_rotate16(sc.a16, T, d.hidden, d.rotate, sc.ar16, stream);
         gemm.f16(sc.ar16, w.o, sc.o32, T, w.o_n, w.o_k);
         if (out != x) up(out, x, (size_t) T * d.hidden * sizeof(float));
         hunyuanimage3_add(out, sc.o32, T * d.hidden, stream);
 
         // --- the MLP: the shared expert, then the routed ones on the router's FP32 logits
-        hunyuanimage3_rms_norm32(out, w.n_post, T, d.hidden, d.eps, sc.xn232, stream);
+        kernels::rms_norm_rows(out, w.n_post, 1, sc.xn232, nullptr, (int) (d.hidden), (int) (T), d.eps, stream);
         hunyuanimage3_rotate16_from32(sc.xn232, T, d.hidden, d.rotate, sc.xr216, stream);
         gemm.f16(sc.xr216, w.sgu, sc.gu32, T, w.sgu_n, w.sgu_k);
         hunyuanimage3_swiglu16_rotated(sc.gu32, T, d.inter, sc.act16, stream);
@@ -195,10 +197,10 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
         hunyuanimage3_add(out, sc.gu32, T * d.hidden, stream);
         // The router on the same FP32 norm (the gate runs float32 in the reference, and which experts a token
         // takes is a discrete choice no later rounding can undo).
-        hunyuanimage3_router_logits(sc.xn232, w.wg, T, d.hidden, d.experts, sc.logits, stream);
+        kernels::f32_gemm_rows(sc.xn232, d.hidden, w.wg, sc.logits, d.experts, d.hidden, d.experts, T, stream);
         // softmax, the top `topk`, renormalized over them (norm_topk_prob), and the rows grouped by expert, on the
         // device: only the experts' bounds come back, for the products' sizes
-        hunyuanimage3_router_topk(sc.logits, T, d.experts, d.topk, sc.d_idx, sc.d_tw, stream);
+        kernels::router_top10(sc.logits, (int) T, (int) d.experts, (int) d.topk, sc.d_idx, sc.d_tw, stream);
         hunyuanimage3_route_lists(sc.d_idx, sc.d_tw, T, d.topk, d.experts, sc.d_bounds, sc.d_rows, sc.d_w, sc.d_cursor,
                                   stream);
         gpu::device_sync();
@@ -209,12 +211,14 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
             const int64_t cnt = begin[(size_t) e + 1] - begin[(size_t) e];
             if (cnt == 0) continue;
             if (!experts.fill(e, sc.egu16, sc.edn16, err)) return false;
-            hunyuanimage3_gather16(sc.xr216, sc.d_rows + begin[(size_t) e], cnt, d.hidden, sc.gx16, stream);
+            prefill::gather_rows16(sc.xr216, sc.d_rows + begin[(size_t) e], sc.gx16, cnt, d.hidden, stream);
             gemm.f16(sc.gx16, sc.egu16, sc.eg32, cnt, w.egu_n, w.egu_k);
             hunyuanimage3_swiglu16_rotated(sc.eg32, cnt, d.inter, sc.gact16, stream);
             gemm.f16(sc.gact16, sc.edn16, sc.ed32, cnt, w.edn_n, w.edn_k);
-            hunyuanimage3_scatter_scale_add(out, sc.ed32, sc.d_w + begin[(size_t) e], sc.d_rows + begin[(size_t) e], cnt,
-                                  d.hidden, stream);
+            // the expert's rows back into their tokens by their weights: the LLMs' scatter of a group's rows
+            // (each token once an expert, so no two work-items add to one value)
+            prefill::moe_scatter_add(sc.ed32, sc.d_rows + begin[(size_t) e], nullptr, nullptr, sc.d_w + begin[(size_t) e],
+                                     cnt, out, stream, d.hidden);
         }
         gpu::device_sync();
         return true;

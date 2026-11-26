@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """A client that stops reading a streamed answer early must not leave its tokens to the next request.
 
-  STRATA_KEY=... python3 tools/early_close_test.py http://127.0.0.1:8090
+  XESTRATA_KEY=... python3 tools/early_close_test.py http://127.0.0.1:8090
 
 The work sits inside main() behind a __main__ guard on purpose.  The file is named *_test.py, so a
 `pytest tools` run imports it while collecting: an unguarded script this one sent a live chat
@@ -19,7 +19,7 @@ import threading
 import urllib.request
 
 URL = ""                                      # main() fills this in from argv[1]
-KEY = os.environ.get("STRATA_KEY", "")
+KEY = os.environ.get("XESTRATA_KEY", "")
 
 
 def req(content, stream, max_tokens=300):

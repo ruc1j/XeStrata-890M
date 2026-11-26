@@ -27,6 +27,7 @@
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/platform/env.hpp"
 #include "plain_prompt.hpp"
 
 #include <algorithm>
@@ -58,11 +59,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
     const int64_t IH = s.idx_n_head, ID = s.idx_key_length;
     const float eps = (float) s.rms_eps, hc_eps = (float) s.hc_eps;
     const int iters = (int) s.hc_sinkhorn_iters;
-    const k::QsaShapes qs = [&] {   // the step records' positions (glm5_idx_steps reads kStepPos only)
-        k::QsaShapes q = k::qsa_real_shapes();
-        q.n_head = s.n_head; q.n_head_kv = nkv_; q.head_dim = s.key_length; q.n_rot = s.rope_dims;
-        return q;
-    }();
+    const k::QsaShapes qs = attn_shapes();   // the step records' positions (glm5_idx_steps reads kStepPos only)
     k::QsaShapes sel;
     sel.idx_block = s.idx_kpool;
     sel.idx_top_k = s.idx_top_k;
@@ -72,7 +69,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
     // x [T][n_in] (ldx a row) through the weight into y [T][n_out] (ldy a row): int8 where the weight's type and shape
     // are the int8 products', else from an FP16 copy of x (contiguous rows)
     static const bool dense_env = [] {   // STRATA_PLAIN_DENSE_MMQ=0: every dense product from FP16
-        const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
+        const char* v = strata::env_get("PLAIN_DENSE_MMQ");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     const bool dense_on = dense_env && prefill::mmq::chosen();
@@ -88,7 +85,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
             return;
         }
         if (ldx != n_in) throw std::runtime_error("plain prompt (GLM): an FP16 product of strided rows");
-        prefill::to_f16(x, P.x16, T * n_in, cs);
+        kernels::f32_to_f16_bulk(x, P.x16, T * n_in, cs);
         gm.native(P.x16, type, w, y, T, n_out, n_in, ldy);
     };
     auto dense = [&](const W& w, const float* x, float* y, int64_t T) {
@@ -96,12 +93,13 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
     };
     // the routed experts' CPU share, as the Qwen-family chunks take it (plain_prompt.cpp)
     static const bool cpu_env = [] {
-        const char* v = std::getenv("STRATA_PLAIN_CPU_SHARE");
+        const char* v = strata::env_get("PLAIN_CPU_SHARE");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool cpu_share = cpu_env && strata::prefill::cpu_share_setting() != 0.0 && split_.c > 0.0 && split_.p > 0.0 &&
-                           P.cpu_cap > 0;
-    static const bool profile = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;
+    const double share_setting = strata::prefill::cpu_share_setting();
+    const bool cpu_share = cpu_env && share_setting != 0.0 &&
+                           (share_setting > 0.0 || (split_.c > 0.0 && split_.p > 0.0)) && P.cpu_cap > 0;
+    static const bool profile = strata::env_get("PROMPT_PROFILE") != nullptr;
     // 0 KDA (its parts 5 projections, 6 convolutions and gates, 7 recurrence, 8 output), 1 DSA, 2 the grouping, 3 the
     // experts, 4 the shared expert, mHC and dense FFN
     double stage_ms[12] = {};   // 9 the chunk's staging, 10 the head, 11 what is left at the end
@@ -128,10 +126,11 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
         for (int64_t c0 = c_begin; c0 < c_last; c0 += P.T) {
             const int64_t T = std::min<int64_t>(P.T, c_last - c0), p0 = pos + c0;
             float* hand = hand_host_ != nullptr ? hand_host_ + (c0 - c_begin) * kHC * N : nullptr;
+            if (first()) embed_ahead(tokens + c0, T);
             for (int64_t t = 0; t < T; ++t) {
                 const int32_t tok = tokens[c0 + t];
                 if (tok < 0 || tok >= n_vocab_ ||
-                    (first() && !k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, P.emb + t * N, N))) {
+                    (first() && !embed(tok, p0 + t, P.emb + t * N))) {
                     err = "plain prompt: a token is out of the vocabulary";
                     return false;
                 }
@@ -257,9 +256,9 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                     const float scale = s.expert_weights_scale > 0 ? (float) s.expert_weights_scale : 1.0f;
                     k::glm5_router_sigmoid(P.rlog, b.router_b, (int) T, (int) E, (int) K, s.expert_weights_norm, scale,
                                            P.ids, P.w, cs);
-                    if (!P.int8) prefill::to_f16(P.hn, P.x16, T * N, cs);   // the FP16 path's routed rows
+                    if (P.f16) kernels::f32_to_f16_bulk(P.hn, P.x16, T * N, cs);   // the FP16 path's routed rows
                     const int64_t ml = s.moe_index(l);
-                    if (!prompt_routed(ml, T, cpu_share, routes.empty() ? nullptr : routes.data() + ml * P.T * K,
+                    if (!prompt_routed_tuned(ml, T, cpu_share, routes.empty() ? nullptr : routes.data() + ml * P.T * K,
                                        [&](int stage) { mark(stage == 1 ? 2 : 3); }, rst, err))
                         return false;
                     swiglu(b, P.shared);   // the shared expert (no gate)
@@ -268,7 +267,9 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                     mark(4);
                 }
                 k::glm5_hc_post(ffn_out, P.g_hs, P.g_post, P.g_comb, P.g_hs, N, T, cs);
+                tap_rows(l, P.g_hs, kHC, T, p0, false, cs);   // DFlash2's prompt taps: the four streams' mean
             }
+            if (!prompt_taps_deliver(ptap_dev_, T, p0, cs, err)) return false;
             // the MTP layer after the trunk, its caches a cell ahead: row t pairs the trunk's normed row t with the
             // token after it (the prompt's last row with a stand-in, rewritten by spec_start once the token is picked).
             // Only its caches are wanted here, so of its block only the latent and the indexer's keys are made.
@@ -286,9 +287,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                 const float* last = P.hn + (rows - 1) * N;
                 k::native_quantize_q8_1(last, xq_, head_.n_in, 1, cs);
                 k::native_mmvq(head_.type, head_.data, xq_, logits_, head_.n_in, head_.n_out, 1, cs);
-                k::SamplerParams sp = sampler_;
-                sp.counter = (uint64_t) (p0 + T - 1);
-                k::sample_tokens(logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+                pick(logits_, 1, p0 + T - 1, m_out_, cs);
                 if (mtp_chunk && !strata::gpu::copy_async(mtp_h_, last, (size_t) N * 4, cs)) {
                     err = std::string("plain prompt: the MTP layer's input: ") + strata::gpu::last_error();
                     return false;
@@ -304,7 +303,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                 }
                 for (int64_t t = 0; t < T; ++t) {
                     const int32_t tok = c0 + t + 1 < n ? tokens[c0 + t + 1] : tokens[n - 1];
-                    if (!k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, P.emb + t * N, N)) {
+                    if (!embed(tok, p0 + 1 + t, P.emb + t * N)) {
                         err = "plain prompt: a token is out of the vocabulary";
                         return false;
                     }
@@ -336,6 +335,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                 for (int64_t ml : moe_local_)   // this stage's layers' routes (seed_usage at the prompt's end)
                     for (int64_t i = 0; i < T * K; ++i) ++prompt_routed_[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])];
             }
+            if (prompt_progress_ && c_begin == 0 && c_end >= n) prompt_progress_(c0 + T, n);   // as plain_prompt.cpp
         }
     } catch (const std::exception& e) {
         err = std::string("plain prompt: ") + e.what();
@@ -349,7 +349,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
     if (c_end < n) return true;   // a layer split's chunk: the stage's part of the prompt goes on with the next
     windows_ += (n + opt_.max_t - 1) / opt_.max_t;
     if (profile)
-        std::fprintf(stderr, "strata plain: GLM prompt of %lld tokens: KDA %.1f ms (projections %.1f, convolutions and "
+        std::fprintf(stderr, "xestrata plain: GLM prompt of %lld tokens: KDA %.1f ms (projections %.1f, convolutions and "
                              "gates %.1f, recurrence %.1f, output %.1f), DSA %.1f, grouping %.1f, experts %.1f, shared and "
                              "dense FFN %.1f, staging %.1f, head %.1f, the rest %.1f; experts not in VRAM %lld, on the CPU %lld "
                              "(%lld rows)\n",

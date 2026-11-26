@@ -18,6 +18,7 @@ services:
         XESTRATA_VERSION: ${XESTRATA_VERSION:-latest}
         XESTRATA_VARIANT: ${XESTRATA_VARIANT:-free}
         XESTRATA_NONFREE: ${XESTRATA_NONFREE:-0}
+        XESTRATA_ROCM: ${XESTRATA_ROCM:-fedora}
     image: localhost/xestrata
     # the server as the package's: on 127.0.0.1, which with the host's network is the host's own
     network_mode: host
@@ -29,9 +30,12 @@ services:
       - /dev/dri
       # ROCm's compute device, besides the render node
       - /dev/kfd
-    # SELinux (Fedora): the folders below are the host's own, not relabeled for the container
+    # SELinux (Fedora): the folders below are the host's own, not relabeled for the container.  seccomp: Podman's own
+    # profile (containers/common v0.66.0) with io_uring allowed, which the engine pins its expert arena with for an
+    # Intel GPU (#42: compaction moving its pages made the GPU's driver map it all again); Podman's denies io_uring
     security_opt:
       - label=disable
+      - seccomp=../third_party/main/containers-common/seccomp-io_uring.json
     # the settings, logs and model files are the host's own, at the same paths: the deb or rpm installed on the host
     # and this container use the same models and settings.  A data folder elsewhere (--data-dir) is mounted at its
     # own path in compose.override.yaml

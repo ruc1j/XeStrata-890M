@@ -2,19 +2,21 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// src/kernels/xe/bf16_gemv.cpp - the Xe ports of Strata's src/kernels/cuda/bf16_gemv.cu (BF16 x BF16 GEMV) and the FP32 x
-// BF16 matrix-vector kernels of Strata's src/kernels/cuda/native_bf16.cu (ggml-cuda's mmvf at llama.cpp 3cf03257; MIT
-// License, Copyright (c) 2023-2026 The ggml authors, see third_party/main/ggml/LICENSE).
+// src/kernels/xe/bf16_gemv.cpp - the Xe ports of the FP32 x BF16 matrix-vector kernels of Strata's
+// src/kernels/cuda/native_bf16.cu (ggml-cuda's mmvf at llama.cpp 3cf03257; MIT License, Copyright (c) 2023-2026 The
+// ggml authors, see third_party/main/ggml/LICENSE).
 //
 // Warp sums are xor butterflies.  Lane 0 of a butterfly adds the same partial sums in the same order as CUDA's
-// shuffle-down tree, so the row results of the warp-per-row kernel are those of the CUDA kernel.
+// shuffle-down tree.
 #include "strata/kernels/bf16_gemv.hpp"
 #include "xe_shuffle.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_bf16_gemv
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -33,48 +35,16 @@
 namespace strata::kernels {
 namespace {
 
-constexpr int THREADS = 256;
 constexpr int WARP = 32;
 
 sycl::queue& queue_for(void* stream) {
     auto& queue = core::Runtime::get().stream(stream);
     return queue;
 }
-void finish(void* stream, const sycl::event& e, const char* what) {
-    if (!stream) core::Runtime::get().wait(e, what);
-}
 
 inline float warp_sum(const sycl::sub_group& sg, float v) {
     for (int off = 16; off > 0; off >>= 1) v += strata_shfl_xor(sg, v, off);
     return v;
-}
-
-sycl::event launch_naive(sycl::queue& q, const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out) {
-    return q.parallel_for(sycl::range<1>((size_t) n_out), [=](sycl::id<1> id) {
-        const int64_t o = (int64_t) id[0];
-        const uint16_t* row = w + o * n_in;
-        float acc = 0.0f;
-        for (int64_t i = 0; i < n_in; ++i) acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
-        y[o] = acc;
-    });
-}
-
-// One sub-group per row, coalesced: consecutive lanes read consecutive weights.
-sycl::event launch_warp(sycl::queue& q, const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out) {
-    const int warps = THREADS / WARP;
-    const size_t groups = (size_t) ((n_out + warps - 1) / warps);
-    return q.parallel_for(sycl::nd_range<1>(groups * THREADS, THREADS),
-                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-        const sycl::sub_group sg = it.get_sub_group();
-        const int64_t o = (int64_t) it.get_group(0) * warps + (int64_t) sg.get_group_linear_id();
-        if (o >= n_out) return;
-        const int lane = (int) sg.get_local_linear_id();
-        const uint16_t* row = w + o * n_in;
-        float acc = 0.0f;
-        for (int64_t i = lane; i < n_in; i += WARP) acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
-        acc = warp_sum(sg, acc);
-        if (lane == 0) y[o] = acc;
-    });
 }
 
 // ggml-cuda mmvf: work-group size chosen for the fewest pair iterations, two ordered FMAs per pair, a warp sum, and
@@ -221,7 +191,7 @@ int mmvf_block_size(int64_t n_in) {
     int best = 32;
     int64_t best_iterations = (n_in + 63) / 64;
     for (int candidate = 64; candidate <= 256; candidate += 32) {
-        const int64_t iterations = (n_in + 2 * candidate - 1) / (2 * candidate);
+        const int64_t iterations = (n_in + (int64_t) 2 * candidate - 1) / ((int64_t) 2 * candidate);
         if (iterations < best_iterations) {
             best_iterations = iterations;
             best = candidate;
@@ -244,7 +214,7 @@ RowsTable& rows_table(sycl::queue& q) {
 }
 int rows_forced() {
     static const int forced = [] {
-        const char* v = std::getenv("STRATA_MMVF_ROWS");
+        const char* v = strata::env_get("MMVF_ROWS");
         return v == nullptr ? -1 : (std::strtol(v, nullptr, 10) != 0 ? 1 : 0);
     }();
     return forced;
@@ -283,13 +253,14 @@ void dispatch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* 
         case 192: launch_mmvf<192, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
         case 224: launch_mmvf<224, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
         case 256: launch_mmvf<256, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+        default: break;   // mmvf_block_size gives only the eight sizes above
     }
 }
 
 // the multi-row call's kernels: the window's usual row counts with their loop fixed at compile time (upstream
 // 104a8485); rows: 4 rows a work-group
 void multi_dispatch(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
-                    int64_t n_in, int64_t n_out, int n_tok, bool rows, MmvfAux aux = {}) {
+                    int64_t n_in, int64_t n_out, int n_tok, bool rows, const MmvfAux& aux = {}) {
     switch (n_tok) {
         case 2: dispatch_mmvf<2, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux); break;
         case 3: dispatch_mmvf<3, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux); break;
@@ -304,55 +275,18 @@ void multi_dispatch(sycl::queue& q, const float* x, int64_t ldx, const uint16_t*
 
 }  // namespace
 
-void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream) {
-    if (n_in <= 0 || n_out <= 0) return;
-    auto& q = queue_for(stream);
-    // Warp-per-row when there are enough rows to fill the machine; see the CUDA file for the measurements.
-    if (n_out >= 64) {
-        finish(stream, launch_warp(q, x, w, y, n_in, n_out), "bf16_gemv(warp)");
-        return;
-    }
-    finish(stream, launch_naive(q, x, w, y, n_in, n_out), "bf16_gemv");
-}
-
-void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out,
-                     int threads_per_row, void* stream) {
-    if (n_in <= 0 || n_out <= 0) return;
-    auto& q = queue_for(stream);
-    if (threads_per_row == 32) {
-        finish(stream, launch_warp(q, x, w, y, n_in, n_out), "bf16_gemv_split(warp)");
-        return;
-    }
-    if (threads_per_row <= 0 || (threads_per_row & (threads_per_row - 1)) != 0)
-        throw core::DeviceError("bf16_gemv_split: threads_per_row " + std::to_string(threads_per_row) +
-                                " must be a power of two (32 selects the warp-per-row path)");
-    const int tpr = threads_per_row;
-    const auto e = q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> scratch(sycl::range<1>((size_t) tpr), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) n_out * tpr, tpr), [=](sycl::nd_item<1> it) {
-            const int64_t o = (int64_t) it.get_group(0);
-            const int t = (int) it.get_local_id(0);
-            const uint16_t* row = w + o * n_in;
-            float acc = 0.0f;
-            for (int64_t i = t; i < n_in; i += tpr) acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
-            // a tree in local memory, as CUDA's shared-memory tree
-            scratch[t] = acc;
-            sycl::group_barrier(it.get_group());
-            for (int off = tpr >> 1; off > 0; off >>= 1) {
-                if (t < off) scratch[t] += scratch[t + off];
-                sycl::group_barrier(it.get_group());
-            }
-            if (t == 0) y[o] = scratch[0];
-        });
-    });
-    finish(stream, e, "bf16_gemv_split");
-}
-
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream, const int32_t* skip_a,
                                const int32_t* skip_b) {
     const bool skip = skip_a != nullptr && skip_b != nullptr;
     if (n_tok == 1 && ldy >= n_out && !skip) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
+    if (n_tok > kVerifyNarrowT && n_tok <= kWindowMaxT) {   // a wide window: its first 8 rows and the rest (wide
+        // instances took VRAM from every run's start; each row's sums are its own either way)
+        bf16_gemv_fp32_mmvf_multi(x, ldx, w, y, ldy, n_in, n_out, kVerifyNarrowT, stream, skip_a, skip_b);
+        bf16_gemv_fp32_mmvf_multi(x + kVerifyNarrowT * ldx, ldx, w, y + kVerifyNarrowT * ldy, ldy, n_in, n_out,
+                                  n_tok - kVerifyNarrowT, stream, skip_a, skip_b);
+        return;
+    }
     if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
@@ -366,6 +300,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
 bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream) {
+    if (n_tok > kVerifyNarrowT && n_tok <= kWindowMaxT) return false;   // a wide window: the two products apart
     if (n_tok < 2 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out < 1 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || w_aux == nullptr || y_aux == nullptr ||
         (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w_aux) & 3u) != 0)
@@ -426,7 +361,7 @@ void bf16_gemv_fp32_mmvf_multi_tune(int64_t n_in, int64_t n_out, void* stream) {
         std::string counts;
         for (int T = 2; T <= 8; ++T)
             if ((mask >> T) & 1u) counts += (counts.empty() ? "" : ",") + std::to_string(T);
-        std::fprintf(stderr, "strata: the %lld x %lld BF16 GEMV takes 4 rows a work-group for %s rows\n",
+        std::fprintf(stderr, "xestrata: the %lld x %lld BF16 GEMV takes 4 rows a work-group for %s rows\n",
                      (long long) n_in, (long long) n_out, counts.c_str());
     }
     std::lock_guard<std::mutex> lock(table.mutex);
@@ -472,39 +407,75 @@ void f32_gemv_fp32_mmvf(const float* x, const float* w, float* y, int64_t n_in, 
     if (!stream) core::Runtime::get().finish(q);
 }
 
+// f32_gemm_rows' kernel: 16 RT x 16 RO outputs a work-group of 16 x 16, K 16 a step through local memory.  Work-item
+// (i, j) loads the step's values of token rows i + 16 r and output rows i + 16 r, then sums tokens i + 16 a against
+// outputs j + 16 b in registers (rows padded by one against bank conflicts).  Every output sums its K in order, one FMA
+// a step, whatever the tile: the same bits as the 16 x 16 kernel before it, fewer loads an FMA
+template<int RT, int RO>
+static void launch_gemm_rows(sycl::queue& q, const float* x, int64_t ldx, const float* w, float* y, int64_t ldy,
+                             int64_t n_in, int64_t n_out, int64_t n_tok) {
+    constexpr int TS = 16;
+    const size_t gt = (size_t) ((n_tok + (int64_t) TS * RT - 1) / ((int64_t) TS * RT)) * TS;
+    const size_t go = (size_t) ((n_out + (int64_t) TS * RO - 1) / ((int64_t) TS * RO)) * TS;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 2> xs(sycl::range<2>((size_t) TS * RT, TS + 1), h), ws(sycl::range<2>((size_t) TS * RO, TS + 1), h);
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>(gt, go), sycl::range<2>(TS, TS)), [=](sycl::nd_item<2> it) {
+            const int li = (int) it.get_local_id(0), lj = (int) it.get_local_id(1);
+            const int64_t t0 = (int64_t) it.get_group(0) * TS * RT, o0 = (int64_t) it.get_group(1) * TS * RO;
+            float acc[RT][RO] = {};
+            for (int64_t k0 = 0; k0 < n_in; k0 += TS) {
+                const int64_t k = k0 + lj;
+                for (int r = 0; r < RT; ++r) {
+                    const int64_t t = t0 + li + (int64_t) TS * r;
+                    xs[li + TS * r][lj] = t < n_tok && k < n_in ? x[t * ldx + k] : 0.0f;
+                }
+                for (int r = 0; r < RO; ++r) {
+                    const int64_t o = o0 + li + (int64_t) TS * r;
+                    ws[li + TS * r][lj] = o < n_out && k < n_in ? w[o * n_in + k] : 0.0f;
+                }
+                sycl::group_barrier(it.get_group());
+                for (int kk = 0; kk < TS; ++kk) {
+                    float xv[RT], wv[RO];
+                    for (int r = 0; r < RT; ++r) xv[r] = xs[li + TS * r][kk];
+                    for (int r = 0; r < RO; ++r) wv[r] = ws[lj + TS * r][kk];
+                    for (int a = 0; a < RT; ++a)
+                        for (int c = 0; c < RO; ++c) acc[a][c] = sycl::fma(xv[a], wv[c], acc[a][c]);
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            for (int a = 0; a < RT; ++a)
+                for (int c = 0; c < RO; ++c) {
+                    const int64_t t = t0 + li + (int64_t) TS * a, o = o0 + lj + (int64_t) TS * c;
+                    if (t < n_tok && o < n_out) y[t * ldy + o] = acc[a][c];
+                }
+        });
+    });
+}
+
 void f32_gemm_rows(const float* x, int64_t ldx, const float* w, float* y, int64_t ldy, int64_t n_in, int64_t n_out,
                    int64_t n_tok, void* stream) {
     if (n_in <= 0 || n_out <= 0 || n_tok <= 0) return;
     if (x == nullptr || w == nullptr || y == nullptr)
         throw std::invalid_argument("f32_gemm_rows: null pointer");
     auto& q = queue_for(stream);
-    // 16 x 16 outputs a work-group, K 16 a step through local memory: work-item (i, j) loads the step's value of
-    // token row i and of output row j, then sums token i against output j (rows padded by one against bank conflicts)
-    constexpr int TS = 16;
-    const size_t gt = (size_t) ((n_tok + TS - 1) / TS) * TS, go = (size_t) ((n_out + TS - 1) / TS) * TS;
-    q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 2> xs(sycl::range<2>(TS, TS + 1), h), ws(sycl::range<2>(TS, TS + 1), h);
-        h.parallel_for(sycl::nd_range<2>(sycl::range<2>(gt, go), sycl::range<2>(TS, TS)), [=](sycl::nd_item<2> it) {
-            const int li = (int) it.get_local_id(0), lj = (int) it.get_local_id(1);
-            const int64_t t = (int64_t) it.get_global_id(0), o = (int64_t) it.get_global_id(1);
-            const int64_t wrow = (int64_t) it.get_group(1) * TS + li;
-            float acc = 0.0f;
-            for (int64_t k0 = 0; k0 < n_in; k0 += TS) {
-                const int64_t k = k0 + lj;
-                xs[li][lj] = t < n_tok && k < n_in ? x[t * ldx + k] : 0.0f;
-                ws[li][lj] = wrow < n_out && k < n_in ? w[wrow * n_in + k] : 0.0f;
-                sycl::group_barrier(it.get_group());
-                for (int kk = 0; kk < TS; ++kk) acc = sycl::fma(xs[li][kk], ws[lj][kk], acc);
-                sycl::group_barrier(it.get_group());
-            }
-            if (t < n_tok && o < n_out) y[t * ldy + o] = acc;
-        });
-    });
+    // Conservative shared regions: K=512 and 4096 on B70, RTX 4070 and RX 9060 XT.  At K=4096, 192 tokens x 512
+    // outputs took 654/556/565 -> 428/302/413 us; 4096 x 128 took 2696/2428/2724 -> 783/703/2291 us (1x1 -> 4x4).
+    // The 64-output case stays 1x1: at 2048 tokens the RX took 730 -> 2468 us, though B70 and RTX prefer 4x4 there.
+    const bool wide = (n_out >= 384 && n_tok >= 192) || (n_out >= 192 && n_tok >= 2048) ||
+                      (n_out >= 128 && n_tok >= 4096);
+    if (wide) launch_gemm_rows<4, 4>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok);
+    else launch_gemm_rows<1, 1>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok);
     if (!stream) core::Runtime::get().finish(q);
 }
 
 void f32_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const float* w, float* y, int64_t ldy, int64_t n_in,
                               int64_t n_out, int n_tok, void* stream) {
+    if (n_tok > kVerifyNarrowT && n_tok <= kWindowMaxT) {   // a wide window: its first 8 rows and the rest
+        f32_gemv_fp32_mmvf_multi(x, ldx, w, y, ldy, n_in, n_out, kVerifyNarrowT, stream);
+        f32_gemv_fp32_mmvf_multi(x + kVerifyNarrowT * ldx, ldx, w, y + kVerifyNarrowT * ldy, ldy, n_in, n_out,
+                                 n_tok - kVerifyNarrowT, stream);
+        return;
+    }
     if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
         n_out <= 0 || n_out > std::numeric_limits<int>::max() || (ldx & 1) != 0 || x == nullptr || w == nullptr ||
         y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w) & 7u) != 0 ||

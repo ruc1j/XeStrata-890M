@@ -43,28 +43,146 @@ Every copyright holder whose work is in this repository, its license and where t
   under the LGPL: LGPL-3.0-or-later AND MIT) - text below and in
   third_party/main/ggml/LICENSE. setup also fetches llama.cpp (MIT, the same authors) into third_party/main/llama.cpp,
   with its own LICENSE
+- Copyright (c) 2026 Edge0
+  Apache-2.0 - the latent MoE support (Edge0-145B / Edge0-120B, Qwen3.8-Flash-Next's shell with experts at a latent
+  width): the pack readers (src/core/latent.cpp, include/strata/core/latent.hpp,
+  include/strata/core/latent_share.hpp), the latent kernels (src/kernels/xe/latent.cpp,
+  include/strata/kernels/latent.hpp, include/strata/kernels/cpu/latent_rows.hpp, src/kernels/cpu/latent_rows.cpp,
+  src/kernels/latent_ref.hpp), the layer parity (src/kernels/latent_parity.cpp) and its reference test
+  (tests/kernels/latent_ref_test.cpp),
+  written after the latent additions of edge0-strata (https://github.com/Edge0-AI/Edge0, branch feat/edge0-strata at
+  761f14a), a fork of Strata whose directory keeps Strata's MIT; Edge0's contributions carry the Edge0 repository's
+  Apache-2.0. The files keep both notices and are under the LGPL as a whole (LGPL-3.0-or-later AND MIT AND
+  Apache-2.0) - LICENSES/Apache-2.0.txt. The models' weights are under the Edge0 Community Model License 1.0 and the
+  Qwen Community License 1.0 (non-free): XeStrata does not bundle them; setup fetches them to the user's machine
+- Copyright (c) 2026 hiruhiru2005
+  MIT - the bih3 trellis and R1Q2 expert format (https://github.com/hiruhiru2005/sync-strata); the files that
+  contain this code are under the LGPL as a whole (LGPL-3.0-or-later AND MIT) - text below
 - Copyright (c) 2026 Peasant Smith and the Project Maya contributors
   MIT - the loop guard of the server (serve/loop_guard.py and its tests), transcribed from Project Maya
   (https://github.com/mw00/project-maya), a fork of Strata; the code stays under MIT, the files as a whole are under
   the LGPL (LGPL-3.0-or-later AND MIT) - text below
+- Copyright contributors to the vLLM-Omni project
+  Apache-2.0 - the image engine's SAM 3 detector (src/image/sam3.cpp, include/strata/image/sam3.hpp), written after
+  vLLM-Omni's port of it (https://github.com/vllm-project/vllm-omni, vllm_omni/diffusion/models/sam3/ at 15bb15d),
+  and its video segmentation's rules (src/image/sam3_video.cpp, include/strata/image/sam3_video.hpp), after
+  vllm_omni/diffusion/models/sam3/sam3_video.py at 2b610b3, and its lab color correction (src/image/img_color.cpp,
+  include/strata/image/img_color.hpp: the wavelet split's bound and the order of the steps), after
+  vllm_omni/diffusion/models/seedvr2/pipeline_seedvr2.py; that code stays under Apache-2.0, the files as a whole are
+  under the LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
+- Copyright 2020 The Google AI Language Team Authors, Facebook AI Research authors and The HuggingFace Inc. team
+  Apache-2.0 - the image engine's Florence-2 beam search (src/image/florence2.cpp), written after transformers'
+  generation (https://github.com/huggingface/transformers, src/transformers/generation/utils.py, _beam_search); that
+  code stays under Apache-2.0, the file as a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0) -
+  LICENSES/Apache-2.0.txt
+- Copyright 2024 Microsoft and The HuggingFace Inc. team
+  Apache-2.0 - the words Florence-2's phrase grounding leaves out (serve/image_regions.py, GROUNDING_SKIP), from
+  Florence-2's processing_florence2.py (https://huggingface.co/microsoft/Florence-2-large); that list stays under
+  Apache-2.0, the file as a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
+- Copyright (c) 2024 SageAttention team; changes Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES (comfy-kitchen)
+  Apache-2.0 - the int8 attention's probabilities as unsigned bytes on NVIDIA GPUs (src/kernels/xe/flash_attn_i8.cpp:
+  the offset of log2 255, the packing of four of them into a word and their row sums by dp4a), written after
+  comfy-kitchen's SageAttention kernels (https://github.com/Comfy-Org/comfy-kitchen,
+  comfy_kitchen/backends/cuda/sage_attention/); that code stays under Apache-2.0, the file as a whole is under the
+  LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
+- Copyright (c) 2021 Gwangbin Bae
+  MIT - the BAE surface-normal network (src/image/cnet_normal.cpp), written after
+  https://github.com/baegwangbin/surface_normal_uncertainty; the file as a whole is under the LGPL
+  (LGPL-3.0-or-later AND MIT) - LICENSES/MIT.txt
+- Copyright (c) 2022 SenseTime X-Lab and 2020 OpenMMLab
+  MIT and Apache-2.0 - the UniFormer segmentation network and the ADE20K palette (src/image/cnet_segmentation.cpp),
+  written after https://github.com/Sense-X/UniFormer; the file as a whole is under the LGPL
+  (LGPL-3.0-or-later AND MIT AND Apache-2.0) - LICENSES/MIT.txt, LICENSES/Apache-2.0.txt
+- Copyright thedeoxen
+  Apache-2.0 - MOSS-Image control LoRA weights, fetched when used from
+  https://huggingface.co/thedeoxen/MOSS-Image-canny-control-lora and the other control kinds; they are not bundled -
+  LICENSES/Apache-2.0.txt
+- Copyright the comfyui_controlnet_aux contributors
+  Apache-2.0 - the defaults and limits of the control maps' settings (serve/image_controls.py: M-LSD's thresholds,
+  Canny's), as https://github.com/Fannovel16/comfyui_controlnet_aux has them; they stay under Apache-2.0, the file as
+  a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
+- Copyright the ComfyUI-SeedVR2_VideoUpscaler contributors
+  Apache-2.0 - the crossfade of SeedVR2's overlapping chunks of a video (src/upscale/seedvr2.cpp, kept_share: a Hann
+  window's half over the overlap's middle third), after https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler
+  (src/core/generation_utils.py); that code stays under Apache-2.0, the file as a whole is under the LGPL
+  (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
+- Copyright 2026 the YASAKANI authors
+  Apache-2.0 - the sampled pick's Gumbel form (src/kernels/xe/sampler.cpp, src/kernels/sampler_host.cpp: the Gumbel
+  noise hashed from (seed, position, token id) and the cut to the 20 most likely tokens before the draws), written
+  after YASAKANI's smp_hash.cuh (kh_mix, kh_gumbel) and q35_sample.cu (its version-3 pick)
+  (https://github.com/yasakani-dev/yasakani, 0.1.0 at 0205f06); that code stays under Apache-2.0, the files as a
+  whole are under the LGPL (LGPL-3.0-or-later AND MIT AND Apache-2.0) - LICENSES/Apache-2.0.txt.  The trellis-coded
+  K/V cache (--kv tcq4, tcq5: include/strata/kernels/kv_tcq.hpp, include/strata/kernels/kv_tcq_tables.hpp,
+  include/strata/kernels/trellis.hpp, src/kernels/kv_tcq_parity.cpp, src/kernels/xe/kv_tcq.cpp,
+  src/kernels/xe/kv_tcq_parts.hpp, tools/kv_tcq_table.py), written after YASAKANI's KV5
+  (kvx_codec.cuh, kvq_fast.cuh, kvq_vit2.cuh, kvq_attn.cuh; tools/kv_tcq_table.py reads its kvq_u5.bin to compare
+  the codebooks); those files as a whole are under the LGPL (LGPL-3.0-or-later AND Apache-2.0)
+  The fixed-point sums of the experts' products (include/strata/kernels/canon_math.hpp, fx_*: each block's scale
+  rounded to a fixed-point integer, the int8 sums times it added in int64, so the CPU's rows and every GPU's products
+  give the same bits in any order), written after YASAKANI's XSUM rows (lnord.cu, gemm_compressed.cu); that code stays
+  under Apache-2.0, the file as a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0)
+  The YD1S static draft table (include/strata/spec/static_drafter.hpp, src/spec/static_drafter.cpp) is written after
+  YASAKANI's specx.cpp. It stays under Apache-2.0; these files as a whole are under the LGPL
+  (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt.
+- Copyright (c) 2024 Sahand Ahmadian; Copyright (c) 2024 Jonseed
+  MIT - the image engine's Detail Daemon (src/image/guidance.cpp, include/strata/image/guidance.hpp: its schedule, the
+  sigma the model is asked at, their constants and the settings' defaults), written after
+  https://github.com/muerrilla/sd-webui-detail-daemon and https://github.com/Jonseed/ComfyUI-Detail-Daemon; that code
+  stays under MIT, the files as a whole are under the LGPL (LGPL-3.0-or-later AND MIT) - text below
+- Copyright (c) 2024 Ostris, LLC
+  MIT - the LoRA trainer's timestep weights (src/image/flow_weighting.cpp: the 1,000 weights of ai-toolkit's
+  "weighted" timesteps, toolkit/timestep_weighing/default_weighing_scheme.py of https://github.com/ostris/ai-toolkit,
+  as they are); they stay under MIT, the file as a whole is under the LGPL (LGPL-3.0-or-later AND MIT) - text below
+- Copyright (c) 1997-2011 Secret Labs AB; Copyright (c) 1995-2011 Fredrik Lundh and contributors; Copyright (c) 2010
+  Jeffrey A. Clark and contributors (Pillow)
+  MIT-CMU - the image engine's resize of a picture on the host (src/image/img_crop.cpp, pillow_resize_planes: the
+  fixed-point weights, the totals and the order of the passes), transcribed from Pillow's libImaging/Resample.c and
+  Image.resize (https://github.com/python-pillow/Pillow); that code stays under MIT-CMU, the file as a whole is under
+  the LGPL (LGPL-3.0-or-later AND MIT-CMU) - LICENSES/MIT-CMU.txt
+- Copyright (c) 2024 ZhengPeng
+  MIT - BiRefNet's foreground estimate (src/image/aux_kernels.cpp, include/strata/image/aux_kernels.hpp and
+  src/image/birefnet.cpp: the blur fusion's two passes, their radii and constants), written after
+  https://github.com/ZhengPeng7/BiRefNet (image_proc.py); that code stays under MIT, the files as a whole are under the
+  LGPL (LGPL-3.0-or-later AND MIT) - text below
 - Copyright (c) 2017 Sean Barrett
   MIT or public domain (the Unlicense), at your option - third_party/main/stb/stb_image.h (stb_image v2.30, an
   unmodified copy), which the image engine (strata-image) is compiled with - third_party/main/stb/LICENSE,
   LICENSES/MIT.txt, LICENSES/Unlicense.txt
+- Copyright (c) 2011 Marco Lui; fork Copyright (c) 2021, Adrien Barbaresi
+  BSD-3-Clause - third_party/main/py3langid/ (py3langid 0.4.0, its package and trained model, unmodified), which the
+  server's translation APIs detect a source text's language with - third_party/main/py3langid/LICENSE,
+  LICENSES/BSD-3-Clause.txt
 - Copyright 2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)
   SIL Open Font License 1.1 - third_party/main/outfit/, the web app's font - third_party/main/outfit/OFL.txt
 - Copyright (c) 2013-2020 Khan Academy and other contributors
-  MIT - third_party/main/katex/ (KaTeX 0.19.0, its script, style sheet and fonts as upstream Strata vendors them),
+  MIT - third_party/main/katex/ (KaTeX 0.19.1, its script, style sheet and fonts as upstream Strata vendors them),
   which the web app's chat draws math with - third_party/main/katex/LICENSE, LICENSES/MIT.txt
+- Copyright (c) 2014 - 2022 Knut Sveidqvist, and the authors of the packages its script bundles
+  MIT - third_party/main/mermaid/ (mermaid 12.3.0, its dist/mermaid.min.js), which the web app's chat draws a plan's
+  flowchart with; the script also carries d3 (ISC, parts BSD-3-Clause), elkjs (Copyright (c) 2017 Kiel University
+  and others; EPL-2.0, taken under it of its EPL-2.0 or GPL-3.0-or-later; compiled and minified there, its source
+  at https://github.com/kieler/elkjs/tree/0.12.0, as BUNDLED.md says), chevrotain (Apache-2.0), DOMPurify (Apache-2.0, of its MPL-2.0 or Apache-2.0) and the
+  MIT packages third_party/main/mermaid/BUNDLED.md lists - third_party/main/mermaid/LICENSE, LICENSES/MIT.txt,
+  LICENSES/ISC.txt, LICENSES/BSD-3-Clause.txt, LICENSES/Apache-2.0.txt, LICENSES/EPL-2.0.txt
+- Copyright The containers/common authors (https://github.com/containers/container-libs); changes Copyright 2026
+  MistVVK and the XeStrata contributors
+  Apache-2.0 - third_party/main/containers-common/seccomp-io_uring.json (Podman's seccomp profile from
+  containers/common v0.66.0, with io_uring allowed), which container/compose.yaml runs the container with -
+  third_party/main/containers-common/LICENSE, LICENSES/Apache-2.0.txt
 - Copyright Codeplay Software Limited; changes Copyright 2026 MistVVK and the XeStrata contributors
   Apache-2.0 - XeStrata's changes to oneMath (https://github.com/uxlfoundation/oneMath), in XeStrata's fork
   (https://github.com/MistVVK/oneMath, branch xestrata), whose tag CMakeLists.txt fetches for the dense matrix products. oneMath
   itself is not in this repository - third_party/main/oneMath/LICENSE, LICENSES/Apache-2.0.txt
 - Copyright the LLVM project contributors; changes Copyright 2026 MistVVK and the XeStrata contributors
-  Apache-2.0 WITH LLVM-exception - XeStrata's fixes to intel/llvm (https://github.com/intel/llvm), in
+  Apache-2.0 WITH LLVM-exception - XeStrata's fixes to intel/llvm (https://github.com/intel/llvm), and intel/llvm's
+  own commit c13ad6c7e3 (pull request 22671, the HIP adapter's virtual memory) backported to the release, in
   third_party/main/intel-llvm/patches/, which tools/intel_llvm_build.py applies to the release it builds. intel/llvm
   itself is not in this repository - third_party/main/intel-llvm/LICENSE.TXT, LICENSES/Apache-2.0.txt,
   LICENSES/LLVM-exception.txt
+- Copyright Intel Corporation and the oneDNN contributors
+  Apache-2.0 - oneDNN's pull requests #6468 and #6472 (https://github.com/uxlfoundation/oneDNN), backported to the tag
+  CMakeLists.txt fetches, in third_party/main/oneDNN/patches/, which CMakeLists.txt applies before it builds oneDNN.
+  oneDNN itself is not in this repository - third_party/main/oneDNN/LICENSE, LICENSES/Apache-2.0.txt
 - Copyright 2022-2026 Maxime Chambonnet, Étienne Mollier, Cordell Bloor, Xuanteng Huang, Christian Kastner, Igor Luppi, Talha Can Havadar
   Expat (MIT) - the target features tools/intel_llvm_build.py gives ROCm's device libraries' build, transcribed
   from the debian/rules of Debian's rocm-llvm package (https://salsa.debian.org/rocm-team/rocm-llvm); they stay
@@ -84,9 +202,14 @@ intel/llvm (Apache-2.0 WITH LLVM-exception) built with XeStrata's fixes, llama.c
 carries (NCSA, Copyright (c) 2014-2016 Advanced Micro Devices, Inc.), stb_image's (MIT, Copyright (c) 2017 Sean
 Barrett), which the image engine is compiled with, oneDNN's library for Intel GPUs (Apache-2.0, Copyright Intel
 Corporation, with the third-party programs its THIRD-PARTY-PROGRAMS lists), AOTriton's library and kernels' images for
-AMD GPUs (MIT, Copyright Advanced Micro Devices, Inc.; the images can carry parts of AMD's aiter (MIT), FlyDSL's kernels
-(Apache-2.0) and Triton (MIT)), and in the contrib-llvm ones oneMath (Apache-2.0) with XeStrata's changes and cuDNN
-Frontend (Apache-2.0, parts MIT, Copyright NVIDIA CORPORATION & AFFILIATES), which the image engine is compiled with.
+AMD GPUs (MIT, Copyright Advanced Micro Devices, Inc.; on Windows its library statically links XZ Utils liblzma
+(0BSD, third_party/main/xz/COPYING.0BSD); the images can carry parts of AMD's aiter (MIT), FlyDSL's kernels
+(Apache-2.0) and Triton (MIT)), and in the contrib-llvm ones oneMath (Apache-2.0) with XeStrata's changes, cuDNN
+Frontend (Apache-2.0, parts MIT, Copyright NVIDIA CORPORATION & AFFILIATES), which the image engine is compiled with,
+and CUTLASS (BSD-3-Clause, Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES), which the engine's int8
+products for NVIDIA GPUs are compiled with.  Both carry, where built for AMD GPUs with WMMA, a module of comfy-kitchen's
+HIP int8 product and int8 attention (Apache-2.0, Copyright (c) 2025 Comfy Org; parts derived from SageAttention,
+Apache-2.0) with its NOTICE.
 The engine in the contrib-llvm packages is compiled with NVIDIA's CUDA Toolkit, and its code for NVIDIA GPUs can contain
 parts of NVIDIA's libdevice; those parts are NVIDIA's, distributed under the NVIDIA CUDA Toolkit End User License
 Agreement.
@@ -100,6 +223,31 @@ Strata (MIT License)
 --------------------
 
 Copyright (c) 2026 Niko1221 and the Strata contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Sync-Strata (MIT License)
+-------------------------
+
+Copyright (c) 2026 Niko1221 and the Strata contributors
+Copyright (c) 2026 hiruhiru2005
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -179,6 +327,154 @@ Copyright 2024, Xuanteng Huang
 Copyright 2024, Christian Kastner
 Copyright 2025, Igor Luppi
 Copyright 2025-2026, Talha Can Havadar
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+sd-webui-detail-daemon (MIT License)
+------------------------------------
+
+Copyright (c) 2024 Sahand Ahmadian
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+ComfyUI-Detail-Daemon (MIT License)
+-----------------------------------
+
+Copyright (c) 2024 Jonseed
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+BiRefNet (MIT License)
+----------------------
+
+Copyright (c) 2024 ZhengPeng
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+BAE surface normals (MIT License)
+---------------------------------
+
+MIT License
+
+Copyright (c) 2021 Gwangbin Bae
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+UniFormer backbone (MIT License)
+--------------------------------
+
+MIT License
+
+Copyright (c) 2022 SenseTime X-Lab
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Ostris (MIT License)
+--------------------
+
+Copyright (c) 2024 Ostris, LLC
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

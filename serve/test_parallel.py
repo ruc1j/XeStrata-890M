@@ -198,37 +198,74 @@ class ParallelArgs(unittest.TestCase):
         self.assertEqual(parallel_args({"parallel": 2}, ["--batch", "3"]), [])       # the args' own value wins
         self.assertEqual(parallel_args({"parallel": "4"}, []), [])                   # said and ignored
         self.assertEqual(parallel_args({"parallel": True}, []), [])
-        self.assertEqual(parallel_args({"parallel": 12}, []), ["--batch", "12"])     # the engine warns and caps
+        self.assertEqual(parallel_args({"parallel": 20}, []), ["--batch", "20"])     # the engine warns and caps
 
     def test_parallel_above_the_window_says_so_unless_batch_mtp(self):
         import contextlib
         import io
         import os
 
-        def said(args, env):
+        def said(n, args, env, wide_env=None):
+            """What the server says of "parallel": n with these args, XESTRATA_BATCH_MTP and XESTRATA_WIDE_WINDOW."""
             buf = io.StringIO()
-            old = os.environ.get("STRATA_BATCH_MTP")
-            if env is None:
-                os.environ.pop("STRATA_BATCH_MTP", None)
-            else:
-                os.environ["STRATA_BATCH_MTP"] = env
+            old = {k: os.environ.get(k) for k in ("XESTRATA_BATCH_MTP", "XESTRATA_WIDE_WINDOW")}
+            for k, v in (("XESTRATA_BATCH_MTP", env), ("XESTRATA_WIDE_WINDOW", wide_env)):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
             try:
                 with contextlib.redirect_stdout(buf):
-                    r = parallel_args({"parallel": 12}, args)
+                    r = parallel_args({"parallel": n}, args)
             finally:
-                if old is None:
-                    os.environ.pop("STRATA_BATCH_MTP", None)
-                else:
-                    os.environ["STRATA_BATCH_MTP"] = old
-            self.assertEqual(r, ["--batch", "12"])
-            return "at most" in buf.getvalue()
-        self.assertTrue(said([], None))                  # 0.1.39: the window holds 8 rows
-        self.assertTrue(said([], "0"))
-        self.assertFalse(said(["--batch-mtp"], None))    # --batch-mtp waves more through the window
-        self.assertFalse(said([], "1"))
+                for k, v in old.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            self.assertEqual(r, ["--batch", str(n)])
+            return buf.getvalue()
+        # the window holds 16 rows (the wide windows' default, auto)
+        self.assertNotIn("at most", said(12, [], None))
+        self.assertIn("at most 16", said(20, [], None))
+        self.assertIn("at most 16", said(20, [], "0"))
+        # the wide windows off - by the args or the environment - hold it at 8, as before
+        self.assertIn("at most 8", said(12, ["--wide-window", "off"], None))
+        self.assertIn("at most 8", said(12, ["--wide-window", "0"], None))
+        self.assertIn("at most 8", said(12, [], None, wide_env="0"))
+        self.assertNotIn("at most", said(8, ["--wide-window", "off"], None))
+        self.assertNotIn("at most", said(12, ["--wide-window", "on"], None, wide_env="0"))   # the args' own value wins
+        # --batch-mtp waves more through the window
+        self.assertNotIn("at most", said(20, ["--batch-mtp"], None))
+        self.assertNotIn("at most", said(12, ["--wide-window", "off"], "1"))
 
         args = engine_args({"args": ["--pack", "p"], "parallel": 2})
         self.assertEqual(args[-2:], ["--batch", "2"])
+        args = engine_args({"args": ["--pack", "p"], "wide_window": "off", "parallel": 2})
+        self.assertIn("--wide-window", args)
+
+    def test_auto_is_not_a_count(self):
+        # the server fills "auto" in from the machine before the engine starts (serve/autotune.py); one that reaches
+        # the arguments unresolved is one at a time
+        self.assertEqual(parallel_args({"parallel": "auto"}, []), [])
+
+    def test_batch_groups_and_the_conversation_cache(self):
+        self.assertEqual(engine_args({"args": ["--pack", "p"], "parallel": 4, "batch_groups": "auto"})[-4:],
+                         ["--batch", "4", "--batch-groups", "auto"])
+        self.assertEqual(engine_args({"args": ["--pack", "p"], "batch_groups": 2})[-2:], ["--batch-groups", "2"])
+        self.assertEqual(engine_args({"args": ["--pack", "p"], "conversation_cache_mib": 2048})[-2:],
+                         ["--conversation-cache-mib", "2048"])
+        self.assertEqual(engine_args({"args": ["--pack", "p"], "conversation_cache_mib": 0})[-2:],
+                         ["--conversation-cache-mib", "0"])
+        # "auto" leaves the engine's own sizing (from the RAM free once the model is loaded)
+        self.assertNotIn("--conversation-cache-mib", engine_args({"args": ["--pack", "p"],
+                                                                  "conversation_cache_mib": "auto"}))
+        # the config's own engine arguments win
+        mine = ["--pack", "p", "--batch-groups", "1", "--conversation-cache-mib", "512"]
+        got = engine_args({"args": list(mine), "batch_groups": "auto", "conversation_cache_mib": 2048})
+        self.assertEqual(got[:len(mine)], mine)
+        self.assertEqual(got.count("--batch-groups"), 1)
+        self.assertEqual(got.count("--conversation-cache-mib"), 1)
 
 
 class PickSlot(unittest.TestCase):
@@ -560,7 +597,7 @@ class ParallelService(unittest.TestCase):
 
     def test_a_burst_of_connections_is_not_reset(self):
         """30-40 clients at once got "connection reset by peer" with the listen backlog of 5 (4 x R9700 burst): the
-        server listens with a deep backlog (STRATA_HTTP_BACKLOG, 256), so 60 simultaneous requests all get answers."""
+        server listens with a deep backlog (XESTRATA_HTTP_BACKLOG, 256), so 60 simultaneous requests all get answers."""
         import serve.server as server
         self.assertGreaterEqual(server.Server.request_queue_size, 64)
         self.start(2)
@@ -654,6 +691,14 @@ class ParallelService(unittest.TestCase):
         a.join(30)
         return res
 
+    def wait_slots_free(self):
+        """The HTTP reply can finish while a background BDONE drain still owns a slot (the handler's
+        _release_slot_when_done frees it at the engine's BDONE, on a thread of its own): wait for its notification,
+        but still fail if a slot never comes free - the leak or deadlock such a wait must not hide."""
+        with self.engine.slot_cv:
+            self.assertTrue(self.engine.slot_cv.wait_for(lambda: not any(self.engine.slot_busy), timeout=10),
+                            f"slots did not clear: {self.engine.slot_busy}")
+
     def test_a_long_prompt_gives_way_to_a_short_one(self):
         """#656: a long solo prompt read gives way at a chunk boundary; the short request is answered first, then the
         long one goes on (in the slot its part waited in) and is answered too."""
@@ -668,7 +713,7 @@ class ParallelService(unittest.TestCase):
         self.assertTrue(any(x.startswith("YIELD ") for x in log), log)
         with self.svc.status_lock:
             self.assertEqual(len(self.svc.history), 2)
-        self.assertFalse(any(self.engine.slot_busy))
+        self.wait_slots_free()
 
     def test_three_requests_long_long_short_do_not_deadlock(self):
         """ENGINE_REVIEW finding 1 (0.1.41 check): two long prompts fill both slots, a short one arrives a moment later
@@ -696,7 +741,12 @@ class ParallelService(unittest.TestCase):
         self.assertFalse(any(th.is_alive() for th in threads), "a request never finished (deadlock)")
         self.assertEqual(errors, [])
         self.assertEqual(sorted(r[0] for r in res.values()), ["ok, done."] * 3)
-        self.assertFalse(any(self.engine.slot_busy))
+        # The HTTP reply can finish while a background BDONE drain still owns a slot.  Wait for its notification,
+        # but still fail if a slot never comes free (the deadlock this test is meant to catch).
+        with self.engine.slot_cv:
+            self.assertTrue(self.engine.slot_cv.wait_for(lambda: not any(self.engine.slot_busy), timeout=10),
+                            f"slots did not clear: {self.engine.slot_busy}")
+            self.assertFalse(any(self.engine.slot_busy))
         with self.svc.status_lock:
             self.assertEqual(len(self.svc.history), 3)
 
@@ -713,7 +763,7 @@ class ParallelService(unittest.TestCase):
         self.assertLess(res[short_q][1], res[long_q][1] - 0.5, res)
         log = self.log.read_text().splitlines()
         self.assertTrue(any(x.startswith("YIELD ") for x in log), log)
-        self.assertFalse(any(self.engine.slot_busy))
+        self.wait_slots_free()
 
     def test_no_way_given_to_a_long_one(self):
         """Two prompts of about the same length: no BYIELD (it only goes to a much shorter one)."""

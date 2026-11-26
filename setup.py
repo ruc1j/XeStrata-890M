@@ -18,8 +18,8 @@ What the first run does (each step is skipped when it is already done):
      disk space
   2. asks the questions
   3. installs the Python packages it needs into .venv (numpy, jinja2, ...)
-  4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md) with its image generator, and the
-     image encoder when images are wanted (on the CPU, and on the GPU through Vulkan)
+  4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md) with its image generator and its
+     vision encoder (the picture reader, on the GPU or the CPU)
   5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.sh and starts the model
@@ -37,10 +37,11 @@ model Qwen-Image-2.1 in 40; mage-flow-turbo|mage-flow|mage-flow-base[-uncensored
 magetrail[-uncensored]: MageTrail, Mage-Flow tuned on Danbooru and e621 images, in 30; -uncensored: the text
 encoder with the refusal direction removed; several, comma-separated: the first the default, the others named by a
 request's "model"; hunyuan-image-3-distil: HunyuanImage 3.0 Instruct-Distil in 8 steps, its own tokenizer and
-system prompt, no text encoder; moss-image|moss-image-base[-uncensored]: MOSS-Image in 50 with guidance, the text
-encoder Qwen3.5-9B; --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image) or w4a8|int8 (HunyuanImage 3.0), --image-dit-q8
+system prompt, no text encoder; moss-image-sft|moss-image-base[-uncensored]: MOSS-Image in 50 with guidance, the text
+encoder Qwen3.5-9B; moss-image-sft-4-step[-uncensored]: MOSS-Image with akhaliq's 4-step LoRA;
+--image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image) or w4a8|int8 (HunyuanImage 3.0), --image-dit-q8
 auto|on|off (Mage-Flow, MOSS-Image) and --image-dit-keep on|off (Mage-Flow), --image-ssd-offload on|off,
---image-gpu-policy auto|keep|shrink|unload).
+--image-gpu-policy auto|keep|shrink|unload, --image-gpu auto|same|PCI).
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, a size it thinks will not fit - is kept, with what it risks.  With --yes, an
@@ -73,28 +74,36 @@ import urllib.request
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NamedTuple, NoReturn
 
-from serve import childenv, inkling2mini_family, inkling2mini_fit, places, release_check
+from serve import childenv, inkling2mini_family, inkling2mini_fit
+from serve import download as download_core
+from serve import envvars, gpu_select, hardware, kernel_check, model_terms, places, release_check, settings
+from serve import sync_models
+from serve import autotune
+from serve import option_values as OV
+from serve.model_terms import _qimage
+from serve import translate as translate_mod
 
 ROOT = Path(__file__).resolve().parent
 WIN = places.WIN
 
 
 # A deb or rpm package installs this folder read-only (/usr/share/xestrata) with a PACKAGED record (where the engine
-# package puts the engine), and so does the Windows 7z.  Then nothing is compiled, the Python packages are the
-# distribution's (or the 7z's), and what setup writes for a model (its config, the logs) goes to the user's folders
-# (serve/places.py) instead of next to this file.
+# package puts the engine), and so does the Windows 7z.  Then nothing is compiled and the Python packages are the
+# distribution's (or the 7z's).  What setup writes for a model (its config, the logs) goes to the user's folders
+# (serve/places.py) in every case, a Strata folder's as well: the configs sit beside the settings (settings.json, which
+# a model's config can override), and every copy of Strata of this user shares them.
 PACKAGED: dict[str, Any] | None = None
 if (ROOT / "PACKAGED").is_file():
     PACKAGED = json.loads((ROOT / "PACKAGED").read_text(encoding="utf-8"))
-CONF = places.user_dir("config") if PACKAGED else ROOT   # the model configs, xestrata-<model>.json
-STATE = places.user_dir("state") if PACKAGED else ROOT    # the logs, and the engine's working folder
+CONF = places.user_dir("config")    # the model configs, xestrata-<model>.json
+STATE = places.user_dir("state")    # the logs, and the engine's working folder
 SETUP_CMD = ("xestrata-cli" if WIN else "xestrata") if PACKAGED else "./setup.sh"
 # Every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when it was pinned, upstream #214), so a checkout installs the same files
-# on any day.  Every file has a fixed size and SHA-256 too (REPO_PINS, upstream e193161d); a revision the repository
-# no longer has stops the download (download()), unless a tester sets STRATA_ALLOW_UNPINNED=1.
+# on any day.  Every file has a fixed size and SHA-256 too (REPO_PINS); a revision the repository no longer has stops
+# the download (download()), unless a tester sets XESTRATA_ALLOW_UNPINNED=1.
 HF_REVISIONS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
     # 2026-10-07 (adds IQ3_S)
@@ -103,24 +112,319 @@ HF_REVISIONS = {
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
     "ornith-ai/Ornith-1.5-35B-A3B-GGUF": "12393612fd4f730ff5aadc23e9b8f9648aa49ceb",                 # 2026-10-11
     "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF": "0bfdfe7f6c424de60481c26379c9d821469f75f1",         # 2026-10-11
+    "dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF": "38ab997c00045ce9fb858b16d7d914193f9e9917",      # 2026-11-03
     "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf": "044a4447c2da94b489484927355665b819eb3d4b",           # 2026-10-11
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
+    "SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF":
+        "313e55f61a045dd18ac023d28fe845ee35988a5d",                                                  # 2026-10-03
     "unsloth/GLM-5.3-Flash-GGUF": "a38483c8cd5df544f53d70fb281afe97369d5ab6",                        # 2026-10-09
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",          # 2026-10-13
     "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": "b32c7399b57f7a627b8aa9403ef06767e9a444e8",    # 2026-10-24
+    "agentionai/Signal-2-Flash-Next-Gyro-GGUF": "7ac34b1887cff43f28c3339ad25b12a9d3c16b1f",        # 2026-11-20
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": "06a318de4011598a142ee54bcfec47c6921c958e",  # 2026-10-22
+    "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": "90a3350cd800ec1fe0d1660a38414ad9e985782f",    # 2026-10-24
+    "SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": "3db919a964b1f0ae0d1000ba7be90b3e38b1f7a3",  # 10-24
     "unsloth/Qwen3.5-9B-GGUF": "3885219b6810b007914f3a7950a8d1b469d598a5",                          # 2026-10-26
+    "unsloth/Qwen3.5-2B-GGUF": "f6d5376be1edb4d416d56da11e5397a961aca8ae",                          # 2026-11-08
+    "unsloth/Qwen3.5-0.8B-GGUF": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",                        # 2026-11-08
+    # 2026-11-23: Inkling-2-Mini's .strata v1.1 files (upstream inkling2's) and the QSA indexer beside them
+    "strata-engine/Inkling-2-Mini-Strata": "04996a1e2c45009b6a04f2af126cb6bdb2ba3587",              # 2026-11-23
+    "tamanekokoro/Inkling-2-Mini-QSA-Indexer": "389228e3d8c78fda6455f023939d11d29e48555e",          # 2026-11-23
+    # 2026-11-24: Unsloth's GGUF of Inkling-2-Mini (its Mainline_Support folder), the engine's .gguf path beside .strata
+    "unsloth/Inkling-2-Mini-GGUF": "ea0c79b2ecd73669e774c8519b79bfabfddbc027",                      # 2026-11-21
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
+    "AtomicChat/Qwen3.8-Flash-Next-GGUF": "f5b0b790eebb89033c48091c26abf74c1b385940",               # 2026-11-03
+    "hiru2005/Sync-XS": "7caf39170ffd473ec37ffc15e853ba9b79f55648",
+    "hiru2005/Sync-S": "f0674698fbb224ec581227228befb59335043aec",
+    "sync-strata/Sync-M": "435b4178227d9fb13b7e63f8645b7213819419a2",
+    "hiru2005/Sync-shared": "5aabe39c669208e8ae0c6ecad8e9d34f808c8d02",
+    # Edge0's latent-MoE packs (EDGE0_REVISIONS below pins the same by model name; setup_edge0 fetches the files)
+    "Edge0/Edge0-145B-q3k": "dd6864e1a097685e0ef808cd2e088cfde992abea",                            # 2026-11-13
+    "Edge0/Edge0-120B-q3k": "2d8fda55854cdc22b5af049476fd55be3f0a5370",                            # 2026-11-13
+    "Edge0/Edge0-145B-NVFP4": "a3778c635f2e97323132ff0b5fe3e093cd48e634",                          # 2026-11-15
+    "Edge0/Edge0-120B-NVFP4": "f2c72e69c8649e3718b17b2b942e364d730a2dcd",                          # 2026-11-15
+    # the translation models (serve/translate.py's MODELS)
+    "pfnet/plamo-3-translate-2b-GGUF": "4f672106b847200bfdc0f6af6c321cd94eba1aed",                  # 2026-11-09
+    "pfnet/plamo-3-translate-0.8b-GGUF": "1cf96ae02133958a20074bfdfab76517bb737d00",                # 2026-11-09
+    "pfnet/plamo-3-translate-8b-GGUF": "c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42",                  # 2026-11-09
+    # the QSA GGUFs, and the base model's picture reader (the QSA repository has none)
+    "MistVVK/SenseNova-Loop-9B-QSA-GGUF": "2ce9e179fa86e3ecd2f813396ef2e792910390af",             # 2026-11-20
+    "sensenova/SenseNova-Loop-9B-GGUF": "11c121055062d33647348cf236a8c543138b282e",                 # 2026-11-20
+}
+
+# The models' terms, the one place About > Model terms reads them from (serve/model_terms.py): for each repository
+# setup downloads from, the license's name as its text titles it, the model card's license field ("card", where it
+# says another or the repository has no text), and the files that hold the terms' full text, each pinned
+# (source "hf:<repo>" or "gh:<owner>/<repo>", commit, path, bytes, SHA-256): the repository's own, else its base
+# model's or the upstream project's.  setup fetches them with the model (model_terms.fetch), so they read offline.
+MODEL_TERMS: dict[str, dict] = {
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.8-Flash-Next",
+             "812d96e10a0dd82b69d749e68693698cf6c36daa", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": {
+        "license": "Swift Open License v1.0",
+        "card": "other (swift-open-license-1.0)",
+        "texts": [
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "LICENSE", 13323,
+             "7a3af3e6b43fcb7c486ea8167252a36a9532dcbdf02d1704a749881872ec551c"),
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "LICENSE-QWEN", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "NOTICE", 1514,
+             "adfc6658815ecb4ddb26b1e3018c819104866b6c54f15e6b63b73827fa40c884"),
+        ],
+    },
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.8-Flash-Next",
+             "812d96e10a0dd82b69d749e68693698cf6c36daa", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "unsloth/Qwen3.8-Flash-Next-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:Qwen/Qwen3.8-Flash-Next",
+             "812d96e10a0dd82b69d749e68693698cf6c36daa", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "ornith-ai/Ornith-1.5-35B-A3B-GGUF": {
+        "license": "MIT",
+        "card": "mit",
+        "texts": [],
+    },
+    "strata-engine/Inkling-2-Mini-Strata": {
+        "license": "Apache-2.0",
+        "card": "apache-2.0",
+        "texts": [],
+    },
+    "tamanekokoro/Inkling-2-Mini-QSA-Indexer": {
+        "license": "MIT",
+        "card": "mit",
+        "texts": [],
+    },
+    "unsloth/Inkling-2-Mini-GGUF": {
+        "license": "Apache-2.0",
+        "card": "apache-2.0",
+        "texts": [],
+    },
+    "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("hf:pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF",
+             "0bfdfe7f6c424de60481c26379c9d821469f75f1", "LICENSE", 1073,
+             "ba0b4cc44cd824e63b2aa20691ab8707ed7407a91b3772d8ed47896d8c4d9629"),
+        ],
+    },
+    "dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF": {
+        "license": "MIT",
+        "card": "mit",
+        "texts": [],
+    },
+    "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf": {
+        "license": "Apache-2.0",
+        "card": "apache-2.0",
+        "texts": [],
+    },
+    "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.6-35B-A3B",
+             "345d467b117d1fd5eda9b879a5988de9ae5f47a7", "LICENSE", 11343,
+             "50cbab8a892c5f2993b8c7351a99182507472def3b1374558308605d99b86b32"),
+        ],
+    },
+    "SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.6-35B-A3B",
+             "345d467b117d1fd5eda9b879a5988de9ae5f47a7", "LICENSE", 11343,
+             "50cbab8a892c5f2993b8c7351a99182507472def3b1374558308605d99b86b32"),
+        ],
+    },
+    "unsloth/GLM-5.3-Flash-GGUF": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("hf:zai-org/GLM-5.3-Flash",
+             "46a050bec13002ad29ee795c16e61cf4fa3c4a9c", "LICENSE", 1070,
+             "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1"),
+        ],
+    },
+    "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:agentionai/Qwen3.8-Flash-Next-Gyro-GGUF",
+             "1ada08422e404aca51ab9df665f089f34c419c6b", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF",
+             "b32c7399b57f7a627b8aa9403ef06767e9a444e8", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "agentionai/Signal-2-Flash-Next-Gyro-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:agentionai/Signal-2-Flash-Next-Gyro-GGUF",
+             "7ac34b1887cff43f28c3339ad25b12a9d3c16b1f", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF",
+             "06a318de4011598a142ee54bcfec47c6921c958e", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.8-Flash-Next",
+             "812d96e10a0dd82b69d749e68693698cf6c36daa", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": {
+        "license": "Swift Open License v1.0",
+        "card": "other (swift-open-license-1.0)",
+        "texts": [
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "LICENSE", 13323,
+             "7a3af3e6b43fcb7c486ea8167252a36a9532dcbdf02d1704a749881872ec551c"),
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "LICENSE-QWEN", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "NOTICE", 1514,
+             "adfc6658815ecb4ddb26b1e3018c819104866b6c54f15e6b63b73827fa40c884"),
+        ],
+    },
+    "unsloth/Qwen3.5-9B-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.5-9B",
+             "c202236235762e1c871ad0ccb60c8ee5ba337b9a", "LICENSE", 11544,
+             "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        ],
+    },
+    "unsloth/Qwen3.5-2B-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.5-2B",
+             "15852e8c16360a2fea060d615a32b45270f8a8fc", "LICENSE", 11544,
+             "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        ],
+    },
+    "unsloth/Qwen3.5-0.8B-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.5-0.8B",
+             "2fc06364715b967f1860aea9cf38778875588b17", "LICENSE", 11544,
+             "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        ],
+    },
+    "MistVVK/SenseNova-Loop-9B-QSA-GGUF": {"license": "Apache License", "card": "apache-2.0"},
+    "sensenova/SenseNova-Loop-9B-GGUF": {"license": "Apache License", "card": "apache-2.0"},
+    "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.5-9B",
+             "c202236235762e1c871ad0ccb60c8ee5ba337b9a", "LICENSE", 11544,
+             "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        ],
+    },
+    "AtomicChat/Qwen3.8-Flash-Next-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:AtomicChat/Qwen3.8-Flash-Next-GGUF",
+             "f5b0b790eebb89033c48091c26abf74c1b385940", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "pfnet/plamo-3-translate-2b-GGUF": {
+        "license": "PLaMo Community License Agreement",
+        "card": "other (plamo-community-license)",
+        "texts": [
+            ("hf:pfnet/plamo-3-translate-2b-GGUF",
+             "4f672106b847200bfdc0f6af6c321cd94eba1aed", "LICENSE/en", 9532,
+             "ca0c5e90f6de6799fc2d2d4f2b2647cc088444c19f286f689e525d4ad28f9ed6"),
+            ("hf:pfnet/plamo-3-translate-2b-GGUF",
+             "4f672106b847200bfdc0f6af6c321cd94eba1aed", "LICENSE/ja", 10713,
+             "7dd74339bbf9a39fe33e271a89657aacf06f452b082fcb1273fb792b8d6b7db2"),
+        ],
+    },
+    "pfnet/plamo-3-translate-0.8b-GGUF": {
+        "license": "PLaMo Community License Agreement",
+        "card": "other (plamo-community-license)",
+        "texts": [
+            ("hf:pfnet/plamo-3-translate-0.8b-GGUF",
+             "1cf96ae02133958a20074bfdfab76517bb737d00", "LICENSE/en", 9532,
+             "ca0c5e90f6de6799fc2d2d4f2b2647cc088444c19f286f689e525d4ad28f9ed6"),
+            ("hf:pfnet/plamo-3-translate-0.8b-GGUF",
+             "1cf96ae02133958a20074bfdfab76517bb737d00", "LICENSE/ja", 10713,
+             "7dd74339bbf9a39fe33e271a89657aacf06f452b082fcb1273fb792b8d6b7db2"),
+        ],
+    },
+    "pfnet/plamo-3-translate-8b-GGUF": {
+        "license": "PLaMo Community License Agreement",
+        "card": "other (plamo-community-license)",
+        "texts": [
+            ("hf:pfnet/plamo-3-translate-8b-GGUF",
+             "c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42", "LICENSE/en", 9532,
+             "ca0c5e90f6de6799fc2d2d4f2b2647cc088444c19f286f689e525d4ad28f9ed6"),
+            ("hf:pfnet/plamo-3-translate-8b-GGUF",
+             "c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42", "LICENSE/ja", 10713,
+             "7dd74339bbf9a39fe33e271a89657aacf06f452b082fcb1273fb792b8d6b7db2"),
+        ],
+    },
 }
 
 
-HF_DEFAULT = "https://huggingface.co"
+# Sync's packs and common weights use the base model's terms; setup pins the same license text for About.
+for _sync_repo in ("hiru2005/Sync-XS", "hiru2005/Sync-S", "sync-strata/Sync-M", "hiru2005/Sync-shared"):
+    MODEL_TERMS[_sync_repo] = {"license": "Qwen Community License 1.0", "card": None,
+                               "texts": MODEL_TERMS["ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"]["texts"]}
+
+
+HF_DEFAULT = download_core.HF_DEFAULT
 
 
 def hf_endpoint() -> str:
     """#495: the Hugging Face host - HF_ENDPOINT as huggingface_hub reads it (a mirror, e.g. https://hf-mirror.com),
     else huggingface.co.  The pinned revisions and the SHA-256 checks are the same whichever host serves the files."""
-    return (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or HF_DEFAULT
+    return download_core.hf_endpoint()
 
 
 def hf(repo: str) -> str:
@@ -169,19 +473,19 @@ urllib.request.install_opener(urllib.request.build_opener(_HeadRedirect))
 
 
 def _urlopen(req, timeout=None):
-    """Every download request of this file goes through here
-    (upstream's name, kept so its download code reads the same)."""
-    return urllib.request.urlopen(req, timeout=timeout)
+    """The download requests of this file that the tests stand in for (upstream's name, kept so its download code
+    reads the same): serve/download.py's open_url, the network rule, with setup's waiting line."""
+    return download_core.open_url(req, say=net_say(), timeout=timeout)
 
 
 def allow_unpinned() -> bool:
-    """STRATA_ALLOW_UNPINNED=1: a tester's opt-out.  A file whose pinned version is gone
-    from Hugging Face is then taken from the repository's current files, without the
-    SHA-256 check (nothing pins them).  Off by default, announced when set."""
-    on = (os.environ.get("STRATA_ALLOW_UNPINNED") or "").strip() == "1"
+    """XESTRATA_ALLOW_UNPINNED=1: a tester's opt-out (upstream e193161de).  A file whose pinned version is gone from
+    Hugging Face is then taken from the repository's current files, without the SHA-256 check (nothing pins them).
+    Off by default, announced when set."""
+    on = (envvars.get("ALLOW_UNPINNED") or "").strip() == "1"
     if on and not _unpinned_said:
         _unpinned_said.append(1)
-        warn("STRATA_ALLOW_UNPINNED=1: a model file whose pinned version is gone from Hugging Face is taken from its "
+        warn("XESTRATA_ALLOW_UNPINNED=1: a model file whose pinned version is gone from Hugging Face is taken from its "
              "current files instead, and is NOT checked against a SHA-256. Unset it to get the checked files only")
     return on
 
@@ -201,12 +505,12 @@ def file_pin(url: str):
 # sizes, and is reachable from mainland China where huggingface.co often is not.  It serves a repository's current
 # files (no pinned revision), so a file from it is checked against the SHA-256 ModelScope publishes for it, and the
 # MTP tensors against the pinned checkpoint's own hashes (tools/mtp_fetch.py).
-# --source / STRATA_SOURCE: huggingface (what auto means), or modelscope: only when asked for (a different host
+# --source / XESTRATA_SOURCE: huggingface (what auto means), or modelscope: only when asked for (a different host
 # serving current files, not our pinned revision: setup never switches to it by itself, it recommends it, #908).
 MS_DEFAULT = "https://www.modelscope.cn"
 SOURCES = ("auto", "modelscope", "huggingface")
 HF_FILE = re.compile(r"^https?://[^/]+/(?P<repo>[^/]+/[^/]+)/resolve/(?P<rev>[^/]+)/(?P<path>.+)$")
-_sources: dict = {}                                # model_source()'s answer per (STRATA_SOURCE, HF_ENDPOINT, host)
+_sources: dict = {}                                # model_source()'s answer per (XESTRATA_SOURCE, HF_ENDPOINT, host)
 _ms_files: dict = {}
 
 
@@ -217,18 +521,34 @@ def ms_endpoint() -> str:
 def reachable(url: str, timeout: float = 5.0) -> bool:
     """Whether `url` answers a HEAD request with success (2xx, after redirects) within `timeout` seconds."""
     try:
-        urllib.request.urlopen(urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"}),
+        urllib.request.urlopen(urllib.request.Request(url, method="HEAD", headers={"User-Agent": "xestrata-setup"}),
                                timeout=timeout).close()
         return True
     except OSError:                                    # HTTPError too: an error page is not the file
         return False
 
 
+def repo_closed(repo: str, timeout: float = 5.0) -> bool:
+    """Whether Hugging Face answers 401 for `repo` without a login: a private or removed repository, which setup cannot
+    download (it takes no Hugging Face token).  Any other answer, or none (offline, a mirror without the API), is no
+    verdict: the download says what is wrong.  A gated repository's page answers 200: only its files are closed."""
+    try:
+        req = urllib.request.Request(f"{hf_endpoint()}/api/models/{repo}", method="HEAD",
+                                     headers={"User-Agent": "xestrata-setup"})
+        urllib.request.urlopen(req, timeout=timeout).close()
+    except urllib.error.HTTPError as e:
+        e.close()
+        return e.code == 401
+    except OSError:
+        pass
+    return False
+
+
 def model_source() -> str:
-    """"modelscope" or "huggingface".  ModelScope only when --source modelscope / STRATA_SOURCE=modelscope asks for it;
-    everything else (auto, a HF_ENDPOINT mirror chosen on purpose, #495) is Hugging Face.  Setup does not switch hosts
-    by itself (#908): ModelScope serves a repository's current files, not our pinned revision."""
-    want = (os.environ.get("STRATA_SOURCE") or "auto").strip().lower()
+    """"modelscope" or "huggingface".  ModelScope only when --source modelscope / XESTRATA_SOURCE=modelscope asks for
+    it; everything else (auto, a HF_ENDPOINT mirror chosen on purpose, #495) is Hugging Face.  Setup does not switch
+    hosts by itself (#908): ModelScope serves a repository's current files, not our pinned revision."""
+    want = (envvars.get("SOURCE") or "auto").strip().lower()
     key = (want, os.environ.get("HF_ENDPOINT") or "", ms_endpoint())
     if key not in _sources:
         _sources[key] = "modelscope" if want in ("ms", "modelscope") else "huggingface"
@@ -244,13 +564,34 @@ def source_hint(url: str) -> str:
 
 
 def proxy_hint() -> str:
-    """The next step when a download cannot reach its server: behind a proxy, the variables below are what Strata (and
-    pip, git) read."""
+    """The next step when a download cannot reach its server: behind a proxy, the variables below are what XeStrata
+    (and pip, git) read."""
     names = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
     if any(os.environ.get(n) for n in names):
         return "; a proxy is set in this terminal (HTTPS_PROXY): check that it is the right one and that it is running"
     return ("; behind a company or school proxy, set HTTPS_PROXY (for example HTTPS_PROXY=http://host:port) in this "
             "terminal first")
+
+
+def net_say():
+    """The network rule's waiting line in setup's own indentation (serve/download.py's open_url): what the transfer
+    waits for, said after 5 s and every 10 s after that, instead of a silent console."""
+    return lambda line: say(f"  {line}")
+
+
+def net_fail(e: "download_core.NetFailure", what=None) -> NoReturn:
+    """setup's stop for a host that did not answer: the plain sentence, the one next step, then the proxy and source
+    hints (serve/download.py's rule, upstream fd40eb0fd)."""
+    fail(e.headline(what), e.next_step() + "".join(h for h in (proxy_hint(), source_hint(str(e))) if h))
+
+
+def disk_fail(e: BaseException, part: Path) -> NoReturn:
+    """setup's stop for a file that cannot be written (full drive, quota, a read-only folder): what happened and the one
+    next step, in plain words instead of the raw errno (upstream 0771e3555)."""
+    words = download_core.disk_words(e)
+    if words is not None:
+        fail(f"cannot write {part.name}: {words[0]}", words[1] + " and run it again")
+    fail(f"cannot write {part.name}: {e}", "free some disk space (or pick another --models-dir) and run it again")
 
 
 def ms_file(url: str):
@@ -270,8 +611,8 @@ def ms_meta(repo: str, path: str):
     if repo not in _ms_files:
         try:
             api = f"{ms_endpoint()}/api/v1/models/{repo}/repo/files?Recursive=true"
-            with urllib.request.urlopen(urllib.request.Request(api, headers={"User-Agent": "strata-setup"}),
-                                        timeout=60) as r:
+            with download_core.open_url(urllib.request.Request(api, headers={"User-Agent": "xestrata-setup"}),
+                                        say=net_say()) as r:
                 files = json.loads(r.read())["Data"]["Files"]
             _ms_files[repo] = {f["Path"]: (int(f.get("Size") or 0), (f.get("Sha256") or "").lower()) for f in files}
         except (OSError, ValueError, KeyError, TypeError):
@@ -287,7 +628,6 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # promise the same compression; the files in it are the commit's.  A new LLAMA_CPP_COMMIT takes its own value:
 # tree_sha256() of the zip unpacked with zipfile.
 LLAMA_CPP_TREE_SHA256 = "87b1443f593e9b9159a61fa933e0fd4a2bc29e95f5ad6da422789d1c7cc515ae"
-
 # KV bytes per context token and attention layer: 8-bit 1056 (the default), rotated 4-bit 576, hybrid K8V4 (8-bit K,
 # 4-bit V) 816, 16-bit 2112 (8K and less, and --kv fp16)
 KV_CELL_BYTES = {"q4_0": 576, "k8v4": 816, "fp16": 2112}
@@ -334,16 +674,56 @@ UNSLOTH_V31_IQ4_XS = "UD-IQ4_XS-v31"
 # after the fork's own choices in the menu; "uma_pool_auto": upstream 86ffdbeb1, see uma_holds_experts
 _V31 = {"ram_gb": 48, "families": ("unsloth",), "budget": True, "experimental": True, "revision": UNSLOTH_V31_REVISION,
         "vision": True, "vision_untested": True, "uma_pool_auto": True}
+# Signal-2 (agentionai): a fine-tune of Qwen3.8-Flash-Next in Gyro-S' trellis format.  The standard file carries the
+# PLE tensors; the -noPLE file is not listed, as the other Gyro repositories' noPLE files are not.  Its size and SHA-256
+# are the Hub's LFS pointer at the revision pinned in HF_REVISIONS (2026-11-20).
+SIGNAL2_FILES = {
+    "Signal-2-Flash-Next-Gyro-S-TQ1_0.gguf":
+        (59548699008, "76bc87090ef5ab7fb8a3ed9f20df14f81fe4aadb2e8885070302e7169d39262f"),
+}
+
+# SenseNova-Loop-9B-QSA: the same four quantizations as the official repository, with trained QSA indexers added.
+# Each row's size and SHA-256 come from the GGUF's LFS pointer at the pinned revision: setup offers no file without
+# a pinned hash.  Every file was generated twice and the two copies compared byte for byte before it was stored.
+SENSENOVA_QSA_REPO = "MistVVK/SenseNova-Loop-9B-QSA-GGUF"
+SENSENOVA_QSA_FILES: dict[str, dict[str, Any]] = {
+    "Q4_K_M": {"file": "Q4_K_M-qsa.gguf", "size": 5965458112,
+               "sha256": "2446cec39015603a224c81a0e75a85e36fba84bd45a006891f52b0ca3a70c4c6",
+               "about": "4-bit, with QSA indexers"},
+    "Q8_0": {"file": "Q8_0-qsa.gguf", "size": 9945475776,
+             "sha256": "72107a8d3be8b7ca4ed829ea3a0ee1fe5b89f49a3264ea57dd72bbc4d0a765b3",
+             "about": "8-bit, with QSA indexers"},
+    "BF16": {"file": "BF16-qsa.gguf", "size": 18566736576,
+             "sha256": "9d745360346d88ca568f5ca7654c754a105a052ac2871a6414f820ff83a2b3db",
+             "about": "the unquantized weights, with QSA indexers"},
+    "Q5_K_M": {"file": "Q5_K_M-qsa.gguf", "size": 6815328960,
+               "sha256": "13d86283cdbbef9147d46fdd81675b870ebd7da4930f98f51f34b083f6c8b099",
+               "about": "5-bit, with QSA indexers"},
+}
+# The picture reader is the base model's official file; the QSA repository holds no vision encoder.
+_SENSENOVA_QSA_MMPROJ = {"repo": "sensenova/SenseNova-Loop-9B-GGUF",
+                         "path": "mmproj-SenseNova-Loop-9B-F16.gguf", "size": 918165984,
+                         "sha256": "1bb6afd085020f555b3dca73b6d2139f3a7b28455228b0f07285d0f0ebc61481"}
+
+
+def sensenova_qsa_models() -> dict[str, dict]:
+    """The sizes setup offers: only those whose file exists at the pinned revision."""
+    return {name: {"repo": SENSENOVA_QSA_REPO, "file": d["file"], "size": d["size"],
+                   "sha256": d["sha256"], "about": d["about"]}
+            for name, d in SENSENOVA_QSA_FILES.items() if d["sha256"]}
+
 
 MODELS: dict[str, dict[str, Any]] = {
-    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0},
+    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0,
+             "families": ("qwen", "swift", "sc117", "sc117-swift")},
     "IQ2_XS": {"about": "2-bit i-quant, a little better quality, close in speed", "download_gb": 68.0, "ram_gb": 48,
-               "arena_gb": 35.5, "families": ("qwen", "swift", "huihui-swift")},
+               "arena_gb": 35.5, "families": ("qwen", "swift", "huihui-swift", "sc117", "sc117-swift")},
     "IQ3_XXS": {"about": "3-bit i-quant, better quality, slower (more CPU work per token)", "download_gb": 75.8,
-                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "huihui-swift")},
+                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "huihui-swift", "sc117", "sc117-swift")},
     # matches the full BF16 model on the published benchmarks; Swift 1.5 got an IQ3_S tier of its own (#1651)
     "IQ3_S": {"about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC "
-                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3},
+                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3,
+              "families": ("qwen", "swift", "sc117", "sc117-swift")},
     # the Coder release: 256 of the 512 experts kept (the ones code, tools and vision use), IQ2_S-IQ4_XS like IQ3_S
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
@@ -367,18 +747,18 @@ MODELS: dict[str, dict[str, Any]] = {
     # upstream 0.1.44 (23250b5d): Unsloth's 5-, 6- and 8-bit files, six shards each; their experts are Q5_K, Q6_K and
     # Q8_0 gate/up with Q8_0 downs, which the expert kernels read.  Not run here (the user's decision of 2026-10-14:
     # offered as they are); on a PC with less RAM than "ram_gb" a RAM budget of the experts, the rest read from the SSD.
-    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality; not "
-                            "tested in XeStrata", "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4,
+    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality",
+                   "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4,
                    "families": ("unsloth",), "budget": True, "experimental": True, "shards": 6,
-                   "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf", "vision": True, "vision_untested": True},
-    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs; not tested in XeStrata",
+                   "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf", "vision": True},
+    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs",
                    "download_gb": 169.2, "ram_gb": 118, "arena_gb": 109.2, "families": ("unsloth",), "budget": True,
                    "experimental": True, "shards": 6, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf",
-                   "vision": True, "vision_untested": True},
-    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC; not tested in XeStrata",
+                   "vision": True},
+    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC",
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth", "huihui-unsloth"),
              "budget": True, "experimental": True, "shards": 6, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf",
-             "vision": True, "vision_untested": True},
+             "vision": True},
     # upstream 9ed3c7789: Unsloth's v3.1 sets (revision UNSLOTH_V31_REVISION, pins UNSLOTH_V31_SHARDS; _V31 above).
     # "quant" is the name on the Hub (folder and file names).  download_gb / arena_gb: the pinned shard sizes and the
     # routed experts' bytes (upstream's tests/fixtures/unsloth_v31); ram_gb: the RAM-budget floor of UD-Q4_K_XL.
@@ -408,8 +788,7 @@ MODELS: dict[str, dict[str, Any]] = {
     # Gyro (agentionai): "ram_gb" is the RAM that holds every expert with the usual room beside them ("arena_gb" +
     # LOW_RAM_HEADROOM_GB); with less, the low-RAM mode needs RAM and VRAM together of "arena_gb" + 12 (low_ram_fits:
     # 6 GB of each for the rest).  The rest of the download is the n-gram table, read from the SSD.  Neither is anyone's
-    # default.  Images: the same mmproj as every Flash-Next model; strata-vision reads only the vocabulary and header of
-    # the Gyro GGUF (tools/vision/gguf_meta.h), whose TQK6 / TQK7 tensors llama.cpp does not know.
+    # default.  Images: the same mmproj as every Flash-Next model (xestrata-vision reads the mmproj alone).
     "Gyro-S": {"about": "for PCs with little memory (36 GB of RAM, or 38 GB of RAM and VRAM together); lower "
                         "quality than the 2-3-bit sizes, and the 2-bit Q2_0 decodes faster",
                "download_gb": 58.5, "ram_gb": 35.8, "arena_gb": 25.8, "families": ("gyro",),
@@ -431,7 +810,35 @@ MODELS: dict[str, dict[str, Any]] = {
                             "together); lower quality than Gyro-Coder-L",
                    "download_gb": 75.8, "ram_gb": 26.0, "arena_gb": 16.0, "families": ("gyro-coder",),
                    "file": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf", "shards": 1, "vision": True},
+    # Signal-2-Gyro-S: the same 48 layers x 512 experts as Gyro-S (TQK6 / TQK7, 25.8 GB), a fine-tune's weights and a
+    # 59.5 GB download.  Its own size key keeps the file size exact; "S" makes the served name
+    # qwen3.8-flash-next-signal-2-gyro-s.
+    "S": {"about": "Signal-2's fine-tune at Gyro-S' size (36 GB of RAM, or 38 GB of RAM and VRAM together); "
+                   "lower quality than the 2-3-bit sizes",
+          "download_gb": 59.5, "ram_gb": 35.8, "arena_gb": 25.8, "families": ("signal2",),
+          "file": "Signal-2-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1, "vision": True},
+    # AtomicChat's AD files (ATOMICCHAT_FILES): IQ3_S gate/up experts in layers 0-3 and 40-47, IQ2_S in the others,
+    # IQ4_NL downs (50.6 GB, IQ3_S's size), Q8_0 dense weights; the n-gram table Q5_1 (4.27) or Q8_0 (5.00), the rest of
+    # the download.  The RAM as Gyro's ("arena_gb" + LOW_RAM_HEADROOM_GB).  Their AD-3.84bpw is not here: its downs are
+    # MXFP4, which the expert kernels do not read
+    "AD-4.27bpw": {"about": "experts of 2.5 to 3.5 bits with 4.5-bit downs, the n-gram table at 5 bits",
+                   "download_gb": 94.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "shards": 3,
+                   "file": "Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-0000{i}-of-00003.gguf", "vision": True},
+    "AD-5.00bpw": {"about": "the same experts as AD-4.27bpw, the n-gram table at 8 bits",
+                   "download_gb": 110.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "shards": 3,
+                   "file": "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-0000{i}-of-00003.gguf", "vision": True},
 }
+# Sync's pre-built packs use the same engine as Qwen3.8-Flash-Next.  The thresholds are the pack authors'
+# recommendations, in GiB; they decide the size within this family and whether it runs here (FIRST_CHOICE).
+MODELS.update({
+    "Sync-XS": {"about": "the smallest Sync pack", "download_gb": 57.7, "ram_gb": 24,
+                "arena_gb": 20.47, "families": ("sync",), "vision": True},
+    "Sync-S": {"about": "the middle Sync pack", "download_gb": 61.7, "ram_gb": 32,
+               "arena_gb": 24.07, "families": ("sync",), "vision": True},
+    "Sync-M": {"about": "the largest Sync pack", "download_gb": 68.1, "ram_gb": 48,
+               "arena_gb": 30.08, "families": ("sync",), "vision": True},
+})
+
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (check_shards reads the other model files' directories; these are also hashed once).
 UNSLOTH_SHARDS = {
@@ -609,6 +1016,22 @@ SWIFT_FILES = {
 # huihui-ai's abliterated copies (uncensored) of Swift 1.5's IQ2_XS and IQ3_XXS and of Unsloth's UD-IQ4_XS,
 # UD-Q4_K_XL and Q8_0: the same file names, shards and sizes as those (Q8_0: 32 bytes more in shards 2 to 6), other
 # weights.  The picture readers are the originals' files.  name -> (bytes, sha256) at the pinned revision.
+# AtomicChat's AD files at the pinned revision (the Hub's LFS pointers): name -> (bytes, sha256).  The two sizes' shard
+# 2 (experts of the last layers) is the same file
+ATOMICCHAT_FILES = {
+    "Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00003.gguf":
+        (44866868384, "11f1dcede7c9cd2a431b7b45b52dc7a72c24a38ae36d39cd3ba6242b364fef39"),
+    "Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00002-of-00003.gguf":
+        (11258338528, "1facceac7841b180b2f18b0be49af7321114084312289e44edd2164cf291b966"),
+    "Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00003-of-00003.gguf":
+        (38400184512, "7e3e597431774c0d1aef6cd6f72f6a55afa179e86538745087dc7fff6eb647e8"),
+    "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-00001-of-00003.gguf":
+        (44866868384, "99312afa27161c1b6498a45cae07ad12f6a567f2251c08b6c49114dd87015d0c"),
+    "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-00002-of-00003.gguf":
+        (11258338528, "1facceac7841b180b2f18b0be49af7321114084312289e44edd2164cf291b966"),
+    "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-00003-of-00003.gguf":
+        (54400261312, "290aab4357f46f61717e1caca3724dd1b722939b60e38a057e351e46dc95f901"),
+}
 HUIHUI_FILES = {
     "Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf":
         (10946624, "2dabcbb53ca537a7947bc7d20414fd464eeaf4d66d43021b5b2556cc87544ad2"),
@@ -658,6 +1081,49 @@ CODER_FILES = {
     "mmproj-Qwen3.8-Flash-Next-BF16.gguf":
         (907543008, "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0"),
 }
+# SC117's abliterated copies of ISTA-DASLab's four sizes: OrcaRouter's abliterated ssm_out, attention output and
+# shared and routed expert down tensors put into ISTA-DASLab's files (Q2_0's re-encoded with ISTA-DASLab's block
+# scales), the rest of the files as ISTA-DASLab's.  Shard 2 (the n-gram table) is ISTA-DASLab's file byte for byte.
+# name -> (bytes, sha256) at the pinned revision.
+SC117_FILES = {
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf":
+        (39665015072, "4acc3ebb5050d20117bdc77fc39200e709dfe2b2367f3522c95b9112a30aff81"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf":
+        (55063448064, "40f369eca301ec6ea318dbb671b3132c26a2f0b89aa5458a7051b33215ee296c"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf":
+        (47342144896, "03b11926b41a3d7f7a008882b1bc7a6330a3c9c43d3cad4598d31dc73042fdc5"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00001-of-00002.gguf":
+        (38021379872, "1620faf21c845524cbe38dcbbaf850b8d155c2299df05d8b7bfb43b642c4647e"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+}
+# SC117's abliterated copies of Swift 1.5's four sizes, made the same way (the donor's types kept: IQ4_XS and the
+# like).  Swift's shard 2 holds layers 13-47, its own file for each size.  name -> (bytes, sha256) at the pinned
+# revision.
+SC117_SWIFT_FILES = {
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf":
+        (39791412224, "ea68dd601c4911415b4461f53accecd99d6d38aa06cb0b6722e8f7fb6556d9da"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00002-of-00002.gguf":
+        (28359413504, "bdec0a9242f2a266ff517280ea6a5934e4a246f0ed8eb7a462c07434ffea161b"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf":
+        (44849330016, "638fbd42a01c7b39a9b7b21c5c8dc5eb1876222d8bd268d471304b647fcd6f94"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf":
+        (38699929024, "091a4f6a53697a12a2ea1e5e1d61414410d50c0d44e971304602bba6873fd23d"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf":
+        (39771812960, "83f75959e296a6380c98d5b6e906a0cde175077ffac2419fd56e7e15969d55dd"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00002-of-00002.gguf":
+        (36056143040, "aa59f45eaa3c02069016903862a5f8d73adfdb7ca97f9cab25f7494e9ac4b1a3"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00001-of-00002.gguf":
+        (39797110944, "745a93a8b3e86e5553899259b7ad7e6d0cf889b69e6a334f4a70965a1a828113"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00002-of-00002.gguf":
+        (26710079616, "5b91b79a4bbee162761c16b9a47a3434c3f8be0ad6bf34849318d9efcb4b6aa1"),
+}
 # RAM beside the budget where the 17 below was not measured: a unified-memory GPU (its expert cache and the budget share
 # the RAM) and what text_ram_gb counts for a config
 UNSLOTH_RAM_LEFT_GB = 24
@@ -666,15 +1132,263 @@ UNSLOTH_RAM_LEFT_GB = 24
 # -> 84.2 tok/s, a 65K prompt reads 97.7 -> 37.0 GB from the SSD, and it ran on when an 8 GiB program started after the
 # load)
 UNSLOTH_BUDGET_LEFT_GB = 17
+UMA_DENSE_ROOM_GB = 8          # in the GPU's own pool: the dense weights' buffers beside the file's dense bytes
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
 # serve the setup takes yarn (or asks, when interactive) and the factor final / 262144 (at least 1), keeps an explicit
 # --rope-scaling / --rope-scale, and refuses an explicit --rope-scaling none there.
+EDGE0_FILES = {
+    "Edge0-145B-q3k": {
+        "LICENSE": (13059, "b1f5016a9f27a770e0fdd98f37c588477154d07a96f50e203de8ac53cdbefa79"),
+        "NOTICE": (2560, "f2f4feabdd5b75e3ed5b41870a022bfc1dfdbcd798b8009f648cc870edbef777"),
+        "README.md": (32435, "a6c9e1e8250cf0b4b72527bf932bed0f993e8ac2750823faacdbf67c3e672a1a"),
+        "dense.bin": (1538625024, "f9bcc7f36eac4e59a7b1cb1962e038ba12dc831a41fb193761f1d1e72657fb62"),
+        "experts.bin": (40076574720, "947d15f3d69ecdb45d602a62bc84803451da779a22294e1db5b3568290b42879"),
+        "index.txt": (117464, "980366930f95ae1b8138652256c3b9be8925b02395d4f093b72410797675a349"),
+        "labels.bin": (98304, "ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06"),
+        "latent_dense_q4.bin": (1981808640, "e31e11f36c7e5a23c82550b524fd44fb28cfa821ef59fd688b8d2339137ab287"),
+        "latent_dense_q8.bin": (3743416320, "fbb25caaa0dcf45ef62f1a4945dcf98a53a166934a3b461b166fbafa831d87ca"),
+        "model-bench.json": (1248, "f26262014dbd7ae0fa5de9ea5cbf67ca8689122954dbd2a66e4d8079b42fa67b"),
+        "model-skeleton.gguf": (5991569248, "ab49fbe7590cdcda45d7a2bcae4be0bd42c6a70b951d594a00eb158d7df0b72f"),
+        "model.json": (1531, "95b8280bf5151e11cf7b0622688172c9572dd8fd13558bb64d7e8edfc8c32ed4"),
+        "mtp/dense.bin": (116099072, "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"),
+        "mtp/dense.txt": (1851, "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"),
+        "mtp/draft_vocab.bin": (425196, "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91"),
+        "mtp/experts.bin": (707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
+        "native_experts.txt": (1463, "0de7b81744e89f722374842a73b8b26a8a6145c645493471a9c10a4f5f566e70"),
+        "ple-fp8.gguf": (51200246112, "c7615c59b060277ddf6f84729fa8f7469cfc82c7fb983d6e7eab5a2f7446f170"),
+        "profile.bin": (196632, "543f8a364c8dbfef909ecd1a1d7adbc177d3db18ceecdca1fc568f3eaeb8c655"),
+        "release-scope.json": (2534, "9ab2d5f7bb8fef4caf664502a73a6b4371c56ad0244e81571df48587a69a11f4"),
+        "scales/l0.f32": (7168, "ccfb45da4cb91bf0cc19d867472ddfb5c2175640046f6bfc754aa4e344855972"),
+        "scales/l1.f32": (7168, "73a4a4964c59fe2ae6eebd994f099fde0389ddf7c49fe5994ea372d7f826a5c6"),
+        "scales/l10.f32": (7168, "30d4046e0efc59b0ff81d74d1da05f41661d12f3cdc3cade317d646b15aef135"),
+        "scales/l11.f32": (7168, "d41bc1a5fc130916cea24416da58d6c3edac68c6a27f24719c885083aef13d8f"),
+        "scales/l12.f32": (7168, "877b3eaac39446fe23023a06a643a0783f6604e4a722dcd5ed40e6976cb68408"),
+        "scales/l13.f32": (7168, "b62631e02ddf5ae3be123d4385ae1d147a13253e250a4d645a4e5f77673aeaa7"),
+        "scales/l14.f32": (7168, "547f5bd37f52a0e913532c90fb7ad11658ac4fabc6b2a28be159c4e07b1e286b"),
+        "scales/l15.f32": (7168, "374222a8750c7aa5e72f5a2b05229521931be61f99778b841d571ca1b19ae4d4"),
+        "scales/l16.f32": (7168, "de4aaf5ddc41a6b961db1e786929aad539da114495867cc3ee2283f77cb10a0a"),
+        "scales/l17.f32": (7168, "c29c3976ce49f137147213a84dece24c4221dae5326f1a0cf45717b03624368b"),
+        "scales/l18.f32": (7168, "aaf7450624f01bb074bae633f17432841a3794c8efaa76202f3d259046d2f679"),
+        "scales/l19.f32": (7168, "81625f559d0218685104a168d32ac8cabfb271531a8e8e9c8282df25f2754884"),
+        "scales/l2.f32": (7168, "1e2ad898903d58779bddef0708f6b9b605376f451da7d4a3e092c75921abee0e"),
+        "scales/l20.f32": (7168, "0effc90ca93708fc835a5fee3a51a9e4e8e28139e7d289e618bb160fbacc6de4"),
+        "scales/l21.f32": (7168, "4643ac0076f9df916418a8ea58ff70dfb5cd3ce8f8220686698dd1011ed70c48"),
+        "scales/l22.f32": (7168, "8c15e401e96b52144fab43ca05e312d9cd12a6ced369aff85b55bb4e8233e45d"),
+        "scales/l23.f32": (7168, "c737877b64bb32eb444eb497db2b1661c5f92bd35716a2b5ed57fa27c9c5bedc"),
+        "scales/l24.f32": (7168, "e708f5923e499b338c1e95b633eef61e75034ec68d8ea1a9579c159cdc372b5b"),
+        "scales/l25.f32": (7168, "f0ac87f861b8c85065e09fdef886f957f73e6ef7d42ef86d6bc6e4abe2daafd3"),
+        "scales/l26.f32": (7168, "14adbeb9d6dcb10dafe0912d897eb02e2aa6abdb9e0a56f377945697bee02630"),
+        "scales/l27.f32": (7168, "1003f7dbacce30b7d2e1d758cfb7057a742bdf648472fcbd63333234f076e515"),
+        "scales/l28.f32": (7168, "e912c6d85335fc9ec83635064e523b0efe19fd5ef4de4f299bddfd1203c33693"),
+        "scales/l29.f32": (7168, "8c186910f9afcecd23abdbaf2eee52f48360b114f4e47543a41922414db1fd5b"),
+        "scales/l3.f32": (7168, "5b4b1994bcb00a0e78150152ed4d3eba1c90203f3772fc9d3b01bb133661949a"),
+        "scales/l30.f32": (7168, "b5cd2e55d0baeed12a8479feb5df830817821a1d00ff24050c451ecdf4913404"),
+        "scales/l31.f32": (7168, "b65fc3a4d56ca8ec2bd59b41ca63e0946ce30f27e4380477a79e7bcb868bef34"),
+        "scales/l32.f32": (7168, "4590579308a3973129592ced56ff24ed38f3bfe3ef4a8412c9dc2dbd40d170a7"),
+        "scales/l33.f32": (7168, "b8e28a6a3a4e68b935d8779bc43f0cca8a7c87e43cfe0cdcb9ce757631c5bd79"),
+        "scales/l34.f32": (7168, "bad3b4908fecfd92429cdc1b16c0b00314a8f843f9510b8a87afdd297a348c65"),
+        "scales/l35.f32": (7168, "2bc0b3d52dbc8ff6079cf978307698aede8a7ebb0084ba746f6164ce020c4fb1"),
+        "scales/l36.f32": (7168, "d6627bdbf25218a3dd429fa752a1ef882fd610eb23b66871b42b078713059356"),
+        "scales/l37.f32": (7168, "8afc17ed3b68756be8e5590ecbebb3e36179fabafb71901faf63e67ffe02f244"),
+        "scales/l38.f32": (7168, "445fbb2f2365079f06569460e6a905dad3e7f475d23af5ac2b967ab548e27c27"),
+        "scales/l39.f32": (7168, "020697f9289610c49dea1b47b72dd7f0f3746352c52b02f7d9d05db9011ddb07"),
+        "scales/l4.f32": (7168, "223b5a8a9fef3fb289915b985f0492db776be6ee4bc794af6bd6b40bc73f5951"),
+        "scales/l40.f32": (7168, "64b0d2d16992197dc7e2f0986f3d71ab0b744b4df0bdbab15bf08450c0919b00"),
+        "scales/l41.f32": (7168, "a75175bdc03d571f557d59aede6de9a0e734c61b03cfacc4ceb74c19b3787b7d"),
+        "scales/l42.f32": (7168, "e6596c611be63531fbf46fc73c1d1fcf86d38b09cfb27f97ee63571eea4be9cd"),
+        "scales/l43.f32": (7168, "e6e2227612938fac5320a81970215dac65bbee6e555573a5a3da7632adfe6087"),
+        "scales/l44.f32": (7168, "4187577ae6c484c700dfbf003a698aef48ce27fff9035ba40781abec05b58bf7"),
+        "scales/l45.f32": (7168, "270938e5d001b88e23a01d7c0f967ca165f1ac35adeff23f6401365d4d381430"),
+        "scales/l46.f32": (7168, "e3c18301cbfdf48eaa11cbb657f0696d3582aad5f68e2c9c27bafa3481b5a4e2"),
+        "scales/l47.f32": (7168, "552e22ee2bf8dbce16b68ac95a1146a141443a42e3326f7115d47dbe0ec9b845"),
+        "scales/l5.f32": (7168, "2b54008e9681de98a3590ab2d87eccda2f0ce4cfb6a99c91ddea2bfaf7ee9103"),
+        "scales/l6.f32": (7168, "7c0475b18ff380f4fc900ef308226b0a98ef855e793add4c1d149a3620a18f30"),
+        "scales/l7.f32": (7168, "ffb91ee9d1abf5ce63a07c1cc6f8182849700c9701705c3a386398fde797771b"),
+        "scales/l8.f32": (7168, "2ef5f3fdea5a3bc49e8b7cd93a41a793460da3685ed9d0ea10e9aae053c85477"),
+        "scales/l9.f32": (7168, "788cb1c638605ac71728913ce4fcb14c008dbbf46982c4c9c9d1f7af90e03ba5"),
+        "start.sh": (1058, "4067fc14bab4b859a8d9666996ecb963f15b52c54b241696f255caf209baa5e8"),
+        "third-party/Qwen-LICENSE.txt": (3235, "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        "tokenizer/chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "tokenizer/merges.txt": (3353258, "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"),
+        "tokenizer/token_type.json": (744960, "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"),
+        "tokenizer/tokenizer.json": (541, "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"),
+        "tokenizer/vocab.json": (5737005, "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"),
+    },
+    "Edge0-120B-q3k": {
+        "LICENSE": (13059, "b1f5016a9f27a770e0fdd98f37c588477154d07a96f50e203de8ac53cdbefa79"),
+        "NOTICE": (2560, "f2f4feabdd5b75e3ed5b41870a022bfc1dfdbcd798b8009f648cc870edbef777"),
+        "README.md": (32744, "6f91e1e1810a789a368765f263f2b95ddaf2a0c9626d6cf06ebc325fe1be1b75"),
+        "dense.bin": (1538625024, "f9bcc7f36eac4e59a7b1cb1962e038ba12dc831a41fb193761f1d1e72657fb62"),
+        "experts.bin": (28626124800, "ffa87de634deb4d0a65b82b06748aef2cbe649838e20f239730cc62a0e3c7c80"),
+        "index.txt": (117464, "980366930f95ae1b8138652256c3b9be8925b02395d4f093b72410797675a349"),
+        "labels.bin": (98304, "ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06"),
+        "latent_dense_q4.bin": (1415577600, "4824fb68c5dceb94c33bae0fda3801b1f26f65eb8b9ea0dfac0450fc2bfa41b5"),
+        "latent_dense_q8.bin": (2673868800, "fec3adc0b7b3b0798127550951e541823a0c96ca136911332ee050e39c302c91"),
+        "model-skeleton.gguf": (5991569248, "ab49fbe7590cdcda45d7a2bcae4be0bd42c6a70b951d594a00eb158d7df0b72f"),
+        "model.json": (1531, "7dd6161693d6af7c7ae3b664e546b44120c6e7b3725b4234dd0bbb9172a0b5ba"),
+        "mtp/dense.bin": (116099072, "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"),
+        "mtp/dense.txt": (1851, "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"),
+        "mtp/draft_vocab.bin": (425196, "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91"),
+        "mtp/experts.bin": (707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
+        "native_experts.txt": (1458, "28566dc85c852619f81afbe368dd0e361df5db06b23e98b41b5ac838e0c29df8"),
+        "ple-fp8.gguf": (51200246112, "c7615c59b060277ddf6f84729fa8f7469cfc82c7fb983d6e7eab5a2f7446f170"),
+        "profile.bin": (196632, "543f8a364c8dbfef909ecd1a1d7adbc177d3db18ceecdca1fc568f3eaeb8c655"),
+        "release-scope.json": (2534, "f5a88536e8159fac311adaa16e8b44433d047ab580a568028c2cc557aac6c6b6"),
+        "scales/l0.f32": (5120, "85e8d36581a6e0b2fb8a22f12f6625ef467281bf8d8bc526c68741bdcb7ddbe6"),
+        "scales/l1.f32": (5120, "3e0a6fff0f1201ca1fd345b1e47fa5bdc2d5bcd4405e58ecc496f6103e12d299"),
+        "scales/l10.f32": (5120, "4b2035666630fb86f2adcbd630506305ceea48c98e3bbe3bc2f248e9f5ccc7f9"),
+        "scales/l11.f32": (5120, "8e0aebd966a8687c5a28826611bbce3dfec31b968d9ab24241aa934e93165456"),
+        "scales/l12.f32": (5120, "74d8083edca0925e1f1a8ecda7ce0c18617170799f3a0569d5722b1a02718619"),
+        "scales/l13.f32": (5120, "cb9b543a3d1e64e5985fd5e16938f8dc257d33e56282ff5b1f14027b4c56b989"),
+        "scales/l14.f32": (5120, "95af2b87fcae0bc7dbf0b916957ec51e97d82f10409a0cbaf7327c7972ca9347"),
+        "scales/l15.f32": (5120, "8d94319506c360b0cdcf0bfc987d4685a21dcf905bf02b9344c2bd485bdaa019"),
+        "scales/l16.f32": (5120, "32373bfb26bb63695cd41e2fdeee3e4cd6bd744c9b1f1b4a9e130ea782399db6"),
+        "scales/l17.f32": (5120, "c492007a2d14eb49ee744ba0afe268e2433c6f63937f5b599a89e222f64dcf41"),
+        "scales/l18.f32": (5120, "d93f01aaa68d51faf05b0d6c6c55825e3b2f434bdd0f3816c91352953964c841"),
+        "scales/l19.f32": (5120, "3fc5e3cd3afa52b11337756fb814230797c4d51f34ef1b036df34e917300bf67"),
+        "scales/l2.f32": (5120, "2eeb3efeafd713dd4e8e7bb8c2abb85ac54f4ecc14e474ea841087500121d5b2"),
+        "scales/l20.f32": (5120, "6701c6dbf754d580b8fb72a33866115c46563d17a5536950a5d86fe3e6654587"),
+        "scales/l21.f32": (5120, "c59bcf8ab53fa1d22b7b235adff7003e92201079d376c7339e12ccdca62d84f8"),
+        "scales/l22.f32": (5120, "fd71197a966c96bc7fa6f0012ef4dad0339280a4df5b4aea05806732ffdb9a16"),
+        "scales/l23.f32": (5120, "1aa2dded4c52631fccbb7d3ac02528ecc60b69e1cef9380d364b73d6a22fec9a"),
+        "scales/l24.f32": (5120, "99302c6a43e44d709bda4a09d90a889844fa5fd6cfe544ddfbd037d953866b14"),
+        "scales/l25.f32": (5120, "1483f9ce27321e6b8d10c9306f7c40136f1e7e1adf3aa7606138af8130ab51de"),
+        "scales/l26.f32": (5120, "29915afbc4dea9c8045ccbbee2d5ac94e6aea8e496545ed9b727b19140636dba"),
+        "scales/l27.f32": (5120, "25239299177bbab603db755fb3739c7227c91204e0093b6c2e986ac100845fdb"),
+        "scales/l28.f32": (5120, "1720ba26be65dc87ec49a4bd9c3fe1b6b4b92ea2754a7cab942db0c3665a1fb5"),
+        "scales/l29.f32": (5120, "b9320996043f4df4fe235eca0683e7078e9a8ac7ae212a0a89b57554bf7338c0"),
+        "scales/l3.f32": (5120, "fd2401ccb2d2d15f3b63e33586b46c447dbc974608409af4992df91c0b70c171"),
+        "scales/l30.f32": (5120, "1159fbf1ac7e1fd20d6cd82fb14f1be91d53c7462785449872e57344176aca37"),
+        "scales/l31.f32": (5120, "7098314f9d94022ca159dd279b9e7198c9e64e8e48923934659e52519d88e692"),
+        "scales/l32.f32": (5120, "fe82b2cc3d4b1335357216a56ac5f2800b4c392c58e093c2ab8a7bc169dba811"),
+        "scales/l33.f32": (5120, "51d0fb481ce58aca0e9ce133a75af614edb63c2876505cf5e36da63a7c295b2d"),
+        "scales/l34.f32": (5120, "5218e92125014bf751d6374a52c997ea6875e1f812af5bc189e149b17ce68a40"),
+        "scales/l35.f32": (5120, "9522b0e703aeb0843a4695b15126763906fc100474aa980f77ed598d1ef590d3"),
+        "scales/l36.f32": (5120, "65c83633c75aff863e3187c75a9de44ae6f45678cf78c3e057a752fa04c062d7"),
+        "scales/l37.f32": (5120, "dcfa6fe6abb0e8235a0864c05e1fc8a836c9641e6ac11d30197c95fa21f4b713"),
+        "scales/l38.f32": (5120, "50a47c31ca71ad178a0d254304f8e90ed2fbee4e306e67cae64dac90ce3dff09"),
+        "scales/l39.f32": (5120, "38732ae23e0f9603c549a7c125e47592a3195d13b79bb7c2de56e23a4d1b894b"),
+        "scales/l4.f32": (5120, "90abd2538b48544cc485cd856c42114f901d14356bf0a86857a9fd3a3c5a09a7"),
+        "scales/l40.f32": (5120, "a10316a6e129834a2db7c7d1b1b5db88a0b00468f4d58f354265c7249c11d6a6"),
+        "scales/l41.f32": (5120, "9e624d36588778350bcb7afde14e36b21a3b70e59b1660f1b581fcfad83f82b9"),
+        "scales/l42.f32": (5120, "8c2774c473010bd59ea6dc7c972b470dae8f76b852f075213677d5ee53a0af5c"),
+        "scales/l43.f32": (5120, "b183a20b1c168d445dafb9b9249143972b9febc3af7d7c9f10d84c8b4426eaf5"),
+        "scales/l44.f32": (5120, "5dd13b9160ba411c7a0aba2089235a2b32ad8efdad2fc922b959b17a90a2c916"),
+        "scales/l45.f32": (5120, "269cf0a2043b02abaabd991d514d91dd375cc633c432d188157e50e1470632d0"),
+        "scales/l46.f32": (5120, "01ae36b1f210e9d7790bd311870fa2cac543d5551c50269db70b9386974d9420"),
+        "scales/l47.f32": (5120, "9b612fcdc354854717f42a7b46d186304f51e95bfc8561a49b159e8db33a1736"),
+        "scales/l5.f32": (5120, "28e0e050ac722705694ab3d1ffcec262b94a6139db1ece3b7b29779e233d7014"),
+        "scales/l6.f32": (5120, "b43b04e83c260a609c8ae5e38bf1cecfddcfc9f76fc79ca7e0097728dbeb5f57"),
+        "scales/l7.f32": (5120, "af2f95705b96b7e640d73b214d756d9e4f3dcad6754161bf516beb1f0da09db5"),
+        "scales/l8.f32": (5120, "7660bac487ec9d9605c704267ebcf5f53193094581587fdfd40d948c5cf4e1b4"),
+        "scales/l9.f32": (5120, "263225e5e897c64c631ed492d6a0686c0f5df1a51d06f666a7137732c314a8b5"),
+        "start.sh": (1058, "4067fc14bab4b859a8d9666996ecb963f15b52c54b241696f255caf209baa5e8"),
+        "third-party/Qwen-LICENSE.txt": (3235, "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        "tokenizer/chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "tokenizer/merges.txt": (3353258, "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"),
+        "tokenizer/token_type.json": (744960, "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"),
+        "tokenizer/tokenizer.json": (541, "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"),
+        "tokenizer/vocab.json": (5737005, "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"),
+    },
+    "Edge0-145B-NVFP4": {
+        "LICENSE": (13059, "b1f5016a9f27a770e0fdd98f37c588477154d07a96f50e203de8ac53cdbefa79"),
+        "NOTICE": (2560, "f2f4feabdd5b75e3ed5b41870a022bfc1dfdbcd798b8009f648cc870edbef777"),
+        "README.md": (39796, "072de3f320d0702193bf3e20b400ff256bafe416abaa8a15cfd55ce747151053"),
+        "dense.bin": (1538625024, "f9bcc7f36eac4e59a7b1cb1962e038ba12dc831a41fb193761f1d1e72657fb62"),
+        "experts.bin": (47563800576, "a39b0c127983b85d07326c8bad49260d6b475293b46e4166428c91a765ee593a"),
+        "index.txt": (117464, "980366930f95ae1b8138652256c3b9be8925b02395d4f093b72410797675a349"),
+        "labels.bin": (98304, "ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06"),
+        "latent_dense_q4.bin": (1981808640, "e31e11f36c7e5a23c82550b524fd44fb28cfa821ef59fd688b8d2339137ab287"),
+        "latent_dense_q8.bin": (3743416320, "fbb25caaa0dcf45ef62f1a4945dcf98a53a166934a3b461b166fbafa831d87ca"),
+        "model-skeleton.gguf": (5991569248, "ab49fbe7590cdcda45d7a2bcae4be0bd42c6a70b951d594a00eb158d7df0b72f"),
+        "model.json": (1532, "c83979acd68612f3b8171a42f61d8aebf78c28aff1ad4d8e8f92e18deab7f97a"),
+        "mtp/dense.bin": (116099072, "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"),
+        "mtp/dense.txt": (1851, "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"),
+        "mtp/draft_vocab.bin": (425196, "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91"),
+        "mtp/experts.bin": (707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
+        "native_experts.txt": (1437, "84c702bd52f6c800f72590c9c99cf6c24290fee4e59e7e81e5a057999772fcc0"),
+        "ple-fp8.gguf": (51200246112, "c7615c59b060277ddf6f84729fa8f7469cfc82c7fb983d6e7eab5a2f7446f170"),
+        "profile.bin": (196632, "543f8a364c8dbfef909ecd1a1d7adbc177d3db18ceecdca1fc568f3eaeb8c655"),
+        "release-scope.json": (2536, "adcdea803989c7e76717ec308064d1d20e8bb5b12e6944cb9cbfa499137389b0"),
+        "start.sh": (1058, "4067fc14bab4b859a8d9666996ecb963f15b52c54b241696f255caf209baa5e8"),
+        "third-party/Qwen-LICENSE.txt": (3235, "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        "tokenizer/chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "tokenizer/merges.txt": (3353258, "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"),
+        "tokenizer/token_type.json": (744960, "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"),
+        "tokenizer/tokenizer.json": (541, "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"),
+        "tokenizer/vocab.json": (5737005, "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"),
+    },
+    "Edge0-120B-NVFP4": {
+        "LICENSE": (13059, "b1f5016a9f27a770e0fdd98f37c588477154d07a96f50e203de8ac53cdbefa79"),
+        "NOTICE": (2560, "f2f4feabdd5b75e3ed5b41870a022bfc1dfdbcd798b8009f648cc870edbef777"),
+        "README.md": (40222, "d027f12776819495c3d2e07196631eacb236b7f5bffb6a8911987f61669bd527"),
+        "dense.bin": (1538625024, "f9bcc7f36eac4e59a7b1cb1962e038ba12dc831a41fb193761f1d1e72657fb62"),
+        "experts.bin": (33974255616, "f342e24b5d6df7ad13a9305563225ab088d139fef095c3411e85b631d1757532"),
+        "index.txt": (117464, "980366930f95ae1b8138652256c3b9be8925b02395d4f093b72410797675a349"),
+        "labels.bin": (98304, "ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06"),
+        "latent_dense_q4.bin": (1415577600, "4824fb68c5dceb94c33bae0fda3801b1f26f65eb8b9ea0dfac0450fc2bfa41b5"),
+        "latent_dense_q8.bin": (2673868800, "fec3adc0b7b3b0798127550951e541823a0c96ca136911332ee050e39c302c91"),
+        "model-skeleton.gguf": (5991569248, "ab49fbe7590cdcda45d7a2bcae4be0bd42c6a70b951d594a00eb158d7df0b72f"),
+        "model.json": (1532, "717a3d96977dd66b6950a05913ee2637b0f746d9d894f3b6490f840406bd8b54"),
+        "mtp/dense.bin": (116099072, "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"),
+        "mtp/dense.txt": (1851, "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"),
+        "mtp/draft_vocab.bin": (425196, "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91"),
+        "mtp/experts.bin": (707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
+        "native_experts.txt": (1433, "d5a43a7b930a6c391e67bb5df8bdd75aaf945d306609fc7cf9117b6825adae23"),
+        "ple-fp8.gguf": (51200246112, "c7615c59b060277ddf6f84729fa8f7469cfc82c7fb983d6e7eab5a2f7446f170"),
+        "profile.bin": (196632, "543f8a364c8dbfef909ecd1a1d7adbc177d3db18ceecdca1fc568f3eaeb8c655"),
+        "release-scope.json": (2536, "2c7adde09899c294712f8da3e4664108ab1b239aecb7490050d55aec6c491aed"),
+        "start.sh": (1058, "4067fc14bab4b859a8d9666996ecb963f15b52c54b241696f255caf209baa5e8"),
+        "third-party/Qwen-LICENSE.txt": (3235, "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        "tokenizer/chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "tokenizer/merges.txt": (3353258, "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"),
+        "tokenizer/token_type.json": (744960, "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"),
+        "tokenizer/tokenizer.json": (541, "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"),
+        "tokenizer/vocab.json": (5737005, "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"),
+    },
+}
+
+# Edge0's latent-MoE releases (Edge0-145B / Edge0-120B, Q3_K or NVFP4 experts): a pre-built Strata pack (experts.bin
+# + the v6 native_experts.txt + dense.bin + the skeleton GGUF + the fp8 n-gram table + the latent D/U files + labels,
+# and the Q3_K packs' column scales), not a GGUF the packer converts.  A file of the same size and SHA-256 in another
+# of them (the n-gram table, the skeleton, dense.bin, the MTP layer, labels, the tokenizer, ...) is downloaded once and
+# hardlinked into the next model's folder.  The weights are
+# non-free (Edge0 Community Model License 1.0 + Qwen Community License 1.0): setup fetches them to the user's machine,
+# XeStrata bundles nothing.  Files pinned at the revision (the Hub's LFS SHA-256; the small files' own SHA-256).
+EDGE0_REVISIONS = {
+    "Edge0-145B-q3k": "dd6864e1a097685e0ef808cd2e088cfde992abea",
+    "Edge0-120B-q3k": "2d8fda55854cdc22b5af049476fd55be3f0a5370",
+    "Edge0-145B-NVFP4": "a3778c635f2e97323132ff0b5fe3e093cd48e634",
+    "Edge0-120B-NVFP4": "f2c72e69c8649e3718b17b2b942e364d730a2dcd",
+}
+EDGE0_MODELS: dict[str, dict[str, Any]] = {
+    "Edge0-145B-q3k": {"repo": "Edge0/Edge0-145B-q3k", "latent_dim": 1792,
+                       "download_gb": 105.4, "ram_gb": 64,
+                       "about": "145B latent MoE (latent width 1792), Q3_K experts; ~99 GB on disk"},
+    "Edge0-120B-q3k": {"repo": "Edge0/Edge0-120B-q3k", "latent_dim": 1280,
+                       "download_gb": 92.3, "ram_gb": 48,
+                       "about": "120B latent MoE (latent width 1280), Q3_K experts; ~86 GB on disk"},
+    # the NVFP4 releases (2026-11-15): the same pack but experts.bin (ggml type 40 with each expert's scales after its
+    # rows) and its manifest, no column scales; their other files are the Q3_K pack's of the same size (linked)
+    "Edge0-145B-NVFP4": {"repo": "Edge0/Edge0-145B-NVFP4", "latent_dim": 1792,
+                         "download_gb": 112.9, "ram_gb": 72,
+                         "about": "145B latent MoE (latent width 1792), NVFP4 experts; ~105 GB on disk"},
+    "Edge0-120B-NVFP4": {"repo": "Edge0/Edge0-120B-NVFP4", "latent_dim": 1280,
+                         "download_gb": 97.6, "ram_gb": 54,
+                         "about": "120B latent MoE (latent width 1280), NVFP4 experts; ~91 GB on disk"},
+}
+EDGE0_LICENSE = ("Edge0 Community Model License 1.0 (personal, research and non-commercial sharing; commercial use "
+                 "needs a separate Edge0 license) and Qwen Community License 1.0 (the Qwen3.8-Flash-Next base): "
+                 "https://huggingface.co/Edge0/Edge0-145B-q3k/blob/main/LICENSE")
+
 # 204800 (200K) sits between 128K and 256K: it is inside the trained 262144, so it needs no rope scaling and
 # costs ~2.8 GB of 8-bit KV with IQ3_S (vs ~3.6 GB at 256K) - a middle step for PCs that cannot hold 256K.
-CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
+CONTEXTS = [8192, 32768, 65536, 131072, 196608, 204800, 262144, 393216, 524288]
 # The model families: the same architecture, weights in the same three GSQ-RCO sizes, different files.
 HUIHUI = "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF"
 HUIHUI_URL = "https://huggingface.co/" + HUIHUI
+SC117 = "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"
+SC117_SWIFT = "SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"
 FAMILIES: dict[str, dict[str, Any]] = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "by": "Qwen; GSQ-RCO quants by ISTA-DASLab",
              "about": "the original model",
@@ -723,8 +1437,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
              "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
              "sha256": GYRO_FILES,
              "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro files are agentionai's "
-                        "quantization): "
-                        "https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"},
+                        "quantization): https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"},
     # agentionai's Gyro-Coder (GYRO_CODER_FILES): Gyro's format with half the experts, for code; never the default.
     # Images: the original's vision encoder, as the Gyro files take it (agentionai ships none for the Coder)
     "gyro-coder": {"title": "Qwen3.8-Flash-Next Gyro-Coder", "by": "agentionai's coding version, Gyro quantized",
@@ -739,6 +1452,19 @@ FAMILIES: dict[str, dict[str, Any]] = {
                    "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro-Coder files are agentionai's "
                               "pruning and quantization): "
                               "https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF"},
+    # Signal-2 (SIGNAL2_FILES): agentionai's fine-tune of Qwen3.8-Flash-Next, Gyro's TQK6 / TQK7 experts with PLE.
+    # The same pack and mmproj as Gyro; never the default.  The -noPLE file is not listed (as for the other Gyros).
+    "signal2": {"title": "Signal-2-Flash-Next (Gyro)", "by": "agentionai's Signal-2 fine-tune, Gyro quantized",
+                "about": "Signal-2's fine-tune at Gyro-S' size: TQK6/TQK7 experts (25.8 GB), a 59.5 GB download, "
+                         "36 GB of RAM or 38 GB of RAM and VRAM together; not a default",
+                "hf": hf("agentionai/Signal-2-Flash-Next-Gyro-GGUF"),
+                "file": "Signal-2-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1, "tag": "signal2-",
+                "name": "qwen3.8-flash-next-signal-2", "vision": True, "pack_args": ["--compat-bf16"],
+                "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+                "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "sha256": SIGNAL2_FILES,
+                "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; Signal-2 is agentionai's fine-tune "
+                           "and Gyro quantization): "
+                           "https://huggingface.co/agentionai/Signal-2-Flash-Next-Gyro-GGUF"},
     # huihui-ai's abliterated copies (HUIHUI_FILES): Swift 1.5's and Unsloth's files with the refusals removed, in
     # folders of one repository ("dirs": the folder of each size); after the regular families, never the default
     "huihui-swift": {"title": "Swift 1.5 (abliterated)", "by": "huihui-ai's uncensored version of Swift 1.5",
@@ -756,26 +1482,103 @@ FAMILIES: dict[str, dict[str, Any]] = {
                                 "it writes",
                        "hf": hf(HUIHUI) + "{d}/",
                        "dirs": {"UD-IQ4_XS": "unsloth-UD-IQ4_XS", "UD-Q4_K_XL": "unsloth-UD-Q4_K_XL", "Q8_0": "Q8_0"},
+                       # made from Unsloth's v3.0: its UD-IQ4_XS is three shards (v3.1's is four)
+                       "forms": {"UD-IQ4_XS": {"shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf"}},
                        "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf", "shards": 4, "tag": "huihui-unsloth-",
                        "mmproj_hf": hf(HUIHUI), "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
                        "name": "qwen3.8-flash-next-abliterated", "vision": False, "pack_args": ["--compat-bf16"],
                        "sha256": HUIHUI_FILES,
                        "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; huihui-ai's abliterated copy): "
                                   + HUIHUI_URL},
+    # SC117's abliterated copies of the original's four sizes (SC117_FILES); after the regular families, never the
+    # default.  Images: the original's vision encoder, which SC117's model card says to use
+    "sc117": {"title": "Qwen3.8-Flash-Next GSQ-RCO (abliterated)",
+              "by": "SC117's uncensored version of ISTA-DASLab's GSQ-RCO files",
+              "about": "the original's four sizes with OrcaRouter's refusal removal (abliteration) put in: far fewer "
+                       "refusals, and its safety filtering is reduced, so check what it writes",
+              "hf": hf(SC117) + "{q}/",
+              "file": "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-{q}-0000{i}-of-00002.gguf", "tag": "sc117-",
+              "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+              "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-gsq-rco-abliterated",
+              "sha256": SC117_FILES,
+              "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; SC117's abliterated copy): "
+                         "https://huggingface.co/" + SC117},
+    # SC117's abliterated copies of Swift 1.5's four sizes (SC117_SWIFT_FILES): IQ3_S at the repository's top, the
+    # others in folders ("dirs"); never the default.  Images: Swift 1.5's vision encoder, as the huihui-ai copy's
+    "sc117-swift": {"title": "Swift 1.5 GSQ-RCO (abliterated)",
+                    "by": "SC117's uncensored version of Swift 1.5",
+                    "about": "Swift 1.5's four sizes with OrcaRouter's refusal removal (abliteration) put in: far "
+                             "fewer refusals, and its safety filtering is reduced, so check what it writes",
+                    "hf": hf(SC117_SWIFT) + "{d}",
+                    "dirs": {"Q2_0": "Q2_0/", "IQ2_XS": "IQ2_XS/", "IQ3_XXS": "IQ3_XXS/", "IQ3_S": ""},
+                    "file": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-{q}-0000{i}-of-00002.gguf",
+                    "tag": "sc117-swift-",
+                    "mmproj_hf": hf("ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+                    "mmproj": "mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf", "name": "swift-1.5-gsq-rco-abliterated",
+                    "sha256": SC117_SWIFT_FILES,
+                    "license": "Swift Open License 1.0 (Swift 1.5's; SC117's abliterated copy): "
+                               "https://huggingface.co/" + SC117_SWIFT},
+    # AtomicChat's AD quantizations (ATOMICCHAT_FILES, the sizes AD-4.27bpw and AD-5.00bpw): after the regular
+    # families, never the default.  Images: the original's vision encoder (the same base model)
+    "atomicchat": {"title": "Qwen3.8-Flash-Next (AtomicChat)", "by": "AtomicChat's AD quantizations",
+                   "about": "AD-4.27bpw and AD-5.00bpw: experts stored like IQ3_S's (61 GB of RAM), the n-gram table "
+                            "at 5 or 8 bits; 94 and 110 GB downloads",
+                   "hf": hf("AtomicChat/Qwen3.8-Flash-Next-GGUF"), "file": "", "shards": 3, "tag": "atomicchat-",
+                   "name": "qwen3.8-flash-next-atomicchat", "vision": True, "pack_args": ["--compat-bf16"],
+                   "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+                   "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "sha256": ATOMICCHAT_FILES,
+                   "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the AD files are AtomicChat's "
+                              "quantization): https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF"},
 }
-# The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `strata --native` with another
-# architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), or its
-# "parts" (a model in several files: each one's path in the repository, size and SHA-256; "file" is the first, which
-# the engine is given), no pack and no PLE table.  "tested": the files this release was checked with (the rest use the
-# same tensor types, checked on those files and in the kernels' tests).  "mmproj": the picture reader's file (the
-# family reads images); "dense": a model without experts, every weight of which the engine keeps in VRAM, and
+FAMILIES["sync"] = {"title": "Qwen3.8-Flash-Next (Sync)", "by": "Sync packs by hiruhiru2005",
+                    "about": "Sync-XS, Sync-S and Sync-M pre-built packs",
+                    "hf": hf("hiru2005/Sync-XS"), "file": "", "tag": "sync-",
+                    "name": "qwen3.8-flash-next-sync", "vision": True,
+                    "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+                    "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+                    "license": "Qwen Community License 1.0: https://huggingface.co/hiru2005/Sync-XS"}
+# Edge0's latent MoE (the Qwen3.8-Flash-Next engine with the experts at a latent width): a pre-built pack, its own
+# install path (setup_edge0).  Listed for --family edge0; the models are the two sizes in Q3_K and NVFP4, each from
+# its own repository (EDGE0_MODELS' "repo").  No picture reader: the pack has none ("vision" False, no mmproj).
+FAMILIES["edge0"] = {"title": "Edge0 (latent MoE)", "by": "Edge0's latent-MoE distillations of Qwen3.8-Flash-Next",
+                     "about": "145B and 120B latent sparse MoE, Q3_K or NVFP4 experts; a pre-built pack, "
+                              "~86 to ~105 GB on disk",
+                     "hf": hf("Edge0/Edge0-145B-q3k"), "file": "", "tag": "edge0-",
+                     "name": "edge0", "models": EDGE0_MODELS, "license": EDGE0_LICENSE, "edge0": True,
+                     "vision": False, "mmproj_hf": None, "mmproj": None}
+# The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `xestrata-engine --native` with
+# another architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), or
+# its "parts" (a model in several files: each one's path in the repository, size and SHA-256; "file" is the first, which
+# the engine is given), no pack and no PLE table.  "tested": the files this release was run with (the others use the
+# same tensor types, checked on those files and in the kernels' tests; tools/strata_mcp.py offers them as
+# experimental).  "mmproj": the picture reader's file (the family reads images); "dense": a model without experts,
+# every weight of which the engine keeps in VRAM, and
 # "kv_bytes": its K/V cache's bytes a token (setup sizes the model and the context by the GPU's memory).
 _ORNITH = "ornith-ai/Ornith-1.5-35B-A3B-GGUF"
 _ORNITH_GSQ = "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF"
+_ORNITH_UNC = "dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF"
+_ORNITH_UNC_FILE = "Ornith-1.5-35B-A3B-CRACK-{}.gguf"
 _LLMJP = "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf"
 _QWEN36 = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
+_QWEN36_UNC = "SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF"
+_QWEN36_UNC_FILE = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-I-{}.gguf"
 _GLM53 = "unsloth/GLM-5.3-Flash-GGUF"
 _QWEN35 = "unsloth/Qwen3.5-9B-GGUF"
+_QWEN35_2B = "unsloth/Qwen3.5-2B-GGUF"
+_QWEN35_08B = "unsloth/Qwen3.5-0.8B-GGUF"
+# The 35B-A3B models' picture readers (qwen35moe, as Qwen3.5-9B's): each repository's mmproj.  Unsloth's Qwen3.6, Ornith
+# AI's and dealignai's (named f16, BF16 inside) hold the same tensors byte for byte, SC117's the same weights in F16
+# (2026-11-08).  pfeifferj's GSQ-RCO repository has none: Ornith AI's reads pictures for those files too (the same
+# model, the projection as wide as its embedding, 2048)
+_QWEN36_MMPROJ = {"repo": _QWEN36, "path": "mmproj-BF16.gguf", "size": 902822528,
+                  "sha256": "da63cb47a76763c712393f8a017070188a304fa39f8aeea6edc629ed7b975cfa"}
+_QWEN36_UNC_MMPROJ = {"repo": _QWEN36_UNC,
+                      "path": "mmproj-Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-F16.gguf",
+                      "size": 899283072, "sha256": "c8e702344a81f8c226a914aa980ed6e1f604bce9374f1fed8e65c896908af414"}
+_ORNITH_MMPROJ = {"repo": _ORNITH, "path": "mmproj-Ornith-1.5-35B-BF16.gguf", "size": 902822240,
+                  "sha256": "1921a36a85aee56cd2abd27f46701802c9d85a33474792e600df6c3b282a135d"}
+_ORNITH_UNC_MMPROJ = {"repo": _ORNITH_UNC, "path": "mmproj-Ornith-1.5-35B-A3B-f16.gguf", "size": 902822240,
+                      "sha256": "eef27583f74f2990b7a3d97119a0b67c05aeb48c92dde9466f050e30bf1a3595"}
 _QWEN35_HAU = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
 
 
@@ -801,11 +1604,89 @@ _GLM53_IQ4 = _glm53_parts("UD-IQ4_XS", [
     (49607025280, "7c2c63c9c30f8060428fdf2ac935dbf2ee9ad8f771d62b6ae47a7f7f2c1520e7"),
     (49486530144, "06c90f191871317c92dd9d25a353b687aed44c50f3ac6c713e9fe410bc2d26dd"),
     (7729791616, "66ebf9ec85e04d3f44af674ae4f694acbc89cc53db75e42f2f4d3646bf321c0d")])
+# Inkling-2-Mini (Thinking Machines, Apache-2.0) as upstream inkling2's .strata v1.1 files (strata-engine's SQ-20,
+# SQ-15 and SQ-10: the trunk, the experts in SF4 / MX8 / S_K with their VRAM load order, and the DSpark drafter in one
+# file), which the engine's Inkling-2-Mini path reads (src/inkling2).  Beside each: the tokenizer.json and chat
+# template of the same commit (tools/strata_tokenizer.py --tokenizer-json makes the server's tokenizer/ of them).  The
+# family "inkling-qsa" is the same files with tamanekokoro's QSA indexer (MIT) beside them, on (the user's decision of
+# 2026-11-23 13:15: the indexer is chosen as a model of its own, as SenseNova-Loop's QSA files are).
+# Sizes and SHA-256 are the Hub's LFS pointers at the revisions pinned in HF_REVISIONS (2026-11-23); SQ-15 and the
+# indexer were also checked after download.
+_INKLING = "strata-engine/Inkling-2-Mini-Strata"
+_INKLING_QSA = "tamanekokoro/Inkling-2-Mini-QSA-Indexer"
+INKLING_FILES = {
+    "Inkling-2-Mini-SQ-20.strata": (19346685952, "0bbfd52344f0dd4779a7807b5f73554a812f24c035e6877b63cd0d499f7e1b97"),
+    "Inkling-2-Mini-SQ-15.strata": (14348316672, "2ea32eed533afba257e2cbee7b073dc2c3da80fe55d1d2d794779b5498e30737"),
+    "Inkling-2-Mini-SQ-10.strata": (10471526400, "ac4d452ad03e4930abd9d46f9c5eec22b2f75a1da45a1e49bd24ccd58b065934"),
+}
+INKLING_SIDE = [   # the files beside every size: (repository, path, bytes, sha256)
+    (_INKLING, "tokenizer.json", 26178678, "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6"),
+    (_INKLING, "chat_template.jinja", 6868, "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc"),
+]
+INKLING_QSA_FILE = "inkling2-qsa-indexer-v3.bin"
+INKLING_QSA_SIDE = (_INKLING_QSA, INKLING_QSA_FILE, 23601344,
+                    "b1d68173617821a7ce4a110c3ce3a4335fdce331b8d217f1d17517302c2725f7")
+INKLING_SIZES = ("SQ-20", "SQ-15", "SQ-10")
+# The card (GiB) that holds every expert of a size at 32K: the engine's device memory at 32K (2026-11-24, Arc Pro B70
+# under XESTRATA_VRAM_LIMIT_MIB: SQ-20 19.49, SQ-15 14.84, SQ-10 11.23, UD-Q4_K_XL 17.98 GiB) and the ~3 GiB it leaves
+# free (core::vram_room).  Below it the rest of the experts run from host memory: decode fell from 26 to 28 tok/s (all
+# in VRAM) to 14 to 21 on a 16 GiB card and to 10 to 13 on a 12 GiB one, so setup offers a size only where it fits.
+INKLING_CARD_GB = {"SQ-20": 22.5, "SQ-15": 17.9, "SQ-10": 14.3, "UD-Q4_K_XL": 21.0}
+# Unsloth's UD-Q4_K_XL in the mainline layout (Mainline_Support's `.gguf_file`, installed under its `.gguf` name): the
+# engine reads it as it is (NVFP4 experts in layers 0..19, Q8_0 in 20..23 and in the dense weights; 2026-11-24, B70:
+# the same speed as SQ-15, about 4 GB more VRAM, no DSpark drafter in the file).  Chosen by hand, never by setup
+# ("by_hand"); the tokenizer and template are strata-engine's, the same 200,058 tokens.
+_INKLING_GGUF = "unsloth/Inkling-2-Mini-GGUF"
+INKLING_GGUF = {"UD-Q4_K_XL": (17629760736, "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3")}
+
+
+def inkling_models(qsa: bool) -> dict:
+    """Inkling-2-Mini's sizes: the .strata file, its tokenizer and template, and with `qsa` the indexer"""
+    side = INKLING_SIDE + [INKLING_QSA_SIDE] if qsa else INKLING_SIDE
+    out = {}
+    for m in INKLING_SIZES:
+        f = f"Inkling-2-Mini-{m}.strata"
+        out[m] = {"repo": _INKLING, "file": f, "size": INKLING_FILES[f][0], "sha256": INKLING_FILES[f][1],
+                  "parts": [{"path": f, "size": INKLING_FILES[f][0], "sha256": INKLING_FILES[f][1]},
+                            *({"repo": r, "path": p, "size": n, "sha256": h} for r, p, n, h in side)],
+                  "about": INKLING_ABOUT[m], "card_gb": INKLING_CARD_GB[m]}
+    for m, (n, h) in INKLING_GGUF.items():
+        f = f"Inkling-2-Mini-{m}.gguf"
+        out[m] = {"repo": _INKLING_GGUF, "file": f, "size": n, "sha256": h, "quantizer": "unsloth", "by_hand": True,
+                  "parts": [{"path": f"Mainline_Support/Inkling-2-Mini-{m}.gguf_file", "local": f, "size": n,
+                             "sha256": h},
+                            *({"repo": r, "path": p, "size": k, "sha256": x} for r, p, k, x in side)],
+                  "about": INKLING_ABOUT[m], "card_gb": INKLING_CARD_GB[m]}
+    return out
+
+
+INKLING_ABOUT = {"SQ-20": "NVFP4 and MXFP8 experts as published, the largest",
+                 "SQ-15": "4- and 5-bit experts, the middle", "SQ-10": "2- and 3-bit experts, the smallest",
+                 "UD-Q4_K_XL": "Unsloth's GGUF: NVFP4 and Q8_0 experts, no DSpark drafter"}
+
 PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
+    # Inkling-2-Mini: the text model, on the engine's .strata path (src/inkling2): 1..64 slots and DSpark drafts
+    "inkling": {"title": "Inkling-2-Mini", "by": "Thinking Machines (Apache-2.0), .strata files by strata-engine",
+                "about": "1.8B active of 128 experts, a 3-pass loop and hybrid attention; text only",
+                "tag": "inkling-", "name": "inkling-2-mini", "max_context": 32768, "plain": True,
+                "file_format": ".strata",
+                "kv_bytes": 8192, "vision": False, "mmproj": None,
+                "models": inkling_models(False),
+                "license": "Apache-2.0"},
+    # the same files with the QSA indexer on: the full-attention layers read the 4-token blocks it picks (the user's
+    # decisions of 2026-11-23 13:15 and 13:17: a model of its own, the one the first install offers)
+    "inkling-qsa": {"title": "Inkling-2-Mini (QSA)", "by": "Thinking Machines (Apache-2.0), .strata files by "
+                    "strata-engine; QSA indexer by tamanekokoro (MIT)",
+                    "about": "Inkling-2-Mini with a block-sparse QSA indexer: faster on long chats, though it may miss "
+                             "details far back (many exact facts at once are better without it); text only",
+                    "tag": "inkling-qsa-", "files_tag": "inkling-", "name": "inkling-2-mini-qsa",
+                    "max_context": 32768, "plain": True, "file_format": ".strata", "qsa": True, "kv_bytes": 8192,
+                    "vision": False, "mmproj": None, "models": inkling_models(True), "license": "Apache-2.0"},
     "ornith": {"title": "Ornith-1.5-35B-A3B", "by": "Ornith AI (MIT)",
-               "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community GSQ-RCO 3 and 3.5 bits",
-               "tag": "ornith-", "name": "ornith-1.5-35b-a3b", "max_context": 262144, "plain": True,
-               "profile": "expert-profile-ornith.bin",
+               "about": "35B, 3B active; a Qwen3.5 MoE that reads images: Q4_K_M to BF16, and community GSQ-RCO 3 "
+                        "and 3.5 bits",
+               "tag": "ornith-", "name": "ornith-1.5-35b-a3b", "max_context": 262144, "plain": True, "kv_bytes": 20480,
+               "profile": "expert-profile-ornith.bin", "mmproj": _ORNITH_MMPROJ,
                "models": {
                    "Q4_K_M": {"repo": _ORNITH, "file": "Ornith-1.5-35B-Q4_K_M.gguf", "size": 21713463040,
                               "sha256": "42739874cc2ccfdb8523b23fbe52e29b2a7555c8176737ca9ca0b5d59859d41f",
@@ -826,15 +1707,35 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                                     "size": 12992461216,
                                     "sha256": "9cae3b59a34308664b53e5b80fd74914cd0c1cf504bcd05609498b0f9126a74f",
                                     "about": "3-bit GSQ-RCO by pfeifferj (a community reproduction of the method, not "
-                                             "IST-DASLab's)", "tested": True},
+                                             "IST-DASLab's)", "tested": True, "quantizer": "gsq-rco-pfeifferj"},
                    "GSQ-RCO-3.5BIT": {"repo": _ORNITH_GSQ, "file": "Ornith-1.5-35B-A3B-GSQ-RCO-3.5bit.gguf",
                                       "size": 15163013536,
                                       "sha256": "69191d3d2c402f7c13950815bf20d826d7066c8d7f1bef4594cf70c13ea56ccc",
-                                      "about": "3.5-bit GSQ-RCO by pfeifferj (as above)"},
+                                      "about": "3.5-bit GSQ-RCO by pfeifferj (as above)",
+                                      "quantizer": "gsq-rco-pfeifferj"},
                }},
+    # Ornith-1.5 with its refusals removed (dealignai's CRACK, which changes the attention's weights; the MTP layer is
+    # kept and changed alike), the official files' versions with their tensor types: only the weights differ
+    "ornith-uncensored": {
+        "title": "Ornith-1.5-35B-A3B (uncensored)", "by": "dealignai (MIT), from Ornith AI's Ornith-1.5-35B-A3B",
+        "about": "Ornith-1.5 with its refusals removed (dealignai's CRACK): far fewer refusals, and its safety "
+                 "filtering is reduced, so check what it writes",
+        "tag": "ornith-uncensored-", "name": "ornith-1.5-35b-a3b-uncensored", "max_context": 262144, "plain": True,
+               "kv_bytes": 20480,
+        "profile": "expert-profile-ornith.bin", "mmproj": _ORNITH_UNC_MMPROJ,
+        "models": {
+            "Q4_K_M": {"repo": _ORNITH_UNC, "file": _ORNITH_UNC_FILE.format("Q4_K_M"), "size": 21713462848,
+                       "sha256": "f1e281f07c99aa9a731b47082c3d1bfc22e9477230330688a543e3d451319d76", "about": "4-bit"},
+            "Q5_K_M": {"repo": _ORNITH_UNC, "file": _ORNITH_UNC_FILE.format("Q5_K_M"), "size": 25347532352,
+                       "sha256": "ee3173b194460a19277d940bfd8fb6a5ca8da8c60294df291aa0b04f46ea9e9d", "about": "5-bit"},
+            "Q6_K": {"repo": _ORNITH_UNC, "file": _ORNITH_UNC_FILE.format("Q6_K"), "size": 29208731200,
+                     "sha256": "14bdc41c560941f5c0a4bd120cbd423ca010184819934ec1057b80d01b394124", "about": "6-bit"},
+            "Q8_0": {"repo": _ORNITH_UNC, "file": _ORNITH_UNC_FILE.format("Q8_0"), "size": 37802149152,
+                     "sha256": "f962dad770b0a388777ed3ab6791fb469bba5e2c6f2b903d6794c4659821451a", "about": "8-bit"},
+        }},
     "llmjp": {"title": "llm-jp-4.1-32b-a3b-thinking", "by": "LLM-jp (Apache-2.0)",
               "about": "32B, 3B active; Japanese and English, a thinking model", "tag": "llmjp-",
-              "name": "llm-jp-4.1-32b-a3b-thinking", "max_context": 262144, "plain": True,
+              "name": "llm-jp-4.1-32b-a3b-thinking", "max_context": 65536, "plain": True, "kv_bytes": 67584,
               "profile": "expert-profile-llmjp.bin",
               "models": {
                   "Q4_K_M": {"repo": _LLMJP, "file": "llm-jp-4.1-32b-a3b-thinking-Q4_K_M.gguf", "size": 21522488192,
@@ -848,10 +1749,11 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
     # CUDA engine path there, 0.1.44; here the same plain path as Ornith's).  Their tensors: Q4_K, Q5_K, Q6_K and Q8_0
     # experts, Q8_0 dense, F32, and the MTP block's two routers in BF16
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen (Apache-2.0), GGUFs with the MTP layer by Unsloth",
-               "about": "35B, 3B active; a Qwen3.5 MoE with the Qwen tokenizer: Unsloth's 4-, 6- and 8-bit files",
-               "tag": "qwen36-", "name": "qwen3.6-35b-a3b", "max_context": 262144, "plain": True,
-               "profile": "expert-profile-qwen36.bin",
+               "about": "35B, 3B active; a Qwen3.5 MoE that reads images: Unsloth's 4-, 6- and 8-bit files",
+               "tag": "qwen36-", "name": "qwen3.6-35b-a3b", "max_context": 262144, "plain": True, "kv_bytes": 23244,
+               "profile": "expert-profile-qwen36.bin", "mmproj": _QWEN36_MMPROJ,
                "draft_vocab": True,   # the vocabulary of Qwen3.8's draft head subsets (data/draft_vocab*.bin)
+               "dflash2": "qwen3.6-35b-a3b",   # its DFlash2 drafter (tools/dflash2_fetch.py's key)
                "models": {
                    "UD-Q4_K_XL": {"repo": _QWEN36, "file": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "size": 22853663008,
                                   "sha256": "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1",
@@ -864,6 +1766,32 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                             "about": "8-bit, the closest to the full model"},
                }},
 }
+# Qwen3.6-35B-A3B with its refusals removed (llmfan46's Heretic + MPOA, the MTP layer kept), quantized by SC117 with
+# APEX: the precision of each tensor by its role and layer.  Their experts: Q5_K and Q6_K (Balanced), IQ4_XS, Q5_K and
+# Q6_K (Quality), Q3_K and Q4_K (Compact), IQ2_S, Q3_K and Q8_0 (MINI); the dense weights Q3_K to Q8_0.  Not run here;
+# the kernels take every one of these types
+PLAIN_FAMILIES["qwen36-uncensored"] = {
+    "title": "Qwen3.6-35B-A3B (uncensored)", "by": "llmfan46 (Apache-2.0), APEX GGUFs by SC117, from Qwen's model",
+    "about": "Qwen3.6-35B-A3B with its refusals removed (Heretic + MPOA): far fewer refusals, and its safety "
+             "filtering is reduced, so check what it writes",
+    "tag": "qwen36-uncensored-", "name": "qwen3.6-35b-a3b-uncensored", "max_context": 262144, "plain": True,
+    "kv_bytes": 23244,
+    "profile": "expert-profile-qwen36.bin", "draft_vocab": True, "mmproj": _QWEN36_UNC_MMPROJ,
+    "models": {
+        "APEX-I-Quality": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("Quality"), "size": 23514746272,
+                           "sha256": "31a6a415d4de270cdd2128103a671202f4b92b6eb30c5f87934f3b06fc2a55cc",
+                           "about": "the best of the four by its authors' numbers (APEX's mixed 4 to 6 bits)",
+                           "rank": 4},
+        "APEX-I-Balanced": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("Balanced"), "size": 25962671520,
+                            "sha256": "782636c45124fd40bf55254f802aba3b6c14e53d36f7a60f724f332761e9aa89",
+                            "about": "5 and 6 bits, its authors' all-rounder", "rank": 3},
+        "APEX-I-Compact": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("Compact"), "size": 17016624544,
+                           "sha256": "ff82d1993140be550f21f17ec9e93697a060d71ce15d8f6089c911032b448058",
+                           "about": "3 and 4 bits, smaller and a little lower in quality", "rank": 2},
+        "APEX-I-MINI": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("MINI"), "size": 14273277376,
+                        "sha256": "e4eae0e289b36039faa26f955ca021025754e0c56130a16746749bb1491118d4",
+                        "about": "2 and 3 bits, the smallest, lower in quality", "rank": 1},
+    }}
 # Qwen3.5-9B (qwen35): dense, 32 blocks (a full attention every 4th, 4 K/V heads of 256: 8 x 2 x 4 x 256 x 2 bytes of
 # K/V a token), every weight in VRAM; Qwen's model as Unsloth's GGUFs, or HauhauCS's with its refusals removed.  Both
 # read pictures through Unsloth's mmproj: HauhauCS's has the same 334 tensors byte for byte (only its metadata
@@ -886,6 +1814,63 @@ PLAIN_FAMILIES["qwen35"] = {
                  "about": "8-bit, the closest to the full model"},
         "BF16": {"repo": _QWEN35, "file": "Qwen3.5-9B-BF16.gguf", "size": 17920697312,
                  "sha256": "daebe40eeea7057c1cdf35ac56d13f507d8bf12171bbb7a6b6b0d3f05439159a",
+                 "about": "the unquantized weights"},
+    }}
+# Qwen3.5-2B and Qwen3.5-0.8B (qwen35, as the 9B): dense, 24 blocks, a full attention every 4th (the GGUFs'
+# full_attention_interval) with 2 K/V heads of 256: 6 layers x (K and V) x 2 heads x 256 x 2 bytes = 12288 bytes of
+# FP16 K/V a token (kv_bytes; the CPU keeps it in FP32, twice that: cpu_ram_gb), up to the GGUFs' context_length of
+# 262144.  Every weight in VRAM, or on the CPU alone (--device cpu, "cpu") on a PC without a GPU.  "default": the size
+# setup recommends where it fits.  Each reads pictures through its own mmproj (Unsloth's, at the same revision), on a
+# GPU only: the CPU's forward reads text
+PLAIN_FAMILIES["sensenova-loop-qsa"] = {
+    "title": "SenseNova-Loop-9B (QSA)", "by": "SenseNova (Apache-2.0); QSA indexers trained separately",
+    "about": "9B dense, 32 layers executed 56 times with two-stream mHC; block-sparse QSA attention, text and "
+             "images, 512K context; the official GGUFs with trained QSA indexers",
+    "tag": "sensenova-qsa-", "name": "sensenova-loop-9b-qsa", "max_context": 524288, "plain": True, "dense": True,
+    "kv_bytes": 57344, "mmproj": _SENSENOVA_QSA_MMPROJ,
+    "license": "Apache License 2.0: https://huggingface.co/sensenova/SenseNova-Loop-9B",
+    "models": sensenova_qsa_models(),
+}
+PLAIN_FAMILIES["qwen35-2b"] = {
+    "title": "Qwen3.5-2B", "by": "Qwen (Apache-2.0), GGUFs by Unsloth",
+    "about": "2B, dense, reads images: for a small GPU or a PC without one; its answers fall short of the 9B's",
+    "tag": "qwen35-2b-", "name": "qwen3.5-2b", "max_context": 262144, "plain": True, "dense": True, "kv_bytes": 12288,
+    "cpu": True, "default": "UD-Q5_K_XL",
+    "mmproj": {"repo": _QWEN35_2B, "path": "mmproj-BF16.gguf", "size": 671372992,
+               "sha256": "f17196c0d8fc756bc65be60075bd4a359917eee8a438505639511727c585d3c2"},
+    "models": {
+        "Q4_K_M": {"repo": _QWEN35_2B, "file": "Qwen3.5-2B-Q4_K_M.gguf", "size": 1280835840,
+                   "sha256": "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223", "about": "4-bit"},
+        "UD-Q5_K_XL": {"repo": _QWEN35_2B, "file": "Qwen3.5-2B-UD-Q5_K_XL.gguf", "size": 1466687744,
+                       "sha256": "67bff9774bc55e44af2eee3c448dc054478b45c0607858fc6df5b336b55f36f4",
+                       "about": "5-bit (Unsloth Dynamic)", "tested": True},
+        "Q6_K": {"repo": _QWEN35_2B, "file": "Qwen3.5-2B-Q6_K.gguf", "size": 1574961408,
+                 "sha256": "fc90339420b4298887aafb307a4291c55440b730133bbffe6ba9630503dcb548", "about": "6-bit"},
+        "Q8_0": {"repo": _QWEN35_2B, "file": "Qwen3.5-2B-Q8_0.gguf", "size": 2012012800,
+                 "sha256": "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1",
+                 "about": "8-bit, the closest to the full model"},
+        "BF16": {"repo": _QWEN35_2B, "file": "Qwen3.5-2B-BF16.gguf", "size": 3775709216,
+                 "sha256": "dc11be2ca4519954a3e4b013ef59497b5522209987d67891851113eda89619f1",
+                 "about": "the unquantized weights"},
+    }}
+PLAIN_FAMILIES["qwen35-0.8b"] = {
+    "title": "Qwen3.5-0.8B", "by": "Qwen (Apache-2.0), GGUFs by Unsloth",
+    "about": "0.8B, dense, reads images: the smallest, for a small GPU or a PC without one; its answers fall short of "
+             "the 2B's and the 9B's",
+    "tag": "qwen35-0.8b-", "name": "qwen3.5-0.8b", "max_context": 262144, "plain": True, "dense": True,
+    "kv_bytes": 12288, "cpu": True, "default": "Q8_0",
+    "mmproj": {"repo": _QWEN35_08B, "path": "mmproj-BF16.gguf", "size": 207346528,
+               "sha256": "d312c4d02fd46eea7a16e4f3bbb58840e6222209322ca1e33ca03247ad8935d6"},
+    "models": {
+        "Q4_K_M": {"repo": _QWEN35_08B, "file": "Qwen3.5-0.8B-Q4_K_M.gguf", "size": 532517120,
+                   "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517", "about": "4-bit"},
+        "Q6_K": {"repo": _QWEN35_08B, "file": "Qwen3.5-0.8B-Q6_K.gguf", "size": 639029504,
+                 "sha256": "8408c5c222111cec253682b49eece2a02ed641ded68490001ec4ee160e71098e", "about": "6-bit"},
+        "Q8_0": {"repo": _QWEN35_08B, "file": "Qwen3.5-0.8B-Q8_0.gguf", "size": 811843840,
+                 "sha256": "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c",
+                 "about": "8-bit, the closest to the full model", "tested": True},
+        "BF16": {"repo": _QWEN35_08B, "file": "Qwen3.5-0.8B-BF16.gguf", "size": 1516744736,
+                 "sha256": "cedf89af31c9041b601fa58303285bc46d99c51baee1b13f5e919626ca526ee5",
                  "about": "the unquantized weights"},
     }}
 PLAIN_FAMILIES["qwen35-uncensored"] = {
@@ -913,6 +1898,7 @@ PLAIN_FAMILIES["glm53"] = {
     "about": "320B, 18B active; a large MoE for the PCs whose RAM and VRAM hold 95 GB or more",
     "tag": "glm53-", "name": "glm-5.3-flash", "max_context": 262144, "plain": True,
     "profile": "expert-profile-glm53.bin",
+    "dflash2": "glm-5.3-flash",   # its DFlash2 drafter (tools/dflash2_fetch.py's key)
     "models": {
         "UD-IQ3_XXS": {"repo": _GLM53, "file": _GLM53_IQ3[0]["path"], "parts": _GLM53_IQ3,
                        "size": sum(x["size"] for x in _GLM53_IQ3), "about": "3-bit (Unsloth Dynamic)", "tested": True},
@@ -940,6 +1926,80 @@ FAMILIES[INKLING2MINI] = {
                    "about": inkling2mini_family.BUILD_ABOUT[b], "tested": b == "SQ-10"}
                for b in inkling2mini_fit.ORDER[::-1]}}
 
+# How setup's questions and the launcher's window list the families: the model, its version (the original, or whose
+# changed copy) and its quantization (whose files), then the size (the user's decision of 2026-11-09: the families of
+# one level mixed models, copies and quantizers).  A family is one (model, version, quantization), its --family ID
+# kept; Ornith-1.5's sizes are of two quantizations (a size's own "quantizer").  BASES in the order setup lists them:
+# Qwen3.8-Flash-Next, the model of FIRST_CHOICE's first families, first.
+BASES = {"qwen3.8-flash-next": "Qwen3.8-Flash-Next",
+         "ornith-1.5": "Ornith-1.5-35B-A3B",
+         "qwen3.6": "Qwen3.6-35B-A3B", "qwen3.5-9b": "Qwen3.5-9B", "qwen3.5-2b": "Qwen3.5-2B",
+         "llm-jp-4.1": "llm-jp-4.1-32b-a3b-thinking", "glm-5.3-flash": "GLM-5.3-Flash", "qwen3.5-0.8b": "Qwen3.5-0.8B",
+         "inkling2-mini": "Inkling-2-Mini",
+         "sensenova-loop-9b": "SenseNova-Loop-9B"}
+VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)",
+            "coder": "Coder (half the experts, kept for code)", "sc117": "abliterated by SC117",
+            "swift-sc117": "Swift 1.5, abliterated by SC117", "huihui-ai": "abliterated by huihui-ai",
+            "swift-huihui-ai": "Swift 1.5, abliterated by huihui-ai", "dealignai": "uncensored by dealignai",
+            "llmfan46": "uncensored by llmfan46", "hauhaucs": "uncensored by HauhauCS",
+            "signal-2": "Signal-2, agentionai's fine-tune"}
+QUANTIZERS = {"gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth",
+              "gyro": "Gyro by agentionai", "sync": "Sync by hiruhiru2005",
+              "ad": "AD by AtomicChat", "ornith-ai": "GGUFs by Ornith AI", "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
+              "dealignai": "GGUFs by dealignai", "llm-jp": "GGUFs by LLM-jp", "apex": "APEX by SC117",
+              "hauhaucs": "GGUFs by HauhauCS", "inkling-sq": "SQ files by strata-engine",
+              "inkling-qsa": "SQ files by strata-engine, with a QSA indexer",
+              "inkling2mini": "SQ files by strata-engine, on an engine of its own",
+              "qsa": "SenseNova QSA indexers",
+              "own": "your own files"}
+TIERS = {  # family: (model, version, quantization), in the order each level lists them
+    "qwen": ("qwen3.8-flash-next", "original", "gsq-rco"),
+    "unsloth": ("qwen3.8-flash-next", "original", "unsloth"),
+    "gyro": ("qwen3.8-flash-next", "original", "gyro"),
+    "sync": ("qwen3.8-flash-next", "original", "sync"),
+    "atomicchat": ("qwen3.8-flash-next", "original", "ad"),
+    "swift": ("qwen3.8-flash-next", "swift", "gsq-rco"),
+    "coder": ("qwen3.8-flash-next", "coder", "gsq-rco"),
+    "gyro-coder": ("qwen3.8-flash-next", "coder", "gyro"),
+    "signal2": ("qwen3.8-flash-next", "signal-2", "gyro"),
+    "sc117": ("qwen3.8-flash-next", "sc117", "gsq-rco"),
+    "sc117-swift": ("qwen3.8-flash-next", "swift-sc117", "gsq-rco"),
+    "huihui-unsloth": ("qwen3.8-flash-next", "huihui-ai", "unsloth"),
+    "huihui-swift": ("qwen3.8-flash-next", "swift-huihui-ai", "gsq-rco"),
+    "ornith": ("ornith-1.5", "original", "ornith-ai"),
+    "ornith-uncensored": ("ornith-1.5", "dealignai", "dealignai"),
+    "qwen36": ("qwen3.6", "original", "unsloth"),
+    "qwen36-uncensored": ("qwen3.6", "llmfan46", "apex"),
+    "qwen35": ("qwen3.5-9b", "original", "unsloth"),
+    "qwen35-uncensored": ("qwen3.5-9b", "hauhaucs", "hauhaucs"),
+    "qwen35-2b": ("qwen3.5-2b", "original", "unsloth"),
+    "llmjp": ("llm-jp-4.1", "original", "llm-jp"),
+    "glm53": ("glm-5.3-flash", "original", "unsloth"),
+    "qwen35-0.8b": ("qwen3.5-0.8b", "original", "unsloth"),
+    "inkling": ("inkling2-mini", "original", "inkling-sq"),
+    "inkling-qsa": ("inkling2-mini", "original", "inkling-qsa"),
+    INKLING2MINI: ("inkling2-mini", "original", "inkling2mini"),   # xestrata-inkling-2-mini (src/inkling2mini)
+    "sensenova-loop-qsa": ("sensenova-loop-9b", "original", "qsa"),
+}
+# a model's line in setup's first question where its original family's "about" does not say what the model is
+BASE_ABOUT = {"qwen3.8-flash-next": "Qwen's model, the one XeStrata is made for"}
+# Signal-2's RAM at its peak (GiB, the engine's resident set): 58.6 to 64.4 in the runs of 2026-11-22 (Arc Pro B70,
+# its n-gram table in RAM: --ple-io ram, 1K and 4K prompts, 512 tokens of decode), the largest kept
+SIGNAL2_PEAK_RAM_GB = 64.4
+# the families a first install is offered, in this order (the user's decision of 2026-11-22): the first this PC runs
+# (first_choice).  Each: (family, the sizes it is offered in, best first, or None: the one recommend_size takes;
+# the RAM it takes at its peak, which the RAM must hold with LOW_RAM_HEADROOM_GB beside it, or None; whether most of
+# the size's experts must be in the GPUs' cache, gpu_holds_most).  Swift 1.5's SC117 copy, IQ3_S where it runs with
+# most of its experts on the GPUs, else IQ3_XXS so (VRAM about 31.2 and 27.5 GB: a 32 GB card); else Signal-2 where
+# the RAM holds its peak (74.4 GiB: a 64 GB PC, 62.7 as ram_gb reads it, does not; a 96 GB one does); else Sync (XS,
+# S or M); else SenseNova-Loop-9B (QSA); else Qwen3.5-2B (LAST_CHOICE), offered when nothing else runs.  A family that
+# is not in FAMILIES is passed over.
+FIRST_CHOICE = (("sc117-swift", ("IQ3_S", "IQ3_XXS"), None, True), ("signal2", None, SIGNAL2_PEAK_RAM_GB, False),
+                ("sync", None, None, False), ("inkling-qsa", None, None, False),
+                ("sensenova-loop-qsa", None, None, False),
+                ("qwen35-2b", None, None, False))
+LAST_CHOICE = "qwen35-2b"
+
 
 def plain_parts(d: dict) -> list[dict[str, Any]]:
     """A PLAIN_FAMILIES model's files: its "parts", or its one file"""
@@ -956,13 +2016,18 @@ REPO_PINS: dict[str, dict[str, tuple[int, str]]] = {
     UNSLOTH_REPO: {**UNSLOTH_V31_SHARDS, **UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
     "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": GYRO_CODER_FILES,
+    "agentionai/Signal-2-Flash-Next-Gyro-GGUF": SIGNAL2_FILES,
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": HUIHUI_FILES,
+    SC117: SC117_FILES,
+    SC117_SWIFT: SC117_SWIFT_FILES,
+    "AtomicChat/Qwen3.8-Flash-Next-GGUF": ATOMICCHAT_FILES,
 }
 for _fam in PLAIN_FAMILIES.values():            # the plain families' files carry their pins in their own entries
     for _m in _fam.get("models", {}).values():
         if "repo" in _m and ("parts" in _m or all(k in _m for k in ("file", "size", "sha256"))):
             for _x in plain_parts(_m):          # a model in several files: each part's pin
-                REPO_PINS.setdefault(_m["repo"], {})[_x["path"].rsplit("/", 1)[-1]] = (_x["size"], _x["sha256"])
+                REPO_PINS.setdefault(_x.get("repo", _m["repo"]), {})[_x["path"].rsplit("/", 1)[-1]] = (
+                    _x["size"], _x["sha256"])
     if _fam.get("mmproj"):
         _m = _fam["mmproj"]
         REPO_PINS.setdefault(_m["repo"], {})[_m["path"].rsplit("/", 1)[-1]] = (_m["size"], _m["sha256"])
@@ -970,12 +2035,80 @@ for _fam in PLAIN_FAMILIES.values():            # the plain families' files carr
 # (bytes, sha256); file_pin looks here first
 REV_PINS: dict[tuple[str, str], dict[str, tuple[int, str]]] = {
     (UNSLOTH_REPO, UNSLOTH_V31_REVISION): {**UNSLOTH_V31_SHARDS, **UNSLOTH_Q4_V31_SHARDS}}
+
+
+# the translation models' GGUFs (serve/translate.py's MODELS), at HF_REVISIONS' commits: file -> (bytes, sha256)
+TRANSLATE_FILES = {
+    "plamo-3-translate-2b-Q4_K_M.gguf":
+        (1807203040, "1ffd9073afcc70e35ccc942428aa2b73d7aa2b9ea779bf504b775369e0276c13"),
+    "plamo-3-translate-0.8b-Q4_K_M.gguf":
+        (573126848, "70891ec70dc7ab4205745a38307867c2881b99239f20327927633abfe4bc9ec6"),
+    "plamo-3-translate-8b-Q4_K_M.gguf":
+        (5280445728, "94e5d3f91b421f7c8900ddaac27b11a19f7441426c954bbb25a2fd60a1640187"),
+}
+for _t in translate_mod.MODELS.values():
+    REPO_PINS.setdefault(_t.repo, {})[_t.file] = TRANSLATE_FILES[_t.file]
+
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
+# A picture reader the person may already have instead of the pinned one: Unsloth's mmproj-F16.gguf for Flash-Next
+# (the same vision tower in F16; the engine runs its F16 mode - nothing changes on the engine side).  Accepted only
+# when it is already there, with this size and this SHA-256 (Unsloth rev 38bb39ee97821de2c9009abb7e93950eec396e66),
+# and only when the pinned file is found nowhere: pinned name -> (file name, bytes, sha256).  Never downloaded.
+ALT_READERS = {MMPROJ: ("mmproj-F16.gguf", 904004000,
+                        "1f7b7f0b984cf065c604360c29c8098362ed61b290db0ff12c6f360bb1a8a980")}
+_ALT_MARK = re.compile(r"alt-reader sha256 ([0-9a-f]{64})")
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
 # under the Qwen Community License, so in third_party/nonfree (XeStrata runs without that folder)
 ESP_VECTOR = (ROOT / "third_party" / "nonfree" / "experimental-speed-projection" /
               "Qwen3.8-Flash-Next-experimental-speed-projection.gguf")
 ESP_SIZE, ESP_SHA256 = 483520, "ef0724c5b79297e481017be85769832bc26eb220c984ecba2b0e1b0c8426312b"
+# the families it applies to: the Coder and Unsloth's files are the same model's residual stream (Unsloth's: the
+# user's decision of 2026-10-22)
+SPEED_PROJECTION_FAMILIES = ("qwen", "coder", "unsloth")
+
+
+def hf_repo(url: str) -> str | None:
+    """The repository of a Hugging Face URL hf() made (its folder, with or without a file), or None."""
+    m = re.match(r"https?://[^/]+/([^/]+/[^/]+)/resolve/", url or "")
+    return m.group(1) if m else None
+
+
+def family_repos(family: str, model: str | None = None) -> list[tuple[str, str]]:
+    """The repositories a family's model (`model`: its size; None: every size) and its picture reader are downloaded
+    from, as (role, repository): "model" and "mmproj".  About > Model terms reads their MODEL_TERMS."""
+    fam = FAMILIES.get(family) or {}
+    out: list[tuple[str, str]] = []
+    if family == "sync":
+        repos = SYNC_REPOS.values() if model is None else (SYNC_REPOS[model],)
+        return [("model", r) for r in repos] + [
+            ("model", "hiru2005/Sync-shared"), ("mmproj", "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")]
+    if fam.get("plain"):
+        for m, d in fam.get("models", {}).items():
+            if model is None or m == model:
+                out.append(("model", d["repo"]))
+        if fam.get("mmproj"):
+            out.append(("mmproj", fam["mmproj"]["repo"]))
+    else:
+        if (r := hf_repo(fam.get("hf", "").replace("{q}/", "").replace("{d}", ""))):
+            out.append(("model", r))
+        if fam.get("mmproj_hf") and (r := hf_repo(fam["mmproj_hf"])):
+            out.append(("mmproj", r))
+    return list(dict.fromkeys(out))
+
+
+def family_license(family: str) -> str | None:
+    """The license setup names for a family: its own "license" line, else its model's MODEL_TERMS (name and page)."""
+    fam = FAMILIES.get(family) or {}
+    if fam.get("license"):
+        return fam["license"]
+    repo = next((r for role, r in family_repos(family) if role == "model"), None)
+    t = MODEL_TERMS.get(repo or "")
+    return f"{t['license']}: https://huggingface.co/{repo}" if t else None
+
+
+# the versions with the refusals removed in their weights, which setup points to when the projection is chosen; the
+# projection itself is never applied to them (not in SPEED_PROJECTION_FAMILIES)
+ABLITERATED_FAMILIES = ("sc117", "sc117-swift", "huihui-swift", "huihui-unsloth")
 
 
 def esp_release_url(name: str) -> str:
@@ -1003,12 +2136,22 @@ def esp_download(data: Path) -> Path | None:
 # sizes its expert slots around it and the default reserve (700 MiB) is enough; engines before 0.1.2 need more
 VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
-EXE = "strata.exe" if WIN else "strata"
-IMAGE_EXE = "strata-image.exe" if WIN else "strata-image"   # the image engine (serve/images.py), built with it
-# the image encoder, one binary per place it runs: the configs of different models may use different ones
-# the image encoders: on the CPU, and on the GPU through Vulkan
-VEXE = {k: v + (".exe" if WIN else "") for k, v in
-        {"cpu": "strata-vision-cpu", "vulkan": "strata-vision-vulkan"}.items()}
+EXE = "xestrata-engine.exe" if WIN else "xestrata-engine"
+IMAGE_EXE = "xestrata-image.exe" if WIN else "xestrata-image"   # the image engine (serve/images.py), built with it
+# the picture reader: the engine's own vision encoder (strata-vision, built with the engine), on the GPU with "gpu"
+# true in its config and on the CPU without
+VISION_EXE = "xestrata-vision.exe" if WIN else "xestrata-vision"
+# a config written before the programs took XeStrata's names names upstream's: point_engine_parts writes the new ones
+# (repoint_engine, on every start)
+UPSTREAM_EXES = ("strata", "strata-image")   # upstream's names
+RENAMED = {old + ext: ("xestrata-engine" if old == UPSTREAM_EXES[0] else "xe" + old) + ext
+           for old in UPSTREAM_EXES for ext in (("", ".exe") if WIN else ("",))}
+# the readers one binary per place it ran (llama.cpp's mtmd on the CPU and on Vulkan, upstream's names and XeStrata's,
+# and the GPU's of a source build before the CPU's joined it): a config that names one gets the one reader
+RENAMED.update({old + ext: VISION_EXE
+                for old in ("strata-vision-cpu", "strata-vision-vulkan",   # upstream's and the earlier names
+                            "xestrata-vision-cpu", "xestrata-vision-vulkan", "xestrata-vision-gpu")
+                for ext in (("", ".exe") if WIN else ("",))})
 
 
 # ------------------------------------------------------------------------------------------------ output
@@ -1120,10 +2263,12 @@ def ask(question, choices, default, yes, free=False):
 
 
 def run(cmd, cwd=None, env=None, check=True, quiet=False):
-    say("  > " + " ".join(str(c) for c in cmd))
+    gguf_py = (env or {}).get("XESTRATA_GGUF_PY")
+    if gguf_py and not Path(gguf_py).is_dir() and Path(gguf_py).parent == ROOT / "third_party" / "main" / "llama.cpp":
+        get_llama_cpp()                                # the preparation tools read GGUF files with it: fetched now
     env = dict(os.environ if env is None else env)
-    # tools/mtp_fetch.py ends when setup ends (#3257: a cancel left it writing)
-    env.setdefault("STRATA_EXIT_WITH_PARENT", "1")
+    envvars.put_default(env, "EXIT_WITH_PARENT", "1")   # mtp_fetch.py ends with setup (upstream #3257)
+    say("  > " + " ".join(str(c) for c in cmd))
     if JSON_OUT and not quiet:                         # the program's lines as log objects, not loose on stdout
         with subprocess.Popen([str(c) for c in cmd], cwd=cwd, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True, errors="replace") as p:
@@ -1148,7 +2293,7 @@ def fetch_mtp(mtp: Path, env: dict, tries: int = 3):
     stops one run, not the install (#3214 #3193): it is run again, and each run continues
     where the last one stopped.  The progress lines it prints are what the app shows."""
     cmd = [sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)]
-    env = {**env, "STRATA_SOURCE": model_source()}
+    env = {**env, "XESTRATA_SOURCE": model_source()}
     for n in range(1, tries + 1):
         r = run(cmd, env=env, check=False)
         rc = 0 if r is None else r.returncode              # (a test double answers None)
@@ -1159,9 +2304,8 @@ def fetch_mtp(mtp: Path, env: dict, tries: int = 3):
                  f"({n + 1} of {tries})")
             time.sleep(5)
     fail(f"the draft layer's download keeps stopping (exit {rc}): the connection to Hugging Face is slow or drops",
-         "run setup again - what is downloaded is kept. If it still stops, set STRATA_SOURCE=modelscope (setup "
-         "--source modelscope) "
-         "to read the same files from ModelScope")
+         "run setup again - what is downloaded is kept. If it still stops, set XESTRATA_SOURCE=modelscope "
+         "(setup --source modelscope) to read the same files from ModelScope")
 
 
 def out(cmd):
@@ -1172,15 +2316,15 @@ def out(cmd):
 
 
 def _kept_mark(path: Path) -> Path | None:
-    """Where the finish mark of a file in a folder Strata cannot write to is kept instead: marks/<hash>.done under
-    Strata's own folder.  The hash is of the file's full path, size and modification time, so a file that changed (or a
-    different file at the same place) has no mark."""
+    """Where the finish mark of a file in a folder XeStrata cannot write to is kept instead: marks/<hash>.done under
+    the user's state folder.  The hash is of the file's full path, size and modification time, so a file that changed
+    (or a different file at the same place) has no mark."""
     try:
         st = path.stat()
         key = f"{path.resolve()}|{st.st_size}|{st.st_mtime_ns}"
     except OSError:
         return None
-    return ROOT / "marks" / (hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:24] + ".done")
+    return STATE / "marks" / (hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:24] + ".done")
 
 
 def mark_text(path: Path) -> str | None:
@@ -1195,18 +2339,19 @@ def mark_text(path: Path) -> str | None:
 
 
 def done(path: Path) -> bool:
-    """A step's finish mark: <path>.done exists (written only after the step completed)."""
+    """A step's finish mark: <path>.done beside it, or the kept one when its folder cannot be written (written only
+    after the step completed)."""
     return mark_text(path) is not None
 
 
 def mark(path: Path, text=""):
     """Write the finish mark.  A folder that cannot be written (--gguf-dir on a read-only share, upstream #570, a
-    read-only model disk) keeps the mark in Strata's own folder instead (marks/), so a 110 GB Engram is hashed once,
-    not on every launch; only when that cannot be written either does setup say so and go on (the step is repeated on
-    the next run), it does not stop."""
+    read-only model disk) keeps the mark in XeStrata's own folder instead (state/marks), so a 110 GB model file is
+    hashed once, not on every launch; only when that cannot be written either does setup say so and go on (the step is
+    repeated on the next run), it does not stop."""
     text = text or time.strftime("%Y-%m-%d %H:%M")
     try:
-        path.with_name(path.name + ".done").write_text(text, encoding="utf-8")
+        download_core.write_done(path, text)
         return
     except OSError as e:
         beside = e
@@ -1248,8 +2393,10 @@ def _memory_status():
 
 
 def ram_gb():
+    """The RAM this machine has, in GB, or a container's own memory limit when that is less (upstream 81ac7c8ef);
+    on Windows serve/hardware.py's reader, the server's too."""
     if WIN:
-        return _memory_status().ullTotalPhys / 2**30
+        return hardware.ram_gb()
     total = 0.0
     try:
         with open("/proc/meminfo") as stream:
@@ -1338,18 +2485,31 @@ def _cgroup_memory_limit(self_cgroup="/proc/self/cgroup", root="/sys/fs/cgroup")
     return min(limits) if limits else None
 
 
+def ram_reserve_args(a) -> list:
+    """The engines' --ram-reserve-mib for setup's --ram-reserve-gib (none without it); the server gives the image
+    engine the same (XESTRATA_RAM_RESERVE_MIB)."""
+    return ["--ram-reserve-mib", str(int(a.ram_reserve_gib * 1024))] if a.ram_reserve_gib else []
+
+
+def usable_ram_gb(a=None) -> float:
+    """The RAM setup plans with: all of it (ram_gb), less --ram-reserve-gib, the RAM left free for other programs
+    (`a`'s, else the command line's: tools/image/install.py passes the model's own)."""
+    reserve = getattr(a if a is not None else ARGS, "ram_reserve_gib", None) or 0.0
+    return ram_gb() - reserve
+
+
 def cpu_info():
     """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
     the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
     name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
-    if WIN:                                            # no /proc/cpuinfo: the engine's own tests (strata-device --cpu)
+    if WIN:                                          # no /proc/cpuinfo: the engine's own tests (xestrata-device --cpu)
         try:
             c = json.loads(engine_tool("--cpu"))
             return c.get("name") or name, bool(c.get("avx2")), bool(c.get("avx512"))
         except (OSError, ValueError, subprocess.SubprocessError):
             return name, False, False
     try:
-        txt = open("/proc/cpuinfo").read()
+        txt = hardware.proc_text("cpuinfo")
         flags = set(re.search(r"^flags\s*:\s*(.*)$", txt, re.M).group(1).split())
         avx2 = "avx2" in flags
         avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512_vnni", "avx512vbmi"} <= flags
@@ -1381,17 +2541,8 @@ def drm_memory(render: str, driver: str):
     try:
         vram = vis = 0
         if driver == "xe":
-            # struct drm_xe_device_query; DRM_XE_DEVICE_QUERY_MEM_REGIONS = 1; regions of 88 bytes after 8
-            q = bytearray(struct.pack("QIIQQQ", 0, 1, 0, 0, 0, 0))
-            req = _drm_iowr(0x40, len(q))
-            fcntl.ioctl(fd, req, q)
-            buf = ctypes.create_string_buffer(struct.unpack_from("I", q, 12)[0])
-            struct.pack_into("Q", q, 16, ctypes.addressof(buf))
-            fcntl.ioctl(fd, req, q)
-            for i in range(struct.unpack_from("I", buf, 0)[0]):
-                cls, _, _, total, _, cpu_vis, _ = struct.unpack_from("HHIQQQQ", buf, 8 + 88 * i)
-                if cls == 1:                                # DRM_XE_MEM_REGION_CLASS_VRAM
-                    vram, vis = vram + total, vis + cpu_vis
+            for total, _, cpu_vis in hardware.xe_regions(fd):
+                vram, vis = vram + total, vis + cpu_vis
         elif driver == "i915":
             # struct drm_i915_query with one DRM_I915_QUERY_MEMORY_REGIONS (4) item; regions of 88 bytes after 16
             item = ctypes.create_string_buffer(struct.pack("QiIQ", 4, 0, 0, 0))
@@ -1446,8 +2597,11 @@ def drm_graphics_ip(render: str) -> int | None:
 
 
 def pci_name(vendor: int, device: int) -> str:
-    """The card's name from the PCI ID database (hwdata), or its IDs."""
+    """The card's product name from udev's PCI database, its name in the PCI ID list, or its IDs."""
     maker = {0x8086: "Intel", 0x1002: "AMD"}.get(vendor, f"0x{vendor:04x}")
+    product = hardware.pci_product_name(vendor, device)
+    if product:
+        return f"{maker} {product}"
     for f in ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"):
         try:
             text = Path(f).read_text(encoding="utf-8", errors="replace")
@@ -1509,8 +2663,8 @@ def nvidia_smi() -> dict:
         return {}
     try:
         r = subprocess.run([exe, "--query-gpu=pci.bus_id,name,memory.total,compute_cap",
-                            "--format=csv,noheader,nounits"], capture_output=True, text=True, errors="replace",
-                           timeout=60)
+                           "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                           errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return {}
     found = {}
@@ -1567,6 +2721,12 @@ def kfd_nodes() -> dict:
 # three, their KFD SIMD count (two per CU) names them.
 UMA_OS_LEFT_GB = 6             # the unified memory kept for the OS (the engine keeps the same out of its figure)
 STRIX_HALO_GFX = "gfx1151"
+# AMD's integrated GPUs, by GFX version: the one place a gfx name may choose (AGENTS.md allows it for the APU judgement
+# and the memory estimate).  The KFD topology gives the GPU node the CPU's cores on some kernels (cpu_cores_count), but
+# ROCm 10.1 with a 6.14 kernel splits a CPU node and a GPU node apart (Strix Halo: cpu_cores_count 0 on the GPU node),
+# so the gfx version says it there: gfx1103 (Phoenix, Hawk Point), gfx1150 (Strix Point), gfx1151 (Strix Halo) and
+# gfx1152 / gfx1153 (Krackan).  A discrete card reports none of them.
+APU_GFX = {"gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153"}
 STRIX_HALO_BY_SIMDS = {80: "8060S", 64: "8050S", 32: "8040S"}
 STRIX_HALO_MODEL = "UD-IQ4_XS"  # upstream's Strix Halo guide measures it; its experts stay in memory from ~80 GB
 STRIX_HALO_MIN_GB = 80
@@ -1594,47 +2754,67 @@ def unused_apu_notes(found, used, ram) -> list:
     return out
 
 
+def unused_card_notes(found, used) -> list:
+    """upstream 7aa9a584a: a card that can run alone but is not in this run is said, not asked - one line per card,
+    with the way to use it.  Nothing about the cards used changes; a chosen card (--gpu, --gpus) asks nothing."""
+    first = next((g for g in found if g["index"] in used), None)
+    if first is None or len(used) != 1:
+        return []                                       # a layer split names its cards already
+    return [f"  GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB) is not used: this model runs on GPU "
+            f"{first['index']} alone, and --gpus {first['index']},{g['index']} splits its layers across the two cards"
+            for g in found
+            if g["index"] not in used and not g.get("integrated") and gpu_problem(g) is None]
+
+
 def strix_halo_notes(gpu, ram) -> list:
     """What setup tells a Strix Halo owner (a leading "!" = a warning): nothing is changed or refused."""
-    notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): the CPU and the GPU share one memory ({ram:.0f} GB seen by the "
-             f"OS + a {gpu.get('carve_gb', 0.0):.1f} GB BIOS carve-out); the model's experts live in it."]
+    notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): one memory in all ({ram:.0f} GB seen by the OS + a "
+             f"{gpu.get('carve_gb', 0.0):.1f} GB BIOS carve-out the OS does not see). The engine's device allocations "
+             "come from the carve-out; the model's experts live in the RAM beside it."]
     if gpu.get("shared_gb", 0.0) < 0.75 * ram - 1:
-        notes.append(f"!the GPU reaches {gpu.get('shared_gb', 0.0):.0f} GB of shared memory (the GTT pool; the "
-                     "kernel's default is about half of the RAM). The kernel options ttm.pages_limit and "
-                     "ttm.page_pool_size give it more (docs/DETAILS.md, AMD APUs); setup changes no host setting")
+        notes.append(f"!the GPU reaches {gpu.get('shared_gb', 0.0):.0f} GB of the RAM through the GTT pool (the "
+                     "kernel's default is about half of the RAM; the GTT pool is the RAM itself). The kernel options "
+                     "ttm.pages_limit and ttm.page_pool_size give it more (docs/DETAILS.md, AMD APUs); setup changes "
+                     "no host setting")
     if gpu.get("carve_gb", 0.0) > 16:
         notes.append(f"!the BIOS carve-out is {gpu['carve_gb']:.0f} GB: that memory is taken from the OS, while the "
-                     "GPU reaches the shared memory anyway. A small carve-out (512 MB - 2 GB) leaves the RAM to the "
-                     "model")
+                     "GPU reaches the RAM through the GTT anyway. A small carve-out (512 MB - 2 GB) leaves the RAM "
+                     "to the model")
     if ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB:
         notes.append(f"  Recommended model: {STRIX_HALO_MODEL} (Unsloth); the menus list the others.")
     return notes
 
 
-def rocm_roots() -> list:
+def rocm_roots(opt: Path = Path("/opt")) -> list:
     """AMD's ROCm tree the build takes, as one ([] without one), so that two installed versions are not mixed: /opt/rocm
     where it holds lib/ or include/ (ROCm 7.2's alternatives link to /opt/rocm-<version>, or ROCm 7.14's links into
     /opt/rocm/core-7.14 that its amdrocm-core packages make), else /opt/rocm/core (their alternatives link), else the
     newest /opt/rocm/core-<version> (ROCm 7.14's packages without amdrocm-core: nothing of /opt/rocm's own), else the
-    newest /opt/rocm-<version>.  The newest by the version's numbers: core-10.1 after core-7.14."""
+    newest /opt/rocm-<version>.  The newest by the version's numbers: core-10.1 after core-7.14.  `opt` is a seam for
+    the tests (a tree that stands for /opt)."""
     def newest(paths):
         return sorted(paths, key=lambda p: [int(n) for n in re.findall(r"\d+", p.name)], reverse=True)
-    opt = Path("/opt/rocm")
-    for root in [opt, opt / "core", *newest(opt.glob("core-*")), *newest(Path("/opt").glob("rocm-*"))]:
+    for root in [opt / "rocm", opt / "rocm" / "core", *newest((opt / "rocm").glob("core-*")),
+                 *newest(opt.glob("rocm-*"))]:
         if (root / "lib").is_dir() or (root / "include").is_dir():
             return [root.resolve() if root.is_symlink() else root]
     return []
+
+
+def ldconfig_print() -> str:
+    """`ldconfig -p`'s output, the loader's cache, "" when it cannot be run (a seam for the tests: the cache a fresh
+    machine reports is substituted with it)."""
+    try:
+        return subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace").stdout
+    except OSError:
+        return ""
 
 
 def rocm_lib_dirs() -> list:
     """The folders of AMD's ROCm libraries the engine needs on its library path: none where the loader finds
     libamdhip64 (a distribution's, or a ROCm that installs an ld.so.conf); ROCm 7.14's packages install none, and the
     SYCL runtime's HIP adapter then did not load (no GPU listed) until its lib/ was on LD_LIBRARY_PATH."""
-    try:
-        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace").stdout
-    except OSError:
-        cached = ""
-    if "libamdhip64.so" in cached:
+    if "libamdhip64.so" in ldconfig_print():
         return []
     return [str(r / "lib") for r in rocm_roots() if any((r / "lib").glob("libamdhip64.so*"))][:1]
 
@@ -1649,6 +2829,87 @@ def rocblas_archs() -> set | None:
     return {m.group(0) for d in dirs for f in d.iterdir() if (m := re.search(r"gfx[0-9a-f]+", f.name))}
 
 
+#: the ROCm libraries the engine's files link, by their ELF names' starts: the HIP runtime, rocBLAS, hipBLASLt
+AMD_ROCM_LIBS = ("libamdhip64", "librocblas", "libhipblaslt")
+
+
+def elf_needed(path) -> list:
+    """The DT_NEEDED library names of an ELF file, parsed here (no binutils run): the names a ROCm tree must have are
+    the ones the engine links, which its build decides (a distribution's rocBLAS can be a .so.4 another's is not).
+    [] when the file is no 64-bit little-endian ELF or cannot be read."""
+    try:
+        with Path(path).open("rb") as f:
+            head = f.read(64)
+            if head[:6] != b"\x7fELF\x02\x01":
+                return []
+            phoff, = struct.unpack_from("<Q", head, 0x20)
+            phentsize, phnum = struct.unpack_from("<HH", head, 0x36)
+            loads, dyn = [], None
+            f.seek(phoff)
+            for _ in range(phnum):
+                ph = f.read(phentsize)
+                p_type, = struct.unpack_from("<I", ph, 0)
+                p_offset, p_vaddr, p_filesz = (struct.unpack_from("<Q", ph, o)[0] for o in (8, 16, 32))
+                if p_type == 1:                     # PT_LOAD: the vaddr the string table's address names
+                    loads.append((p_vaddr, p_filesz, p_offset))
+                elif p_type == 2:                   # PT_DYNAMIC
+                    dyn = (p_offset, p_filesz)
+            if dyn is None:
+                return []
+            f.seek(dyn[0])
+            entries = [struct.unpack_from("<QQ", f.read(16)) for _ in range(dyn[1] // 16)]
+            strtab = next((v for t, v in entries if t == 5), None)   # DT_STRTAB: a vaddr
+            if strtab is None:
+                return []
+            off = next((o + (strtab - v) for v, fs, o in loads if v <= strtab < v + fs), None)
+            if off is None:
+                return []
+            f.seek(off)
+            blob = f.read()                                   # the string table, to the file's end
+            names = []
+            for t, v in entries:
+                if t == 1 and v < len(blob):                  # DT_NEEDED: an offset into the table
+                    end = blob.find(b"\0", v)
+                    if end > 0:
+                        names.append(blob[v:end].decode("ascii", "replace"))
+            return names
+    except (OSError, struct.error):
+        return []
+
+
+def engine_files(eng: Path) -> list:
+    """The engine's executables and the libraries bundled beside it (the engine folder's lib/), whose linked names
+    say what the GPU makers' runtimes must provide."""
+    out = [p for p in (eng / EXE, eng / IMAGE_EXE, eng / VISION_EXE) if p.is_file()]
+    out += sorted(p for p in (eng / "lib").glob("*.so*") if p.is_file()) if (eng / "lib").is_dir() else []
+    return out
+
+
+def amd_needed(eng: Path) -> list:
+    """The ROCm libraries' names the engine links (its files' DT_NEEDED: libamdhip64.so.7, librocblas.so.5,
+    libhipblaslt.so.1 on every build today - the engine's build decides them, not this code), [] when it links
+    none."""
+    return sorted({n for f in engine_files(eng) for n in elf_needed(f) if n.startswith(AMD_ROCM_LIBS)})
+
+
+def amd_rocm_usable(needed: list, gfx: set | list, roots=None) -> Path | None:
+    """The first of AMD's ROCm trees (rocm_roots(), the newest first) that can run this engine on the GPUs of `gfx`:
+    every library of `needed` in its lib/ under its own name (the loader's rule: another soname, a distribution's
+    .so.4 against AMD's .so.5, does not satisfy it), and rocBLAS's and hipBLASLt's code for every arch in `gfx`
+    (their kernel files' names).  None without one: the distribution's ROCm is asked for then, as before.  `roots` is
+    a seam for the tests."""
+    gfx = set(gfx)
+    for root in (rocm_roots() if roots is None else roots):
+        lib = root / "lib"
+        if not needed or not all((lib / n).exists() for n in needed):
+            continue
+        have = [{m.group(0) for f in d.iterdir() if (m := re.search(r"gfx[0-9a-f]+", f.name))}
+                for d in (lib / "rocblas/library", lib / "hipblaslt/library") if d.is_dir()]
+        if gfx and len(have) == 2 and all(gfx <= h for h in have):
+            return root
+    return None
+
+
 def distro_id() -> str:
     """The distribution's ID in /etc/os-release ("ubuntu", "fedora"), empty when it cannot be read."""
     try:
@@ -1656,6 +2917,16 @@ def distro_id() -> str:
     except OSError:
         return ""
     return m.group(1) if m else ""
+
+
+def distro_version() -> str | None:
+    """The distribution's version in /etc/os-release ("45", "26.04"), None when it cannot be read: NVIDIA's CUDA
+    toolkit on Fedora is chosen by it."""
+    try:
+        m = re.search(r"^VERSION_ID=\"?([^\"\n]*)", Path("/etc/os-release").read_text(), re.M)
+    except OSError:
+        return None
+    return m.group(1) or None if m else None
 
 
 def distro_family() -> str:
@@ -1674,17 +2945,19 @@ def distro_family() -> str:
 
 
 def amd_elsewhere() -> str:
-    """Where an AMD GPU that this distribution's rocBLAS lacks runs: Fedora 44's rocBLAS has code for more of them
-    (README.md, "AMD GPUs")."""
+    """Where an AMD GPU that this distribution's rocBLAS lacks runs: Fedora's rocBLAS (44's as 45's) has code for
+    more of them (README.md, "AMD GPUs")."""
     return ("see README.md (AMD GPUs)" if distro_id() == "fedora" else
-            "Fedora 44's has code for more AMD GPUs (README.md, AMD GPUs)")
+            "Fedora 44's or 45's has code for more AMD GPUs (README.md, AMD GPUs)")
 
 
 # The distribution packages that building and running XeStrata from the source needs (docs/BUILD.md, "Packages"), by
-# distribution and part: "base" for the free and contrib modes (intel/llvm's build tools, the image encoders' and the
-# optional conversation compression's), and each GPU maker's (Intel's oneMKL in the contrib mode only, NVIDIA's in the
-# contrib mode only).  On Arch the
-# Vulkan ICD is the GPU maker's own package, not one mesa-vulkan-drivers carries for both.
+# distribution and part: "base" for the free and contrib modes (intel/llvm's build tools, the CPU picture reader's and
+# the optional conversation compression's), and each GPU maker's (Intel's oneMKL in the contrib mode only, NVIDIA's in
+# the contrib mode only).  opencl-headers: intel/llvm's
+# SYCL tools (sycl-ls, part of what its build installs) include CL/cl.h, and they get no include for the OpenCL headers
+# the configuration fetches (those are the runtime's own objects'); no distribution's compiler brings the header in (a
+# fresh Fedora lacks it as Arch does).
 # oneMKL's series the contrib mode takes, and only it (Intel's repositories carry several side by side): one whose SYCL
 # library runs on the SYCL runtime XeStrata builds with, which tools/intel_llvm_build.py's TAG fixes (2026.2's needs
 # functions intel/llvm v7.1.1's libsycl.so.9 lacked, sycl::detail::defaultAsyncHandler among them: v7.2.0).  Raised
@@ -1693,8 +2966,8 @@ def amd_elsewhere() -> str:
 ONEMKL_SERIES = "2026.2"
 PACKAGES = {
     "ubuntu": {
-        "base": "python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc "
-                "spirv-headers mesa-vulkan-drivers libblosc2-dev",
+        "base": "python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev "
+                "opencl-headers libblosc2-dev",
         "intel": "libze1 libze-intel-gpu1 libigc2 libigdfcl2",
         "intel-contrib": f"intel-oneapi-mkl-sycl-devel-{ONEMKL_SERIES}",
         "amd": "libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev "
@@ -1703,41 +2976,42 @@ PACKAGES = {
     },
     "fedora": {
         "base": "python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static "
-                "vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel",
+                "opencl-headers blosc2-devel",
         "intel": "oneapi-level-zero oneapi-level-zero-devel intel-level-zero",
         "intel-contrib": f"intel-oneapi-mkl-sycl-devel-{ONEMKL_SERIES}",
         "amd": "rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel "
                "hipblas-common-devel",
-        "nvidia": "cuda-toolkit-13-4",
+        # NVIDIA's CUDA toolkit, by the Fedora version (FEDORA_CUDA below): the newest known, a version not listed
+        "nvidia": "cuda-toolkit-13-5",
     },
     "arch": {
         # Arch and its derivatives (ID_LIKE=arch).  Intel's oneAPI repository has no Arch packages: there is no oneMKL
         # (Intel's offline installer is the way to it), so an Intel GPU's dense products stay in XeStrata's own
         # kernels.  zstd's package has no libzstd.a, so
         # intel/llvm's build links the shared one (tools/intel_llvm_build.py).
-        # opencl-headers: intel/llvm's SYCL tools (sycl-ls, part of what its build installs) include CL/cl.h, and they
-        # get no include for the OpenCL headers the configuration fetches (those are the runtime's own objects'); Arch's
-        # clang does not bring the header in, Ubuntu's and Fedora's builds have it
-        "base": "python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc "
-                "spirv-headers opencl-headers blosc2",
-        "intel": "level-zero-loader intel-compute-runtime vulkan-intel",
+        "base": "python base-devel git cmake ninja lld hwloc zstd opencl-headers blosc2",
+        "intel": "level-zero-loader intel-compute-runtime",
         "intel-contrib": "",
         # ROCm's clang (rocm-llvm) carries clang's runtime builtins too, which HIP's CMake package asks for where
         # PACKAGES' other lists name a package of their own for them (Debian's libclang-rt-21-dev)
-        "amd": "hip-runtime-amd rocm-device-libs rocm-llvm rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon",
+        "amd": "hip-runtime-amd rocm-device-libs rocm-llvm rocm-llvm rocblas hipblaslt hipblas-common",
         "nvidia": "cuda",
     },
 }
 
 # The packages of the tools setup does not install itself, for its messages, by distro_family()
 TOOL_PACKAGES = {
-    "ubuntu": {"g++": "build-essential", "glslc": "glslc", "vulkan": "libvulkan-dev", "spirv": "spirv-headers",
-               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema"},
-    "fedora": {"g++": "gcc-c++", "glslc": "glslc", "vulkan": "vulkan-loader-devel", "spirv": "spirv-headers-devel",
-               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema"},
-    "arch": {"g++": "base-devel", "glslc": "shaderc", "vulkan": "vulkan-headers", "spirv": "spirv-headers",
-             "pdf": "poppler", "jsonschema": "python-jsonschema"},
+    "ubuntu": {"g++": "build-essential", "pdf": "poppler-utils", "jsonschema": "python3-jsonschema",
+               "ffmpeg": "ffmpeg"},
+    "fedora": {"g++": "gcc-c++", "pdf": "poppler-utils", "jsonschema": "python3-jsonschema", "ffmpeg": "ffmpeg-free"},
+    "arch": {"g++": "base-devel", "pdf": "poppler", "jsonschema": "python-jsonschema", "ffmpeg": "ffmpeg"},
 }
+
+# NVIDIA's CUDA toolkit on Fedora, by the Fedora version (its repository, setup's NVIDIA_REPO and
+# tools/package/container.sh): Fedora 44 has 13.4 and 45 has 13.5, as the release's packages do
+# (tools/package/build.sh).  NVIDIA's repository is fedora44's so far, which Fedora 45 uses as well; its name says the
+# CUDA version, and a Fedora version not listed takes the newest known
+FEDORA_CUDA = {"44": "cuda-toolkit-13-4", "45": "cuda-toolkit-13-5"}
 
 # The command that installs distribution packages on this PC, by distro_family()
 INSTALLERS = {"ubuntu": "sudo apt install ", "fedora": "sudo dnf install ", "arch": "sudo pacman -S --needed "}
@@ -1753,9 +3027,10 @@ def tool_pkg(kind: str) -> str:
     return TOOL_PACKAGES[distro_family()][kind]
 
 
-def packages_for(distro: str, makers: set, mode: str) -> tuple:
+def packages_for(distro: str, makers: set, mode: str, ver: str | None = None) -> tuple:
     """The packages (PACKAGES) for a distribution ("ubuntu", "fedora", "arch"), the GPU makers ("intel", "amd",
-    "nvidia") and the build mode, and the notes that go with them (the repositories, what a mode cannot build)."""
+    "nvidia") and the build mode (`ver`: its version, NVIDIA's CUDA toolkit on Fedora by it), and the notes that go
+    with them (the repositories, what a mode cannot build)."""
     p = PACKAGES[distro]
     names = p["base"].split()
     notes = []
@@ -1768,9 +3043,9 @@ def packages_for(distro: str, makers: set, mode: str) -> tuple:
         names += p["amd"].split()
     if "nvidia" in makers:
         if mode == "contrib":
-            names += p["nvidia"].split()
+            names += [FEDORA_CUDA[ver]] if distro == "fedora" and ver in FEDORA_CUDA else p["nvidia"].split()
             notes.append("NVIDIA GPUs: NVIDIA's driver as well" +
-                         (" (cuda-toolkit-13-4 is in NVIDIA's CUDA repository)" if distro == "fedora" else ""))
+                         (f" ({names[-1]} is in NVIDIA's CUDA repository)" if distro == "fedora" else ""))
         else:
             notes.append("NVIDIA GPUs: the contrib mode only (--license contrib)")
     if any(n.startswith("intel-oneapi-") for n in names):
@@ -1788,20 +3063,24 @@ def print_packages(spec: str, mode: str) -> int:
         for line in lines:
             say(line)
         return 0
+    ver = None
     if spec:
         distro, _, makers_s = spec.partition("/")
         makers = {m.strip() for m in makers_s.split(",") if m.strip()}
+        m = re.search(r"\d+", distro)
+        ver = m.group(0) if m else None
         distro = next((f for f in PACKAGES if distro.startswith(f)), distro)
     else:
         distro, makers = distro_family(), {g["vendor"] for g in gpus()}
+        ver = distro_version()
     if distro not in PACKAGES:
         fail(f"--packages: no list for {distro or 'this distribution'}",
-             "the lists are for Ubuntu 26.04, Fedora 44 and Arch: e.g. --packages ubuntu26.04/intel,amd")
+             "the lists are for Ubuntu 26.04, Fedora 44 or 45 and Arch: e.g. --packages ubuntu26.04/intel,amd")
     if not makers or not makers <= {"intel", "amd", "nvidia"}:
         fail("--packages: the GPU makers are intel, amd and nvidia" + ("" if spec else " (no GPU of theirs found)"),
-             "e.g. --packages fedora44/intel,amd")
-    names, notes = packages_for(distro, makers, mode)
-    say(f"Packages for {distro}, {', '.join(sorted(makers))} GPUs, the {mode} build:")
+             "e.g. --packages fedora45/intel,amd")
+    names, notes = packages_for(distro, makers, mode, ver)
+    say(f"Packages for {distro}{f' {ver}' if ver else ''}, {', '.join(sorted(makers))} GPUs, the {mode} build:")
     say("  " + INSTALLERS[distro] + " ".join(names))
     for n in notes:
         say(f"  - {n}")
@@ -1835,6 +3114,14 @@ INTEL_REPO = {
                "    'gpgkey=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB' \\\n"
                "    | sudo tee /etc/yum.repos.d/oneAPI.repo > /dev/null"),
 }
+# (Ubuntu's and Arch's own repositories carry the CUDA toolkit: multiverse, extra.  NVIDIA's repository is
+# fedora44's, which Fedora 45 uses as well - it has none of its own yet, 2026-11-18: change the URL when NVIDIA
+# publishes one, developer.download.nvidia.com/compute/cuda/repos/)
+NVIDIA_REPO = {
+    "fedora": "sudo dnf config-manager addrepo \\\n"
+              "    --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/"
+              "cuda-fedora44.repo",
+}
 
 
 def pkg_installed(name: str) -> bool:
@@ -1863,13 +3150,40 @@ def repo_added(url: str) -> bool:
     return False
 
 
-def runtime_missing(makers: set) -> tuple:
+def amd_libs_loadable() -> bool:
+    """Whether the loader finds the HIP runtime, rocBLAS and hipBLASLt the engine links, whoever installed them: AMD's
+    own packages (the Podman image's ROCm, container/install.sh) are not the distribution's that BUILD.json's runtime
+    names."""
+    return all(f"{lib}.so" in ldconfig_print() for lib in ("libamdhip64", "librocblas", "libhipblaslt"))
+
+
+def amd_rocm_line(rocm: Path | None) -> str:
+    """The one line setup says about which ROCm runs the engine: AMD's tree (with its path, which names the version),
+    else the distribution's (the loader's)."""
+    if rocm is not None:
+        return f"AMD: ROCm at {rocm} (ahead of the distribution's on the engine's library path)"
+    return "AMD: the distribution's ROCm (the loader's)"
+
+
+def amd_runtime_ok(gfx: set | list) -> bool:
+    """Whether the AMD GPUs of `gfx` have their runtime: the loader's (amd_libs_loadable) or a complete AMD ROCm
+    (amd_rocm_usable: the engine's linked names and the GPUs' archs), which the engine's library path is then pointed
+    at, ahead of the distribution's (prepare_engine).  AMD's packages install no ld.so.conf, so the loader sees nothing
+    of them and the distribution's was asked for; the user's own ROCm runs the engine when it can."""
+    if amd_libs_loadable():
+        return True
+    return amd_rocm_usable(amd_needed(packaged_engine_dir()), set(gfx)) is not None
+
+
+def runtime_missing(makers: set, gfx: set | None = None) -> tuple:
     """For the package's engine: the GPU makers' packages (BUILD.json's runtime) that the GPUs of `makers` need and
-    are not installed, those that would make them faster (OpenCL, which oneDNN's attention runs on; oneMKL, cuBLAS:
-    contrib; pip's are linux_nvidia_libs'), and the commands that add the repositories those come from.  Empty for an
-    engine without the record."""
+    are not installed (`gfx`: their AMD archs, this PC's without a name), those that would make them faster (OpenCL,
+    which oneDNN's attention runs on; oneMKL, cuBLAS: contrib; pip's are linux_nvidia_libs'), and the commands that
+    add the repositories those come from.  Empty for an engine without the record."""
     rt = packaged_engine().get("runtime") or {}
-    need = [n for m in ("intel", "amd") if m in makers for n in rt.get(m, []) if not pkg_installed(n)]
+    amd = "amd" in makers and not amd_runtime_ok(gfx if gfx is not None else amd_archs())
+    need = [n for m in ("intel", "amd") if m in makers and not (m == "amd" and amd)
+            for n in rt.get(m, []) if not pkg_installed(n)]
     fast = [n for m, k in (("intel", "onednn"), ("intel", "onemkl"), ("nvidia", "cublas")) if m in makers
             for n in rt.get(k, []) if not pkg_installed(n)]
     d = distro_family()
@@ -1883,6 +3197,20 @@ def runtime_missing(makers: set) -> tuple:
 def runtime_commands(need: list, fast: list, repos: list) -> list:
     """The lines that install them: the repositories first, then the packages in one command."""
     return [f"  {r}" for r in repos] + ([f"  {install_cmd(need + fast)}"] if need or fast else [])
+
+
+def install_hint(packages: list) -> str:
+    """A message's commands that install these packages (PACKAGES' names), after adding the repositories of Intel's
+    (oneMKL) and NVIDIA's (the CUDA toolkit, on Fedora) that they come from and that are not added yet."""
+    d = distro_family()
+    repos = []
+    if any(n.startswith("intel-oneapi-") for n in packages) and d in INTEL_REPO and \
+            not repo_added("repos.intel.com/oneapi"):
+        repos.append(INTEL_REPO[d])
+    if any(n.startswith("cuda-") for n in packages) and d in NVIDIA_REPO and \
+            not repo_added("developer.download.nvidia.com/compute/cuda/repos"):
+        repos.append(NVIDIA_REPO[d])
+    return "\n".join(runtime_commands([], packages, repos))
 
 
 def igc_version() -> str | None:
@@ -1939,6 +3267,16 @@ def igc_affected(version: str | None) -> bool:
     return major == 2 and 25 <= minor < 32
 
 
+def svm_broken_kernel(release: str | None) -> bool:
+    """Whether a Linux kernel's release (uname's) frees, on a page the xe driver's SVM moved back to RAM, the zdd
+    through a pointer that still carries the moved flag: Ubuntu's 7.0.0 from ABI 40 on, until the build with the fix
+    (checked against the source of Ubuntu's 7.0.0-14 to -44, 2026-11-18; -38 and earlier have no flag at all).  The
+    engine's svm_broken_kernel in src/core/device.cpp is this rule (AGENTS.md, "Ubuntu's 7.0.0 kernel and the xe
+    driver's SVM")."""
+    m = re.match(r"7\.0\.0-(\d+)", release or "")
+    return m is not None and int(m.group(1)) >= 40
+
+
 def ubuntu_lts() -> str | None:
     """Ubuntu 24.04 or 26.04 ("26.04"), the two LTS releases the graphics PPA serves; None elsewhere."""
     if distro_id() != "ubuntu":
@@ -1989,10 +3327,10 @@ def say_driver_update(lts: str) -> None:
 def check_igc(makers: set) -> None:
     """Says, without stopping, when an Intel GPU of Xe2 or later (the xe driver's graphics IP 20 or later, as the
     engine asks it: xe_gpu_from_xe2 in src/core/device.cpp) runs with a compiler the engine works around
-    (igc_affected), and sends the user to Fedora 44, whose IGC is a fixed one, or to the Podman container (Fedora
-    44 inside).  Ubuntu 24.04/26.04 is sent to the graphics PPA too - with the HWE kernel straight to it, from the
-    GA kernel to the HWE kernel first (the PPA installs the driver with the IGC, and that driver is the one for the
-    HWE kernel)."""
+    (igc_affected), and sends the user to Fedora 44 or 45, whose IGC is a fixed one (45's is 2.41), or to the
+    Podman container (Fedora 45 inside).  Ubuntu 24.04/26.04 is sent to the graphics PPA too - with the HWE kernel
+    straight to it, from the GA kernel to the HWE kernel first (the PPA installs the driver with the IGC, and that
+    driver is the one for the HWE kernel)."""
     if WIN or "intel" not in makers:
         return
     v = igc_version()
@@ -2001,8 +3339,8 @@ def check_igc(makers: set) -> None:
     if not any(g["vendor"] == "intel" and (g.get("ip") or 0) >= 20 for g in gpus()):
         return
     warn(f"Intel's compiler (IGC {v}) has a bug XeStrata works around at the engine's start: the decode of short "
-         "prompts is up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install "
-         "with Podman (Fedora 44 inside: README, Install)")
+         "prompts is up to 10% slower. For full speed, use Fedora 44 or 45 (their IGC is 2.32 or later), or "
+         "install with Podman (Fedora 45 inside: README, Install)")
     lts = ubuntu_lts()
     if lts:
         if hwe_kernel(lts):
@@ -2012,13 +3350,103 @@ def check_igc(makers: set) -> None:
         say_driver_update(lts)
 
 
+def check_xe_kernel(makers: set) -> None:
+    """Says, without stopping, when an Intel GPU runs on the xe driver of a kernel without the fix of CVE-2026-68264
+    (serve/kernel_check.py): the driver can crash on a retried GPU memory bind, which the engine cannot avoid."""
+    if WIN or "intel" not in makers:
+        return
+    rel = kernel_check.unfixed_release()
+    if rel is not None:
+        warn(kernel_check.text(rel))
+
+
+def check_svm_kernel(makers: set) -> None:
+    """Says, without stopping, when an Intel GPU runs on the xe driver of a kernel whose drm/pagemap frees a page
+    its SVM moved back to RAM with the moved flag still set (svm_broken_kernel: Ubuntu's 7.0.0 ABI 40 and later):
+    a moved page can oops the kernel or leak memory silently.  The engine works around nothing; it says so too (the
+    start log and INFO svm_workaround).  This is the same two conditions."""
+    if WIN or "intel" not in makers:
+        return
+    rel = platform.release()
+    if kernel_check.xe_gpu() and svm_broken_kernel(rel):
+        warn(f"Linux {rel} has the xe driver's drm/pagemap bug (Ubuntu's 7.0.0 from ABI 40 on): a page its SVM "
+             "moves can oops the kernel or leak memory silently on xe GPUs. XeStrata works around nothing here; "
+             "use Fedora 44 or 45, or a kernel without the error (Ubuntu's 7.0.0-38 or earlier, or the build with "
+             "the fix). A container (Podman, incus) runs on the host's kernel, so change the host's")
+
+
+IOMMU_PT = {   # the kernel option iommu=pt, set the way each distribution's boot loader takes it
+    "ubuntu": ["echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"$GRUB_CMDLINE_LINUX_DEFAULT iommu=pt\"' | "
+               "sudo tee /etc/default/grub.d/90-iommu-pt.cfg", "sudo update-grub"],
+    "fedora": ["sudo grubby --update-kernel=ALL --args=iommu=pt"],
+    "arch": ["add iommu=pt to the kernel's command line in the boot loader's configuration"],
+}
+
+
+def check_iommu(pcis: list) -> None:
+    """Says, without stopping, when the IOMMU translates a chosen GPU's memory accesses (its IOMMU group's type DMA
+    or DMA-FQ in sysfs).  Each start pins and maps tens of GB of host memory for the GPU, and with translation on
+    the kernel allocates an I/O address for every page: on the B70 (xe, Linux 7.0) the fill of the expert slots at
+    the start fell from 23 GB/s to 139-459 MB/s when the engine started again soon after it stopped (setup's warm-up
+    start and then the real one), with the kernel's iova_depot_work_func hogging a CPU; booted with iommu=pt
+    (identity for the host's own devices) six such starts filled at 23-25 GB/s (2026-11-02)."""
+    if WIN:
+        return
+    found = []
+    for pci in pcis:
+        try:
+            kind = Path(f"/sys/bus/pci/devices/{pci}/iommu_group/type").read_text().strip()
+        except OSError:                                # no IOMMU, or no such file on this kernel
+            continue
+        if kind in ("DMA", "DMA-FQ"):
+            found.append(f"{pci} ({kind})")
+    if not found:
+        return
+    warn("the IOMMU translates the GPU's memory accesses (PCI " + ", ".join(found) + "): the engine's start can "
+         "copy to the GPU many times slower, mostly when it starts again soon after it stopped. Starting Linux "
+         "with iommu=pt (the host's own devices then reach memory directly; devices passed to a virtual machine "
+         "keep the IOMMU) avoids it:")
+    for line in IOMMU_PT.get(distro_family(), IOMMU_PT["arch"]):
+        say(f"  {line}")
+    say("  and restart the PC")
+
+
+def check_compaction(makers: set) -> None:
+    """#42: says, without stopping, what keeps an Intel GPU's view of the expert arena in place.  The arena is ordinary
+    memory registered for the GPU's copies, which the xe or i915 driver follows rather than pins: when memory
+    compaction moves one of its pages, the driver maps the whole registration again at the next copy, and with the IOMMU
+    translating that ran past the driver's limit and faulted the copy engine (a B70, Linux 7.0).  The engine locks the
+    arena in RAM where vm.compact_unevictable_allowed is 0 (compaction then leaves locked pages alone), else pins it
+    with io_uring where it can (not a shared arena: the one image generation on the same card keeps, or a layer split's
+    in separate engines), and either needs RLIMIT_MEMLOCK for it."""
+    if WIN or "intel" not in makers or wsl_version() != 0:
+        return
+    in_container = Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
+    try:
+        cua = Path("/proc/sys/vm/compact_unevictable_allowed").read_text().strip()
+    except OSError:
+        cua = ""
+    if cua == "1":
+        warn("memory compaction may move the expert arena under the Intel GPU (vm.compact_unevictable_allowed is 1), "
+             "and each move makes its driver map all of it again: with the IOMMU translating that can stall or fault "
+             "the GPU's copies. Letting compaction leave locked memory alone (the engine locks the arena) avoids it" +
+             (", on the host (a container shares the host's setting):" if in_container else ":"))
+        say("  echo 'vm.compact_unevictable_allowed = 0' | sudo tee /etc/sysctl.d/90-xestrata.conf")
+        say("  sudo sysctl --system")
+    if memlock_gib() < 4:                              # the arena's lock the engine asks for (as in check_ram)
+        warn(f"this user may lock only {memlock_gib():.2f} GiB of RAM (ulimit -l), too little to keep the expert arena "
+             "in place for the Intel GPU: raise the memlock limit for your user (memlock in /etc/security/limits.conf, "
+             "or DefaultLimitMEMLOCK in systemd's user.conf) and log in again" +
+             (", on the host" if in_container else ""))
+
+
 def check_level_zero(makers: set, yes: bool = False, explicit: bool = False) -> None:
     """When the Level Zero driver is older than the build that fixed it refusing device memory while the VRAM is
     free (intel/compute-runtime #916; XeStrata #34 and #15: every allocation on the card can fail that way after a
     GPU fault, and only a host reboot clears it).  On Ubuntu 24.04/26.04 with the HWE kernel the graphics PPA
     brings the fixed driver, and the start is stopped until it is updated or the user asks to go on (confirm_risk,
     --old-driver as the explicit consent); on the GA kernel, where the PPA's driver does not belong, the user is
-    sent to the HWE kernel and the PPA, or to Fedora 44, and the start goes on.  Elsewhere nothing is said: no
+    sent to the HWE kernel and the PPA, or to Fedora 44 or 45, and the start goes on.  Elsewhere nothing is said: no
     repository to point at."""
     if WIN or "intel" not in makers:
         return
@@ -2041,14 +3469,14 @@ def check_level_zero(makers: set, yes: bool = False, explicit: bool = False) -> 
         again = " - the commands above" if _g_driver_update_said else ""
         warn(f"the Level Zero driver (build {build}) predates the fix for refusing device memory while the VRAM is "
              "free (the engine can fail to start; only a host reboot clears the card), and the GA kernel's xe "
-             "driver is the older one: move to the HWE kernel and the graphics PPA, or use Fedora 44 / Podman "
+             "driver is the older one: move to the HWE kernel and the graphics PPA, or use Fedora 44 or 45 / Podman "
              f"(README, Install){again}")
         say_driver_update(lts)
     else:
         warn(f"the Level Zero driver (build {build}) predates the fix for refusing device memory while the VRAM is "
              "free: the engine can fail to start, and only a host reboot clears the card (XeStrata #34, "
-             "intel/compute-runtime #916). Update the driver (compute-runtime 26.22 or later), or use Fedora 44 / "
-             "Podman (their drivers are newer)")
+             "intel/compute-runtime #916). Update the driver (compute-runtime 26.22 or later), or use Fedora 44 or "
+             "later / Podman (their drivers are newer)")
 
 
 def windows_nvidia_libs() -> list:
@@ -2186,9 +3614,8 @@ def cuda_major(root: str) -> int | None:
         pass
     nvcc = Path(root) / "bin" / "nvcc"
     try:
-        out = subprocess.run([str(nvcc) if nvcc.exists() else "nvcc", "--version"], capture_output=True, text=True,
-                             errors="replace",
-                             timeout=30).stdout
+        out = subprocess.run([str(nvcc) if nvcc.exists() else "nvcc", "--version"], capture_output=True,
+                             text=True, errors="replace", timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
         return None
     m = re.search(r"release (\d+)\.", out)
@@ -2241,13 +3668,17 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
     agrees (`install`: not with --check)."""
     if WIN:
         windows_libs(makers, gfx, yes, install)
+        check_ffmpeg()
         return
     check_igc(makers)
+    check_xe_kernel(makers)
+    check_svm_kernel(makers)
     check_level_zero(makers, yes, explicit)
     linux_nvidia_libs(makers, data, (packaged_engine().get("runtime") or {}).get("nvidia_pip") or [])
     check_pdf()
     check_jsonschema()
-    need, fast, repos = runtime_missing(makers)
+    check_ffmpeg()
+    need, fast, repos = runtime_missing(makers, gfx)
     if not need and not fast:
         return
     lines = runtime_commands(need, fast, repos)
@@ -2259,6 +3690,32 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
         say(line)
 
 
+def check_build_packages(makers: set, mode: str) -> None:
+    """Building from the source (Linux): stops at the start when the distribution packages the build needs for the
+    GPUs of `makers` and the mode (packages_for) are missing, with one command that installs them all, after the
+    repositories they come from - not one at a time where each is first needed.  A CUDA toolkit, oneMKL or ROCm
+    installed otherwise (NVIDIA's or Intel's installer, AMD's repository) is asked of the files, not of the package
+    names."""
+    d = distro_family()
+    # the build's own view: every NVIDIA GPU's code in the contrib mode (cuda_archs), every AMD GPU's (amd_archs),
+    # oneMKL for any Intel GPU (intel_gpu_present), not only the cards this run chose
+    makers = set(makers) | ({"nvidia"} if mode == "contrib" and cuda_archs() else set()) | \
+        ({"amd"} if amd_archs() else set()) | ({"intel"} if intel_gpu_present() else set())
+    names, _ = packages_for(d, makers, mode, distro_version())
+    p = PACKAGES[d]
+    skip = set()
+    if cuda_toolkits():
+        skip |= set(p["nvidia"].split()) | (set(FEDORA_CUDA.values()) if d == "fedora" else set())
+    if mkl_root() is not None:
+        skip |= set(p["intel-contrib"].split())
+    if "amd" in makers:
+        skip |= set(p["amd"].split()) - set(rocm_missing())
+    missing = [n for n in names if n not in skip and not pkg_installed(n)]
+    if missing:
+        fail("building XeStrata here needs these packages: " + ", ".join(missing),
+             "install them, then run it again:\n" + install_hint(missing))
+
+
 def check_pdf() -> None:
     """Linux: a PDF a request sends is read with poppler's pdftotext and pdftoppm, run as programs (Windows' 7z carries
     the Python packages instead).  Without them it is refused: said, with the command that installs them, never a
@@ -2267,6 +3724,20 @@ def check_pdf() -> None:
         return
     warn("a PDF a request sends is read with poppler's pdftotext and pdftoppm (without them it is refused):")
     say(f"  {install_cmd([tool_pkg('pdf')])}")
+
+
+def check_ffmpeg() -> None:
+    """The video tools (SeedVR2's and SAM 3's videos) read and write a video with the ffmpeg and ffprobe commands, run
+    as programs (not part of XeStrata: the deb and rpm packages recommend the distribution's, the Windows 7z does not
+    carry them).  Without them only the video tools are refused: said, with the command that installs them, never a
+    stop."""
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return
+    warn("the video tools read and write a video with ffmpeg and ffprobe (without them a video is refused):")
+    if WIN:
+        say("  install ffmpeg (https://ffmpeg.org/download.html) and put its bin folder on the PATH")
+    else:
+        say(f"  {install_cmd([tool_pkg('ffmpeg')])}")
 
 
 def check_jsonschema() -> None:
@@ -2293,8 +3764,8 @@ def rocm_missing() -> list:
     clang_ok = False
     for cxx in [str(c) for r in roots for c in (r / "llvm/bin/clang++", r / "lib/llvm/bin/clang++") if c.exists()] + \
             glob.glob("/usr/lib64/rocm/llvm/bin/clang++") + glob.glob("/usr/lib/llvm-*/bin/clang++"):
-        r = subprocess.run([cxx, "-print-libgcc-file-name", "--rtlib=compiler-rt"], capture_output=True, text=True,
-                           errors="replace")
+        r = subprocess.run([cxx, "-print-libgcc-file-name", "--rtlib=compiler-rt"], capture_output=True,
+                           text=True, errors="replace")
         clang_ok = clang_ok or (r.returncode == 0 and Path(r.stdout.strip()).is_file())
     # in the order of PACKAGES' AMD part
     have = [any((d / "hip" / "hip_runtime_api.h").exists() for d in inc),
@@ -2353,7 +3824,7 @@ def gpus():
             kfd = kfd_nodes() if kfd is None else kfd
             node = kfd.get(pci, {})
             render = next(iter(sorted((dev / "drm").glob("renderD*"))), None)
-            integrated = bool(node.get("integrated"))
+            integrated = bool(node.get("integrated")) or node.get("gfx") in APU_GFX
             name = f"{pci_name(0x1002, did)} ({node.get('gfx') or 'no KFD node'})"
             if node.get("gfx") == STRIX_HALO_GFX and node.get("simds") in STRIX_HALO_BY_SIMDS:
                 name = f"AMD Radeon {STRIX_HALO_BY_SIMDS[node['simds']]} (Ryzen AI Max, Strix Halo, gfx1151)"
@@ -2412,8 +3883,8 @@ def gpus_wsl():
 
 
 def gpus_from_engine():
-    """The GPUs as the engine sees them (strata-device --list-devices), in its order (the card it would take first), in
-    gpus()'s form.  What sysfs alone gives on Linux is not known here: the PCIe link, a small BAR (taken as the whole
+    """The GPUs as the engine sees them (xestrata-device --list-devices), in its order (the card it would take first),
+    in gpus()'s form.  What sysfs alone gives on Linux is not known here: the PCIe link, a small BAR (taken as the whole
     VRAM); an AMD card's gfx name is the HIP runtime's (its "arch"), the render node is not needed (no device files to
     open)."""
     vendors = {0x8086: "intel", 0x10DE: "nvidia", 0x1002: "amd"}
@@ -2433,11 +3904,31 @@ def gpus_from_engine():
     return found
 
 
+def gpu_files_missing(g) -> str | None:
+    """A card sysfs lists but whose device files are not here, in plain words (None: they are).  A container sees the
+    host's sysfs whole, every GPU in it, but only the device files it was given: the compose files pass /dev/dri, and
+    NVIDIA's (/dev/nvidia*) only with compose.nvidia.yaml.  Windows and WSL list the cards from the engine or
+    nvidia-smi, which reach them."""
+    if g.get("driver") not in ("xe", "i915", "nvidia", "amdgpu"):
+        return None
+    gone = hardware.missing_devices(g.get("vendor"), g.get("render"))
+    if not gone:
+        return None
+    where = ("not passed into this container" if Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
+             else "missing")
+    hint = (": add compose.nvidia.yaml (docs/BUILD.md#podman)" if where != "missing" and g.get("vendor") == "nvidia"
+            else ": add compose.amd.yaml (docs/BUILD.md#podman)" if where != "missing" and g.get("vendor") == "amd"
+            else " (nvidia-smi says why)" if g.get("vendor") == "nvidia" else "")
+    return f"its device files are {where} ({', '.join(gone)}){hint}"
+
+
 def gpu_problem(g, together=False):
     """Why Strata cannot use this card, in plain words (None: it can).  What the card can do (16-wide sub-groups,
     FP16, the matrix engines) is checked by the engine and the compiler's probe, not here."""
     if together:
         return "not supported together with other GPUs - the Xe engine runs on one GPU"
+    if (missing := gpu_files_missing(g)) is not None:
+        return missing
     cc = g.get("cc") or ""
     if g.get("vendor") == "nvidia" and re.fullmatch(r"\d+\.\d+", cc) and round(float(cc) * 10) < 60:
         # Maxwell and older (upstream #3218 builds sm_52 in its experimental build): NVIDIA's SYCL runtime reports FP16,
@@ -2513,7 +4004,7 @@ def check_gpus(sel, found, what="") -> None:
         gpu_table(found)
         single = [x for x in found if gpu_problem(x) is None]
         hint = ("use " + " or ".join(f"--gpu {x['index']}" for x in single)) if single else \
-            "Strata's Xe engine needs an Intel GPU on the xe or i915 driver, an RDNA2 or later AMD GPU on amdgpu, " \
+            "XeStrata's Xe engine needs an Intel GPU on the xe or i915 driver, an RDNA2 or later AMD GPU on amdgpu, " \
             "or with --license contrib an NVIDIA GPU"
         fail(f"GPU {i}{'' if g is None else ' (' + g['name'] + ')'} {what}cannot be used: {p}", hint)
 
@@ -2529,7 +4020,7 @@ def choose_gpus(a, found) -> list:
     single = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
     if not single:
         gpu_table(found)
-        fail("none of your GPUs can run Strata",
+        fail("none of your GPUs can run XeStrata",
              "it needs an Intel GPU on the xe or i915 driver, an RDNA2 or later AMD GPU on amdgpu, or with --license "
              "contrib an NVIDIA GPU")
     return [single[0]["index"]]
@@ -2610,6 +4101,33 @@ def free_gb(path):
     return shutil.disk_usage(path).free / 1e9
 
 
+def disk_room_problem(models_dir, pack_dir, other_gb, copy_gb, other_note="", free=None):
+    """None when the files this setup run still writes fit, else (message, hint).  `other_gb` is what goes to the model
+    folder (a download, the preparation, the picture files); `copy_gb` is the Q2_0 experts' pack, which is written to
+    the data folder's packs folder and not to the model folder (a refusal named the model folder although the bytes
+    belonged to the pack in the data folder).  The pack is measured where it goes; on one drive both add up."""
+    free = free or free_gb
+    packs = pack_dir.parent
+    free_models = free(models_dir)
+    models_problem = (f"not enough free disk space in {models_dir}: need ~{other_gb:.0f} GB, {free_models:.0f} GB free"
+                      + other_note, "use --models-dir on a bigger drive")
+    if free_models < other_gb:
+        return models_problem
+    if not copy_gb:
+        return None
+    free_packs = free(packs)
+    try:
+        same_drive = os.stat(models_dir).st_dev == os.stat(packs).st_dev
+    except OSError:
+        same_drive = False
+    needs = copy_gb + (other_gb if same_drive else 0)
+    if free_packs < needs:
+        return (f"not enough free disk space for the Q2_0 experts' pack in {pack_dir}: it needs about {needs:.0f} GB "
+                f"and {free_packs:.0f} GB are free there.",
+                "free some space, or move XeStrata's data folder to a bigger drive (--data-dir)")
+    return None
+
+
 # ------------------------------------------------------------------------------------------------ downloads
 def drop_archive(z: Path) -> None:
     """An unpacked or refused engine archive and its .done mark go: a refused one kept them, and every later run
@@ -2618,12 +4136,12 @@ def drop_archive(z: Path) -> None:
     z.with_name(z.name + ".done").unlink(missing_ok=True)
 
 
-# Parallel ranged downloads (0.2.0).  One TCP stream often cannot fill a fast line (a long or
-# lossy route, a CDN that limits each connection): download() takes the file in DL_CHUNK pieces
-# over several connections, writes each piece at its own offset, and keeps the finished pieces in
-# <name>.part.chunks so a stopped download continues where it was.  Anything that is not a ranged
-# file of known length (no Range support, no length, a small file) is one stream, as before.
-DL_CONNECTIONS = 16             # STRATA_DL_CONNECTIONS=1 restores one stream (for testers)
+# Parallel ranged downloads (upstream 04221c3e2).  One TCP stream often cannot fill a fast line (a long or lossy route,
+# a CDN that limits each connection): download() takes the file in DL_CHUNK pieces over several connections, writes each
+# piece at its own offset, and keeps the finished pieces in <name>.part.chunks so a stopped download continues where it
+# was.  Anything that is not a ranged file of known length (no Range support, no length, a small file) is one stream,
+# as before.
+DL_CONNECTIONS = 16             # XESTRATA_DL_CONNECTIONS=1 restores one stream (for testers)
 DL_CHUNK = 32 << 20             # bytes per piece: what the piece list records and what a failed request loses at most
 # pieces one request asks for (4 x 32 MiB): a new connection per piece spends its first seconds
 # in TCP slow start (measured: 8 connections 66 MB/s with a request per piece, 73 with 128 MiB)
@@ -2636,8 +4154,8 @@ DL_SAVE_EVERY = 5.0             # seconds between writes of the progress file
 
 
 def dl_connections() -> int:
-    """How many connections a big download uses: STRATA_DL_CONNECTIONS, else DL_CONNECTIONS (1 = one stream)."""
-    raw = (os.environ.get("STRATA_DL_CONNECTIONS") or "").strip()
+    """How many connections a big download uses: XESTRATA_DL_CONNECTIONS, else DL_CONNECTIONS (1 = one stream)."""
+    raw = (envvars.get("DL_CONNECTIONS") or "").strip()
     try:
         n = int(raw) if raw else DL_CONNECTIONS
     except ValueError:
@@ -2748,8 +4266,8 @@ class _Source:
         with self.lock:
             if stale is not None and self.final is not None and self.final != stale:
                 return self.final                        # another connection already got a fresh address
-            req = urllib.request.Request(self.url, headers={"User-Agent": "strata-setup", "Range": "bytes=0-0"})
-            with _urlopen(req, timeout=60) as r:
+            req = urllib.request.Request(self.url, headers={"User-Agent": "xestrata-setup", "Range": "bytes=0-0"})
+            with download_core.open_url(req, say=net_say()) as r:
                 cr = (r.headers.get("Content-Range") or "").strip()
                 if r.status != 206 or cr != f"bytes 0-0/{self.total}":
                     raise _NoRange(f"HTTP {r.status}, Content-Range {cr!r}")
@@ -2825,7 +4343,7 @@ def _prefix_bytes(done: set, total: int) -> int:
 
 def _load_pieces(part: Path, total: int) -> set:
     """The finished pieces of an earlier run.  <name>.part.chunks lists them; a .part without it comes from one stream
-    (an older setup, or STRATA_DL_CONNECTIONS=1): its bytes are a run from the start, so those pieces are finished."""
+    (an older setup, or XESTRATA_DL_CONNECTIONS=1): its bytes are a run from the start, so those pieces are finished."""
     side = part.with_name(part.name + ".chunks")
     n = -(-total // DL_CHUNK)
     try:
@@ -2947,8 +4465,8 @@ def _fetch_run(src: _Source, st: _Pieces, f, run: list):
         attempt_pos = pos
         try:
             url = src.get()
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={pos}-{end}"})
-            with _urlopen(req, timeout=60) as r:
+            req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={pos}-{end}"})
+            with download_core.open_url(req, say=net_say()) as r:
                 _check_ranged(r, pos, end, st.total, src.etag)
                 while pos <= end:
                     if st.stop.is_set():
@@ -2974,7 +4492,7 @@ def _fetch_run(src: _Source, st: _Pieces, f, run: list):
                                         st.flight.pop(i, None)
                             return
             return
-        except (_NoRange, _DiskError, _Changed):
+        except (_NoRange, _DiskError, _Changed, download_core.NetFailure):
             raise
         except urllib.error.HTTPError as e:
             err = e
@@ -3015,7 +4533,7 @@ def _piece_worker(src: _Source, st: _Pieces, todo: list, part: Path):
     except _PieceFailed as e:
         st.errors.append(e)
         st.abort_round.set()
-    except (_NoRange, _DiskError, _Changed) as e:
+    except (_NoRange, _DiskError, _Changed, download_core.NetFailure) as e:
         st.fatal = st.fatal or e
         st.stop.set()
     except OSError as e:                                # the .part itself could not be opened
@@ -3046,13 +4564,12 @@ class StallNote:
                 "where it stopped")
 
 
-DL_PROBE_WAITS = (1.0, 3.0)                     # seconds before the 2nd and the 3rd range probe (upstream 95e9b7341)
+DL_PROBE_WAITS = (1.0, 3.0)                     # seconds before the 2nd and the 3rd range probe
 
 
 def _probe_retryable(exc: BaseException) -> bool:
     """Is a failed range probe worth one more try?  A hiccup is (a timeout, a reset or dropped connection, a busy
-    server: 429/5xx); no internet is not (no DNS answer, no route, refused): that fails at once, with no wait and no
-    message."""
+    server: 429/5xx); no internet is not (no DNS answer, no route, refused): that fails at once, with no wait."""
     import errno
     import socket
     if isinstance(exc, urllib.error.HTTPError):
@@ -3065,14 +4582,14 @@ def _probe_retryable(exc: BaseException) -> bool:
         return False
     if isinstance(exc, OSError) and exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN):
         return False
-    return isinstance(exc, (TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
-                            http.client.HTTPException))
+    return isinstance(exc, (TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError, http.client.HTTPException))
 
 
 def _probe_ranges(src: "_Source", waits=DL_PROBE_WAITS, sleep=time.sleep) -> bool:
     """The first range request of a parallel download, tried up to len(waits)+1 times when it fails by a hiccup: one
-    failed probe used to make a 60-90 GB download a single stream.  False: the server does not do ranges, or the probe
-    failed (the caller then reads one stream)."""
+    failed probe used to make a 50-100 GB download a single stream.  False: the server does not do ranges, or the probe
+    failed (the caller then reads one stream).  A file that changed raises _Changed, as before."""
     for attempt in range(len(waits) + 1):
         try:
             src.resolve()
@@ -3137,7 +4654,7 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
             if st.fatal is not None:
                 break
             if st.errors:
-                print()
+                progress_end()
                 warn(f"download interrupted ({st.errors[0]}); retrying in 10 s ...")
                 _save_pieces(part, total, st.snapshot())
                 time.sleep(10)
@@ -3146,17 +4663,19 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
         _save_pieces(part, total, st.snapshot())
         raise
     report(force=True)
-    print()
+    progress_end()
     if isinstance(st.fatal, _Changed):
         part.unlink(missing_ok=True)
         part.with_name(part.name + ".chunks").unlink(missing_ok=True)
         part.with_name(part.name + ".src").unlink(missing_ok=True)
         fail(f"{name} changed on the server while it was downloading: the part that was there was deleted",
              "run it again (the download starts over with the file that is there now)")
+    if isinstance(st.fatal, download_core.NetFailure):
+        _save_pieces(part, total, st.snapshot())
+        net_fail(st.fatal, name)
     if isinstance(st.fatal, _DiskError):
         _save_pieces(part, total, st.snapshot())
-        fail(f"cannot write {part.name}: {st.fatal}",
-             "free some disk space (or pick another --models-dir) and run it again")
+        disk_fail(st.fatal, part)
     if isinstance(st.fatal, _NoRange):
         _save_pieces(part, total, st.snapshot())
         # the server stopped doing ranges: one stream from the unbroken start
@@ -3189,8 +4708,8 @@ def _repair_piece(src: _Source, st: _Pieces, f, i: int, stats: dict):
         before = pos
         try:
             url = src.get()
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={pos}-{end}"})
-            with _urlopen(req, timeout=60) as r:
+            req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={pos}-{end}"})
+            with download_core.open_url(req, say=net_say()) as r:
                 _check_ranged(r, pos, end, st.total, src.etag)
                 while pos <= end:
                     if st.stop.is_set():
@@ -3209,7 +4728,7 @@ def _repair_piece(src: _Source, st: _Pieces, f, i: int, stats: dict):
                     pos += len(b)
                     st.add(i, len(b))
             return
-        except (_NoRange, _DiskError, _Changed):
+        except (_NoRange, _DiskError, _Changed, download_core.NetFailure):
             raise
         except urllib.error.HTTPError as e:
             if e.code in (401, 403, 410) and url is not None:
@@ -3274,13 +4793,11 @@ def repair_download(url: str, path: Path, total: int, label: str, conns: int):
                 t.join(0.25)
             if time.time() - last > 2:
                 last = time.time()
-                have = st.have()
-                print(f"\r  {label}: {have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)   ", end="",
-                      flush=True)
+                progress(label, st.have(), total)
     except BaseException:
         st.stop.set()
         raise
-    print()
+    progress_end()
     if errors:
         warn(f"could not compare {path.name} with the server again ({errors[0]})")
         return None
@@ -3302,41 +4819,35 @@ def download_single(url: str, part: Path, total: int, label: str):
         if total and have >= total:                    # stopped after the last byte, before the rename: nothing to
             break                                      # ask for (a range past the end is a 416, retried 30 times)
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={have}-"})
-            with _urlopen(req, timeout=60) as r:
-                if have:
-                    m = _CONTENT_RANGE.match(r.headers.get("Content-Range") or "")
-                    if r.status != 206 or not m or int(m.group(1)) != have or (total and int(m.group(3)) != total):
-                        # another range: its bytes are not the file's; ask again from the start
-                        if r.status != 200:
-                            part.unlink(missing_ok=True)
-                            raise OSError(f"the server answered another range than bytes {have}- (HTTP {r.status})")
-                        # the server ignored the range and sent the whole file: start over
-                        have = 0
-                elif r.status not in (200, 206):
-                    raise OSError(f"HTTP {r.status}")
+            req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={have}-"})
+            with download_core.open_url(req, say=net_say()) as r:
+                try:
+                    have = download_core.resumed_at(r, have, total)
+                except OSError:
+                    part.unlink(missing_ok=True)
+                    raise
                 with open(part, "ab" if have else "wb") as f:
                     last = 0.0
-                    while True:
-                        b = r.read(8 << 20)
-                        if not b:
-                            break
-                        if total and have + len(b) > total:
-                            raise OSError("the server sent more bytes than the file has")
-                        f.write(b)
-                        have += len(b)
+
+                    def report(done):
+                        nonlocal last
                         if time.time() - last > 2:
                             last = time.time()
-                            size = f"{have / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have / total:.0f}%)" if total \
-                                else f"{have / 1e6:7.1f} MB"
-                            print(f"\r  {label}: {size}   ", end="", flush=True)
+                            progress(label, done, total)
+
+                    have = download_core.copy_stream(r, f, have=have, chunk=8 << 20, limit=total, progress=report)
                     f.flush()
                     os.fsync(f.fileno())
-            print()
+            progress_end()
             if not total or have >= total:
                 break
+        except download_core.NetFailure:
+            progress_end()
+            raise                                      # the rule's window is spent: download_file says it once
         except (OSError, http.client.HTTPException) as e:
-            print()
+            progress_end()
+            if download_core.disk_words(e) is not None:   # a .part that cannot be written: no retry helps
+                disk_fail(e, part)
             if part.exists() and total and part.stat().st_size > total:
                 part.unlink(missing_ok=True)             # more than the file has can only be wrong bytes
             warn(f"download interrupted ({e}); retrying in 10 s ...")
@@ -3347,15 +4858,32 @@ def range_total(url: str) -> int:
     """The file's length from a one-byte ranged GET (Content-Range: bytes 0-0/N), for a server whose HEAD gives none
     (ModelScope's: #1915); 0 when it does not say.  With the length known the file comes over several connections."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": "bytes=0-0"})
-        with _urlopen(req, timeout=60) as r:
+        req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": "bytes=0-0"})
+        with download_core.open_url(req, timeout=download_core.FIRST_CONNECT_S) as r:
             m = re.match(r"\s*bytes 0-0/(\d+)\s*$", r.headers.get("Content-Range") or "")
             return int(m.group(1)) if r.status == 206 and m else 0
     except (OSError, http.client.HTTPException):
         return 0
 
 
+_TERMS_DONE: set = set()
+
+
 def download(url, dst: Path, what=None):
+    """A model's file (download_file), and its repository's terms beside it (model_terms.fetch: About > Model terms
+    reads them offline), once a run.  The terms not fetched leave the model as it is: a warning only, and the page
+    links them instead."""
+    download_file(url, dst, what)
+    m = HF_FILE.match(str(url))
+    repo = m.group("repo") if m else None
+    if repo and repo not in _TERMS_DONE:
+        terms = {**MODEL_TERMS, **_qimage().TERMS}   # this module's table, not a second import of it
+        if repo in terms:
+            _TERMS_DONE.add(repo)
+            model_terms.fetch([repo], say=warn, timeout=30, terms=terms)
+
+
+def download_file(url, dst: Path, what=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
     A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -3385,7 +4913,14 @@ def download(url, dst: Path, what=None):
         src = Path(url[7:] if url.startswith("file://") else url)
         if not src.exists():
             fail(f"not found: {src}")
-        shutil.copyfile(src, dst)
+        try:
+            shutil.copyfile(src, dst)
+        except OSError as e:      # a source that cannot be opened: no waiting, one sentence (upstream 465fcbbc9)
+            words = download_core.disk_words(e)
+            if words is not None and words[0].startswith(("the drive", "the drive's quota")):
+                disk_fail(e, dst)
+            fail(f"cannot copy {src}: {e}", "check that the file is there and readable, and that the "
+                                            "destination can be written, then run it again")
         mark(dst)
         ok(f"{what or dst.name} copied")
         return
@@ -3402,11 +4937,17 @@ def download(url, dst: Path, what=None):
     pin = REPO_PINS.get(ms[0], {}).get(ms[1].rsplit("/", 1)[-1]) if ms is not None else file_pin(url)
     for attempt in range(5):
         try:
-            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
-            with _urlopen(req, timeout=60) as r:          # closed: a HEAD's answer has no body to keep the socket for
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "xestrata-setup"})
+            with _urlopen(req) as r:                      # closed: a HEAD's answer has no body to keep the socket for
                 total = int(r.headers.get("Content-Length", 0))
             break
+        except download_core.NetFailure as e:   # 12 s then 30 s: about 44 s for a silent host, not 320
+            net_fail(e, what or dst.name)
         except urllib.error.HTTPError as e:
+            if e.code == 401:                              # a private or removed repository: no try opens it
+                fail(f"{what or dst.name}: {url.split('/')[2]} answers 401 for {hf_repo(url) or url}: the repository "
+                     "is private or gone, and setup downloads without a login", "choose another model, or update "
+                     "XeStrata")
             if e.code == 404 and hf_unpinned(url) != url:  # the pinned revision is gone from the repository
                 if not allow_unpinned():
                     fail(f"the pinned version of {what or dst.name} is no longer on Hugging Face",
@@ -3456,7 +4997,10 @@ def download(url, dst: Path, what=None):
         return
     if not (total >= DL_MIN_PARALLEL and conns > 1 and parallel_download(url, part, total, label, conns, dst.name)):
         _claim_part(part, url)
-        download_single(url, part, total, label)
+        try:
+            download_single(url, part, total, label)
+        except download_core.NetFailure as e:
+            net_fail(e, what or dst.name)
     if total and part.stat().st_size != total:
         fail(f"could not finish downloading {dst.name}: {part.stat().st_size:,} bytes on disk, "
              f"the server says {total:,}",
@@ -3523,16 +5067,13 @@ SHARD_NAME = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
     """--gguf-dir's shards (upstream 5a18f83a1, #305): every -0000i-of-0000N file of the model, N read from the first
     shard's name as the engine and tools/iq_pack.py do.  The published name first; else the one first shard in the
-    folder whose name has the size in it (an upload split or named differently).  A missing shard is check_shards'
-    error later, as before."""
+    folder whose name has the size in it (an upload split or named differently), never another choice's published
+    file (the regular Qwen3.8 IQ3_XXS taken for huihui-swift's: gguf_dir_problem then names that choice).  A missing
+    shard is check_shards' error later, as before."""
     first = folder / model_file(fam, model, 1)
     if not first.exists():
-        found = sorted(p for p in folder.glob("*-00001-of-*.gguf") if SHARD_NAME.search(p.name))
-        # (not the files of a catalog choice with the same quant name but another layout: the v3.1 UD-IQ4_XS (four
-        # shards) is not the pinned UD-IQ4_XS (three))
-        other = lambda p: ((c := gguf_choice(p.name)) is not None and c[1] != model   # noqa: E731
-                           and model_quant(c[1]).lower() == model_quant(model).lower())
-        found = [p for p in found if not other(p)]
+        found = sorted(p for p in folder.glob("*-00001-of-*.gguf")
+                       if SHARD_NAME.search(p.name) and not gguf_choice(p.name))
         mine = [p for p in found if model.lower() in p.name.lower() or model_quant(model).lower() in p.name.lower()]
         pick = mine if mine else found
         if len(pick) == 1:
@@ -3607,24 +5148,334 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
     return f"{folder} has no {fam['title']} {model} file", hint
 
 
+def published_pin(name: str, fam: dict | None = None, model: str | None = None) -> tuple | None:
+    """The pinned (bytes, SHA-256) of a published model file by its name.  With the family and the size, only the
+    repositories that choice downloads from are looked at: swift and huihui-swift publish a file of the same name
+    with a different hash, and a search over every repository would find two pins and reject the person's own file."""
+    repos: set[str] = set()
+    if fam is not None:
+        hf = fam.get("hf")
+        if hf:
+            parts = str(hf).split("/resolve/", 1)[0].split("/")
+            if len(parts) >= 2:
+                repos.add("/".join(parts[-2:]))
+        info = (fam.get("models") or {}).get(model) if model else None
+        if isinstance(info, dict) and info.get("repo"):
+            repos.add(str(info["repo"]))
+    if not repos:
+        return None
+    pins = {REPO_PINS[repo][name] for repo in repos if name in REPO_PINS.get(repo, {})}
+    return next(iter(pins)) if len(pins) == 1 else None
+
+
+def gguf_dir_renamed(shards: list, fam: dict, model: str) -> None:
+    """--gguf-dir: a shard found under another name than the published one (gguf_dir_shards) must be the published
+    file, its size and then its SHA-256: another model named like a size (a fine-tune's IQ3_XXS) was installed as that
+    size, its pack and config over the official one's.  Such a model goes in with --gguf."""
+    for i, s in enumerate(shards, 1):
+        pub = model_file(fam, model, i)
+        if s.name == pub or not s.exists():
+            continue
+        pin = published_pin(pub, fam, model)     # the repo this family and size downloads from, not every repo
+        hint = (f"a model of your own goes in under a name of its own: {SETUP_CMD} --setup --gguf {shards[0]} "
+                "--name <a name>")
+        if pin is None or s.stat().st_size != pin[0]:
+            fail(f"{s.name} is not {fam['title']} {model}'s file ({pub}" +
+                 (f", {pin[0]:,} bytes)" if pin else ")"), hint)
+        size, sha = pin
+        verify_sha256(s, size, sha, own=True, other=hint)
+
+
+CUSTOM = "custom"                                      # the family of a model from the user's own files (--gguf)
+# the architectures the plain engine runs (plain_generate.cpp) besides Qwen3.8-Flash-Next's qwen4exp
+PLAIN_ARCHS = ("qwen35moe", "qwen35", "qwen3moe", "glm5-next", "glm5next")
+# the last: GLM's other spelling
+
+
+def custom_id(name: str) -> str:
+    """--name's model id: custom-<the name in lower case, letters, digits, dots and hyphens>, the config's tag."""
+    slug = re.sub(r"[^a-z0-9.]+", "-", name.lower()).strip("-.")[:48].strip("-.")
+    if not slug:
+        fail(f"--name {name!r} has no letters or digits", "give the model a name, e.g. --name my-model")
+    return "custom-" + slug
+
+
+# XeStrata's own draft layer (mtp-q2_0.gguf, tools/mtp_fetch.py) beside a model is not a second model (upstream
+# 788e37279, #4693)
+DRAFT_LAYER = re.compile(r"mtp[-_][a-z0-9_.-]*\.gguf")
+
+
+def model_firsts(folder: Path) -> list[Path]:
+    """The models' first files in a folder: each .gguf that is not split or is the first shard of a split one, the
+    picture readers (mmproj*.gguf) and XeStrata's own draft layer aside."""
+    def first(p: Path) -> bool:
+        m = SHARD_NAME.search(p.name)
+        low = p.name.lower()
+        return not low.startswith("mmproj") and not DRAFT_LAYER.fullmatch(low) and (m is None or m.group(1) == "00001")
+    return sorted(p for p in folder.glob("*.gguf") if first(p))
+
+
+def gguf_files(path: Path) -> list[Path]:
+    """--gguf's shards: a .gguf file (any shard of a split model: all of them, named as the first one), or a folder
+    with one model's files (its picture reader, mmproj*.gguf, aside)."""
+    if path.is_dir():
+        firsts = model_firsts(path)
+        if len(firsts) != 1:
+            what = "no model file (.gguf) in this folder" if not firsts else \
+                "several models in this folder (" + ", ".join(p.name for p in firsts) + ")"
+            fail(f"--gguf {path}: {what}",
+                 "give the model's file (its first shard for a split one) instead of the folder")
+        path = firsts[0]
+    if not path.is_file():
+        fail(f"--gguf {path}: no such file")
+    m = SHARD_NAME.search(path.name)
+    if m is None or int(m.group(2)) < 1:
+        return [path]
+    stem, total = path.name[:m.start()], int(m.group(2))
+    return [path.with_name("%s-%05d-of-%05d.gguf" % (stem, i, total)) for i in range(1, total + 1)]
+
+
+def expert_profile_for(layers: int, experts: int) -> str | None:
+    """A profile in data/ (expert-profile*.bin, the experts most routed first) made for a model of this many MoE
+    layers and experts, which the engine takes (read_expert_profile refuses another shape); None: none is."""
+    for p in sorted((ROOT / "data").glob("expert-profile*.bin")):
+        try:
+            with open(p, "rb") as f:
+                head = f.read(16)
+        except OSError:
+            continue
+        if len(head) == 16 and head[:4] == b"STRP" and struct.unpack("<3I", head[4:]) == (1, layers, experts):
+            return p.name
+    return None
+
+
+def experts_gb(path) -> float:
+    """The bytes of a plain model's expert tensors, in GB, from its GGUF header: the part the engine's expert cache
+    holds (the tensors custom_info reads for a model of the user's own files); 0.0 when the header cannot be read."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from gguf_reader import GGUFFile
+    try:
+        return round(sum(t.expected_bytes() or 0 for t in GGUFFile(path).tensors
+                         if re.match(r"blk\.\d+\.ffn_(gate|up|down)_exps\.", t.name)) / 1e9, 1)
+    except (OSError, ValueError, struct.error):
+        return 0.0
+
+
+def custom_info(shards: list, mid: str) -> dict:
+    """What setup needs of a model in the user's own files, from their headers (nothing is read past them): the
+    architecture, the files (size and time, to tell a changed file), the sizes setup's tables give its own models
+    (the download, the experts, the RAM by the Gyro rule: the experts and LOW_RAM_HEADROOM_GB), the context, the
+    expert profile of its shape, and a dense model's K/V bytes a token.  Kept in its config ("custom")."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from gguf_reader import GGUFFile
+    try:
+        heads = [GGUFFile(s) for s in shards]
+    except (OSError, ValueError, struct.error) as e:
+        fail(f"cannot read {shards[0]} as a GGUF model file ({e})", "give a whole .gguf file")
+    meta = heads[0].metadata
+    arch = str(meta.get("general.architecture") or "")
+    if arch != "qwen4exp" and arch not in PLAIN_ARCHS:
+        fail(f"{shards[0].name} is a {arch or 'model without an architecture'}: XeStrata runs Qwen3.8-Flash-Next "
+             "(qwen4exp) and the models of " + ", ".join(PLAIN_ARCHS[:-1]) + " only")
+
+    def key(k: str, default=0):
+        v = meta.get(f"{arch}.{k}", default)
+        return v if isinstance(v, (int, float)) else max(v) if isinstance(v, list) and v else default
+    tensors = [t for g in heads for t in g.tensors]
+    experts = [t for t in tensors if re.match(r"blk\.\d+\.ffn_(gate|up|down)_exps\.", t.name)]
+    layers = len({t.name.split(".")[1] for t in experts if ".ffn_gate_exps." in t.name})
+    n_expert = int(key("expert_count"))
+    arena = sum(t.expected_bytes() or 0 for t in experts) / 1e9
+    total = sum(s.stat().st_size for s in shards)
+    info = {"name": mid, "arch": arch, "title": str(meta.get("general.name") or shards[0].stem),
+            "files": [{"path": str(s.resolve()), "size": s.stat().st_size, "mtime": int(s.stat().st_mtime)}
+                      for s in shards],
+            "download_gb": round(total / 1e9, 1), "arena_gb": round(arena, 1),
+            "ram_gb": round(arena + LOW_RAM_HEADROOM_GB, 1), "plain": arch != "qwen4exp",
+            "profile": expert_profile_for(layers, n_expert) if layers else None,
+            "max_context": max([c for c in CONTEXTS if c <= int(key("context_length", 262144))] or [CONTEXTS[0]])}
+    if arch == "qwen35":                               # dense: every weight in VRAM, its K/V a token beside them
+        attn = int(key("block_count")) // max(1, int(key("full_attention_interval", 4)))
+        info.update(dense=True, kv_bytes=attn * 2 * int(key("attention.head_count_kv")) *
+                    int(key("attention.key_length")) * 2)
+    return info
+
+
+def register_custom(info: dict) -> str:
+    """Puts a model from the user's own files (its config's "custom") into this run's tables, as setup's own sizes
+    are, so every rule that reads them (the RAM, the low-RAM mode, the pack) takes it; returns its family dict's
+    title.  Never at import: tools that list the tables (tools/strata_mcp.py) see setup's own models only.  A Qwen3.8
+    model is a size of family CUSTOM; a plain one is family CUSTOM with this one size, the family that setup_plain
+    reads."""
+    mid = info["name"]
+    about = f"your own files ({info['title']}, {info['download_gb']:.0f} GB)"
+    if not info.get("plain"):
+        MODELS[mid] = {"about": about, "download_gb": info["download_gb"], "ram_gb": info["ram_gb"],
+                       "arena_gb": info["arena_gb"], "families": (CUSTOM,), "shards": len(info["files"]),
+                       "file": Path(info["files"][0]["path"]).name, "vision": True, "custom": True}
+        FAMILIES[CUSTOM] = {**FAMILIES["qwen"], "title": info["title"], "by": "your own files", "about": about,
+                            "tag": "", "name": "qwen3.8-flash-next", "pack_args": ["--compat-bf16"],
+                            "profile": info.get("profile") or "expert-profile.bin", "custom": True}
+        return FAMILIES[CUSTOM]["title"]
+    first = Path(info["files"][0]["path"])
+    FAMILIES[CUSTOM] = {"title": info["title"], "by": "your own files", "about": about, "tag": "",
+                        "name": info["arch"], "max_context": info["max_context"], "plain": True, "custom": True,
+                        "arch": info["arch"], "profile": info.get("profile"), "dense": info.get("dense", False),
+                        "kv_bytes": info.get("kv_bytes", 0),
+                        "models": {mid: {"file": first.name, "size": sum(f["size"] for f in info["files"]),
+                                         "parts": [{"path": Path(f["path"]).name, "size": f["size"], "sha256": None}
+                                                   for f in info["files"]],
+                                         "about": about, "tested": True, "custom": True}}}
+    return info["title"]
+
+
+def inspect_with_engine(src: Path, code: int) -> int:
+    """--inspect of files on this PC: after the headers' reading (tools/strata_inspect.py, exit `code`), the installed
+    engine's verdict where there is one, which decides (its kernels are what runs the model)."""
+    eng = packaged_engine_dir()
+    try:
+        meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return code
+    if not src.exists() or not (eng / EXE).is_file():
+        return code
+    try:
+        if src.is_dir():
+            firsts = model_firsts(src)
+            if len(firsts) != 1:
+                return code                            # several variants: strata_inspect listed them
+            src = firsts[0]
+        libs = list(meta.get("lib_dirs", []))
+        if meta.get("license") == "contrib" and not WIN:
+            libs += nvidia_lib_dirs(data_folder_path(None, load_settings()))
+        got = engine_check(eng / EXE, libs, src)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"The engine could not check it: {e}")
+        return code
+    if got is None:
+        return code
+    if got.get("ok"):
+        print(f"The engine: it runs these types ({got.get('arch')}). {SETUP_CMD} --setup --gguf {src} --name <a name> "
+              "installs it from these files")
+        return 0
+    print("The engine: it cannot run this model:\n  " + "\n  ".join(got.get("problems") or ["no reason given"]))
+    return 2
+
+
+def custom_of(cfg_path: Path) -> dict | None:
+    """The "custom" block of an installed model's config (a model from the user's own files), or None."""
+    try:
+        got = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("custom")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return got if isinstance(got, dict) and got.get("name") and got.get("files") else None
+
+
+def engine_check(exe: Path, lib_dirs: list, gguf: Path) -> dict | None:
+    """The engine's own verdict on the model in `gguf` (xestrata-engine --check-model: its headers against the engine's
+    kernels, no GPU opened), its JSON line; None from an engine without the check (an older one would start the model
+    instead).  Raises OSError when the engine gives no verdict."""
+    try:
+        if b"--check-model" not in exe.read_bytes():
+            return None
+    except OSError:
+        return None
+    env = dict(os.environ)
+    if lib_dirs:
+        var = "PATH" if WIN else "LD_LIBRARY_PATH"
+        env[var] = os.pathsep.join([*lib_dirs, env.get(var, "")])
+    r = subprocess.run([str(exe), "--check-model", str(gguf)], env=env, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=600)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise OSError((r.stderr.strip() or f"exit code {r.returncode}")[-600:]) from None
+
+
+def check_model(exe: Path, lib_dirs: list, gguf: Path) -> dict:
+    """engine_check, and setup stops with the engine's reasons when it cannot run the model."""
+    try:
+        got = engine_check(exe, lib_dirs, gguf)
+    except (OSError, subprocess.SubprocessError) as e:
+        fail(f"the engine could not check {gguf.name}: {e}")
+    if got is None:
+        fail(f"this engine ({exe}) cannot check a model's files", f"update XeStrata ({SETUP_CMD} --update)")
+    if not got.get("ok"):
+        why = got.get("problems") or ["no reason given"]
+        if not got.get("readable"):
+            fail(f"cannot read {gguf.name}: {why[0]}", "give whole model files (a download cut short is refused)")
+        fail(f"XeStrata cannot run {gguf.name}:\n       " + "\n       ".join(why[:8]) +
+             (f"\n       ({len(why) - 8} more)" if len(why) > 8 else ""))
+    return got
+
+
+def alt_reader_places(models_dir, roots, gguf_dir) -> list:
+    """Where an alternative picture reader is looked for: the same places as the pinned one (the data folder's models/,
+    an earlier install's models/, and the person's own GGUF folder: beside the shards, the folder above and that
+    folder's models/)."""
+    alt = ALT_READERS.get(MMPROJ)
+    if alt is None:
+        return []
+    places = [Path(models_dir) / alt[0]] + [Path(r) / "models" / alt[0] for r in roots or []]
+    if gguf_dir:
+        base = Path(gguf_dir)
+        places += [base / alt[0], base.parent / alt[0], base.parent / "models" / alt[0]]
+    return places
+
+
+def accepted_alt_reader(places):
+    """The first file in `places` that is the alternative picture reader of the pinned one (name, size and SHA-256
+    all as pinned in ALT_READERS), else None.  Anything else with that name is ignored: never deleted, never renamed.
+    The SHA-256 (0.9 GB, a few seconds) is remembered in a mark in the state folder, never beside the person's file,
+    keyed by the real path, size and modification time, so a replaced file is hashed again."""
+    alt = ALT_READERS.get(MMPROJ)
+    if alt is None:
+        return None
+    name, size, sha = alt
+    for p in places:
+        p = Path(p)
+        try:
+            if p.name != name or not p.is_file() or p.stat().st_size != size:
+                continue                               # absent, another name or another size: ignored as before
+        except OSError:
+            continue
+        kept = _kept_mark(p)
+        digest = None
+        try:
+            found = (_ALT_MARK.match(kept.read_text(encoding="utf-8", errors="replace"))
+                     if kept is not None and kept.exists() else None)
+            digest = found.group(1) if found else None
+        except OSError:
+            digest = None
+        if digest is None:
+            say(f"  checking {p.name} (SHA-256, {size / 1e9:.1f} GB) ...")
+            digest = _hash_file(p, size)
+            if kept is not None:
+                try:
+                    kept.parent.mkdir(parents=True, exist_ok=True)
+                    kept.write_text(f"alt-reader sha256 {digest}\n", encoding="utf-8")
+                except OSError:
+                    pass                               # (not remembered: the next run hashes again)
+        if digest == sha:
+            return p
+        say(f"  note: {p} has the name of Unsloth's picture reader but is a different file, so it is not used. "
+            "The picture reader is downloaded (0.9 GB).")
+    return None
+
+
 def _hash_file(s: Path, size: int) -> str:
-    h = hashlib.sha256()
-    seen, last = 0, 0.0
-    with open(s, "rb") as f:
-        while True:
-            b = f.read(16 << 20)
-            if not b:
-                break
-            h.update(b)
-            seen += len(b)
-            # a figure for the app and the Terminal: hashing 60 GB takes minutes
-            if time.time() - last > 2 and size >= (1 << 30):
-                last = time.time()
-                print(f"\r  checking {s.name}: {seen / 1e9:6.2f} / {size / 1e9:.2f} GB ({100 * seen // size}%)   ",
-                      end="", flush=True)
-    if seen >= (1 << 30):
-        print()
-    return h.hexdigest()
+    last = 0.0
+
+    def report(seen):
+        nonlocal last
+        if time.time() - last > 2 and size >= (1 << 30):
+            last = time.time()
+            progress(f"checking {s.name}", seen, size)
+
+    digest = download_core.sha256_file(s, progress=report)
+    if s.stat().st_size >= (1 << 30):
+        progress_end()
+    return digest
 
 
 def keep_bad(s: Path) -> Path | None:
@@ -3651,12 +5502,13 @@ def drop_bad(dst: Path) -> None:
         pass
 
 
-def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None) -> None:
+def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None, other: str | None = None) -> None:
     """A shard's size and SHA-256 against the pinned values (the Unsloth file); the result is kept in its finish mark,
     so the ~5 minutes of hashing 111 GB happen once.  A wrong file is kept as <name>.bad (keep_bad): the next run
     checks it once more and otherwise downloads the file again.
     `repair` (a downloaded file's own re-reader, see repair_download): the wrong file is first compared with the server
-    piece by piece and only the damaged pieces are written again, then it is checked a second time."""
+    piece by piece and only the damaged pieces are written again, then it is checked a second time.  `other`: what the
+    person can do instead when their own file (`own`) is not the published one."""
     m = s.with_name(s.name + ".done")
     kept = mark_text(s)
     if kept is not None and f"sha256 {sha}" in kept:
@@ -3684,10 +5536,13 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None) 
     if digest != sha:
         if own:
             fail(f"{s.name} does not match the published file (SHA-256 {digest}, expected {sha})",
-                 "it may be damaged or another version; your file was left as it is. Copy the whole published file "
-                 "into the folder")
+                 "it may be damaged or another version; your file was left as it is. " +
+                 (other or "Copy the whole published file into the folder"))
+        gone = _kept_mark(s)                           # keyed on the file's stat: taken before it is renamed
         keep_bad(s)                                    # kept as <name>.bad, not thrown away (see keep_bad)
         m.unlink(missing_ok=True)
+        if gone is not None:
+            gone.unlink(missing_ok=True)
         if server_same:
             hint = ("the server sends exactly the bytes you have (every block was compared), so the file there is not "
                     "the version this XeStrata pins: update XeStrata. Run setup again to check the kept file once more")
@@ -3747,10 +5602,9 @@ def tree_sha256(top: Path) -> str:
 
 
 def get_llama_cpp():
-    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
+    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools), as a zip: no git."""
     llama = ROOT / "third_party" / "main" / "llama.cpp"
-    if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir() and \
-            (llama / "tools" / "mtmd" / "CMakeLists.txt").exists():   # a copy without mtmd cannot build the encoder
+    if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
         return llama
     z = ROOT / "third_party" / "main" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
     download(LLAMA_CPP_ZIP, z, "llama.cpp source")
@@ -3785,7 +5639,7 @@ def get_llama_cpp():
 
 
 def req_name(line: str) -> str:
-    """The distribution name of a requirement line ("numpy==2.5.3; python_version >= '3.12'" -> "numpy")."""
+    """The distribution name of a requirement line ("numpy==2.5.5; python_version >= '3.12'" -> "numpy")."""
     return re.split(r"[\s<>=!~;\[]", line.strip(), maxsplit=1)[0].lower().replace("_", "-")
 
 
@@ -3813,15 +5667,6 @@ def _marker_met(line: str) -> bool:
     return Marker(line.split(";", 1)[1]).evaluate()
 
 
-def _installed(name: str) -> bool:
-    try:
-        import importlib.metadata as md
-        md.distribution(name)
-        return True
-    except Exception:
-        return False
-
-
 def pip_stamp_is_ours(stamp: Path) -> bool:
     """The list of installed packages was written for this system (upstream fb3bae20c, #3634): a .venv on a disk that
     Windows and Linux both start from keeps the other one's list, which then says "already installed" about packages
@@ -3837,17 +5682,25 @@ def pip_stamp_is_ours(stamp: Path) -> bool:
     return all(importlib.util.find_spec(m) is not None for m in ("numpy", "jinja2", "regex", "yaml"))
 
 
+def pip_stamp_path(packages) -> Path:
+    """The install record for this exact list of requirements.  A changed pin gets a different record, so an
+    existing .venv cannot say "already installed" about the old versions (2026-11-24)."""
+    digest = hashlib.sha256("\n".join(packages).encode("utf-8")).hexdigest()[:16]
+    # a Python whose prefix this user cannot write (the system's, run without setup.sh's .venv): pip installs into
+    # the user's site, and the list is kept there
+    root = Path(sys.prefix) if os.access(sys.prefix, os.W_OK) else Path(site.getuserbase())
+    return root / f".strata-pip-{digest}.json"
+
+
 def pip_install(packages, what):
-    """pip install into .venv, skipped when the same list was installed before.  An install from before the pinned
-    requirements recorded bare names: those packages are kept as they are (nothing is reinstalled), and the pinned
-    dependencies it already has count as installed."""
-    # a Python whose prefix this user cannot write (the system's, run without setup.sh's .venv): pip installs into the
-    # user's site, and the list is kept there
-    stamp = (Path(sys.prefix) if os.access(sys.prefix, os.W_OK) else Path(site.getuserbase())) / ".strata-pip.json"
+    """pip install into .venv, skipped when this exact list was installed before.  An install from before the
+    pinned requirements recorded bare names: its old record is dropped so the current pins are installed."""
+    stamp = pip_stamp_path(packages)
+    old = stamp.parent / ".strata-pip.json"
+    for f in (old, old.with_name(old.name + ".os")):
+        f.unlink(missing_ok=True)
     have = json.loads(stamp.read_text()) if stamp.exists() and pip_stamp_is_ours(stamp) else []
-    bare = {p.lower() for p in have if req_name(p) == p.lower()}
-    need = [p for p in packages if p not in have and req_name(p) not in bare
-            and not (bare and "==" in p and _installed(req_name(p)))]
+    need = [p for p in packages if p not in have]
     if not need:
         ok(f"{what} already installed")
         return
@@ -3898,8 +5751,7 @@ INTEL_LLVM_DEFAULT = ROOT / ".tools" / "intel-llvm" / "install"
 INTEL_LLVM_CONTRIB = ROOT / ".tools" / "intel-llvm-contrib" / "install"
 FREE_HOW = ("intel/llvm's DPC++ 7 or later (free software): build it here: ./setup.sh --intel-llvm-build (13 minutes "
             "on 28 threads, 3.5 GB), or a distribution's package of version 7 or later")
-MKL_HOW = ("oneMKL (not free software; Intel's apt repository, set up as docs/BUILD.md#packages says): "
-           f"sudo apt install intel-oneapi-mkl-sycl-devel-{ONEMKL_SERIES}")
+MKL_HOW = "oneMKL (not free software; Intel's oneAPI repository, docs/BUILD.md#packages): install it:\n"
 # Intel's repositories carry apt and dnf packages, not Arch's: on Arch the oneAPI packages come from Intel's offline
 # installer, if they are wanted at all (the free and contrib modes build intel/llvm from the source)
 ONEAPI_ARCH = ("Intel oneAPI is not in Arch's repositories (only apt's and dnf's): either install it with Intel's "
@@ -3965,14 +5817,57 @@ def packaged_engine_dir() -> Path:
     return ROOT / PACKAGED["engine"] if PACKAGED else ROOT / "engine"
 
 
+# Issue #41: what the GPU listing needed (engine_tool) - None: not listed yet, "": nothing, else the
+# ONEAPI_DEVICE_SELECTOR that put_listing_selector writes into the run config for every engine serve starts
+LISTING_SELECTOR: str | None = None
+
+
 def engine_tool(*args: str) -> str:
-    """strata-device's output for `args` (--list-devices, --cpu): where setup has no sysfs or /proc to read (Windows),
-    the engine reports the GPUs and the CPU itself."""
-    exe = packaged_engine_dir() / ("strata-device.exe" if WIN else "strata-device")
-    r = subprocess.run([str(exe), *args], capture_output=True, text=True, errors="replace", timeout=120)
+    """xestrata-device's output for `args` (--list-devices, --cpu): where setup has no sysfs or /proc to read (Windows),
+    the engine reports the GPUs and the CPU itself.
+    Issue #41: a Level Zero runtime that fails as the GPUs are listed (UR_RESULT_ERROR_UNINITIALIZED on a Windows PC
+    with an RTX 2060 and no usable Intel GPU) stops SYCL's whole listing, the CUDA and HIP GPUs with it, and the engine
+    cannot list again without it in the same process: the runtime reads ONEAPI_DEVICE_SELECTOR once, as it starts.  So
+    the listing is run once more with Level Zero left out (gpu_select.L0_OFF) when the user set no selector; when that
+    lists, setup's later programs (this process's environment) and the run config (put_listing_selector) keep it."""
+    global LISTING_SELECTOR
+    exe = packaged_engine_dir() / ("xestrata-device.exe" if WIN else "xestrata-device")
+
+    def run():
+        return subprocess.run([str(exe), *args], capture_output=True, text=True, errors="replace", timeout=120)
+    r = run()
+    if (r.returncode != 0 and LISTING_SELECTOR is None and "ONEAPI_DEVICE_SELECTOR" not in os.environ
+            and "level_zero backend failed" in r.stderr + r.stdout):
+        os.environ["ONEAPI_DEVICE_SELECTOR"] = gpu_select.L0_OFF
+        again = run()
+        if again.returncode == 0:
+            LISTING_SELECTOR = gpu_select.L0_OFF
+            warn("Intel's GPU runtime (Level Zero) failed to list the GPUs, which hid the others too: they are used "
+                 f"without it (ONEAPI_DEVICE_SELECTOR={gpu_select.L0_OFF}, kept in the run config). An Intel GPU "
+                 "needs its driver repaired or updated first")
+            r = again
+        else:
+            del os.environ["ONEAPI_DEVICE_SELECTOR"]
     if r.returncode != 0:
         raise subprocess.SubprocessError((r.stderr or r.stdout).strip() or f"{exe.name} {' '.join(args)} failed")
+    if LISTING_SELECTOR is None and "--list-devices" in args:
+        LISTING_SELECTOR = ""
     return r.stdout
+
+
+def put_listing_selector(cfg: dict) -> None:
+    """Issue #41: the selector the GPU listing needed (engine_tool) into the run config's "env", which serve gives the
+    engine, the image engine and xestrata-device (serve/gpu_select.py); a selector the config already names is the
+    user's and stays.  A listing that needed none drops an earlier run's, so a Level Zero that lists again is used."""
+    if LISTING_SELECTOR is None:
+        return
+    env = dict(cfg.get("env") or {})
+    if LISTING_SELECTOR:
+        env.setdefault("ONEAPI_DEVICE_SELECTOR", LISTING_SELECTOR)
+    elif env.get("ONEAPI_DEVICE_SELECTOR") == gpu_select.L0_OFF:
+        del env["ONEAPI_DEVICE_SELECTOR"]
+    if env or "env" in cfg:
+        cfg["env"] = env
 
 
 def packaged_engine() -> dict:
@@ -4149,7 +6044,7 @@ def contrib_compiler(a, st: dict) -> tuple:
     if comp["cuda_archs"] and not cuda_toolkits():
         fail("NVIDIA's CUDA toolkit is missing (the contrib build makes the NVIDIA GPUs' code with it, and their "
              "dense products go to its cuBLAS)",
-             "install it: " + install_cmd([PACKAGES[distro_family()]["nvidia"]]))
+             "install it:\n" + install_hint(PACKAGES[distro_family()]["nvidia"].split()))
     return comp, d
 
 
@@ -4194,7 +6089,8 @@ def choose_compiler(a, gpu: dict) -> dict:
             comp["license"], comp["onemkl"] = "contrib", intel_gpu_present()
     if comp["onemkl"] and mkl_root() is None:
         fail(f"--license {mode} hands the Intel GPU's dense matrix products to oneMKL, which is not installed",
-             ONEAPI_ARCH if distro_family() == "arch" else MKL_HOW)
+             ONEAPI_ARCH if distro_family() == "arch" else
+             MKL_HOW + install_hint(PACKAGES[distro_family()]["intel-contrib"].split()))
     comp["hip_archs"] = amd_archs()
     if comp["hip_archs"]:
         if missing := rocm_missing():
@@ -4213,19 +6109,22 @@ def choose_compiler(a, gpu: dict) -> dict:
                      (" --contrib" if llvm.resolve() == INTEL_LLVM_CONTRIB.resolve() else ""))
             a.intel_llvm_rebuild = True
             build_intel_llvm(a, contrib=llvm.resolve() == INTEL_LLVM_CONTRIB.resolve())
-    if gpu.get("vendor") in ("nvidia", "amd"):
+    if gpu.get("vendor") in ("nvidia", "amd") or gpu.get("cpu"):
         # the tensor cores through cuBLAS and joint_matrix, AMD's WMMA and dot instructions: the XMX question is
-        # Intel's
+        # Intel's; without a GPU there is none to ask
         xmx = False
     else:
         probed = probe_gpu(comp, pci)
         if probed == {}:
             # no compiler makes the engine run on a GPU its driver does not list (seen on openSUSE Leap 16, whose
             # compute-runtime 25.18 lists no Arc Pro B70)
+            missing = [n for n in PACKAGES[distro_family()]["intel"].split() if not pkg_installed(n)]
             fail(f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU at PCI {pci}" if pci else
                  f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU",
-                 "the GPU's Level Zero driver (libze-intel-gpu1, Intel's compute-runtime) is missing or too old for "
-                 "this GPU: install a newer one (docs/BUILD.md#packages) and run setup again")
+                 "the GPU's Level Zero driver (Intel's compute-runtime) is not installed: install it:\n" +
+                 install_hint(missing) if missing else
+                 "the GPU's Level Zero driver (libze-intel-gpu1, Intel's compute-runtime) is too old for this GPU: "
+                 "install a newer one (docs/BUILD.md#packages) and run setup again")
         xmx = has_xmx(probed)
         if not xmx and not allow_no_xmx:
             say(f"\n  {Path(comp['cxx']).name} ({compiler_version(comp['cxx'], comp['env'])}) gives this GPU no XMX "
@@ -4241,7 +6140,7 @@ def choose_compiler(a, gpu: dict) -> dict:
     comp["version"] = compiler_version(comp["cxx"], comp["env"])
     comp["xmx"] = xmx
     what = ("NVIDIA's tensor cores" if gpu.get("vendor") == "nvidia" else "an AMD GPU" if gpu.get("vendor") == "amd"
-            else "XMX" if xmx else "no XMX: the slower prompt path")
+            else "no GPU: the CPU's forward" if gpu.get("cpu") else "XMX" if xmx else "no XMX: the slower prompt path")
     ok(f"SYCL compiler: {comp['version']} ({mode}; {what}" +
        (f"; NVIDIA code for {', '.join(comp['cuda_archs'])}" if comp["cuda_archs"] else "") +
        (f"; AMD code for {', '.join(comp['hip_archs'])}" if comp["hip_archs"] else "") + ")")
@@ -4249,26 +6148,13 @@ def choose_compiler(a, gpu: dict) -> dict:
 
 
 def check_build_tools(comp: dict) -> None:
-    """What the build needs besides the SYCL compiler: g++ for the CPU image encoder (glslc and the Vulkan headers for
-    the Vulkan one: vulkan_missing).  Setup does not install them (no apt or sudo from setup): it says what is
-    missing."""
+    """What the build needs besides the SYCL compiler: g++, whose C++ standard library intel/llvm's clang compiles
+    against.  Setup does not install it (no apt or sudo from setup): it says what is missing."""
     missing = []
     if shutil.which("g++") is None:
         missing.append(tool_pkg("g++"))
     if missing:
         fail("missing: " + ", ".join(missing), "install them, then run it again (docs/XE.md lists the packages)")
-
-
-def vulkan_missing() -> list:
-    """The packages the Vulkan image encoder (ggml-vulkan) needs that are not installed."""
-    need = []
-    if shutil.which("glslc") is None:
-        need.append(tool_pkg("glslc"))
-    if not Path("/usr/include/vulkan/vulkan.h").exists():
-        need.append(tool_pkg("vulkan"))
-    if not Path("/usr/include/spirv/unified1/spirv.hpp").exists():
-        need.append(tool_pkg("spirv"))
-    return need
 
 
 def configured_generator(bdir: Path) -> str | None:
@@ -4311,8 +6197,8 @@ def cmake_build(src, bdir, target, defs, env=None):
     fresh_if_other_generator(bdir)
     conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
             "-DCMAKE_BUILD_TYPE=Release", *defs]
-    # the tools on PATH too: ggml's Vulkan backend configures its shader generator as a separate CMake project
-    # (ExternalProject) that asks for Ninja by name, which fails on a clean system where only pip's ninja exists
+    # the tools on PATH too: llama.cpp's ggml configures its CPU build as a separate CMake project (ExternalProject)
+    # that asks for Ninja by name, which fails on a clean system where only pip's ninja exists
     env = dict(env or os.environ)
     env["PATH"] = os.pathsep.join(dict.fromkeys([str(Path(ninja).parent), str(Path(cmake).parent),
                                                  env.get("PATH", "")]))
@@ -4323,8 +6209,8 @@ def cmake_build(src, bdir, target, defs, env=None):
     run([cmake, "--build", str(bdir), "--target", *targets, "-j", str(jobs)], env=env)
 
 
-ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/main/ggml")
-VISION_SOURCES = ("tools/vision",)
+# the picture reader (tools/vision/strata_vision.cpp) is built with the engine and its sources count for it
+ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/main/ggml", "tools/vision")
 
 
 def source_hash(parts) -> str:
@@ -4369,17 +6255,16 @@ def engine_cmake_args() -> list:
     return keep
 
 
-def build_engine(visions, llama, comp: dict, data: Path) -> Path:
-    """Compile the engine with `comp` (choose_compiler) and the image encoders in `visions` ("cpu", "vulkan"); the
-    results go to engine/.  A compiled engine or encoder whose source files or compiler changed since (a
-    `git pull`, another intel/llvm) is compiled again.  Each encoder has its own binary, so installing one never
-    replaces the other."""
+def build_engine(llama, comp: dict, data: Path) -> Path:
+    """Compile the engine with `comp` (choose_compiler), its image engine and its picture reader (the engine's own
+    vision encoder, on the GPU or the CPU); the results go to engine/.  A compiled engine whose source files or compiler
+    changed since (a `git pull`, another intel/llvm) is compiled again."""
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
     meta = json.loads(stamp.read_text()) if stamp.exists() else {}
     xe = engine_is_xe(meta)
-    src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
+    src = source_hash(ENGINE_SOURCES)
     used = {"cxx": comp["cxx"], "version": comp["version"], "kind": comp["kind"], "xmx": comp["xmx"],
             "license": comp["license"], "cuda_archs": comp["cuda_archs"], "onemkl": comp["onemkl"],
             "hip_archs": comp.get("hip_archs", [])}
@@ -4390,52 +6275,38 @@ def build_engine(visions, llama, comp: dict, data: Path) -> Path:
     cudnn = nvidia_libs_dir(data) / "nvidia" / "cudnn"
     if comp["license"] == "contrib" and comp["cuda_archs"] and (cudnn / "include" / "cudnn.h").exists():
         used["cudnn_root"] = str(cudnn)
-    engine_ok = (xe and (eng / EXE).exists() and (eng / IMAGE_EXE).exists() and meta.get("src") == src
-                 and meta.get("compiler") == used)
-    built = dict(meta.get("vision_srcs") or {}) if xe else {}
-    missing = [v for v in dict.fromkeys(visions)
-               if v in VEXE and not ((eng / VEXE[v]).exists() and built.get(v) == vsrc)]
-    if engine_ok and not missing:
+    engine_ok = (xe and (eng / EXE).exists() and (eng / IMAGE_EXE).exists() and (eng / VISION_EXE).exists()
+                 and meta.get("src") == src and meta.get("compiler") == used)
+    if engine_ok:
         ok("engine already built for this PC")
         return eng
     check_build_tools(comp)
-    if "vulkan" in missing and (need := vulkan_missing()):
-        fail("the Vulkan image encoder needs: " + ", ".join(need), "install them: " + install_cmd(need))
-    if not engine_ok:
-        bdir = ROOT / "build-xe"
-        cache = bdir / "CMakeCache.txt"
-        if cache.exists() and (f"CMAKE_CXX_COMPILER:FILEPATH={comp['cxx']}" not in cache.read_text(errors="replace")
-                               or (meta.get("compiler") or {}).get("cmake_args") != used.get("cmake_args")):
-            shutil.rmtree(bdir)                        # CMake keeps the compiler and the -D values it configured with
-        say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
-            and bdir.exists() else "  Compiling the Strata engine for the GPU (20-40 minutes, once) ...")
-        cmake_build(ROOT, bdir, ["strata", "strata-image"],
-                    [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
-                     f"-DSTRATA_LICENSE={comp['license']}",
-                     f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",
-                     f"-DSTRATA_HIP_ARCHS={';'.join(comp.get('hip_archs', []))}",
-                     f"-DSTRATA_ONEMKL={'ON' if comp['onemkl'] else 'OFF'}",
-                     *([f"-DMKL_ROOT={mkl_root()}"] if comp["onemkl"] else []), "-DSTRATA_ENABLE_XE=ON",
-                     "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
-                     f"-DSTRATA_GGML_DIR={llama}", *(f"-D{x}" for x in used.get("cmake_args", [])),
-                     *([f"-DSTRATA_CUDNN_ROOT={used['cudnn_root']}"] if "cudnn_root" in used else [])], comp["env"])
-        install_binary(bdir / EXE, eng / EXE)
-        install_binary(bdir / IMAGE_EXE, eng / IMAGE_EXE)
-    for v in missing:
-        llama_def = f"-DLLAMA_DIR={llama}"
-        if v == "vulkan":
-            say("  Compiling the image encoder for the GPU (Vulkan; 5-15 minutes, once) ...")
-            bdir = ROOT / "build-vision-vulkan"
-            cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision",
-                        [llama_def, "-DSTRATA_VISION_VULKAN=ON", "-DSTRATA_PORTABLE=ON"])
-        else:
-            say("  Compiling the image encoder for the CPU ...")
-            bdir = ROOT / "build-vision-cpu"
-            cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision", [llama_def, "-DSTRATA_PORTABLE=ON"])
-        install_binary(bdir / "bin" / "strata-vision", eng / VEXE[v])
-        built[v] = vsrc
+    bdir = ROOT / "build-xe"
+    cache = bdir / "CMakeCache.txt"
+    cache_text = cache.read_text(errors="replace") if cache.exists() else ""
+    cached_cxx = next((line.split("=", 1)[1].strip() for line in cache_text.splitlines()
+                       if line.startswith("CMAKE_CXX_COMPILER:")), None)
+    if cache.exists() and (cached_cxx != comp["cxx"]
+                           or (meta.get("compiler") or {}).get("cmake_args") != used.get("cmake_args")):
+        shutil.rmtree(bdir)                        # CMake keeps the compiler and the -D values it configured with
+    say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
+        and bdir.exists() else "  Compiling the XeStrata engine for the GPU (20-40 minutes, once) ...")
+    # the targets keep upstream's names (CMakeLists.txt); strata-vision is the picture reader
+    cmake_build(ROOT, bdir, ["strata", "strata-image", "strata-vision"],   # upstream's CMake target names
+                [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
+                 f"-DSTRATA_LICENSE={comp['license']}",
+                 f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",
+                 f"-DSTRATA_HIP_ARCHS={';'.join(comp.get('hip_archs', []))}",
+                 f"-DSTRATA_ONEMKL={'ON' if comp['onemkl'] else 'OFF'}",
+                 *([f"-DMKL_ROOT={mkl_root()}"] if comp["onemkl"] else []), "-DSTRATA_ENABLE_XE=ON",
+                 "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
+                 f"-DSTRATA_GGML_DIR={llama}", *(f"-D{x}" for x in used.get("cmake_args", [])),
+                 *([f"-DSTRATA_CUDNN_ROOT={used['cudnn_root']}"] if "cudnn_root" in used else [])], comp["env"])
+    install_binary(bdir / EXE, eng / EXE)
+    install_binary(bdir / IMAGE_EXE, eng / IMAGE_EXE)
+    install_binary(bdir / VISION_EXE, eng / VISION_EXE)
     stamp.write_text(json.dumps({"source": "local", "backend": "xe", "version": source_version(), "compiler": used,
-                                 "lib_dirs": comp["lib_dirs"], "src": src, "vision_srcs": built}, indent=1))
+                                 "lib_dirs": comp["lib_dirs"], "src": src}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
 
@@ -4476,27 +6347,28 @@ def update_installed_engine() -> None:
     remove_old_image_engine()
     eng = ROOT / "engine"
     info = eng / "BUILD.json"
-    if not info.exists() or not (eng / EXE).exists():
+    if not info.exists():
         return
     meta = json.loads(info.read_text())
-    visions = list((meta.get("vision_srcs") or {}).keys())
-    vsrc = source_hash(VISION_SOURCES)
-    if engine_is_xe(meta) and meta.get("src") == source_hash(ENGINE_SOURCES) and \
-            all(meta["vision_srcs"][v] == vsrc for v in visions):
+    # an engine compiled before the programs took XeStrata's names has none of EXE's name, one before the picture
+    # reader was one binary none of VISION_EXE's: it is compiled again
+    have = (eng / EXE).exists() and (eng / VISION_EXE).exists()
+    if have and engine_is_xe(meta) and meta.get("src") == source_hash(ENGINE_SOURCES):
         return
 
     try:
-        build_engine(visions, get_llama_cpp(), recorded_compiler(meta), data_folder_path(None, load_settings()))
+        build_engine(get_llama_cpp(), recorded_compiler(meta), data_folder_path(None, load_settings()))
     except (Exception, SystemExit) as e:
         why = "" if isinstance(e, SystemExit) else f" ({e})"
-        if not engine_is_xe(meta):
-            fail(f"the installed engine is not the Xe build and compiling it failed{why}", "run ./setup.sh --setup")
+        if not engine_is_xe(meta) or not (eng / EXE).exists():
+            fail(f"the installed engine is not the Xe build of this version and compiling it failed{why}",
+                 "run ./setup.sh --setup")
         warn(f"could not compile the updated engine{why}: starting the installed one")
 
 
-# ---- image generation: Qwen-Image-2.1-Turbo on XeStrata's own image engine (strata-image, built with the text
+# ---- image generation: Qwen-Image-2.1-Turbo on XeStrata's own image engine (xestrata-image, built with the text
 # engine; serve/images.py).  upstream 0.1.44 (a5b3b6c2) runs stable-diffusion.cpp's sd-cli instead.
-# what XeStrata's earlier image generator (stable-diffusion.cpp's sd-cli, before strata-image) left in the install
+# what XeStrata's earlier image generator (stable-diffusion.cpp's sd-cli, before xestrata-image) left in the install
 OLD_IMAGE_ENGINE = ("engine-image", "build-image-vulkan", "build-image-cpu", "third_party/stable-diffusion.cpp")
 
 
@@ -4509,13 +6381,6 @@ def remove_old_image_engine() -> None:
         if p.is_dir():
             shutil.rmtree(p, ignore_errors=True)
             ok(f"removed {rel}/: the earlier image generator (sd-cli), which XeStrata's own image engine replaced")
-
-
-def _qimage():
-    if str(ROOT / "tools" / "image") not in sys.path:
-        sys.path.insert(0, str(ROOT / "tools" / "image"))
-    import qimage
-    return qimage
 
 
 def text_ram_gb(args: list, ram: float, model: str | None = None) -> float:
@@ -4555,11 +6420,17 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
     (setup_images).  A text encoder the chat model's own file (shared_text_quant, `chat_gguf`) keeps that size: its
     RAM is the chat model's."""
     QI = _qimage()
-    _, dit, enc = QI.IMAGE_MODELS[choice]
+    user = choice.startswith(QI.ANIMA_USER)   # a derivative of Anima in its folder: the release's files but its DiT
+    _, dit, enc = ("", "anima-base", "anima-stock") if user else QI.IMAGE_MODELS[choice]
     label, steps, _ = QI.DITS[dit]
+    if user:
+        label = choice
     q8 = {"on": True, "off": False}.get(getattr(a, "image_dit_q8", None) or "auto")   # None: by the VRAM
     asked = size or a.image_quant or QI.default_quant(dit)
     hunyuan = QI.is_hunyuanimage3(dit)
+    auto_largest = bool(getattr(a, "image_auto_largest", False) and size is None and not a.image_quant)
+    if auto_largest and hunyuan:
+        asked = QI.HUNYUANIMAGE3_QUANTS[-1]
     if hunyuan and asked not in QI.HUNYUANIMAGE3_QUANTS:   # Qwen-Image's --image-quant, given for this model too
         warn(f"--image-quant {asked}: {label} comes as w4a8 or int8 (Tencent's quantizations); w4a8 taken (int8 is "
              "the nearer the model's bf16 weights, and about twice as slow a step)")
@@ -4570,8 +6441,13 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
             warn(f"--image-quant {a.image_quant}: {label} comes in one size, which the engine quantizes itself "
                  "(--image-dit-q8 auto|on|off)")
         asked = QI.dit_quants(dit)[-1]
+        if auto_largest and getattr(a, "image_dit_q8", None) in (None, "auto"):
+            q8 = False
+            if text_gb is not None:
+                left = usable_ram_gb(a) - text_gb
+                q8 = not QI.fit_ram(left, enc, asked, QI.default_text_quant(dit), dit, q8=False)[2]
     dit_keep = getattr(a, "image_dit_keep", None) != "off"
-    tasked = "" if hunyuan else QI.DEFAULT_TEXT_QUANT       # HunyuanImage 3.0 has no text encoder
+    tasked = "" if hunyuan else QI.default_text_quant(dit)   # HunyuanImage 3.0 has no text encoder
     shared = shared_text_quant(QI, dit, enc, chat_gguf)
     if shared:
         tasked = shared
@@ -4581,7 +6457,7 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
     # the text encoder in the messages, where the model has one
     was, now = (f" (text encoder {tasked})", f" (text encoder {tquant})") if tasked else ("", "")
     if not ssd and text_gb is not None:
-        left = ram_gb() - text_gb
+        left = usable_ram_gb(a) - text_gb
         if shared:   # the chat model's file: counted in text_gb already, so not twice
             left += QI.FILES[QI.text_file(enc, shared)][2] / 1e9
         quant, tquant, fits = QI.fit_ram(left, enc, asked, tasked, dit, dit_keep, q8)
@@ -4607,67 +6483,184 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
         "POST /v1/images/generations)")
     if enc:
         tfile = QI.FILES[QI.text_file(enc, tquant)]
-        base = "Qwen3.5-9B" if QI.is_moss(dit) else f"Qwen3-VL-{'4B' if QI.is_mage(dit) else '8B'}"
+        base = ("Qwen3.5-9B" if QI.is_moss(dit) else "Qwen3-0.6B-Base" if QI.is_anima(dit)
+                else f"Qwen3-VL-{'4B' if QI.is_mage(dit) else '8B'}")
         say(f"  Text encoder: {Path(tfile[1]).name} ({tfile[0]}"
             + (f", {base} with its refusal direction removed)" if enc.endswith("uncensored") else ")")
             + (", the chat model's own file" if shared == tquant else ""))
     else:
         say(f"  Prompt: the model's own tokenizer ({QI.FILES['hunyuanimage3-tokenizer'][1]}) and its system prompt")
     say("  " + QI.license_note(dit))
-    return {"choice": choice, "quant": quant, "tquant": tquant, "lowered": lowered, "q8": q8,
-            "names": QI.file_names(quant, enc, tquant, dit)}
+    say("  " + QI.aux_note())
+    names = QI.file_names(quant, enc, tquant, dit)
+    if user:   # its DiT is the user's file, not one to fetch
+        names = names[1:]
+    return {"choice": choice, "requested_size": size, "quant": quant, "tquant": tquant, "lowered": lowered,
+            "q8": q8, "names": names}
+
+
+def image_descriptions(models_dir: Path) -> list[dict]:
+    """Image picker levels and size estimates, from the same files and RAM table as installation."""
+    qi = _qimage()
+    result = []
+    for family, origin, versions in qi.IMAGE_FAMILIES:
+        versions = list(versions)
+        if versions[0][0] == "anima-base":
+            versions.extend((name, f"Your own: {name[len(qi.ANIMA_USER):]}")
+                            for name in qi.anima_user_dits(models_dir))
+        for choice, version in versions:
+            own = choice.startswith(qi.ANIMA_USER)
+            _, dit, enc = qi.IMAGE_MODELS["anima-base" if own else choice]
+
+            def estimates(encoder: str) -> list[dict]:
+                sizes = []
+                for size in reversed(qi.size_choices(dit)):
+                    quant = qi.default_quant(dit) if qi.engine_quantized(dit) else size
+                    names = qi.file_names(quant, encoder, qi.default_text_quant(dit), dit)
+                    download = sum(qi.FILES[n][2] for n in names[1 if own else 0:]) / 1e9
+                    ram = qi.ram_need_gb(quant, encoder, qi.default_text_quant(dit), dit, q8=qi.mage_q8(size))
+                    if own:
+                        weight = (models_dir / qi.ANIMA_DIR / (choice[len(qi.ANIMA_USER):] + ".safetensors"))
+                        share = qi.MF_Q8_SHARE if size == "int8" else 1
+                        ram += (weight.stat().st_size - qi.FILES["anima-base-bf16"][2]) * share / 1e9
+                    sizes.append({"id": size, "download_gb": round(download, 1), "ram_gb": round(ram, 1)})
+                return sizes
+            sizes = estimates(enc)
+            uncensored = choice + "-uncensored" in qi.IMAGE_MODELS
+            uncensored_sizes = estimates(qi.IMAGE_MODELS[choice + "-uncensored"][2]) if uncensored else sizes
+            result.append({"id": choice, "title": choice if own else qi.DITS[dit][0],
+                           "family": family, "version": version, "origin": origin,
+                           "origin_key": qi.IMAGE_ORIGIN_KEYS[origin],
+                           "own": own,
+                           "about": "A DiT made from Anima on this PC" if own else qi.ABOUT.get(choice, ""),
+                           "download_gb": sizes[0]["download_gb"], "ram_gb": sizes[0]["ram_gb"],
+                           "sizes": sizes, "uncensored_sizes": uncensored_sizes, "quants": [x["id"] for x in sizes],
+                           "edits": dit in qi.MF_EDIT or (qi.is_moss(dit) and dit not in qi.MOSS_FEW_STEP)
+                           or not qi.engine_quantized(dit), "license": qi.license_note(dit),
+                           "tools": list(qi.IMAGE_TOOLS), "uncensored": uncensored})
+    return result
+
+
+def import_anima(path: Path, models_dir: Path) -> str:
+    """Check an Anima DiT and copy it without overwriting an existing model."""
+    qi = _qimage()
+    path = path.expanduser().resolve()
+    if path.suffix != ".safetensors" or any(c in path.stem for c in ",:/\\"):
+        raise ValueError("choose an Anima .safetensors file without commas or colons in its name")
+    why = qi.anima_header(path)
+    if why:
+        raise ValueError(why)
+    folder = models_dir / qi.ANIMA_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    dest = folder / path.name
+    reserved = {qi.local_path(models_dir, k).name for k in qi.FILES if k.startswith(("anima-", "llm-anima-"))}
+    if dest.name in reserved or "anima-" + path.stem in {v[0] for v in qi.IMAGE_MODELS.values()}:
+        raise ValueError("the name is reserved for an Anima release")
+    if dest.resolve() != path:
+        if dest.exists():
+            raise FileExistsError(f"{dest} is already there")
+        tmp = dest.with_name(dest.name + ".part")
+        try:
+            with path.open("rb") as src, tmp.open("xb") as out:
+                shutil.copyfileobj(src, out)
+            os.replace(tmp, dest)                # a half-copied file never appears under the final name
+        except BaseException:
+            try:                                 # after the with: Windows cannot unlink an open file
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+    name = qi.ANIMA_USER + path.stem
+    if name not in qi.anima_user_dits(models_dir):
+        raise ValueError("the name is reserved for an Anima release")
+    return name
 
 
 def ask_images(cfg_path: Path) -> str | None:
-    """Image generation asked on the console: the image models (numbers, comma-separated), the default of several, and
-    their -uncensored text encoder -> an --images value; None to leave the config's as it is (none before, none now).
-    The answers the model's config `cfg_path` was written with are the defaults."""
-    QI = _qimage()
-    plain = [c for c in QI.IMAGE_MODELS if not c.endswith("-uncensored")]
-    by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}
-    now: list[str] = []
+    """Choose image models one at a time; the first is the default."""
+    qi = _qimage()
+    if ARGS is not None:
+        ARGS.image_auto_largest = True
+    models_dir = (Path(ARGS.models_dir) if ARGS and ARGS.models_dir
+                  else data_folder_path(None, load_settings()) / "models")
+    by_name = {v[0]: k for k, v in qi.IMAGE_MODELS.items()}
+    for k in qi.anima_user_dits(models_dir):
+        by_name.setdefault("anima-" + k[len(qi.ANIMA_USER):], k)
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         cfg = {}
     if isinstance(cfg, dict) and isinstance(cfg.get("images"), dict):
-        now = [by_name[s["model_name"]] for s in [cfg["images"], *(cfg.get("image_models") or [])]
-               if isinstance(s, dict) and s.get("model_name") in by_name]
-    had = [c.removesuffix("-uncensored") for c in now]
-    say()
-    say("  Image generation: models that make images besides the text model (POST /v1/images/generations and the")
-    say("  web page's Images tab). One runs on the GPU at a time; with several, the web page and the API's \"model\"")
-    say("  choose, and a request that names none gets the default.")
-    for i, c in enumerate(plain, 1):
-        _, dit, enc = QI.IMAGE_MODELS[c]
-        names = QI.file_names(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit)
-        need = QI.ram_need_gb(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit)
-        say(f"    {i}. {c}: {QI.ABOUT.get(c, '')} (download {sum(QI.FILES[n][2] for n in names) / 1e9:.0f} GB, "
-            f"~{need:.0f} GB of RAM)")
-    default = ",".join(str(plain.index(c) + 1) for c in had if c in plain) or "none"
+        picks = [x.get("setup_choice") or by_name[x["model_name"]]
+                 for x in [cfg["images"], *(cfg.get("image_models") or [])]
+                 if isinstance(x, dict) and not x.get("training_base_only")
+                 and (x.get("setup_choice") or x.get("model_name") in by_name)]
+    else:
+        picks = [] if cfg else list(qi.SETUP_DEFAULT)
     while True:
-        got = ask("Which image models? (numbers, comma-separated; none: no image generation)", [], default, False,
-                  free=True)
-        if got.lower() in ("none", "no", "n", ""):
-            return "no" if now else None
-        try:
-            picks = [plain[int(x) - 1] for x in got.replace(" ", "").split(",")]
-            if len(set(picks)) == len(picks) and all(int(x) >= 1 for x in got.replace(" ", "").split(",")):
-                break
-        except (ValueError, IndexError):
-            pass
-        say(f"  please answer numbers from 1 to {len(plain)}, comma-separated, or none")
-    if len(picks) > 1:
-        first = had[0] if had and had[0] in picks else picks[0]
-        say("  " + ", ".join(f"{i}. {c}" for i, c in enumerate(picks, 1)))
-        d = int(ask("Which is the default?", [str(i) for i in range(1, len(picks) + 1)], str(picks.index(first) + 1),
-                    False))
-        picks = [picks[d - 1], *(c for i, c in enumerate(picks, 1) if i != d)]
-    if any(c + "-uncensored" in QI.IMAGE_MODELS for c in picks):
-        unc = ask("Their text encoder with its refusal direction removed (-uncensored)?", ["y", "n"],
-                  "y" if any(c.endswith("-uncensored") for c in now) else "n", False) == "y"
-        picks = [c + "-uncensored" if unc and c + "-uncensored" in QI.IMAGE_MODELS else c for c in picks]
-    return ",".join(picks)
+        say("  Image models chosen (the first is the default):")
+        for i, choice in enumerate(picks, 1):
+            say(f"    {i}. {choice}")
+        say("  a) add one   r) remove one   d) choose the default   k) keep these   n) none")
+        action = ask("What next?", ["a", "r", "d", "k", "n"], "k", False)
+        if action == "k":
+            return ",".join(picks) if picks else "no"
+        if action == "n":
+            return "no"
+        if action in ("r", "d"):
+            if picks:
+                n = int(ask("Which one?", [str(i) for i in range(1, len(picks) + 1)], "1", False)) - 1
+                item = picks.pop(n)
+                if action == "d":
+                    picks.insert(0, item)
+            continue
+        models = image_descriptions(models_dir)
+        families = list(dict.fromkeys(m["family"] for m in models))
+        for i, family in enumerate(families, 1):
+            say(f"    {i}) {family}")
+        index = int(ask("Which model?", [str(i) for i in range(1, len(families) + 1)], "1", False)) - 1
+        family = families[index]
+        versions = [m for m in models if m["family"] == family]
+        own = versions[0]["id"] == "anima-base"
+        if len(versions) > 1 or own:
+            for i, m in enumerate(versions, 1):
+                say(f"    {i}) {m['version']}")
+            if own:
+                say("    f) a file on this PC (an Anima DiT, .safetensors)")
+            choices = [str(i) for i in range(1, len(versions) + 1)] + (["f"] if own else [])
+            selected = ask("Which version?", choices, "1", False)
+            if selected == "f":
+                path = ask("Path to the Anima DiT", [], "", False, free=True)
+                try:
+                    name = import_anima(Path(path), models_dir)
+                    versions = image_descriptions(models_dir)
+                    model = next(m for m in versions if m["id"] == name)
+                except (OSError, ValueError) as e:
+                    say(f"  {e}")
+                    continue
+            else:
+                model = versions[int(selected) - 1]
+        else:
+            model = versions[0]
+        name = model["id"]
+        if model["uncensored"]:
+            say("    1) refusal direction removed (-uncensored)   2) original")
+            if ask("Its text encoder?", ["1", "2"], "1", False) == "1":
+                name += "-uncensored"
+        if picks and name in [n for n, _ in qi.parse_choices(",".join(picks))]:
+            say("  That model and text encoder are already chosen.")
+            continue
+        sizes = model["uncensored_sizes"] if name.endswith("-uncensored") else model["sizes"]
+        if len(sizes) > 1:
+            say("    1) auto (the largest that fits the RAM)")
+            for i, size in enumerate(sizes, 2):
+                say(f"    {i}) {size['id']}: download {size['download_gb']:.1f} GB, "
+                    f"~{size['ram_gb']:.1f} GB of RAM")
+            size = int(ask("Which size?", [str(i) for i in range(1, len(sizes) + 2)], "1", False)) - 1
+            if size:
+                name += ":" + sizes[size - 1]["id"]
+        picks.append(name)
+        say(f"  Added: {name}")
 
 
 def write_ratio_head(QI, models_dir: Path) -> None:
@@ -4682,9 +6675,9 @@ def write_ratio_head(QI, models_dir: Path) -> None:
     def read(url: str, start: int, end: int) -> bytes:
         for attempt in range(5):
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "strata-setup",
+                req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup",
                                                            "Range": f"bytes={start}-{end}"})
-                with urllib.request.urlopen(req, timeout=120) as r:
+                with download_core.open_url(req, say=net_say()) as r:
                     # only the range asked for when the server says so (206 and its Content-Range): a mirror or proxy
                     # that ignores Range answers 200 with the whole shard, which is not read
                     got = r.headers.get("Content-Range") or ""
@@ -4740,8 +6733,38 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
     exe = eng / IMAGE_EXE
     if not exe.exists():
         fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
-    plans = [image_plan(a, choice, text_gb, size, chat_gguf) for choice, size in QI.parse_choices(a.images)]
-    names = list(dict.fromkeys(n for p in plans for n in p["names"]))   # the files the models share, once
+    choices = QI.parse_choices(a.images)
+    training = getattr(a, "image_lora_training", None)
+    if training is None and not a.yes and not JSON_OUT:
+        training = ask_option("image-lora-training", False)
+    for c, _ in choices:
+        if c.startswith(QI.ANIMA_USER):
+            path = models_dir / QI.ANIMA_DIR / (c[len(QI.ANIMA_USER):] + ".safetensors")
+            why = QI.anima_header(path) if path.is_file() else "no such file"
+            if why:
+                fail(f"{c}: {path}: {why}", f"put the derivative's DiT (.safetensors) in {path.parent}")
+    plans = [image_plan(a, choice, text_gb, size, chat_gguf) for choice, size in choices]
+    extra_names = []
+    if training:
+        chosen = {p["choice"] for p in plans}
+        for source in list(plans):
+            choice = source["choice"]
+            base = QI.TRAINING_BASE.get(choice, choice)
+            if choice.startswith("qwen-image-"):
+                extra_names.append("base-F16")
+            if base == choice or base in chosen:
+                continue
+            # These configs expose the base to the training panel.  Its VAE and text encoder are the same as the
+            # derivative's; fetch only the base DiT, not the base's unrelated editing weights.
+            _, dit, _ = QI.IMAGE_MODELS[base]
+            quant = "F16" if dit == "base" else QI.default_quant(dit)
+            files = QI.file_names(quant, QI.IMAGE_MODELS[base][2], source["tquant"], dit)
+            dit_files = files[:4] if QI.is_moss(dit) else files[:1]
+            plans.append({**source, "choice": base, "requested_size": None, "quant": quant,
+                          "lowered": None, "names": dit_files, "training_base_only": True})
+            chosen.add(base)
+    # The files the models share, once.
+    names = list(dict.fromkeys([*(n for p in plans for n in p["names"]), *extra_names]))
     need = sum(QI.FILES[k][2] for k in names) / 1e9
     what = "the image model" if len(plans) == 1 else f"the {len(plans)} image models"
     if ask(f"Download {what} ({need:.1f} GB) and set up image generation?", ["y", "n"], "y", a.yes) != "y":
@@ -4760,19 +6783,275 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
         ok(f"system prompt: {prompt.name} ({len(prompt.read_text(encoding='utf-8'))} characters) out of "
            f"{QI.local_path(models_dir, 'hunyuanimage3-system-prompt').name}")
         write_ratio_head(QI, models_dir)
+    ask_sam3_license(a, models_dir / QI.AUX_DIR)
     cfgs = []
     for p in plans:
         cfg = QI.image_config(p["quant"], exe, models_dir, model=p["choice"],
                               uma=bool((gpu or {}).get("integrated")), policy=a.image_gpu_policy or "auto",
                               ssd_offload=getattr(a, "image_ssd_offload", None) == "on", text_quant=p["tquant"],
                               dit_q8=p["q8"], dit_keep=getattr(a, "image_dit_keep", None) != "off")
+        if p.get("training_base_only"):
+            # The full-step base shares the derivative's text/VAE files.  No editing adapters were downloaded.
+            cfg["training_base_only"] = True
+            for key in ("edit_model", "edit_steps", "edit_lora", "edit_adapter", "edit_adapters"):
+                cfg.pop(key, None)
+        cfg["setup_choice"] = p["choice"] + ((":" + p["requested_size"]) if p["requested_size"] else "")
         if p["lowered"]:
             cfg["quant_lowered"] = p["lowered"]
         cfgs.append(cfg)
         ok(f"image generation: {cfg['model_name']} {p['quant']}"
            + (f", text encoder {p['tquant']}" if p['tquant'] else "")
            + f", GPU policy {cfg['gpu_policy']}" + ("" if p is plans[0] else " (a request names it by \"model\")"))
+    fetch_image_tools(a, gpu, models_dir / QI.AUX_DIR, [c.get("family") for c in cfgs])
     return cfgs[0], cfgs[1:]
+
+
+def fetch_image_tools(a, gpu: dict | None, aux: Path, families: list) -> None:
+    """The image tools' weights fetched now (serve/image_aux.py setup_names: what the editing tools take by default
+    and fall back to, for this GPU's VRAM, the RAM and the image models of `families`), for --image-tools yes, and the
+    versions a request chooses as well for all (asked when not given, yes by default and with --yes).  Without them
+    the server fetches each the first time a tool needs it, and the tool waits for it.  One that fails is a warning:
+    the server fetches it then."""
+    from serve import image_aux
+    QI = _qimage()
+    vram = 0 if (gpu or {}).get("integrated") else int((gpu or {}).get("vram_gb", 0) * 1024)
+    ram = int(usable_ram_gb(a) * 1024)
+
+    def missing(versions: bool) -> list:
+        return [n for n in image_aux.setup_names(vram, ram, aux, families, versions) if not image_aux.ready(n, aux)]
+
+    def gb(names: list) -> float:
+        return sum(QI.FILES[QI.AUX[n]["file"]][2] for n in names) / 1e9
+    want = getattr(a, "image_tools", None)
+    if want is None:
+        if not missing(True):
+            return
+        if not a.yes:
+            say()
+            say(f"  The image tools' weights: yes {gb(missing(False)):.1f} GB, all {gb(missing(True)):.1f} GB")
+        want = ask_option("image-tools", a.yes)
+    if want == "no":
+        return
+    names = missing(want == "all")
+    for name in names:
+        got = image_aux.fetch(name, aux, lambda m: say(f"  {m}"))
+        if got["status"] == "ready":
+            ok(f"image tools: {name}")
+        else:
+            warn(f"image tools: {name} was not fetched ({got.get('error') or got['status']}): the server fetches it "
+                 "when a tool first needs it")
+
+
+def ask_sam3_license(a, aux: Path) -> None:
+    """SAM 3.1's weights (find_region, edit_region: words to masks) are under Meta's SAM License, so the server fetches
+    them only once the user has agreed (serve/image_aux.py, its record <aux>/sam3.accepted): asked here, no by default
+    and with --yes (agreeing is the user's own act); the web page's Images view asks it too.  Florence-2 (MIT) finds
+    the parts until then.  --image-sam3-license agree agrees without the question (the launcher's window, a script),
+    no leaves it unagreed without it."""
+    QI = _qimage()
+    mark = aux / "sam3.accepted"
+    if mark.is_file():
+        return
+    choice = getattr(a, "image_sam3_license", None)
+    if choice == "no":
+        return
+    if choice != "agree":
+        OPTION["image-sam3-license"]["vars"] = {"license": QI.SAM3_LICENSE}
+        if not a.yes:
+            say("  (you can also agree later, on the web page's Images view)")
+        if ask_option("image-sam3-license", a.yes) != "agree":
+            return
+    aux.mkdir(parents=True, exist_ok=True)
+    mark.write_text(f"{time.strftime('%Y-%m-%d %H:%M')} setup\n{QI.SAM3_LICENSE}\n", encoding="utf-8")
+    ok("the SAM License agreed to: SAM 3.1 (1.7 GB) comes with the image tools' weights, or when a part is first found")
+
+
+def image_gpu(a, cfg: dict) -> str | None:
+    """--image-gpu -> the PCI address of the card the image jobs take on their own (the "images" section's "gpu_pci",
+    serve/server.py's image_env), or None for the text model's.  auto: a usable discrete GPU that no text engine of
+    `cfg` takes (its "gpu_pci" and "split_pci", the replicas' cards among them), the one with the most VRAM; when the
+    text model takes every card and has exactly one later card, that card (the server lends it to each image job:
+    a helper expert cache there closes for it, serve/server.py image_helper_card); none when the config names no
+    text card (one GPU)."""
+    want = getattr(a, "image_gpu", None) or "auto"
+    if want == "same":
+        return None
+    usable = [x for x in gpus() if gpu_problem(x) is None]
+    if want != "auto":
+        g = next((x for x in usable if x["pci"].lower() == want.lower()), None)
+        if g is None:
+            fail(f"--image-gpu {want}: no usable GPU at that PCI address",
+                 "--check lists the GPUs and their PCI addresses")
+        return g["pci"]
+    text = {cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])} - {None}
+    free = [x for x in usable if x["pci"] not in text and not x.get("integrated")]
+    if not text:
+        return None
+    if not free:
+        later = cfg.get("split_pci") or []
+        return later[0] if len(later) == 1 and not cfg.get("replicas") else None
+    return max(free, key=lambda x: x["vram_gb"])["pci"]
+
+
+def place_images(a, cfg: dict) -> None:
+    """The "images" section's card (image_gpu), said as setup chose it."""
+    if not isinstance(cfg.get("images"), dict):
+        return
+    pci = image_gpu(a, cfg)
+    cfg["images"].pop("gpu_pci", None)
+    later = cfg.get("split_pci") or []
+    if pci and len(later) == 1 and pci == later[0] and not cfg.get("replicas"):
+        g = next(x for x in gpus() if x["pci"] == pci)
+        cfg["images"]["gpu_pci"] = pci
+        ok(f"image GPU: {gpu_name(g)}, the text model's second card: lent to each image job (the text model uses it "
+           "as a helper expert cache, or not at all when the first card is as fast alone)")
+    elif pci and pci in {cfg.get("gpu_pci"), *later}:
+        warn(f"--image-gpu {pci}: the text model takes that GPU too, so the image jobs share it (one at a time)")
+    elif pci:
+        g = next(x for x in gpus() if x["pci"] == pci)
+        cfg["images"]["gpu_pci"] = pci
+        ok(f"image GPU: {gpu_name(g)}, apart from the text model's: the images are made beside the chat")
+
+
+# ------------------------------------------------------------------------------------------------ translation
+# The translation model (serve/translate.py's MODELS; the run config's "translate" section, serve/server.py's
+# Translation): its own engine on its GGUF, started with the first translation, beside the text model.
+TRANSLATE_DIR = "translate"                          # its folder in the models folder
+# The RAM (GB) its engine keeps beside its file: its K/V at the 8K tokens it is started with (the 2B's and the 0.8B's
+# sliding-window layers keep a ring), the engine's buffers and the runtime's, with room to spare (an allowance, not
+# measured)
+TRANSLATE_RAM_EXTRA_GB = 2.5
+
+
+def translate_ram_gb(m) -> float:
+    return TRANSLATE_FILES[m.file][0] / 1e9 + TRANSLATE_RAM_EXTRA_GB
+
+
+def images_ram_gb(cfg: dict) -> float:
+    """The RAM (GB) the config's image models keep while one of them runs (one at a time: the largest), as image_plan
+    fitted them (qimage.ram_need_gb)."""
+    QI = _qimage()
+    by_name = {v[0]: v for v in QI.IMAGE_MODELS.values()}
+    need = 0.0
+    for s in [cfg.get("images"), *(cfg.get("image_models") or [])]:
+        if not isinstance(s, dict):
+            continue
+        model = by_name.get(s.get("model_name")) or (("", "anima-base", "anima-stock")
+                                                     if s.get("family") == "anima" else None)
+        if model is None or not s.get("quant"):
+            continue
+        _, dit, enc = model
+        try:
+            need = max(need, QI.ram_need_gb(s["quant"], enc, s.get("text_quant") or QI.default_text_quant(dit), dit,
+                                            q8=s.get("dit_q8")))
+        except KeyError:                              # a size this XeStrata does not know: the files' own
+            continue
+    return need
+
+
+def saved_config(cfg_path: Path) -> dict:
+    """The model's earlier run config, {} when there is none."""
+    try:
+        old = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    return old if isinstance(old, dict) else {}
+
+
+def saved_translate(cfg_path: Path):
+    """The model's config's "translate" section: its dict, None for no translation (--translate no), or ... when the
+    config has none (set up before translation was, or never)."""
+    return saved_config(cfg_path).get("translate", ...)
+
+
+def translate_gpu(a, on_cpu: bool) -> str:
+    """--translate-gpu -> the "translate" section's "gpu": auto (the image jobs' card where the config has images, else
+    the text model's), same, cpu, or a usable GPU's PCI address; cpu without a GPU."""
+    want = getattr(a, "translate_gpu", None) or "auto"
+    if on_cpu:
+        if want not in ("auto", "same", "cpu"):
+            warn(f"--translate-gpu {want}: the model runs on the CPU, so translations do too")
+        return "cpu"
+    if want in ("auto", "same", "cpu"):
+        return want
+    g = next((x for x in gpus() if gpu_problem(x) is None and x["pci"].lower() == want.lower()), None)
+    if g is None:
+        fail(f"--translate-gpu {want}: no usable GPU at that PCI address",
+             "--check lists the GPUs and their PCI addresses")
+    return g["pci"]
+
+
+def translate_model(a, text_gb: float, image_gb: float):
+    """--translate's model -> (it, the size it was lowered from or None), or (None, None): no, or none fits.  auto: the
+    2B where the RAM the text and image models leave holds it, else the 0.8B, else none (the 8B only when asked)."""
+    want = a.translate
+    if want == "no":
+        return None, None
+    if want != "auto":
+        return translate_mod.model_by_size(want), None
+    left = usable_ram_gb(a) - text_gb - image_gb
+    first, small = (translate_mod.MODELS[f"plamo-3-translate-{x}"] for x in ("2b", "0.8b"))
+    for m in (first, small):
+        if translate_ram_gb(m) <= left:
+            if m is not first:
+                warn(f"translation: {m.name}, not {first.name}: the RAM the text and image models leave "
+                     f"({max(left, 0):.1f} GB) does not hold the 2B ({translate_ram_gb(first):.1f} GB); "
+                     "--translate 2b takes it all the same")
+            return m, (None if m is first else first.size)
+    warn(f"translation: not set up: the RAM the text and image models leave ({max(left, 0):.1f} GB) holds no "
+         "translation model; --translate 0.8b or 2b sets one up all the same")
+    return None, None
+
+
+def ask_translate(cfg_path: Path) -> str:
+    """--translate asked on the console, after the image models; the answer the model's config `cfg_path` was written
+    with offered."""
+    saved = saved_translate(cfg_path)
+    return ask_option("translate", False, default=(
+        "no" if saved is None else saved.get("choice", "auto") if isinstance(saved, dict) else None))
+
+
+def setup_translate(a, cfg: dict, cfg_path: Path, text_gb: float, on_cpu: bool = False) -> None:
+    """The run config's "translate" section for --translate (no, auto, 2b, 0.8b, 8b) and --translate-gpu: the model
+    downloaded and checked, its card.  Not given: asked in a terminal (the earlier answer offered), else the earlier
+    config's section kept (carry_over; its card changed by --translate-gpu), else auto (ask_translate asks in a
+    terminal beforehand).  `text_gb`: the RAM the text
+    model keeps (as image_plan's); the image models' are read of `cfg`."""
+    saved = saved_translate(cfg_path)
+    if a.translate is None:
+        if saved is ...:
+            a.translate = "auto"
+        elif isinstance(saved, dict) and getattr(a, "translate_gpu", None):
+            cfg["translate"] = {**saved, "gpu": translate_gpu(a, on_cpu)}
+            return
+        else:                                        # carried over as it is (carry_over)
+            return
+    # the image models this run set up, else the earlier ones it carries over
+    m, lowered = translate_model(a, text_gb, images_ram_gb(cfg if "images" in cfg else saved_config(cfg_path)))
+    if m is None:
+        cfg["translate"] = None
+        if a.translate == "no":
+            ok("translation: off")
+        return
+    gpu = translate_gpu(a, on_cpu)
+    size, sha = TRANSLATE_FILES[m.file]
+    lic, url = m.license
+    say()
+    say(f"  {m.name}: the translation APIs (DeepL's, LibreTranslate's, OpenAI's) and the web page's Translate tab.")
+    say(f"  Its license is the {lic}, not free software: {url}")
+    say("  (its full text: the web app's About > Model terms).  Read it before you use the model.")
+    say("  XeStrata does not include the model: it is downloaded now.")
+    dst = Path(a.models_dir) / TRANSLATE_DIR / m.file
+    if not (dst.exists() and done(dst)) and free_gb(Path(a.models_dir)) < size / 1e9 + 2:
+        warn(f"less than {size / 1e9 + 2:.0f} GB free for {m.name}: the download may run out of disk space")
+    download(hf(m.repo) + m.file, dst, f"translation model: {m.file}")
+    verify_sha256(dst, size, sha)
+    cfg["translate"] = {"model": m.id, "path": str(dst), "gpu": gpu, "choice": a.translate}
+    if lowered:
+        cfg["translate"]["lowered"] = lowered
+    ok(f"translation: {m.name} on " + {"auto": "the image jobs' GPU where there is one, else the text model's",
+                                       "same": "the text model's GPU", "cpu": "the CPU"}.get(gpu, f"the GPU {gpu}")
+       + " (started with the first translation)")
 
 
 # ------------------------------------------------------------------------------------------------ the data folder
@@ -4830,10 +7109,7 @@ DISPLAY_RESERVE_MIB = 1500     # upstream #779: the tip for an NVIDIA card that 
 DESKTOP_RESERVE_MIB = 3072     # upstream #560 #516: what kept a KDE/Wayland desktop alive beside a full expert cache
 
 
-def linux_desktop(env=None) -> bool:
-    """A graphical session on Linux (Wayland or X)."""
-    env = os.environ if env is None else env
-    return sys.platform.startswith("linux") and bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"))
+linux_desktop = hardware.linux_desktop
 
 
 def desktop_reserve_note() -> list[str]:
@@ -4911,7 +7187,7 @@ def kv_streaming_ram_gb(ctx, kv) -> float:
 def kv_streaming_wanted(model, ctx, kv, ram) -> bool:
     """Does setup stream this model's KV cache on this PC (--kv-resident): from 64K up, when the RAM holds the cache
     beside the model's experts (+1 GB).  The merges' and the release's measurements ask it too (tools/bench_core.py)."""
-    return ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_streaming_ram_gb(ctx, kv) + 1
+    return ctx >= 65536 and ram >= MODELS[model]["arena_gb"] + LOW_RAM_HEADROOM_GB + kv_streaming_ram_gb(ctx, kv) + 1
 
 
 #: The draft layer (MTP) takes about 1 GB of graphics memory out of the expert cache (upstream 671f4573d): its files
@@ -4942,15 +7218,33 @@ def low_ram_resident(model, ram, vram_gb, ctx=32768, kv="int8") -> bool:
     return ram >= rest + LOW_RAM_HEADROOM_GB
 
 
+def minimum_setup_ram(family: str | None) -> float:
+    """Keep other families' existing entry gate when Sync's smaller pack is added."""
+    return min(d["ram_gb"] for d in MODELS.values()
+               if family == "sync" or "sync" not in d.get("families", ()))
+
+
+def setup_ram_stop(family: str | None, ram: float, need: float) -> None:
+    """Stop setup: this PC's RAM is short of the smallest Flash-Next size `family` offers (minimum_setup_ram)"""
+    # every model keeps ALL its experts in RAM (23+ GB) unless the GPU holds enough of them for the low-RAM mode
+    hint = ("Sync-XS needs about 24 GiB of RAM; add memory or keep less reserved" if family == "sync" else
+            "XeStrata keeps the model's experts in RAM (23-50 GB) and the GPU holds a copy of the "
+            "most-used ones: it needs 32 GB of RAM or more (48 GB for the full model), or a GPU with "
+            "the VRAM to hold most of them")
+    fail(f"RAM: {ram:.0f} GB - the smallest model needs about {need} GB", hint)
+
+
 def low_ram_fits(model, ram, vram_gb) -> bool:
     """In the low-RAM mode: the experts the GPU does not hold fit the RAM left beside the rest (as file cache)."""
     return ram - 6 + max(0.0, vram_gb - 5 - MTP_VRAM_GB) >= MODELS[model]["arena_gb"]
 
 
 def model_file(fam: dict, model: str, i: int) -> str:
-    """Shard i's file name: the family's pattern, or the model's own (UD-IQ4_XS has three shards, not four).  {q} is the
-    name on the Hub ("quant"; the catalog name of the v3.1 UD-IQ4_XS is another)."""
-    return MODELS.get(model, {}).get("file", fam["file"]).format(q=model_quant(model), i=i)
+    """Shard i's file name: the family's own form of the size, the size's, or the family's pattern (UD-Q2_0 has three
+    shards, not four; huihui-ai's UD-IQ4_XS three).  {q} is the name on the Hub ("quant"; the catalog name of the v3.1
+    UD-IQ4_XS is another)."""
+    form = {**MODELS.get(model, {}), **fam.get("forms", {}).get(model, {})}
+    return form.get("file", fam["file"]).format(q=model_quant(model), i=i)
 
 
 def model_quant(model: str) -> str:
@@ -4981,8 +7275,301 @@ def fam_pin(fam: dict, s: Path) -> tuple[int, str]:
     return pin
 
 
+def family_sizes(family: str) -> list:
+    """A family's sizes in setup's order: a model of PLAIN_FAMILIES as its table lists them; a Flash-Next family's
+    (MODELS) the experimental ones last."""
+    fam = FAMILIES[family]
+    if fam.get("plain"):
+        return list(fam["models"])
+    return sorted((m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))),
+                  key=lambda m: bool(MODELS[m].get("experimental")))
+
+
+def size_quantizer(family: str, size: str) -> str:
+    """The quantization a size is of (QUANTIZERS): its family's, or the size's own (Ornith-1.5's GSQ-RCO sizes)"""
+    fam = FAMILIES[family]
+    own = fam["models"].get(size, {}).get("quantizer") if fam.get("plain") else None
+    return own or ("own" if fam.get("custom") else TIERS[family][2])
+
+
+def tier_of(family: str) -> tuple:
+    """(model, version, quantization) of a family; a model of the user's own files is a model of its own"""
+    return TIERS.get(family) or (CUSTOM, "original", "own")
+
+
+def served_name(family: str, size: str) -> str:
+    """The name the server answers to (the run config's "model_name"), by the same levels as setup's questions: the
+    model, its version where it is not the original, the quantization, the size (SC117's Swift 1.5 in GSQ-RCO's
+    IQ3_XXS: qwen3.8-flash-next-swift-sc117-gsq-rco-iq3_xxs).  A level the next one already says is left out
+    (HauhauCS's version is HauhauCS's files; a Gyro size begins with "gyro-"; of GSQ-RCO by pfeifferj only "pfeifferj"
+    comes before a "gsq-rco-" size).  A model of the user's own files keeps its family's name and the size.  The name
+    before 2026-11-09 (legacy_name) stays an alias of a config setup writes again (carry_over)."""
+    if family not in TIERS:
+        return legacy_name(family, size)
+    model, version, _ = TIERS[family]
+    quant, s = size_quantizer(family, size), size.lower()
+    parts = [BASES[model].lower()]
+    if version != "original":
+        parts.append(version)
+    if quant != version and not s.startswith(quant + "-"):
+        method = next((m for m in QUANTIZERS if quant.startswith(m + "-") and s.startswith(m + "-")), None)
+        parts.append(quant[len(method) + 1:] if method else quant)
+    return "-".join(parts + [s])
+
+
+def legacy_name(family: str, size: str) -> str:
+    """A family's served name before the levels (2026-11-09): its table's "name" and the size"""
+    return f"{FAMILIES[family]['name']}-{size.lower()}"
+
+
+def tier_families(base: str | None = None, variant: str | None = None, fams=None) -> list:
+    """The families of a model (and a version), in the order setup lists them"""
+    order = list(BASES)
+    fams = [f for f in (fams if fams is not None else FAMILIES) if f in TIERS]
+    fams.sort(key=lambda f: order.index(TIERS[f][0]))
+    return [f for f in fams if (base is None or TIERS[f][0] == base) and (variant is None or TIERS[f][1] == variant)]
+
+
+def tier_family(base: str, variant: str | None, quantizer: str | None) -> str:
+    """--base, --variant and --quantizer -> the family (the version and quantization first listed where not given);
+    a choice that matches none stops setup with the ones there are"""
+    if base not in BASES:
+        fail(f"--base {base}: no such model", "choose one of: " + ", ".join(BASES))
+    fams = tier_families(base)
+    variants = list(dict.fromkeys(TIERS[f][1] for f in fams))
+    if variant is not None and variant not in variants:
+        fail(f"--variant {variant}: {BASES[base]} has no such version", "choose one of: " + ", ".join(variants))
+    fams = [f for f in fams if TIERS[f][1] == (variant or variants[0])]
+    quants = {q: f for f in fams
+              for q in dict.fromkeys([TIERS[f][2], *(size_quantizer(f, m) for m in family_sizes(f))])}
+    if quantizer is not None and quantizer not in quants:
+        fail(f"--quantizer {quantizer}: no such quantization of that version", "choose one of: " + ", ".join(quants))
+    return quants[quantizer] if quantizer else fams[0]
+
+
+class Room(NamedTuple):
+    """This PC's memory as the recommendations read it (GB): the RAM; the VRAM that holds Flash-Next experts
+    (low_ram_fits' vram_gb: the first card's, each later card's less 5); the VRAM that holds a plain MoE's weights
+    (each card less 5 for its buffers, setup_plain's); the VRAM a dense model has (every card's); the context a dense
+    model is sized at (vram_ctx); no GPU (the CPU runs the model)."""
+    ram: float
+    vram: float = 0.0
+    plain_vram: float = 0.0
+    gpu_gb: float = 0.0
+    ctx: int = 32768
+    on_cpu: bool = False
+
+
+def room_of(ram: float, cards: list) -> Room:
+    """The Room of this PC with `cards` (the GPUs a model runs on; none, or the CPU's entry: no GPU)"""
+    if not cards or cards[0].get("cpu"):
+        return Room(ram, on_cpu=True)
+    return Room(ram, gpu_expert_vram(cards[0]) + sum(max(0.0, gpu_expert_vram(c) - 5) for c in cards[1:]),
+                sum(max(0.0, c.get("vram_gb", 0.0) - 5) for c in cards), sum(gpu_expert_vram(c) for c in cards),
+                vram_ctx(cards))
+
+
+def size_quality(family: str, size: str) -> tuple:
+    """A size's place in its family's quality order, lowest first: a Flash-Next size by its experts (more bits keep more
+    of the model), then its download (AtomicChat's AD-5.00bpw: the same experts, the n-gram table at 8 bits); a model
+    of PLAIN_FAMILIES by its files' size, or its "rank" where its authors rank sizes otherwise (APEX's I-Quality above
+    the larger I-Balanced)"""
+    fam = FAMILIES[family]
+    if fam.get("plain"):
+        d = fam["models"][size]
+        return (d.get("rank", 0), d["size"])
+    return (MODELS[size]["arena_gb"], MODELS[size]["download_gb"])
+
+
+def size_fits(family: str, size: str, room: Room) -> bool:
+    """Does this size run on this PC with its weights in memory: a Flash-Next size's experts all in RAM (a RAM-budget
+    size's beside UNSLOTH_RAM_LEFT_GB, a GSQ-RCO size's in the low-RAM mode too, its file cache the GPU's share), a
+    plain MoE's file in RAM and VRAM with 8 GB beside it, a dense model's weights and K/V in VRAM; on the CPU, a dense
+    model in RAM"""
+    fam = FAMILIES[family]
+    if fam.get("plain"):
+        d = fam["models"][size]
+        if room.on_cpu:
+            return bool(fam.get("cpu")) and cpu_ram_gb(fam, cpu_ctx(fam, room.ram)) <= room.ram
+        if fam.get("dense"):
+            return room.gpu_gb >= dense_vram_gb(fam, d, min(DENSE_MIN_CTX, fam["max_context"]))
+        if d.get("card_gb"):    # Inkling-2-Mini: every expert on one card (INKLING_CARD_GB; plain_vram is its less 5)
+            return room.plain_vram + 5 >= d["card_gb"] and room.ram >= 8
+        return room.ram + room.plain_vram >= d["size"] / 1e9 + 8
+    d = MODELS[size]
+    if family == "sync":
+        return room.ram >= d["ram_gb"] and (size != "Sync-S" or room.vram >= 12 or room.ram >= 48)
+    if d.get("budget"):
+        return d["arena_gb"] + UNSLOTH_RAM_LEFT_GB <= room.ram
+    if room.ram >= d["ram_gb"]:
+        return True
+    gsq = family in TIERS and TIERS[family][2] == "gsq-rco"
+    return gsq and low_ram_fits(size, room.ram, room.vram)
+
+
+# The recommendations by quality (the user's decisions of 2026-11-09 and 2026-11-14): a GSQ-RCO family's best size this
+# PC runs (IQ3_S before IQ3_XXS); a model of PLAIN_FAMILIES up to Q8_0, never its unquantized weights (BF16 answers as
+# Q8_0 does, in twice the memory)
+PLAIN_TOP = "Q8_0"
+UNQUANTIZED = ("BF16", "F16", "F32")
+
+
+def recommend_size(family: str, room: Room, names: list | None = None) -> str:
+    """The size setup recommends of `family` (of `names`, a quantization's): the best quality this PC runs with its
+    weights in memory (size_fits), never an experimental one - a GSQ-RCO family's IQ3_S where it runs, else its
+    IQ3_XXS, a model of PLAIN_FAMILIES' at most Q8_0, on the CPU the family's own choice - else the smallest"""
+    fam = FAMILIES[family]
+    names = names or family_sizes(family)
+    if room.on_cpu and fam.get("default") in names:
+        return fam["default"]
+    order = sorted(names, key=lambda m: size_quality(family, m))
+    kept = [m for m in order if not (not fam.get("plain") and MODELS[m].get("experimental"))
+            and not (fam.get("plain") and fam["models"][m].get("by_hand"))] or order
+    if fam.get("plain"):
+        top = [m for m in kept if m not in UNQUANTIZED and
+               (PLAIN_TOP not in kept or size_quality(family, m) <= size_quality(family, PLAIN_TOP))]
+        kept = top or kept
+    fits = [m for m in kept if size_fits(family, m, room)]
+    return fits[-1] if fits else kept[0]
+
+
+def ask_tiers(fams: list, rec_fam: str, room: Room, halo_fam: str | None, yes: bool) -> tuple:
+    """Step 2's first questions: the model, its version and its quantization (TIERS), each with `rec_fam`'s answer
+    as the default (its recommended size's quantization) and a level of one choice not asked -> the family and the
+    quantization chosen (None where the family has only its own)"""
+    rec_base, rec_variant, _ = TIERS[rec_fam]
+    rec_quant = size_quantizer(rec_fam, recommend_size(rec_fam, room))
+
+    def pick(question: str, choices: list, lines: list, rec) -> Any:
+        if len(choices) == 1:
+            return choices[0]
+        for i, line in enumerate(lines, 1):
+            say(f"  {i}) {line}")
+        default = str(choices.index(rec) + 1) if rec in choices else "1"
+        return choices[int(ask(question, [str(i) for i in range(1, len(choices) + 1)], default, yes)) - 1]
+
+    ordered = tier_families(fams=fams)
+    bases = list(dict.fromkeys(TIERS[f][0] for f in ordered))
+    firsts = {b: next(f for f in ordered if TIERS[f][0] == b) for b in bases}
+    base = pick("Which model?", bases,
+                [f"{BASES[b]:28s} {BASE_ABOUT.get(b, FAMILIES[firsts[b]]['about'])}"
+                 + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if halo_fam and TIERS[halo_fam][0] == b
+                    else "") for b in bases], rec_base)
+    in_base = [f for f in ordered if TIERS[f][0] == base]
+    variants = list(dict.fromkeys(TIERS[f][1] for f in in_base))
+    by = {v: FAMILIES[next(f for f in in_base if TIERS[f][1] == v)]["by"] for v in variants}
+    variant = pick("Which version?", variants, [f"{VARIANTS[v]:28s} {by[v]}" for v in variants],
+                   rec_variant if base == rec_base else variants[0])
+    quants: dict[str, str] = {}
+    for f in (f for f in in_base if TIERS[f][1] == variant):
+        for q in dict.fromkeys(size_quantizer(f, m) for m in family_sizes(f)):
+            quants.setdefault(q, f)
+    lines = [f"{QUANTIZERS[q]:28s} " + (FAMILIES[f]["about"] if list(quants.values()).count(f) == 1 else
+                                        ", ".join(m for m in family_sizes(f) if size_quantizer(f, m) == q))
+             + ("   [experimental]" if FAMILIES[f].get("experimental") else "") for q, f in quants.items()]
+    quant = pick("Which quantization?", list(quants), lines,
+                 rec_quant if (base, variant) == (rec_base, rec_variant) else next(iter(quants)))
+    family = quants[quant]
+    return family, (quant if len({size_quantizer(family, m) for m in family_sizes(family)}) > 1 else None)
+
+
+def runs_here(family: str, room: Room) -> bool:
+    """Does any size of the family, experimental ones aside, run on this PC with its weights in memory"""
+    fam = FAMILIES[family]
+    return any(size_fits(family, m, room) for m in family_sizes(family)
+               if fam.get("plain") or not MODELS[m].get("experimental"))
+
+
+def gpu_holds_most(size: str, room: Room) -> bool:
+    """Most of a Flash-Next size's experts in the GPUs' cache at 32K (low_ram_gpu_gb: the VRAM less ~6 GB for the
+    dense weights, buffers and the draft layer).  Below that "most experts stay on the CPU and it will be slow" (step
+    1's line for a small card), and a 3-bit GSQ-RCO size does more CPU work per expert than a smaller one: IQ3_S needs
+    6 + 50.3 / 2 = 31.2 GB, IQ3_XXS 6 + 42.9 / 2 = 27.5."""
+    return low_ram_gpu_gb(size, room.vram) >= MODELS[size]["arena_gb"] / 2
+
+
+def first_choice(fams: list, room: Room) -> tuple:
+    """(family, size) a first install is offered: on the CPU Qwen3.5-2B, else the first of FIRST_CHOICE this PC runs
+    (the first of its sizes that runs with what it asks of the GPUs, or any size, and its peak RAM with
+    LOW_RAM_HEADROOM_GB beside it), else Qwen3.5-2B (LAST_CHOICE); the first of `fams` without it.  The size is None
+    where the family's own recommendation (recommend_size) decides it."""
+    last = (LAST_CHOICE if LAST_CHOICE in fams else fams[0], None)
+    if room.on_cpu:
+        return last
+    for f, sizes, peak, most in FIRST_CHOICE:
+        if f not in fams or (peak is not None and room.ram < peak + LOW_RAM_HEADROOM_GB):
+            continue
+        if sizes is None:
+            if runs_here(f, room):
+                return f, None
+            continue
+        size = next((m for m in sizes if size_fits(f, m, room) and (not most or gpu_holds_most(m, room))), None)
+        if size:
+            return f, size
+    return last
+
+
+def first_offered(fams: list, room: Room) -> tuple:
+    """first_choice among the families setup can download (the user's decision of 2026-11-22): one whose model
+    repository Hugging Face answers 401 (repo_closed) is passed over with a line that says so, and the next of
+    FIRST_CHOICE is offered.  When none is left (the last step closed too) setup stops, naming each."""
+    fams, passed = list(fams), []
+    while True:
+        f, size = first_choice(fams, room)
+        shut = [r for role, r in family_repos(f, size or recommend_size(f, room)) if role == "model" and repo_closed(r)]
+        if not shut:
+            return f, size
+        passed.append(f"{FAMILIES[f]['title']} ({', '.join(shut)})")
+        warn(f"{FAMILIES[f]['title']} is passed over: Hugging Face answers 401 for {', '.join(shut)} (the repository "
+             "is private or gone; setup downloads without a login)")
+        if f == LAST_CHOICE or f not in [c for c, *_ in FIRST_CHOICE]:
+            fail("none of the models setup offers a first install can be downloaded: Hugging Face answers 401 for "
+                 + "; ".join(passed), "choose another model with --family (--help lists them), or update XeStrata")
+        fams.remove(f)
+
+
+def apu_first(gpu) -> bool:
+    """XeStrata-890M: a GPU that shares the RAM (an integrated GPU, as the device reports it) on AMD's driver: the
+    devices this fork tunes Qwen3.8-Flash-Next's decode for, whose first install keeps the fork's offer."""
+    return shares_ram(gpu) and (gpu or {}).get("vendor") == "amd"
+
+
+def apu_first_choice(fams: list, ram: float) -> tuple:
+    """XeStrata-890M: (family, size) a first install is offered on an integrated AMD GPU (apu_first): Qwen3.8-Flash-
+    Next's GSQ-RCO files, IQ3_XXS from 60 GB of RAM, else Q2_0, as the fork offered before upstream's FIRST_CHOICE
+    (the user's decisions of 2026-11-09 to 11-22, made on discrete cards): the model and the sizes whose decode the
+    fork measures on the Radeon 890M."""
+    if "qwen" not in fams:
+        return fams[0], None
+    return "qwen", ("IQ3_XXS" if ram >= 60 else "Q2_0")
+
+
+def recommend_family(fams: list, room: Room) -> str:
+    """The family a first install is offered (first_choice)"""
+    return first_choice(fams, room)[0]
+
+
 def model_shards(fam: dict, model: str) -> int:
-    return MODELS.get(model, {}).get("shards", fam.get("shards", 2))
+    return fam.get("forms", {}).get(model, MODELS.get(model, {})).get("shards", fam.get("shards", 2))
+
+
+def files_gb(family: str, model: str) -> float:
+    """A size's model files on disk (GB), as setup's lists show it: the sizes pinned for that family's files (SC117's
+    Swift 1.5 IQ3_S 83.5, not MODELS' 83.6 of ISTA-DASLab's), a Sync pack's files with the files all packs share, a
+    model of PLAIN_FAMILIES' file; a model of the user's own files as setup read them.  The picture reader and the MTP
+    draft layer are not counted."""
+    fam = FAMILIES[family]
+    if fam.get("plain"):
+        return fam["models"][model]["size"] / 1e9
+    if fam.get("custom"):
+        return MODELS[model]["download_gb"]
+    if family == "sync":
+        return sum(n for files in (sync_models.PACK_FILES[model], sync_models.SHARED_FILES)
+                   for n, _ in files.values()) / 1e9
+    pins = [published_pin(model_file(fam, model, i), fam, model) for i in range(1, model_shards(fam, model) + 1)]
+    if None in pins:
+        raise KeyError(f"{family} {model}: a model file without a pinned size")
+    return sum(p[0] for p in pins if p) / 1e9
 
 
 def resident_budget_gib(model, ram, kv_ram_gb=0.0, uma=False) -> int:
@@ -5095,8 +7682,9 @@ def budget_choice(model, ram, asked, uma=False) -> float:
     if asked > rec:
         warn(f"a {asked:g} GiB RAM budget is more than setup recommends for this PC ({rec} GiB: the RAM less "
              f"{UNSLOTH_RAM_LEFT_GB if uma else UNSLOTH_BUDGET_LEFT_GB} GB for the OS, the engine and the file cache "
-             "that reads the other experts). Kept as you chose: the engine clamps it to the RAM it finds free at start "
-             "(less 8 GiB), and the file cache gets less room - it may be slower, or run the PC out of RAM under load")
+             "that reads the other experts). Kept "
+             "as you chose: the engine clamps it to the RAM it finds free at start (less 8 GiB), and the file cache "
+             "gets less room - it may be slower, or run the PC out of RAM under load")
     return int(asked) if asked == int(asked) else asked
 
 
@@ -5118,17 +7706,23 @@ def settings_path() -> Path:
 
 def load_settings() -> dict:
     try:
-        return json.loads(settings_path().read_text(encoding="utf-8"))
+        return settings.load(settings_path(), strict=False)
     except (OSError, ValueError):
         return {}
 
 
 def save_settings(s: dict) -> None:
+    path = settings_path()
+    if path.exists():
+        try:
+            settings.load(path)              # never replace settings we could not read with an empty default
+        except (OSError, ValueError) as e:
+            warn(f"could not read {path} ({e}); its settings are kept until the file is fixed")
+            return
     try:
-        settings_path().parent.mkdir(parents=True, exist_ok=True)
-        write_private(settings_path(), json.dumps(s, indent=1))
+        settings.save(path, s)
     except OSError as e:
-        warn(f"could not save {settings_path()} ({e})")
+        warn(f"could not save {path} ({e})")
 
 
 def has_data(folder: Path) -> bool:
@@ -5141,16 +7735,31 @@ def has_data(folder: Path) -> bool:
     return False
 
 
+def in_trash(path: str | os.PathLike) -> bool:
+    """#3410: True when ``path`` is inside a Trash / Recycle Bin folder (a Strata folder that was deleted with the file
+    manager is still a folder there, and was remembered as an install): ~/.local/share/Trash/files/.., /.Trash-1000/..,
+    ~/.Trash/.., $RECYCLE.BIN\\.."""
+    # a Windows-shaped path read on Linux has no separators for Path
+    parts = [x.lower() for p in Path(path).parts for x in str(p).split("\\")]
+    for i, x in enumerate(parts):
+        if x in (".trash", "$recycle.bin", "recycler", "$recycle.bin.old") or x.startswith(".trash-"):
+            return True
+        if x == "trash" and i + 1 < len(parts) and parts[i + 1] in ("files", "info", "expunged"):
+            return True                                  # the XDG Trash: ~/.local/share/Trash/files
+    return False
+
+
 def other_installs(settings: dict) -> list:
     """Strata folders besides this one that may hold model files: the ones this user ran before, and Strata* folders
     next to this one (a zip unpacked again lands in e.g. `Strata-main (1)\\Strata-main`)."""
-    cands = [Path(p) for p in settings.get("installs", [])]
+    cands = [Path(p) for p in settings.get("installs", []) if not in_trash(p)]
+    NAMES = ("xestrata", "strata")                     # XeStrata's folders and upstream's
     for base in dict.fromkeys((ROOT.parent, ROOT.parent.parent)):
         try:
             for d in base.iterdir():
-                if d.is_dir() and d.name.lower().startswith("strata"):
+                if d.is_dir() and d.name.lower().startswith(NAMES):
                     cands.append(d)
-                    cands += [c for c in d.iterdir() if c.is_dir() and c.name.lower().startswith("strata")]
+                    cands += [c for c in d.iterdir() if c.is_dir() and c.name.lower().startswith(NAMES)]
         except OSError:
             pass
     found = []
@@ -5231,10 +7840,30 @@ def data_folder_path(requested: str | None, settings: dict) -> Path:
         Path(settings["data_dir"]) if settings.get("data_dir") else default_data_dir()
 
 
-def data_folder(requested: str | None) -> tuple:
-    """(the data folder, folders on other drives that still hold model files).  Moves the model files of this folder
-    and of earlier Strata folders on the same drive into the data folder, and points their configs there."""
+def library_size_gb(folder: Path) -> float:
+    """The GB of model files (models, packs, mtp) in a data folder."""
+    return sum(folder_size(folder / d) for d in ("models", "packs", "mtp") if (folder / d).exists()) / 1e9
+
+
+def same_folder(a: Path, b: Path) -> bool:
+    """The same folder, however it is spelled (a different case, a short 8.3 name, a link)."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def data_folder(requested: str | None, move: bool = False, yes: bool = True, set_default: bool = False) -> tuple:
+    """(the data folder, folders that still hold model files and are used where they are).
+
+    Without --data-dir, or with the folder in use: moves the model files of this folder and of earlier Strata folders
+    on the same drive into the data folder, and points their configs there.  upstream 9d2cb4f6d: a --data-dir that
+    names a NEW folder moves nothing by itself.  When model files already exist elsewhere (the remembered data folder
+    among them), they are kept where they are and found from there, and the new folder takes the new downloads (the
+    answer with --yes or when nobody can answer); `move` (--move-data, or the answer "move") moves them in.  Only a
+    move, --set-default-data-dir, or a PC with no model files changes the remembered data folder."""
     settings = load_settings()
+    remembered = data_folder_path(None, settings)
     dest = data_folder_path(requested, settings)
     try:
         dest.mkdir(parents=True, exist_ok=True)
@@ -5243,9 +7872,32 @@ def data_folder(requested: str | None) -> tuple:
             fail(f"cannot use {dest} for the model files ({e})", "choose another folder with --data-dir")
         warn(f"cannot use {dest} for the model files ({e}): keeping them in {ROOT}")
         dest = ROOT
+    sources = [*([] if PACKAGED else [ROOT]), *other_installs(settings)]
+    if requested and not same_folder(dest, remembered):
+        sources.append(remembered)
+        held: list = []
+        for folder in sources:
+            if not same_folder(folder, dest) and has_data(folder) and not any(same_folder(folder, h) for h in held):
+                held.append(folder)
+        movable = [f for f in held if same_drive(f, dest)]
+        if movable and not move and not yes:
+            gb = sum(library_size_gb(f) for f in movable)
+            size = f"{gb:.0f} GB" if gb >= 10 else f"{gb:.1f} GB"
+            say()
+            say(f"  Your models are in {', '.join(str(f) for f in movable)} ({size}).")
+            say(f"  keep) leave them there and use {dest} only for new downloads")
+            say(f"  move) move your {size} of models to {dest}")
+            move = ask(f"Move your {size} of models to the new folder, or use it only for new downloads?",
+                       ["keep", "move"], "keep", False) == "move"
+        if held and not move:
+            for folder in held:
+                say(f"  your model files stay in {folder}; {dest} is used for new downloads")
+            if set_default:
+                save_settings({**settings, "data_dir": str(dest)})
+            return dest, held
     elsewhere = []
-    for folder in [*([] if PACKAGED else [ROOT]), *other_installs(settings)]:
-        if folder == dest or not has_data(folder):
+    for folder in dict.fromkeys(sources):
+        if same_folder(folder, dest) or not has_data(folder):
             continue
         if not same_drive(folder, dest):
             elsewhere.append(folder)                    # another drive: used where it is (no 70 GB copy)
@@ -5269,10 +7921,10 @@ def data_folder(requested: str | None) -> tuple:
             elsewhere.append(folder)                    # in use, or a copy the data folder already has
             warn(f"some model files are still in {folder} (in use, or already in {dest})")
         else:
-            ok(f"model files from {folder} moved to {dest} (a new copy of Strata finds them there)")
+            ok(f"model files from {folder} moved to {dest} (a new copy of XeStrata finds them there)")
     # the Strata folders this user ran (a package's folder holds no model files or configs: not one of them)
     installs = [*([] if PACKAGED else [str(ROOT)])] + \
-        [p for p in settings.get("installs", []) if p != str(ROOT) and Path(p).is_dir()]
+        [p for p in settings.get("installs", []) if p != str(ROOT) and Path(p).is_dir() and not in_trash(p)]
     save_settings({**settings, "data_dir": str(dest), "installs": installs[:20]})
     return dest, elsewhere
 
@@ -5288,16 +7940,80 @@ def folder_size(path: Path) -> int:
     return total
 
 
+def script_guard_setup(a) -> None:
+    """The script guard (serve/script_guard.py) for every model, by --script-guard or the question: the answers kept
+    free of other languages' characters (ja, en) or not (off), written to the settings (script_guard); a model's
+    config, the web page and a request's own "script_guard" go over it.  Asked as web search is: interactively, the
+    first time or with --setup.  The answer offered is option_default's: the mode set, else the system's language's
+    (its own mode for Japanese, Korean and Chinese, zh-tw for Taiwan's and Hong Kong's; off for Vietnamese; en for
+    any other)."""
+    settings = load_settings()
+    want = a.script_guard
+    busy = a.update or a.bench or a.bench_verbose or a.bench_original_compat is not None or a.calibrate
+    if want is None and not busy and not a.yes and not JSON_OUT and sys.stdin.isatty() and \
+            ("script_guard" not in settings or a.setup):
+        want = ask_option("script-guard", False)
+    if want is None:
+        return
+    save_settings({**load_settings(), "script_guard": want})
+    ok(f"other languages in the answers: {'kept out (' + want + ')' if want != 'off' else 'as the model writes'}"
+       " (every model; the server reads it when it starts)")
+
+
+# the search APIs setup offers: name -> (who, the settings' key, the launcher's variable, the terms)
+WEB_SEARCH_APIS = {
+    OV.SEARCH_DEEPSEEK: ("DeepSeek", "deepseek_api_key", "XESTRATA_DEEPSEEK_API_KEY", "billed by DeepSeek per search"),
+    OV.SEARCH_TINYFISH: ("TinyFish", "tinyfish_api_key", "XESTRATA_TINYFISH_API_KEY",
+                         "free up to TinyFish's daily allowance"),
+}
+
+
+def web_search_setup(a) -> None:
+    """Web search (serve/search.py) for every model, by --web-search or the question: deepseek and tinyfish take
+    DeepSeek's or TinyFish's search API with the user's API key (asked without echo, or the launcher's
+    XESTRATA_DEEPSEEK_API_KEY / XESTRATA_TINYFISH_API_KEY; one already set is kept), no takes out what setup set up.
+    Asked only interactively, and only the first time or with --setup; unasked, nothing changes.  A search_url the
+    user wrote by hand (their own SearXNG) is left as it is."""
+    settings = load_settings()
+    want = a.web_search
+    busy = a.update or a.bench or a.bench_verbose or a.bench_original_compat is not None or a.calibrate
+    if want is None and not busy and not a.yes and not JSON_OUT and sys.stdin.isatty() and \
+            ("web_search" not in settings or a.setup):
+        say()
+        say(f"  A SearXNG-compatible server of your own: write its address as search_url in {settings_path()}.")
+        want = ask_option("web-search", False)
+    if want is None:
+        return
+    if want == "no":
+        if settings.get("search_engine") in WEB_SEARCH_APIS:
+            settings.pop("search_engine", None)
+            for api in WEB_SEARCH_APIS.values():
+                settings.pop(api[1], None)
+            ok("web search: off")
+        save_settings({**settings, "web_search": "no"})
+        return
+    who, field, env, terms = WEB_SEARCH_APIS[want]
+    key = os.environ.get(env, "").strip()               # the launcher's, kept off its command line
+    if not key and not JSON_OUT and sys.stdin.isatty():
+        import getpass
+        key = getpass.getpass(f"{who} API key (not shown; Enter keeps the one set): ").strip()
+    key = key or str(settings.get(field) or "")
+    if not key or any(c.isspace() for c in key) or len(key) < 8:
+        warn(f"web search: no {who} API key was given; nothing changed")
+        return
+    save_settings({**settings, "web_search": want, "search_engine": want, field: key})
+    ok(f"web search: {who}'s search API ({terms}; the key is kept in {settings_path()}, readable by you only)")
+
+
 def remove_data() -> int:
     """--remove-data: what XeStrata keeps for this user, which apt and dnf leave when they remove the program - the
     model files, the prepared packs and the MTP layer in the data folder, the settings and model configs, the logs -
-    listed with their sizes and deleted after a yes typed at the question (--yes is not one).  GGUF files given with
-    --gguf-dir are the user's own and stay; in a Strata folder (no package), its own files stay too."""
+    listed with their sizes and deleted after a yes typed at the question (or its button in the launcher; --yes is
+    not one).  GGUF files given with --gguf-dir are the user's own and stay; in a Strata folder (no package), its own
+    files stay too."""
     settings = load_settings()
     data = Path(settings["data_dir"]) if settings.get("data_dir") else default_data_dir()
-    targets = [data / d for d in DATA_ITEMS] + [settings_path().parent]
-    if PACKAGED:
-        targets += [CONF, STATE]
+    targets = [data / d for d in DATA_ITEMS] + [settings_path().parent, CONF, STATE]
     targets = [t for t in dict.fromkeys(targets) if t.exists()]
     if not targets:
         say("Nothing of XeStrata's is kept for this user.")
@@ -5305,7 +8021,12 @@ def remove_data() -> int:
     say("These folders hold what XeStrata keeps for you:")
     for t in targets:
         say(f"  {t}  ({folder_size(t) / 1e9:.1f} GB)")
-    if not sys.stdin.isatty() or input("Delete them? Type yes to delete: ").strip().lower() != "yes":
+    # --json (the Windows launcher): the question as an ask object, whose button the person presses
+    if JSON_OUT:
+        sure = ask("Delete them?", ["yes", "no"], "no", False) == "yes"
+    else:
+        sure = sys.stdin.isatty() and input("Delete them? Type yes to delete: ").strip().lower() == "yes"
+    if not sure:
         say("Nothing was deleted.")
         return 1
     for t in targets:
@@ -5396,19 +8117,31 @@ def choices_from_config(cfg_path: Path) -> dict:
     """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     tag = cfg_path.stem[len("xestrata-"):]
-    family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
-    model = tag[len(FAMILIES[family]["tag"]):].upper()     # unsloth-ud-iq4_xs: UD-IQ4_XS
-    model = next((m for m in MODELS if m.upper() == model), model)   # (the catalog's spelling: UD-IQ4_XS-v31's v)
+    custom = cfg.get("custom") if isinstance(cfg.get("custom"), dict) else None
+    # the longest tag: one family's can start another's (gyro- and gyro-coder-, qwen35- and qwen35-uncensored-)
+    family = max((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])),
+                 key=lambda f: len(FAMILIES[f]["tag"]), default="qwen")
+    # the size as the tables name it (unsloth-ud-iq4_xs: UD-IQ4_XS; gyro-gyro-m: Gyro-M, which upper() lost)
+    model = tag[len(FAMILIES[family]["tag"]):]
+    # Edge0's config is named after the model itself (xestrata-edge0-145b-q3k.json): the tag is the size, not a prefix
+    # of it.  The other families' tags are a prefix (qwen-iq3_xxs), so the whole tag matches no size and the old answer
+    # stays.
+    model = next((m for m in FAMILIES[family].get("models", MODELS)
+                  if m.lower() in (model.lower(), tag.lower())), model.upper())
     a = cfg.get("args", [])
     val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731
     vis = cfg.get("vision")
     esp = val("--control-vector-scaled")
     rv = val("--vram-reserve-mib") or ""
     reserve = int(rv) if rv.isdigit() else None
+    rr = val("--ram-reserve-mib") or ""
     esp_path = esp.rsplit(":", 1)[0] if esp else None
-    return {"family": family, "model": model if model in FAMILIES[family].get("models", MODELS) else None,
+    if custom is not None:                             # a model of the user's own files (--gguf): custom-NAME
+        family, model = CUSTOM, str(custom.get("name") or tag)
+    return {"family": family, "model": model if family == CUSTOM or model in FAMILIES[family].get("models", MODELS)
+            else None,
             "context": int(ctx) if (ctx := val("--max-context")) else None,
-            "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4") else None,
+            "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4", "tcq4", "tcq5") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
             "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
             "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
@@ -5416,7 +8149,8 @@ def choices_from_config(cfg_path: Path) -> dict:
             "split_pci": [cfg.get("gpu_pci"), *cfg["split_pci"]] if cfg.get("split_pci") else None,
             # #493: --vram-reserve-mib given at setup (images write the default 700 themselves)
             "vram_reserve_mib": reserve if reserve is not None and (
-                vis is None or reserve != VISION["gpu"]["reserve_mib"]) else None}
+                vis is None or reserve != VISION["gpu"]["reserve_mib"]) else None,
+            "ram_reserve_gib": int(rr) / 1024 if rr.isdigit() and int(rr) > 0 else None}
 
 
 def calibration_targets(have: list, model: str | None, family: str | None) -> list:
@@ -5430,6 +8164,27 @@ def calibration_targets(have: list, model: str | None, family: str | None) -> li
         if (not model or ch["model"] == model) and (not family or ch["family"] == family):
             out.append(c)
     return out
+
+
+def mmproj_beside(gguf_dir, name: str, size: int | None = None):
+    """The picture file a person's own GGUF folder (--gguf-dir) already has: in the folder itself, or in the folder
+    above it and that folder's models/ (a XeStrata data folder's layout: models/<size>/ shards, models/<picture file>).
+    The two outer places are taken only at the pinned size (`size`), so a half-copied file is fetched again and not
+    used.  None when there is none (upstream 434c6221b)."""
+    if not gguf_dir:
+        return None
+    base = Path(gguf_dir)
+    own = base / name
+    if own.is_file():
+        return own
+    for r in (base.parent, base.parent / "models"):
+        f = r / name
+        try:
+            if f.is_file() and (size is None or f.stat().st_size == size):
+                return f
+        except OSError:
+            continue
+    return None
 
 
 def find_in(roots: list, rel: str):
@@ -5454,8 +8209,54 @@ def model_config(path: Path) -> bool:
         why = e.strerror or str(e)
     except ValueError:
         why = "not valid JSON"
-    warn(f"skipped {path.name} ({why}): it is not a XeStrata model config")
+    warn(f"skipped {path.name} ({why}): it is not an XeStrata model config")
     return False
+
+
+def move_checkout_configs() -> None:
+    """The model configs an earlier setup wrote into this Strata folder (before they went to the user's folder, CONF)
+    moved there once, with their .bak and Chat settings; the config's log and working folder go to STATE, and its
+    start script is written again for the moved config.  The old logs stay where they are.  A file CONF already has
+    is left: the same content is removed here, a different one stays (CONF's is used) and is named."""
+    if PACKAGED or same_folder(ROOT, CONF):
+        return
+    for old in [p for p in model_config_files(ROOT) if model_config(p)]:
+        new = CONF / old.name
+        moved = not new.exists()
+        if moved:
+            try:
+                cfg = json.loads(old.read_text(encoding="utf-8-sig"))
+                if isinstance(cfg.get("log"), str) and Path(cfg["log"]).parent == ROOT:
+                    cfg["log"] = str(STATE / Path(cfg["log"]).name)
+                if cfg.get("cwd") == str(ROOT):
+                    cfg["cwd"] = str(STATE)
+                CONF.mkdir(parents=True, exist_ok=True)
+                STATE.mkdir(parents=True, exist_ok=True)
+                write_config(new, cfg)
+            except (OSError, ValueError) as e:
+                warn(f"could not move {old} to {CONF} ({getattr(e, 'strerror', None) or e}): it stays there")
+                continue
+            old.unlink()
+            ok(f"moved {old.name} to {CONF}")
+            tag = old.stem[len("xestrata-"):]
+            if (ROOT / f"run-{tag}.sh").is_file():
+                write_run_script(tag, new, cfg.get("port", 8095), cfg.get("open_browser") is not False)
+        for f in [*([] if moved else [old]), old.with_name(old.name + ".bak"),
+                  old.with_name(old.stem + ".shared-settings.json")]:
+            if not f.is_file():
+                continue
+            there = CONF / f.name
+            try:
+                if not there.exists():
+                    copy_private(f, there)
+                elif there.read_bytes() != f.read_bytes():
+                    warn(f"{f} was not moved: {there} is used (yours to compare or delete)")
+                    if f == old:
+                        break                          # another config of that name: its .bak and settings stay too
+                    continue
+                f.unlink()
+            except OSError as e:
+                warn(f"could not move {f} to {CONF} ({e.strerror or e})")
 
 
 def installed_configs():
@@ -5640,7 +8441,8 @@ def recommend_pool_workers(args: list) -> list:
     """`args` with setup's recommended `--pool-workers` for a hybrid CPU, unless they set one already (a calibration's
     measured count, or the user's own).  A recommendation: the config line can be edited or removed."""
     n = hybrid_pool_workers(cpu_cores())
-    if n is None or "--pool-workers" in args:
+    on_cpu = "--device" in args[:-1] and args[args.index("--device") + 1] == "cpu"   # no expert pool: --cpu-threads
+    if n is None or "--pool-workers" in args or on_cpu:
         return args
     n = min(n, POOL_WORKERS_CAP)   # setup never writes more workers than the engine's own default takes
     p, e = cpu_cores()
@@ -5703,10 +8505,12 @@ def gpu_sel(value) -> list:
     return sel
 
 
-def hardware_key(cfg: dict) -> str:
+def hardware_key(cfg: dict, name: str | None = None) -> str:
     """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
     (the context's KV cache and the image encoder take VRAM from the expert cache)."""
     sel = cfg.get("gpu")
+    if isinstance(sel, str):
+        sel = gpu_sel(sel)
     gl = [gpu_info(i) or {} for i in sel] if isinstance(sel, list) else [gpu_info(sel) or {}]
     if cfg.get("split_pci"):                             # a layer split (setup --gpus): its other cards
         gl += [next((x for x in gpus() if x["pci"] == pci), {}) for pci in cfg["split_pci"]]
@@ -5714,7 +8518,17 @@ def hardware_key(cfg: dict) -> str:
     a = cfg.get("args", [])
     ctx = a[a.index("--max-context") + 1] if "--max-context" in a else "?"
     return "|".join([g.get("name", "?"), f"{g.get('vram_gb', 0):.0f}GB", cpu_info()[0], f"{ram_gb():.0f}GB",
-                     cfg.get("model_name", "?"), ctx, "images" if "--vision" in a else "text"])
+                     name or cfg.get("model_name", "?"), ctx, "images" if "--vision" in a else "text"])
+
+
+def saved_for(table: str, cfg: dict):
+    """What settings.json's `table` holds for this PC and model (hardware_key), also when it was kept under a name the
+    model had before (its config's aliases: setup's names before served_name)"""
+    got = load_settings().get(table) or {}
+    for name in [cfg.get("model_name"), *(cfg.get("aliases") or [])]:
+        if isinstance(name, str) and hardware_key(cfg, name) in got:
+            return got[hardware_key(cfg, name)]
+    return None
 
 
 # What the engine and setup fit to the PC by themselves, said wherever the tuning is offered or asked for
@@ -5730,7 +8544,7 @@ def calibrate_config(cfg_path: Path) -> bool:
     import calibrate as CAL
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     say()
-    say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
+    say("  Tuning XeStrata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
     say("  CPU threads, the expert cache). It takes roughly 15-30 minutes (3 rounds of each value); "
         "the PC is busy meanwhile.")
     try:
@@ -5762,20 +8576,28 @@ def calibrate_config(cfg_path: Path) -> bool:
 
 
 def bench_config(cfg_path: Path, data: Path, verbose: bool, original: str | None, rounds: int,
-                 temperature: float) -> int:
-    """Measure the model `cfg_path` sets up (tools/bench.py) and say where the record is."""
+                 temperature: float, gpu: int | list | None = None) -> int:
+    """Measure the model `cfg_path` sets up (tools/bench.py) and say where the record is.  `gpu`: --gpu N or --gpus
+    (#49), the cards this bench runs on instead of the config's; the config is not changed."""
     sys.path.insert(0, str(ROOT / "tools"))
     BENCH = importlib.import_module("bench")           # tools/bench.py (to mypy, `bench` is the records' folder)
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     found = gpus()
-    pcis = [cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])]
+    cards = None
+    if gpu is not None:
+        sel = gpu if isinstance(gpu, list) else [gpu]
+        check_gpus(sel, found)
+        cards = [next(x for x in found if x["index"] == i)["pci"] for i in sel]
+    pcis = cards or [cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])]
     chosen = ([x for p in pcis if p for x in found if x["pci"] == p] or [gpu_info()]) if found else []
+    if cards:
+        ok("GPU" + ("s" if len(chosen) > 1 else "") + ": " + " + ".join(gpu_name(x) for x in chosen) + " (this bench)")
     say()
     say(f"  Measuring {cfg.get('model_name', cfg_path.stem)} on this PC: the engine is started many times, about "
         f"{20 * rounds} minutes" + (" and more with --bench-verbose" if verbose else "") +
         (f", twice that with upstream {original}" if original else "") + ". The PC is busy meanwhile.")
     try:
-        md = BENCH.run(cfg_path, data, chosen, verbose, original, say, rounds, temperature)
+        md = BENCH.run(cfg_path, data, chosen, verbose, original, say, rounds, temperature, cards)
     except (BENCH.BenchError, BENCH.C.EngineLeft) as e:
         fail(str(e))
     say()
@@ -5787,7 +8609,7 @@ def bench_config(cfg_path: Path, data: Path, verbose: bool, original: str | None
 
 def saved_calibration(cfg: dict) -> dict | None:
     """The settings an earlier calibration found for this PC and model, if any."""
-    return (load_settings().get("calibration") or {}).get(hardware_key(cfg))
+    return saved_for("calibration", cfg)
 
 
 def repoint_engine(cfg_path: Path, cfg: dict) -> dict:
@@ -5797,18 +8619,34 @@ def repoint_engine(cfg_path: Path, cfg: dict) -> dict:
     (container/) share the settings, and keep the engine in different folders (lib vs lib64); the engine finds its
     libraries by its RPATH, so a config's other package's lib_dirs, missing here, are skipped."""
     if not PACKAGED:
+        # a source install's engine stays where it is; a config older than the programs' names XeStrata's (RENAMED)
+        # gets the new names there
+        if cfg.get("exe") and point_engine_parts(cfg, Path(cfg["exe"]).parent):
+            write_config(cfg_path, cfg)
         return cfg
-    eng = packaged_engine_dir()
-    changed = False
-    for part in (cfg, cfg.get("vision"), (cfg.get("vision") or {}).get("fallback")):
-        if isinstance(part, dict) and part.get("exe"):
-            new = str(eng / Path(part["exe"]).name)
-            if part["exe"] != new:
-                part["exe"] = new
-                changed = True
-    if changed:
+    if point_engine_parts(cfg, packaged_engine_dir()):
         write_config(cfg_path, cfg)
     return cfg
+
+
+def point_engine_parts(cfg: dict, eng: Path, parts: tuple = ("text", "vision", "images")) -> bool:
+    """Points the engines a config names ("exe": the text engine, the vision encoders, the image engine of "images" and
+    "image_models") at the folder `eng`, where one of that name is (on Linux the package's always has them all); True
+    when one changed.  `parts` picks which."""
+    vision = cfg.get("vision")
+    vision = vision if isinstance(vision, dict) else {}
+    found = [*((cfg,) if "text" in parts else ()),
+             *((vision, vision.get("fallback")) if "vision" in parts else ()),
+             *((cfg.get("images"), *(cfg.get("image_models") or [])) if "images" in parts else ())]
+    changed = False
+    for part in found:
+        if isinstance(part, dict) and part.get("exe"):
+            name = Path(part["exe"]).name
+            new = eng / RENAMED.get(name, name)
+            if part["exe"] != str(new) and (PACKAGED or new.is_file()):
+                part["exe"] = str(new)
+                changed = True
+    return changed
 
 
 def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
@@ -5881,6 +8719,78 @@ def saved_draft_vocab(cfg_path: Path) -> str | None:
     return v if v in DRAFT_VOCABS else None
 
 
+def saved_drafting(cfg_path: Path) -> str | None:
+    """The drafter a model's config chose earlier (--drafting), or None: a setup run again without the flag keeps it."""
+    try:
+        v = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("drafting")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if v in ("auto", "mtp", "dflash2", "off") else None
+
+
+PLE_IO = ("auto", "direct", "ram")   # --ple-io: how the engine reads the n-gram table; auto lets setup choose (#49)
+
+
+def saved_ple_io(cfg_path: Path) -> str | None:
+    """How a model's config was told to read its n-gram table (--ple-io direct or ram), or None (auto): a setup run
+    again without the flag keeps it."""
+    try:
+        v = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("ple_io")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if v in ("direct", "ram") else None
+
+
+def ple_io_auto(ple: Path, model: str, ram: float, low_ram: bool) -> bool:
+    """Whether setup keeps the n-gram table in RAM by itself (--ple-io ram), saying why; False: the engine chooses
+    (auto: it measures direct against mmap, and locks the table in RAM itself where XESTRATA_PLE_AUTO_RAM asks it)."""
+    if str(ROOT / "tools") not in sys.path:
+        sys.path.insert(0, str(ROOT / "tools"))
+    from gguf_reader import GGUFFile
+
+    def table_gb() -> float:
+        try:
+            tensor = next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)
+            size = getattr(tensor, "expected_bytes", lambda: None)()
+        except Exception:                           # an unreadable header: the table's usual size
+            size = None
+        return size / 1e9 if size else 28.8
+
+    disk = rotational_disk(ple)                        # upstream #605
+    if disk:
+        gb = table_gb()
+        if ram >= MODELS[model]["ram_gb"] + gb + 4:
+            ok(f"the model is on a rotational disk ({disk}): its {gb:.0f} GB n-gram table is kept in RAM "
+               "(--ple-io ram) - read from the disk at random, it can stall prompts for minutes")
+            return True
+        warn(f"the model is on a rotational disk ({disk}): its n-gram table is read from it at random, which can "
+             f"stall prompts for minutes. An SSD is recommended; with ~{gb:.0f} GB more RAM, --ple-io ram keeps the "
+             "table in RAM instead")
+        return False
+    if low_ram or WIN or wsl_version() != 0:
+        return False
+    # upstream b25b30970: on an SSD too, a PC with RAM to spare keeps the n-gram table in RAM, so a new prompt's first
+    # chunk does not wait for its table rows (65,536 random SSD reads at 4K tokens).  upstream (RTX PRO 5000, Linux,
+    # NVMe): prompt 4K -18%, 20K -9%, decode +0.8%; the B70 (IQ3_XXS 4K, 2026-10-20): prompt +1.9%, decode the same.
+    # Measured on Linux only (Windows locks pages otherwise, WSL pins little), and only with 16 GB to spare beyond the
+    # model's own need: a smaller PC keeps reading from the SSD.
+    gb = table_gb()
+    if ram >= MODELS[model]["ram_gb"] + gb + 16:
+        ok(f"{ram:.0f} GB of RAM: the {gb:.0f} GB n-gram table is kept in RAM (--ple-io ram), so a new prompt does not "
+           "wait for its rows from the SSD; --ple-io direct reads it from the SSD instead")
+        return True
+    return False
+
+
+def set_ple_io(args: list, choice: str | None) -> None:
+    """The config's args with `--ple-io choice` (direct or ram), or without --ple-io (None)."""
+    while "--ple-io" in args[:-1]:
+        i = args.index("--ple-io")
+        del args[i:i + 2]
+    if choice:
+        args += ["--ple-io", choice]
+
+
 # the draft head's VRAM per subset (IQ3_S: the largest)
 DRAFT_VOCAB_MIB = {"cjk": 348, "cyrillic": 193, "fr": 151, "en": 133,
                    "ja": 185}   # ja: from its token count (56,554) at cjk's bytes a token (not measured)
@@ -5917,6 +8827,10 @@ def refresh_draft_vocab(rt: Path, choice: str = "cjk") -> None:
     new, dst = ROOT / "data" / DRAFT_VOCABS.get(choice, "draft_vocab.bin"), rt / "draft_vocab.bin"
     if not new.exists() or not rt.is_dir():
         return
+    # the English subset beside it too: the engine takes it on a card the expert cache leaves short otherwise
+    en, en_dst = ROOT / "data" / DRAFT_VOCABS["en"], rt / "draft_vocab_en.bin"
+    if en.exists() and (not en_dst.exists() or en_dst.read_bytes() != en.read_bytes()):
+        shutil.copyfile(en, en_dst)
     if dst.exists():
         old = hashlib.sha256(dst.read_bytes()).hexdigest()
         shipped = {hashlib.sha256((ROOT / "data" / f).read_bytes()).hexdigest()
@@ -5937,7 +8851,7 @@ def refresh_shared_draft_vocab(cfg: dict, done: set) -> None:
     the default subset over the cyrillic one of the config in use).  The folder takes the subset of the most recently
     used config that names it; a start still installs its own config's."""
     args = cfg.get("args") or []
-    if "--mtp" not in args[:-1]:
+    if "--mtp" not in args[:-1] or cfg.get("family") == "sync":
         return
     rt = Path(args[args.index("--mtp") + 1])
     key = os.path.normcase(os.path.abspath(rt))
@@ -5999,10 +8913,134 @@ def settings_summary(cfg: dict, port=None) -> str:
     return " ".join(out) + ("; " if out else "") + "server " + ", ".join(srv)
 
 
+def server_on_port(port: int, api_key: str | None = None) -> tuple[str, list] | None:
+    """What answers GET /v1/models on this PC's `port`: None (nothing listens, or it does not answer in a few
+    seconds), ("xestrata", the ids of the models it serves) or ("other", [])."""
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models")
+    key = (api_key or "").split(",")[0].strip()
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    # 127.0.0.1 is never behind a proxy: a proxy in http_proxy with no localhost in no_proxy would get the key
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=5) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        e.close()
+        return ("other", [])                          # it answered, but not as XeStrata does to its own key
+    except (OSError, ValueError):
+        return None
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list) or not any(isinstance(m, dict) and m.get("owned_by") == "xestrata" for m in data):
+        return ("other", [])
+    return ("xestrata", [str(m.get("id")) for m in data if isinstance(m, dict) and m.get("id")])
+
+
+def systemd_service_active() -> bool:
+    """Whether the packages' user service (xestrata.service: the model set up last) runs for this user."""
+    if WIN or not shutil.which("systemctl"):
+        return False
+    try:
+        return subprocess.run(["systemctl", "--user", "is-active", "--quiet", "xestrata.service"],
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def attach_running(cfg: dict, port: int, open_browser: bool) -> bool:
+    """A start where a server already listens on the model's port (the packages' systemd service, or a start in another
+    terminal): the same model served there is used, not started twice (True: setup is done); another model of
+    XeStrata's stops setup with how to free the port; something else is left to the server's own message on the busy
+    port (False).  For setup in a terminal and for the launcher's window alike."""
+    got = server_on_port(port, cfg.get("api_key"))
+    if got is None or got[0] != "xestrata":
+        return False
+    name = str(cfg.get("model_name") or "").lower()
+    if name not in [m.lower() for m in got[1]]:
+        fail(f"port {port} is serving {got[1][0] if got[1] else 'another model'} of XeStrata's",
+             "stop it (the systemd service: systemctl --user stop xestrata), or start this model on another port "
+             "with --port")
+    service = systemd_service_active()
+    url = f"http://127.0.0.1:{port}"
+    ok(f"{cfg.get('model_name')} is already running on port {port}" +
+       (" as the systemd service (to stop it: systemctl --user stop xestrata)" if service else
+        " (started elsewhere: stop it there)") + "; not started again")
+    if JSON_OUT:
+        emit({"type": "attached", "url": url, "service": service})
+    say(f"ready: {url}/v1  (already running)")
+    if open_browser and not JSON_OUT:
+        import webbrowser
+        webbrowser.open(url + "/")
+    return True
+
+
+# The launcher's window on Linux (launcher/, the xestrata-gui package): an extra, which nothing else needs.  The
+# packages put it here; ./setup.sh gui builds it into the checkout's build/launcher with the .NET 10 SDK.
+GUI_PACKAGED = Path("/usr/lib/xestrata/launcher/xestrata-gui")
+GUI_SOURCE = ROOT / "build" / "launcher" / "xestrata-gui"
+
+
+def dotnet_has(kind: str) -> bool:
+    """Whether .NET 10 or later is installed: its runtime (kind "runtime"; the window rolls forward to a later major
+    version) or its SDK ("sdk", which ./setup.sh gui builds the window with)."""
+    dotnet = shutil.which("dotnet")
+    if not dotnet:
+        return False
+    try:
+        listed = subprocess.run([dotnet, "--list-runtimes" if kind == "runtime" else "--list-sdks"],
+                                capture_output=True, text=True, errors="replace", timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    pattern = r"^Microsoft\.NETCore\.App (\d+)\." if kind == "runtime" else r"^(\d+)\."
+    return any(int(v) >= 10 for v in re.findall(pattern, listed, re.M))
+
+
+def gui_runtime_problem(sdk: bool = False) -> str | None:
+    """Why the launcher's window cannot open here, with what to install (None: it can): only `xestrata gui` and
+    `./setup.sh gui` ask, setup's checks never do (.NET is not needed for anything else).  `sdk`: the window is built
+    from the source first, with the SDK."""
+    if PACKAGED and not GUI_PACKAGED.is_file():
+        return ("the window is the xestrata-gui package: sudo apt install xestrata-gui (Ubuntu) or sudo dnf install "
+                "xestrata-gui (Fedora), which brings the .NET 10 runtime with it. Everything it does is also there "
+                "without it: xestrata --setup in a terminal, and the web page")
+    if dotnet_has("sdk" if sdk else "runtime"):
+        return None
+    what = "dotnet-sdk-10.0" if sdk else "dotnet-runtime-10.0"
+    family = distro_id()
+    if family == "ubuntu" or family == "fedora":
+        how = f"sudo {'apt' if family == 'ubuntu' else 'dnf'} install {what}"
+        return (f"the window needs .NET 10 ({'its SDK, to build it' if sdk else 'its runtime'}): {how}. Everything it "
+                "does is also there without it: setup in a terminal, and the web page")
+    return ("the window needs the .NET 10 runtime, which this distribution has no official package of, so the window "
+            "is not available here. Everything it does is there without it: setup in a terminal (xestrata --setup, "
+            "./setup.sh), and the web page")
+
+
+def run_gui(args: list) -> int:
+    """`xestrata gui` and `./setup.sh gui`: the launcher's window, told where setup.py and its Python are; what is
+    missing said, and 1, where it cannot open."""
+    if WIN:
+        fail("on Windows the window is xestrata.exe (xestrata-cli gui opens it)")
+    exe = GUI_PACKAGED if PACKAGED else GUI_SOURCE
+    why = gui_runtime_problem(sdk=not PACKAGED)
+    if why:
+        say(f"XeStrata's window: {why}.")
+        return 1
+    if not PACKAGED:                                   # the checkout's window, built (again) from launcher/
+        r = run(["dotnet", "publish", str(ROOT / "launcher" / "Gui" / "Gui.fsproj"), "-c", "Release", "-r",
+                 "linux-x64", "--self-contained", "false", "--nologo", "-o", str(exe.parent)], check=False, quiet=True,
+                env={**os.environ, "DOTNET_CLI_TELEMETRY_OPTOUT": "1", "AVALONIA_TELEMETRY_OPTOUT": "1"})
+        if r.returncode != 0:
+            say("XeStrata's window could not be built (dotnet publish failed, above).")
+            return 1
+    env = {**os.environ, "XESTRATA_APP_DIR": str(ROOT), "XESTRATA_PYTHON": sys.executable}
+    return subprocess.call([str(exe), *args], env=env)
+
+
 def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
           layer_split=None, keep=None) -> int:
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
-    --vram-reserve-mib)."""
+    --vram-reserve-mib, --ple-io, --route-tail-skip)."""
     cfg = repoint_engine(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     cfg = upgrade_config(cfg_path, cfg)
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
@@ -6018,6 +9056,29 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             args += ["--vram-reserve-mib", str(reserve)]
         write_config(cfg_path, cfg)
         ok(f"saved for this model: {reserve} MiB of VRAM kept free for other programs (--vram-reserve-mib)")
+    tail = keep.pop("route_tail_skip", None)           # the route tail skip: the config's route_tail_skip_default
+    if tail is not None:
+        cfg["route_tail_skip_default"] = route_tail_skip_value(tail)
+        write_config(cfg_path, cfg)
+        ok(f"saved for this model: the route tail skip {tail} (--route-tail-skip)")
+    ple_io = keep.pop("ple_io", None)                  # #49: how the engine reads the n-gram table, in the args
+    if ple_io is not None:
+        args = cfg["args"]
+        if "--ple-gguf" not in args[:-1]:
+            warn(f"--ple-io does nothing for {cfg.get('model_name', cfg_path.stem)}: it has no n-gram table")
+        else:
+            cfg.pop("ple_io", None)
+            if ple_io == "auto":                       # setup's own choice again, from the RAM and the disk
+                model = choices_from_config(cfg_path)["model"]
+                low_ram = "--resident-experts" in args or "--mmap-experts" in args
+                use_ram = model in MODELS and \
+                    ple_io_auto(Path(args[args.index("--ple-gguf") + 1]), model, usable_ram_gb(), low_ram)
+                set_ple_io(args, "ram" if use_ram else None)
+            else:
+                cfg["ple_io"] = ple_io
+                set_ple_io(args, ple_io)
+            write_config(cfg_path, cfg)
+            ok(f"saved for this model: the n-gram table's reads --ple-io {ple_io}")
     if keep and any(cfg.get(k) != v for k, v in keep.items()):   # #179: a --host/--api-key on a start was ignored
         cfg.update(keep)
         write_config(cfg_path, cfg)
@@ -6026,8 +9087,21 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             else f"{k.replace('_', ' ')} {v}" for k, v in keep.items()))
     cfg_path.touch()                                     # the most recently used model
     if "--mtp" in cfg["args"][:-1]:
-        refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
-    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+        i = cfg["args"].index("--mtp") + 1
+        if cfg.get("family") == "sync":
+            mtp = sync_mtp(Path(cfg["args"][i]).parent, cfg.get("draft_vocab", "cjk"))
+            if cfg["args"][i] != str(mtp):
+                cfg["args"][i] = str(mtp)
+                write_config(cfg_path, cfg)
+        else:
+            refresh_draft_vocab(Path(cfg["args"][i]), cfg.get("draft_vocab", "cjk"))
+    # the DFlash2 pack's folder is shared by the models of this install: another config's setup may have left its
+    # subset there. Put this config's choice back before the engine reads it.
+    if isinstance(cfg.get("draft_model"), str):
+        refresh_draft_vocab(Path(cfg["draft_model"]).parent, cfg.get("draft_vocab", "cjk"))
+    if attach_running(cfg, int(port or cfg.get("port", 8095)), open_browser):
+        return 0
+    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata", "--config", str(cfg_path),
            "--port", str(port or cfg.get("port", 8095))]
     found = gpus()
     env = None
@@ -6044,9 +9118,9 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     elif gpu is not None:                              # --gpu N: this start only, by the card's PCI address
         check_gpus(gpu if isinstance(gpu, list) else [gpu], found)
         g = next(x for x in found if x["index"] == (gpu[0] if isinstance(gpu, list) else gpu))
-        env = dict(os.environ, STRATA_GPU_PCI=g["pci"])
+        env = dict(os.environ, XESTRATA_GPU_PCI=g["pci"])
         if cfg.get("split_pci"):                       # one card for this start, the saved split kept
-            env["STRATA_LAYER_SPLIT"] = "off"
+            envvars.put(env, "LAYER_SPLIT", "off")
         ok("GPU: " + gpu_name(g) + " (this start)")
     elif cfg.get("split_pci"):
         cards = [next((x for x in found if x["pci"] == pci), None) for pci in [cfg.get("gpu_pci"), *cfg["split_pci"]]]
@@ -6128,14 +9202,22 @@ def warm_up(cfg_path: Path) -> None:
     import socket
     import urllib.error
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    # The prompt's CPU share is measured here, once per PC and model, and the value written into the config: the
+    # engine's default measures it in every run, and a measured share moves a greedy answer between runs (2026-11-13);
+    # a fixed value is read the same way every time.
+    share_arg = False
+    if "--prefill-cpu-share" not in cfg.get("args", [])[:-1]:
+        cfg.setdefault("args", []).extend(["--prefill-cpu-share", "auto"])
+        write_config(cfg_path, cfg)
+        share_arg = True
     with socket.socket() as sk:
         sk.bind(("127.0.0.1", 0))
         port = sk.getsockname()[1]
     log = STATE / (cfg_path.stem + "-warmup.log")
     base = f"http://127.0.0.1:{port}"
     # #19: a server with a key answers 401 to a request without it (the warm-up waited out its 15 minutes): the first
-    # of the keys it takes, in its order (STRATA_API_KEY, else "api_key": a string "k1,k2" or a list)
-    key = os.environ.get("STRATA_API_KEY") or cfg.get("api_key") or ""
+    # of the keys it takes, in its order (XESTRATA_API_KEY, else "api_key": a string "k1,k2" or a list)
+    key = envvars.get("API_KEY") or cfg.get("api_key") or ""
     keys = [k.strip() for k in (key if isinstance(key, list) else str(key).split(",")) if str(k).strip()]
     auth = {"Authorization": f"Bearer {keys[0]}"} if keys else {}
     elog = cfg.get("log")                              # the engine's own log: the prompt's CPU share it measured
@@ -6199,7 +9281,7 @@ def warm_up(cfg_path: Path) -> None:
         return box["answer"]
 
     with open(log, "w", encoding="utf-8") as out:
-        proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config",
+        proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata", "--config",
                                  str(cfg_path), "--port", str(port)], stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, **new_process_group())
         try:
@@ -6229,15 +9311,20 @@ def warm_up(cfg_path: Path) -> None:
         finally:
             end_process_group(proc)
     if share is not None:
-        fix_prefill_share(cfg_path, share)
+        fix_prefill_share(cfg_path, share, replace_auto=share_arg)
+    elif share_arg:                     # nothing measured: the engine's own default (the GPU's) stays
+        cfg["args"] = cfg["args"][:-2]
+        write_config(cfg_path, cfg)
     free = start_free_mib(elog, since)
     if free is not None and not host_cache_on(json.loads(cfg_path.read_text(encoding="utf-8"))):
         fix_vram_free(cfg_path, free)
 
 
 def start_free_mib(elog: str | None, since: int) -> int | None:
-    """The VRAM free at the engine's start ("strata generate: N MiB of VRAM free at the start") in its log after byte
-    `since`, the lowest if it started more than once; None when the log has none."""
+    """The VRAM free at the engine's start ("xestrata generate: N MiB of VRAM free at the start") in its log after byte
+    `since`, the lowest if it started more than once; None when the log has none, or only 0: an engine that could not
+    read the free VRAM wrote 0 (an unsupported integrated GPU beside the card broke Level Zero's sysman for both), and
+    kept in the config, it left every start without an expert cache."""
     if not elog:
         return None
     try:
@@ -6246,8 +9333,9 @@ def start_free_mib(elog: str | None, since: int) -> int | None:
             text = f.read().decode("utf-8", "replace")
     except OSError:
         return None
-    found = re.findall(r"strata generate: ([0-9]+) MiB of VRAM free at the start", text)
-    return min(int(v) for v in found) if found else None
+    found = [int(v) for v in re.findall(r"xestrata generate: ([0-9]+) MiB of VRAM free at the start", text)]
+    found = [v for v in found if v > 0]
+    return min(found) if found else None
 
 
 VRAM_FREE_MARGIN_MIB = 32   # the free VRAM moved by up to ~20 MiB between starts on the B70 (2026-10-17)
@@ -6283,12 +9371,14 @@ def host_cache_on(cfg: dict) -> bool:
 
 
 def saved_vram_free(cfg: dict) -> str | None:
-    """The free VRAM an earlier warm-up saw for this PC and model, less the margin (fix_vram_free), if any."""
-    return (load_settings().get("vram_free_mib") or {}).get(hardware_key(cfg))
+    """The free VRAM an earlier warm-up saw for this PC and model, less the margin (fix_vram_free), if any; not a 0 an
+    engine that could not read it left (start_free_mib)."""
+    v = saved_for("vram_free_mib", cfg)
+    return v if v not in (None, "0") else None
 
 
 def measured_cpu_share(elog: str | None, since: int) -> float | None:
-    """The last prompt's CPU share the engine measured ("strata serve: prefill CPU share X (measured)") in its log
+    """The last prompt's CPU share the engine measured ("xestrata serve: prefill CPU share X (measured)") in its log
     after byte `since`; None when it measured none (the share is not armed, or fixed already)."""
     if not elog:
         return None
@@ -6298,20 +9388,22 @@ def measured_cpu_share(elog: str | None, since: int) -> float | None:
             text = f.read().decode("utf-8", "replace")
     except OSError:
         return None
-    found = re.findall(r"strata serve: prefill CPU share ([0-9.]+) \(measured\)", text)
+    found = re.findall(r"xestrata serve: prefill CPU share ([0-9.]+) \(measured\)", text)
     return float(found[-1]) if found else None
 
 
-def fix_prefill_share(cfg_path: Path, share: float) -> None:
-    """Write the measured prompt CPU share into the config (--prefill-cpu-share): measured anew in every run, it moved
-    a little, which experts the CPU took with it, and two greedy runs of one prompt parted (2026-10-16).  A
-    "--prefill-cpu-share auto" in the args is the user's and stays."""
+def fix_prefill_share(cfg_path: Path, share: float, replace_auto: bool = False) -> None:
+    """Write the measured prompt CPU share into the config (--prefill-cpu-share): the engine measures it in every run by
+    default, and a measured share moves a little, which experts the CPU took with it, and two greedy runs of one prompt
+    parted (2026-10-16); measured once here, the runs of this PC and model read a prompt the same way.  A
+    "--prefill-cpu-share auto" the user put there is the user's and stays, unless this warm-up wrote it
+    (`replace_auto`)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     a = list(cfg.get("args", []))
     v = f"{share:.2f}"
     if "--prefill-cpu-share" in a[:-1]:
         i = a.index("--prefill-cpu-share")
-        if a[i + 1] == "auto":
+        if a[i + 1] == "auto" and not replace_auto:
             return
         a[i + 1] = v
     else:
@@ -6327,52 +9419,40 @@ def fix_prefill_share(cfg_path: Path, share: float) -> None:
 
 def saved_prefill_share(cfg: dict) -> str | None:
     """The prompt CPU share an earlier warm-up measured for this PC and model (fix_prefill_share), if any."""
-    return (load_settings().get("prefill_cpu_share") or {}).get(hardware_key(cfg))
+    return saved_for("prefill_cpu_share", cfg)
 
 
 # upstream #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the
-PARALLEL_MAX = 8               # #465: the engine's batch window holds at most 8 requests
-PARALLEL_SHARE = 0.2           # #465: the slots' sessions may take this share of the VRAM the expert cache would hold
-PARALLEL_HELD = 0.5            # #465: ... and only where the cache still holds this share of the experts beside them
-PARALLEL_COST_NOTE = ("parallel N reduces waiting for several users but costs about 10-25% speed per request on this "
-                      "card")
+# #465: the batch slots - the rule and the slot's size are serve/autotune.py's, which the server chooses by
+PARALLEL_MAX = autotune.PARALLEL_MAX
+PARALLEL_COST_NOTE = autotune.PARALLEL_COST_NOTE
 
 
 def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
-    """#465: the VRAM one batch slot's session takes: its KV cache (12 QSA layers; with KV streaming only the 32K
-    positions the attention reads stay in VRAM) and the DeltaNet state (~0.17 GB).  Measured (upstream): 0.56 GiB at
-    32K int8."""
-    kv_tok = 12 * KV_CELL_BYTES.get(kv, 1056)
-    return (min(ctx, 32768) if streaming else ctx) * kv_tok / 1e9 + 0.17
+    """#465: the VRAM one batch slot's session takes (serve/autotune.py's rule: 0.56 GiB at 32K int8)."""
+    return autotune.parallel_slot_gb(ctx, kv, streaming)
 
 
 def parallel_recommend(vram_gb: float, arena_gb: float, ctx: int, kv: str, streaming: bool) -> int:
-    """#465: how many requests at once ("parallel") to recommend: 0 = none (one at a time).  Only where the experts
-    mostly fit in VRAM - the expert cache (the card's VRAM less ~5 GB) still holds PARALLEL_HELD of the model's experts
-    beside the slots' sessions, which take at most PARALLEL_SHARE of it, up to 4.  Where the experts mostly run on the
-    CPU a batch reads about as many experts as the requests one by one and every slot's VRAM is expert cache lost
-    (upstream measured a 12 GB card: a request alone 11-24% slower with 2-4 slots; docs/BATCHING.md)."""
-    cache_gb = max(0.0, vram_gb - 5)
-    slot = parallel_slot_gb(ctx, kv, streaming)
-    best = 0
-    for n in (2, 3, 4):
-        if n * slot <= PARALLEL_SHARE * cache_gb and (cache_gb - n * slot) >= PARALLEL_HELD * arena_gb:
-            best = n
-    return best
+    """#465: how many requests at once ("parallel") this card offers: 0 = one at a time (serve/autotune.py's rule)."""
+    return autotune.parallel_recommend(vram_gb, arena_gb, ctx, kv, streaming)
 
 
 def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, kv: str, streaming: bool,
                   batch_mtp: bool = False) -> list[str]:
-    """#465: what setup says about "parallel": the recommendation (or, where it would cost speed, why it is left at
-    one), or how the asked count compares with it (kept as asked: recommend, never force).  `batch_mtp`: the engine
-    runs with --batch-mtp (the server's default with --mtp), which takes every slot asked, past PARALLEL_MAX."""
+    """#465: what setup says about "parallel": what the server will choose by itself (it is "auto" unless the config
+    says otherwise, from the cards' VRAM and the experts' size), or how the asked count compares with it (kept as
+    asked: recommend, never force).  `batch_mtp`: the engine runs with --batch-mtp (the server's default with --mtp),
+    which takes every slot asked, past PARALLEL_MAX."""
     rec = parallel_recommend(vram_gb, arena_gb, ctx, kv, streaming)
     slot = parallel_slot_gb(ctx, kv, streaming)
     if asked is None or asked <= 1:
         if not rec:
-            return [f"Several requests at once: left at one at a time - {PARALLEL_COST_NOTE} (docs/BATCHING.md)."]
-        return [f"Several requests at once (opt-in): --parallel {rec} decodes up to {rec} together instead of one "
-                f"after the other (each takes ~{slot:.1f} GB of VRAM from the expert cache; docs/BATCHING.md)."]
+            return [f"Several requests at once: one at a time on this machine - {PARALLEL_COST_NOTE} "
+                    "(docs/BATCHING.md)."]
+        return [f'Several requests at once: off in "auto" (the default) - a slot takes VRAM from the expert cache, '
+                f'which a request alone pays for. This machine holds {rec}: the config\'s "parallel": {rec} starts '
+                f"them (each slot takes ~{slot:.1f} GB; docs/BATCHING.md)"]
     lines = [f"parallel requests: {asked} at once (each takes ~{slot:.1f} GB of VRAM from the expert cache, "
              f"{asked * slot:.1f} GB in all)"]
     used = asked if batch_mtp else min(asked, PARALLEL_MAX)
@@ -6394,10 +9474,29 @@ def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, 
 
 # user's - a "sampling" or "mcp_servers" block, "cors_origins", "open_browser" - and is kept when setup runs again, as
 # are "host" and "api_key" when this run does not give them
-SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "gpu_pci",
-                        "draft_vocab", "vision"})
+SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "family", "log", "lib_dirs", "port",
+                        "gpu_pci", "draft_vocab", "ple_io", "vision", "custom"})
 SPLIT_KEYS = frozenset({"split_pci", "layer_split"})
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "gpu_pci", "max_tokens", "threads", "onednn", "fallback"})
+
+
+def keep_old_names(cfg: dict, old_path: Path | None) -> None:
+    """The earlier config's served names (its "model_name" when served_name changed it, and its "aliases") as this
+    config's aliases, before anything looks the model up by name: what an earlier warm-up or calibration measured is
+    kept under the name of that time (hardware_key), and clients may still ask for it."""
+    try:
+        old = json.loads(old_path.read_text(encoding="utf-8-sig")) if old_path is not None else None
+    except (OSError, ValueError):
+        old = None
+    if not isinstance(old, dict) or "aliases" in cfg:
+        return
+    names = [x for x in (old.get("aliases") or []) if isinstance(x, str)]
+    was = old.get("model_name")
+    if isinstance(was, str) and was and was != cfg.get("model_name") and was not in names:
+        names.append(was)
+        ok(f"the model's name is {cfg.get('model_name')} now; {was} stays an alias it answers to")
+    if names:
+        cfg["aliases"] = names
 
 
 def carry_over(old: dict, cfg: dict, gpus_chosen: bool = False) -> list[str]:
@@ -6426,6 +9525,9 @@ def carry_over(old: dict, cfg: dict, gpus_chosen: bool = False) -> list[str]:
         if isinstance(mm, str) and Path(mm).name != Path(str(nv.get("mmproj"))).name and Path(mm).is_file():
             nv["mmproj"] = mm
             kept.append("vision mmproj")
+    if "images" in kept or "image_models" in kept:
+        # (an earlier install's image engine: the package's, or another folder's build)
+        point_engine_parts(cfg, Path(cfg["exe"]).parent, ("images",))
     kept += carry_profile_args(old, cfg)
     return kept
 
@@ -6468,12 +9570,28 @@ def args_dropped(old: dict, cfg: dict) -> list[str]:
     return list(dict.fromkeys(f for f in flags(old) if f not in new))
 
 
-def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, gpus_chosen: bool = False) -> None:
+def conversation_save_default(a, cfg: dict) -> dict:
+    """The conversations the engine lets go are kept on the disk by default (serve's "conversation_save"), in a folder
+    of their own for each model beside the model files: the folder's budget is shared by every file in it, and a file
+    another model wrote only takes room.  "conversation_save": false in the config turns it off."""
+    return {"conversation_save": str(Path(a.models_dir) / "conversations" / cfg["model_name"])}
+
+
+def skills_default(a) -> dict:
+    """The skills the web page's user adds (serve/skills.py) are kept in the data folder's skills/, one folder for every
+    model's server, so a skill added with one model is there with the others."""
+    data = getattr(a, "data_folder", None)
+    return {"skills_dir": str(Path(data) / "skills")} if data else {}
+
+
+def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, gpus_chosen: bool = False,
+                       defaults: dict | None = None) -> None:
     """Setup's run config, written over an earlier one for the same model without losing what the user added to it:
     the keys setup does not write are carried over (carry_over; `gpus_chosen`: this run chose its GPUs), and the
     earlier file is kept as xestrata-<model>.json.bak when it changes.  `source`: an earlier install's config to carry
-    the keys over from when this folder has none yet (a copy set up like the last one).  A line says what was kept,
-    one what was not."""
+    the keys over from when this folder has none yet (a copy set up like the last one).  `defaults`: keys setup fills
+    in only where the earlier config has none, so the user's own value (false included) stays.  A line says what was
+    kept, one what was not."""
     old_path = cfg_path if cfg_path.is_file() else source
     old = None
     if old_path is not None and old_path.is_file():
@@ -6484,6 +9602,12 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, gp
         if not isinstance(old, dict):
             old = None
     kept = carry_over(old, cfg, gpus_chosen) if old is not None else []
+    put_listing_selector(cfg)
+    for k, v in (defaults or {}).items():
+        if k not in cfg:
+            cfg[k] = v
+        elif cfg[k] == v and k in kept:               # setup's own default from the last run: not the user's
+            kept.remove(k)
     bak = None
     if cfg_path.is_file() and old != cfg:
         bak = cfg_path.with_name(cfg_path.name + ".bak")
@@ -6504,7 +9628,7 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, gp
 
 def write_run_script(model, cfg_path, port, open_browser=True):
     """run-<model>.sh: the server with this config; `open_browser` False (--no-browser) leaves --open out."""
-    serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+    serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata", "--config", str(cfg_path),
              "--port", str(port)] + (["--open"] if open_browser else [])
     script = ROOT / f"run-{model.lower()}.sh"
     script.write_text("#!/bin/sh\ncd \"" + str(ROOT) + "\"\nexec " + " ".join(f'"{x}"' for x in serve) + "\n",
@@ -6544,10 +9668,9 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     return scaling or "yarn", scale if scale is not None else derived_factor(ctx, trained)
 
 
-def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
-    """Steps 3 and 4: the Python packages, and the engine (the package's, or compiled here with the image encoders
-    `vision` needs) -> (llama.cpp's folder, the engine's folder, the image encoder's kind, the engine's library
-    folders)."""
+def prepare_engine(a, gpu: dict) -> tuple[Path, Path, list]:
+    """Steps 3 and 4: the Python packages, and the engine (the package's, or compiled here with its image engine and
+    picture reader) -> (llama.cpp's folder, the engine's folder, the engine's library folders)."""
     # ---- 3. python packages
     step(3, "Python packages")
     if PACKAGED:                                       # the distribution's, which the package depends on
@@ -6557,12 +9680,11 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
                     "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil, jsonschema")
 
     # ---- 4. the engine
-    step(4, "the Strata engine")
+    step(4, "the XeStrata engine")
     if PACKAGED:                                       # the package's: nothing is compiled
         llama = ROOT / "third_party" / "main" / "llama.cpp"   # gguf-py, for the tools below
         eng = packaged_engine_dir()
         meta = packaged_engine()
-        enc = "vulkan"
         # the engine's SYCL runtime, and oneMKL's folder when it is installed (oneMath opens its backend at run time;
         # without it the engine takes its own kernels)
         lib_dirs = list(meta.get("lib_dirs", []))
@@ -6570,74 +9692,210 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
             lib_dirs.append(str(Path(mkl) / "lib"))
         if meta.get("license") == "contrib" and not WIN:
             lib_dirs += nvidia_lib_dirs(data_folder_path(a.data_dir, load_settings()))
+        if not WIN and (gfx := amd_archs()):
+            # AMD's own ROCm, when it can run this engine: ahead of the distribution's on the engine's library path
+            # (LD_LIBRARY_PATH wins over the loader's cache), also where the loader already finds it through an
+            # ld.so.conf of its own - the user's ROCm 10 over the distribution's 7 then
+            rocm = amd_rocm_usable(amd_needed(eng), gfx)
+            if rocm is not None:
+                lib_dirs.insert(1, str(rocm / "lib"))
+            ok(amd_rocm_line(rocm))
         ok(f"engine: {eng / EXE} ({meta.get('package', 'package')})")
     else:
         llama = get_llama_cpp()
-        ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
+        ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml)")
         comp = choose_compiler(a, gpu)
-        enc = "vulkan"
         data = data_folder_path(a.data_dir, load_settings())
-        eng = build_engine({"none": [], "gpu": [enc, "cpu"], "cpu": ["cpu"]}[vision], llama, comp, data)
+        eng = build_engine(llama, comp, data)
         # the runtime of the compiler the engine was built with (none for the distribution's), and pip's NVIDIA ones
         nvidia_libs = nvidia_lib_dirs(data) if comp["license"] == "contrib" else []
         lib_dirs = list(dict.fromkeys(comp["lib_dirs"] + nvidia_libs))
         ok(f"engine: {eng / EXE}")
-    return llama, eng, enc, lib_dirs
+    return llama, eng, lib_dirs
 
 
 # A dense model's VRAM beside its weights and K/V cache: the prompt's buffers (Qwen3.5-9B's for 4096-token chunks are
 # about 1.9 GB, counted from prompt_carve, not measured; the engine halves the chunk until they fit, down to 16 tokens),
 # the products' libraries and the driver's reserve.  The least that lets the engine start.
 DENSE_MARGIN_GB = 1.0
+# A MoE's own weights beside its experts (the dense part, the head, the norms): about 2-3 GB across the plain
+# MoE families, an estimate for the streaming rule's VRAM half (the engine counts the real bytes).  The expert tier
+# is elastic: its partial residency on a small card is normal, not a weight the K/V pushed out.
+MOE_DENSE_GB = 3.0
 # ... and its RAM: the model file's pages pass through the OS cache once while the weights go to the GPU, and the
 # token embedding stays mapped (rows read on the host); an estimate, not measured
 DENSE_RAM_GB = 8
 
 
-def dense_vram_gb(fam: dict, d: dict, ctx: int) -> float:
-    """The VRAM (GB) a dense model of PLAIN_FAMILIES needs at a context of `ctx`: its weights, its K/V and the margin"""
-    return d["size"] / 1e9 + fam["kv_bytes"] * ctx / 1e9 + DENSE_MARGIN_GB
+def dense_vram_gb(fam: dict, d: dict, ctx: int, streaming: bool = False) -> float:
+    """The VRAM (GB) a dense model of PLAIN_FAMILIES needs at a context of `ctx`: its weights, its K/V and the margin.
+    With KV streaming (--kv-resident) the K/V's VRAM is the resident cells a layer, not the whole context."""
+    kv_cells = PLAIN_KV_RESIDENT if streaming else ctx
+    return d["size"] / 1e9 + fam["kv_bytes"] * kv_cells / 1e9 + DENSE_MARGIN_GB
+
+
+PLAIN_KV_RESIDENT = 32768   # the resident cells a layer --kv-resident auto keeps in VRAM (resolve_kv_resident)
+
+
+def plain_kv_host_gb(fam: dict, ctx: int, kv: str) -> float:
+    """The RAM a plain model's streamed KV host copy takes at a context of `ctx`: its K/V bytes a token (kv_bytes,
+    FP16 across the attention layers), scaled by the --kv format.  An estimate (the engine's figure is per layer and
+    head, and counts the MTP layer's)."""
+    factor = {"fp16": 1.0, "int8": 0.52, "q4_0": 0.28, "k8v4": 0.40}.get(kv, 1.0)
+    return ctx * fam.get("kv_bytes", 0) * factor / 1e9
+
+
+def plain_kv_streaming_wanted(fam: dict, d: dict, ctx: int, ram: float, kv: str, vram: float = 0.0) -> bool:
+    """Does the engine stream this plain model's KV (--kv-resident auto): from 64K up, only where the resident K/V
+    does not fit the GPU beside the model's own weights (the expert tier is elastic: its partial residency on a
+    small card is normal, not a weight pushed out), and the RAM holds the experts (a dense model: none) beside the
+    KV host copy and the engine's headroom.  The engine decides the same at load (resolve_kv_resident /
+    auto_gpu_layers, the real bytes); setup uses the model file as the experts' upper bound, for the context
+    guidance.  Where the resident form fits, streaming measured 45-76% slower decode (B70, RTX 4070, RX 9060 XT,
+    2026-11-15): it is not the default there.  Qwen3.8's rule (kv_streaming_wanted) has no VRAM condition: its QSA
+    reads only the selected cells, so streaming costs it nothing."""
+    if ctx < 65536:
+        return False
+    experts = 0.0 if fam.get("dense") else d["size"] / 1e9
+    if ram < experts + LOW_RAM_HEADROOM_GB + plain_kv_host_gb(fam, ctx, kv) + 1:
+        return False
+    if vram <= 0:
+        return True   # the GPU's size unknown: the RAM rule alone
+    weights = d["size"] / 1e9 if fam.get("dense") else MOE_DENSE_GB
+    return weights + fam.get("kv_bytes", 0) * ctx / 1e9 + DENSE_MARGIN_GB > vram
+
+
+# The shortest context a dense model is offered at: the size runs here when it fits the GPU at this context, and the
+# recommended context is shortened to what fits rather than the size made smaller (the 32K the smaller cards were
+# recommended before 2026-11-14's 128K)
+DENSE_MIN_CTX = 32768
+
+
+def dense_ctx(fam: dict, d: dict, gpu_gb: float, ctx: int) -> int:
+    """The context recommended for a dense model's size `d`: the longest of CONTEXTS up to `ctx` (and the model's)
+    whose K/V fits the GPU beside the weights, at least the shortest it is offered at"""
+    least = min(DENSE_MIN_CTX, fam["max_context"])
+    fit = [c for c in CONTEXTS if least <= c <= min(ctx, fam["max_context"]) and dense_vram_gb(fam, d, c) <= gpu_gb]
+    return fit[-1] if fit else least
+
+
+# A dense model on the CPU (--device cpu, the families with "cpu"): its weights repacked as int8 (one byte a weight, a
+# 4-byte scale and a 4-byte correction for each 32 of a row: 1.25 bytes; 895 MiB measured for Qwen3.5-0.8B), the K/V
+# in FP32 for the whole context from the start (src/core/plain_cpu.cpp), and the rest of the engine and the server
+CPU_MARGIN_GB = 2.0
+
+
+def cpu_ram_gb(fam: dict, ctx: int) -> float:
+    """The RAM (GB) a dense model of PLAIN_FAMILIES needs on the CPU at a context of `ctx`, any of its sizes: the
+    int8 copy of its weights (counted from the BF16 file's two bytes a weight), its FP32 K/V and the margin"""
+    weights = fam["models"]["BF16"]["size"] / 2 * 1.25
+    return weights / 1e9 + 2 * fam["kv_bytes"] * ctx / 1e9 + CPU_MARGIN_GB
+
+
+def cpu_ctx(fam: dict, ram: float) -> int:
+    """The context recommended on the CPU: the longest of CONTEXTS up to 32K (a longer prompt takes minutes to read on
+    a CPU) that the RAM holds, else the shortest"""
+    fits = [c for c in CONTEXTS if c <= min(32768, fam["max_context"]) and cpu_ram_gb(fam, c) <= ram]
+    return max(fits) if fits else CONTEXTS[0]
+
+
+def replicas_config(a, cfg: dict) -> None:
+    """--replicas N: data-parallel replicas (serve/replicas.py, upstream 8d276c19) over the chosen GPUs, in equal
+    groups.  Without it the config's "replicas" stays "auto": the server runs one engine per card when the model fits
+    one card and the RAM holds a copy of its experts for each (serve/autotune.py); setup says what that is here."""
+    if a.replicas is None:
+        if not cfg.get("replicas"):
+            n = autotune.replicas(autotune.read(cfg), cfg)
+            if n >= 2:
+                ok(f"replicas: this machine could run {n} engines, one on each card (the model fits one card, and the "
+                   f'RAM holds a copy of its experts for each); "replicas": {n} runs them - the server does not choose '
+                   "them by itself, since a request alone is faster on the layer split")
+        return
+    if a.replicas < 2:
+        return
+    cards = [cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])] if cfg.get("gpu_pci") else []
+    if not cards or len(cards) % a.replicas:
+        warn(f"--replicas {a.replicas}: needs the chosen GPUs ({len(cards) or 'one'}) to divide into {a.replicas} "
+             "equal groups; not set (choose the cards with --gpus, or write the groups into the config: "
+             '"replicas": [{"gpus": ["0000:03:00.0"]}, {"gpus": ["0000:09:00.0"]}])')
+        return
+    cfg["replicas"] = a.replicas
+    per = len(cards) // a.replicas
+    ok(f"{a.replicas} replicas of {per} GPU(s) each: "
+       f"{' | '.join(','.join(cards[i * per:(i + 1) * per]) for i in range(a.replicas))}")
+    if per > 1 and a.layer_split not in (None, "auto"):
+        warn("--layer-split is one engine's value; with replicas every group would get it: leave it at auto")
+    warn("each replica loads its own copy of the model's experts into RAM and runs its own host threads: "
+         "check that the RAM holds them")
+
+
+def plain_rope_extend(family: str, fam: dict) -> bool:
+    """Whether a plain family's context can go past its trained length by rope scaling: the Qwen-family rotations
+    (Ornith-1.5, Qwen3.6, Qwen3.5) take it, as Qwen3.8-Flash-Next does.  llm-jp-4.1 keeps its trained 64K (the user's
+    decision), and GLM-5.3-Flash's MLA is nope-only (no rotation to scale).  A model of the user's own files: by its
+    architecture."""
+    if family == "llmjp":
+        return False
+    arch = FAMILIES.get(family, {}).get("arch") if family == CUSTOM else None
+    return not (family == "glm53" or arch in ("glm5-next", "glm5next"))
+
+
+def plain_kv_takes(family: str) -> tuple:
+    """The KV cache precisions a plain family's engine path takes (--kv), FP16 the default: the Hadamard-rotated Q4_0
+    and trellis-coded forms for heads of 256; GLM-5.3-Flash's DSA caches in FP16 only.  A model of the user's own
+    files: by its architecture, as the family of that architecture."""
+    arch = FAMILIES.get(family, {}).get("arch") if family == CUSTOM else None
+    return ("fp16",) if family == "glm53" or arch in ("glm5-next", "glm5next") else \
+        ("fp16", "int8") if family == "llmjp" or arch == "qwen3moe" else \
+        ("fp16", "int8", "q4_0", "k8v4", "tcq4", "tcq5")
 
 
 def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
                 ram: float, roots: list, elsewhere: list, port: int, adopted: Path | None) -> int:
     """Steps 2-7 for a model of PLAIN_FAMILIES: its size and context, the engine, the GGUF file (size and SHA-256 at
-    the pinned revision), its tokenizer and chat template written out, and the config: `strata --native` with no pack,
-    PLE table or MTP layer.  Images where the family has a picture reader ("mmproj"), as for Qwen3.8-Flash-Next.  The
-    Qwen3.8-Flash-Next options (KV precision, low-RAM modes, the speed projection) do not apply; --low-ram on|mmap reads
+    the pinned revision), its tokenizer and chat template written out, and the config: `xestrata-engine --native` with
+    no pack, PLE table or MTP layer.  Images where the family has a picture reader ("mmproj"), as for
+    Qwen3.8-Flash-Next.  --kv, --parallel and --replicas as for Qwen3.8-Flash-Next where the engine takes them (the
+    speed projection's vector is that model's); --low-ram on|mmap reads
     the experts from the model file instead of RAM (--mmap-experts), the engine's own choice when the RAM is short;
+    --resident-budget-gib N keeps N GiB of them in RAM and reads the rest from the file;
     --gpus with several cards splits the layers across them (docs/MULTIGPU.md).  A dense model's sizes are recommended
     by the GPU's memory, which holds all of its weights."""
     models = fam["models"]
     names = list(models)
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
+    if a.quantizer and not a.model:   # one quantization's sizes (Ornith-1.5's GSQ-RCO files or Ornith AI's)
+        names = [m for m in names if size_quantizer(family, m) == a.quantizer] or names
     # the experts the GPUs hold need no copy in RAM (every card of --gpus: the layer split)
     vram = sum(max(0.0, gpu_info(i).get("vram_gb", 0.0) - 5) for i in sel) if len(sel) > 1 \
         else max(0.0, gpu.get("vram_gb", 0.0) - 5)
     dense = bool(fam.get("dense"))
-    gpu_gb = sum(gpu_expert_vram(gpu_info(i)) for i in sel) if len(sel) > 1 else gpu_expert_vram(gpu)
-    rec_ctx = min(vram_ctx(chosen), fam["max_context"])
+    on_cpu = bool(gpu.get("cpu"))                      # no GPU: the CPU's forward (--device cpu)
+    gpu_gb = 0.0 if on_cpu else \
+        sum(gpu_expert_vram(gpu_info(i)) for i in sel) if len(sel) > 1 else gpu_expert_vram(gpu)
+    rec_ctx = cpu_ctx(fam, ram) if on_cpu else min(vram_ctx(chosen), fam["max_context"])
     for i, m in enumerate(names, 1):
         d = models[m]
         gb = d["size"] / 1e9
-        if dense:
-            need = dense_vram_gb(fam, d, rec_ctx)
-            fit = "" if gpu_gb >= need else \
-                f"   <- needs ~{need:.0f} GB of VRAM at {rec_ctx // 1024}K, the GPU has {gpu_gb:.0f} GB"
+        if on_cpu:
+            need = cpu_ram_gb(fam, rec_ctx)
+            fit = "" if ram >= need else \
+                f"   <- needs ~{need:.0f} GB of RAM at {rec_ctx // 1024}K, this PC has {ram:.0f} GB"
+        elif dense:
+            c = dense_ctx(fam, d, gpu_gb, rec_ctx)
+            need = dense_vram_gb(fam, d, c)
+            fit = (f"   (at {c // 1024}K)" if c < rec_ctx else "") if gpu_gb >= need else \
+                f"   <- needs ~{need:.0f} GB of VRAM at {c // 1024}K, the GPU has {gpu_gb:.0f} GB"
         else:
             fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
-        say(f"  {i}) {m:15s} {d['about']}; download {gb:.0f} GB" + ("" if d.get("tested") else "   [untested]") + fit)
-    if dense:   # the largest that fits the GPU, else the smallest
-        fits = [i for i, m in enumerate(names, 1) if gpu_gb >= dense_vram_gb(fam, models[m], rec_ctx)]
-        rec = str(max(fits, key=lambda i: models[names[i - 1]]["size"])) if fits else \
-            str(min(range(1, len(names) + 1), key=lambda i: models[names[i - 1]]["size"]))
-    else:
-        rec = next((str(i) for i, m in enumerate(names, 1) if models[m].get("tested")), "1")
+        say(f"  {i}) {m:15s} {d['about']}" + ("" if d.get("custom") else f"; download {gb:.1f} GB") + fit)
+    # the best quality this PC runs (recommend_size; on the CPU the family's own choice: every size runs as int8)
+    cards = [gpu_info(i) for i in sel] if len(sel) > 1 else [gpu]
+    rec = str(names.index(recommend_size(family, room_of(ram, cards), names)) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     d = models[model]
-    if not d.get("tested"):
-        warn(f"{model} has not been run with this release (its tensor types are checked with the tested files)")
+    own = bool(a.gguf_dir or d.get("custom"))          # the person's own files: never downloaded or marked
     if not dense and ram + vram < d["size"] / 1e9 + 8:
         warn(f"{model}'s {d['size'] / 1e9:.0f} GB of weights do not fit this PC's RAM and GPU with room to spare: "
              "the engine reads the experts neither holds from the model file through the OS file cache (slower)")
@@ -6645,50 +9903,98 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     tag = fam["tag"] + model
     # images: the family's picture reader, asked as for Qwen3.8-Flash-Next (the GPU encoder from 24 GB of VRAM)
     vision = "none"
-    if not fam.get("mmproj"):
+    if on_cpu and fam.get("mmproj"):                   # the CPU's forward takes no picture's embeddings
+        if a.vision not in (None, "no", "none"):
+            warn("images are not available on the CPU (its forward reads text only): off")
+        ok("images: not available on the CPU (a GPU reads them)")
+    elif not fam.get("mmproj"):
         if a.vision not in (None, "no", "none"):
             warn(f"images are not available with {fam['title']} yet: off")
     elif a.vision:
         vision = "none" if a.vision in ("no", "none") else images_encoder(a.vision, gpu)
     else:
-        say()
-        say("  Images: the model can also read pictures (screenshots, photos, scanned pages). This adds a 0.9 GB")
-        say("  download; the image encoder runs on the GPU from 24 GB of VRAM, else on the CPU (a few seconds a"
-            " picture).")
-        vision = images_encoder("yes", gpu) if ask("Do you want images?", ["y", "n"], "y", a.yes) == "y" else "none"
-    if fam.get("mmproj"):
+        asked = ask_option("vision", a.yes)
+        vision = "none" if asked == "no" else images_encoder(asked, gpu)
+    if fam.get("mmproj") and not on_cpu:
         ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                          "cpu": "on (encoder on the CPU)"}[vision])
-    # the context: up to the model's, recommended by the smallest card's memory as for Qwen3.8-Flash-Next
-    contexts = [c for c in CONTEXTS if c <= fam["max_context"]]
+    # the context: up to the model's trained length, recommended by the smallest card's memory as for
+    # Qwen3.8-Flash-Next; past it by rope scaling where the model's rotation takes it (the 384K and 512K steps too)
+    rope_extend = plain_rope_extend(family, fam)
+    trained = fam["max_context"]
+    contexts = [c for c in CONTEXTS if c <= trained or rope_extend]
+    if dense and not on_cpu:
+        # a dense model's shortened to what fits the GPU beside its weights
+        rec_ctx = dense_ctx(fam, d, gpu_gb, rec_ctx)
     if a.context:
         ctx = a.context
-        if ctx > fam["max_context"]:
-            fail(f"{fam['title']} takes up to {fam['max_context']} tokens of context",
-                 f"--context {fam['max_context']}")
+        if ctx > trained and not rope_extend:
+            fail(f"{fam['title']} takes up to {trained} tokens of context", f"--context {trained}")
     else:
         say()
-        say("  Context length = how much text the model can see at once. Longer needs more VRAM for it, so fewer")
-        say("  experts fit on the GPU:")
+        if on_cpu:
+            say("  Context length = how much text the model can see at once. Longer needs more RAM, and a long prompt")
+            say("  takes the CPU minutes to read:")
+        else:
+            say("  Context length = how much text the model can see at once. Longer needs more VRAM for it, so fewer")
+            say("  experts fit on the GPU:")
         for i, c in enumerate(contexts, 1):
-            say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
+            rec_mark = "   (recommended for your " + ("PC)" if on_cpu else "GPU)")
+            say(f"  {i}) {c // 1024}K tokens" + (rec_mark if c == rec_ctx else "") +
+                ("   (experimental: setup adds rope scaling)" if c > trained else ""))
         ctx = contexts[int(ask("Context?", [str(i) for i in range(1, len(contexts) + 1)],
                                str(contexts.index(rec_ctx) + 1), a.yes)) - 1]
+    # the rope scaling for the context actually served, as for Qwen3.8-Flash-Next: past the trained length an omitted
+    # method is yarn (asked when interactive) and the factor final / trained; an explicit --rope-scaling / --rope-scale
+    # wins.  A model whose rotation does not take it (llm-jp-4.1, GLM-5.3-Flash) keeps its trained angles.
+    scaling = rope_scale = None
+    if rope_extend:
+        scaling = a.rope_scaling
+        if ctx > trained and scaling is None and not a.yes:
+            scaling = ask_option("rope-scaling", a.yes)
+        try:
+            scaling, rope_scale = resolve_rope(ctx, scaling, a.rope_scale, trained=trained)
+        except ValueError as e:
+            fail(str(e))
+        if scaling is not None:
+            origin = (f"final context / trained {trained}; override with --rope-scale" if a.rope_scale is None
+                      else "as requested")
+            ok(f"rope scaling: {scaling}, factor {rope_scale:g} ({origin})")
+    elif a.rope_scaling is not None or a.rope_scale is not None:
+        arch = FAMILIES.get(family, {}).get("arch") if family == CUSTOM else None
+        nope = family == "glm53" or arch in ("glm5-next", "glm5next")
+        why = "its MLA is nope-only, with no rotation to scale" if nope else "it keeps its trained context"
+        warn(f"--rope-scaling / --rope-scale do not apply to {fam['title']}: {why}")
     ok(f"context: {ctx} tokens")
-    if dense and gpu_gb < dense_vram_gb(fam, d, ctx):
-        warn(f"{fam['title']} {model} keeps every weight in VRAM: ~{dense_vram_gb(fam, d, ctx):.0f} GB at a "
+    kv_fmt = a.kv if (a.kv and a.kv in plain_kv_takes(family)) else "fp16"
+    streaming = not on_cpu and plain_kv_streaming_wanted(fam, d, ctx, ram, kv_fmt, gpu_gb)
+    if streaming:
+        ok(f"KV streaming (auto): the last {PLAIN_KV_RESIDENT // 1024}K cells a layer stay in VRAM, the rest in RAM "
+           f"(~{plain_kv_host_gb(fam, ctx, kv_fmt):.1f} GB), so the long context fits and more experts stay on the GPU")
+    if on_cpu and ram < cpu_ram_gb(fam, ctx):
+        warn(f"{fam['title']} on the CPU keeps its weights as int8 and the KV cache in FP32: "
+             f"~{cpu_ram_gb(fam, ctx):.0f} GB at a {ctx // 1024}K context, and this PC has {ram:.0f} GB, so the engine "
+             "may not start; a shorter context fits")
+    elif dense and not on_cpu and gpu_gb < dense_vram_gb(fam, d, ctx, streaming):
+        warn(f"{fam['title']} {model} keeps every weight in VRAM: ~{dense_vram_gb(fam, d, ctx, streaming):.0f} GB at a "
              f"{ctx // 1024}K context, and the GPU has {gpu_gb:.0f} GB, so the engine may not start; a smaller size "
              "or context fits")
     parts = plain_parts(d)
-    names_of = [Path(x["path"]).name for x in parts]   # side by side in one folder: the engine finds them by name
-    models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
+    # a file whose published name differs from its name on disk (Inkling-2-Mini's Mainline_Support .gguf_file
+    # must be a .gguf for the engine and the model folder's scan) gets its local name from "local".
+    names_of = [Path(x.get("local", x["path"])).name for x in parts]
+    # a family of another's files ("files_tag": Inkling-2-Mini's QSA entry shares the plain entry's folder)
+    files_tag = fam.get("files_tag", fam["tag"]) + model
+    models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / files_tag
+    if d.get("custom"):
+        models_dir = Path(a.custom["files"][0]["path"]).parent
 
     def all_there(folder: Path) -> bool:
-        return all((folder / n).exists() and (done(folder / n) or a.gguf_dir) for n in names_of)
-    if not a.gguf_dir and not all_there(models_dir):
+        return all((folder / n).exists() and (done(folder / n) or own) for n in names_of)
+    if not own and not all_there(models_dir):
         for r in elsewhere:                            # already downloaded in a Strata folder on another drive
-            if all_there(r / "models" / tag):
-                models_dir = r / "models" / tag
+            if all_there(r / "models" / files_tag):
+                models_dir = r / "models" / files_tag
                 ok(f"model file found in {models_dir}")
                 break
     gguf = models_dir / names_of[0]
@@ -6696,30 +10002,39 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     left = 0 if have else d["size"] / 1e9
     mm = fam.get("mmproj") if vision != "none" else None
     mmproj = models_dir / Path(mm["path"]).name if mm else None   # the picture reader, beside the model
-    if mm is not None and mmproj is not None and not (mmproj.exists() and (done(mmproj) or a.gguf_dir)):
+    if mm is not None and mmproj is not None and not mmproj.exists():
+        near = mmproj_beside(a.gguf_dir, mmproj.name, mm["size"])   # the person's own folder, or the one above it
+        if near is not None:
+            mmproj = near
+    if mm is not None and mmproj is not None and not (mmproj.exists() and (done(mmproj) or own)):
         left += mm["size"] / 1e9
     if left and free_gb(models_dir) < left:
         fail(f"not enough free disk space in {models_dir}: need ~{left:.0f} GB, {free_gb(models_dir):.0f} GB free",
              "use --models-dir on a bigger drive")
 
-    llama, eng, enc, lib_dirs = prepare_engine(a, gpu, vision)
+    llama, eng, lib_dirs = prepare_engine(a, gpu)
+    if d.get("custom"):                                # the engine's verdict before anything is made
+        check_model(eng / EXE, lib_dirs, gguf)
+        ok(f"the engine runs {gguf.name}")
 
     # ---- 5. the model file
-    step(5, f"downloading {fam['title']} {model}")
+    step(5, f"downloading {fam['title']} {model}" if not d.get("custom") else f"the model files of {fam['title']}")
     if not have:
         say(f"  The model file{'s go' if len(parts) > 1 else ' goes'} in {models_dir} (a copy you already have: put "
             f"it there with its name, {', '.join(names_of)}, or use --gguf-dir <its folder>)")
     for x, n in zip(parts, names_of):
-        if not ((models_dir / n).exists() and (done(models_dir / n) or a.gguf_dir)):
-            download(hf(d["repo"]) + x["path"], models_dir / n)
-        verify_sha256(models_dir / n, x["size"], x["sha256"], own=bool(a.gguf_dir))
+        if d.get("custom"):                        # what setup read of them; the engine checked the rest
+            continue
+        if not ((models_dir / n).exists() and (done(models_dir / n) or own)):
+            download(hf(x.get("repo", d["repo"])) + x["path"], models_dir / n)
+        verify_sha256(models_dir / n, x["size"], x["sha256"], own=own)
     more = f" and {len(parts) - 1} more beside it" if len(parts) > 1 else ""
     ok(f"model file present: {gguf}{more}")
     if mm is not None and mmproj is not None:
         # the same file beside another size or the other family (Qwen3.5-9B's two share one): linked, not fetched
         # (only a copy whose finish mark holds the pinned SHA-256: GLM-5.3-Flash's is named mmproj-BF16.gguf too)
-        other = [p for p in Path(a.models_dir).glob("*/" + mmproj.name) if p != mmproj
-                 and f"sha256 {mm['sha256']}" in (mark_text(p) or "")]
+        other = [p for p in Path(a.models_dir).glob("*/" + mmproj.name)
+                 if p != mmproj and f"sha256 {mm['sha256']}" in (mark_text(p) or "")]
         if other and not mmproj.exists() and not a.gguf_dir:
             try:
                 os.link(other[0], mmproj)
@@ -6733,10 +10048,15 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         ok(f"vision encoder: {mmproj}")
 
     # ---- 6. the tokenizer and the chat template, for the server
-    step(6, "preparing the model for Strata")
+    step(6, "preparing the model for XeStrata")
     tok_dir = (find_in(roots, f"tokenizers/{tag.lower()}") or roots[0] / "tokenizers" / tag.lower())
+    # a .strata model: the server's tokenizer from its tokenizer.json
+    if fam.get("file_format") == ".strata" and not (tok_dir / "tokenizer" / "vocab.json").exists():
+        run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--tokenizer-json",
+             str(models_dir / "tokenizer.json"), "--chat-template", str(models_dir / "chat_template.jinja"), "--out",
+             str(tok_dir)])
     if not (tok_dir / "tokenizer" / "vocab.json").exists():
-        env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+        env = dict(os.environ, XESTRATA_GGUF_PY=str(llama / "gguf-py"))
         run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(gguf), "--out", str(tok_dir)],
             env=env)
     ok(f"tokenizer: {tok_dir / 'tokenizer'}")
@@ -6744,28 +10064,95 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # ---- 7. the settings
     step(7, "writing the model's settings" if PACKAGED else "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx)]
+    if fam.get("qsa"):   # Inkling-2-Mini (QSA): the indexer on for every request; its budget, local and sink are the
+        # engine's (--qsa-budget, --qsa-local, --qsa-sink: provisional until the MODEL check measures them)
+        args += ["--qsa-indexer", str(models_dir / INKLING_QSA_FILE), "--qsa", "on"]
+    if scaling is not None:     # the resolved rope configuration: the explicit flags, or yarn and the derived factor
+        args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
+    if on_cpu:
+        args += ["--device", "cpu"]
     if fam.get("profile"):                             # the experts filled into VRAM at start, most routed first
         args += ["--expert-profile", str(ROOT / "data" / fam["profile"])]
     if fam.get("draft_vocab"):                         # the MTP layer's drafts over a token subset (--draft-vocab)
         args += ["--draft-vocab", str(ROOT / "data" / DRAFT_VOCABS.get(a.draft_vocab or "cjk", "draft_vocab.bin"))]
+    # the drafter: a model with a DFlash2 drafter (the family's "dflash2", tools/dflash2_fetch.py's key) has it fetched
+    # into dflash2/ beside the model for auto (the default) and dflash2; with auto the engine measures it, the MTP layer
+    # and no drafter at its start and keeps the fastest (the window too, --spec auto)
+    drafting = getattr(a, "drafting", None) or saved_drafting(CONF / f"xestrata-{tag.lower()}.json") or "auto"
+    df2_key = fam.get("dflash2")
+    df2_pack = None
+    if df2_key and drafting in ("auto", "dflash2") and not on_cpu:
+        df2_dir = models_dir / "dflash2"
+        say(f"  The DFlash2 drafter of {fam['title']} (a second way to guess ahead) comes from Inco AI (Apache-2.0);")
+        say("  it is packed on this PC.")
+        run([sys.executable, str(ROOT / "tools" / "dflash2_fetch.py"), "fetch", "--model", df2_key, "--out",
+             str(df2_dir)], env=dict(os.environ), check=False)
+        df2_pack = next((p for p in (df2_dir / f"{df2_key}-dflash2.q4_0-selq4.pack",
+                                     df2_dir / f"{df2_key}-dflash2.q4_0.pack") if p.exists()), None)
+        if df2_pack is None:
+            warn("the DFlash2 drafter is not on this PC (the download did not complete): the MTP layer continues")
+            if drafting == "dflash2":
+                drafting = "mtp"
+    elif drafting == "dflash2":
+        drafting = "auto"   # no drafter for this model: the MTP layer, measured against none
+    if not on_cpu:
+        if drafting == "off":
+            args += ["--draft", "off"]
+        elif drafting == "dflash2" and df2_pack is not None:
+            args += ["--draft", "dflash2", "--draft-model", str(df2_pack)]
+        else:
+            args += ["--draft", drafting, "--spec", "auto"]
+            if drafting == "auto" and df2_pack is not None:
+                args += ["--draft-model", str(df2_pack)]
+        ok(f"drafting: {drafting}")
     if vision != "none":   # the GPU encoder warms up before the engine, which then sizes itself around it
         args += ["--vision"]
     if a.vram_reserve_mib is not None:
         args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
     elif vision != "none":
         args += ["--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
+    args += ram_reserve_args(a)
+    # --kv: the KV cache's precision, as far as the model's engine path takes it
+    if a.kv and on_cpu:
+        warn(f"--kv {a.kv}: the CPU keeps the KV cache in FP32")
+    elif a.kv:
+        takes = plain_kv_takes(family)
+        if a.kv not in takes:
+            warn(f"--kv {a.kv} is not available for {fam['title']} ({', '.join(takes)}): the KV cache stays FP16")
+        elif a.kv != "fp16":
+            args += ["--kv", a.kv]
+            ok(f"KV cache: {a.kv}")
     # --low-ram: the engine keeps in RAM what the VRAM does not hold as far as the RAM allows and reads the rest from
-    # the file by itself (resident and auto); on and mmap read every expert the VRAM misses from the file
-    if a.low_ram in ("on", "mmap"):
+    # the file by itself (resident and auto); on and mmap read every expert the VRAM misses from the file.
+    # --resident-budget-gib N: N GiB of them in RAM, the rest read from the file (the engine's RAM tier, as
+    # Qwen3.8-Flash-Next's)
+    if a.resident_budget_gib is not None and not dense:
+        args += ["--resident-budget-gib", f"{a.resident_budget_gib:g}"]
+        ok(f"RAM budget: {a.resident_budget_gib:g} GiB of the experts the GPU does not hold in RAM, the rest read from "
+           "the model file")
+        if a.low_ram in ("on", "mmap"):
+            warn(f"--low-ram {a.low_ram} is left out: --resident-budget-gib keeps part of the experts in RAM")
+    elif a.low_ram in ("on", "mmap"):
         args += ["--mmap-experts"]
         ok("low-RAM mode: the experts the GPU does not hold are read from the model file (--mmap-experts)")
     elif a.low_ram == "resident":
         ok("low-RAM mode: the engine keeps in RAM what the GPU does not hold as far as the RAM allows (its default)")
     cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
-                           "tokenizer": str(tok_dir / "tokenizer"), "model_name": f"{fam['name']}-{model.lower()}",
+                           "tokenizer": str(tok_dir / "tokenizer"), "model_name": served_name(family, model),
+                           "family": family,
+                           **({"arch": "inkling2_loop"} if fam.get("file_format") == ".strata" else {}),
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
+    if not on_cpu:
+        cfg["drafting"] = drafting
+        if df2_pack is not None:
+            cfg["draft_model"] = str(df2_pack)
+    # for serve/autotune.py's choices (its "parallel": slots taken from the VRAM the experts leave, "replicas",
+    # "split_serve"): the model's files and, of them, the experts the cache holds - a dense model has none
+    cfg["model_gb"] = round(d["size"] / 1e9, 1)
+    if fam.get("profile"):
+        cfg["experts_gb"] = experts_gb(gguf)
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
-        cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
+        cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (XESTRATA_GPU_PCI)
     if len(sel) > 1:                                   # --gpus: the layer split's other cards, as Qwen3.8-Flash-Next's
         cfg["gpu_pci"] = gpu["pci"]
         cfg["split_pci"] = [gpu_info(i)["pci"] for i in sel[1:]]
@@ -6777,30 +10164,48 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         cfg["api_key"] = a.api_key
     if a.browser is not None:
         cfg["open_browser"] = a.browser
-    if a.parallel is not None and a.parallel >= 2:
-        warn("--parallel is not available for this model yet: one request at a time")
+    if a.parallel is not None and a.parallel >= 2:   # the batch slots (docs/BATCHING.md, the plain engine's part)
+        if on_cpu:
+            warn("--parallel is not available on the CPU: one request at a time")
+        elif family == "glm53" or vision != "none":
+            warn(f"--parallel is not available {'for GLM-5.3-Flash' if family == 'glm53' else 'with images'} yet: "
+                 "one request at a time")
+        else:
+            cfg["parallel"] = a.parallel
+            ok(f"parallel requests: up to {a.parallel} decoded together (as many as half the free VRAM holds)")
+    elif a.parallel == 1:
+        cfg["parallel"] = 1
+    replicas_config(a, cfg)
     if vision != "none" and mmproj is not None:   # as Qwen3.8-Flash-Next's (setup's main path)
         vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
-        cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
+        cpu_enc = {"exe": str(eng / VISION_EXE), "gpu": False,
                    "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"],
                    "threads": vision_threads()}
         cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), **cpu_enc}
         if vision == "gpu":
-            cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), "exe": str(eng / VEXE[enc]), "gpu": True,
+            cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), "exe": str(eng / VISION_EXE), "gpu": True,
                              "gpu_pci": gpu["pci"], "max_tokens": vt, "fallback": cpu_enc}
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
-    if a.images is None and not a.yes and not JSON_OUT:   # as for Qwen3.8-Flash-Next: asked only interactively
-        a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")
+    if on_cpu and a.images:
+        warn("image generation is not available without a GPU: no image models")
+        a.images = None
+    elif a.images is None and not a.yes and not JSON_OUT and not on_cpu:   # as for Qwen3.8-Flash-Next: asked only
+        a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")    # interactively
+    if a.translate is None and not a.yes and not JSON_OUT:
+        a.translate = ask_translate(CONF / f"xestrata-{tag.lower()}.json")
     if a.images:   # only when given: else an earlier "images" is carried over
         # the RAM the chat model keeps, as --describe estimates it (a dense model's DENSE_RAM_GB, the others' file and
         # 8 GB); an image model's text encoder of the same file shares it (shared_text_quant)
         text_gb = DENSE_RAM_GB if dense else d["size"] / 1e9 + 8
         got = setup_images(a, gpu, Path(a.models_dir), eng, text_gb, gguf)
         cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
+        place_images(a, cfg)
         if not cfg["image_models"]:
             cfg["image_models"] = None
-    return finish_setup(a, cfg, tag, port, adopted, vision != "none", tune=False)
+    setup_translate(a, cfg, CONF / f"xestrata-{tag.lower()}.json", DENSE_RAM_GB if dense else d["size"] / 1e9 + 8,
+                    on_cpu)
+    return finish_setup(a, cfg, tag, port, adopted, vision != "none")
 
 
 INKLING2MINI_EXE = inkling2mini_family.EXE
@@ -6887,11 +10292,11 @@ def setup_inkling2mini(a, fam: dict, gpu: dict, ram: float, roots: list, port: i
         fail(f"not enough free disk space in {models_dir}: need ~{left / 1e9:.0f} GB, "
              f"{free_gb(models_dir):.0f} GB free", "use --models-dir on a bigger drive")
 
-    _, eng, _, lib_dirs = prepare_engine(a, gpu, "none")
+    _, eng, lib_dirs = prepare_engine(a, gpu)
     exe = eng / INKLING2MINI_EXE
     if not exe.exists():
         fail(f"this engine has no {INKLING2MINI_EXE} (the program that runs {fam['title']})",
-             "install a XeStrata package that has it, or build it (cmake --build ... --target strata-inkling-2-mini)")
+             "install a XeStrata package that has it, or build it: cmake --build ... --target strata-inkling-2-mini")
 
     step(5, f"downloading {fam['title']} {model}")
     paths = [inkling2mini_fetch(a, n, models_dir) for n in files]
@@ -6899,7 +10304,7 @@ def setup_inkling2mini(a, fam: dict, gpu: dict, ram: float, roots: list, port: i
     if vision:
         ok(f"image reader: {paths[-1]}")
 
-    step(6, "preparing the model for Strata")
+    step(6, "preparing the model for XeStrata")
     tok_dir = (find_in(roots, f"tokenizers/{tag.lower()}") or roots[0] / "tokenizers" / tag.lower())
     if not (tok_dir / "tokenizer" / "vocab.json").exists():
         sys.path.insert(0, str(ROOT / "tools"))
@@ -6945,11 +10350,17 @@ def setup_inkling2mini(a, fam: dict, gpu: dict, ram: float, roots: list, port: i
 def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images: bool, tune: bool = True,
                  notes: list[str] | tuple = ()) -> int:
     """The end of an install: the model's config written, its start script, the warm-up, what to do next, and the
-    start.  `tune`: Qwen3.8-Flash-Next's engine options, where an earlier calibration's settings for this PC apply.
+    start.  `tune`: the engine options an earlier calibration found for this PC and model, where there are some
+    (--pcie-frac, --pool-workers and the adaptive tier's, which both engines take).
     `notes`: the model's own tips, printed with the CPU's."""
     cfg_path = CONF / f"xestrata-{tag.lower()}.json"
     CONF.mkdir(parents=True, exist_ok=True)
     STATE.mkdir(parents=True, exist_ok=True)
+    if getattr(a, "custom", None):                     # a model of the user's own files: what setup read of them
+        cfg["custom"] = a.custom
+    if getattr(a, "route_tail_skip", None):            # else an earlier config's own choice is carried over
+        cfg["route_tail_skip_default"] = route_tail_skip_value(a.route_tail_skip)
+    keep_old_names(cfg, cfg_path if cfg_path.is_file() else adopted)
     cal = saved_calibration(cfg) if tune else None
     if cal is not None:
         sys.path.insert(0, str(ROOT / "tools"))
@@ -6969,7 +10380,7 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
     if free is not None and "--vram-free-mib" not in cfg["args"] and not host_cache_on(cfg):
         cfg["args"] = [*cfg["args"], "--vram-free-mib", free]
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None,
-                       getattr(a, "gpus_chosen", False))
+                       getattr(a, "gpus_chosen", False), {**conversation_save_default(a, cfg), **skills_default(a)})
     script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     if not a.no_warmup:
         warm_up(cfg_path)
@@ -6997,78 +10408,563 @@ def vram_ctx(cards: list) -> int:
     """The context the GPUs' memory recommends: each card keeps its layers' KV of the whole context, so the smallest
     decides; an AMD APU, in the memory it can use in all."""
     small = min(x.get("uma_gb", x["vram_gb"]) for x in cards)
-    return 32768 if small < 14 else 65536 if small < 20 else 131072
+    return 131072 if small < 14 else 196608 if small < 20 else 262144
+
+
+# ------------------------------------------------------------------------------------------------ the options
+# The options a front end shows as fields, in one table: --describe's "options" (the launcher's window draws its
+# fields from them), the command line's options (option_args) and setup's own questions (ask_option) are made from it,
+# so a label lives here only.  An option:
+#   name     the command line's --NAME (and its key in describe); the image options are also tools/image/install.py's,
+#            without "image-"
+#   label    a field's label, in English (the window shows its translation where its catalogs have setup.NAME.label)
+#   help     the command line's help
+#   kind     choice (one of `choices`, [value, label] each), int, number (min, max: the values taken), text (pattern: a
+#            regular expression the whole value matches), path (folder or file: `pick`), flag (a check box: --NAME
+#            alone, or with `values`, [checked, unchecked], --NAME with either), password (not on the command line:
+#            given in the environment variable `env`), gpus (the GPUs as check boxes, two or more: their indexes)
+#   place    install (the install page), advanced (its Advanced), start (how a model runs: at an install and at a
+#            start), images (how the image models run: at an install with images, and an installed model's images)
+#   when     what has to hold for the field to be shown (all of them): vision (the model reads pictures), kv (setup
+#            takes a KV cache precision there), long_context (a context past 262,144), speed_projection, budget (a RAM
+#            budget of the experts), images (image models chosen), multi_gpu (two GPUs or more), download (not the
+#            user's own files), sam3 (SAM 3.1's license not agreed to yet), NAME=VALUE and NAME!=VALUE (another
+#            option's value; "" is blank)
+#   default  the value shown first: a choice's or a check box's (True: checked); a value of "" passes nothing.  keep:
+#            the option is passed only when it was changed (it is saved, and the default shown is what is saved)
+#   hint     the text a blank field shows; takes: what the value must be, after "--NAME takes"; about: a note under
+#            the field; vars: what {NAME} in the texts stands for; question: setup's question for it, in a terminal;
+#            gpu_choices: the choices also list the GPUs, by "index" or by "pci"; path_choice: the choice that shows
+#            a path field whose value is passed instead; needed: why a password field cannot be left blank, unless its
+#            key is saved already ("set" in describe)
+#   cli      more of argparse's add_argument (metavar, choices, default)
+def _option(name: str, label: str, help: str, kind: str = "choice", place: str = "install", **more) -> dict:
+    return {"name": name, "label": label, "help": help, "kind": kind, "place": place, **more}
+
+
+OPTIONS = [
+    # ---- the install page: setup's questions of step 2
+    _option("data-dir", "Data folder: where the model files go (tens of GB)",
+            "where the model files go (~70-120 GB): default XeStrata-data next to this folder, remembered for every "
+            "XeStrata folder on this PC", kind="path", pick="folder"),
+    _option("gguf-dir", "Model files you already have",
+            "use GGUF files you already have (a folder with every shard: <name>-00001-of-0000N.gguf ... "
+            "-0000N-of-0000N.gguf)", kind="path", pick="folder", when=["download"],
+            hint="(optional) a folder with the model files already downloaded"),
+    _option("vision", "Read pictures too (screenshots, photos, scanned pages; a 0.9 GB download)",
+            "let the model read images (on by default where the model can; yes = the reader for this card: the CPU "
+            "under 24 GB of VRAM, the GPU from 24 GB; gpu = the encoder on the GPU, the CPU encoder taking over when "
+            "it cannot start; cpu = on the CPU only; no = text only)",
+            choices=[["yes", "On: the reader for this GPU (on the GPU from 24 GB of VRAM, else on the CPU)"],
+                     ["gpu", "On, the reader on the GPU (the CPU when it cannot start there)"],
+                     ["cpu", "On, the reader on the CPU"],
+                     ["no", "Off: text only"]],
+            default="yes", when=["vision"], question="Do you want images?",
+            cli={"choices": ["yes", "no", "none", "gpu", "cpu"]}),
+    _option("kv", "KV cache precision (the model's memory of the conversation)",
+            "KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less precise), "
+            "k8v4 (8-bit keys and 4-bit values: about three quarters of the memory) or fp16 (16-bit, twice the "
+            "memory of int8)",
+            choices=[["int8", "8-bit (recommended)"],
+                     ["q4_0", "4-bit: half the memory, a little less precise on long documents"],
+                     ["k8v4", "8-bit keys and 4-bit values: about three quarters of the memory"],
+                     ["fp16", "16-bit: twice the memory of 8-bit"]],
+            default="int8", when=["kv"], question="KV cache?"),
+    _option("rope-scaling", "RoPE extension: a context past the model's trained 262,144 positions rescales its rotary "
+            "angles",
+            "the RoPE extension for a context past the model's trained 262144: linear (position interpolation) or "
+            "yarn, llama.cpp's types. Omitted with such a context, setup takes yarn; none is refused there",
+            choices=[["yarn", "yarn (keeps the trained angles on the high-frequency pairs)"],
+                     ["linear", "linear (shrinks every angle)"]],
+            default="yarn", when=["long_context"], question="RoPE extension method?",
+            cli={"choices": ["none", "linear", "yarn"]}),
+    _option("experimental-speed-projection", "EXPERIMENTAL - speed projection (off unless you choose it)",
+            "EXPERIMENTAL, off by default: the control vector in third_party/nonfree/experimental-speed-projection "
+            "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md",
+            choices=[["off", "Off"], ["on", "On"], ["file", "On, with another control vector (a GGUF file)"]],
+            default="off", when=["speed_projection"], path_choice="file", pick="file",
+            hint="another control vector, a GGUF file",
+            about="A small control vector applied while the model runs (layers 4-44). It changes how the model "
+                  "answers: its package describes it as a refusal-direction projection (the model declines far fewer "
+                  "requests). When on, the web app can switch it off per chat. For fewer refusals, choose SC117's or "
+                  "huihui-ai's abliterated version as the model instead (the refusals removed in its weights).",
+            question="Turn on the experimental speed projection?", cli={"metavar": "on|off|GGUF"}),
+    _option("web-search", "Web search, for every model: the model searches when a request asks for it (the web "
+            "page's Search switch, the API's web search tools)",
+            "web search for every model (serve's web search tools, the web page's Search switch): deepseek uses "
+            "DeepSeek's search API with your API key (asked without echo; billed by DeepSeek per search); tinyfish "
+            "TinyFish's search API with your API key (asked without echo; free up to a daily allowance); no takes "
+            "either out. A SearXNG-compatible server of your own is its address as search_url in settings.json. "
+            "Without it setup asks the first time, and with --setup",
+            choices=[[OV.SEARCH_OFF, "Off"],
+                     [OV.SEARCH_DEEPSEEK, "DeepSeek's search API: your API key, billed by DeepSeek per search "
+                      "(USD 0.75 per "
+                      "1,000); the search words go to DeepSeek"],
+                     [OV.SEARCH_TINYFISH, "TinyFish's search API: your API key, free up to a daily allowance (12,000 "
+                      "searches, 1,000 pages read); the search words and the pages found go to TinyFish"]],
+            default="no", question="Use web search?"),
+    _option("deepseek-api-key", "DeepSeek API key (kept in your settings, never shown)",
+            "the DeepSeek API key of web search", kind="password", env="XESTRATA_DEEPSEEK_API_KEY",
+            when=["web-search=deepseek"], hint="your DeepSeek API key",
+            needed="Web search with DeepSeek needs your DeepSeek API key."),
+    _option("tinyfish-api-key", "TinyFish API key (kept in your settings, never shown)",
+            "the TinyFish API key of web search", kind="password", env="XESTRATA_TINYFISH_API_KEY",
+            when=["web-search=tinyfish"], hint="your TinyFish API key",
+            needed="Web search with TinyFish needs your TinyFish API key."),
+    # ---- the install page's Advanced: what setup takes without asking
+    _option("vision-tokens", "The most image tokens a picture becomes (more reads small text better, and takes "
+            "longer)",
+            "the most image tokens a picture becomes (default 1024 with the encoder on the GPU, 300 on the CPU): more "
+            "reads small text and charts better, and takes longer to encode; remembered for this model",
+            kind="int", place="advanced", min=1, when=["vision", "vision!=no"], hint="1024 on the GPU, 300 on the CPU",
+            takes="a number of image tokens, 1 or more", cli={"metavar": "N"}),
+    _option("rope-scale", "RoPE extension factor (1 or more)",
+            "the extension factor, finite and >= 1 (default: the final context over the trained 262144, at least 1: "
+            "1.5 for 384K, 2 for 512K, 1 inside the trained range)",
+            kind="number", place="advanced", min=1, max=1e6, when=["long_context"], hint="the context over 262,144",
+            takes="a number, 1 or more"),
+    _option("low-ram", "Low-RAM mode: the experts read from the model files instead of all copied into RAM",
+            "read the model's experts from its files instead of copying them all into RAM (for a PC with a big GPU "
+            "and little RAM); auto: when the experts would not fit the RAM. In this mode the experts the GPU does not "
+            "hold are copied into RAM once when they fit (resident), else read through the OS file cache (mmap); "
+            "resident / mmap force one of the two",
+            place="advanced",
+            choices=[["auto", "Auto: when the experts do not fit the RAM"], ["on", "On"], ["off", "Off"],
+                     ["resident", "On, the experts the GPU does not hold copied into RAM"],
+                     ["mmap", "On, the experts the GPU does not hold read through the OS file cache"]],
+            default="auto", cli={"default": "auto"}),
+    _option("host-cache", "Expert cache in host USM (an integrated AMD GPU: every expert in the RAM it shares)",
+            "XeStrata-890M: auto puts the expert cache in host USM, with every expert of the model in it, on an "
+            "integrated AMD GPU whose carve-out does not hold the experts and whose RAM holds the model "
+            "(STRATA_CACHE_HOST=1, --mmap-experts, --no-prefill-borrow: decode 15-22 -> about 39 tok/s on the Radeon "
+            "890M, the README's table); off writes the engine's default path instead",
+            place="advanced",
+            choices=[["auto", "Auto: on an integrated AMD GPU whose RAM holds the model"],
+                     ["off", "Off: the engine's default path"]],
+            default="auto", cli={"default": "auto"}),
+    _option("resident-budget-gib", "GiB of the experts kept in RAM (the rest read from the SSD)",
+            "UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 17 GB, 47 on 64 GB; a "
+            "GPU that shares the RAM: less 24 GB; "
+            "more is kept as you choose, with a note); the other models' files: the GiB of the experts the GPU does "
+            "not hold kept in RAM, the rest read from the file",
+            kind="number", place="advanced", min=1, max=1e6, when=["budget"], hint="setup's choice for this RAM",
+            takes="a number of GiB", cli={"metavar": "N"}),
+    _option("ram-reserve-gib", "RAM left free for other programs, in GiB (the model's mode, its experts in RAM and "
+            "the image models' sizes are chosen with that much less; slower when the experts are then read from the "
+            "SSD)",
+            "RAM in GiB XeStrata leaves free for other programs: setup chooses the model's mode, the RAM its experts "
+            "keep and the image models' sizes with that much less, and the engines keep it free beside their RAM "
+            "copies (slower when the experts no longer fit and are read from the SSD; default: none, as before); set "
+            "up again to change it",
+            kind="number", place="advanced", min=0, max=1e6, hint="(none) GiB of RAM to leave free for other programs",
+            takes="a number of GiB, 0 or more", cli={"metavar": "N"}),
+    _option("parallel", "Requests decoded together (each takes VRAM from the expert cache)",
+            "up to N requests decode together (batch slots; default: the server chooses by itself at every start from "
+            "the card's VRAM and the experts' size, and 1 to N fixes it). Each slot takes VRAM from the expert cache; "
+            "setup says what the automatic choice would be",
+            kind="int", place="advanced", min=1, hint="1: one request at a time",
+            takes="a number of requests, 1 or more", cli={"metavar": "N"}),
+    _option("replicas", "With a layer split: independent engines, each on an equal group of the GPUs",
+            "several GPUs (--gpus): run N independent engines, each on its own equal group of the chosen cards (2 "
+            "replicas on 4 cards = two 2-card engines), requests spread over them (default: the server chooses by "
+            "itself when every card alone holds the model; more total throughput for a model that fits fewer cards; "
+            "each replica holds its own copy of the model in RAM and VRAM)",
+            kind="int", place="advanced", min=1, hint="1", takes="a number of engines, 1 or more",
+            cli={"metavar": "N"}),
+    _option("source", "Where the model files come from",
+            "where the model files come from: auto (default: Hugging Face), huggingface or modelscope (mainland "
+            "China: the same files, checked against ModelScope's published SHA-256; XESTRATA_SOURCE)",
+            place="advanced",
+            choices=[["", "Hugging Face (default)"], ["modelscope", "ModelScope (mainland China: the same files)"]],
+            default="", when=["download"], cli={"choices": SOURCES, "default": None}),
+    _option("models-dir", "Where the model files go", "where the GGUF files go (default: <data folder>/models)",
+            kind="path", place="advanced", pick="folder", when=["download"], hint="<data folder>{sep}models",
+            vars={"sep": os.sep}),
+    _option("move-data", "Move the model files already on this PC into the data folder",
+            "with --data-dir: move the model files already on this PC into the new folder (without it nothing is "
+            "moved: the old files stay usable and the new folder gets the new downloads)",
+            kind="flag", place="advanced", default=False),
+    _option("set-default-data-dir", "Remember the data folder for later downloads without moving anything",
+            "with --data-dir: remember the new folder as the data folder without moving anything",
+            kind="flag", place="advanced", default=False),
+    _option("no-warmup", "Skip the first start that compiles the GPU code (the first request then takes ~30 s more)",
+            "skip starting the model once at the end of setup to compile its GPU code (the first request then "
+            "compiles it: ~30 s more)", kind="flag", place="advanced", default=False),
+    # ---- how the image models run (setup's --image-NAME, tools/image/install.py's --NAME)
+    _option("image-lora-training", "Also prepare the bases for LoRA training",
+            "download the full-step training bases for the selected image models (Qwen-Image also needs its F16 "
+            "base); without this option only inference files are downloaded",
+            kind="flag", place="images", default=False, when=["images"],
+            question="Prepare the image models for LoRA training too?", cli={"default": None}),
+    _option("image-gpu", "The GPU that makes the images",
+            "the GPU of the image jobs (default auto: a discrete GPU the text model does not take, the one with the "
+            "most VRAM, where the images are made beside the chat; else the text model's); same: the text model's "
+            "GPU; a PCI address as --check lists it: that GPU",
+            place="images",
+            choices=[["auto", "Auto: a GPU the text model does not use, else the text model's"],
+                     ["same", "The text model's GPU"]],
+            default="auto", gpu_choices="pci", when=["images"], cli={"metavar": "auto|same|PCI"}),
+    _option("image-tools", "Download the image tools' weights now (upscale, fix parts, find a region, remove the "
+            "background, control); else each on its first use",
+            "yes (default): download now the weights the editing tools take by default or fall back to: the "
+            "upscale's (SeedVR2 for this GPU and RAM, RealESRGAN), the parts' fix detectors, the region finders "
+            "(Florence-2, SAM 3 once its license is agreed to), the background's removers (BiRefNet general and "
+            "lite) and the control's (every control image's networks, the image models' own control weights); all: "
+            "the versions a request chooses as well (SeedVR2 7B sharp, the other BiRefNets); no: the server "
+            "downloads each the first time a tool needs it, and that tool waits for it; asked when not given, yes "
+            "with --yes",
+            place="images",
+            choices=[["yes", "Yes: what the tools take by default"],
+                     ["all", "All: the versions a request chooses as well"],
+                     ["no", "No: each on its first use"]],
+            default="yes", when=["images"], question="  Download the image tools' weights now?"),
+    _option("image-sam3-license", "Agree to Meta's SAM License, so that SAM 3.1 finds a part of a picture by words "
+            "(find_region, edit_region); without it Florence-2 (MIT) finds the parts",
+            "agree: agree to Meta's SAM License for SAM 3.1 (find_region and edit_region find a part of a picture by "
+            "words with it), no: do not (Florence-2, MIT, finds the parts); asked when not given, no with --yes",
+            kind="flag", place="images", values=["agree", "no"], default=False, when=["images", "sam3"],
+            about="The license: {license}", question="  Agree to the SAM License (read it at the address above)?",
+            cli={"choices": ["agree", "no"]}),
+    _option("image-dit-q8", "Mage-Flow, MOSS-Image and Anima: the image model on the GPU",
+            "Mage-Flow, MOSS-Image: auto (default) keeps its image model in VRAM as 16-bit when it fits there with "
+            "the text encoder (nearer the reference) and quantizes it to 8 bits when it does not (half the VRAM and "
+            "the bytes streamed; int8 products where the GPU's math library has them, else Q8_0); on always 8 bits, "
+            "off always 16-bit",
+            place="images",
+            choices=[["auto", "Auto: 16-bit when it fits the VRAM with its text encoder, else 8-bit"],
+                     ["on", "Always 8-bit"], ["off", "Always 16-bit"]],
+            default="auto", when=["images"]),
+    _option("image-dit-keep", "Mage-Flow: the image model not in use (the generation's or the edit's)",
+            "Mage-Flow: on (default) keeps the image model not in use (the generation's or the edit's) in RAM as "
+            "Q8_0, so switching is quick; off lets it go (about 4.4 GB less RAM) and reads it from the file again at "
+            "each switch",
+            place="images",
+            choices=[["on", "Keep the one not in use in RAM (quick switch)"],
+                     ["off", "Let it go (about 4.4 GB less RAM)"]],
+            default="on", when=["images"]),
+    _option("image-ssd-offload", "Keep the image models' sizes when the RAM is short, reading what does not fit from "
+            "the SSD (slower)",
+            "on: keep the image model's and its text encoder's sizes even when the RAM is short, and read what does "
+            "not fit from the SSD (slower); off (default): smaller sizes instead",
+            kind="flag", place="images", values=["on", "off"], default=False, when=["images"],
+            cli={"choices": ["on", "off"]}),
+    _option("image-gpu-policy", "The text model while an image is made",
+            "what the text model does during an image job (default auto: stays loaded when both fit, else gives VRAM "
+            "back or is unloaded and its conversation restored afterwards)",
+            place="images",
+            choices=[[OV.GPU_POLICIES[0], "Auto: stays when both fit, else gives VRAM back or is unloaded"],
+                     [OV.GPU_POLICIES[1], "Keep it loaded"], [OV.GPU_POLICIES[2], "Give VRAM back for the image"],
+                     [OV.GPU_POLICIES[3], "Unload it, its conversation restored afterwards"]],
+            default="auto", when=["images"]),
+    # ---- the translation model (serve/translate.py's MODELS)
+    _option("translate", "Translation: a model of its own for the translation APIs and the web page's Translate tab "
+            "(PLaMo 3 Translate, under the PLaMo Community License)",
+            "the translation model (PLaMo 3 Translate, under the PLaMo Community License, not free software: its "
+            "full text in the web app's About > Model terms): auto (default: the 2B where the RAM the text and image "
+            "models leave holds it, else the 0.8B, else none), 2b, 0.8b, 8b, or no; not given, the earlier choice is "
+            "kept",
+            choices=[["auto", "Auto: the 2B, the 0.8B where the RAM is short"],
+                     ["2b", "PLaMo 3 Translate 2B (1.8 GB)"], ["0.8b", "PLaMo 3 Translate 0.8B (0.6 GB)"],
+                     ["8b", "PLaMo 3 Translate 8B (5.3 GB)"], ["no", "No translation model"]],
+            default="auto", question="Which translation model?"),
+    _option("translate-gpu", "The GPU that translates",
+            "the translation model's GPU (default auto: the image jobs' GPU where there are image models, else the "
+            "text model's); same: the text model's GPU; cpu: the CPU; a PCI address as --check lists it: that GPU",
+            choices=[["auto", "Auto: the image models' GPU, else the text model's"],
+                     ["same", "The text model's GPU"], ["cpu", "The CPU"]],
+            default="auto", gpu_choices="pci", when=["translate!=no"], cli={"metavar": "auto|same|cpu|PCI"}),
+    # ---- how a model runs: at an install, and at a start
+    _option("gpu", "GPU",
+            "the GPU, numbered in PCI order as --check lists them (default: the one with the most VRAM); the engine "
+            "takes it by PCI address",
+            place="start", choices=[["", "As set up (the one with the most VRAM the first time)"]], default="",
+            gpu_choices="index", when=["multi_gpu"]),
+    _option("gpus", "Split the model's layers over these GPUs (two or more; the first runs the early layers)",
+            "a layer split across these GPUs, e.g. 0,1 (numbered as --check lists them; the first runs the early "
+            "layers; docs/MULTIGPU.md); saved for the model",
+            kind="gpus", place="start", when=["multi_gpu"]),
+    _option("layer-split", "With a split: the first layer of each later GPU's share (e.g. 36, or 16,32 for three "
+            "GPUs)",
+            "with --gpus: the first layer of each later GPU's share (e.g. 36, or 16,32 for 3 GPUs), one rising number "
+            "per GPU after the first - not layers per card; or auto (the default: measured on this PC)",
+            kind="text", place="start", pattern=r"auto|[1-9][0-9]*(,[1-9][0-9]*)*", when=["multi_gpu", "gpus!="],
+            hint="auto (measured on this PC)", takes="auto or rising layer numbers, e.g. 36 or 16,32"),
+    _option("port", "Port", "the server's port (default: the one the install was set up with, 8095 for a new one)",
+            kind="int", place="start", min=1, max=65535, hint="as set up (8095 for a new model)",
+            takes="a port number, 1 to 65535"),
+    _option("host", "Who may connect (with networks: set an API key too)",
+            "where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = all IPv4 interfaces, :: = all "
+            "IPv6 interfaces (issue #26; an --api-key is recommended)",
+            place="start",
+            choices=[["", "This PC only (127.0.0.1)"], ["0.0.0.0", "Every IPv4 network (0.0.0.0)"],
+                     ["::", "Every IPv6 network (::)"]],
+            default="", cli={"choices": None}),
+    _option("api-key", "API key",
+            "require this key from clients (recommended with --host 0.0.0.0 or --host ::); several keys: key1,key2",
+            kind="text", place="start", hint="(none) a key the clients must send; several: key1,key2"),
+    _option("vram-reserve-mib", "VRAM left free for other programs, in MiB",
+            "VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's default: "
+            "700); the expert cache takes that much less",
+            kind="int", place="start", min=0, hint="the engine's default (700)", takes="a number of MiB, 0 or more",
+            cli={"metavar": "N"}),
+    _option("draft-vocab", "The draft layer's tokens",
+            "the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English and code only "
+            "(~110 MiB less VRAM), cyrillic = English, code and the Cyrillic script, fr = English, code and French "
+            "(French answers draft more), ja = English, code and Japanese (XeStrata-890M: the draft layer reads "
+            "about half of cjk's bytes; the same answers)",
+            place="start",
+            choices=[["", "As set up (with Chinese, Japanese and Korean the first time)"],
+                     ["cjk", "With Chinese, Japanese and Korean"],
+                     ["en", "English and code only (~110 MiB less VRAM)"],
+                     ["cyrillic", "English, code and the Cyrillic script"],
+                     ["fr", "English, code and French"],
+                     ["ja", "English, code and Japanese (about half of cjk's bytes)"]],
+            default=""),
+    _option("drafting", "How the model guesses ahead (speculative decoding)",
+            "the drafter: auto = the model's MTP layer and, where the model has one, the DFlash2 block drafter "
+            "(fetched, ~0.5-0.8 GB packed); the engine measures them and no drafter at its start and keeps the "
+            "fastest (default), mtp = the MTP layer only (Qwen3.8-Flash-Next's default on an integrated AMD GPU), "
+            "dflash2 = DFlash2 only, off = no drafter",
+            choices=[["auto", "Auto: measured at each start, the fastest kept (recommended)"],
+                     ["mtp", "The model's MTP layer only"],
+                     ["dflash2", "DFlash2 only (Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B)"],
+                     ["off", "Off: no speculative decoding"]],
+            default="auto", when=["download"], question="How should the model guess ahead?"),
+    _option("script-guard", "Other languages' characters in the answers, for every model (the thinking is left as "
+            "it is)",
+            "keep other languages' characters out of the answers of every model (serve/script_guard.py): ja keeps "
+            "Simplified Chinese, Hangul and Vietnamese letters out of Japanese answers, en every CJK character and "
+            "Vietnamese letters out of English (and other non-CJKV) ones, ko kana and non-Korean Han characters out "
+            "of Korean ones, zh-cn and zh-tw kana, Hangul, Japanese-only forms and the other Chinese script out of "
+            "Chinese ones; off leaves them as the model writes. The web page and a request's own \"script_guard\" go "
+            "over it. Without it setup asks the first time, and with --setup",
+            place="start",
+            choices=[[OV.GUARD_LANGS[0], "Japanese: no Simplified Chinese, Hangul or Vietnamese letters "
+                      "in the answers"],
+                     [OV.GUARD_LANGS[1], "English and others: no CJK characters or Vietnamese letters"],
+                     [OV.GUARD_LANGS[2], "Korean: no kana, Han characters Korean does not use, or Vietnamese letters"],
+                     [OV.GUARD_LANGS[3], "Chinese (Simplified): no kana, Hangul or Japanese-only characters"],
+                     [OV.GUARD_LANGS[4], "Chinese (Traditional): no kana, Hangul or Japanese-only characters"],
+                     [OV.GUARD_OFF, "Off: answers as the model writes them"]],
+            default=OV.GUARD_OFF, keep=True, question="Keep other languages' characters out?"),
+    _option("ple-io", "Qwen3.8-Flash-Next's n-gram table",
+            "how the engine reads Qwen3.8-Flash-Next's n-gram table, kept for the model: ram = the whole table in RAM "
+            "(faster new prompts, ~29 GB more RAM), direct = read from the SSD as needed, auto = setup chooses by the "
+            "RAM and the disk (default)",
+            place="start",
+            choices=[["", "As set up (auto: chosen by the RAM and the disk)"],
+                     ["auto", "Auto: chosen by the RAM and the disk"],
+                     ["ram", "The whole table in RAM (faster new prompts, ~29 GB more RAM)"],
+                     ["direct", "Read from the SSD as needed"]],
+            default=""),
+    # the route tail skip (XESTRATA_ROUTE_TAIL_SKIP, the config's route_tail_skip_default): off by default (upstream
+    # 9624759956, owner 11-19; Q6 2026-11-23 on the RX 9060 XT: rank 7 moved the answers by KL 0.078 against a 0.019
+    # floor for +12% decode); the choice of upstream 98ebfb3e1c kept: auto (rank 7 where the engine's rule allows),
+    # off, 1-9
+    _option("route-tail-skip", "Skip rarely used parts of the model (faster answers that can change slightly)",
+            "the route tail skip: an expert not in VRAM that every token of a verify window routes at the rank or "
+            "lower is neither read nor computed: off (default), auto = rank 7 except where nearly every expert is in "
+            "VRAM or with --parallel, 1-9 = that rank (lower skips more: faster, the answers change more; only 7 is "
+            "measured)",
+            place="start",
+            choices=[["", "As set up (off the first time)"],
+                     ["off", "Off (recommended)"],
+                     ["auto", "Automatic: on where it helps (rank 7)"],
+                     ["7", "On: rank 7 (the measured one)"],
+                     *[[str(r), str(r)] for r in (1, 2, 3, 4, 5, 6, 8, 9)]],
+            about="Lower numbers skip more parts: faster, and the answers change more. Only 7 has been measured.",
+            default=""),
+    _option("old-driver", "Start although the Intel GPU's driver is older than the one setup asks for",
+            "start although the Level Zero driver predates the fix setup stops on (see its message)",
+            kind="flag", place="start", default=False),
+]
+OPTION = {o["name"]: o for o in OPTIONS}
+
+
+def route_tail_skip_value(choice: str) -> str:
+    """--route-tail-skip's choice as XESTRATA_ROUTE_TAIL_SKIP's value (the config's route_tail_skip_default)."""
+    return "0" if choice == "off" else choice
+
+
+def option_args(ap) -> None:
+    """The command line's options of OPTIONS (not the passwords: those come in the environment)."""
+    for o in OPTIONS:
+        if o["kind"] == "password":
+            continue
+        kw: dict = {"help": o["help"]}
+        if o["kind"] == "choice" and not o.get("gpu_choices") and not o.get("path_choice"):
+            kw["choices"] = [v for v, _ in o["choices"] if v]
+        elif o["kind"] == "int":
+            kw["type"] = int
+        elif o["kind"] == "number":
+            kw["type"] = float
+        elif o["kind"] == "flag" and not o.get("values"):
+            kw["action"] = "store_true"
+        kw.update(o.get("cli", {}))
+        if kw.get("choices") is None:
+            kw.pop("choices", None)
+        ap.add_argument("--" + o["name"], **kw)
+
+
+def option_problem(name: str, value) -> str | None:
+    """Why `value` is not one --NAME takes (its range or its pattern), or None."""
+    o = OPTION[name]
+    if value is None:
+        return None
+    if o["kind"] in ("int", "number"):
+        if not (o.get("min", -math.inf) <= value <= o.get("max", math.inf)) or value != value:
+            return f"--{name} takes {o['takes']}"
+    elif o.get("pattern") and not re.fullmatch(o["pattern"], str(value)):
+        return f"--{name} takes {o['takes']}"
+    return None
+
+
+def option_default(name: str):
+    """The answer setup offers for --NAME, the same in a terminal's question and in describe: what is set where it is
+    saved for every model (web search, the script guard), else the table's."""
+    settings = load_settings()
+    if name == "web-search":
+        return settings["search_engine"] if settings.get("search_engine") in WEB_SEARCH_APIS else "no"
+    if name == "script-guard":
+        modes = [v for v, _ in OPTION[name]["choices"]]
+        if settings.get("script_guard") in modes:
+            return settings["script_guard"]
+        return OV.GUARD_OFF          # off until the user chooses a language
+    if name == "data-dir":
+        return str(data_folder_path(None, settings))
+    o = OPTION[name]
+    return o.get("default", False if o["kind"] == "flag" else "")
+
+
+def ask_option(name: str, yes: bool, values: list | None = None, default=None) -> str:
+    """Setup's question for --NAME in a terminal: its label, its choices (`values` of them; not the blank one) and the
+    table's question, `default` (else option_default's) offered."""
+    o = OPTION[name]
+    if default is None:
+        default = option_default(name)
+    if o["kind"] == "flag":
+        choices = [["y", "yes"], ["n", "no"]]
+        default = "y" if default in (True, (o.get("values") or ["y"])[0]) else "n"
+    else:
+        choices = [[v, t] for v, t in o["choices"]
+                   if v and v != o.get("path_choice") and (values is None or v in values)]
+    if not yes:
+        say()
+        say(f"  {o['label']}:")
+        if o.get("about"):
+            for line in textwrap.wrap(o["about"].format(**o.get("vars", {})), 104):
+                say(f"  {line}")
+        if o["kind"] != "flag":
+            width = max(len(v) for v, _ in choices)
+            for v, t in choices:
+                say(f"    {v:{width}s}  {t}")
+    got = ask(o["question"], [v for v, _ in choices], default, yes)
+    if o["kind"] == "flag":
+        return (o.get("values") or [True, False])[0 if got == "y" else 1]
+    return got
+
+
+def options_described() -> list:
+    """OPTIONS for describe: each as the table has it (the command line's own settings and the questions left out),
+    its default what setup offers now, a password's whether its key is saved, the GPUs' choices filled in."""
+    QI = _qimage()
+    settings = load_settings()
+    out = []
+    for o in OPTIONS:
+        d = {k: v for k, v in o.items() if k not in ("help", "cli", "question")}
+        d["default"] = option_default(o["name"])
+        if o["kind"] == "password":
+            d["set"] = bool(settings.get(o["name"].removesuffix("-api-key") + "_api_key"))
+        if o["name"] == "image-sam3-license":
+            d["vars"] = {"license": QI.SAM3_LICENSE}
+        out.append(d)
+    return out
 
 
 def describe() -> dict:
     """What a front end (the Windows launcher) shows before it asks anything, as one object: this PC (RAM, CPU, the
     GPUs and why one cannot be used, the one setup takes by default), every model family and size with the RAM it
     needs, whether it fits and which is recommended (the rules the questions of step 2 use, for that GPU), the data
-    folder, the installed models (and their image models), and the image models one can add.  It reports only:
-    nothing is made, moved or saved.  The front end passes its choices back as --family, --model, --context, --gpu,
-    --data-dir and --images (an installed model's image models through tools/image/install.py)."""
-    ram = ram_gb()
+    folder, the installed models (and their image models), the image models one can add and those a new model is
+    offered, and which of step 2's other questions (the pictures, the KV cache, the speed projection, a RAM budget)
+    each family and size asks.  It reports only: nothing is made, moved or saved.  The front end passes its choices
+    back as setup's options (--family, --model, --context, --vision, --kv, ..., and --images; an installed model's
+    image models through tools/image/install.py).  With --gguf, the family of those files (CUSTOM) and what setup read
+    of them ("custom"); the engine's verdict comes at the install."""
+    ram = usable_ram_gb()                              # the fits with --ram-reserve-gib given with --describe
     found = gpus()
     # the card choose_gpus takes without --gpu: the supported one with the most VRAM
     usable = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
     gpu = usable[0] if usable else None
     vram = gpu_expert_vram(gpu) if gpu else 0.0
     by_vram = vram_ctx([gpu]) if gpu else 32768
+    room = room_of(ram, [gpu] if gpu else [])
+    # XeStrata-890M: on an integrated AMD GPU, the fork's offer (apu_first_choice), as step 2 makes it
+    first_fam, first_size = (apu_first_choice([f for f in FAMILIES if f != CUSTOM], ram) if gpu and apu_first(gpu)
+                             else first_offered([f for f in FAMILIES if f != CUSTOM], room))
     families = []
     for f, fam in FAMILIES.items():
+        if fam.get("edge0"):
+            # Edge0 is installed by --family edge0 alone: its sizes are EDGE0_MODELS, not TIERS/MODELS
+            continue
         models = []
+        names = family_sizes(f)
+        # the recommendation of each quantization's sizes (Ornith-1.5 has two), and of the family's
+        by_quant = {q: recommend_size(f, room, [m for m in names if size_quantizer(f, m) == q])
+                    for q in dict.fromkeys(size_quantizer(f, m) for m in names)}
+        rec = recommend_size(f, room, names)
+        if f == first_fam and first_size:              # the first install's offer: its size, also within its quant
+            rec = by_quant[size_quantizer(f, first_size)] = first_size
         if fam.get("plain"):
-            names = list(fam["models"])
-            rec = next((m for m in names if fam["models"][m].get("tested")), names[0])
             ctx_f = min(by_vram, fam["max_context"])
-            if fam.get("dense"):   # every weight in VRAM: the largest size that fits the GPU
-                fit_d = [m for m in names if vram >= dense_vram_gb(fam, fam["models"][m], ctx_f)]
-                rec = max(fit_d, key=lambda m: fam["models"][m]["size"]) if fit_d else names[0]
             for m in names:
                 d = fam["models"][m]
                 gb = d["size"] / 1e9
-                fits = ("yes" if vram >= dense_vram_gb(fam, d, ctx_f) else "no") if fam.get("dense") \
-                    else "yes" if ram + vram >= gb + 8 else "slow"
+                fits = ("yes" if size_fits(f, m, room) else "no") if fam.get("dense") \
+                    else "yes" if size_fits(f, m, room) else "slow"
                 models.append({"id": m, "about": d["about"], "download_gb": round(gb, 1),
                                "ram_gb": DENSE_RAM_GB if fam.get("dense") else round(gb + 8),
-                               "fits": fits, "tested": bool(d.get("tested")),
-                               "experimental": False, "recommended": m == rec, "context": ctx_f})
-            max_ctx = fam["max_context"]
+                               "fits": fits,
+                               "experimental": False, "recommended": m == by_quant[size_quantizer(f, m)],
+                               "quantizer": size_quantizer(f, m), "context": ctx_f,
+                               "vision": bool(fam.get("mmproj")), "budget": not fam.get("dense")})
+            max_ctx = CONTEXTS[-1] if plain_rope_extend(f, fam) else fam["max_context"]
         else:
-            names = sorted((m for m in MODELS if f in MODELS[m].get("families", ("qwen", "swift"))),
-                           key=lambda m: bool(MODELS[m].get("experimental")))
-            rec = names[names.index("IQ3_XXS")] if ram >= 60 and "IQ3_XXS" in names else names[0]
             for m in names:
                 d = MODELS[m]
                 low = not d.get("budget") and low_ram_needed(m, ram) and low_ram_fits(m, ram, vram)
-                fits = ("budget" if d.get("budget") else "yes" if ram >= d["ram_gb"] else "low-ram" if low else
+                fits = (("yes" if size_fits(f, m, room) else "no") if f == "sync" else
+                        "budget" if d.get("budget") else "yes" if ram >= d["ram_gb"] else "low-ram" if low else
                         "no")
-                models.append({"id": m, "about": d["about"], "download_gb": d["download_gb"], "ram_gb": d["ram_gb"],
-                               "fits": fits, "tested": True, "experimental": bool(d.get("experimental")),
-                               "recommended": m == rec, "context": min(by_vram, ram_ctx(m, ram, low))})
+                models.append({"id": m, "about": d["about"], "download_gb": round(files_gb(f, m), 1),
+                               "ram_gb": d["ram_gb"],
+                               "fits": fits, "experimental": bool(d.get("experimental")),
+                               "recommended": m == by_quant[size_quantizer(f, m)], "quantizer": size_quantizer(f, m),
+                               "context": min(by_vram, ram_ctx(m, ram, low)),
+                               "vision": d.get("vision", fam.get("vision")) is not False,
+                               "budget": bool(d.get("budget"))})
             max_ctx = CONTEXTS[-1]
+        base, variant, quant = tier_of(f)
         families.append({"id": f, "title": fam["title"], "by": fam["by"], "about": fam["about"],
-                         "license": fam.get("license"), "experimental": bool(fam.get("experimental")),
-                         "images": not fam.get("plain"),             # setup_plain sets up no image generation
+                         # its place in the lists (TIERS) and the size recommended of it, whose quantization is the
+                         # one the window shows first
+                         "base": base, "variant": variant, "quantizer": quant, "recommended_size": rec,
+                         "license": family_license(f), "experimental": bool(fam.get("experimental")),
+                         "images": gpu is not None,                  # image generation needs a GPU (setup_plain's too)
+                         # the questions setup_plain does not ask: the KV cache's precision, the speed projection
+                         "kv": not fam.get("plain"), "speed_projection": f in SPEED_PROJECTION_FAMILIES,
+                         # the precisions --kv takes; a plain family's are not asked, FP16 unless one is given
+                         "kv_takes": list(plain_kv_takes(f)) if fam.get("plain") else ["int8", "q4_0", "k8v4", "fp16"],
+                         # the options whose choices are the family's own: NAME -> its choices and its default
+                         "options": ({"kv": {"choices": list(plain_kv_takes(f)), "default": "fp16"}}
+                                     if fam.get("plain") else {}),
                          "contexts": [c for c in CONTEXTS if c <= max_ctx], "models": models})
     QI = _qimage()
-    images = []
-    for choice, (_, dit, enc) in QI.IMAGE_MODELS.items():
-        if choice.endswith("-uncensored"):
-            continue
-        names = QI.file_names(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit)
-        images.append({"id": choice, "title": QI.DITS[dit][0], "about": QI.ABOUT.get(choice, ""),
-                       "download_gb": round(sum(QI.FILES[n][2] for n in names) / 1e9, 1),
-                       "ram_gb": round(QI.ram_need_gb(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit), 1),
-                       "edits": dit in QI.MF_EDIT or not QI.engine_quantized(dit),
-                       "license": QI.license_note(dit),
-                       "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS,
-                       # the sizes one can ask for after its name (--images qwen-image-turbo:Q6_K, magetrail:int8,
-                       # hunyuan-image-3-distil:int8), largest first; Mage-Flow's: 8 bits always (int8) or 16 (bf16),
-                       # not the file's
-                       "quants": list(QI.size_choices(dit)) if QI.engine_quantized(dit)
-                       else list(reversed(QI.size_choices(dit)))})
+    images = image_descriptions(data_folder_path(getattr(ARGS, "data_dir", None), load_settings()) / "models")
     by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}   # a config's model_name -> its --images choice
+    for m in images:
+        if m["id"].startswith(QI.ANIMA_USER):
+            by_name.setdefault("anima-" + m["id"][len(QI.ANIMA_USER):], m["id"])
     installed = []
     for c in installed_configs():
         ch = choices_from_config(c)
@@ -7076,16 +10972,275 @@ def describe() -> dict:
         secs = [cfg.get("images"), *(cfg.get("image_models") or [])] if isinstance(cfg.get("images"), dict) else []
         installed.append({"config": str(c), "model_name": cfg.get("model_name", c.stem), "family": ch["family"],
                           "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095,
-                          "images": [by_name[s["model_name"]] for s in secs
-                                     if isinstance(s, dict) and s.get("model_name") in by_name]})
+                          "images": [s.get("setup_choice") or by_name[s["model_name"]] for s in secs
+                                     if isinstance(s, dict) and not s.get("training_base_only")
+                                     and (s.get("setup_choice") or s.get("model_name") in by_name)]})
     return {"type": "describe", "version": source_version(), "packaged": bool(PACKAGED),
-            "ram_gb": round(ram, 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),
+            "ram_gb": round(ram_gb(), 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),
             "gpu": gpu["index"] if gpu else None,
             "gpus": [{"index": g["index"], "name": g["name"], "vendor": g.get("vendor"),
                       "vram_gb": round(g["vram_gb"], 1), "integrated": bool(g.get("integrated")), "pci": g.get("pci"),
                       "problem": gpu_problem(g)} for g in found],
             "data_dir": str(data_folder_path(None, load_settings())), "families": families, "installed": installed,
-            "images": images}
+            # the lists' levels (TIERS): the models in setup's order with the family a first install is offered, and
+            # the versions' and quantizations' names
+            "bases": [{"id": b, "title": t} for b, t in BASES.items()]
+            + ([{"id": CUSTOM, "title": FAMILIES[CUSTOM]["title"]}] if CUSTOM in FAMILIES else []),
+            "recommended_family": first_fam,
+            "variants": VARIANTS, "quantizers": QUANTIZERS,
+            "images": images, "image_default": list(QI.SETUP_DEFAULT),
+            # SAM 3.1's license (--image-sam3-license), and whether it was agreed to (ask_sam3_license's record)
+            "sam3": {"license": QI.SAM3_LICENSE,
+                     "agreed": (data_folder_path(None, load_settings()) / "models" / QI.AUX_DIR
+                                / "sam3.accepted").is_file()},
+            "web_search": (load_settings()["search_engine"]
+                           if load_settings().get("search_engine") in WEB_SEARCH_APIS else None),
+            # --describe --gguf PATH: what setup read of those files (their family, CUSTOM, is in "families")
+            "custom": getattr(ARGS, "custom", None),
+            # the fields of the options (OPTIONS), each with what setup offers now
+            "options": options_described()}
+
+
+SYNC_REPOS = {"Sync-XS": "hiru2005/Sync-XS", "Sync-S": "hiru2005/Sync-S",
+              "Sync-M": "sync-strata/Sync-M"}
+
+
+def verify_sync_file(dst: Path, size: int, expected: str) -> None:
+    """Check a Sync file without trusting another download's finish mark."""
+    if not dst.is_file() or dst.stat().st_size != size:
+        fail(f"{dst} does not have the pinned size", "the file was left in place; check it and retry")
+    # This mark is keyed on path, size and mtime, and is written only after the direct read.
+    kept = _kept_mark(dst)
+    direct_mark = kept.with_name(kept.name + ".sync-direct") if kept else None
+    if direct_mark and direct_mark.is_file() and direct_mark.read_text(encoding="utf-8") == expected:
+        return
+    say(f"  checking {dst.name} against the pinned SHA-256 ...")
+    actual = sync_models.sha256(dst, size)
+    if actual != expected:
+        fail(f"{dst} has SHA-256 {actual}, expected {expected}", "the file was left in place; check it")
+    if direct_mark:
+        direct_mark.parent.mkdir(parents=True, exist_ok=True)
+        direct_mark.write_text(expected, encoding="utf-8")
+
+
+def fetch_sync_files(models_dir: Path, model: str) -> tuple[Path, Path]:
+    """Fetch the selected pack and the shared files once, checking the pinned manifest hashes."""
+    root = models_dir / "sync"
+    pack, shared = root / model.lower(), root / "sync-shared"
+    groups = ((pack, SYNC_REPOS[model], sync_models.PACK_FILES[model]),
+              (shared, "hiru2005/Sync-shared", sync_models.SHARED_FILES))
+    for folder, repo, files in groups:
+        REPO_PINS.setdefault(repo, {}).update({p.rsplit("/", 1)[-1]: pin for p, pin in files.items()})
+        for rel, (size, expected) in files.items():
+            dst = folder / rel
+            if not dst.exists():
+                download_file(hf(repo) + rel, dst, rel)
+            verify_sync_file(dst, size, expected)
+    return pack, shared
+
+
+def sync_mtp(shared: Path, choice: str) -> Path:
+    """Keep the pinned shared draft vocabulary intact when another subset is selected."""
+    source = shared / "mtp-rt"
+    if choice == "cjk":
+        return source
+    if choice not in DRAFT_VOCABS:
+        fail(f"unknown draft vocabulary: {choice}")
+    dst = shared / f"mtp-rt-{choice}"
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in ("dense.bin", "dense.txt", "experts.bin"):
+        original, link = source / name, dst / name
+        if link.exists():
+            if not os.path.samefile(original, link):
+                fail(f"{link} is not the shared MTP file", "the file was left in place")
+        else:
+            os.link(original, link)
+    vocab = (ROOT / "data" / DRAFT_VOCABS[choice]).read_bytes()
+    target = dst / "draft_vocab.bin"
+    if target.exists() and target.read_bytes() != vocab:
+        fail(f"{target} is not the selected draft vocabulary", "the file was left in place")
+    if not target.exists():
+        target.write_bytes(vocab)
+    return dst
+
+
+def setup_sync(a, family: str, model: str, gpu: dict, sel: list, found: list, gpu_chosen: bool, ram: float,
+               roots: list, port: int, adopted: Path | None, ctx: int, kv: str, vision: str, low_ram: bool,
+               resident: bool, scaling: str | None, rope_scale: float | None) -> int:
+    """Install a pinned Sync pack without converting its already packed experts or MTP layer."""
+    if a.gguf_dir or a.custom:
+        fail("Sync is a pre-built pack, not a GGUF supplied with --gguf-dir", "use --models-dir for its files")
+    if len(sel) > 1:
+        fail("Sync packs run on one GPU", "choose one card with --gpu")
+    if a.drafting not in (None, "auto", "mtp", "off"):
+        fail(f"--drafting {a.drafting} is not available for Sync", "choose auto, mtp or off")
+    fam = FAMILIES[family]
+    tag = fam["tag"] + model
+    _, eng, lib_dirs = prepare_engine(a, gpu)
+    step(5, f"downloading {model}")
+    pack, shared = fetch_sync_files(Path(a.models_dir), model)
+    model_terms.fetch([SYNC_REPOS[model], "hiru2005/Sync-shared"], say=warn, timeout=30, terms=MODEL_TERMS)
+    native = shared / "native-gguf" / "Qwen3.8-Flash-Next-Sync-common.gguf"
+    draft_vocab = a.draft_vocab or saved_draft_vocab(CONF / f"xestrata-{tag.lower()}.json") or "cjk"
+    mtp = sync_mtp(shared, draft_vocab)
+    args = ["--pack", str(pack), "--native", str(native), "--ple-gguf", str(native),
+            "--mtp", str(mtp), "--expert-profile", str(ROOT / "data" / "expert-profile.bin"),
+            "--expert-cache", "auto", "--prefill", "auto", "--spec", "auto", "--spec-min-p", "0.5",
+            "--max-context", str(ctx)]
+    if a.drafting == "off":
+        args += ["--draft", "off"]
+    if scaling is not None:
+        assert rope_scale is not None
+        args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
+    if ctx > 8192 or kv != "fp16":
+        args += ["--kv", kv]
+    if low_ram:
+        args += ["--resident-experts" if resident else "--mmap-experts"]
+    if a.resident_budget_gib is not None:
+        args += ["--resident-budget-gib", f"{a.resident_budget_gib:g}"]
+    if a.ple_io and a.ple_io != "auto":
+        set_ple_io(args, a.ple_io)
+    if vision != "none":
+        args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
+    if a.vram_reserve_mib is not None:
+        if "--vram-reserve-mib" in args:
+            args[args.index("--vram-reserve-mib") + 1] = str(a.vram_reserve_mib)
+        else:
+            args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
+    args += ram_reserve_args(a)
+    cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
+                           "tokenizer": str(shared / "tokenizer"), "model_name": served_name(family, model),
+                           "aliases": [model, model.lower()], "family": family,
+                           "log": str(STATE / f"xestrata-{tag.lower()}.log"),
+                           "lib_dirs": lib_dirs, "port": port, "model_gb": MODELS[model]["download_gb"],
+                           "experts_gb": MODELS[model]["arena_gb"], "draft_vocab": draft_vocab}
+    # the route tail skip stays off, as the engine's default (R7 KL against off on B70 at 12 GiB: XS 0.008904,
+    # S 0.010352, M 0.011171; above the 0.0058 reference); --route-tail-skip turns it on
+    if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
+        cfg["gpu_pci"] = gpu["pci"]
+    replicas_config(a, cfg)
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if a.browser is not None:
+        cfg["open_browser"] = a.browser
+    if a.parallel is not None:
+        cfg["parallel"] = max(1, a.parallel)
+    if vision != "none":
+        mmproj = Path(a.models_dir) / fam["mmproj"]
+        if not mmproj.exists():
+            mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
+        if not mmproj.exists():
+            download(fam["mmproj_hf"] + fam["mmproj"], mmproj)
+        size, sha = file_pin(fam["mmproj_hf"] + fam["mmproj"])
+        verify_sync_file(mmproj, size, sha)
+        vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
+        cpu_enc = {"exe": str(eng / VISION_EXE), "gpu": False,
+                   "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"], "threads": vision_threads()}
+        cfg["vision"] = {"mmproj": str(mmproj), "model": str(native), **cpu_enc}
+        if vision == "gpu":
+            cfg["vision"] = {"mmproj": str(mmproj), "model": str(native), "exe": str(eng / VISION_EXE),
+                             "gpu": True, "gpu_pci": gpu["pci"], "max_tokens": vt, "fallback": cpu_enc}
+    if a.images:
+        got = setup_images(a, gpu, Path(a.models_dir), eng, text_ram_gb(args, ram, model))
+        cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
+        place_images(a, cfg)
+        if not cfg["image_models"]:
+            cfg["image_models"] = None
+    setup_translate(a, cfg, CONF / f"xestrata-{tag.lower()}.json", text_ram_gb(args, ram, model))
+    return finish_setup(a, cfg, tag, port, adopted, vision != "none")
+
+
+def setup_edge0(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
+                ram: float, roots: list, elsewhere: list, port: int, adopted: Path | None) -> int:
+    """Steps 5-7 for Edge0's latent MoE (the Qwen3.8-Flash-Next engine, experts at a latent width): the pre-built
+    pack downloaded file by file (each checked against its SHA-256 at the pinned revision), the files the two models
+    share hardlinked from the one already here, and the config from the pack's model.json (the engine's args and the
+    latent environment, paths made absolute).  The weights are non-free (Edge0 Community Model License 1.0 + Qwen
+    Community License 1.0): their terms are accepted before the download.  XeStrata bundles nothing."""
+    names = list(EDGE0_MODELS)
+    if a.model and a.model not in names:
+        fail(f"{fam['title']} has no {a.model}", "choose one of: " + ", ".join(names))
+    for i, m in enumerate(names, 1):
+        d = EDGE0_MODELS[m]
+        fit = "" if ram >= d["ram_gb"] else f"   <- needs ~{d['ram_gb']} GB of RAM, this PC has {ram:.0f}"
+        say(f"  {i}) {m:16s} {d['about']}; download ~{d['download_gb']:.0f} GB{fit}")
+    model = a.model or names[int(ask("Which model?", [str(i) for i in range(1, len(names) + 1)], "1", a.yes)) - 1]
+    d = EDGE0_MODELS[model]
+    say(f"  Its license: {EDGE0_LICENSE}")
+    if ask("  Accept these terms and download the weights?", ["y", "n"], "n", a.yes) != "y":
+        fail("the Edge0 weights need their license accepted; nothing was downloaded")
+    models_dir = Path(a.models_dir)
+    pack = models_dir / model
+    rev, repo, files = EDGE0_REVISIONS[model], d["repo"], EDGE0_FILES[model]
+    # Without a pin download_file marks a file done as soon as it is renamed, before verify_sha256 reads it: a run
+    # stopped in the middle of a 50 GB hash would leave a broken file that no later run checks again.  The pack's
+    # own sizes and hashes are the pins for its repository's files.
+    for m, md in EDGE0_MODELS.items():
+        REPO_PINS.setdefault(md["repo"], {}).update(
+            {path.rsplit("/", 1)[-1]: size_sha for path, size_sha in EDGE0_FILES[m].items()})
+    step(5, f"downloading {model}")
+    say(f"  The model files go in {pack} (a file another Edge0 model here has too is hardlinked from it;")
+    say("  a different filesystem downloads its own copy)")
+    for path, (size, sha) in sorted(files.items(), key=lambda kv: (kv[1][0], kv[0])):
+        dst = pack / path
+        if dst.exists() and done(dst):
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        # the same file (size and SHA-256) in another Edge0 model's folder
+        src = next((models_dir / o / path for o in EDGE0_MODELS
+                    if o != model and EDGE0_FILES[o].get(path) == (size, sha) and (models_dir / o / path).exists()
+                    and done(models_dir / o / path)), None)
+        if src is not None:
+            try:
+                dst.unlink(missing_ok=True)
+                os.link(src, dst)
+                mark(dst, f"hardlink {src}")
+                ok(f"{path} linked from {src.parent.name}")
+                continue
+            except OSError:
+                pass   # a different filesystem: download it
+        download_file(f"{hf_endpoint()}/{repo}/resolve/{rev}/{path}", dst, path)
+        verify_sha256(dst, size, sha, own=True)
+    ok(f"model files present: {pack}")
+    llama, eng, lib_dirs = prepare_engine(a, gpu)
+    # the config from the pack's model.json: the engine's args and the latent environment, paths made absolute
+    mj = json.loads((pack / "model.json").read_text(encoding="utf-8"))
+
+    def abs_path(p: str) -> str:
+        p = p.lstrip("./")
+        return str(pack / p) if p not in (".", "") else str(pack)
+
+    path_flags = {"--pack", "--native", "--native-dense-gguf", "--ple-gguf", "--expert-profile", "--mtp"}
+    args: list[str] = []
+    it = iter(mj.get("args", []))
+    for tok in it:
+        if tok in path_flags:
+            args += [tok, abs_path(next(it))]
+        else:
+            args.append(tok)
+    env: dict[str, str] = {}
+    for k, v in (mj.get("env") or {}).items():
+        name = "XESTRATA_" + k[len("STRATA_"):] if k.startswith("STRATA_") else k
+        # the D/U's format (Q8_0 or Q4_0, both in the pack) is the engine's choice from the card's VRAM (LatentTab in
+        # generate.cpp), not model.json's fixed one; XESTRATA_LATENT_DENSE_FMT=4/8 in the config is the user's
+        if name == "XESTRATA_LATENT_DENSE_FMT":
+            continue
+        if name in ("XESTRATA_LATENT_DENSE", "XESTRATA_LATENT_A", "XESTRATA_LATENT_LABELS"):
+            v = abs_path(v)
+        env[name] = str(v)
+    tag = model.lower()
+    cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(pack),
+                           "tokenizer": str(pack / "tokenizer"), "model_name": tag, "family": family,
+                           "log": str(STATE / f"xestrata-{tag}.log"), "lib_dirs": lib_dirs, "port": port,
+                           "env": env, "model_gb": d["download_gb"],
+                           "experts_gb": files["experts.bin"][0] / 1e9}
+    if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
+        cfg["gpu_pci"] = gpu["pci"]
+    return finish_setup(a, cfg, tag, port, adopted, False,
+                        notes=("The latent MoE runs its experts at the latent width on the GPU; D/U and the column "
+                               "scales are the pack's. First runs: see docs/DETAILS.md (Edge0).",))
 
 
 def main() -> int:
@@ -7094,36 +11249,29 @@ def main() -> int:
     if sys.platform != "linux" and not (WIN and PACKAGED):
         fail("XeStrata runs on Linux, and on Windows from its 7z" if WIN else "XeStrata runs on Linux and Windows")
     if wsl_version() == 1:
-        fail("Strata does not run on WSL 1 (it has no GPU access)", "use WSL 2, or a native Linux installation")
+        fail("XeStrata does not run on WSL 1 (it has no GPU access)", "use WSL 2, or a native Linux installation")
     if wsl_version() == 2:
         warn("WSL 2 has not been tested: XeStrata may work there, or not. If you get it working (or fix what stops "
              "it), a pull request is welcome")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
+    ap.add_argument("--family", choices=[*FAMILIES, CUSTOM],
+                    help="the model, version and quantization in one name (qwen = Qwen3.8-Flash-Next's GSQ-RCO files, "
+                         "swift = Swift 1.5's; custom = a model installed with --gguf); or --base, --variant and "
+                         "--quantizer")
+    ap.add_argument("--base", choices=list(BASES), help="the model (setup's first question)")
+    ap.add_argument("--variant", choices=list(VARIANTS),
+                    help="the model's version: the original, or whose changed copy (default: the original)")
+    ap.add_argument("--quantizer", choices=list(QUANTIZERS),
+                    help="whose quantization of that version (default: the first setup lists)")
     plain_models = [m for f in PLAIN_FAMILIES.values() for m in f["models"]] + list(FAMILIES[INKLING2MINI]["models"])
-    ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *plain_models])))
+    models = list(dict.fromkeys([*MODELS, *plain_models, *EDGE0_MODELS]))
+    ap.add_argument("--model", metavar="{" + ",".join(models) + ",custom-NAME}",
+                    help="the size; custom-NAME: a model installed with --gguf --name NAME")
     ap.add_argument("--context", type=int)
-    ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
-                    help="the RoPE extension for a context past the model's trained 262144: linear (position "
-                         "interpolation) or yarn, llama.cpp's types. Omitted with such a context, setup takes yarn; "
-                         "none is refused there")
-    ap.add_argument("--rope-scale", type=float,
-                    help="the extension factor, finite and >= 1 (default: the final context over the trained "
-                         "262144, at least 1: 1.5 for 384K, 2 for 512K, 1 inside the trained range)")
-    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4", "fp16"],
-                    help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
-                         "precise), k8v4 (8-bit keys and 4-bit values: about three quarters of the memory) or fp16 "
-                         "(16-bit, twice the memory of int8)")
-    ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
-                    help="let the model read images (on by default where the model can; yes = the reader for this "
-                         "card: the CPU under 24 GB of VRAM, the GPU from 24 GB; gpu = the encoder on the GPU, the CPU "
-                         "encoder taking over when it cannot start; cpu = on the CPU only; no = text only)")
-    ap.add_argument("--vision-tokens", type=int, metavar="N",
-                    help="the most image tokens a picture becomes (default 1024 with the encoder on the GPU, 300 on "
-                         "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
-                         "for this model")
+    option_args(ap)                                  # the options a front end shows as fields (OPTIONS)
     ap.add_argument("--images", metavar="qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|"
-                    "mage-flow-base|magetrail|moss-image|moss-image-base[-uncensored]|hunyuan-image-3-distil|no",
+                    "mage-flow-base|magetrail|moss-image-sft|moss-image-base|moss-image-sft-4-step[-uncensored]|"
+                    "hunyuan-image-3-distil|no",
                     help="image generation (POST /v1/images/generations) on XeStrata's image engine: "
                          "qwen-image-turbo (Qwen-Image-2.1-Turbo, 8 steps) or qwen-image-base (its base model "
                          "Qwen-Image-2.1, 40 steps by default, about 5 times as long an image); the text encoder "
@@ -7134,9 +11282,11 @@ def main() -> int:
                          "tuned on Danbooru and e621 images, 30 steps, guidance 5; no edits), the text encoder "
                          "Unsloth's Qwen3-VL-4B or, -uncensored, huihui-ai's abliterated one; hunyuan-image-3-distil "
                          "(HunyuanImage 3.0 Instruct-Distil, 8 steps, guidance 2.5, about 50 GB of RAM), which reads "
-                         "its own prompt with the model's tokenizer and system prompt (no text encoder); moss-image "
-                         "(MOSS-Image, 50 steps, guidance 3; text and a layout of boxes in the prompt) or "
-                         "moss-image-base (its base model), the text encoder Qwen3.5-9B (Unsloth's or, -uncensored, "
+                         "its own prompt with the model's tokenizer and system prompt (no text encoder); "
+                         "moss-image-sft (MOSS-Image-SFT, 50 steps, guidance 3; text and a layout of boxes in the "
+                         "prompt) or moss-image-base (its base model) or moss-image-sft-4-step "
+                         "(akhaliq's 4-step LoRA, without guidance, no edits), the text encoder Qwen3.5-9B "
+                         "(Unsloth's or, -uncensored, "
                          "HauhauCS's; Q8_0, lowered first (Q6_K, Q4_K_M), or the chat model's own file when that is "
                          "Qwen3.5-9B of the same maker); several, "
                          "comma-separated (qwen-image-turbo,magetrail): the first the default, the others named by a "
@@ -7145,56 +11295,21 @@ def main() -> int:
                     help="the image model's size (default Q8_0, or w4a8 for HunyuanImage 3.0, lowered when its files "
                          "would not fit the RAM the text model leaves, after its text encoder; the GPU's memory does "
                          "not decide it)")
-    ap.add_argument("--image-dit-q8", choices=["auto", "on", "off"],
-                    help="Mage-Flow, MOSS-Image: auto (default) keeps its image model in VRAM as 16-bit when it "
-                         "fits there with the text encoder (nearer the reference) and quantizes it to 8 bits when it "
-                         "does not "
-                         "(half the VRAM and the bytes streamed; int8 products where the GPU's math library has "
-                         "them, else Q8_0); on always 8 bits, off always 16-bit")
-    ap.add_argument("--image-dit-keep", choices=["on", "off"],
-                    help="Mage-Flow: on (default) keeps the image model not in use (the generation's or the edit's) in "
-                         "RAM as Q8_0, so switching is quick; off lets it go (about 4.4 GB less RAM) and reads it from "
-                         "the file again at each switch")
-    ap.add_argument("--image-ssd-offload", choices=["on", "off"],
-                    help="on: keep the image model's and its text encoder's sizes even when the RAM is short, and "
-                         "read what does not fit from the SSD (slower); off (default): smaller sizes instead")
-    ap.add_argument("--image-gpu-policy", choices=["auto", "keep", "shrink", "unload"],
-                    help="what the text model does during an image job (default auto: stays loaded when both fit, "
-                         "else gives VRAM back or is unloaded and its conversation restored afterwards)")
-    ap.add_argument("--experimental-speed-projection", metavar="on|off|GGUF",
-                    help="EXPERIMENTAL, off by default: the control vector in "
-                         "third_party/nonfree/experimental-speed-projection "
-                         "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md")
-    ap.add_argument("--port", type=int,
-                    help="the server's port (default: the one the install was set up with, 8095 for a new one)")
-    ap.add_argument("--gpu", help="the GPU, numbered in PCI order as --check lists them (default: the one with "
-                                  "the most VRAM); the engine takes it by PCI address")
-    ap.add_argument("--gpus", help="a layer split across these GPUs, e.g. 0,1 (numbered as --check lists them; the "
-                                   "first runs the early layers; docs/MULTIGPU.md); saved for the model")
-    ap.add_argument("--layer-split", help="with --gpus: the first layer of each later GPU's share (e.g. 36, or 16,32 "
-                                          "for 3 GPUs), one rising number per GPU after the first - not layers per "
-                                          "card; or auto (the default: measured on this PC)")
-    ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = all IPv4 "
-                                   "interfaces, :: = all IPv6 interfaces (issue #26; an --api-key is recommended)")
     ap.add_argument("--no-browser", dest="browser", action="store_false", default=None,
                     help="do not open the chat page in the browser when the model is ready (for a harness or an app "
                          "that uses the API; remembered for this model, also in run-<model>.sh)")
     ap.add_argument("--browser", dest="browser", action="store_true",
                     help="open the chat page again when the model is ready (the default; undoes --no-browser)")
-    ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0 or --host ::); "
-                                      "several keys: key1,key2")
-    ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default XeStrata-data next to this "
-                                       "folder, remembered for every Strata folder on this PC")
-    ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
-    ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
-                                       "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
+    ap.add_argument("--gguf", metavar="PATH",
+                    help="install a model from GGUF files already on this PC, nothing downloaded: its .gguf file (the "
+                         "first shard of a split one) or its folder; Qwen3.8-Flash-Next (qwen4exp) or a model of the "
+                         "architectures the other models have (qwen35moe, qwen35, qwen3moe, glm5-next). Setup reads "
+                         "its headers and asks the engine whether it runs them, and stops with the reason if not")
+    ap.add_argument("--name", help="with --gguf: the model's name (default: its file's); it is installed as "
+                                   "custom-NAME (--model custom-NAME for --bench, --calibrate and a start)")
     ap.add_argument("--inspect", nargs="+", metavar=("SOURCE", "VARIANT"),
                     help="what a GGUF is and whether XeStrata runs it, from its headers only (no download): a file, a "
                          "folder, a URL, ms:owner/repo (ModelScope) or hf:owner/repo, and optionally a variant name")
-    ap.add_argument("--source", choices=SOURCES, default=None,
-                    help="where the model files come from: auto (default: Hugging Face), huggingface or modelscope "
-                         "(mainland China: the same files, checked against ModelScope's published SHA-256; "
-                         "STRATA_SOURCE)")
     ap.add_argument("--license", choices=[*LICENSES, "contrib-icpx"],
                     help="the build mode: free builds with free software only, for Intel and AMD GPUs; contrib (the "
                          "default) builds with intel/llvm's CUDA target for Intel, AMD and NVIDIA GPUs, and hands the "
@@ -7213,48 +11328,21 @@ def main() -> int:
                     help="with --intel-llvm-build: keep its build tree so the next update is quicker")
     ap.add_argument("--allow-no-xmx", action="store_true",
                     help="build even when the compiler gives the GPU no XMX (prompt processing about 1.6 times slower)")
-    ap.add_argument("--low-ram", choices=["auto", "on", "off", "resident", "mmap"], default="auto",
-                    help="read the model's experts from its files instead of copying them all into RAM (for a PC with "
-                         "a big GPU and little RAM); auto: when the experts would not fit the RAM. In this mode the "
-                         "experts the GPU does not hold are copied into RAM once when they fit (resident), else read "
-                         "through the OS file cache (mmap); resident / mmap force one of the two")
-    ap.add_argument("--host-cache", choices=["auto", "off"], default="auto",
-                    help="XeStrata-890M: auto puts the expert cache in host USM, with every expert of the model in it, "
-                         "on an integrated AMD GPU whose carve-out does not hold the experts and whose RAM holds the "
-                         "model (STRATA_CACHE_HOST=1, --mmap-experts, --no-prefill-borrow: decode 15-22 -> about 39 "
-                         "tok/s on the Radeon 890M, the README's table); off writes the engine's default path instead")
-    ap.add_argument("--resident-budget-gib", type=float, metavar="N",
-                    help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 17 GB, "
-                         "47 on 64 GB; a GPU that shares the RAM: less 24 GB; more is kept as you choose, with a note)")
-    ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
-                    help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
-                         "default: 700); the expert cache takes that much less")
-    ap.add_argument("--parallel", type=int, metavar="N",
-                    help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
-                         "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
-    ap.add_argument("--replicas", type=int, metavar="N",
-                    help="several GPUs (--gpus): run N independent engines, each on its own equal group of the chosen "
-                         "cards (2 replicas on 4 cards = two 2-card engines), requests spread over them (opt-in; more "
-                         "total throughput for a model that fits fewer cards; each replica holds its own copy of the "
-                         "model in RAM and VRAM)")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--json", action="store_true",
                     help="one JSON object a line for a front end (the Windows launcher): messages, steps, progress and "
                          "questions, whose answers are read as lines on stdin")
+    ap.add_argument("--image-auto-largest", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--import-anima", metavar="PATH", help="add an Anima DiT from this PC")
     ap.add_argument("--describe", action="store_true",
                     help="print this PC, the model families and sizes (with the RAM they need and the recommended "
                          "ones), the data folder and the installed models as one JSON object, and exit (the Windows "
                          "launcher's first screen)")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
-    ap.add_argument("--old-driver", action="store_true",
-                    help="start although the Level Zero driver predates the fix setup stops on (see its message)")
     ap.add_argument("--update", action="store_true",
                     help="update the engine, Python packages and model settings as a start would, without starting "
                          "the model (update.sh runs it after a git pull)")
-    ap.add_argument("--no-warmup", action="store_true",
-                    help="skip starting the model once at the end of setup to compile its GPU code (the first "
-                         "request then compiles it: ~30 s more)")
     ap.add_argument("--build", action="store_true", help=argparse.SUPPRESS)   # the engine is always compiled here
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--check-update", action="store_true",
@@ -7263,16 +11351,11 @@ def main() -> int:
     ap.add_argument("--packages", nargs="?", const="", metavar="DISTRO/MAKERS",
                     help="print the command that installs the distribution packages building from the source needs, "
                          "for the build mode (--license) and DISTRO/MAKERS, e.g. ubuntu26.04/intel,amd or "
-                         "fedora44/nvidia (default: this PC's distribution and GPUs), and exit; with XeStrata's deb or "
+                         "fedora45/nvidia (default: this PC's distribution and GPUs), and exit; with XeStrata's deb or "
                          "rpm, the GPU makers' packages this PC's GPUs lack")
     ap.add_argument("--remove-data", action="store_true",
                     help="delete the model files, settings and logs XeStrata keeps for you (asks first; removing the "
                          "program with apt or dnf leaves them)")
-    ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
-                    help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
-                         "and code only (~110 MiB less VRAM), cyrillic = English, code and the Cyrillic script, fr = "
-                         "English, code and French (French answers draft more), ja = English, code and Japanese "
-                         "(XeStrata-890M: the draft layer reads about half of cjk's bytes; the same answers)")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 15-30 minutes, longer on a slow card), "
                          "then start the model; usually not needed, the engine and setup fit them by themselves "
@@ -7300,7 +11383,13 @@ def main() -> int:
                          "--clients N, --compare DIR). --bench is XeStrata's own measurement")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--image-text-encoder", help=argparse.SUPPRESS)   # removed: --images names the encoder
+    ap.add_argument("--gui", nargs=argparse.REMAINDER, metavar="ARGS",
+                    help="open the launcher's window (xestrata gui, ./setup.sh gui; on Linux the xestrata-gui package, "
+                         "or built from launcher/ with the .NET 10 SDK); ARGS go to it (--lang CODE, "
+                         "--software-render)")
     a = ap.parse_args()
+    if a.gui is not None:
+        return run_gui(a.gui)
     if a.license == "contrib-icpx":
         fail("--license contrib-icpx: the contrib-icpx mode (Intel oneAPI's icpx) was removed",
              "use --license contrib (contrib-llvm: intel/llvm, for Intel, AMD and NVIDIA GPUs), or --license free")
@@ -7316,18 +11405,34 @@ def main() -> int:
     if a.image_text_encoder is not None:
         fail("--image-text-encoder was removed: --images names the text encoder",
              "use --images " + "|".join(images) + " (--image-text-encoder uncensored is qwen-image-turbo-uncensored)")
+    if a.model and a.model not in models and not a.model.startswith("custom-"):
+        ap.error(f"argument --model: invalid choice: {a.model!r} (choose from {', '.join(models)}, or custom-NAME)")
+    # --base, --variant and --quantizer name a family by its levels (TIERS); --family names it in one
+    if a.base:
+        if a.family:
+            ap.error("--family and --base name the model twice: give one of them")
+        a.family = tier_family(a.base, a.variant, a.quantizer)
+    elif a.variant:
+        ap.error("--variant is a version of the model --base names: give --base too")
+    elif a.quantizer and a.family and a.quantizer not in {size_quantizer(a.family, m) for m in family_sizes(a.family)}:
+        ap.error(f"--quantizer {a.quantizer}: --family {a.family} has no such quantization")
+    if a.gguf and (a.family or a.model or a.gguf_dir or a.inspect):
+        ap.error("--gguf installs the model in those files: give it without --family, --model, --gguf-dir and "
+                 "--inspect")
+    if a.name and not a.gguf:
+        ap.error("--name names a model installed with --gguf, e.g. --gguf model.gguf --name my-model")
     if a.source:
-        os.environ["STRATA_SOURCE"] = a.source
+        envvars.put(os.environ, "SOURCE", a.source)
     if a.inspect:                                      # upstream #911: headers only, nothing is installed
-        sys.exit(subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode)
+        code = subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode
+        sys.exit(inspect_with_engine(Path(a.inspect[0]).expanduser(), code) if len(a.inspect) == 1 else code)
     global ARGS
     ARGS = a
-    if a.vision_tokens is not None and a.vision_tokens < 1:
-        ap.error("--vision-tokens takes a number of image tokens, 1 or more, e.g. --vision-tokens 768")
+    for o in OPTIONS:                                  # the ranges and patterns of the table, as the window checks
+        if o["kind"] != "password" and (why := option_problem(o["name"], getattr(a, o["name"].replace("-", "_")))):
+            ap.error(why)
     if any(x and "=" not in x for x in a.cmake_arg or []):
         ap.error("--cmake-arg takes KEY=VALUE, e.g. --cmake-arg STRATA_ROCM_DEVICE_LIBS=/opt/rocm-7.1.1/amdgcn/bitcode")
-    if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
-        ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
     if a.bench_original_compat is not None and (a.bench or a.bench_verbose or a.original_strata):
         ap.error("--bench-original-compat is a measurement of its own: give it without --bench, --bench-verbose and "
                  "--original-strata")
@@ -7350,32 +11455,59 @@ def main() -> int:
         return remove_data()
     if a.check_update:
         return check_update()
+    a.custom = None
+    if a.gguf:                                         # a model from the user's own files: its headers decide
+        shards = gguf_files(Path(a.gguf).expanduser())
+        check_shards(shards)
+        mid = custom_id(a.name or SHARD_NAME.sub("", shards[0].name).removesuffix(".gguf"))
+        old = custom_of(CONF / f"xestrata-{mid}.json")
+        if (CONF / f"xestrata-{mid}.json").exists() and \
+                (old is None or [f["path"] for f in old.get("files", [])] != [str(x.resolve()) for x in shards]):
+            fail(f"a model named {mid} is installed from other files",
+                 "give this one another --name (or set that one up again from its own files)")
+        a.custom = custom_info(shards, mid)
+        register_custom(a.custom)
+        a.family, a.model = CUSTOM, mid
+    if a.import_anima:
+        try:
+            name = import_anima(Path(a.import_anima), data_folder_path(a.data_dir, load_settings()) / "models")
+        except (OSError, ValueError) as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        emit({"type": "anima_imported", "name": name})
+        return 0
     if a.describe:
         emit(describe())
         return 0
-    say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
+    say("XeStrata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
     # --check only reports (a user ran it to look, on a work machine): nothing made, moved or saved.  Given with what
     # acts before it (a measurement, an update), the data folder is prepared as for those
     if a.check and not (a.bench or a.bench_verbose or a.bench_original_compat is not None or a.update):
         data, elsewhere = data_folder_path(a.data_dir, load_settings()), []
     else:
-        data, elsewhere = data_folder(a.data_dir)      # the model files: in the data folder, found from any copy
+        data, elsewhere = data_folder(a.data_dir, a.move_data, a.yes, a.set_default_data_dir)   # found from any copy
     roots = [data, *elsewhere]
+    a.data_folder = str(data)
     if a.models_dir is None:
         a.models_dir = str(data / "models")
 
     # ---- 0. already installed: just start it
+    if not (a.check and not (a.bench or a.bench_verbose or a.bench_original_compat is not None or a.update)):
+        move_checkout_configs()
+        web_search_setup(a)
+        script_guard_setup(a)
     have = installed_configs()
     if a.update:                                       # #475: update.sh - never starts the model
         return update_install(have)
     explicit = a.setup or a.model or a.family or a.check or a.no_start
     adopted = None                                     # the earlier install this copy is set up like
-    if not have and not explicit:                      # a new copy of Strata (an update unzipped elsewhere): set it
+    if not have and not explicit:                      # a new copy of XeStrata (an update unzipped elsewhere): set it
         prev = previous_config(elsewhere, load_settings())   # up like the last one, from the files already here
         if prev is not None:
             ch = choices_from_config(prev)
             if ch["model"]:
-                say(f"  Found your earlier install in {prev.parent} ({prev.stem[len('strata-'):]}): setting up this "
+                model = re.sub(r"^(?:xe)?strata-", "", prev.stem)   # xestrata-<model>.json, or an older strata-
+                say(f"  Found your earlier install in {prev.parent} ({model}): setting up this "
                     "copy the same way - the model files are reused, nothing big is downloaded.")
                 a.family, a.model, a.context = ch["family"], ch["model"], a.context or ch["context"]
                 adopted = prev
@@ -7386,6 +11518,8 @@ def main() -> int:
                 a.port = a.port or ch["port"]
                 if a.vram_reserve_mib is None:          # #493: an explicit reserve set up before
                     a.vram_reserve_mib = ch.get("vram_reserve_mib")
+                if a.ram_reserve_gib is None:
+                    a.ram_reserve_gib = ch.get("ram_reserve_gib")
                 by_pci = {x["pci"]: x["index"] for x in gpus()}
                 if ch.get("split_pci") and all(pci in by_pci for pci in ch["split_pci"]):
                     # a layer split: set up across the same cards again
@@ -7417,18 +11551,19 @@ def main() -> int:
             fail("no model is installed yet", "run setup without --bench first, then --bench")
         # the model the release table and the upstream merges measure, so a record compares with theirs; --model and
         # --family pick another installed one (a PC with less RAM)
-        family, model = a.family or "qwen", a.model or "IQ3_XXS"
+        family = a.family or (CUSTOM if (a.model or "").startswith("custom-") else "qwen")
+        model = a.model or "IQ3_XXS"
         bench_cfgs = [c for c in have if (ch := choices_from_config(c))["family"] == family and ch["model"] == model]
         if not bench_cfgs:
             installed = "; ".join(f"xestrata --bench --model {ch['model']}" +
-                                  (f" --family {ch['family']}" if ch["family"] != "qwen" else "")
+                                  (f" --family {ch['family']}" if ch["family"] not in ("qwen", CUSTOM) else "")
                                   for c in have if (ch := choices_from_config(c))["model"])
-            fail(f"{FAMILIES[family]['title']} {model} is not installed",
+            fail(f"{FAMILIES[family]['title'] if family in FAMILIES else 'your model'} {model} is not installed",
                  f"measure an installed model: {installed}" if installed else
                  f"install it first: xestrata --setup --model {model}")
         update_installed_engine()
         return bench_config(bench_cfgs[0], data, a.bench_verbose, a.original_strata, a.bench_rounds,
-                            round(a.bench_temperature, 1))
+                            round(a.bench_temperature, 1), run_gpu)
     if a.calibrate and (a.setup or a.check or not have):    # upstream #2036: said, not dropped
         why = "--setup" if a.setup else "--check" if a.check else "no model is installed yet"
         warn(f"--calibrate does nothing with {why}: it tunes a model that is already installed. Run "
@@ -7460,7 +11595,8 @@ def main() -> int:
                                        a.yes)) - 1]
             return start(run_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io,
+                               "route_tail_skip": a.route_tail_skip})
         update_installed_engine()
         pick_cfg = have[0]
         if len(have) > 1:
@@ -7474,13 +11610,15 @@ def main() -> int:
                  + ("keeps" if a.no_start else "starts with") + " the default settings")
         return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                                           keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                                                "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+                                                "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser,
+                                                "ple_io": a.ple_io, "route_tail_skip": a.route_tail_skip})
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         update_installed_engine()
         if len(have) == 1:
             return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io,
+                               "route_tail_skip": a.route_tail_skip})
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
@@ -7489,87 +11627,140 @@ def main() -> int:
         if pick <= len(have):
             return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io,
+                               "route_tail_skip": a.route_tail_skip})
 
     # ---- 1. the PC
     step(1, "checking your PC")
     found = gpus()
-    if not found:
+    # no GPU: the dense Qwen3.5 models that run on the CPU alone ("cpu" in PLAIN_FAMILIES), text only and one request
+    # at a time; setup asks for no GPU then (--gpu, --gpus and the other families still need one)
+    cpu_fams = [f for f, d in PLAIN_FAMILIES.items() if d.get("cpu")]
+    on_cpu = not found and (a.family is None or a.family in cpu_fams) and a.gpu is None and not a.gpus
+    if not found and not on_cpu:
         fail("no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found",
-             "Strata's Xe engine needs an Intel GPU (Intel Arc, or the processor's graphics) on the xe or i915 kernel "
-             "driver, an RDNA2 or later AMD GPU on amdgpu, or with --license contrib an NVIDIA GPU on NVIDIA's driver "
-             "(lspci -k shows the driver)")
-    if len(found) > 1 or gpu_problem(found[0]) is not None:
-        gpu_table(found)
-    gpu_chosen = a.gpu is not None                     # --gpu given: the config names the card
-    a.gpus_chosen = gpu_chosen or bool(a.gpus)         # and with --gpus, the earlier split is not kept (carry_over)
-    sel = choose_gpus(a, found)
-    a.gpu = sel[0]
-    GPU_PICK = a.gpu
-    gpu = gpu_info(a.gpu)
-    chosen = [gpu]
-    mem = "no VRAM of its own (it shares the system RAM)" if gpu.get("integrated") else f"{gpu['vram_gb']:.0f} GB VRAM"
-    if "uma_gb" in gpu:
-        mem = (f"unified memory: a {gpu['carve_gb']:.1f} GB BIOS carve-out + {gpu['shared_gb']:.0f} GB shared with the "
-               f"RAM, {gpu['uma_gb']:.0f} GB usable by the GPU")
-    ok(f"GPU: {gpu['name']}, {mem}, PCI {gpu['pci']}, PCIe link " + (gpu["link"] or "not readable"))
-    if gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu:
-        for line in strix_halo_notes(gpu, ram_gb()):
+             "XeStrata's Xe engine needs an Intel GPU (Intel Arc, or the processor's graphics) on the xe or i915 "
+             "kernel driver, an RDNA2 or later AMD GPU on amdgpu, or with --license contrib an NVIDIA GPU on NVIDIA's "
+             "driver (lspci -k shows the driver)")
+    if on_cpu:
+        gpu_chosen = a.gpus_chosen = False
+        sel, chosen = [], []
+        gpu: dict[str, Any] = {"name": "none", "cpu": True, "vram_gb": 0.0, "pci": None, "vendor": None, "count": 0}
+        ok("GPU: none found: the CPU alone runs " + " and ".join(PLAIN_FAMILIES[f]["title"] for f in cpu_fams) +
+           " (text only, slower than on a GPU)")
+    else:
+        if len(found) > 1 or gpu_problem(found[0]) is not None:
+            gpu_table(found)
+        gpu_chosen = a.gpu is not None                     # --gpu given: the config names the card
+        a.gpus_chosen = gpu_chosen or bool(a.gpus)         # and with --gpus, the earlier split is not kept (carry_over)
+        sel = choose_gpus(a, found)
+        a.gpu = sel[0]
+        GPU_PICK = a.gpu
+        gpu = gpu_info(a.gpu)
+        chosen = [gpu]
+        mem = "no VRAM of its own (it shares the system RAM)" if gpu.get("integrated") else \
+            f"{gpu['vram_gb']:.0f} GB VRAM"
+        if "uma_gb" in gpu:
+            mem = (f"unified memory: a {gpu['carve_gb']:.1f} GB BIOS carve-out (the GPU's own pool) + "
+                   f"{gpu['shared_gb']:.0f} GB of the RAM reached through the GTT, {gpu['uma_gb']:.0f} GB in all")
+        ok(f"GPU: {gpu['name']}, {mem}, PCI {gpu['pci']}, PCIe link " + (gpu["link"] or "not readable"))
+        if gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu:
+            for line in strix_halo_notes(gpu, ram_gb()):
+                (warn if line.startswith("!") else say)(line.lstrip("!"))
+        for line in (unused_card_notes(found, set(sel)) if not gpu_chosen and not a.gpus else []):
+            say(line)
+        for line in unused_apu_notes(found, set(sel), ram_gb()):
             (warn if line.startswith("!") else say)(line.lstrip("!"))
-    for line in unused_apu_notes(found, set(sel), ram_gb()):
-        (warn if line.startswith("!") else say)(line.lstrip("!"))
-    for i in sel[1:]:                                  # --gpus: the later layers' cards
-        x = gpu_info(i)
-        ok(f"then GPU {i}: {x['name']}, {x['vram_gb']:.0f} GB VRAM, PCI {x['pci']} (layer split, "
-           f"{a.layer_split or 'auto'})")
-    if not WIN and gpu.get("vendor") == "amd" and not os.access("/dev/kfd", os.R_OK | os.W_OK):
-        fail("no access to the GPU's compute device (/dev/kfd)",
-             "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
-    makers = {x["vendor"] for x in chosen} | {gpu_info(i)["vendor"] for i in sel[1:]}
-    amd_gfx = {x.get("gfx") for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x["vendor"] == "amd"}
-    if PACKAGED:                                       # the GPU makers' packages the package only suggests
-        check_runtime(makers, amd_gfx, data, a.yes, a.old_driver, install=not a.check)
-    elif not WIN and (majors := [v for t in cuda_toolkits() if (v := cuda_major(t))]):   # a contrib build: its CUDA
-        linux_nvidia_libs(makers, data, nvidia_pip_names(max(majors)))
-    if not WIN and (gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK)):
-        fail(f"no access to the GPU ({gpu['render'] or 'no render node'})",
-             "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else
-             "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
-    if gpu["bar_gb"] < gpu["vram_gb"] - 0.5:
-        warn(f"Resizable BAR looks off: the card shows {gpu['bar_gb']:.1f} GB of its {gpu['vram_gb']:.0f} GB to the "
-             "CPU. "
-             "Copies to the GPU will be slower; turn on Re-Size BAR (and Above 4G Decoding) in the BIOS")
-    if gpu.get("integrated") and "uma_gb" not in gpu:
-        warn("the processor's own graphics: Strata will run, but slowly - its memory is the system RAM, and it has "
-             "no matrix engines (XMX) on most processors")
-    elif gpu.get("integrated") and gpu.get("vendor") == "amd" and gpu.get("carve_gb", 0.0) < 11:
-        # XeStrata-890M: the experts go into the RAM the GPU shares (uma_host_cache), not into the carve-out
-        say("  unified memory: when the RAM holds the model, every expert goes into the RAM the GPU shares and the GPU "
-            "reads it there (the expert cache in host USM); the carve-out's size does not limit it")
-    elif gpu["vram_gb"] < 11:
-        warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
-    ram = ram_gb()
+        for i in sel[1:]:                                  # --gpus: the later layers' cards
+            x = gpu_info(i)
+            ok(f"then GPU {i}: {x['name']}, {x['vram_gb']:.0f} GB VRAM, PCI {x['pci']} (layer split, "
+               f"{a.layer_split or 'auto'})")
+        if not WIN and gpu.get("vendor") == "amd" and not os.access("/dev/kfd", os.R_OK | os.W_OK):
+            fail("no access to the GPU's compute device (/dev/kfd)",
+                 "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
+        makers = {x["vendor"] for x in chosen} | {gpu_info(i)["vendor"] for i in sel[1:]}
+        amd_gfx = {x.get("gfx") for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x["vendor"] == "amd"}
+        check_iommu([x["pci"] for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x.get("pci")])
+        check_compaction(makers)
+        if PACKAGED:                                       # the GPU makers' packages the package only suggests
+            check_runtime(makers, amd_gfx, data, a.yes, a.old_driver, install=not a.check)
+        elif not WIN:
+            check_build_packages(makers, license_mode(a))
+            if majors := [v for t in cuda_toolkits() if (v := cuda_major(t))]:       # a contrib build: its CUDA
+                linux_nvidia_libs(makers, data, nvidia_pip_names(max(majors)))
+        if not WIN and (gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK)):
+            fail(f"no access to the GPU ({gpu['render'] or 'no render node'})",
+                 "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else
+                 "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
+        if gpu["bar_gb"] < gpu["vram_gb"] - 0.5:
+            warn(f"Resizable BAR looks off: the card shows {gpu['bar_gb']:.1f} GB of its {gpu['vram_gb']:.0f} GB to "
+                 "the CPU. Copies can be slower; AMD GPUs can appear stalled and LoRA training can fail. "
+                 "Enable Above 4G Decoding and Resizable BAR in the BIOS")
+        if gpu.get("integrated") and "uma_gb" not in gpu:
+            warn("the processor's own graphics: XeStrata will run, but slowly - its memory is the system RAM, and it "
+                 "has no matrix engines (XMX) on most processors")
+        elif gpu.get("integrated") and gpu.get("vendor") == "amd" and gpu.get("carve_gb", 0.0) < 11:
+            # XeStrata-890M: the experts go into the RAM the GPU shares (uma_host_cache), not into the carve-out
+            say("  unified memory: when the RAM holds the model, every expert goes into the RAM the GPU shares and the "
+                "GPU reads it there (the expert cache in host USM); the carve-out's size does not limit it")
+        elif gpu["vram_gb"] < 11:
+            warn("less than 12 GB of VRAM: XeStrata will run, but most experts stay on the CPU and it will be slow")
+    ram, ram_total = usable_ram_gb(), ram_gb()
     cpu, avx2, avx512 = cpu_info()
-    need = min(d["ram_gb"] for d in MODELS.values())
-    low_ok = low_ram_fits("IQ1_M", ram, gpu_expert_vram(gpu)) and a.low_ram != "off"   # the smallest model, mapped
-    if ram < need - 4 and not a.check and not low_ok:
-        # every model keeps ALL its experts in RAM (23+ GB) unless the GPU holds enough of them for the low-RAM mode
-        fail(f"RAM: {ram:.0f} GB - the smallest model (the Coder) needs about {need} GB",
-             "Strata keeps the model's experts in RAM (23-50 GB) and the GPU holds a copy of the most-used ones: it "
-             "needs 32 GB of RAM or more (48 GB for the full model), or a GPU with the VRAM to hold most of them")
-    ok(f"RAM: {ram:.0f} GB" if ram >= need - 4 else
-       f"RAM: {ram:.0f} GB (less than the {need} GB the smallest model needs)" +
-       ("; the GPU's VRAM makes up for it (the low-RAM mode)" if low_ok else ""))
+    if on_cpu:                                         # the smallest of the CPU's models at the shortest context
+        need = min(cpu_ram_gb(PLAIN_FAMILIES[f], CONTEXTS[0]) for f in cpu_fams)
+        if ram < need and not a.check:
+            fail(f"RAM: {ram:.0f} GB - without a GPU the smallest model needs about {need:.0f} GB")
+        ok(f"RAM: {ram:.0f} GB")
+    else:
+        need = minimum_setup_ram(a.family)
+        low_ok = low_ram_fits("IQ1_M", ram, gpu_expert_vram(gpu)) and a.low_ram != "off"   # the smallest model, mapped
+        if a.ram_reserve_gib and ram < need - 4 and not low_ok and ram_total >= need - 4:
+            # the reserve leaves less than the smallest model runs in: it keeps that least, and less stays free
+            ram = need - 4
+            warn(f"--ram-reserve-gib {a.ram_reserve_gib:g} leaves less RAM than the smallest model runs in "
+                 f"({need - 4:.0f} GB): XeStrata takes that much, and about {ram_total - ram:.0f} GB stay free")
+            a.ram_reserve_gib = math.floor(ram_total - ram)
+        # a model of PLAIN_FAMILIES this PC runs needs none of that RAM: the one asked for, else one of FIRST_CHOICE
+        # (Qwen3.5-2B the last, its weights in VRAM); then the stop waits for a Flash-Next family chosen in step 2
+        plain_ok = any(runs_here(f, room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]]))
+                       for f in ([a.family] if a.family else [f for f, *_ in FIRST_CHOICE]) if f in PLAIN_FAMILIES)
+        if ram < need - 4 and not a.check and not low_ok and not plain_ok:
+            setup_ram_stop(a.family, ram, need)
+        if a.ram_reserve_gib:
+            ok(f"RAM: {ram_total:.0f} GB, {a.ram_reserve_gib:g} GiB of it kept free for other programs "
+               f"(--ram-reserve-gib): XeStrata plans with {max(ram, 0.0):.0f} GB")
+        elif ram >= need - 4:
+            ok(f"RAM: {ram:.0f} GB")
+        else:
+            ok(f"RAM: {ram:.0f} GB (less than the {need} GB the smallest Qwen3.8-Flash-Next model needs)" +
+               ("; the GPU's VRAM makes up for it (the low-RAM mode)" if low_ok else
+                "; the smaller models run on the GPU" if plain_ok else ""))
     ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     if not avx2:
-        fail("this CPU has no AVX2; Strata needs at least AVX2")
+        fail("this CPU has no AVX2; XeStrata needs at least AVX2")
+    if a.check and on_cpu:                             # without a GPU: the CPU's models alone
+        say()
+        any_fits = False
+        for f in cpu_fams:
+            fam = PLAIN_FAMILIES[f]
+            c = cpu_ctx(fam, ram)
+            holds = ram >= cpu_ram_gb(fam, c)
+            any_fits = any_fits or holds
+            say(f"  {fam['title']} (every size): ~{cpu_ram_gb(fam, c):.0f} GB of RAM at {c // 1024}K on the CPU: "
+                + ("fits" if holds else "does not fit"))
+        say("\nWithout a GPU, " + ("this PC can run these models on the CPU (text only). Run it again without --check "
+                                   "to install." if any_fits else "this PC has too little RAM for them."))
+        return 0 if any_fits else 1
     if a.check:
         say()
         any_fits = False
         for m, d in MODELS.items():
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
             vram = gpu_expert_vram(gpu) + sum(max(0.0, gpu_expert_vram(gpu_info(i)) - 5) for i in sel[1:])
-            if d.get("budget"):
+            if "sync" in d.get("families", ()):
+                verdict = "fits" if size_fits("sync", m, room_of(ram, chosen)) else "does not fit"
+            elif d.get("budget"):
                 fits = (f"fits with {resident_budget_gib(m, ram, uma=shares_ram(gpu))} GiB of its experts in RAM, "
                         "the rest read from the SSD")
                 if uma_holds_experts(m, ram, gpu):     # upstream 86ffdbeb1: every expert in the RAM the GPU shares
@@ -7588,8 +11779,8 @@ def main() -> int:
         for fam in PLAIN_FAMILIES.values():
             for m, d in fam["models"].items():
                 gb = d["size"] / 1e9
-                if fam.get("dense"):   # every weight in VRAM, at the context the card recommends
-                    c = min(vram_ctx([gpu]), fam["max_context"])
+                if fam.get("dense"):   # every weight in VRAM, at the context the card recommends or that fits
+                    c = dense_ctx(fam, d, gpu_expert_vram(gpu), vram_ctx([gpu]))
                     need = dense_vram_gb(fam, d, c)
                     verdict = "fits" if gpu_expert_vram(gpu) >= need else "does not fit the GPU"
                     say(f"  {fam['title']} {m}: ~{need:.0f} GB of VRAM at {c // 1024}K: {verdict}")
@@ -7597,48 +11788,64 @@ def main() -> int:
                 verdict = "fits" if ram >= gb + 8 else "fits with the GPU's VRAM" if ram + plain_vram >= gb + 8 \
                     else "slow (the experts that do not fit are read from the SSD)"
                 say(f"  {fam['title']} {m}: ~{gb + 8:.0f} GB of RAM and VRAM: {verdict}")
-        if not any_fits:
+        if not any_fits and not plain_ok:
             # upstream #977: every size says "does not fit", so the verdict says so too (and the exit code, for
             # scripts). It only reports: --model NAME --yes still installs one anyway.
-            say(f"\nThis PC cannot run Strata yet: no model size fits {ram:.0f} GB of RAM (the smallest needs about "
+            say(f"\nThis PC cannot run XeStrata yet: no model size fits {ram:.0f} GB of RAM (the smallest needs about "
                 f"{need} GB). --model NAME --yes installs one anyway, slowly.")
             return 1
-        say("\nThis PC can run Strata. Run it again without --check to install.")
+        say("\nThis PC can run XeStrata. Run it again without --check to install.")
         return 0
 
     # ---- 2. the questions
     step(2, "your choices")
-    fams = list(FAMILIES)
+    if a.custom is None and (a.family == CUSTOM or (a.model or "").startswith("custom-")):
+        # an installed model of the user's own files set up again from them (--setup --model custom-NAME)
+        old = custom_of(CONF / f"xestrata-{a.model}.json") if a.model else None
+        if old is None:
+            fail(f"{a.model or '--family custom'}: no model of your own files is installed under that name",
+                 f"install one with {SETUP_CMD} --setup --gguf <its .gguf file> --name <a name>")
+        a.custom = custom_info([Path(f["path"]) for f in old["files"]], a.model)
+        register_custom(a.custom)
+        a.family = CUSTOM
+    if on_cpu and a.family == CUSTOM:
+        fail("a model of your own files needs a GPU: without one the CPU runs " +
+             " and ".join(PLAIN_FAMILIES[f]["title"] for f in cpu_fams))
+    fams = cpu_fams if on_cpu else [f for f in FAMILIES if f != CUSTOM and f != "edge0"]   # edge0: --family edge0
     # a Strix Halo with the memory for it: UD-IQ4_XS is the recommendation, the menus list the rest (upstream c4a329fe)
     halo = gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu and ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB
     halo_fam = (next((f for f in fams if f in MODELS.get(STRIX_HALO_MODEL, {}).get("families", ())), None)
                 if halo else None)
+    # XeStrata-890M: on an integrated AMD GPU, the fork's offer (apu_first_choice), its size also with --family;
+    # elsewhere FIRST_CHOICE
+    first: tuple = apu_first_choice(fams, ram) if apu_first(gpu) else (None, None)
     if a.family:
         family = a.family
     else:
-        rec_fam = halo_fam or fams[0]
-        for i, f in enumerate(fams, 1):
-            d = FAMILIES[f]
-            say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" +
-                ("   [experimental]" if d.get("experimental") else "") +
-                (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == halo_fam and f != fams[0] else ""))
-        family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)], str(fams.index(rec_fam) + 1),
-                              a.yes)) - 1]
+        # the first this PC runs of FIRST_CHOICE (without a GPU: the 2B, the better answers), asked by its levels
+        room = room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]])
+        if first[0] is None:
+            first = first_offered(fams, room)
+        family, a.quantizer = ask_tiers(fams, halo_fam or first[0], room, halo_fam, a.yes)
+    if not on_cpu and family not in PLAIN_FAMILIES and ram < minimum_setup_ram(family) - 4 and not low_ok:
+        setup_ram_stop(family, ram, minimum_setup_ram(family))     # step 1's stop, for the Flash-Next family chosen
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
-    if fam.get("license"):
-        say(f"  Its license: {fam['license']}")
+    if (lic := family_license(family)):
+        say(f"  Its license: {lic}")
     if fam.get("inkling2mini"):
         return setup_inkling2mini(a, fam, gpu, ram, roots, port, adopted)
     if fam.get("plain"):
         return setup_plain(a, family, fam, gpu, chosen, sel, found, gpu_chosen, ram, roots, elsewhere, port, adopted)
+    if fam.get("edge0"):
+        return setup_edge0(a, family, fam, gpu, chosen, sel, found, gpu_chosen, ram, roots, elsewhere, port, adopted)
     say()
     # an experimental size sorts last (UD-IQ4_XS before UD-Q4_K_XL); --model takes the names as they are
     names = sorted((m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))),
                    key=lambda m: bool(MODELS[m].get("experimental")))
     if a.model and a.model not in names:
         # upstream #444: say which family has that size, and (with --gguf-dir) which files XeStrata can run at all
-        elsewhere_fams = [f for f in FAMILIES if f in MODELS[a.model].get("families", ("qwen", "swift"))]
+        elsewhere_fams = [f for f in FAMILIES if f in MODELS.get(a.model, {}).get("families", ())]
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names)
              + (f" (or {a.model}: " + ", ".join(f"--family {f} --model {a.model}" for f in elsewhere_fams) + ")"
                 if elsewhere_fams else "")
@@ -7653,15 +11860,18 @@ def main() -> int:
         if m == have_size:
             fit += "   (installed)"
         if d.get("budget") and not uma_holds_experts(m, ram, gpu):
-            say(f"  {i}) {m} {d['about']}; download {d['download_gb']:.0f} GB, keeps ~"
+            say(f"  {i}) {m} {d['about']}; download {files_gb(family, m):.1f} GB, keeps ~"
                 f"{resident_budget_gib(m, ram, uma=shares_ram(gpu))} GB of its {d['arena_gb']:.0f} GB of experts in "
                 f"RAM{fit}")
             continue
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, vram) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, vram):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, vram) else "the rest from the SSD)"))
-        say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
-    rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
+        say(f"  {i}) {m:8s} {d['about']}" + ("" if d.get("custom") else f"; download {files_gb(family, m):.1f} GB") +
+            f", uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
+    rec = str(names.index(recommend_size(family, room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]]), names)) + 1)
+    if family == first[0] and first[1] in names:     # the first install's offer (first_choice): its size
+        rec = str(names.index(first[1]) + 1)
     if family == halo_fam and STRIX_HALO_MODEL in names:
         rec = str(names.index(STRIX_HALO_MODEL) + 1)
     if have_size is not None:   # setup run again: the installed size, whatever is recommended for a first install
@@ -7693,10 +11903,23 @@ def main() -> int:
                          "install it anyway", "  Install it anyway?")
             warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
         budget = budget_choice(model, ram, a.resident_budget_gib, uma=shares_ram(gpu))
-        ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
+        # upstream 86ffdbeb1: on a unified-memory GPU whose own pool holds the experts, the expert cache takes them all
+        # and nothing is pinned.  The GPU's own pool is the BIOS carve-out (the OS does not see it), not `uma_gb`: the
+        # GTT pool is the RAM itself.  The dense weights and the buffers take their part of the carve-out first, so the
+        # experts' room is the carve-out less the file's dense bytes (the download holds experts and dense) and room
+        # beside them.
+        own_gb = (gpu.get("carve_gb") or 0.0) if gpu.get("integrated") else 0.0
+        dense_gb = max(0.0, MODELS[model]["download_gb"] - MODELS[model]["arena_gb"])
+        if (gpu.get("integrated") and a.resident_budget_gib is None
+                and own_gb >= MODELS[model]["arena_gb"] + dense_gb + UMA_DENSE_ROOM_GB):
+            ok(f"{model}'s experts fit the GPU's own memory ({own_gb:.0f} GB BIOS carve-out): the expert cache takes "
+               "them all, no RAM copy is pinned")
+            budget = None
+        else:
+            ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
         if a.low_ram not in ("auto", "off"):
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
-    elif a.resident_budget_gib is not None:
+    elif a.resident_budget_gib is not None and family != "sync":
         warn(f"--resident-budget-gib is for UD-Q4_K_XL and UD-IQ4_XS: {model} keeps all of its experts in RAM or in "
              "the low-RAM mode")
     low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
@@ -7744,12 +11967,7 @@ def main() -> int:
              "recommended size.")
     scaling = a.rope_scaling
     if ctx > 262144 and scaling is None and not a.yes:
-        say()
-        say(f"  A {ctx // 1024}K context runs the model past its trained 262,144 positions: the rotary angles")
-        say("  get rescaled (llama.cpp's RoPE extension). yarn keeps the trained angles on the high-frequency")
-        say("  pairs and corrects the magnitudes; linear shrinks every angle. Override any time with")
-        say("  --rope-scaling.")
-        scaling = ask("RoPE extension method?", ["yarn", "linear"], "yarn", a.yes)
+        scaling = ask_option("rope-scaling", a.yes)
     try:
         scaling, rope_scale = resolve_rope(ctx, scaling, a.rope_scale)
     except ValueError as e:
@@ -7759,16 +11977,13 @@ def main() -> int:
                   else "as requested")
         ok(f"rope scaling: {scaling}, factor {rope_scale:g} ({origin})")
     ok(f"context: {ctx} tokens")
-    # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21)
-    kv = "fp16" if ctx <= 8192 else (a.kv or "int8")
+    # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21).
+    # Up to 8K the engine's 16-bit unless --kv names another (upstream #6354 made 8-bit the default there on small
+    # cards; here it is a choice only, as it changes the answers: OUT, 2026-11-23)
+    kv = (a.kv or "fp16") if ctx <= 8192 else (a.kv or "int8")
     if ctx > 8192 and not a.kv and not a.yes:
-        say()
-        say("  KV cache precision (the model's memory of the conversation):")
-        say("  1) 8-bit   (recommended: what every published number was measured with)")
-        say("  2) 4-bit   half the memory (about 4% faster at 128K), but measurably less precise on long")
-        say("             documents; long-context lookups (needle tests) still pass")
-        kv = ["int8", "q4_0"][int(ask("KV cache?", ["1", "2"], "1", a.yes)) - 1]
-    if ctx > 8192:
+        kv = ask_option("kv", a.yes)
+    if ctx > 8192 or kv != "fp16":
         ok("KV cache: " + {"int8": "8-bit", "q4_0": "4-bit (Hadamard-rotated)",
                            "k8v4": "8-bit keys, 4-bit values", "fp16": "16-bit"}[kv])
     if MODELS[model].get("vision", fam.get("vision")) is False:     # a size without images
@@ -7780,25 +11995,21 @@ def main() -> int:
         # differ from the CPU encoder's by a few percent; the answers agree): the 2026-09-30-xe-vision-sycl record
         vision = "none" if a.vision in ("no", "none") else images_encoder(a.vision, gpu)
     else:
-        small = 0 < gpu_expert_vram(gpu) < IMAGES_GPU_ENCODER_MIN_VRAM_GB
-        say()
-        say("  Images: the model can also read pictures (screenshots, photos, scanned pages). This adds a 0.9 GB")
-        if small:
-            say("  download. On a card under 24 GB the encoder runs on the CPU (a few seconds per picture, nothing")
-            say("  taken from the GPU): the GPU encoder keeps ~1.4 GB of VRAM free, which cost 3-5% of text speed on")
-            say("  16 GB cards. --vision gpu if you want pictures in under a second.")
-        else:
-            say("  download; the image encoder runs on the GPU (on the CPU if it cannot start there).")
         # upstream 91baead75: pictures on by default wherever the model reads them, on every make of card (the reader
         # follows images_encoder: the CPU under 24 GB of VRAM, the GPU from 24 GB)
-        vision = images_encoder("yes", gpu) if ask("Do you want images?", ["y", "n"], "y", a.yes) == "y" else "none"
+        if 0 < gpu_expert_vram(gpu) < IMAGES_GPU_ENCODER_MIN_VRAM_GB and not a.yes:
+            say()
+            say("  On a card under 24 GB the picture reader runs on the CPU (a few seconds per picture, nothing taken")
+            say("  from the GPU): the GPU encoder keeps ~1.4 GB of VRAM free, which cost 3-5% of text speed on 16 GB")
+            say("  cards. Choose gpu if you want pictures in under a second.")
+        asked = ask_option("vision", a.yes)
+        vision = "none" if asked == "no" else images_encoder(asked, gpu)
     ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                      "cpu": "on (encoder on the CPU)"}[vision])
-    if vision != "none" and MODELS[model].get("vision_untested"):
-        warn(f"images with {model} are untested: users report them working upstream, but this file has not been run "
-             "with images (upstream #967); tell us if the answers look wrong")
     if a.images is None and not a.yes and not JSON_OUT:   # asked here only interactively: --images says it, and the
         a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")   # launcher (--json) passes it
+    if a.translate is None and not a.yes and not JSON_OUT:
+        a.translate = ask_translate(CONF / f"xestrata-{tag.lower()}.json")
     # The low-RAM mode's two variants.  resident: the experts the GPU's cache does not hold are copied from the model
     # files into RAM once (--resident-experts; the engine keeps what fits the RAM it finds free and reads the rest
     # from the files).  mmap: they are read through the OS file cache.  The GPU's share: its VRAM less the dense
@@ -7827,18 +12038,24 @@ def main() -> int:
     # chosen here; with it loaded, the web app and the API switch it off per request
     esp = None
     esp_choice = (a.experimental_speed_projection or "").strip()
-    # the Coder and Unsloth's files: the same model's residual stream (Unsloth's: the user's decision of 2026-10-22)
-    if family in ("qwen", "coder", "unsloth"):
+    if family in SPEED_PROJECTION_FAMILIES:
         if not esp_choice:
-            say()
-            say("  EXPERIMENTAL - speed projection: a small control vector applied while the model runs (layers 4-44).")
-            say("  It changes how the model answers: its package describes it as a refusal-direction projection (the")
-            say("  model declines far fewer requests). Off unless you choose it; when on, the web app can switch it")
-            say("  off per chat. Details: " + (esp_release_url("README.md") if PACKAGED else
-                                               "third_party/nonfree/experimental-speed-projection/README.md"))
-            esp_choice = ("on" if ask("Turn on the experimental speed projection?", ["y", "n"], "n", a.yes) == "y"
-                          else "off")
+            esp_choice = ask_option("experimental-speed-projection", a.yes)
+            if esp_choice == "on" and not a.yes:
+                say("  Its details: " + (esp_release_url("README.md") if PACKAGED else
+                                         "third_party/nonfree/experimental-speed-projection/README.md"))
         if esp_choice.lower() not in ("off", "no", "n", "0"):
+            # the user's decision of 2026-11-05: fewer refusals are offered as the abliterated versions (refusals
+            # removed in the weights), the vector only when it is still wanted after that
+            alt = [f for f in ABLITERATED_FAMILIES if f in MODELS[model].get("families", ("qwen", "swift"))]
+            hint = " or ".join(f"{SETUP_CMD} --setup --family {f}" + (f" --model {model}" if alt else "")
+                               for f in alt or ABLITERATED_FAMILIES)
+            confirm_risk("for fewer refusals XeStrata recommends an abliterated version, SC117's or huihui-ai's (the "
+                         "refusals removed in the weights), not the experimental speed projection: " + hint,
+                         bool(a.experimental_speed_projection), a.yes,
+                         "the experimental speed projection was not turned on",
+                         f"install an abliterated version ({hint}), or pass --experimental-speed-projection on "
+                         "--yes to use the projection anyway", "  Turn on the experimental speed projection anyway?")
             esp = (ESP_VECTOR if esp_choice.lower() in ("on", "yes", "y", "1")
                    else Path(esp_choice).expanduser().resolve())
             if not esp.is_file() and esp == ESP_VECTOR and PACKAGED:
@@ -7852,13 +12069,22 @@ def main() -> int:
         ok("experimental speed projection: " + ("ON (experimental)" if esp else "off"))
     elif esp_choice.lower() not in ("", "off", "no", "n", "0"):
         warn(f"the experimental speed projection cannot be used with {fam['title']}: left off")
+    if family == "sync":
+        return setup_sync(a, family, model, gpu, sel, found, gpu_chosen, ram, roots, port, adopted, ctx, kv, vision,
+                          low_ram, resident, scaling, rope_scale)
+    own = bool(a.gguf_dir or a.custom)                 # the person's own files: never downloaded, deleted or marked
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     shards = gguf_dir_shards(models_dir, fam, model) if a.gguf_dir else \
         [models_dir / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
+    if a.custom:
+        shards = [Path(f["path"]) for f in a.custom["files"]]
+        models_dir = shards[0].parent
     problem = gguf_dir_problem(models_dir, shards[0], fam, model) if a.gguf_dir else None
     if problem:                                        # upstream #444: files XeStrata cannot run, or another choice's
         fail(*problem)
-    if not a.gguf_dir and not all(sh.exists() and done(sh) for sh in shards):
+    if a.gguf_dir:
+        gguf_dir_renamed(shards, fam, model)
+    if not own and not all(sh.exists() and done(sh) for sh in shards):
         for r in elsewhere:                            # already downloaded in a Strata folder on another drive
             cand = [r / "models" / tag / sh.name for sh in shards]
             if all(c.exists() and done(c) for c in cand):
@@ -7866,12 +12092,13 @@ def main() -> int:
                 ok(f"model files found in {models_dir}")
                 break
     # upstream #173: a whole file copied in by hand has no finish mark (75e6efeb7, 762e58b5b); a pinned one is hashed
-    mark_whole_unless_pinned(shards, model_hf(fam, model) if fam.get("hf") else None, bool(a.gguf_dir))
-    have_model = all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
+    mark_whole_unless_pinned([] if a.custom else shards, model_hf(fam, model) if fam.get("hf") else None,
+                             bool(a.gguf_dir))
+    have_model = all(s.exists() and (done(s) or own) for s in shards)
     # upstream #425: a download that resumes needs room only for what is still missing - the finished shards and the
     # .part files already on the disk count
     on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part")) if f.is_file()) / 1e9
-    to_fetch = 0 if a.gguf_dir or have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
+    to_fetch = 0 if own or have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
     # upstream ed15a3d0: count only what step 6 will still write - the AVX-512 Q2_0 conversion when its pack is not
     # there yet, a new MTP draft layer only when none is
     pack_now = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
@@ -7879,28 +12106,30 @@ def main() -> int:
     mtp_have = find_in(roots, "mtp/rt/experts.bin") is not None
     q2_avx = model == "Q2_0" and avx512 and family == "qwen"
     margin = 2 if mtp_have else 8                      # working room: a guess, not bytes that will be written
-    real = to_fetch + (40 if q2_avx and not pack_bin else 0) + (1 if vision != "none" else 0)
+    copy_gb = 40 if q2_avx and not pack_bin else 0     # the Q2_0 experts' pack (goes to the data folder's packs)
+    real = to_fetch + copy_gb + (1 if vision != "none" else 0)
     need = real + margin
     free_now = free_gb(models_dir)
-    if free_now < real:                                # upstream 537f8fef8: stop only when the bytes do not fit
-        fail(f"not enough free disk space in {models_dir}: need ~{real:.0f} GB, {free_now:.0f} GB free",
-             "use --models-dir on a bigger drive")
+    if (problem := disk_room_problem(models_dir, pack_now, real - copy_gb, copy_gb,
+                                     f" ({on_disk:.0f} GB of the model is already there)" if on_disk >= 1
+                                     and not have_model else "")):   # upstream 537f8fef8: only when the bytes lack room
+        fail(*problem)
     if free_now < need:
         warn(f"little free disk space in {models_dir}: {free_now:.0f} GB free for about {real:.0f} GB of files. "
              "Setup goes on and should fit; free up space if it stops")
 
-    llama, eng, enc, lib_dirs = prepare_engine(a, gpu, vision)
-    # #24: a package takes only the image encoders it carries (the Windows 7z has the CPU one, no Vulkan one)
-    if PACKAGED and vision == "gpu" and not (eng / VEXE[enc]).exists():
-        warn("this package has no GPU image encoder: images are read on the CPU")
-        vision = "cpu"
-    if PACKAGED and vision == "cpu" and not (eng / VEXE["cpu"]).exists():
+    llama, eng, lib_dirs = prepare_engine(a, gpu)
+    if a.custom:                                       # the engine's verdict before anything is made
+        check_model(eng / EXE, lib_dirs, shards[0])
+        ok(f"the engine runs {shards[0].name}")
+    # #24: a package takes the picture reader only where it carries one
+    if PACKAGED and vision != "none" and not (eng / VISION_EXE).exists():
         warn("this package has no image encoder: images are off")
         vision = "none"
 
     # ---- 5. the model files
-    step(5, f"downloading {fam['title']} {model}")
-    if not a.gguf_dir:
+    step(5, f"downloading {fam['title']} {model}" if not own else f"the model files of {fam['title']}")
+    if not own:
         missing = [s.name for s in shards if not (s.exists() and done(s))]
         if missing:                                    # #495: files downloaded by hand go here, or --gguf-dir
             say(f"  The model files go in {models_dir}")
@@ -7918,10 +12147,12 @@ def main() -> int:
             if s.exists() and done(s):
                 ok(f"{s.name} already downloaded")
                 continue
-            # the original's shard 2 is the same file for all its sizes and the Coder: reuse one that is already here
+            # the original's shard 2 is the same file for all its sizes, the Coder and SC117's copies: reuse one that
+            # is already here
             other = [p for p in Path(a.models_dir).glob("*/Qwen3.8-Flash-Next-GSQ-RCO-*-00002-of-00002.gguf")
                      if done(p)]
-            if family in ("qwen", "coder") and s.name.endswith("00002-of-00002.gguf") and other and not s.exists():
+            if family in ("qwen", "coder", "sc117") and s.name.endswith("00002-of-00002.gguf") and other \
+                    and not s.exists():
                 try:
                     os.link(other[0], s)
                     mark(s)
@@ -7933,25 +12164,39 @@ def main() -> int:
     check_shards(shards)
     for s in shards:                                   # the Unsloth files: pinned sizes and SHA-256
         if s.name in fam.get("sha256", {}):
-            verify_sha256(s, *fam_pin(fam, s), own=bool(a.gguf_dir))
+            verify_sha256(s, *fam_pin(fam, s), own=own)
     ok("model files present")
     mmproj = Path(a.models_dir) / fam["mmproj"]
     if not mmproj.exists():
         mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
     if vision != "none":
-        if not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / fam["mmproj"]).exists():
-            mmproj = Path(a.gguf_dir) / fam["mmproj"]
+        pin = file_pin(fam["mmproj_hf"] + fam["mmproj"])
+        near = None if mmproj.exists() else mmproj_beside(
+            a.gguf_dir or (models_dir if own else None), fam["mmproj"], pin[0] if pin else None)
+        alt_reader = (accepted_alt_reader(alt_reader_places(a.models_dir, roots, a.gguf_dir))
+                      if near is None and not mmproj.exists() and fam["mmproj"] == MMPROJ else None)
+        if near is not None:                           # the person's own folder, or the one above it: used there
+            mmproj = near
+            if pin:
+                verify_sha256(mmproj, pin[0], pin[1], own=True)
+            ok(f"vision encoder: {mmproj}")
+        elif alt_reader is not None:                   # the person's own Unsloth F16 reader: no second download
+            mmproj = alt_reader
+            ok(f"vision encoder: {mmproj} (Unsloth's mmproj-F16.gguf, SHA-256 checked)")
         else:
-            download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
-        ok(f"vision encoder: {mmproj}")
+            if not mmproj.exists() and own and (models_dir / fam["mmproj"]).exists():
+                mmproj = models_dir / fam["mmproj"]
+            else:
+                download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
+            ok(f"vision encoder: {mmproj}")
         if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; upstream #625)
             say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
                 "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")
 
     # ---- 6. the pack and the MTP draft layer
-    step(6, "preparing the model for Strata")
+    step(6, "preparing the model for XeStrata")
     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
-    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    env = dict(os.environ, XESTRATA_GGUF_PY=str(llama / "gguf-py"))
     if model == "Q2_0" and avx512 and family == "qwen":
         # the Q2_0 experts repacked for the AVX-512 kernel (the measured speed): a one-time ~40 GB conversion
         if not (pack / "index.txt").exists() or not (pack / "experts.bin").exists():   # index.txt is written last
@@ -7962,11 +12207,24 @@ def main() -> int:
         if not (pack / "tokenizer" / "vocab.json").exists():
             run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(shards[0]),
                  "--out", str(pack)], env=env)   # writes <pack>/tokenizer/
-    elif not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
-        # every tensor as the GGUF stores it; the experts are read from the GGUF at start (seconds to build)
-        # (UD-Q4_K_XL: --compat-bf16 - its Q8_0 hyper-connection projections become BF16, the form the engine reads)
-        run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
-             *fam.get("pack_args", [])], env=env)
+    else:
+        # the files the pack was made from: another model's files under the same tag (--gguf-dir, files replaced by
+        # hand) made a pack whose dense weights were the old model's beside the new one's experts
+        src = [{"name": s.name, "size": s.stat().st_size, "mtime": int(s.stat().st_mtime)} for s in shards]
+        try:
+            made = json.loads((pack / "source.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            made = None
+        if made != src or not (pack / "native_experts.txt").exists() or \
+                not (pack / "tokenizer" / "vocab.json").exists():
+            # every tensor as the GGUF stores it; the experts are read from the GGUF at start (seconds to build)
+            # (UD-Q4_K_XL: --compat-bf16 - its Q8_0 hyper-connection projections become BF16, the form the engine reads)
+            (pack / "source.json").unlink(missing_ok=True)
+            if made is not None and made != src:       # another model's: its tokenizer too (iq_pack keeps one)
+                shutil.rmtree(pack / "tokenizer", ignore_errors=True)
+            run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
+                 *fam.get("pack_args", [])], env=env)
+            (pack / "source.json").write_text(json.dumps(src, indent=1), encoding="utf-8")
     ok(f"model prepared: {pack}")
     mtp = (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
     rt = mtp / "rt"
@@ -7991,6 +12249,34 @@ def main() -> int:
     for line in draft_vocab_note(0.0 if apu else gpu_expert_vram(gpu), draft_vocab):
         say("  " + line)
 
+    # the DFlash2 block drafter: a pinned download packed on this PC (tools/dflash2_fetch.py), fetched for auto (the
+    # default) and dflash2. With auto the engine measures the MTP, DFlash2 and no drafter at its start and keeps the
+    # fastest, releasing the others (strata/spec/draft_probe.hpp): where the MTP wins (the B70 and the RTX 4070) the
+    # engine is as it is without the pack. A failed download leaves the MTP (auto measures it against no drafter).
+    # XeStrata-890M: on an integrated AMD GPU (apu_first) the default stays the MTP with the window of 4, as the fork
+    # wrote it: DFlash2 decodes slower than the MTP on the 890M, so it is fetched only when --drafting asks for it
+    apu_draft = apu_first(gpu)
+    drafting = (getattr(a, "drafting", None) or saved_drafting(CONF / f"xestrata-{tag.lower()}.json")
+                or ("mtp" if apu_draft else "auto"))
+    df2_dir = data / "dflash2"
+    df2_pack = df2_dir / "qwen3.8-flash-next-dflash2.q4_0-selq4.pack"
+    if drafting in ("auto", "dflash2"):
+        say("  The DFlash2 drafter (a second way to guess ahead, ~0.5 GB packed) comes from")
+        say("  incoai/Qwen3.8-Flash-Next-DFlash2 (Apache-2.0); it is packed on this PC.")
+        run([sys.executable, str(ROOT / "tools" / "dflash2_fetch.py"), "fetch", "--out", str(df2_dir)],
+            env=env, check=False)
+        have_pack = df2_pack.exists() or (df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack").exists()
+        if not have_pack:   # offline or a failed check: the MTP layer continues (the install goes on)
+            warn("the DFlash2 drafter is not on this PC (the download did not complete): the MTP layer continues")
+            if drafting == "dflash2":
+                drafting = "mtp"
+    # the draft vocabulary beside the pack (when one is present). Several configs share this folder: keep a subset
+    # made by hand, and let each start put back the choice in its own config.
+    have_df2_pack = df2_pack.exists() or (df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack").exists()
+    if have_df2_pack and drafting in ("auto", "dflash2"):
+        refresh_draft_vocab(df2_dir, draft_vocab or "cjk")
+    ok(f"drafting: {drafting}")
+
     # ---- 7. the start script
     step(7, "writing the model's settings" if PACKAGED else "writing the start script")
     sys.path.insert(0, str(ROOT / "tools"))
@@ -8000,11 +12286,22 @@ def main() -> int:
         fail("the model has no per_layer_token_embd tensor (is this a Qwen3.8-Flash-Next GGUF?)")
     args = ["--pack", str(pack), "--native", str(shards[0]), "--ple-gguf", str(ple),
             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
-            "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
+            "--prefill", "auto", "--spec", "4" if apu_draft else "auto", "--spec-min-p", "0.5", "--mtp", str(rt),
             "--max-context", str(ctx)]
+    df2_use = df2_pack if df2_pack.exists() else df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack"
+    if drafting == "off":
+        args += ["--draft", "off"]
+    elif drafting == "dflash2" and df2_use.exists():
+        args += ["--draft", "dflash2", "--draft-model", str(df2_use), "--spec", "6"]   # the anchor + up to 7 drafts
+    elif drafting == "auto":
+        args += ["--draft", "auto"]
+        if df2_use.exists():   # the engine measures DFlash2 against the MTP at its start and keeps the faster
+            args += ["--draft-model", str(df2_use)]
+    elif drafting == "mtp":
+        args += ["--draft", "mtp"]
     if scaling is not None:     # the resolved configuration: the explicit flags, or yarn and the derived factor
         args += ["--rope-scaling", scaling, "--rope-scale", f"{rope_scale:g}"]
-    if ctx > 8192:
+    if ctx > 8192 or kv != "fp16":
         args += ["--kv", kv]
     if low_ram:   # the experts from the model files: the ones the GPU does not hold copied into RAM, or mapped
         args += ["--resident-experts" if resident else "--mmap-experts"]
@@ -8028,39 +12325,13 @@ def main() -> int:
             warn("the experts in RAM cannot be locked (ulimit -Hl is below their size), so the OS may swap them out, "
                  "and the GPU waits while it does: raise the memlock limit for your user (memlock in "
                  "/etc/security/limits.conf, or DefaultLimitMEMLOCK in systemd's user.conf) and log in again")
-    disk = rotational_disk(ple)                        # upstream #605
-    if disk:
-        tensor = next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)
-        size = getattr(tensor, "expected_bytes", lambda: None)()
-        table_gb = size / 1e9 if size else 28.8
-        if ram >= MODELS[model]["ram_gb"] + table_gb + 4:
-            args += ["--ple-io", "ram"]
-            ok(f"the model is on a rotational disk ({disk}): its {table_gb:.0f} GB n-gram table is kept in RAM "
-               "(--ple-io ram) - read from the disk at random, it can stall prompts for minutes")
-        else:
-            warn(f"the model is on a rotational disk ({disk}): its n-gram table is read from it at random, which can "
-                 f"stall prompts for minutes. An SSD is recommended; with ~{table_gb:.0f} GB more RAM, "
-                 "--ple-io ram in the config's args keeps the table in RAM instead")
-    elif not low_ram and ple_ram_platform_ok():
-        # upstream b25b3097: on an SSD too, a PC with RAM to spare keeps the n-gram table in RAM: a new prompt's first
-        # chunk then does not wait for its table rows (65,536 random SSD reads at 4K tokens).  Upstream's RTX PRO 5000
-        # (Linux, NVMe, fresh engine per prompt, 3 rounds, the same bits): prompt 4K 1298 -> 1059 ms (-18%), 20K 4644 ->
-        # 4223 ms (-9%), 98K 20447 -> 20027 ms (-2%), decode +0.8%.  On a card whose prompt is slow the read hides
-        # behind layer 0 and nothing changes.  It costs the table's size in RAM, so only with 16 GB to spare beyond the
-        # model's own need; a smaller PC keeps reading from the SSD as before.  (Not measured on this fork's GPUs.)
-        try:
-            tensor = next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)
-            size = getattr(tensor, "expected_bytes", lambda: None)()
-        except Exception:
-            size = None
-        table_gb = size / 1e9 if size else 28.8
-        if ram >= MODELS[model]["ram_gb"] + table_gb + 16:
-            args += ["--ple-io", "ram"]
-            ok(f"{ram:.0f} GB of RAM: the {table_gb:.0f} GB n-gram table is kept in RAM (--ple-io ram), so a new "
-               "prompt does "
-               "not wait for its rows from the SSD (a 4K prompt about 18% sooner on a fast card upstream); remove "
-               "--ple-io "
-               "ram from the config's args to read it from the SSD instead")
+    # a setup run again without --ple-io keeps the choice this model's config was given before
+    ple_io = a.ple_io or saved_ple_io(CONF / f"xestrata-{tag.lower()}.json") or "auto"
+    if ple_io != "auto":
+        set_ple_io(args, ple_io)
+        ok(f"the n-gram table: --ple-io {ple_io}, as chosen (--ple-io auto lets setup choose)")
+    elif ple_io_auto(ple, model, ram, low_ram):
+        set_ple_io(args, "ram")
     # KV streaming: from 64K up the whole KV cache lives in RAM and only the part the attention reads (32K positions
     # per layer) stays in VRAM; the VRAM it frees holds more experts (+6% at 128K, +23% at 262K with Q2_0). It
     # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 10.6 KB with K8V4, 7.5 KB with 4-bit, so
@@ -8094,9 +12365,11 @@ def main() -> int:
                    f"so setup leaves {UNSLOTH_RAM_LEFT_GB} GB of the RAM for the OS and the desktop. "
                    "--expert-cache N in the config's args sets it")
             else:
-                warn(f"this GPU shares the RAM, and the {budget:g} GiB RAM budget leaves almost none for the expert "
-                     "cache: it stays on auto, which may take the room the OS needs. A smaller "
-                     "--resident-budget-gib leaves room")
+                # upstream 1d342f083: say where the cache is sized from, not that it may take the OS's room (on a
+                # unified-memory GPU a larger --vram-reserve-mib cannot raise it)
+                carve = gpu.get("carve_gb") or 0.0
+                where = f"the {carve:.0f} GB BIOS carve-out" if carve else "the shared memory"
+                ok(f"expert cache: sized from {where}, not from the RAM (the GTT pool is the RAM)")
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
     if a.vram_reserve_mib is not None:                 # #493: VRAM left free for other programs (only when given)
@@ -8110,6 +12383,7 @@ def main() -> int:
             args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
         ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert cache takes "
            "that much less)")
+    args += ram_reserve_args(a)
     if 0 < gpu_expert_vram(gpu) < SMALL_CARD_GB and not host_cache:
         # #496, #41: on a 6 GB card the expert cache can get no room at all; the engine lowers its own reserve when
         # (not with the expert cache in host USM: there the carve-out's size is not the cache's room)
@@ -8130,34 +12404,29 @@ def main() -> int:
                  "--cvec-mode", "project", "--cvec-dir", "per-layer"]
     cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
                            "tokenizer": str(pack / "tokenizer"),
-                           "model_name": f"{fam['name']}-{model.lower()}",
+                           "model_name": served_name(family, model), "family": family,
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if host_cache:
         cfg["env"] = {"STRATA_CACHE_HOST": "1"}        # the engine's environment (serve/server.py child_env)
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
-        cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
+        cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (XESTRATA_GPU_PCI)
+    # for serve/autotune.py's choices ("parallel", "replicas", "split_serve"): the model's files and, of them, the
+    # experts the cache holds
+    cfg["model_gb"] = MODELS[model]["download_gb"]
+    cfg["experts_gb"] = MODELS[model]["arena_gb"]
     if len(sel) > 1:                                   # --gpus: the layer split's other cards (docs/MULTIGPU.md)
         cfg["gpu_pci"] = gpu["pci"]
         cfg["split_pci"] = [gpu_info(i)["pci"] for i in sel[1:]]
         if a.layer_split:
             cfg["layer_split"] = str(a.layer_split)
-    if a.replicas is not None and a.replicas >= 2:      # data-parallel replicas (serve/replicas.py, upstream 8d276c19)
-        cards = [cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])] if cfg.get("gpu_pci") else []
-        if not cards or len(cards) % a.replicas:
-            warn(f"--replicas {a.replicas}: needs the chosen GPUs ({len(cards) or 'one'}) to divide into {a.replicas} "
-                 "equal groups; not set (choose the cards with --gpus, or write the groups into the config: "
-                 '"replicas": [{"gpus": ["0000:03:00.0"]}, {"gpus": ["0000:09:00.0"]}])')
-        else:
-            cfg["replicas"] = a.replicas
-            per = len(cards) // a.replicas
-            ok(f"{a.replicas} replicas of {per} GPU(s) each: "
-               f"{' | '.join(','.join(cards[i * per:(i + 1) * per]) for i in range(a.replicas))}")
-            if per > 1 and a.layer_split not in (None, "auto"):
-                warn("--layer-split is one engine's value; with replicas every group would get it: leave it at auto")
-            warn("each replica loads its own copy of the model's experts into RAM and runs its own host threads: "
-                 "check that the RAM holds them")
+    replicas_config(a, cfg)
     if draft_vocab:
         cfg["draft_vocab"] = draft_vocab
+    cfg["drafting"] = drafting
+    if "--draft-model" in args:
+        cfg["draft_model"] = args[args.index("--draft-model") + 1]
+    if ple_io != "auto":
+        cfg["ple_io"] = ple_io
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
@@ -8176,18 +12445,18 @@ def main() -> int:
         else:
             cfg["parallel"] = 1
             ok("parallel requests: one at a time (--parallel 1)")
-    else:                                              # the opt-in, said once (nothing changes)
+    else:                                              # "auto": the server chooses; setup says what that is here
         for line in parallel_note(None, gpu_expert_vram(gpu), MODELS[model]["arena_gb"], ctx, kv, streaming):
             say("  " + line)
     if vision != "none":
         vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
-        cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
+        cpu_enc = {"exe": str(eng / VISION_EXE), "gpu": False,
                    "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"],
                    "threads": vision_threads()}
         cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), **cpu_enc}
         if vision == "gpu":
-            # the GPU encoder takes the card by PCI address: with Vulkan the first GPU can be another card
-            cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), "exe": str(eng / VEXE[enc]),
+            # the GPU reader takes the card by PCI address: the first GPU the runtime lists can be another card
+            cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), "exe": str(eng / VISION_EXE),
                              "gpu": True, "gpu_pci": gpu["pci"], "max_tokens": vt,
                              "fallback": cpu_enc}   # the server starts it when the GPU encoder does not start
     elif a.vision_tokens is not None:
@@ -8195,8 +12464,10 @@ def main() -> int:
     if a.images:                                       # only when given: else an earlier "images" is carried over
         got = setup_images(a, gpu, Path(a.models_dir), Path(cfg["exe"]).parent, text_ram_gb(cfg["args"], ram, model))
         cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
+        place_images(a, cfg)
         if not cfg["image_models"]:
             cfg["image_models"] = None
+    setup_translate(a, cfg, CONF / f"xestrata-{tag.lower()}.json", text_ram_gb(cfg["args"], ram, model))
     return finish_setup(a, cfg, tag, port, adopted, vision != "none")
 
 

@@ -6,8 +6,10 @@
 #include "strata/core/device.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -17,6 +19,7 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <utility>
 #include <cstring>
 #if !defined(_WIN32)
@@ -171,9 +174,9 @@ ExpertCache::~ExpertCache() { close(); }
 // ---- #533: the segmented arena (--vram-elastic): one address range for the whole arena, backed by physical
 // segments, the tail's segments unmapped and mapped again later.  Nothing here runs unless a segment size was set.
 bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
-    if (!strata::gpu::vmem_supported()) {
+    if (!strata::gpu::vmem_usable()) {
         err = "ExpertCache: --vram-elastic needs virtual memory (sycl_ext_oneapi_virtual_mem), which this GPU's "
-              "runtime does not offer";
+              "runtime does not offer or does not map again right";
         return false;
     }
     const uint64_t gran = (uint64_t) strata::gpu::vmem_granularity();
@@ -184,8 +187,13 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
     // a whole number of 2 MiB pages as well: Level Zero reports 64 KiB but refused a 0.49 GiB segment of 64 KiB
     // pages (UR_RESULT_ERROR_INVALID_VALUE, the B70), and CUDA's granularity is 2 MiB
     const uint64_t g = std::lcm(gran, (uint64_t) 2 << 20);
-    const uint64_t total = (want + g - 1) / g * g;
-    seg_ = (int64_t) (((uint64_t) seg_req_ + g - 1) / g * g);
+    // the segments all of one size, as many as the size asked for gives: HIP refused access to a segment shorter than
+    // the ones mapped before it (hipMemSetAccess: invalid argument, the RX 9060 XT on ROCm 7.1, 2026-11-02; segments
+    // of one size, from 2 MiB to 1 GiB, were taken).  What it adds to the arena is under a granule a segment.
+    const uint64_t asked = std::max<uint64_t>(((uint64_t) seg_req_ + g - 1) / g * g, g);
+    const uint64_t n_seg = std::max<uint64_t>((want + asked - 1) / asked, 1);
+    seg_ = (int64_t) (((want + n_seg - 1) / n_seg + g - 1) / g * g);
+    const uint64_t total = n_seg * (uint64_t) seg_;
     void* va = strata::gpu::vmem_reserve((size_t) total);
     if (va == nullptr) {
         err = std::string("ExpertCache: cannot reserve the segmented cache's address range: ") + strata::gpu::last_error();
@@ -209,6 +217,30 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
             return false;
         }
         mapped_segs_ = (int64_t) i + 1;
+    }
+    // whether the runtime gives an unmapped segment's VRAM back, not only keeps it for this process (ROCm 7.1 and
+    // 7.2's HIP kept it until the whole range was freed, 2026-11-02): the last segment unmapped, with the device's
+    // free memory read before and after (gpu::vmem_unmap_returns), and mapped again.
+    returns_vram_ = true;
+    size_t free_b = 0, total_b = 0;
+    if (segs_.size() >= 2 && strata::gpu::device_sync() && strata::gpu::mem_info(&free_b, &total_b)) {
+        const size_t last = segs_.size() - 1;
+        bool back = false;
+        strata::gpu::vmem_unmap_returns(base_ + last * (size_t) seg_, (size_t) seg_size_[last], segs_[last], &back);
+        segs_[last] = nullptr;
+        mapped_segs_ = (int64_t) last;
+        returns_vram_ = back;
+        for (int tries = 0; tries < 50 && segs_[last] == nullptr; ++tries) {
+            segs_[last] = strata::gpu::vmem_map(base_ + last * (size_t) seg_, (size_t) seg_size_[last]);
+            if (segs_[last] == nullptr) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (segs_[last] == nullptr) {
+            err = std::string("ExpertCache: the segmented cache's last segment could not be mapped again: ") +
+                  strata::gpu::last_error();
+            release_segmented();
+            return false;
+        }
+        mapped_segs_ = (int64_t) segs_.size();
     }
     return true;
 }
@@ -243,6 +275,11 @@ int64_t ExpertCache::slots_within(int64_t bytes) const {
 bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     if (segs_.empty()) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
+        return false;
+    }
+    if (!returns_vram_) {
+        err = "this GPU's runtime keeps the VRAM of an unmapped segment in the process (it does not reach another "
+              "program): the expert cache cannot give VRAM back";
         return false;
     }
     int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
@@ -287,21 +324,30 @@ namespace {
 bool g_cache_vmm = false;   // set_vmm
 bool g_cache_host = false;  // set_host_usm
 
+// upstream e008709d (#5708): a failed free-memory query is not a full card.  The size checks below go on without the
+// figure, so say once why (a "0 MiB free" would read as a measurement).
+void note_free_query_error(const char* where) {
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+        std::fprintf(stderr, "xestrata: the GPU's free memory could not be read (%s); the expert cache is sized at %s without that check\n",
+                     strata::gpu::last_error(), where);
+}
+
 // STRATA_TEST_ALLOC_FAIL=N: the first N single allocations of the cache fail as a refused allocation does, so the
 // piece fallback and its give-up can be tested without a driver in that state (the B70's xe, 2026-10-22: 25.5 GiB
 // refused with 26.4 GiB reported free, every retry after it refused).
 bool fake_alloc_fail() {
-    static const char* const kEnv = "STRATA_TEST_ALLOC_FAIL";
-    const char* v = std::getenv(kEnv);
+    static const char* const kEnv = "TEST_ALLOC_FAIL", *const kSet = "XESTRATA_TEST_ALLOC_FAIL";
+    const char* v = strata::env_get(kEnv);
     char* end = nullptr;
     const long n = v != nullptr ? std::strtol(v, &end, 10) : 0;
     if (n <= 0 || end == v) return false;
     char one[8] = "1";
     std::snprintf(one, sizeof one, "%ld", n - 1);   // counts down, so a test can stage several cases
 #if defined(_WIN32)
-    _putenv_s(kEnv, one);
+    _putenv_s(kSet, one);
 #else
-    ::setenv(kEnv, one, 1);
+    ::setenv(kSet, one, 1);
 #endif
     return true;
 }
@@ -310,17 +356,17 @@ bool fake_alloc_fail() {
 // of it leaves no prefix to keep, the same give-up as no piece at all).
 bool fake_piece_fail(bool first) {
     if (first) return false;
-    static const char* const kEnv = "STRATA_TEST_PIECE_FAIL";
-    const char* v = std::getenv(kEnv);
+    static const char* const kEnv = "TEST_PIECE_FAIL", *const kSet = "XESTRATA_TEST_PIECE_FAIL";
+    const char* v = strata::env_get(kEnv);
     char* end = nullptr;
     const long n = v != nullptr ? std::strtol(v, &end, 10) : 0;
     if (n <= 0 || end == v) return false;
     char one[8];
     std::snprintf(one, sizeof one, "%ld", n - 1);
 #if defined(_WIN32)
-    _putenv_s(kEnv, one);
+    _putenv_s(kSet, one);
 #else
-    ::setenv(kEnv, one, 1);
+    ::setenv(kSet, one, 1);
 #endif
     return true;
 }
@@ -340,7 +386,7 @@ void lock_host_slots(void* p, uint64_t bytes) {
     const double gib = (double) bytes / 1073741824.0;
     strata::core::detail::HostMemory hm;
     if (strata::core::detail::host_available_memory(hm) && hm.cgroup_limit != ~uint64_t{0}) {
-        std::fprintf(stderr, "strata: the host expert cache (%.2f GiB) stays pageable: this cgroup has a memory limit "
+        std::fprintf(stderr, "xestrata: the host expert cache (%.2f GiB) stays pageable: this cgroup has a memory limit "
                              "(%.2f GiB)\n", gib, (double) hm.cgroup_limit / 1073741824.0);
         return;
     }
@@ -362,13 +408,13 @@ void lock_host_slots(void* p, uint64_t bytes) {
         struct rlimit up = rl;
         up.rlim_cur = rl.rlim_max == RLIM_INFINITY ? room : std::min<rlim_t>(rl.rlim_max, room);
         if (setrlimit(RLIMIT_MEMLOCK, &up) == 0)
-            std::fprintf(stderr, "strata: the memory this program may lock was %llu MiB; raised to %llu MiB for the "
+            std::fprintf(stderr, "xestrata: the memory this program may lock was %llu MiB; raised to %llu MiB for the "
                                  "host expert cache\n", (unsigned long long) (rl.rlim_cur / 1048576),
                          (unsigned long long) (up.rlim_cur / 1048576));
     }
     const auto t0 = std::chrono::steady_clock::now();
     if (mlock(p, bytes) == 0) {
-        std::fprintf(stderr, "strata: the host expert cache is locked in RAM (%.2f GiB, %.1f s; STRATA_CACHE_MLOCK=0 "
+        std::fprintf(stderr, "xestrata: the host expert cache is locked in RAM (%.2f GiB, %.1f s; STRATA_CACHE_MLOCK=0 "
                              "leaves it pageable)\n", gib,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         return;
@@ -377,12 +423,12 @@ void lock_host_slots(void* p, uint64_t bytes) {
     munlock(p, bytes);   // a lock that failed while it faulted pages in leaves the range marked
     struct rlimit now {};
     if (getrlimit(RLIMIT_MEMLOCK, &now) == 0 && now.rlim_cur != RLIM_INFINITY && now.rlim_cur < room)
-        std::fprintf(stderr, "strata: the host expert cache (%.2f GiB) was not locked in RAM: this program may lock "
+        std::fprintf(stderr, "xestrata: the host expert cache (%.2f GiB) was not locked in RAM: this program may lock "
                              "only %.2f GiB (RLIMIT_MEMLOCK).  It still works; when the kernel swaps the cache out, "
                              "the GPU waits for the pages.  In a systemd service set LimitMEMLOCK=infinity, elsewhere "
                              "run `ulimit -l unlimited`\n", gib, (double) now.rlim_cur / 1073741824.0);
     else
-        std::fprintf(stderr, "strata: the host expert cache (%.2f GiB) was not locked in RAM (mlock: %s): when the "
+        std::fprintf(stderr, "xestrata: the host expert cache (%.2f GiB) was not locked in RAM (mlock: %s): when the "
                              "kernel swaps it out, the GPU waits for the pages\n", gib, std::strerror(why));
 }
 #endif
@@ -434,7 +480,8 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // `device_slot()` walks off the end. So the free-VRAM figure is read and compared BEFORE the allocation,
     // and the two numbers are named in the refusal.
     size_t free_b = 0, total_b = 0;
-    if (!host_usm_ && strata::gpu::mem_info(&free_b, &total_b)) {
+    if (!host_usm_ && !strata::gpu::mem_info(&free_b, &total_b)) note_free_query_error("open");
+    else if (!host_usm_) {
         if ((uint64_t) free_b < want) {
             err = "ExpertCache: " + std::to_string(n_slots) + " slots of " +
                   std::to_string((long long) (blob_bytes >> 20)) + " MiB = " +
@@ -490,7 +537,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
                 std::vector<uint64_t> off((size_t) n_slots + 1, 0);
                 for (size_t i = 0; i < (size_t) n_slots; ++i) off[i + 1] = off[i] + (uint64_t) blob_bytes;
                 if (alloc_pieces(off, piece, true, &fitted, err)) {
-                    std::fprintf(stderr, "strata: expert cache: the one allocation of %lld MiB was refused; %lld slots "
+                    std::fprintf(stderr, "xestrata: expert cache: the one allocation of %lld MiB was refused; %lld slots "
                                          "(%lld MiB) taken in pieces instead\n",
                                  (long long) (want >> 20), (long long) fitted,
                                  (long long) (slot_end(fitted) >> 20));
@@ -546,7 +593,8 @@ bool ExpertCache::alloc_pieces(const std::vector<uint64_t>& size_off, uint64_t p
     const uint64_t want = size_off.back();
     if (!best_effort) {
         size_t free_b = 0, total_b = 0;
-        if (strata::gpu::mem_info(&free_b, &total_b) && (uint64_t) free_b < want) {
+        if (!strata::gpu::mem_info(&free_b, &total_b)) note_free_query_error("alloc_pieces");
+        else if ((uint64_t) free_b < want) {
             err = "ExpertCache: " + std::to_string((long long) (want >> 20)) + " MiB of slots, but only " +
                   std::to_string((long long) (free_b >> 20)) + " MiB of VRAM is free";
             return false;
@@ -642,7 +690,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         const uint64_t piece = std::min(std::max<uint64_t>(want / 8, 256u << 20), max_alloc_bytes());
         int64_t fitted = 0;
         if (alloc_refused_ && want > piece && alloc_pieces(off, piece, true, &fitted, err)) {
-            std::fprintf(stderr, "strata: expert cache: the one allocation of %lld MiB was refused; %lld slots "
+            std::fprintf(stderr, "xestrata: expert cache: the one allocation of %lld MiB was refused; %lld slots "
                                  "(%lld MiB) taken in pieces instead\n",
                          (long long) (want >> 20), (long long) fitted, (long long) (slot_end(fitted) >> 20));
             start_tables(fitted, n_layers, n_expert, mx);   // seeds the layers' cursors on these slots (#369)
@@ -741,8 +789,23 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
+bool ExpertCache::slot_copy_size(int32_t slot, int64_t bytes, size_t& n, std::string& err) const {
+    if (slot < 0 || slot >= slots_) {
+        err = "ExpertCache: slot outside the arena";
+        return false;
+    }
+    const int64_t capacity = slot_end((int64_t) slot + 1) - slot_end(slot);
+    if (bytes < 0 || bytes > capacity) {
+        err = "ExpertCache: requested bytes exceed the selected slot";
+        return false;
+    }
+    n = (size_t) (bytes > 0 ? bytes : capacity);
+    return true;
+}
+
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    size_t n = 0;
+    if (!slot_copy_size(slot, bytes, n, err)) return false;
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot: slot " + std::to_string(slot) + " is outside 0.." +
@@ -783,7 +846,8 @@ bool ExpertCache::fill_slot_host(int32_t slot, const uint8_t* host_blob, std::st
 }
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    size_t n = 0;
+    if (!slot_copy_size(slot, bytes, n, err)) return false;
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
         err = "ExpertCache::fill_slot_blocking: slot outside the arena";
@@ -803,7 +867,8 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 }
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    size_t n = 0;
+    if (!slot_copy_size(slot, bytes, n, err)) return false;
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {
         err = dst == nullptr ? "ExpertCache::fill_slot_queued: slot outside the arena"
@@ -829,7 +894,11 @@ bool ExpertCache::sync_queued(std::string& err) {
 }
 
 bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    const int64_t nb = bytes > 0 && bytes <= blob_ ? bytes : blob_;
+    size_t nb = 0;
+    if (!slot_copy_size(slot, bytes, nb, err) || host_blob == nullptr) {
+        if (host_blob == nullptr) err = "ExpertCache::verify_slot: the host blob is null";
+        return false;
+    }
     const uint8_t* src = device_slot(slot);
     if (src == nullptr) {
         err = "ExpertCache::verify_slot: slot outside the arena";
@@ -850,7 +919,7 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
         char buf[256];
         std::snprintf(buf, sizeof buf,
                       "ExpertCache::verify_slot: slot %d differs from the arena at byte %llu (of %lld)",
-                      (int) slot, (unsigned long long) first, (long long) blob_);
+                      (int) slot, (unsigned long long) first, (long long) nb);
         err = buf;
         return false;
     }

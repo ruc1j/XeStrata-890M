@@ -3,12 +3,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #pragma once
 
-namespace strata::kernels {
+#include <cstdint>
 
-// Set before session construction/capture; existing CUDA graphs retain their
-// selected kernels. Disabled by default. Integration chooses the call sites.
-void native_qsa_set_enabled(bool enabled);
-bool native_qsa_enabled();
+namespace strata::kernels {
 
 // Pinned single-token CUDA F32 arithmetic from llama.cpp
 // 3cf03257f219afbe7334045ff7c6a06ac68c627d. No allocation or synchronization;
@@ -23,6 +20,14 @@ bool native_qsa_enabled();
 // Pinned 256-thread (width<1024) or 1024-thread XOR reduction, (scale*x)*gamma.
 void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float* output,
                                   int n_cols, int n_rows, float epsilon, void* stream);
+
+// The engines' one RMSNorm (the image engine's, the plain models' and Qwen3.8-Flash-Next's, prompt and decode): rows of
+// n_cols, row r scaled by gamma's row r % groups (gamma null: by 1), into `output` (FP32; it may be `input`) or `out16`
+// (FP16), one of them.  `pinned`: native_qsa_rms_norm_weighted's arithmetic to the bit; else the form the device runs
+// fastest (its own work-group reduction where it has 16-wide sub-groups), the same for any number of rows.  A null
+// stream waits.
+void rms_norm_rows(const float* input, const float* gamma, int groups, float* output, uint16_t* out16, int n_cols,
+                   int n_rows, float epsilon, void* stream, bool pinned = false);
 
 // The same, writing the output also as q8_1 blocks (n_cols a multiple of 32) into x_q8_1, bit for bit
 // native_quantize_q8_1 of the output: one launch for the norm and the quantization of the next products.
@@ -41,8 +46,9 @@ void native_qsa_rms_norm_grouped_q8_1(const float* input, const float* gamma, fl
 
 // attn/output [head_dim,n_head]; q_full [2*head_dim,n_head], each row is
 // [query channels, gate channels]. Output is attn*sigmoid(second-half gate).
-// Exact output==attn is supported; all other spans must be disjoint.
+// Exact output==attn is supported; all other spans must be disjoint.  out16: the output as FP16 there instead
+// (output unused; Qwen3.8-Flash-Next's prompt, whose o-projection reads FP16).
 void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,
-                           int n_head, int head_dim, void* stream);
+                           int n_head, int head_dim, void* stream, uint16_t* out16 = nullptr);
 
 } // namespace strata::kernels

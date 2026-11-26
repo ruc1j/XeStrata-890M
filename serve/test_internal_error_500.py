@@ -7,6 +7,7 @@ left (ConnectionError) is still re-raised, and an answer already begun is not re
 
     python -m serve.test_internal_error_500
 """
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -15,11 +16,14 @@ import serve.server as server
 
 def handler(raise_this, answer_started=False):
     svc = SimpleNamespace(begin_request=lambda path, req: None, drop_embeddings=lambda: None,
-                          reserve_inference=lambda: True, release_inference=lambda: None)
+                          reserve_inference=lambda: True, release_inference=lambda: None,
+                          request_trace=threading.local(), debug_begin=lambda path, req: None,
+                          debug_end=lambda rec: None, translation=None)
     H = server.make_handler(svc)
     h = H.__new__(H)
     h.path = "/v1/chat/completions"
     h.record, h.watch_done, h.answer_started = None, None, answer_started
+    h.headers = {}
     h._authorized = lambda: True
     h._foreign_page = lambda: False
     h._body = lambda: b'{"messages": []}'

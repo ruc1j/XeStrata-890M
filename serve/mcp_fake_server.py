@@ -63,7 +63,7 @@ def handle(msg: dict):
             "serverInfo": {"name": "fake", "version": "0.1"}}}
     if method == "tools/list":
         start = int(params.get("cursor") or 0)
-        page = {"tools": TOOLS[start:start + PAGE]}
+        page: dict = {"tools": TOOLS[start:start + PAGE]}
         if start + PAGE < len(TOOLS):
             page["nextCursor"] = str(start + PAGE)
         return {"jsonrpc": "2.0", "id": rid, "result": page}

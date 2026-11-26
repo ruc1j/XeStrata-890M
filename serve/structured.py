@@ -93,7 +93,7 @@ def jsonschema_modules():
                 from jsonschema.exceptions import SchemaError
             except ImportError:
                 _jsonschema = False
-                print("[strata] json_schema and strict tools: the Python package jsonschema is not installed, so "
+                print("[xestrata] json_schema and strict tools: the Python package jsonschema is not installed, so "
                       "strict requests are refused and other json_schema answers are only checked to be one JSON "
                       "object (the distribution's python3-jsonschema, or ./setup.sh again)", flush=True)
             else:
@@ -293,7 +293,7 @@ def validated_json(text, validator, finish):
                 value = json.loads(repair_latex_escapes(extract_json(text)), object_pairs_hook=pairs,
                                    parse_constant=constant)
                 canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-                print("[strata] structured output: repaired backslashes that were not valid JSON escapes", flush=True)
+                print("[xestrata] structured output: repaired backslashes that were not valid JSON escapes", flush=True)
             except (ValueError, TypeError):
                 value = None
         if value is None:
@@ -354,6 +354,20 @@ def tool_grammar(tools, strict: set, patterns: dict, thinking: bool, form: str):
             content = {"type": "any_text"}
         tags.append({"type": "tag", "begin": f"<tool_call>\n<function={name}>\n", "content": content,
                      "end": "\n</function>\n</tool_call>"})
+    calls = {"type": "triggered_tags", "triggers": ["<tool_call>\n<function="], "tags": tags, "excludes": [],
+             "at_least_one": False, "stop_after_first": False}
+    return _structural({"type": "sequence", "elements": [_THINKING, calls]} if thinking else calls)
+
+
+def call_names_grammar(names, thinking: bool, form: str):
+    """A forced call among several tools (the web page's image button, xestrata_images.force): the server writes the
+    call's opening, and this keeps its name to one of `names` - else the model chose one of its own after
+    "<function=" (a memory tool it knew), which is no declared tool and went back as text, and no image was made.
+    In Qwen's call form; None in another (GLM's, Harmony's) or without names."""
+    if form != "qwen" or not names:
+        return None
+    tags = [{"type": "tag", "begin": f"<tool_call>\n<function={name}>\n", "content": {"type": "any_text"},
+             "end": "\n</function>\n</tool_call>"} for name in names]
     calls = {"type": "triggered_tags", "triggers": ["<tool_call>\n<function="], "tags": tags, "excludes": [],
              "at_least_one": False, "stop_after_first": False}
     return _structural({"type": "sequence", "elements": [_THINKING, calls]} if thinking else calls)

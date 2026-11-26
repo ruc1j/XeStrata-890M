@@ -169,15 +169,19 @@ class Calibrate(unittest.TestCase):
         self.assertEqual(b.count("--spec-min-p"), 1)
 
     def test_engine_args_are_the_servers(self):
-        # #447: a "gpu" list is a layer split only with two or more cards; "0,2" is one too; split_skip_if_fits counts
-        helper = {"args": BASE + ["--expert-cache-device1", "1800"], "gpu": [0], "env": {"CUDA_VISIBLE_DEVICES": "0,1"}}
+        # #447: a "gpu" list is a layer split only with two or more cards; "0,2" is one too; split_skip_if_fits counts.
+        # (the server's defaults that do not depend on "gpu", --session-save-reclaim among them, are off: those are
+        # serve/test_server.py's)
+        off = {"session_save_reclaim": False}
+        helper = {"args": BASE + ["--expert-cache-device1", "1800"], "gpu": [0], "env": {"CUDA_VISIBLE_DEVICES": "0,1"},
+                  **off}
         self.assertEqual(CAL.engine_args(helper), helper["args"])                 # one stage + a helper card: no split
-        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": 1}), BASE)
-        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": [0, 2]}), BASE + ["--layer-split", "auto"])
-        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": "0,2", "layer_split": "18"}),
+        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": 1, **off}), BASE)
+        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": [0, 2], **off}), BASE + ["--layer-split", "auto"])
+        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": "0,2", "layer_split": "18", **off}),
                          BASE + ["--layer-split", "18"])
         own = BASE + ["--layer-split", ""]                                       # the config's own value wins
-        self.assertEqual(CAL.engine_args({"args": own, "gpu": [0, 1]}), own)
+        self.assertEqual(CAL.engine_args({"args": own, "gpu": [0, 1], **off}), own)
 
     def test_run_measures_with_the_servers_args(self):
         with tempfile.TemporaryDirectory() as d:
@@ -191,18 +195,19 @@ class Calibrate(unittest.TestCase):
             fake = type("ST", (), {"Tokenizer": lambda *a: type("T", (), {"encode": lambda s, t, **k: [0]})()})
             try:
                 with mock.patch.dict(sys.modules, {"strata_tokenizer": fake}):
-                    CAL.run({"tokenizer": d, "args": list(BASE), "gpu": [0]}, start_engine=lambda a: None)
+                    CAL.run({"tokenizer": d, "args": list(BASE), "gpu": [0], "session_save_reclaim": False},
+                            start_engine=lambda a: None)
             finally:
                 CAL.measure = saved
     def test_engine_error(self):
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "strata-x.log"
-            log.write_text("strata generate: an old error\n", encoding="utf-8")
+            log.write_text("xestrata generate: an old error\n", encoding="utf-8")
             since = log.stat().st_size
             with open(log, "a", encoding="utf-8") as f:
-                f.write("loading ...\nstrata generate: --expert-cache-remote with a layer split needs a GPU that runs "
-                        "no stage (2 visible, 2 used by the split)\n\n")
-            self.assertEqual(CAL.engine_error(str(log), since), "strata generate: --expert-cache-remote with a layer "
+                f.write("loading ...\nxestrata generate: --expert-cache-remote with a layer split needs a GPU that "
+                        "runs no stage (2 visible, 2 used by the split)\n\n")
+            self.assertEqual(CAL.engine_error(str(log), since), "xestrata generate: --expert-cache-remote with a layer "
                              "split needs a GPU that runs no stage (2 visible, 2 used by the split)")
             with open(log, "a", encoding="utf-8") as f:
                 f.write("Segmentation fault\n")
@@ -251,7 +256,8 @@ class SetupIntegration(unittest.TestCase):
         cfg_path = Path(self.tmp.name) / "xestrata-q2_0.json"
         cfg = {"exe": "x", "args": list(BASE), "model_name": "qwen3.8-flash-next-q2_0"}
         cfg_path.write_text(json.dumps(cfg))
-        CAL.run = lambda c, say=print, start_engine=None: {"settings": {"--pcie-frac": "0.20"}, "report": {"tok_s": 61.2}}
+        CAL.run = lambda c, say=print, start_engine=None: {"settings": {"--pcie-frac": "0.20"},
+                                                           "report": {"tok_s": 61.2}}
         self.assertTrue(self.S.calibrate_config(cfg_path))
         written = json.loads(cfg_path.read_text())
         self.assertEqual(CAL.arg_value(written["args"], "--pcie-frac"), "0.20")

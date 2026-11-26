@@ -13,9 +13,11 @@
 //   2. `ssm_a` IS NEGATIVE.  `gate = softplus(...) * ssm_a`, so `exp(gate) < 1` and the state DECAYS.  A
 //      fixture with a positive `ssm_a` would still produce finite output and the recurrence would blow up
 //      instead of decaying, so the sign is checked as a property and not assumed.
-//   3. The SiLU oracle computes in double, then casts. The GPU must meet its existing error bound.
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_gdn_preprocess.hpp"
+#include "strata/kernels/native_qsa.hpp"
 
 #include "strata/core/runtime.hpp"
 #include "strata/core/pinned.hpp"
@@ -88,10 +90,10 @@ int run(int argc, char** argv) {
     int bad = 0;
     const int64_t H_V = 48;
 
-    // ---- 1. gdn_gate, with the reference's own softplus
+    // ---- 1. the GDN gate (native_gdn_gate), with the reference's own softplus
     {
         const int n = (int) H_V;
-        std::mt19937 rng(11);
+        std::mt19937 rng(11);  // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the parity inputs reproducible
         std::normal_distribution<float> g(0.0f, 1.0f);
         std::vector<float> alpha(n), dt(n), a(n), want(n);
         for (int i = 0; i < n; ++i) {
@@ -132,19 +134,21 @@ int run(int argc, char** argv) {
         if (positive) ++bad;
 
         float *d_a = nullptr, *d_dt = nullptr, *d_sa = nullptr, *d_g = nullptr;
-        buffers.allocate(&d_a, n * 4);
-        buffers.allocate(&d_dt, n * 4);
-        buffers.allocate(&d_sa, n * 4);
-        buffers.allocate(&d_g, n * 4);
-        transfers.upload(d_a, alpha.data(), n * 4);
-        transfers.upload(d_dt, dt.data(), n * 4);
-        transfers.upload(d_sa, a.data(), n * 4);
-        strata::kernels::gdn_gate(d_a, d_dt, d_sa, d_g, 1, H_V, nullptr);
+        buffers.allocate(&d_a, (size_t) n * 4);
+        buffers.allocate(&d_dt, (size_t) n * 4);
+        buffers.allocate(&d_sa, (size_t) n * 4);
+        buffers.allocate(&d_g, (size_t) n * 4);
+        transfers.upload(d_a, alpha.data(), (size_t) n * 4);
+        transfers.upload(d_dt, dt.data(), (size_t) n * 4);
+        transfers.upload(d_sa, a.data(), (size_t) n * 4);
+        auto& cq = strata::core::Runtime::get().compute();   // the kernel takes an explicit stream
+        strata::kernels::native_gdn_gate(d_a, d_dt, d_sa, d_g, H_V, &cq);
+        cq.wait();
         std::vector<float> got((size_t) n);
-        transfers.download(got.data(), d_g, n * 4);
+        transfers.download(got.data(), d_g, (size_t) n * 4);
 
         const double rel = rel_l1(want, got);
-        std::printf("  %-44s rel %.3e\n", "gdn_gate vs the reference", rel);
+        std::printf("  %-44s rel %.3e\n", "native_gdn_gate vs the reference", rel);
         // The CPU reference uses double; the GPU must meet the same error bound.
         if (!(rel <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++bad; }
 
@@ -187,44 +191,22 @@ int run(int argc, char** argv) {
         }
     }
 
-    // ---- 2. silu, in double then cast
-    {
-        const int n = 4096;
-        std::mt19937 rng(22);
-        std::normal_distribution<float> g(0.0f, 3.0f);
-        std::vector<float> x((size_t) n), want((size_t) n);
-        for (int i = 0; i < n; ++i) {
-            x[(size_t) i] = g(rng);
-            const double v = (double) x[(size_t) i];
-            want[(size_t) i] = (float) (v / (1.0 + std::exp(-v)));
-        }
-        float* d_x = nullptr;
-        buffers.allocate(&d_x, n * 4);
-        transfers.upload(d_x, x.data(), n * 4);
-        strata::kernels::silu_inplace(d_x, n, nullptr);
-        std::vector<float> got((size_t) n);
-        transfers.download(got.data(), d_x, n * 4);
-        const double rel = rel_l1(want, got);
-        std::printf("\n  %-44s rel %.3e\n", "silu vs the double reference", rel);
-        if (!(rel <= 1e-7)) { std::printf("    *** over 1e-7 ***\n"); ++bad; }
-    }
-
     // ---- 3. scale and the f32->f16 bridge
     {
         const int n = 1024;
         std::vector<float> x((size_t) n), want((size_t) n);
-        for (int i = 0; i < n; ++i) x[(size_t) i] = (float) (i - n / 2) * 0.013f;
+        for (int i = 0; i < n; ++i) x[(size_t) i] = (float) (i - n / 2) * 0.013f;  // NOLINT(bugprone-integer-division): n / 2 rounds down on purpose
         const float s = 1.0f / std::sqrt(128.0f);
         for (int i = 0; i < n; ++i) want[(size_t) i] = x[(size_t) i] * s;
 
         float* d_x = nullptr;
         uint16_t* d_h = nullptr;
-        buffers.allocate(&d_x, n * 4);
-        buffers.allocate(&d_h, n * 2);
-        transfers.upload(d_x, x.data(), n * 4);
+        buffers.allocate(&d_x, (size_t) n * 4);
+        buffers.allocate(&d_h, (size_t) n * 2);
+        transfers.upload(d_x, x.data(), (size_t) n * 4);
         strata::kernels::scale_inplace(d_x, n, s, nullptr);
         std::vector<float> got((size_t) n);
-        transfers.download(got.data(), d_x, n * 4);
+        transfers.download(got.data(), d_x, (size_t) n * 4);
         int diff = 0;
         for (int i = 0; i < n; ++i) if (got[(size_t) i] != want[(size_t) i]) ++diff;
         std::printf("  %-44s %d of %d differ\n", "scale_inplace is exact", diff, n);
@@ -232,7 +214,7 @@ int run(int argc, char** argv) {
 
         strata::kernels::f32_to_f16_bulk(d_x, d_h, n, nullptr);
         std::vector<uint16_t> h((size_t) n);
-        transfers.download(h.data(), d_h, n * 2);
+        transfers.download(h.data(), d_h, (size_t) n * 2);
         int hbad = 0;
         for (int i = 0; i < n; ++i)
             if (h[(size_t) i] != strata::kernels::f16_from_f32(got[(size_t) i])) ++hbad;
@@ -240,9 +222,10 @@ int run(int argc, char** argv) {
         if (hbad) ++bad;
     }
 
-    // ---- 4. rms_norm_weighted, and the TWO RIVAL READINGS it exists to be told apart from.
+    // ---- 4. the RMSNorm (rms_norm_rows, in the decode's pinned arithmetic), and the TWO RIVAL READINGS it
+    // exists to be told apart from.
     //
-    // This kernel's whole reason for being a separate entry point from `gdn_l2_norm` is that the two differ by
+    // This kernel's whole reason for being a separate entry point from the L2 norm is that the two differ by
     // one `/ cols`, and that a swap produces a well-scaled, plausible tensor.  So the test computes BOTH wrong
     // readings and requires each to differ from the right one by more than the tolerance before it judges the
     // kernel - the same discipline the shared-expert test uses for silu-on-gate.
@@ -274,7 +257,7 @@ int run(int argc, char** argv) {
             return out;
         };
         const std::vector<float> want = ref(false, true);
-        const std::vector<float> rival_sum = ref(true, false);    // what gdn_l2_norm computes
+        const std::vector<float> rival_sum = ref(true, false);    // what the GDN L2 norm computes
         const std::vector<float> rival_now = ref(false, false);   // the (1+w)-vs-w / no-weight confusion
 
         auto rel = [&](const std::vector<float>& a, const std::vector<float>& b) {
@@ -299,7 +282,7 @@ int run(int argc, char** argv) {
         buffers.allocate(&d_w, w.size() * 4);
         transfers.upload(d_x, x.data(), x.size() * 4);
         transfers.upload(d_w, w.data(), w.size() * 4);
-        strata::kernels::rms_norm_weighted(d_x, d_w, rows, cols, eps, nullptr);
+        strata::kernels::rms_norm_rows(d_x, d_w, 1, d_x, nullptr, (int) cols, (int) rows, eps, nullptr, /*pinned=*/true);
         std::vector<float> got((size_t) (rows * cols));
         transfers.download(got.data(), d_x, got.size() * 4);
 
@@ -312,12 +295,12 @@ int run(int argc, char** argv) {
         }
         int nonfinite = 0;
         for (float v : got) if (!std::isfinite(v)) ++nonfinite;
-        std::printf("  %-44s rel %.3e  worst %.3e  nonfinite %d\n", "rms_norm_weighted vs f64 oracle", r_got,
+        std::printf("  %-44s rel %.3e  worst %.3e  nonfinite %d\n", "rms_norm_rows (pinned) vs f64 oracle", r_got,
                     worst, nonfinite);
         if (nonfinite) ++bad;
         // The kernel accumulates in f32 over 256 terms; 1e-6 is loose enough for that and far tighter than the
         // 16x the rival readings are off by.
-        if (!(r_got < 1e-6)) { std::printf("  *** rms_norm_weighted is WRONG ***\n"); ++bad; }
+        if (!(r_got < 1e-6)) { std::printf("  *** rms_norm_rows is WRONG ***\n"); ++bad; }
         // and a null `w` must be legal, because `ref/qsa.py` allows it.
         //
         // THE INPUT HAS TO BE RE-UPLOADED FIRST.  The kernel is IN PLACE, so `d_x` currently holds the
@@ -327,7 +310,7 @@ int run(int argc, char** argv) {
         // sides were never looking at the same input.
         const std::vector<float> want_null = ref(false, false);
         transfers.upload(d_x, x.data(), x.size() * 4);
-        strata::kernels::rms_norm_weighted(d_x, nullptr, rows, cols, eps, nullptr);
+        strata::kernels::rms_norm_rows(d_x, nullptr, 1, d_x, nullptr, (int) cols, (int) rows, eps, nullptr, /*pinned=*/true);
         transfers.download(got.data(), d_x, got.size() * 4);
         int null_bad = 0;
         for (size_t i = 0; i < got.size(); ++i)
@@ -341,7 +324,7 @@ int run(int argc, char** argv) {
     // Volatile materializes the multiply so this oracle cannot silently use FMA.
     {
         auto* stream = &Runtime::get().compute();
-        std::mt19937 rng(77);
+        std::mt19937 rng(77);  // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the parity inputs reproducible
         std::uniform_real_distribution<float> values(-2.0f, 2.0f);
         int mismatches = 0, guards = 0, fma_diff = 0, cases = 0;
         for (const int bits : {2, 4, 8}) {
@@ -376,6 +359,19 @@ int run(int argc, char** argv) {
                     transfers.upload(dof, offsets.data(), offsets.size() * sizeof(float));
                     Runtime::get().finish(*stream);
 
+                    auto packed = [&](bool with_offset) {
+                        strata::kernels::EmbedTable t;
+                        t.rows = dc;
+                        t.row_bytes = (size_t) row_bytes;
+                        t.n_rows = 3;
+                        t.n_embd = n;
+                        t.scales = ds;
+                        t.offsets = with_offset ? dof : nullptr;
+                        t.code_bits = bits;
+                        t.code_bias = bias;
+                        t.group_elems = group;
+                        return t;
+                    };
                     for (const bool with_offset : {false, true}) {
                         for (int row = 0; row < 3; ++row) {
                             std::vector<float> want((size_t) n), got((size_t) n + 2, -12345.0f);
@@ -386,17 +382,14 @@ int run(int argc, char** argv) {
                                 const float offset = with_offset ? offsets[gi] : 0.0f;
                                 want[(size_t) i] = product + offset;
                                 const float fused = std::fma(code, scales[gi], offset);
-                                if (std::memcmp(&fused, &want[(size_t) i], sizeof(float)) != 0) ++fma_diff;
+                                if (std::memcmp(&fused, &want[(size_t) i], sizeof(float)) != 0) ++fma_diff;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
                             }
                             transfers.upload(out, got.data(), got.size() * sizeof(float));
-                            strata::kernels::embedding_gather(dc + (size_t) row * row_bytes,
-                                ds + (size_t) row * row_groups,
-                                with_offset ? dof + (size_t) row * row_groups : nullptr,
-                                n, bits, bias, group, out + 1, stream);
+                            strata::kernels::embed_rows(packed(with_offset), nullptr, row, 1, out + 1, stream);
                             transfers.download(got.data(), out, got.size() * sizeof(float));
                             Runtime::get().finish(*stream);
                             for (int i = 0; i < n; ++i) {
-                                if (std::memcmp(&want[(size_t) i], &got[(size_t) i + 1], sizeof(float)) != 0) ++mismatches;
+                                if (std::memcmp(&want[(size_t) i], &got[(size_t) i + 1], sizeof(float)) != 0) ++mismatches;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
                             }
                             if (got.front() != -12345.0f || got.back() != -12345.0f) ++guards;
                             ++cases;
@@ -407,10 +400,7 @@ int run(int argc, char** argv) {
                                 namespace exp = sycl::ext::oneapi::experimental;
                                 exp::command_graph graph(stream->get_context(), stream->get_device());
                                 graph.begin_recording(*stream);
-                                strata::kernels::embedding_gather(dc + (size_t) row * row_bytes,
-                                    ds + (size_t) row * row_groups,
-                                    with_offset ? dof + (size_t) row * row_groups : nullptr,
-                                    n, bits, bias, group, out + 1, stream);
+                                strata::kernels::embed_rows(packed(with_offset), nullptr, row, 1, out + 1, stream);
                                 strata::kernels::scale_inplace(out + 1, n, 2.0f, stream);
                                 graph.end_recording(*stream);
                                 auto executable = graph.finalize();
@@ -419,7 +409,7 @@ int run(int argc, char** argv) {
                                 Runtime::get().finish(*stream);
                                 for (int i = 0; i < n; ++i) {
                                     const float expected = want[(size_t) i] * 2.0f;
-                                    if (std::memcmp(&expected, &got[(size_t) i + 1], sizeof(float)) != 0) ++mismatches;
+                                    if (std::memcmp(&expected, &got[(size_t) i + 1], sizeof(float)) != 0) ++mismatches;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
                                 }
                                 if (got.front() != -12345.0f || got.back() != -12345.0f) ++guards;
                             }

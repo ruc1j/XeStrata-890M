@@ -6,7 +6,7 @@ DiT reads (built here: it has no text encoder), the fields a request gives it, a
 serve/test_images.py is upstream's, for the sd-cli XeStrata no longer starts; this is not that file.
 
     python -m unittest serve.test_image_hunyuanimage3
-    STRATA_HUNYUANIMAGE3_TOKENIZER=<the folder with the model's tokenizer.json> python -m unittest \
+    XESTRATA_HUNYUANIMAGE3_TOKENIZER=<the folder with the model's tokenizer.json> python -m unittest \
 serve.test_image_hunyuanimage3
 """
 from __future__ import annotations
@@ -21,12 +21,12 @@ from serve import images
 
 RESOLUTIONS = {"base_size": 1024, "step": 64, "align": 16,
                "extra_resolutions": [[1024, 768], [1280, 720], [768, 1024], [720, 1280]]}
-REAL = os.environ.get("STRATA_HUNYUANIMAGE3_TOKENIZER")
+REAL = os.environ.get("XESTRATA_HUNYUANIMAGE3_TOKENIZER")
 
 
 def cfg(**kw) -> dict:
     """A run config's "images" section as setup --images writes HunyuanImage 3.0's (tools/image/qimage.py)."""
-    out = {"model_name": "hunyuan-image-3-distil", "family": "hunyuan-image-3", "exe": "strata-image",
+    out = {"model_name": "hunyuan-image-3-distil", "family": "hunyuan-image-3", "exe": "xestrata-image",
            "quant": "w4a8", "diffusion_model": "dit.safetensors", "vae": "vae.safetensors",
            "tokenizer": "tokenizer.json", "system_prompt": "en_unified.txt", "vision": "shard.safetensors",
            "max_refs": 3, "steps": 8, "guidance": 2.5,
@@ -143,7 +143,7 @@ class Requests(unittest.TestCase):
             images.parse_edit_request({"prompt": "a cube"}, [png] * 4, cfg())
 
     def test_the_other_two_models_are_as_they_were(self):
-        qwen = {"exe": "strata-image", "diffusion_model": "dit.gguf", "vae": "vae.safetensors", "llm": "text.gguf",
+        qwen = {"exe": "xestrata-image", "diffusion_model": "dit.gguf", "vae": "vae.safetensors", "llm": "text.gguf",
                 "schedule": "turbo"}
         job = images.parse_request({"prompt": "a cube", "size": "1024x1024"}, qwen)
         self.assertEqual((job["steps"], job["bucket"]), (images.TURBO_STEPS, None))
@@ -153,6 +153,70 @@ class Requests(unittest.TestCase):
         job = images.parse_request({"prompt": "a cube", "size": "1024x1024"}, mage)
         self.assertEqual((job["steps"], job["bucket"]), (4, None))
         self.assertNotIn("guidance", job)
+
+
+class Extend(unittest.TestCase):
+    def test_fit_canvas_and_scale_picture_and_sides(self):
+        for size, spec, ratio in (((832, 1216), {"aspect": "16:9"}, 16 / 9),
+                                  ((1216, 832), {"aspect": "9:16"}, 9 / 16),
+                                  ((1024, 1024), {"aspect": "21:9"}, 21 / 9)):
+            with self.subTest(size=size, spec=spec):
+                shrunk, pads, scale = images.parse_extend(spec, *size, 2048)
+                canvas = (shrunk[0] + pads[0] + pads[2], shrunk[1] + pads[1] + pads[3])
+                self.assertLess(scale, 1)
+                self.assertLessEqual(max(canvas), 2048)
+                self.assertAlmostEqual(canvas[0] / canvas[1], ratio, delta=0.005)
+        size, pads, scale = images.parse_extend({"left": 1000, "bottom": 900}, 1600, 1200, 2048)
+        self.assertLess(scale, 1)
+        self.assertEqual(pads[0], int(1000 * scale))
+        self.assertEqual(pads[3], int(900 * scale))
+        self.assertLessEqual(max(size[0] + pads[0], size[1] + pads[3]), 2048)
+
+    def test_edit_uses_shrunk_picture_and_reports_scale(self):
+        import io
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (832, 1216), "red").save(buf, format="PNG")
+        job = images.parse_edit_request({"prompt": "a cube", "extend": {"aspect": "16:9"}},
+                                        [buf.getvalue()], cfg(vision=None))
+        self.assertLess(job["extend_scale"], 1)
+        self.assertLessEqual(max(images.image_dims(job["init"])), 2048)
+        self.assertEqual(images.image_dims(job["init"]), images.image_dims(job["mask"]))
+        job = images.parse_edit_request({"prompt": "a cube", "extend": {"aspect": "16:9"}},
+                                        [buf.getvalue()], cfg())
+        self.assertLess(job["extend_scale"], 1)
+        self.assertEqual(images.image_dims(job["init"]), images.image_dims(job["mask"]))
+        rw, rh = images.image_dims(job["refs"][0])
+        cw, ch = images.image_dims(job["init"])
+        self.assertLess(rw, cw)
+        self.assertEqual(rh, ch)
+        with Image.open(io.BytesIO(job["refs"][0])) as ref:
+            self.assertEqual(ref.getpixel((0, 0)), (255, 0, 0))
+        job = images.parse_edit_request({"prompt": "a cube", "extend": {"aspect": "4:5"}},
+                                        [buf.getvalue()], cfg())
+        self.assertNotIn("extend_scale", job)
+        self.assertEqual(job["refs"][0], buf.getvalue())
+        self.assertEqual(images.image_dims(job["init"]), images.image_dims(job["mask"]))
+        self.assertGreater(images.image_dims(job["init"])[0], 832)
+
+
+class AuxiliaryMemory(unittest.TestCase):
+    def test_auxiliary_budget_refusal_suggests_a_smaller_model(self):
+        with self.assertRaises(images.ImageRequestError) as caught:
+            images.check_room({"least_mib": 8300, "cap_mib": 8192}, None, {"aux": {"kind": "birefnet"}})
+        self.assertIn("smaller auxiliary model", str(caught.exception))
+        self.assertNotIn("reference images", str(caught.exception))
+
+    def test_allocation_refusal_is_a_memory_shortage(self):
+        from serve import image_regions
+
+        class Gen:
+            def aux_ask(self, line, want):
+                raise images.ImageJobFailed("image engine (BiRefNet): GPU memory: alloc_device: 123 bytes refused; "
+                                            "device free 54 MiB")
+        with self.assertRaises(image_regions.MemoryShort) as caught:
+            image_regions._ask(Gen(), "MATTE", "MATTE")
+        self.assertNotIn("alloc_device", str(caught.exception))
 
 
 class Sequence(unittest.TestCase):
@@ -221,10 +285,10 @@ class Job(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.d = Path(self.tmp.name)
-        for name in ("strata-image", "dit.safetensors", "vae.safetensors", "tokenizer.json", "en_unified.txt",
+        for name in ("xestrata-image", "dit.safetensors", "vae.safetensors", "tokenizer.json", "en_unified.txt",
                      "shard.safetensors"):
             (self.d / name).write_text("x", encoding="utf-8")
-        self.cfg = cfg(exe=str(self.d / "strata-image"), diffusion_model=str(self.d / "dit.safetensors"),
+        self.cfg = cfg(exe=str(self.d / "xestrata-image"), diffusion_model=str(self.d / "dit.safetensors"),
                        vae=str(self.d / "vae.safetensors"), tokenizer=str(self.d / "tokenizer.json"),
                        system_prompt=str(self.d / "en_unified.txt"), vision=str(self.d / "shard.safetensors"))
         self.gen = images.ImageGen(self.cfg)
@@ -240,7 +304,7 @@ class Job(unittest.TestCase):
         (self.d / "en_unified.txt").unlink()
         self.assertEqual(self.gen.missing(), [str(self.d / "en_unified.txt")])
         with self.assertRaises(ValueError):
-            images.ImageGen(cfg(exe=str(self.d / "strata-image"), tokenizer=""))   # the tokenizer is required
+            images.ImageGen(cfg(exe=str(self.d / "xestrata-image"), tokenizer=""))   # the tokenizer is required
 
     def test_the_engine_takes_no_text_encoder(self):
         self.assertNotIn("--text", self.gen.engine.command())
@@ -272,7 +336,7 @@ class Job(unittest.TestCase):
 
 
 @unittest.skipUnless(REAL and Path(REAL).is_dir(),
-                     "set $STRATA_HUNYUANIMAGE3_TOKENIZER to the folder with the model's files")
+                     "set $XESTRATA_HUNYUANIMAGE3_TOKENIZER to the folder with the model's files")
 class RealTokenizer(unittest.TestCase):
     """The same builder over the model's own tokenizer.json (the markers are its added tokens)."""
 

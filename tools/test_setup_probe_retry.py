@@ -1,11 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""The first range probe of a parallel download is tried again after a hiccup, and not after "no internet" (upstream
-95e9b7341): one failed probe used to make a 60-90 GB download a single stream.
-
-    python -m unittest tools.test_setup_probe_retry
-"""
+"""The first range probe of a parallel download is tried again after a hiccup, and not after "no internet"
+(upstream 95e9b7341): one failed probe used to make a 50-100 GB download a single stream."""
 from __future__ import annotations
 
 import errno
@@ -58,7 +55,8 @@ class ProbeRetry(unittest.TestCase):
         for offline in (urllib.error.URLError(socket.gaierror(-3, "Temporary failure in name resolution")),
                         urllib.error.URLError(ConnectionRefusedError()),
                         urllib.error.URLError(OSError(errno.ENETUNREACH, "Network is unreachable")),
-                        OSError(errno.EHOSTUNREACH, "No route to host"), urllib.error.URLError("unknown url type"),
+                        OSError(errno.EHOSTUNREACH, "No route to host"),
+                        urllib.error.URLError("unknown url type"),
                         urllib.error.HTTPError("u", 404, "missing", {}, None)):
             src = FakeSource(offline)
             ok, waits = probe(src)

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/program/option_scope.cpp - see include/strata/program/option_scope.hpp.  The lists follow generate.cpp's
-// options: one added there goes into one of them (or into plain_generate.cpp, where the other models take it).
+// src/program/option_scope.cpp - see include/strata/program/option_scope.hpp.  The list follows generate.cpp's
+// options: one added there goes into plain_generate.cpp too, or into it when it rests on Qwen3.8-Flash-Next's own
+// structure.
 #include "strata/program/option_scope.hpp"
 
 #include <algorithm>
@@ -11,37 +12,32 @@ namespace strata::program {
 namespace {
 
 // Qwen3.8-Flash-Next's pack, PLE table, embedding and dense images, QSA, GR streams, MTP head norm, vision tower, and
-// the switches and dumps of their kernels
+// the switches and dumps of their kernels; and A/B switches of its engine's own parts (the shared expert's order, the
+// canonical copies, the prompt path's borrowing and cut-off, the cache's per-layer and CPU-order experiments).
+// (--kv-resident is shared now: the plain engine streams its dense attention's K/V too, the last N cells a layer in
+// VRAM and the rest read from RAM; GLM-5.3-Flash's DSA keeps --kv-ram.)
+// Its separate MTP pack's drafter (--mtp and its window and cap), its verifier's and token graph's switches and
+// measurements (the per-stage counts, the 48 layer graphs, the stream-token path, the split verify window, the fetch
+// branch's --pcie-mode, the pool's hit and publish experiments), and its prompt path's grouped products
+// (--prefill-experts): the other models' engine has windows of its own, one graph a window size, one fetch over PCIe
+// --draft-fallback and --draft-mtp-spec rest on generate.cpp running DFlash2 and the MTP layer together (a static
+// primary with the other as fallback, its own window): the plain engine keeps both loaded but picks one per request
+// by its measured speed (--draft auto, strata/spec/drafter_policy.hpp) and sets the MTP's window with --spec, so the
+// static knobs add nothing there.  --spec-min-p and --window-hashes are shared (shared_options.hpp).
 const char* const kQwen38Only[] = {
     "--pack", "--ple-gguf", "--no-ple", "--ple-io", "--ple-row-cache", "--ple-inflight", "--ple-delay-us",
-    "--ple-sync-submit", "--embd-gguf", "--native-dense-gguf", "--native-head-gguf", "--native-bf16",
-    "--native-bf16-extra", "--native-ple-key", "--native-ple-postops", "--native-moe-combine", "--native-gdn",
-    "--native-flash-attn-short", "--native-qsa", "--native-qsa-indexer", "--native-rope", "--native-router",
-    "--gr-fp32-activations", "--gr-native-mmvf", "--no-fused-gr", "--no-fused-gdn", "--no-fast-attn",
-    "--no-fast-select", "--mtp-hnorm", "--vision", "--shared-late", "--shared-expert-arena", "--keep-canonical",
+    "--ple-sync-submit", "--embd-gguf", "--native-dense-gguf", "--native-head-gguf", "--native-flash-attn-short",
+    "--no-fused-gr", "--no-fused-gdn", "--no-fast-attn", "--mtp-hnorm", "--vision", "--shared-late", "--keep-canonical",
     "--cpu-oracle-q8-0", "--dump-final-r", "--dump-halves", "--dump-mixed", "--dump-residual", "--dump-layers",
-    "--prefill", "--prefill-experts", "--prefill-until", "--no-prefill-borrow",
-    "--resident-experts", "--resident-cpu-experts", "--resident-budget-gib", "--expert-cache-per-layer",
+    "--prefill", "--prefill-until", "--no-prefill-borrow", "--prefill-experts",
+    "--expert-cache-per-layer",
     "--expert-cache-cpu-order",
-};
-
-// the engine's options every model could take, which the other models' path does not have yet
-const char* const kNotYet[] = {
-    "--slots", "--batch", "--batch-cpu-split", "--batch-groups", "--batch-mtp", "--no-batch-mtp",
-    "--stream-token", "--check-logits", "--prompt-cache", "--prompt-cache-every", "--prompt-cache-root",
-    "--prompt-cache-tail", "--conversation-save", "--conversation-save-checkpoints",
-    "--conversation-save-compress", "--conversation-save-hours", "--conversation-save-mib", "--session-min-free-mib",
-    "--kv-grow", "--no-kv-grow", "--kv-resident", "--vram-reserve-later-mib", "--adapt-async", "--pcie-frac", "--pcie-mode", "--pool-tasks", "--stats", "--stage-timing",
-    "--spec-split", "--no-spec-split", "--spec-oracle", "--spec-corrupt", "--suffix-draft",
-    "--lookup-chain", "--lookup-chain-min", "--coupled-draft", "--no-coupled-draft", "--mtp", "--mtp-max-t",
-    "--mtp-window", "--gpu-stages", "--expert-cache-device1",
-    "--expert-cache-device2", "--expert-cache-device3", "--expert-cache-remote-placement", "--gpu-only-full",
-    "--control-vector", "--control-vector-layer-range", "--control-vector-scaled", "--cvec-dir", "--cvec-mode",
-    "--logits-stride", "--window-hashes", "--graph-only", "--no-capture", "--no-token-graph",
-    "--no-pool", "--no-host-worker", "--no-hit-poke", "--no-publish-kernel", "--no-split-rows", "--pipeline-windows",
-    "--sync-every-layer", "--short-read", "--yarn-attn-factor", "--yarn-beta-fast", "--yarn-beta-slow", "--yarn-ext-factor", "--turn-token", "--tail-role-token",
-    "--aux-cpus", "--pool-cores", "--memory-limit-mib", "--conversation-cache-min-tokens",
-    "--conversation-cache-park-gain", "--session-save-reclaim", "--prompt-cache-spread",
+    "--mtp", "--mtp-max-t", "--mtp-window", "--draft-fallback", "--draft-mtp-spec",
+    "--stream-token", "--check-logits", "--stats", "--stage-timing",
+    "--spec-split", "--no-spec-split", "--spec-oracle", "--spec-corrupt", "--gpu-stages", "--gpu-only-full",
+    "--logits-stride", "--graph-only", "--no-capture", "--no-token-graph", "--no-pool",
+    "--no-hit-poke", "--no-publish-kernel", "--no-split-rows", "--sync-every-layer", "--pcie-mode",
+    "--batch-cpu-split",
 };
 
 bool listed(const char* const* first, const char* const* last, const std::string& name) {
@@ -52,7 +48,6 @@ bool listed(const char* const* first, const char* const* last, const std::string
 
 OptionScope option_scope(const std::string& name) {
     if (listed(std::begin(kQwen38Only), std::end(kQwen38Only), name)) return OptionScope::qwen38_only;
-    if (listed(std::begin(kNotYet), std::end(kNotYet), name)) return OptionScope::not_yet;
     return OptionScope::unknown;
 }
 

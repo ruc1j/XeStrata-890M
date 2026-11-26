@@ -48,17 +48,20 @@ DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PORT = 8095
 STATE_DIR = ".strata-mcp"                             # in the Strata folder (git-ignored)
 CONFIG = "xestrata-"                                  # setup's run configs: xestrata-<model>.json
+WIN = os.name == "nt"
 
 # What setup.py offers, used only when setup.py cannot be imported (the numbers are setup's MODELS / FAMILIES /
 # CONTEXTS; tools/test_strata_mcp.py checks they still match).
 FALLBACK_MODELS = {
-    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0},
+    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0,
+             "families": ("qwen", "swift", "sc117", "sc117-swift")},
     "IQ2_XS": {"about": "2-bit i-quant, a little better quality, close in speed", "download_gb": 68.0, "ram_gb": 48,
-               "arena_gb": 35.5, "families": ("qwen", "swift", "huihui-swift")},
+               "arena_gb": 35.5, "families": ("qwen", "swift", "huihui-swift", "sc117", "sc117-swift")},
     "IQ3_XXS": {"about": "3-bit i-quant, better quality, slower (more CPU work per token)", "download_gb": 75.8,
-                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "huihui-swift")},
+                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "huihui-swift", "sc117", "sc117-swift")},
     "IQ3_S": {"about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC "
-                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3},
+                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3,
+              "families": ("qwen", "swift", "sc117", "sc117-swift")},
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
     "UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic), between IQ3_S and UD-Q4_K_XL in quality; on a PC with "
@@ -70,13 +73,13 @@ FALLBACK_MODELS = {
                    "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth", "huihui-unsloth"),
                    # upstream #967: images allowed (setup warns: untested)
                    "budget": True, "experimental": True, "vision": True},
-    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality; not "
-                            "tested in XeStrata", "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4,
+    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality",
+                   "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4,
                    "families": ("unsloth",), "budget": True, "experimental": True, "vision": True},
-    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs; not tested in XeStrata",
+    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs",
                    "download_gb": 169.2, "ram_gb": 118, "arena_gb": 109.2, "families": ("unsloth",), "budget": True,
                    "experimental": True, "vision": True},
-    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC; not tested in XeStrata",
+    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC",
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth", "huihui-unsloth"),
              "budget": True, "experimental": True, "vision": True},
     # upstream 9ed3c7789: Unsloth's v3.1 sets (setup.py MODELS: experimental, not run in XeStrata)
@@ -118,6 +121,19 @@ FALLBACK_MODELS = {
                             "together); lower quality than Gyro-Coder-L",
                    "download_gb": 75.8, "ram_gb": 26.0, "arena_gb": 16.0, "families": ("gyro-coder",),
                    "vision": True},
+    "S": {"about": "Signal-2's fine-tune at Gyro-S' size (36 GB of RAM, or 38 GB of RAM and VRAM together); "
+                   "lower quality than the 2-3-bit sizes",
+          "download_gb": 59.5, "ram_gb": 35.8, "arena_gb": 25.8, "families": ("signal2",), "vision": True},
+    "AD-4.27bpw": {"about": "experts of 2.5 to 3.5 bits with 4.5-bit downs, the n-gram table at 5 bits",
+                   "download_gb": 94.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "vision": True},
+    "AD-5.00bpw": {"about": "the same experts as AD-4.27bpw, the n-gram table at 8 bits",
+                   "download_gb": 110.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "vision": True},
+    "Sync-XS": {"about": "the smallest Sync pack", "download_gb": 57.7, "ram_gb": 24,
+                "arena_gb": 20.47, "families": ("sync",), "vision": True},
+    "Sync-S": {"about": "the middle Sync pack", "download_gb": 61.7, "ram_gb": 32,
+               "arena_gb": 24.07, "families": ("sync",), "vision": True},
+    "Sync-M": {"about": "the largest Sync pack", "download_gb": 68.1, "ram_gb": 48,
+               "arena_gb": 30.08, "families": ("sync",), "vision": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -137,6 +153,9 @@ FALLBACK_FAMILIES = {
     "gyro-coder": {"title": "Qwen3.8-Flash-Next Gyro-Coder",
                    "about": "half the experts (kept for code): Gyro-Coder-L (35 GB of RAM, or 37 GB of RAM and VRAM "
                             "together) and Gyro-Coder (26 or 28 GB); weaker outside coding", "tag": "gyro-coder-"},
+    "signal2": {"title": "Signal-2-Flash-Next (Gyro)",
+                "about": "Signal-2's fine-tune at Gyro-S' size: TQK6/TQK7 experts (25.8 GB), a 59.5 GB download, "
+                         "36 GB of RAM or 38 GB of RAM and VRAM together; not a default", "tag": "signal2-"},
     "huihui-swift": {"title": "Swift 1.5 (abliterated)", "about": "Swift 1.5 with its refusals removed (abliteration): "
                                                                   "far fewer refusals, and its safety filtering is "
                                                                   "reduced, so check what it writes",
@@ -145,15 +164,57 @@ FALLBACK_FAMILIES = {
                        "about": "Qwen3.8-Flash-Next with its refusals removed (abliteration), as Unsloth's 4- and "
                                 "8-bit files: far fewer refusals, and its safety filtering is reduced, so check what "
                                 "it writes", "tag": "huihui-unsloth-", "vision": False},
+    "sc117": {"title": "Qwen3.8-Flash-Next GSQ-RCO (abliterated)",
+              "about": "the original's four sizes with OrcaRouter's refusal removal (abliteration) put in: far fewer "
+                       "refusals, and its safety filtering is reduced, so check what it writes", "tag": "sc117-"},
+    "sc117-swift": {"title": "Swift 1.5 GSQ-RCO (abliterated)",
+                    "about": "Swift 1.5's four sizes with OrcaRouter's refusal removal (abliteration) put in: far "
+                             "fewer refusals, and its safety filtering is reduced, so check what it writes",
+                    "tag": "sc117-swift-"},
+    "atomicchat": {"title": "Qwen3.8-Flash-Next (AtomicChat)",
+                   "about": "AD-4.27bpw and AD-5.00bpw: experts stored like IQ3_S's (61 GB of RAM), the n-gram table "
+                            "at 5 or 8 bits; 94 and 110 GB downloads", "tag": "atomicchat-"},
+    "sync": {"title": "Qwen3.8-Flash-Next (Sync)", "about": "Sync-XS, Sync-S and Sync-M pre-built packs",
+             "tag": "sync-"},
+    "edge0": {"title": "Edge0 (latent MoE)",
+              "about": "145B and 120B latent sparse MoE, Q3_K or NVFP4 experts; a pre-built pack, ~86 to ~105 GB "
+                       "on disk",
+              "tag": "edge0-", "vision": False},
+    "inkling": {"title": "Inkling-2-Mini",
+                "about": "1.8B active of 128 experts, a 3-pass loop and hybrid attention; text only",
+                "tag": "inkling-", "vision": False},
+    "inkling-qsa": {"title": "Inkling-2-Mini (QSA)",
+                    "about": "Inkling-2-Mini with a block-sparse QSA indexer: faster on long chats, though it may miss "
+                             "details far back (many exact facts at once are better without it); text only",
+                    "tag": "inkling-qsa-", "vision": False},
     "ornith": {"title": "Ornith-1.5-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community "
                                                        "GSQ-RCO 3 and 3.5 bits", "tag": "ornith-"},
+    "ornith-uncensored": {"title": "Ornith-1.5-35B-A3B (uncensored)",
+                          "about": "Ornith-1.5 with its refusals removed (dealignai's CRACK): far fewer refusals, and "
+                                   "its safety filtering is reduced, so check what it writes",
+                          "tag": "ornith-uncensored-"},
     "llmjp": {"title": "llm-jp-4.1-32b-a3b-thinking", "about": "32B, 3B active; Japanese and English, a thinking model",
               "tag": "llmjp-"},
     "qwen36": {"title": "Qwen3.6-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE with the Qwen tokenizer: Unsloth's "
                                                     "4-, 6- and 8-bit files", "tag": "qwen36-"},
+    "qwen36-uncensored": {"title": "Qwen3.6-35B-A3B (uncensored)",
+                          "about": "Qwen3.6-35B-A3B with its refusals removed (Heretic + MPOA): far fewer refusals, "
+                                   "and its safety filtering is reduced, so check what it writes",
+                          "tag": "qwen36-uncensored-"},
     "qwen35": {"title": "Qwen3.5-9B",
                "about": "9B, dense, reads images: for a GPU of 8 GB or more, every weight in its VRAM",
                "tag": "qwen35-"},
+    "sensenova-loop-qsa": {"title": "SenseNova-Loop-9B (QSA)",
+                           "about": "9B dense, 32 layers executed 56 times with two-stream mHC; block-sparse QSA "
+                                    "attention, text and images, 512K context; the official GGUFs with trained QSA "
+                                    "indexers",
+                           "tag": "sensenova-qsa-"},
+    "qwen35-2b": {"title": "Qwen3.5-2B",
+                  "about": "2B, dense, reads images: for a small GPU or a PC without one; its answers fall short of "
+                           "the 9B's", "tag": "qwen35-2b-"},
+    "qwen35-0.8b": {"title": "Qwen3.5-0.8B",
+                    "about": "0.8B, dense, reads images: the smallest, for a small GPU or a PC without one",
+                    "tag": "qwen35-0.8b-"},
     "qwen35-uncensored": {"title": "Qwen3.5-9B (uncensored)",
                           "about": "Qwen3.5-9B with its refusals removed (HauhauCS's Aggressive): far fewer refusals, "
                                    "and its safety filtering is reduced, so check what it writes",
@@ -165,15 +226,28 @@ FALLBACK_FAMILIES = {
                        "about": "26.4B, 3.4B active, a looped MoE on an engine of its own; 10 to 20 GB",
                        "tag": "inkling-2-mini-"},
 }
-FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
+FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 196608, 204800, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
                 "Plain prose, no title.")
+
+
+if WIN:
+    import ctypes
+    from ctypes import wintypes
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    _k32.OpenProcess.restype = wintypes.HANDLE
+    _k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    _k32.GetProcessTimes.argtypes = (wintypes.HANDLE, *(ctypes.POINTER(wintypes.FILETIME),) * 4)
+    _k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    _k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    _QUERY, _STILL_ACTIVE = 0x1000, 259              # PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE
 
 
 def log(msg: str) -> None:
     """Diagnostics go to stderr: stdout carries only the protocol."""
     try:
-        sys.stderr.write(f"[strata-mcp] {msg}\n")
+        sys.stderr.write(f"[xestrata-mcp] {msg}\n")
         sys.stderr.flush()
     except (OSError, ValueError):
         pass
@@ -189,6 +263,23 @@ def proc_identity(pid) -> str | None:
         return None
     if pid <= 0:
         return None
+    if WIN:
+        # upstream 7ea172159: an ended child that nobody has reaped yet is not "running".  On Windows the test must
+        # not be os.kill(pid, 0): that terminates the process (its exit code is the signal).  OpenProcess and
+        # GetExitCodeProcess say whether it still runs, GetProcessTimes gives the start time for the token.
+        h = _k32.OpenProcess(_QUERY, False, pid)
+        if not h:
+            return None
+        try:
+            code = wintypes.DWORD()
+            if not _k32.GetExitCodeProcess(h, ctypes.byref(code)) or code.value != _STILL_ACTIVE:
+                return None
+            c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+            if not _k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e), ctypes.byref(k), ctypes.byref(u)):
+                return None
+            return f"win:{(c.dwHighDateTime << 32) | c.dwLowDateTime}"
+        finally:
+            _k32.CloseHandle(h)
     stat = Path(f"/proc/{pid}/stat")
     if Path("/proc/self/stat").exists():
         try:
@@ -198,8 +289,8 @@ def proc_identity(pid) -> str | None:
         if fields[0] in ("Z", "X"):                     # a zombie has ended
             return None
         return f"linux:{fields[19]}"                    # field 22 of stat: the start time in clock ticks
-    try:                                                # elsewhere (no /proc): alive, without a start time
-        os.kill(pid, 0)
+    try:                                                # a POSIX system without /proc: alive, without a start time
+        os.kill(pid, 0)                                 # (never on Windows: there it would end the process)
         return "pid"
     except OSError:
         return None
@@ -277,7 +368,7 @@ def spawn_detached(cmd: list, cwd: Path, log_path: Path, env: dict | None = None
 def run_quiet(cmd, timeout=30) -> str:
     """A command's stdout ('' when it is missing or fails)."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
                               stdin=subprocess.DEVNULL).stdout or ""
     except (OSError, subprocess.SubprocessError, ValueError):
         return ""
@@ -496,7 +587,7 @@ class Strata:
     def settings_path(self) -> Path:
         # the checkout's serve/places.py (the user's folders on Linux and on Windows)
         places = self.root / "serve" / "places.py"
-        spec = importlib.util.spec_from_file_location("strata_places_for_mcp", places) if places.is_file() else None
+        spec = importlib.util.spec_from_file_location("xestrata_places_for_mcp", places) if places.is_file() else None
         if spec is not None and spec.loader is not None:
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
@@ -546,8 +637,14 @@ class Strata:
 
     # ---- what is installed
     def configs(self) -> list[Path]:
-        return sorted((p for p in self.root.glob(CONFIG + "*.json") if not p.name.endswith(".shared-settings.json")),
-                      key=lambda p: p.stat().st_mtime, reverse=True)   # #346: the Chat settings file is no config
+        # setup's folder for them (the user's, beside settings.json), then the ones an earlier setup wrote into this
+        # Strata folder, which the next setup moves there; a name in both is the user folder's
+        found: dict[str, Path] = {}
+        for folder in (self.settings_path().parent, self.root):
+            for p in folder.glob(CONFIG + "*.json"):
+                if not p.name.endswith(".shared-settings.json"):   # #346: the Chat settings file is no config
+                    found.setdefault(p.name, p)
+        return sorted(found.values(), key=lambda p: p.stat().st_mtime, reverse=True)
 
     @staticmethod
     def read_config(path: Path) -> dict:
@@ -556,6 +653,16 @@ class Strata:
             return cfg if isinstance(cfg, dict) else {}
         except (OSError, ValueError):
             return {}
+
+    def engine_here(self, reference: str) -> bool:
+        """台帳 0619（upstream b55ae23e8e）: "component:..." 実行ファイルはパスではないので、
+        インストール済みの engine を root と PATH から探す。XeStrata には upstream の
+        strata_control.engine_component が無いため、現地の配置に合わせて照合した。"""
+        name = str(reference).split(":", 1)[1] if str(reference).startswith("component:") else str(reference)
+        if not name or "/" in name or "\\" in name:
+            return False
+        return any(candidate.is_file() for candidate in (self.root / name, self.root / "bin" / name)) \
+            or shutil.which(name) is not None
 
     def describe_config(self, path: Path) -> dict:
         cfg = self.read_config(path)
@@ -566,7 +673,8 @@ class Strata:
             return a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None
         tag = path.stem[len(CONFIG):]
         missing = [p for p in [cfg.get("exe"), *[x for x in a if isinstance(x, str) and x.endswith(".gguf")]]
-                   if not p or not Path(p).exists()]
+                   if not p or not (self.engine_here(p) if str(p).startswith("component:")
+                                    else Path(p).exists())]
         script = self.root / f"run-{tag}.sh"
         vis = cfg.get("vision")
         return {"model": tag, "config": path.name, "model_name": cfg.get("model_name"),
@@ -581,14 +689,18 @@ class Strata:
     def find_config(self, model: str | None) -> Path:
         have = self.configs()
         if not have:
-            raise ToolError("no model is installed in " + str(self.root) + " yet: install one first (strata_install)")
+            raise ToolError("no model is installed yet: install one first (strata_install)")
         if not model:
             return have[0]                              # the most recently used, as setup starts it
         m = model.strip().lower()
         exact = [c for c in have if c.stem[len(CONFIG):] == m]
         if exact:
             return exact[0]
-        by_name = [c for c in have if str(self.read_config(c).get("model_name", "")).lower() == m]
+
+        def names(c):                                  # its model name and aliases (setup's names before 2026-11-09)
+            cfg = self.read_config(c)
+            return [str(x).lower() for x in [cfg.get("model_name", ""), *(cfg.get("aliases") or [])]]
+        by_name = [c for c in have if m in names(c)]
         if by_name:
             return by_name[0]
         ends = [c for c in have if c.stem.endswith("-" + m)]
@@ -709,11 +821,11 @@ class Strata:
             fam, model, why = "coder", "IQ1_M", (f"{ram:.0f} GB of RAM: the full model needs ~48 GB; the Coder "
                                                  "(half the experts, best for code) needs ~32 GB")
         else:
-            return {"family": None, "model": None, "why": f"{ram:.0f} GB of RAM: Strata needs 32 GB or more "
+            return {"family": None, "model": None, "why": f"{ram:.0f} GB of RAM: XeStrata needs 32 GB or more "
                                                           "(the smallest model, the Coder, keeps ~23 GB of experts in "
                                                           "RAM)"}
         if hw.get("cpu", {}).get("avx2") is False:
-            return {"family": None, "model": None, "why": "this CPU has no AVX2; Strata needs at least AVX2"}
+            return {"family": None, "model": None, "why": "this CPU has no AVX2; XeStrata needs at least AVX2"}
         ctx = 32768 if vram < 14 else 65536 if vram < 20 else 131072
         if best.get("integrated"):
             notes.append("the processor's own graphics: it runs, but slowly (its memory is the system RAM)")
@@ -746,9 +858,11 @@ class Strata:
                         if d.get("mem_total"):          # a plain model: none of Flash-Next's budget or low-RAM modes
                             pass
                         elif d.get("budget"):
+                            # one label for every model (upstream a16f3fe39): all of its experts in RAM is "fits";
+                            # with less RAM a budget of them is kept and the rest read from the SSD, which runs
+                            # ("may run slower") - never "does not fit", whatever a RAM floor alone said
                             verdict = (("experimental: " if d.get("experimental") else "")
-                                       + "part of its experts in RAM, the rest read from the SSD"
-                                       if ram >= d["ram_gb"] else "does not fit")
+                                       + ("fits" if ram >= d["ram_gb"] else "may run slower"))
                         elif S and S.low_ram_needed(m, ram) and S.low_ram_fits(m, ram, vram):
                             verdict = "fits in the low-RAM mode (slower: the GPU holds part of the experts)"
                     except Exception:                   # noqa: BLE001
@@ -795,7 +909,7 @@ class Strata:
         if st == 0:
             return None
         if st != 200 or not isinstance(health, dict) or health.get("service") != "strata":
-            return {"port": port, "other": True, "note": "something else answers on this port (not a Strata server)"}
+            return {"port": port, "other": True, "note": "something else answers on this port (not an XeStrata server)"}
         info = {"port": port, "url": base, "model": health.get("model"), "context": health.get("max_context"),
                 "images": health.get("images"), "loaded": health.get("loaded"),
                 "api_key_required": bool(health.get("api_key"))}
@@ -915,8 +1029,8 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
                                       "'coder-iq1_m', 'swift-iq3_xxs'); default: the most recently used one"}
     ro = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
     return [
-        {"name": "strata_status", "title": "Strata status",
-         "description": "Is Strata (the local AI model server) running, and what is installed? Reports the running "
+        {"name": "strata_status", "title": "XeStrata status",
+         "description": "Is XeStrata (the local AI model server) running, and what is installed? Reports the running "
                         "server (model, engine version, context, busy or idle, VRAM/RAM in use), the installed models "
                         "and data folder, an install in progress, this PC's hardware (OS, CPU, RAM, GPUs, free disk) "
                         "and the model size setup recommends for this PC. Read-only; call it first.",
@@ -925,15 +1039,15 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "hardware": {"type": "boolean", "description": "include the hardware check and the recommendation "
                                                             "(default true; takes a second or two)"}}},
          "annotations": ro},
-        {"name": "strata_models", "title": "Strata models",
-         "description": "The models and sizes Strata's setup offers (families: qwen = Qwen3.8-Flash-Next, swift = "
+        {"name": "strata_models", "title": "XeStrata models",
+         "description": "The models and sizes XeStrata's setup offers (families: qwen = Qwen3.8-Flash-Next, swift = "
                         "Swift 1.5, coder = the Coder), with download size, RAM needed, "
                         "whether each fits this PC, which are installed, the context lengths, and the recommendation. "
                         "Read-only.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
          "annotations": ro},
-        {"name": "strata_install", "title": "Install Strata",
-         "description": "Install a Strata model on this PC by running Strata's setup non-interactively in the "
+        {"name": "strata_install", "title": "Install XeStrata",
+         "description": "Install an XeStrata model on this PC by running XeStrata's setup non-interactively in the "
                         "background (Python packages, the engine, a 58-111 GB model download, preparation, start "
                         "script). Without confirm=true it only returns the plan (what would be downloaded, disk "
                         "space): show it to the user and call again with confirm=true once they agree. Returns at "
@@ -969,8 +1083,8 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "cancel": {"type": "boolean", "description": "true = stop the install in progress"}}},
          "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True,
                          "openWorldHint": True}},
-        {"name": "strata_start", "title": "Start Strata",
-         "description": "Start an installed Strata model in the background (as its start script does, without "
+        {"name": "strata_start", "title": "Start XeStrata",
+         "description": "Start an installed XeStrata model in the background (as its start script does, without "
                         "opening a browser) and wait until it answers. Loading takes 1-3 minutes and the PC can be "
                         "slow meanwhile; if it is not ready within wait_seconds this returns 'loading' - check again "
                         "with strata_status. The model keeps running until strata_stop.",
@@ -983,9 +1097,9 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
                                              "a tool call after 60 s)"}}},
          "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True,
                          "openWorldHint": False}},
-        {"name": "strata_stop", "title": "Stop Strata",
-         "description": "Stop the Strata model: the engine is unloaded through the server's own API (it frees its "
-                        "VRAM and RAM itself), then the server this tool started is ended. A Strata started "
+        {"name": "strata_stop", "title": "Stop XeStrata",
+         "description": "Stop the XeStrata model: the engine is unloaded through the server's own API (it frees its "
+                        "VRAM and RAM itself), then the server this tool started is ended. An XeStrata started "
                         "elsewhere (e.g. its own window) is only unloaded - close its window to end it. Refuses while "
                         "a request is running unless force=true.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
@@ -993,8 +1107,8 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "force": {"type": "boolean", "description": "stop even while a request is running"}}},
          "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True,
                          "openWorldHint": False}},
-        {"name": "strata_logs", "title": "Strata logs",
-         "description": "The last lines of a Strata log: 'server' (the model server this tool started: loading, "
+        {"name": "strata_logs", "title": "XeStrata logs",
+         "description": "The last lines of an XeStrata log: 'server' (the model server this tool started: loading, "
                         "requests, errors), 'engine' (the engine's own log for a model), 'setup' (the install). "
                         "Default: the setup log while an install runs, else the server log. Read-only.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
@@ -1002,16 +1116,16 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "model": installed_model,
              "lines": {"type": "integer", "minimum": 1, "maximum": 500, "description": "default 80"}}},
          "annotations": ro},
-        {"name": "strata_benchmark", "title": "Strata speed test",
-         "description": "A short fixed request (greedy, thinking off) through the running Strata server; reports "
+        {"name": "strata_benchmark", "title": "XeStrata speed test",
+         "description": "A short fixed request (greedy, thinking off) through the running XeStrata server; reports "
                         "the output speed (tokens/s) and prompt speed. Takes 10-60 s. Refuses while the model is "
                         "busy.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
              "port": port,
              "max_tokens": {"type": "integer", "minimum": 16, "maximum": 512, "description": "default 200"}}},
          "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}},
-        {"name": "strata_connect_info", "title": "Connect to Strata",
-         "description": "How to point other apps at the local Strata server: the OpenAI and Anthropic base URLs, "
+        {"name": "strata_connect_info", "title": "Connect to XeStrata",
+         "description": "How to point other apps at the local XeStrata server: the OpenAI and Anthropic base URLs, "
                         "the model id, whether an API key is needed, and ready-to-paste settings for Claude Code, "
                         "Codex CLI, the OpenAI SDK, curl, Cursor/Continue/Open WebUI. Read-only.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {"port": port}},
@@ -1064,13 +1178,13 @@ class Tools:
             out["ports_used_by_other_programs"] = others
         if running:
             r = running[0]
-            summary = (f"Strata is running on port {r['port']}: {r.get('model')}"
+            summary = (f"XeStrata is running on port {r['port']}: {r.get('model')}"
                        + (", busy" if r.get("busy") else ", idle")
                        + ("" if r.get("loaded", True) else " (model unloaded; the next request loads it)"))
         elif "loading" in out:
-            summary = f"Strata is loading {out['loading']['model']} (port {out['loading']['port']})"
+            summary = f"XeStrata is loading {out['loading']['model']} (port {out['loading']['port']})"
         else:
-            summary = "Strata is not running"
+            summary = "XeStrata is not running"
         inst = s.installed()
         job = s.install_job()
         if job:
@@ -1167,7 +1281,7 @@ class Tools:
             plan, args = self.install_plan(family, model, context, vision, kv, gpu, port, data_dir)
             tracked = s.tracked_server()
             if tracked and not tracked.get("ended"):
-                raise ToolError("Strata is running (started by strata_start): stop it first with strata_stop - setup "
+                raise ToolError("XeStrata is running (started by strata_start): stop it first with strata_stop - setup "
                                 "may update the engine files it uses")
             if not confirm:
                 return {"summary": f"Plan: install {plan['title']} ({plan['download_gb']:.0f} GB download"
@@ -1182,7 +1296,7 @@ class Tools:
         s = self.s
         models, families, contexts, _src = s.tables()
         if sys.version_info < (3, 10):
-            raise ToolError("this Python is too old: Strata's setup needs Python 3.10+; run ./setup.sh once instead "
+            raise ToolError("this Python is too old: XeStrata's setup needs Python 3.10+; run ./setup.sh once instead "
                             "(it installs Python)")
         hw = s.hardware()
         rec = s.recommend(hw)
@@ -1262,7 +1376,7 @@ class Tools:
         job_id = f"{int(time.time())}-{os.getpid()}"
         log_path = s.state_dir / "setup.log"
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n===== strata-mcp: install {plan['title']} at {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            f.write(f"\n===== xestrata-mcp: install {plan['title']} at {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
         spec = {"job": job_id, "root": str(s.root), "python": s.run_python(), "base_python": sys.executable,
                 "create_venv": s.python_override is None and not s.venv_python().exists(),
                 "args": args, "result": str(s.state_dir / "install-result.json")}
@@ -1302,29 +1416,29 @@ class Tools:
             tracked = s.tracked_server()
             if tracked and not tracked.get("ended"):
                 info = s.probe(tracked["port"])
-                return {"summary": f"Strata is already {'running' if info else 'loading'} ({tracked.get('model')}, "
+                return {"summary": f"XeStrata is already {'running' if info else 'loading'} ({tracked.get('model')}, "
                                    f"port {tracked['port']}, started by this MCP server)"
                                    + ("" if tracked.get("model") == desc["model"] else
                                       ": stop it first (strata_stop) to start another model"),
                         "server": info}
             info = s.probe(port, deep=False)
             if info and not info.get("other"):
-                return {"summary": f"a Strata server already runs on port {port} ({info.get('model')}), started "
+                return {"summary": f"an XeStrata server already runs on port {port} ({info.get('model')}), started "
                                    "outside this MCP server; stop it (close its window) or use another port",
                         "server": info}
             if info or not port_free(port):
                 raise ToolError(f"port {port} is used by another program; choose another port (port=...)")
             py = s.run_python()
             if not Path(py).exists():
-                raise ToolError("Strata's Python environment (.venv) is missing: run the install again")
-            cmd = [py, str(s.root / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+                raise ToolError("XeStrata's Python environment (.venv) is missing: run the install again")
+            cmd = [py, str(s.root / "serve" / "server.py"), "--engine", "xestrata", "--config", str(cfg_path),
                    "--port", str(port)]
             if gpu is not None:
                 cmd += ["--gpu", str(gpu)]
             log_path = s.state_dir / "server.log"
             s.state_dir.mkdir(parents=True, exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n===== strata-mcp: start {desc['model']} on port {port} at "
+                f.write(f"\n===== xestrata-mcp: start {desc['model']} on port {port} at "
                         f"{time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
             env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
             try:
@@ -1348,15 +1462,15 @@ class Tools:
                 tail = read_tail(log_path, 15)
                 end_group_leftovers(p.pid)
                 s.save_state("server", None)
-                raise ToolError(f"Strata stopped while starting (exit code {p.poll()}). Its last output:\n"
+                raise ToolError(f"XeStrata stopped while starting (exit code {p.poll()}). Its last output:\n"
                                 + "\n".join(tail))
             info = s.probe(port)
             if info and not info.get("other"):
-                return {"summary": f"Strata is running: {info.get('model')} on http://127.0.0.1:{port}/v1 "
+                return {"summary": f"XeStrata is running: {info.get('model')} on http://127.0.0.1:{port}/v1 "
                                    "(OpenAI and Anthropic APIs; chat page at http://127.0.0.1:" + str(port) + "/)",
                         "server": {**info, "pid": p.pid}}
             if time.time() >= end:
-                return {"summary": f"Strata is loading {desc['model']} (this takes 1-3 minutes; the PC may be slow "
+                return {"summary": f"XeStrata is loading {desc['model']} (this takes 1-3 minutes; the PC may be slow "
                                    "meanwhile). Check with strata_status in a minute.",
                         "loading": {"pid": p.pid, "port": port,
                                     "last_log_line": (read_tail(log_path, 1) or [""])[-1] or None}}
@@ -1375,12 +1489,12 @@ class Tools:
                 key = s.api_key_for(port)
                 st, body = http_json(f"http://127.0.0.1:{port}/status", api_key=key, timeout=3)
                 if st == 200 and isinstance(body, dict) and body.get("busy") and not force:
-                    raise ToolError("a request is running on Strata right now; wait for it, or call strata_stop "
+                    raise ToolError("a request is running on XeStrata right now; wait for it, or call strata_stop "
                                     "with force=true to stop anyway")
                 st, body = http_json(f"http://127.0.0.1:{port}/unload", "POST", api_key=key, timeout=120)
                 unloaded = (body or {}).get("status") if isinstance(body, dict) else None
                 if st == 409 and not force:
-                    raise ToolError("Strata is busy (a request is running or queued); call again with force=true "
+                    raise ToolError("XeStrata is busy (a request is running or queued); call again with force=true "
                                     "to stop anyway")
                 proc_terminate(tracked["pid"], tracked["ident"])   # POSIX: SIGTERM = the server's own Ctrl+C path
                 clean = wait_gone(tracked["pid"], tracked["ident"], 30)
@@ -1392,7 +1506,8 @@ class Tools:
                 if gone:
                     end_group_leftovers(tracked["pid"])
                     s.save_state("server", None)
-                return {"summary": "Strata stopped" + ("" if gone else " - but its process still runs; see strata_logs")
+                return {"summary": "XeStrata stopped" + ("" if gone else
+                                                         " - but its process still runs; see strata_logs")
                                    + (" (the engine unloaded itself first)" if unloaded == "unloaded" else ""),
                         "model": tracked.get("model"), "port": port, "engine_unloaded": unloaded,
                         "ended_cleanly": clean}
@@ -1403,16 +1518,16 @@ class Tools:
                     st, body = http_json(f"http://127.0.0.1:{p}/unload", "POST", api_key=key, timeout=120)
                     r = body.get("status") if isinstance(body, dict) else None
                     if st == 409:
-                        raise ToolError("Strata is busy (a request is running); try again when it is done")
+                        raise ToolError("XeStrata is busy (a request is running); try again when it is done")
                     if st == 401:
-                        raise ToolError("Strata (started outside this MCP server) wants an API key this folder's "
+                        raise ToolError("XeStrata (started outside this MCP server) wants an API key this folder's "
                                         "configs do not have; close its window to stop it")
-                    return {"summary": f"Strata on port {p} was started outside this MCP server (its own window or a "
+                    return {"summary": f"XeStrata on port {p} was started outside this MCP server (its own window or a "
                                        f"service), so only its model was unloaded ({r}): its VRAM and RAM are free, "
                                        "but the server still listens and loads the model again on the next request. "
                                        "Close its window to end it completely.",
                             "port": p, "engine_unloaded": r}
-            return {"summary": "Strata is not running"}
+            return {"summary": "XeStrata is not running"}
 
     # ---- strata_logs
     def strata_logs(self, source=None, model=None, lines=80) -> dict:
@@ -1431,7 +1546,7 @@ class Tools:
                 raise ToolError(f"{cfg.name} names no engine log")
             path = Path(raw)
             if not s.allowed(path):
-                raise ToolError(f"{cfg.name}'s log {raw} is outside the Strata folder and its data folder: not shown")
+                raise ToolError(f"{cfg.name}'s log {raw} is outside the XeStrata folder and its data folder: not shown")
         if not path.exists():
             return {"summary": f"no {source} log yet ({path})", "log": str(path), "lines": []}
         tail = read_tail(path, lines)
@@ -1447,13 +1562,13 @@ class Tools:
                 target = info
                 break
         if target is None:
-            raise ToolError("Strata is not running: start it first (strata_start)")
+            raise ToolError("XeStrata is not running: start it first (strata_start)")
         p = target["port"]
         key = s.api_key_for(p)
         st, stat = http_json(f"http://127.0.0.1:{p}/status", api_key=key, timeout=3)
         if st == 200 and isinstance(stat, dict) and (stat.get("busy") or stat.get("queued")):
-            raise ToolError("Strata is busy with a request; run the speed test when it is idle")
-        body = {"model": target.get("model") or "strata", "max_tokens": max_tokens, "temperature": 0,
+            raise ToolError("XeStrata is busy with a request; run the speed test when it is idle")
+        body = {"model": target.get("model") or "xestrata", "max_tokens": max_tokens, "temperature": 0,
                 "reasoning_effort": "none", "stream": False,
                 "messages": [{"role": "user", "content": BENCH_PROMPT}]}
         t0 = time.time()
@@ -1490,14 +1605,14 @@ class Tools:
         if port is None:
             cfgs = s.configs()
             port = target["port"] if target else (s.describe_config(cfgs[0])["port"] if cfgs else DEFAULT_PORT)
-        model = (target or {}).get("model") or "strata"
+        model = (target or {}).get("model") or "xestrata"
         key_needed = (target or {}).get("api_key_required")
         if key_needed is None:
             key_needed = any(s.describe_config(c)["api_key_set"] for c in s.configs())
         key = "<your api_key from xestrata-<model>.json>" if key_needed else "none"
         base = f"http://127.0.0.1:{port}"
         return {
-            "summary": (f"Strata {'runs' if target else 'will run'} at {base}: OpenAI base URL {base}/v1, Anthropic "
+            "summary": (f"XeStrata {'runs' if target else 'will run'} at {base}: OpenAI base URL {base}/v1, Anthropic "
                         f"base URL {base}" + (" (an API key is required)" if key_needed else " (any API key works)")),
             "running": bool(target), "openai_base_url": f"{base}/v1", "anthropic_base_url": base,
             "anthropic_messages_endpoint": f"{base}/v1/messages", "chat_page": base + "/", "model": model,
@@ -1506,10 +1621,10 @@ class Tools:
             "examples": {
                 "claude_code": {"env": {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_AUTH_TOKEN": key,
                                         "ANTHROPIC_MODEL": "claude-sonnet-4-5"},
-                                "note": "Claude Code needs a Claude model name it knows; Strata ignores the name"},
+                                "note": "Claude Code needs a Claude model name it knows; XeStrata ignores the name"},
                 "codex_cli": {"file": "~/.codex/config.toml",
-                              "toml": f'model = "{model}"\nmodel_provider = "strata"\n\n[model_providers.strata]\n'
-                                      f'name = "Strata"\nbase_url = "{base}/v1"\nwire_api = "chat"'},
+                              "toml": f'model = "{model}"\nmodel_provider = "xestrata"\n\n[model_providers.xestrata]\n'
+                                      f'name = "XeStrata"\nbase_url = "{base}/v1"\nwire_api = "chat"'},
                 "openai_python": (f'from openai import OpenAI\nclient = OpenAI(base_url="{base}/v1", api_key="{key}")\n'
                                   f'r = client.chat.completions.create(model="{model}", messages=[{{"role": "user", '
                                   f'"content": "Hello!"}}])\nprint(r.choices[0].message.content)'),
@@ -1526,8 +1641,8 @@ class Tools:
 
 
 # ------------------------------------------------------------------------------------------------ MCP over stdio
-INSTRUCTIONS = ("Strata runs a large AI model (Qwen3.8-Flash-Next, a mixture of experts) locally on this PC's GPU and "
-                "RAM, with an OpenAI- and Anthropic-compatible server on http://127.0.0.1:8095. Call strata_status "
+INSTRUCTIONS = ("XeStrata runs a large AI model (Qwen3.8-Flash-Next, a mixture of experts) locally on this PC's GPU "
+                "and RAM, with an OpenAI- and Anthropic-compatible server on http://127.0.0.1:8095. Call strata_status "
                 "first. To install: strata_install (it returns a plan; get the user's OK for the 58-111 GB download, "
                 "then call it with confirm=true; it runs in the background - call it again for progress). Then "
                 "strata_start, strata_stop, strata_logs for problems, strata_connect_info to point other apps at it.")
@@ -1660,10 +1775,10 @@ def install_job(spec_path: str) -> int:
         if spec.get("create_venv"):
             venv = root / ".venv"
             if py.exists() and subprocess.run([str(py), "-m", "pip", "--version"], capture_output=True).returncode:
-                print("strata-mcp: .venv has no pip (an earlier run stopped half-way): making it again", flush=True)
+                print("xestrata-mcp: .venv has no pip (an earlier run stopped half-way): making it again", flush=True)
                 shutil.rmtree(venv, ignore_errors=True)
             if not py.exists():
-                print(f"strata-mcp: creating Strata's Python environment in {venv} ...", flush=True)
+                print(f"xestrata-mcp: creating XeStrata's Python environment in {venv} ...", flush=True)
                 r = subprocess.run([spec["base_python"], "-m", "venv", str(venv)])
                 if r.returncode or not py.exists():
                     print("\n  [X]  could not create the Python environment (.venv)", flush=True)
@@ -1672,23 +1787,23 @@ def install_job(spec_path: str) -> int:
                     record(exit_code=1, ended=time.strftime("%Y-%m-%d %H:%M:%S"))
                     return 1
         cmd = [str(py), str(root / "setup.py"), *spec["args"]]
-        print("strata-mcp: running " + " ".join(cmd), flush=True)
+        print("xestrata-mcp: running " + " ".join(cmd), flush=True)
         env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
         p = subprocess.Popen(cmd, cwd=str(root), stdin=subprocess.DEVNULL, env=env)
         record(child_pid=p.pid, child_ident=proc_identity(p.pid))
         rc = p.wait()
     except Exception as e:                              # noqa: BLE001
-        print(f"\n  [X]  strata-mcp could not run setup: {e}", flush=True)
+        print(f"\n  [X]  xestrata-mcp could not run setup: {e}", flush=True)
         rc = 1
-    print(f"strata-mcp: setup ended with exit code {rc}", flush=True)
+    print(f"xestrata-mcp: setup ended with exit code {rc}", flush=True)
     record(exit_code=rc, ended=time.strftime("%Y-%m-%d %H:%M:%S"))
     return rc
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Strata's MCP server (stdio): install, start, check and stop Strata "
+    ap = argparse.ArgumentParser(description="XeStrata's MCP server (stdio): install, start, check and stop XeStrata "
                                              "from an AI assistant. See docs/DETAILS.md.")
-    ap.add_argument("--root", help="the Strata folder (default: the one this file is in)")
+    ap.add_argument("--root", help="the XeStrata folder (default: the one this file is in)")
     ap.add_argument("--install-job", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     if a.install_job:
@@ -1698,12 +1813,12 @@ def main(argv=None) -> int:
         return 2
     root = Path(a.root).expanduser().resolve() if a.root else DEFAULT_ROOT
     if not (root / "setup.py").is_file() or not (root / "serve" / "server.py").is_file():
-        log(f"{root} is not a Strata folder (no setup.py / serve/server.py)")
+        log(f"{root} is not an XeStrata folder (no setup.py / serve/server.py)")
         return 2
     out = sys.stdout.buffer
     sys.stdout = sys.stderr                             # stray prints must never corrupt the protocol stream
     server = McpServer(Strata(root), out)
-    log(f"ready (Strata folder {root})")
+    log(f"ready (XeStrata folder {root})")
     try:
         server.serve(sys.stdin.buffer)
     except KeyboardInterrupt:

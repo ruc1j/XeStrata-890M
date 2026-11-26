@@ -19,15 +19,22 @@
 // multiplied element by element with the int32 tile (iq_mmq_usable checks that an int32 tile and an FP32 one hold
 // their elements in the same order).  Intel's XMX take tiles of 8 x N x 32 on N lanes instead (intel_body), RDNA3 and
 // RDNA4 their WMMA instructions.
+// The activations' blocks are q8_act.hpp's (iq_mmq_quantize).
 //
 // In a source file of its own, so its kernels are in a device image apart from the Intel-only ones.
 #include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/nvfp4.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
 #include "amd_wmma.hpp"
+#include "strata/core/graph.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/core/runtime.hpp"
+#include "strata/platform/env.hpp"
 #include "iq_bits.hpp"
+#include "bih3.hpp"
 #include "cuda_intrinsics.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_iq_mmq
 #include "strata/kernels/device_arch_tag.hpp"
@@ -35,18 +42,27 @@
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL
 #include "ggml-common.h"
+#include "device_caps.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <algorithm>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <tuple>
 #include <type_traits>
+#include <unordered_map>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
 
 namespace mx = sycl::ext::oneapi::experimental::matrix;
+namespace ix = sycl::ext::intel::experimental::matrix;
 namespace syclex = sycl::ext::oneapi::experimental;
 using namespace iq_bits;
 using u32x4 = uint32_t __attribute__((ext_vector_type(4)));   // one 16-byte access (sycl::uint4 is split on NVPTX)
@@ -175,6 +191,44 @@ template<> struct Dec<18> {   // IQ3_XXS: d (0.5 + ls) / 2
         }
         r.s0 = r.s1 = (float) b->d * (float) (2 * (aux >> 28) + 1) * 0.25f;
         return r;
+    }
+};
+// An i-quant gate/up in the fixed-point sums (canon_math.hpp's fx_*; iq_mmq_grouped's kIqMmqFx + its type, on canonical
+// activations): Dec<T>'s values, s0 the 32's integer scale and s1 the 256's d, which the FX bodies take apart; K its
+// power of two.  IQ2_XXS (2 ls + 1, K 1/8), IQ3_XXS (2 ls + 1, K 1/4), IQ3_S (1 + 2 ls, K 1).
+template<int T> struct FxOf;
+template<> struct FxOf<16> {
+    using B = block_iq2_xxs;
+    static constexpr int log2k() { return -3; }
+    static int scale(const B* b, int ib) { return (int) (2 * ((uint32_t) get_int_b2(b->qs, 2 * ib + 1) >> 28) + 1); }
+};
+template<> struct FxOf<18> {
+    using B = block_iq3_xxs;
+    static constexpr int log2k() { return -2; }
+    static int scale(const B* b, int ib) {
+        return (int) (2 * ((uint32_t) get_int_b2(b->qs, QK_K / 16 + ib) >> 28) + 1);
+    }
+};
+template<> struct FxOf<21> {
+    using B = block_iq3_s;
+    static constexpr int log2k() { return 0; }
+    static int scale(const B* b, int ib) { return 1 + 2 * ((b->scales[ib / 2] >> (4 * (ib & 1))) & 0x0F); }
+};
+template<int T> struct DecFx {
+    using F = FxOf<T>;
+    static constexpr int QK = 256, BSZ = (int) sizeof(typename F::B);
+    static constexpr int group32() { return 8; }   // the blocks of 32 a group (FXG)
+    static constexpr int fx_log2() { return F::log2k(); }
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+        Sub r = Dec<T>::get(row, sb, row_bytes);
+        const auto* b = reinterpret_cast<const typename F::B*>(row) + sb / 8;
+        r.s0 = (float) F::scale(b, sb % 8);
+        r.s1 = (float) b->d;
+        return r;
+    }
+    // the d of block b of 256 (fx_tops)
+    static float block_d(const uint8_t* row, int b) {
+        return (float) (reinterpret_cast<const typename F::B*>(row) + b)->d;
     }
 };
 template<> struct Dec<21> {   // IQ3_S: d (1 + 2 ls)
@@ -383,6 +437,23 @@ template<> struct Dec<8> {   // Q8_0: d
         return r;
     }
 };
+template<> struct Dec<2> {   // Q4_0: d (code - 8), element j in qs[j]'s low nibble, j+16 in its high (the latent D/U)
+    static constexpr int QK = 32, BSZ = (int) sizeof(block_q4_0);
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const block_q4_0* b = reinterpret_cast<const block_q4_0*>(row) + sb;
+        Sub r;
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t w = (uint32_t) get_int_b2(b->qs, j);
+            const uint32_t lo = w & 0x0F0F0F0Fu, hi = (w >> 4) & 0x0F0F0F0Fu;
+            // each nibble 0..15 -> the signed byte (code - 8): flip the sign bit, then sign-extend it into the byte
+            const uint32_t cl = lo ^ 0x08080808u, ch = hi ^ 0x08080808u;
+            r.v[j] = cl | ((cl & 0x08080808u) * 0x1Eu);
+            r.v[4 + j] = ch | ((ch & 0x08080808u) * 0x1Eu);
+        }
+        r.s0 = r.s1 = (float) b->d;
+        return r;
+    }
+};
 template<> struct Dec<14> {   // Q6_K: d scale (6-bit value - 32), a scale per 16
     static constexpr int QK = 256, BSZ = (int) sizeof(block_q6_K);
     static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
@@ -503,13 +574,35 @@ template<> struct Dec<11> {   // Q3_K: d (6-bit scale - 32) ((2-bit value | high
         Sub r;
         for (int k = 0; k < 8; ++k) {   // values 0-15 from qs[32n..] and hmask[0..], 16-31 from qs[32n + 16..]
             const int l = k < 4 ? 4 * k : 16 + 4 * (k - 4);
-            const uint32_t q = ((uint32_t) get_int_b2(b->qs + 32 * n, l / 4) >> (2 * j)) & 0x03030303u;
+            const uint32_t q = ((uint32_t) get_int_b2(b->qs + (size_t) 32 * n, l / 4) >> (2 * j)) & 0x03030303u;
             const uint32_t h = ((uint32_t) get_int_b2(b->hmask, l / 4) >> (4 * n + j)) & 0x01010101u;
             r.v[k] = (((q | (h << 2)) | 0x80808080u) - 0x04040404u) ^ 0x80808080u;
         }
         const float d = (float) b->d;
         r.s0 = d * (float) scale(b->scales, 8 * n + 2 * j);
         r.s1 = d * (float) scale(b->scales, 8 * n + 2 * j + 1);
+        return r;
+    }
+};
+// NVFP4 (nvfp4.hpp): 32 values are two 16-value sub-blocks of one block of 64, each with its UE4M3 scale (halved: the
+// table is the E2M1 values doubled).  Sub-block s's ints 2 s and 2 s + 1 hold its values 0-3 | 8-11 and 4-7 | 12-15
+// in their low | high nibbles.
+template<> struct Dec<40> {
+    static constexpr int QK = 64, BSZ = (int) sizeof(block_nvfp4);
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const block_nvfp4* b = reinterpret_cast<const block_nvfp4*>(row) + sb / 2;
+        const int s0 = 2 * (sb % 2);   // the first of the two sub-blocks
+        Sub r;
+        for (int k = 0; k < 2; ++k) {
+            const Int2 a = get_int_from_table_16(get_int_b4(b->qs, 2 * (s0 + k)), kvalues_fp4);
+            const Int2 c = get_int_from_table_16(get_int_b4(b->qs, 2 * (s0 + k) + 1), kvalues_fp4);
+            r.v[4 * k + 0] = (uint32_t) a.x;
+            r.v[4 * k + 1] = (uint32_t) c.x;
+            r.v[4 * k + 2] = (uint32_t) a.y;
+            r.v[4 * k + 3] = (uint32_t) c.y;
+        }
+        r.s0 = nvfp4::ue4m3_half(b->d[s0]);
+        r.s1 = nvfp4::ue4m3_half(b->d[s0 + 1]);
         return r;
     }
 };
@@ -527,7 +620,7 @@ template<> struct Dec<10> {
         if (sb % 2 == 0) {
             for (int k = 0; k < 8; ++k) {
                 const int l = k < 4 ? 4 * k : 16 + 4 * (k - 4);
-                r.v[k] = ((uint32_t) get_int_b4(b->qs + 32 * n, l / 4) >> (2 * j)) & 0x03030303u;
+                r.v[k] = ((uint32_t) get_int_b4(b->qs + (size_t) 32 * n, l / 4) >> (2 * j)) & 0x03030303u;
             }
             const float d = (float) b->dm[0];
             r.s0 = d * (float) (sc0 & 0x0F);
@@ -563,6 +656,35 @@ template<> struct Dec<kNativeQ6KRows> {   // Q6_K split by row (native_mmvq.hpp)
     }
 };
 
+// The gathered bih3 R1Q2 planes: three signed-byte blocks for each original block of 32. Their scale is FP32,
+// so gathering does not round the row, column or two-bit scales to FP16 a second time.
+template<> struct Dec<kBih3Planes> {
+    static constexpr int QK = 32, BSZ = 36;
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const uint8_t* block = row + (size_t) sb * BSZ;
+        Sub r;
+        for (int j = 0; j < 8; ++j) r.v[j] = (uint32_t) get_int_b4(block, j);
+        r.s0 = r.s1 = *reinterpret_cast<const float*>(block + 32);
+        return r;
+    }
+};
+
+// The gathered bih3 R1Q2 codes (kBih3Code): sub-block sb of the three-plane row is plane sb % 3 of the 32 values
+// sb / 3, decoded from the 128-value block's codes in the tile (the plane's two products of each state only): the
+// codes are 0.5 bytes a weight against kBih3Planes' 3.4.
+template<> struct Dec<kBih3Code> {
+    static constexpr int QK = 384, BSZ = 64;
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const int v = sb / 3, p = sb % 3;
+        const uint8_t* block = row + (size_t) (v / 4) * BSZ;
+        const int k = block[60], step0 = (v % 4) * 8;
+        Sub r;
+        for (int j = 0; j < 8; ++j) r.v[j] = xe::bih3_state_plane(xe::bih3_state_w(block, k, step0 + j), p);
+        r.s0 = r.s1 = *reinterpret_cast<const float*>(block + 56);
+        return r;
+    }
+};
+
 template<> struct Dec<kNativeQ8Rows> {   // Q8_0 split by row (native_mmvq.hpp): a row's qs, then its d
     static constexpr int QK = 32, BSZ = (int) sizeof(block_q8_0);
     static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
@@ -575,8 +697,64 @@ template<> struct Dec<kNativeQ8Rows> {   // Q8_0 split by row (native_mmvq.hpp):
     }
 };
 
+template<> struct Dec<kIqMmqFx + 16> : DecFx<16> {};
+template<> struct Dec<kIqMmqFx + 18> : DecFx<18> {};
+template<> struct Dec<kIqMmqFx + 21> : DecFx<21> {};
+// IQ2_XS and IQ2_S (a scale for each 16): Dec<T>'s values, s0 and s1 the halves' integer scales 2 ls + 1, m the 256's d
+// (K 1/8)
+template<int T, class B> struct DecFxHalf {
+    static constexpr int QK = 256, BSZ = (int) sizeof(B);
+    static constexpr int group32() { return 8; }   // the blocks of 32 a group (FXG)
+    static constexpr int fx_log2() { return -3; }
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+        Sub r = Dec<T>::get(row, sb, row_bytes);
+        const B* b = reinterpret_cast<const B*>(row) + sb / 8;
+        r.s0 = (float) (2 * (b->scales[sb % 8] & 0x0F) + 1);
+        r.s1 = (float) (2 * (b->scales[sb % 8] >> 4) + 1);
+        r.m = (float) b->d;
+        return r;
+    }
+    static float block_d(const uint8_t* row, int b) { return (float) (reinterpret_cast<const B*>(row) + b)->d; }
+};
+template<> struct Dec<kIqMmqFx + 17> : DecFxHalf<17, block_iq2_xs> {};
+template<> struct Dec<kIqMmqFx + 22> : DecFxHalf<22, block_iq2_s> {};
+// IQ4_NL (a down projection's, on activations with a scale for each 32): Dec<20>'s values, s0 1, s1 the block's d
+template<> struct Dec<kIqMmqFx + 20> {
+    static constexpr int QK = 32, BSZ = (int) sizeof(block_iq4_nl);
+    static constexpr int group32() { return 1; }   // the blocks of 32 a group (FXG)
+    static constexpr int fx_log2() { return 0; }
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+        Sub r = Dec<20>::get(row, sb, row_bytes);
+        r.s0 = 1.0f;
+        r.s1 = (float) (reinterpret_cast<const block_iq4_nl*>(row) + sb)->d;
+        return r;
+    }
+    static float block_d(const uint8_t* row, int b) {
+        return (float) (reinterpret_cast<const block_iq4_nl*>(row) + b)->d;
+    }
+};
+
+// Q2_0 (gate/up on a scale for each 256, down on one for each 32): Dec<42>'s values (code - 1), s0 1, s1 the 64's d; a
+// group of one block of 32, whichever its activation
+template<> struct Dec<kIqMmqFx + 42> {
+    static constexpr int QK = 64, BSZ = (int) sizeof(block_q2_0);
+    static constexpr int group32() { return 1; }   // the blocks of 32 a group (FXG)
+    static constexpr int fx_log2() { return 0; }
+    static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
+        Sub r = Dec<42>::get(row, sb, row_bytes);
+        r.s0 = 1.0f;
+        return r;
+    }
+    static float block_d(const uint8_t* row, int b) {
+        return (float) (reinterpret_cast<const block_q2_0*>(row) + b)->d;
+    }
+};
+
 template<int TY>
-constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11; }
+constexpr bool half_scales() {
+    return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11 || TY == 40 ||
+           TY == kIqMmqFx + 17 || TY == kIqMmqFx + 22;
+}
 template<int TY>
 constexpr bool has_min() { return TY == 7 || TY == 12 || TY == 13; }
 template<int TY, bool = split_dec<Dec<TY>>::value> struct GridOf { using type = uint32_t; };
@@ -586,6 +764,13 @@ constexpr int grid_bytes() {
     if constexpr (split_dec<Dec<TY>>::value) return Dec<TY>::GRID_BYTES;
     else return 0;
 }
+
+template<int TY>
+constexpr bool fx_form() {
+    return TY == kIqMmqFx + 16 || TY == kIqMmqFx + 17 || TY == kIqMmqFx + 18 || TY == kIqMmqFx + 20 ||
+           TY == kIqMmqFx + 21 || TY == kIqMmqFx + 22 || TY == kIqMmqFx + 42;
+}
+
 
 // ---------------------------------------------------------------- the products
 template<typename T>
@@ -609,13 +794,40 @@ constexpr int up128(int b) { return (b + 127) / 128 * 128; }
 // WM / (lanes / WN) of the rows, the products by dp4a.  IS: Intel's XMX shapes (1: Xe2's 8 x 16 x 32 on 16 lanes, 2:
 // Xe-HPG's 8 x 8 x 32 on 8), the same work-group and steps (intel_body); a type with a scale per 16 values keeps two
 // copies of the activations, each with the other half of every block zeroed.
-template<int TY, int SGM, int NSGM, bool DP4A = false, bool TAIL = false, int IS = 0>
+//
+// REG (with IS): the sub-group form (intel_reg_body), a sub-group a column strip of ISG outputs down all WM rows,
+// each lane decoding its own output's blocks: no work-group barrier, each sub-group reading the block's activations
+// on its own (intel_sub_group_first chooses between the two forms).  The idea is arcint's
+// (github.com/marfrit/arcint, Apache-2.0: its int8 expert products on the Arc B60 lost 46-59% with the decoded weights
+// shared through local memory, and kept them in each lane's registers).
+template<int TY, int SGM, int NSGM, bool DP4A = false, bool TAIL = false, int IS = 0, bool REG = false>
 struct Kernel {
     static constexpr int SGN = 2, NSGN = 4, NSG = NSGM * NSGN;
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
     static constexpr bool HALF = half_scales<TY>();
     static constexpr bool MIN = has_min<TY>();
+    // FX: the fixed-point sums (canon_math.hpp's fx_*): a group's FXG blocks' int32 sums times their integer scale s0
+    // (exact), then that sum times the group's fx_scale added in int64 (any order: the CPU's canonical rows give the
+    // same bits); the activations canonical (iq_mmq_quantize's canon: one fp16 scale a group), K whole
+    static constexpr bool FX = fx_form<TY>();
+    // the per-row / per-output state's type: the experts' canon fx exponent tops (int)
+    using Top = int;
+    // FX: the blocks of 32 that share one activation scale and one d (8: a 256's, gate/up; 1: IQ4_NL's, Q2_0's)
+    static constexpr int FXG = [] {
+        if constexpr (FX) return Dec<TY>::group32();
+        else return 1;
+    }();
+    static_assert(!FX || !MIN, "the fixed-point sums take no min");
+    // FX with a scale for each 16 (HALF): the halves' integer scales in the weights' two scale slots, the group's d in
+    // the min's (wml, Sub::m)
+    static constexpr bool FXH = FX && HALF;
     static constexpr int ISG = IS == 1 ? 16 : IS == 2 ? 8 : SG;   // the sub-group size, and Intel's tile width
+    static constexpr int LANES = REG ? WN : NSG * SG;              // the work-group: REG, WN / ISG sub-groups
+    // K in parts (launch's ksplit) is for a product of at most kIqMmqSplitRows rows, which a tile of more rows never
+    // is given: such a tile's RDNA body is compiled without the parts, K whole from 0 and the values straight into
+    // dst (XeStrata-890M: the 128-row tile of the dense projections, whose body with the parts' bounds and their way
+    // out in it was 30 to 60% slower on the 890M)
+    static constexpr bool PARTS = WM <= kIqMmqSplitRows;
     static constexpr int A_N = IS != 0 && HALF ? 2 : 1;           // copies of the activations' tile
     // MIN: the activations' block sums as [block][row] and the weights' min terms as [block][output] after the rest
     // The output staging tile (ST) last: the WMMA body writes its accumulators straight out and does without it
@@ -624,8 +836,14 @@ struct Kernel {
     // after it, 36 KB and one work-group for the 64-row tile, was faster still: 1.65 -> 1.61 ms, 16 rows 0.71 -> 0.65)
     static constexpr int A_OFF = 0, B_OFF = up128(A_OFF + A_N * WM * LDA), XS_OFF = up128(B_OFF + WN * LDB),
                          WS_OFF = up128(XS_OFF + NB * WM * 4), XU_OFF = up128(WS_OFF + 2 * NB * WN * 4),
-                         WM_OFF = up128(XU_OFF + NB * WM * 4), ST_OFF = MIN ? up128(WM_OFF + NB * WN * 4) : XU_OFF,
-                         LOCAL_DIRECT = ST_OFF, LOCAL = up128(ST_OFF + NSG * TM * TN * 4);
+                         WM_OFF = up128(XU_OFF + NB * WM * 4),
+                         // REG: a sub-group's B tiles, and on 8 lanes its A tiles
+                         SG_LOCAL = (HALF ? 2 : 1) * 32 * ISG + (IS == 1 ? 0 : WM * 32),
+                         // FX: the rows' and the outputs' tops (fx_tops) past what the body uses (FXH: the d's
+                         // in the min's slot)
+                         FX_OFF = FXH ? up128(WM_OFF + NB * WN * 4) : XU_OFF,
+                         ST_OFF = MIN ? up128(WM_OFF + NB * WN * 4) : FX ? up128(FX_OFF + (WM + WN) * 4) : XU_OFF,
+                         LOCAL_DIRECT = ST_OFF, LOCAL = REG ? WN / ISG * SG_LOCAL : up128(ST_OFF + NSG * TM * TN * 4);
     // RDNA's body (LOCAL_DIRECT) keeps the type's grid table in local memory after the rest (XeStrata-890M): the
     // decode's second loads (the grid's pairs, behind the block's bytes) from there instead of global memory
     static constexpr int GRID_BYTES = grid_bytes<TY>();
@@ -643,15 +861,61 @@ struct Kernel {
     int64_t ld_dst, tiles_m, tiles_n;
     sycl::local_accessor<uint8_t, 1> lm;
     bool hdst = false;   // the rows go out as FP16 (dst then holds halves, ld_dst halves apart): STRATA_PF_DM16
+    // K in ksplit parts of kspan values (launch's), a work-group each, each part's sums into part[ks][row][col] (n_out
+    // columns), which launch adds up in order; part null: one part, the sums straight into dst
+    int64_t ksplit = 1, kspan = 0;
+    float* part = nullptr;
+    int64_t total_rows = 0, n_out = 0;
 
+    // one value into dst, as FP16 where the rows go out so (hdst)
     void put(int64_t i, float v) const {
         if (hdst) reinterpret_cast<sycl::half*>(dst)[i] = sycl::half(v);
         else dst[i] = v;
     }
+    void out(int64_t ks, int64_t row, int64_t col, float v) const {
+        if (part != nullptr) part[(ks * total_rows + row) * n_out + col] = v;
+        else put((int64_t) ids[row] * ld_dst + col, v);
+    }
 
-    void dp4a_body(sycl::nd_item<1> it) const {
+    // FX: the tile's rows' tops (the largest exponent of their scales, one each FXG blocks) into ta, its outputs' (of
+    // their blocks' d) into tw, over the whole of K: canon_math.hpp's top of row and output is ta + tw.  The step
+    // loop's first barrier publishes them.
+    void fx_tops(int lid, int lanes, int64_t row0, int64_t rows, int64_t m0, int64_t n0, const uint8_t* wx, int* ta,
+                 int* tw) const {
+        const int64_t kb = K / 32;
+        for (int rr = lid; rr < WM; rr += lanes) {
+            int t = canon::kFxNone;
+            if (m0 + rr < rows)
+                for (int64_t b = 0; b < kb; b += FXG) t = sycl::max(t, canon::fx_exp(xs[(row0 + m0 + rr) * kb + b]));
+            ta[rr] = m0 + rr < rows ? canon::fx_row_top(canon::fx_exp(xs[(row0 + m0 + rr) * kb]), t) : t;
+        }
+        if (tw == nullptr) return;
+        for (int nn = lid; nn < WN; nn += lanes) tw[nn] = fx_wtop(wx + (size_t) (n0 + nn) * row_bytes);
+    }
+    // FX: an output's top (of its blocks' d) over the whole of K, its weights' row at wr
+    Top fx_wtop(const uint8_t* wr) const {
+        int t = canon::kFxNone;
+        for (int64_t b = 0; b < K / Dec<TY>::QK; ++b) t = sycl::max(t, canon::fx_exp(Dec<TY>::block_d(wr, (int) b)));
+        return canon::fx_row_top(canon::fx_exp(Dec<TY>::block_d(wr, 0)), t);
+    }
+    // FX: a group's integer scale from its activation scale and its d at a row and output's top
+    static int32_t fx_a(float xsv, float wd, int top) {
+        return canon::fx_scale(canon::fx_part(xsv), canon::fx_part(wd), top);
+    }
+    // FX: block b's group d of output column `col` in the tile (FXH: the min's slot)
+    static float fx_wd(const float* wsl, const float* wml, int b, int col) {
+        if constexpr (FXH) return wml[b * WN + col];
+        else return wsl[(2 * b + 1) * WN + col];
+    }
+    static float fx_out(int64_t sum, int top) {
+        if constexpr (FX) return canon::fx_value(sum, top, Dec<TY>::fx_log2());
+        else return 0.0f;
+    }
+
+    void dp4a_body(sycl::nd_item<1> it, int64_t ks) const {
         constexpr int lanes = NSG * SG, RSTEP = lanes / WN, RPT = WM / RSTEP;
-        const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
+        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, per = tiles_m * tiles_n, e = g / per,
+                      r = g % per;
         const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
         const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
         if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
@@ -666,8 +930,25 @@ struct Kernel {
         float* wsl = local_as<float>(base + WS_OFF).get();
         float acc[RPT];
         for (int i = 0; i < RPT; ++i) acc[i] = 0.0f;
+        [[maybe_unused]] int32_t isum[FX ? RPT : 1];
+        [[maybe_unused]] int64_t acc64[FX ? RPT : 1];
+        [[maybe_unused]] Top* ta = local_as<Top>(base + FX_OFF).get();
+        // FX: this work-item's output's top in a register, not through local memory: in the B70's DP4a kernel (IGC
+        // 2.41.16) every output's top read there differed from the same computed again from global memory, while
+        // the rows' tops and the scales there were right, and every fixed-point check of iq_mmq_parity failed with
+        // XESTRATA_NO_XMX=1 (2026-11-16; the RTX 4070's and the RX 9060 XT's DP4a and the B70's XMX were right).
+        // Its own column's: K / QK d's
+        [[maybe_unused]] Top twn = (Top) canon::kFxNone;
+        if constexpr (FX) {
+            for (int i = 0; i < RPT; ++i) {
+                isum[i] = 0;
+                acc64[i] = 0;
+            }
+            fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, nullptr);
+            twn = fx_wtop(wx + (size_t) (n0 + n) * row_bytes);
+        }
         const int64_t kb = K / 32;   // activation scales a row
-        for (int64_t k0 = 0; k0 < K; k0 += KC) {
+        for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
             sycl::group_barrier(it.get_group());   // the last step's tiles are read
             const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
             for (int v = lid; v < WM * (KC / 16); v += lanes) {
@@ -692,7 +973,7 @@ struct Kernel {
                 o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
                 wsl[(2 * b) * WN + nn] = d.s0;
                 wsl[(2 * b + 1) * WN + nn] = d.s1;
-                if constexpr (MIN) wml[b * WN + nn] = d.m;
+                if constexpr (MIN || FXH) wml[b * WN + nn] = d.m;
             }
             sycl::group_barrier(it.get_group());
             for (int b = 0; b < NB; ++b) {
@@ -706,30 +987,43 @@ struct Kernel {
                     int s0 = 0, s1 = 0;
                     for (int j = 0; j < 4; ++j) s0 = xe::dp4a(ap[j], wv[j], s0);
                     for (int j = 4; j < 8; ++j) s1 = xe::dp4a(ap[j], wv[j], s1);
+                    if constexpr (FX) {   // ws0 (ws1 FXH: the second 16's) the integer scale
+                        isum[i] += FXH ? (int32_t) ws0 * s0 + (int32_t) ws1 * s1 : (int32_t) ws0 * (s0 + s1);
+                        if ((k0 / 32 + b) % FXG == FXG - 1) {
+                            acc64[i] += (int64_t) fx_a(xsl[b * WM + rr], fx_wd(wsl, wml, b, n), ta[rr] + twn) *
+                                            isum[i];
+                            isum[i] = 0;
+                        }
+                        continue;
+                    }
                     acc[i] += xsl[b * WM + rr] * (ws0 * (float) s0 + ws1 * (float) s1);
                     if constexpr (MIN) acc[i] -= wml[b * WN + n] * xul[b * WM + rr];
                 }
             }
         }
         for (int i = 0; i < RPT; ++i) {
-            const int64_t row = m0 + rbase + (int64_t) i * RSTEP;
-            if (row < rows) put((int64_t) ids[row0 + row] * ld_dst + n0 + n, acc[i]);
+            const int rr = rbase + i * RSTEP;
+            const int64_t row = m0 + rr;
+            float v = acc[i];
+            if constexpr (FX) v = fx_out(acc64[i], ta[rr] + twn);
+            if (row < rows) out(ks, row0 + row, n0 + n, v);
         }
     }
 
     // Intel's XMX: the sub-groups split the WM x WN tile into 8 x ISG tiles, a column of them each (TPS tiles down its
     // row group's rows).  The weights' words go to local memory in Intel's VNNI order, [K / 4][output] (a word is 4 K
     // values of one output, as Dec gives them); a block of 32 is one product.  An 8 x N accumulator gives each lane one
-    // column, its element i in row i (Xe's DPAS layout, as qsa_prompt_attn takes it; intel_layout_ok checks it at the
+    // column, its element i in row i (Xe's DPAS layout, as flash_attn's selection form takes it; intel_layout_ok checks it at the
     // start), so the scales are applied by element order: asking each element its coordinates cost more than the
     // products there.
-    void intel_body(sycl::nd_item<1> it) const {
+    void intel_body(sycl::nd_item<1> it, int64_t ks) const {
 #if STRATA_IQ_MMQ_INTEL
         constexpr int IM = 8, IK = 32, IN = ISG;
         constexpr int NT = WN / IN, NSUB = NSG * SG / ISG, RG = NSUB / NT, TPS = WM / IM / RG;
         static_assert(NSUB % NT == 0 && (WM / IM) % RG == 0, "the tiles split evenly over the sub-groups");
         constexpr int LDBV = WN * 4;   // a VNNI row: 4 K values of every output
-        const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
+        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, per = tiles_m * tiles_n, e = g / per,
+                      r = g % per;
         const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
         const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
         if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
@@ -753,9 +1047,21 @@ struct Kernel {
         for (int t = 0; t < TPS; ++t)
             for (int i = 0; i < IM; ++i) acc[t][i] = 0.0f;
         mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, IM, IN> ci;
+        [[maybe_unused]] int32_t isum[FX ? TPS : 1][IM];
+        [[maybe_unused]] int64_t acc64[FX ? TPS : 1][IM];
+        [[maybe_unused]] Top* ta = local_as<Top>(base + FX_OFF).get();
+        [[maybe_unused]] Top* tw = ta + WM;
+        if constexpr (FX) {
+            for (int t = 0; t < TPS; ++t)
+                for (int i = 0; i < IM; ++i) {
+                    isum[t][i] = 0;
+                    acc64[t][i] = 0;
+                }
+            fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+        }
 
         const int64_t kb = K / 32;   // activation scales a row
-        for (int64_t k0 = 0; k0 < K; k0 += KC) {
+        for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
             sycl::group_barrier(it.get_group());   // the last step's tiles are read
             const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
             for (int v = lid; v < WM * (KC / 16); v += lanes) {
@@ -791,7 +1097,7 @@ struct Kernel {
                 for (int j = 0; j < 8; ++j) bw[(b * 8 + j) * WN + nn] = d.v[j];
                 wsl[(2 * b) * WN + nn] = d.s0;
                 wsl[(2 * b + 1) * WN + nn] = d.s1;
-                if constexpr (MIN) wml[b * WN + nn] = d.m;
+                if constexpr (MIN || FXH) wml[b * WN + nn] = d.m;
             }
             sycl::group_barrier(it.get_group());
             for (int b = 0; b < NB; ++b) {
@@ -806,6 +1112,14 @@ struct Kernel {
                         mx::joint_matrix_mad(sg, ci, a, bm, ci);
                         const float* xr = xsl + static_cast<ptrdiff_t>(b * WM + rs + t * IM);
                         int i = 0;
+                        if constexpr (FX) {   // ws: the lane's column's integer scale
+                            const int32_t cw = (int32_t) ws;
+                            mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
+                                isum[t][i] += cw * c;
+                                ++i;
+                            });
+                            continue;
+                        }
                         // the int32 sum converted by one instruction (exact_float's two are for NVIDIA's slow
                         // conversion) and added in one fma: B70, Ornith Q4_K_M at 256 rows an expert 988 -> 898 us
                         mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
@@ -814,6 +1128,17 @@ struct Kernel {
                         });
                     }
                 }
+                if constexpr (FX)
+                    if ((k0 / 32 + b) % FXG == FXG - 1) {   // into int64 (lane: column, element i: row)
+                        [[maybe_unused]] const float wd = fx_wd(wsl, wml, b, cs + lane);
+                        [[maybe_unused]] const Top twl = tw[cs + lane];
+                        for (int t = 0; t < TPS; ++t)
+                            for (int i = 0; i < IM; ++i) {
+                                const int rr = rs + t * IM + i;
+                                acc64[t][i] += (int64_t) fx_a(xsl[b * WM + rr], wd, ta[rr] + twl) * isum[t][i];
+                                isum[t][i] = 0;
+                            }
+                    }
                 if constexpr (MIN) {   // less the weights' min of the lane's column times each row's sum
                     const float wmn = wml[b * WN + cs + lane];
                     for (int t = 0; t < TPS; ++t)
@@ -824,23 +1149,212 @@ struct Kernel {
         for (int t = 0; t < TPS; ++t)
             for (int i = 0; i < IM; ++i) {
                 const int64_t row = m0 + rs + (int64_t) t * IM + i;
-                if (row < rows) put((int64_t) ids[row0 + row] * ld_dst + n0 + cs + lane, acc[t][i]);
+                float v = acc[t][i];
+                if constexpr (FX) v = fx_out(acc64[t][i], ta[rs + t * IM + i] + tw[cs + lane]);
+                if (row < rows) out(ks, row0 + row, n0 + cs + lane, v);
             }
 #else
         (void) it;
+        (void) ks;
 #endif
     }
 
+    // REG: sub-group j takes the outputs [j ISG, (j + 1) ISG) of the work-group's WN, all its WM rows as TPS tiles of
+    // 8.  Each lane decodes its own output's block of 32 (Dec) and writes its words into the sub-group's own B tile in
+    // local memory, which the sub-group loads back (no work-group barrier; a B tile written by joint_matrix_apply lost
+    // the B70); a type with a scale per 16 values takes two B tiles, each with the other half zeroed.  The activations'
+    // tiles come from global memory or through local memory (below), their scales read by lane (row j ISG + l in
+    // lane l) and given to each element by select_from_group.
+    void intel_reg_body(sycl::nd_item<1> it, int64_t ks) const {
+#if STRATA_IQ_MMQ_INTEL
+        constexpr int IM = 8, IK = 32, IN = ISG, TPS = WM / IM, XR = (WM + IN - 1) / IN;
+        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, per = tiles_m * tiles_n, e = g / per,
+                      r = g % per;
+        const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
+        const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
+        if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
+        const auto sg = it.get_sub_group();
+        const int sgid = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int64_t col = n0 + (int64_t) sgid * IN + lane;
+        const uint8_t* wx = (wtab != nullptr ? wtab[e] + woff : w + (size_t) e * expert_bytes) + (size_t) col * row_bytes;
+        constexpr int NH = HALF ? 2 : 1;   // B tiles a block
+        // the sub-group's local memory: its B tiles, then its rows' A tiles of the block (SG_LOCAL bytes)
+        const auto mine = lm.template get_multi_ptr<sycl::access::decorated::no>() + static_cast<int>(sgid * SG_LOCAL);
+        const auto bp = local_as<int8_t>(mine);
+        uint32_t* bw = local_as<uint32_t>(mine).get();
+        const auto ap = local_as<int8_t>(mine + NH * IK * IN);
+        [[maybe_unused]] u32x4* aw = local_as<u32x4>(mine + NH * IK * IN).get();
+        [[maybe_unused]] const auto gx =
+            sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                const_cast<int8_t*>(xq));
+        const int64_t live = sycl::min<int64_t>(rows - m0, (int64_t) WM);   // the tile's rows of this expert
+        const int tiles = (int) ((live + IM - 1) / IM);
+
+        float acc[TPS][IM];
+        for (int t = 0; t < TPS; ++t)
+            for (int i = 0; i < IM; ++i) acc[t][i] = 0.0f;
+        mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, IM, IN> ci;
+
+        const int64_t kb = K / 32;
+        // FX: the lane's output's top and its rows' (row j IN + l in lane l), the sums as in intel_body
+        [[maybe_unused]] int32_t isum[FX ? TPS : 1][IM];
+        [[maybe_unused]] int64_t acc64[FX ? TPS : 1][IM];
+        [[maybe_unused]] Top ta_r[XR];
+        [[maybe_unused]] Top twl = (Top) canon::kFxNone;
+        if constexpr (FX) {
+            for (int t = 0; t < TPS; ++t)
+                for (int i = 0; i < IM; ++i) {
+                    isum[t][i] = 0;
+                    acc64[t][i] = 0;
+                }
+            for (int64_t b = 0; b < K / Dec<TY>::QK; ++b)
+                twl = sycl::max(twl, (Top) canon::fx_exp(Dec<TY>::block_d(wx, (int) b)));
+            twl = (Top) canon::fx_row_top(canon::fx_exp(Dec<TY>::block_d(wx, 0)), twl);
+            for (int j = 0; j < XR; ++j) {
+                const int64_t rr = (int64_t) j * IN + lane;
+                ta_r[j] = (Top) canon::kFxNone;
+                if (rr < live) {
+                    for (int64_t b = 0; b < kb; b += FXG)
+                        ta_r[j] = sycl::max(ta_r[j], (Top) canon::fx_exp(xs[(row0 + m0 + rr) * kb + b]));
+                    ta_r[j] = (Top) canon::fx_row_top(canon::fx_exp(xs[(row0 + m0 + rr) * kb]), ta_r[j]);
+                }
+            }
+        }
+        const int64_t b0 = ks * kspan / 32, b1 = sycl::min(K, (ks + 1) * kspan) / 32;
+        for (int64_t b = b0; b < b1; ++b) {
+            const Sub d = Dec<TY>::get(wx, (int) b, row_bytes);
+            float xr[XR];
+            [[maybe_unused]] float xu_r[XR];
+            for (int j = 0; j < XR; ++j) {
+                const int64_t rr = (int64_t) j * IN + lane;
+                const bool in = rr < live;
+                xr[j] = in ? xs[(row0 + m0 + rr) * kb + b] : 0.0f;
+                if constexpr (MIN) xu_r[j] = in ? xu[(row0 + m0 + rr) * kb + b] : 0.0f;
+            }
+            mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, IK, IN, mx::layout::ext_intel_packed> bm[NH];
+            sycl::group_barrier(sg);   // the last block's tiles are loaded
+            for (int h = 0; h < NH; ++h)
+                for (int j = 0; j < 8; ++j) bw[(h * 8 + j) * IN + lane] = !HALF || j / 4 == h ? d.v[j] : 0u;
+            // A: on 16 lanes (Xe2) a bounds-checked tile load from global memory (zeros past the last row; Xe2's
+            // block reads: B70, llm-jp-4.1 Q4_K_M at 32 rows an expert 426 us, against 592 with a plain load and 653
+            // through local memory); on 8 (Xe-HPG), whose compile refuses the checked load (the A380: it failed the
+            // build of every int8 XMX kernel), the rows' 32 values of the block copied into local memory, 16 bytes a
+            // lane, zeros past the last row
+            if constexpr (IS != 1)
+                for (int c = lane; c < tiles * IM * 2; c += IN) {
+                    const int64_t row = row0 + m0 + c / 2;
+                    aw[c] = row < total_rows ? *reinterpret_cast<const u32x4*>(xq + row * K + b * IK + c % 2 * 16)
+                                             : u32x4{0u, 0u, 0u, 0u};
+                }
+            sycl::group_barrier(sg);
+            for (int h = 0; h < NH; ++h)
+                mx::joint_matrix_load(sg, bm[h], bp + static_cast<int>(h * 8 * IN * 4), IN * 4);
+            for (int t = 0; t < TPS; ++t) {
+                if (t >= tiles) break;
+                mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, IM, IK, mx::layout::row_major> a;
+                if constexpr (IS == 1)
+                    ix::joint_matrix_load_checked(sg, a, gx, (size_t) K, (size_t) total_rows, (size_t) K,
+                                                  (size_t) (row0 + m0 + (int64_t) t * IM), (size_t) (b * IK));
+                else
+                    mx::joint_matrix_load(sg, a, ap + static_cast<int>(t * IM * IK), IK);
+                for (int h = 0; h < NH; ++h) {
+                    const float ws = h == 1 ? d.s1 : d.s0;
+                    mx::joint_matrix_fill(sg, ci, 0);
+                    mx::joint_matrix_mad(sg, ci, a, bm[h], ci);
+                    int i = 0;
+                    if constexpr (FX) {   // d.s0: the lane's output's integer scale
+                        const int32_t cw = (int32_t) (h == 1 ? d.s1 : d.s0);
+                        mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
+                            isum[t][i] += cw * c;
+                            ++i;
+                        });
+                        continue;
+                    }
+                    mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
+                        const int rr = t * IM + i;
+                        const float x = sycl::select_from_group(sg, xr[rr / IN], rr % IN);
+                        acc[t][i] = sycl::fma(ws * x, static_cast<float>(c), acc[t][i]);
+                        ++i;
+                    });
+                }
+            }
+            if constexpr (MIN) {   // less the weights' min of the lane's column times each row's sum
+                for (int t = 0; t < TPS; ++t)
+                    for (int i = 0; i < IM; ++i) {
+                        const int rr = t * IM + i;
+                        acc[t][i] -= d.m * sycl::select_from_group(sg, xu_r[rr / IN], rr % IN);
+                    }
+            }
+            if constexpr (FX)
+                if (b % FXG == FXG - 1)   // the group's sums into int64 (d.s1: its d)
+                    for (int t = 0; t < TPS; ++t) {
+                        if (t >= tiles) break;
+                        for (int i = 0; i < IM; ++i) {
+                            const int rr = t * IM + i;
+                            const float x = sycl::select_from_group(sg, xr[rr / IN], rr % IN);
+                            const Top tr = sycl::select_from_group(sg, ta_r[rr / IN], rr % IN);
+                            acc64[t][i] += (int64_t) fx_a(x, FXH ? d.m : d.s1, tr + twl) * isum[t][i];
+                            isum[t][i] = 0;
+                        }
+                    }
+        }
+        for (int t = 0; t < TPS; ++t)
+            for (int i = 0; i < IM; ++i) {
+                const int64_t row = m0 + (int64_t) t * IM + i;
+                float v = acc[t][i];
+                if constexpr (FX) {
+                    const int rr = t * IM + i;
+                    v = fx_out(acc64[t][i], sycl::select_from_group(sg, ta_r[rr / IN], rr % IN) + twl);
+                }
+                if (row < rows) out(ks, row0 + row, col, v);
+            }
+#else
+        (void) it;
+        (void) ks;
+#endif
+    }
+
+    // the work-group's part of K, one a work-group.  K whole (every launch but a few rows' with the parts' buffer)
+    // straight with the constant part: through the parts' index, every launch of the experts' products ran slower on
+    // the B70 (Qwen3.6-35B-A3B UD-Q4_K_XL's 1K prompt 3012 -> 2885 tok/s, 2026-11-12), and the Q4_K and Q5_K WMMA
+    // bodies of 32 rows a tile spilled 60 to 65 VGPRs on the RX 9060 XT (none with the constant).  Never a run of
+    // parts a work-group: a loop over them around the bodies made AMD's compiler keep their addresses live across it,
+    // and the WMMA bodies spilled up to 106 VGPRs (the few rows' products of MOSS-Image's text encoder at 16 and 64
+    // rows 0.54 -> 0.97 ms, 2026-11-12; 0.61 without the loop).  Without it the Q2_K bodies take 203 VGPRs, not 239,
+    // and run a little slower on the RX 9060 XT (Ornith-1.5-35B-A3B GSQ-RCO 3bit's 1K prompt 1519 -> 1472 tok/s,
+    // 2026-11-13): the loop's registers, not its work, had made them faster
     void body(sycl::nd_item<1> it) const {
+        if constexpr (!PARTS) {
+            part_body(it, 0);
+        } else if constexpr (STRATA_AMD_GFX1150) {
+            // gfx1150: one copy of the body.  With the two below its int8 products of 64 rows an expert and more were
+            // 12% slower (iq_mmq_parity --bench on the 890M, IQ3_XXS: 1.49 -> 1.68 ms at 64 rows, 5.38 -> 6.11 at
+            // 256) and the 128-row IQ2_XS tile spilled 148 registers
+            part_body(it, ksplit == 1 ? 0 : (int64_t) it.get_group(0) % ksplit);
+        } else {
+            if (ksplit == 1) part_body(it, 0);
+            else part_body(it, (int64_t) it.get_group(0) % ksplit);
+        }
+    }
+
+    // Inlined at both of body's calls: with two calls NVIDIA's compiler kept it a function of its own, every kernel
+    // calling it with the kernel's fields on the stack (192 to 320 bytes), and the slower int8 products made the
+    // RTX 4070's prompts take FP16 from 609 rows an expert and chunks of half the tokens (Qwen3.8-Flash-Next
+    // IQ3_XXS's 32K 1244 -> 886 tok/s, 2026-11-13)
+    __attribute__((always_inline)) void part_body(sycl::nd_item<1> it, int64_t ks) const {
         if constexpr (DP4A) {
-            dp4a_body(it);
+            dp4a_body(it, ks);
+        } else if constexpr (IS != 0 && REG) {
+            intel_reg_body(it, ks);
         } else if constexpr (IS != 0) {
-            intel_body(it);
+            intel_body(it, ks);
         } else if constexpr (!built<TY>()) {
             (void) it;
+            (void) ks;
         } else {
 #if STRATA_IQ_MMQ_MATRIX
-            const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
+            const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, per = tiles_m * tiles_n, e = g / per,
+                      r = g % per;
             const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
             const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
             if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
@@ -869,9 +1383,27 @@ struct Kernel {
             mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, TM, TN> ci[SGM][SGN];
             for (int i = 0; i < SGM; ++i)
                 for (int j = 0; j < SGN; ++j) mx::joint_matrix_fill(sg, acc[i][j], 0.0f);
+            // FX: a group's int32 sums as tiles (each block's times its integer scale, a tile of the outputs' loaded
+            // with stride 0), then through the sub-group's staging tile into int64 sums a lane holds by position
+            // (element q = lane + SG k of the tile): the tiles do not say where their elements sit
+            constexpr int FQ = TM * TN / SG;
+            [[maybe_unused]] mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, TM, TN>
+                fxs[FX ? SGM : 1][FX ? SGN : 1];
+            [[maybe_unused]] int64_t acc64[FX ? SGM : 1][FX ? SGN : 1][FX ? FQ : 1];
+            [[maybe_unused]] Top* ta = local_as<Top>(base + FX_OFF).get();
+            [[maybe_unused]] Top* tw = ta + WM;
+            [[maybe_unused]] const auto sti = local_as<int32_t>(base + ST_OFF) + static_cast<int>(sgid * TM * TN);
+            if constexpr (FX) {
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < SGN; ++j) {
+                        mx::joint_matrix_fill(sg, fxs[i][j], 0);
+                        for (int k = 0; k < FQ; ++k) acc64[i][j][k] = 0;
+                    }
+                fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+            }
 
             const int64_t kb = K / 32;   // activation scales a row
-            for (int64_t k0 = 0; k0 < K; k0 += KC) {
+            for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
                 sycl::group_barrier(it.get_group());   // the last step's tiles are read
                 const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
                 for (int v = lid; v < WM * (KC / 16); v += lanes) {
@@ -896,13 +1428,15 @@ struct Kernel {
                     o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
                     wsl[(2 * b) * WN + nn] = d.s0;
                     wsl[(2 * b + 1) * WN + nn] = d.s1;
-                    if constexpr (MIN) wml[b * WN + nn] = d.m;
+                    if constexpr (MIN || FXH) wml[b * WN + nn] = d.m;
                 }
                 sycl::group_barrier(it.get_group());
                 for (int b = 0; b < NB; ++b) {
                     mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> xsf[SGM];
-                    for (int i = 0; i < SGM; ++i)   // element (r, c): the scale of row r
-                        mx::joint_matrix_load(sg, xsf[i], xsp + static_cast<int>(b * WM + ms + i * TM), 0, mx::layout::col_major);
+                    if constexpr (!FX)
+                        for (int i = 0; i < SGM; ++i)   // element (r, c): the scale of row r
+                            mx::joint_matrix_load(sg, xsf[i], xsp + static_cast<int>(b * WM + ms + i * TM), 0,
+                                                  mx::layout::col_major);
                     for (int h = 0; h < (HALF ? 2 : 1); ++h) {
                         for (int i = 0; i < SGM; ++i)
                             for (int j = 0; j < SGN; ++j) mx::joint_matrix_fill(sg, ci[i][j], 0);
@@ -916,6 +1450,21 @@ struct Kernel {
                             for (int i = 0; i < SGM; ++i)
                                 for (int j = 0; j < SGN; ++j) mx::joint_matrix_mad(sg, ci[i][j], a[i], bm[j], ci[i][j]);
                         }
+                        if constexpr (FX) {
+                            for (int j = 0; j < SGN; ++j) {
+                                // element (r, c): the integer scale of column c
+                                mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> sc;
+                                mx::joint_matrix_load(sg, sc, wsp + static_cast<int>((2 * b + h) * WN + ns + j * TN), 0,
+                                                      mx::layout::row_major);
+                                for (int i = 0; i < SGM; ++i) {
+                                    mx::joint_matrix_apply(sg, ci[i][j], sc,
+                                                           [](int32_t& c, float& w) { c *= (int32_t) w; });
+                                    mx::joint_matrix_apply(sg, fxs[i][j], ci[i][j],
+                                                           [](int32_t& a, int32_t& c) { a += c; });
+                                }
+                            }
+                            continue;
+                        }
                         for (int j = 0; j < SGN; ++j)
                             for (int i = 0; i < SGM; ++i) {
                                 // the pair of scales (r, c): the weights' of column c along each row, times the row's
@@ -927,6 +1476,21 @@ struct Kernel {
                                 mx::joint_matrix_apply(sg, acc[i][j], sc, [](float& a, float& s) { a += s; });
                             }
                     }
+                    if constexpr (FX)
+                        if ((k0 / 32 + b) % FXG == FXG - 1)   // the group's sums out by position, into int64
+                            for (int i = 0; i < SGM; ++i)
+                                for (int j = 0; j < SGN; ++j) {
+                                    mx::joint_matrix_store(sg, fxs[i][j], sti, TN, mx::layout::row_major);
+                                    sycl::group_barrier(sg);
+                                    for (int k = 0; k < FQ; ++k) {
+                                        const int q = lane + SG * k, rr = ms + i * TM + q / TN;
+                                        [[maybe_unused]] const int nn = ns + j * TN + q % TN;
+                                        acc64[i][j][k] += (int64_t) fx_a(xsl[b * WM + rr], fx_wd(wsl, wml, b, nn),
+                                                                             ta[rr] + tw[nn]) * sti[q];
+                                    }
+                                    sycl::group_barrier(sg);
+                                    mx::joint_matrix_fill(sg, fxs[i][j], 0);
+                                }
                     if constexpr (MIN)   // less the weights' min of column c times row r's sum
                         for (int i = 0; i < SGM; ++i) {
                             mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> xuf;
@@ -942,6 +1506,17 @@ struct Kernel {
                         }
                 }
             }
+            if constexpr (FX) {   // straight out of the lanes' int64 sums
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < SGN; ++j)
+                        for (int k = 0; k < FQ; ++k) {
+                            const int q = lane + SG * k, rr = ms + i * TM + q / TN, nn = ns + j * TN + q % TN;
+                            float v;
+                            v = fx_out(acc64[i][j][k], ta[rr] + tw[nn]);
+                            if (m0 + rr < rows) out(ks, row0 + m0 + rr, n0 + nn, v);
+                        }
+                return;
+            }
             // out through local memory, the rows past the expert's last not written
             for (int i = 0; i < SGM; ++i)
                 for (int j = 0; j < SGN; ++j) {
@@ -950,7 +1525,7 @@ struct Kernel {
                     const int64_t rb = m0 + ms + (int64_t) i * TM, cb = n0 + ns + (int64_t) j * TN;
                     for (int q = lane; q < TM * TN; q += SG) {
                         const int64_t row = rb + q / TN;
-                        if (row < rows) put((int64_t) ids[row0 + row] * ld_dst + cb + q % TN, stp[q]);
+                        if (row < rows) out(ks, row0 + row, cb + q % TN, stp[q]);
                     }
                     sycl::group_barrier(sg);
                 }
@@ -960,7 +1535,8 @@ struct Kernel {
             // the accumulator's rows 8 (l / 16) + e.  GFX11: each lane all 16 K values (lanes 16-31 repeat 0-15), the
             // accumulator's rows 2 e + l / 16.  The same products and scales as the joint_matrix body above, in the
             // positions those layouts give.
-            const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
+            const int64_t gk = (int64_t) it.get_group(0), g = PARTS ? gk / ksplit : gk, per = tiles_m * tiles_n,
+                      e = g / per, r = g % per;
             const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
             const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
             if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
@@ -988,20 +1564,43 @@ struct Kernel {
             [[maybe_unused]] float* xul = local_as<float>(base + XU_OFF).get();
             [[maybe_unused]] float* wml = local_as<float>(base + WM_OFF).get();
             float* wsl = local_as<float>(base + WS_OFF).get();
-            using i8v = int __attribute__((ext_vector_type(8)));
-#if defined(__GFX12__)
-            using frag = int __attribute__((ext_vector_type(2)));
-            constexpr int KOFF = 8;   // bytes of K a lane holds past its half's start
-            auto row_of = [&](int el) { return hi * 8 + el; };
-#else
-            using frag = int __attribute__((ext_vector_type(4)));
-            constexpr int KOFF = 0;
-            auto row_of = [&](int el) { return el * 2 + hi; };
-#endif
+            using i8v = xe::wmma::iv8;     // amd_wmma.hpp's int8 operands and layouts
+            using frag = xe::wmma::s8f;
+            constexpr int KOFF = xe::wmma::KOFF;   // bytes of K a lane holds past its half's start
+            auto row_of = [&](int el) { return xe::wmma::row_of(hi, el); };
+            // The accumulators stay in registers only while every loop that indexes them is unrolled.  A tile that may
+            // take K in parts (PARTS) has two ways out below, and with them its loops over the accumulators were left
+            // as loops: all 256 bytes of them lived in the stack, loaded and stored at every product (XeStrata-890M,
+            // iq_mmq_parity on the 890M: the experts' products 8 to 17% slower, a K-tail product 28%).  Those loops are
+            // unrolled by name there; the larger tile keeps the fork's loops as they were, where naming them cost
+            // IQ3_S's dense product 13%.
             float acc[SGM][SGN][8];
-            for (int i = 0; i < SGM; ++i)
-                for (int j = 0; j < SGN; ++j)
-                    for (int el = 0; el < 8; ++el) acc[i][j][el] = 0.0f;
+            if constexpr (PARTS) {
+#pragma unroll
+                for (int i = 0; i < SGM; ++i)
+#pragma unroll
+                    for (int j = 0; j < SGN; ++j)
+#pragma unroll
+                        for (int el = 0; el < 8; ++el) acc[i][j][el] = 0.0f;
+            } else {
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < SGN; ++j)
+                        for (int el = 0; el < 8; ++el) acc[i][j][el] = 0.0f;
+            }
+            // FX: as intel_body, by the elements' positions
+            [[maybe_unused]] int32_t isum[FX ? SGM : 1][FX ? SGN : 1][8];
+            [[maybe_unused]] int64_t acc64[FX ? SGM : 1][FX ? SGN : 1][8];
+            [[maybe_unused]] Top* ta = local_as<Top>(base + FX_OFF).get();
+            [[maybe_unused]] Top* tw = ta + WM;
+            if constexpr (FX) {
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < SGN; ++j)
+                        for (int el = 0; el < 8; ++el) {
+                            isum[i][j][el] = 0;
+                            acc64[i][j][el] = 0;
+                        }
+                fx_tops(lid, lanes, row0, rows, m0, n0, wx, ta, tw);
+            }
 
             [[maybe_unused]] const typename GridOf<TY>::type* gl = nullptr;
             if constexpr (GRID_BYTES > 0) {
@@ -1033,11 +1632,12 @@ struct Kernel {
                         raw[u] = D::load(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b, row_bytes);
                 }
             };
-            if constexpr (split_dec<Dec<TY>>::value) load_raw(Dec<TY>{}, 0);
-            for (int64_t k0 = 0; k0 < K; k0 += KC) {
+            // this part's steps (all of K where the tile takes no parts)
+            const int64_t kbeg = PARTS ? ks * kspan : 0, kend = PARTS ? sycl::min(K, (ks + 1) * kspan) : K;
+            if constexpr (split_dec<Dec<TY>>::value) load_raw(Dec<TY>{}, kbeg);
+            for (int64_t k0 = kbeg; k0 < kend; k0 += KC) {
                 sycl::group_barrier(it.get_group());   // the last step's tiles are read
                 const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
-#pragma unroll
                 for (int u = 0; u < APL; ++u) {
                     const int v = lid + u * lanes;
                     if (AV % lanes != 0 && v >= AV) break;
@@ -1070,9 +1670,9 @@ struct Kernel {
                         o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
                         wsl[(2 * b) * WN + nn] = d.s0;
                         wsl[(2 * b + 1) * WN + nn] = d.s1;
-                        if constexpr (MIN) wml[b * WN + nn] = d.m;
+                        if constexpr (MIN || FXH) wml[b * WN + nn] = d.m;
                     }
-                    if (k0 + KC < K) load_raw(Dec<TY>{}, k0 + KC);   // the next step's words, behind this step's products
+                    if (k0 + KC < kend) load_raw(Dec<TY>{}, k0 + KC);   // the next step's words, behind this step's products
                 } else {
 #pragma unroll
                     for (int u = 0; u < DPL; ++u) {
@@ -1086,7 +1686,7 @@ struct Kernel {
                         o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
                         wsl[(2 * b) * WN + nn] = d.s0;
                         wsl[(2 * b + 1) * WN + nn] = d.s1;
-                        if constexpr (MIN) wml[b * WN + nn] = d.m;
+                        if constexpr (MIN || FXH) wml[b * WN + nn] = d.m;
                     }
                 }
                 sycl::group_barrier(it.get_group());
@@ -1106,38 +1706,110 @@ struct Kernel {
                                 const frag a = *reinterpret_cast<const frag*>(al + (ms + i * TM + lo) * LDA + b * 32 + kk + hi * KOFF);
                                 for (int j = 0; j < SGN; ++j) {
                                     const frag bm = *reinterpret_cast<const frag*>(bl + (ns + j * TN + lo) * LDB + b * 32 + kk + hi * KOFF);
-#if defined(__GFX12__)
-                                    ci[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, bm, ci[j], false);
-#else
-                                    ci[j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, bm, ci[j], false);
-#endif
+                                    ci[j] = xe::wmma::mad_s8(a, bm, ci[j]);
                                 }
                             }
                             for (int j = 0; j < SGN; ++j) {
                                 const float ws = wsl[(2 * b + h) * WN + ns + j * TN + lo];   // this lane's column's
+                                if constexpr (FX) {   // ws: the integer scale
+                                    for (int el = 0; el < 8; ++el) isum[i][j][el] += (int32_t) ws * ci[j][el];
+                                    continue;
+                                }
                                 for (int el = 0; el < 8; ++el)
                                     // (float) c: one full-rate conversion on RDNA (exact below 2^24, as exact_float)
                                     acc[i][j][el] = sycl::fma(ws * xsr[el], (float) ci[j][el], acc[i][j][el]);
                             }
                         }
-                    if constexpr (MIN)
+                    if constexpr (FX)
+                        if ((k0 / 32 + b) % FXG == FXG - 1) {   // the group's sums into int64
+                                // fx_scale's parts, a row's and an output's apart: m = ma mw, s = (ea - ta + kFxHead) +
+                                // (ew - tw)
+                                uint32_t am[SGM][8];
+                                int as[SGM][8];
+                                for (int i = 0; i < SGM; ++i)
+                                    for (int el = 0; el < 8; ++el) {
+                                        const canon::FxPart p = canon::fx_part(xsl[b * WM + ms + i * TM + row_of(el)]);
+                                        am[i][el] = p.m;
+                                        as[i][el] = p.e - ta[ms + i * TM + row_of(el)] + canon::kFxHead;
+                                    }
+                                for (int j = 0; j < SGN; ++j) {
+                                    const int nn = ns + j * TN + lo;
+                                    const canon::FxPart wp = canon::fx_part(fx_wd(wsl, wml, b, nn));
+                                    const int ws = wp.e - tw[nn];
+                                    for (int i = 0; i < SGM; ++i)
+                                        for (int el = 0; el < 8; ++el) {
+                                            acc64[i][j][el] += (int64_t) canon::fx_shift(am[i][el] * wp.m, as[i][el] + ws,
+                                                                                         wp.neg) * isum[i][j][el];
+                                            isum[i][j][el] = 0;
+                                        }
+                                }
+                        }
+                    if constexpr (MIN && PARTS) {
+#pragma unroll
+                        for (int j = 0; j < SGN; ++j) {
+                            const float wm = wml[b * WN + ns + j * TN + lo];
+#pragma unroll
+                            for (int i = 0; i < SGM; ++i)
+#pragma unroll
+                                for (int el = 0; el < 8; ++el)
+                                    acc[i][j][el] -= wm * xul[b * WM + ms + i * TM + row_of(el)];
+                        }
+                    } else if constexpr (MIN) {
                         for (int j = 0; j < SGN; ++j) {
                             const float wm = wml[b * WN + ns + j * TN + lo];
                             for (int i = 0; i < SGM; ++i)
                                 for (int el = 0; el < 8; ++el)
                                     acc[i][j][el] -= wm * xul[b * WM + ms + i * TM + row_of(el)];
                         }
-                }
-            }
-            // straight out, the rows past the expert's last not written
-            for (int i = 0; i < SGM; ++i)
-                for (int j = 0; j < SGN; ++j) {
-                    const int64_t cb = n0 + ns + (int64_t) j * TN + lo;
-                    for (int el = 0; el < 8; ++el) {
-                        const int64_t row = m0 + ms + (int64_t) i * TM + row_of(el);
-                        if (row < rows) put((int64_t) ids[row0 + row] * ld_dst + cb, acc[i][j][el]);
                     }
                 }
+            }
+            // straight out, the rows past the expert's last not written.  Whether K is in parts is asked once, not at
+            // each of a lane's 64 values (XeStrata-890M): with out()'s ways inside the loops the dense products were a
+            // quarter slower than the fork's (iq_mmq_parity --dense on the 890M, IQ4_XS 10240 x 2560, 2048 rows:
+            // 13.2 ms against 17.0).
+            const auto value = [&](int i, int j, int el) {
+                if constexpr (FX)
+                    return fx_out(acc64[i][j][el], ta[ms + i * TM + row_of(el)] + tw[ns + j * TN + lo]);
+                else
+                    return acc[i][j][el];
+            };
+            if constexpr (PARTS) {
+                if (part != nullptr) {
+#pragma unroll
+                    for (int i = 0; i < SGM; ++i)
+#pragma unroll
+                        for (int j = 0; j < SGN; ++j) {
+                            const int64_t cb = n0 + ns + (int64_t) j * TN + lo;
+#pragma unroll
+                            for (int el = 0; el < 8; ++el) {
+                                const int64_t row = m0 + ms + (int64_t) i * TM + row_of(el);
+                                if (row < rows) part[(ks * total_rows + row0 + row) * n_out + cb] = value(i, j, el);
+                            }
+                        }
+                } else {
+#pragma unroll
+                    for (int i = 0; i < SGM; ++i)
+#pragma unroll
+                        for (int j = 0; j < SGN; ++j) {
+                            const int64_t cb = n0 + ns + (int64_t) j * TN + lo;
+#pragma unroll
+                            for (int el = 0; el < 8; ++el) {
+                                const int64_t row = m0 + ms + (int64_t) i * TM + row_of(el);
+                                if (row < rows) put((int64_t) ids[row0 + row] * ld_dst + cb, value(i, j, el));
+                            }
+                        }
+                }
+            } else {
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < SGN; ++j) {
+                        const int64_t cb = n0 + ns + (int64_t) j * TN + lo;
+                        for (int el = 0; el < 8; ++el) {
+                            const int64_t row = m0 + ms + (int64_t) i * TM + row_of(el);
+                            if (row < rows) put((int64_t) ids[row0 + row] * ld_dst + cb, value(i, j, el));
+                        }
+                    }
+            }
 #endif
         }
     }
@@ -1161,24 +1833,96 @@ struct Kernel {
     }
 };
 
-template<int TY, int SGM, int NSGM, bool DP4A, bool TAIL, int IS>
+// The parts' buffer of a queue (iq_mmq_split_reserve), for one expert's few rows with K in parts (launch): the
+// queue's own belonging (Runtime::queue_item), freed when its stream is destroyed - keyed by the bare queue address
+// it would outlive the queue and meet the next one there
+struct SplitBuf {
+    explicit SplitBuf(sycl::queue& q) : q(q) {}
+    ~SplitBuf() {
+        if (p != nullptr) {
+            sycl::free(p, q);
+            core::graph_epoch_bump();   // a recorded step may hold the old one
+        }
+    }
+    sycl::queue q;
+    std::mutex mu;
+    float* p = nullptr;
+    size_t n = 0;
+};
+
+// The queue's reserved parts' buffer when it holds `floats`, else null
+float* part_buffer(sycl::queue& q, size_t floats) {
+    SplitBuf& b = core::Runtime::of_queue(q).queue_item<SplitBuf>(q);
+    std::lock_guard<std::mutex> lock(b.mu);
+    return b.n >= floats ? b.p : nullptr;
+}
+
+template<int TY, int SGM, int NSGM, bool DP4A, bool TAIL, int IS, bool REG = false>
 sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                    int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
-                   int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst, bool half_dst) {
-    using KT = Kernel<TY, SGM, NSGM, DP4A, TAIL, IS>;
+                   int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst, bool half_dst = false,
+                   const float* xs_in = nullptr) {
+    using KT = Kernel<TY, SGM, NSGM, DP4A, TAIL, IS, REG>;
     const int64_t tiles_m = (max_rows + KT::WM - 1) / KT::WM, tiles_n = w_rows / KT::WN;
     const size_t row_bytes = (size_t) (w_cols / Dec<TY>::QK) * (size_t) Dec<TY>::BSZ;
     const auto* x8 = static_cast<const int8_t*>(xq);
-    const auto* xs = reinterpret_cast<const float*>(x8 + total_rows * w_cols);
+    const auto* xs = xs_in != nullptr ? xs_in : reinterpret_cast<const float*>(x8 + total_rows * w_cols);
     const auto* xu = xs + total_rows * (w_cols / 32);
+    const int64_t steps = (w_cols + KC - 1) / KC;
+    // One expert's few rows, where the queue holds the parts' buffer: K in kIqMmqSplitMax parts (two steps a part at
+    // least), a work-group each, each part's sums from zero and a pass of their own adding the parts in order.  A
+    // prompt's few rows (64 tokens of PLaMo 3 Translate 2B) left the RTX 4070's 46 units mostly idle with K whole: 16
+    // tiles of 64 x 128 for a 2560-output product (llama.cpp splits K the same way, its stream-K).  The parts are the
+    // product's own, so the sums and a prompt's states are the same from start to start: a work-group's own share of K
+    // before, as many parts as the work-groups a timing at the start aimed for (0 to 16 quarters of the compute units),
+    // made them follow that choice, which a near tie took one way or the other (the RX 9060 XT, 2026-11-10: Mage-Flow's
+    // text encoder 0 or 16 quarters, 0.35 ms each, and another image from the same seed).  Two parts: each part's sums
+    // go through memory, and more of them cost more than the work-groups they let run (Qwen3.5-9B Q4_K_M's FFN gate at
+    // 16 and 64 rows, 2026-11-11: the B70 0.40 ms with 2 parts, 0.43 with 4, 0.46 with 8; the RTX 4070 0.32, 0.34,
+    // 0.40).  A work-group each, not one running both: one work-group was the slower wherever the two were timed
+    // (2026-11-12: the B70 0.59 ms against 0.42 and 0.47 against 0.34, the RTX 4070 0.38 against 0.32), and its loop
+    // over the parts spilled on AMD (body).  The pass: adding the second part into dst as the work-group went cost the
+    // RTX 4070's products 0.37 ms against 0.33, the read in the kernels' output; the last of a tile's work-groups
+    // adding them, a counter a tile, 0.40 against 0.32 (the B70's 0.24 against 0.29, the RX 9060 XT's as long as the
+    // pass, 2026-11-13: MOSS-Image's text encoder at 16 and 64 rows 1.30 to 1.47 ms either way, and every launch of the
+    // kernel slower with its code, the 512-row products 1.86 -> 6.6 ms).  It costs a short prompt 1-2 ms on the RTX
+    // 4070 (Qwen3.5-9B's 52 tokens 1127 -> 1083 tok/s, PLaMo 3 Translate 2B's 64 3810 -> 3372, 2026-11-11).
+    int64_t kspan = steps * KC, ksplit = 1;
+    float* part = nullptr;
+    // (the fixed-point sums take K whole: a part's int64 sums would need a pass of their own; and the FP16 rows,
+    // half_dst: the pass adds the parts in FP32)
+    if (KT::PARTS && !KT::FX && !half_dst && n == 1 && total_rows <= kIqMmqSplitRows && steps >= 4) {
+        const int64_t want = std::min<int64_t>(kIqMmqSplitMax, steps / 2);
+        const int64_t span = (steps + want - 1) / want * KC, parts = (steps * KC + span - 1) / span;
+        part = part_buffer(q, (size_t) (parts * total_rows * w_rows));
+        if (part != nullptr) {
+            ksplit = parts;
+            kspan = span;
+        }
+    }
     // RDNA's WMMA body does without the output staging tile (LOCAL_DIRECT)
-    const size_t local = !DP4A && xe::amd_wmma(q.get_device()) ? (size_t) KT::LOCAL_DIRECT_GRID : (size_t) KT::LOCAL;
-    return q.submit([&](sycl::handler& h) {
+    const size_t local = !DP4A && IS == 0 && xe::amd_wmma(q.get_device()) ? (size_t) KT::LOCAL_DIRECT_GRID
+                                                                          : (size_t) KT::LOCAL;
+    sycl::event e = q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>(local), h);
-        const size_t wg = (size_t) KT::NSG * SG;
-        h.parallel_for(sycl::nd_range<1>((size_t) n * (size_t) (tiles_m * tiles_n) * wg, wg),
-                       KT{static_cast<const uint8_t*>(w), wtab, woff, expert_bytes, row_bytes, x8, xs, xu, w_cols, bounds, ids, dst,
-                          ld_dst, tiles_m, tiles_n, lm, half_dst});
+        const size_t wg = (size_t) KT::LANES;
+        KT k{static_cast<const uint8_t*>(w), wtab, woff, expert_bytes, row_bytes, x8, xs, xu, w_cols, bounds, ids, dst,
+             ld_dst, tiles_m, tiles_n, lm};
+        k.hdst = half_dst;
+        k.ksplit = ksplit;
+        k.kspan = kspan;
+        k.part = part;
+        k.total_rows = total_rows;
+        k.n_out = w_rows;
+        h.parallel_for(sycl::nd_range<1>((size_t) n * (size_t) (tiles_m * tiles_n * ksplit) * wg, wg), k);
+    });
+    if (part == nullptr) return e;
+    // the parts added in order into dst (one expert: its rows are the ids' first total_rows)
+    return q.parallel_for(sycl::range<2>((size_t) total_rows, (size_t) w_rows), [=](sycl::id<2> i) {
+        const int64_t row = (int64_t) i[0], col = (int64_t) i[1];
+        float v = part[row * w_rows + col];
+        for (int64_t ks = 1; ks < ksplit; ++ks) v += part[(ks * total_rows + row) * w_rows + col];
+        dst[(int64_t) ids[row] * ld_dst + col] = v;
     });
 }
 
@@ -1225,7 +1969,7 @@ bool intel_fits(sycl::queue& q) {
                                                                        {sycl::get_kernel_id<Big>()});
         return true;
     } catch (const sycl::exception& e) {
-        std::fprintf(stderr, "strata: the int8 XMX products do not build for this GPU (%s)\n", e.what());
+        std::fprintf(stderr, "xestrata: the int8 XMX products do not build for this GPU (%s)\n", e.what());
         return false;
     }
 }
@@ -1241,7 +1985,7 @@ bool intel_layout_ok(sycl::queue& q) {
         });
         q.memcpy(&res, out, sizeof(int)).wait();
     } catch (const sycl::exception& e) {
-        std::fprintf(stderr, "strata: the int8 XMX layout check did not run (%s)\n", e.what());
+        std::fprintf(stderr, "xestrata: the int8 XMX layout check did not run (%s)\n", e.what());
         res = 0;
     }
     sycl::free(out, q);
@@ -1250,14 +1994,12 @@ bool intel_layout_ok(sycl::queue& q) {
 int intel_shape_of(sycl::queue& q) {
     static core::PerDevice<int> per_device;
     return per_device.get(q.get_device(), [&q] {
-        const char* no = std::getenv("STRATA_NO_XMX");
-        if (no != nullptr && std::strtol(no, nullptr, 10) != 0) return 0;
+        if (no_xmx()) return 0;
         const sycl::device d = q.get_device();
-        const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
         const auto combos = matrix_combinations(d);
         for (int is = 1; is <= 2; ++is) {
             const size_t n = is == 1 ? 16 : 8;
-            if (std::find(sgs.begin(), sgs.end(), n) == sgs.end()) continue;
+            if (!xe::has_sub_group(d, n)) continue;
             bool rep = false;
             for (const auto& c : combos) {
                 const bool m = c.msize == 8 || (c.msize == 0 && c.max_msize >= 8);
@@ -1268,11 +2010,110 @@ int intel_shape_of(sycl::queue& q) {
             }
             if (!rep || !(is == 1 ? intel_fits<1>(q) : intel_fits<2>(q))) continue;
             if (is == 1 ? intel_layout_ok<1>(q) : intel_layout_ok<2>(q)) return is;
-            std::fprintf(stderr, "strata: the GPU's int8 XMX accumulators are laid out otherwise: the experts' prompt "
+            std::fprintf(stderr, "xestrata: the GPU's int8 XMX accumulators are laid out otherwise: the experts' prompt "
                                  "products do not take them\n");
         }
         return 0;
     });
+}
+
+// Whether a product on Intel's XMX takes the sub-group form (intel_reg_body) before the work-group one (intel_body),
+// by its type, N, K, whether it is one expert's (a dense product) and the class of the rows its experts average
+// (powers of two, 8 to 256).  Neither wins everywhere: B70 (2026-11-10), 16 experts of r rows, llm-jp-4.1's Q4_K_M
+// and Qwen3.8's IQ2_XS, the sub-group form at 32 rows 425 and 256 us against 504 and 346, at 8 rows 292 and 156
+// against 209 and 194, at 64 rows 652 and 435 against 538 and 361.  So the two are timed for each class when the
+// engine warms up (iq_mmq_choose_forms), not inside a prompt, and kept for the GPU (the sub-group form 5% faster or
+// more, so that a near tie does not flip from start to start); a product not timed there takes the work-group form.
+// XESTRATA_IQ_MMQ_SUB_GROUP=1 or 0 takes one form.
+struct SgChoice {
+    std::mutex mu;
+    std::map<std::tuple<int, int, bool, int64_t, int64_t>, bool> picks;
+};
+SgChoice& sg_choice(sycl::queue& q) {
+    static core::PerDevice<std::shared_ptr<SgChoice>> per_device;
+    return *per_device.get(q.get_device(), [] { return std::make_shared<SgChoice>(); });
+}
+// top: the last class (log2 of its rows), which takes every larger mean too
+int rows_class(int64_t mean_rows, int top = 8) {
+    int r = 3;   // 8 rows and fewer
+    while (r < top && ((int64_t) 1 << r) < mean_rows) ++r;
+    return r;
+}
+thread_local bool t_choosing = false;   // inside iq_mmq_choose_forms: a class not chosen yet is timed
+// The choice between two forms of a product for its class (sg_choice's key), kept for the GPU: `first` timed against
+// `second` inside iq_mmq_choose_forms and taken where it is 5% faster or more; a class not timed takes `second`.
+bool timed_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int64_t N, int64_t K, int top,
+                 const std::function<sycl::event()>& first, const std::function<sycl::event()>& second) {
+    SgChoice& c = sg_choice(q);
+    const auto key = std::make_tuple(ty, rows_class(mean_rows, top), n == 1, N, K);
+    {
+        std::lock_guard<std::mutex> lock(c.mu);
+        if (const auto it = c.picks.find(key); it != c.picks.end()) return it->second;
+    }
+    if (!t_choosing) return false;
+    double a_s = 0, b_s = 0;
+    const auto time = [&](const std::function<sycl::event()>& f) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 3; ++i) f();
+        q.wait_and_throw();
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 3;
+    };
+    try {
+        q.wait_and_throw();
+        first();   // each once first: its kernel's build
+        second();
+        q.wait_and_throw();
+        a_s = time(first);
+        b_s = time(second);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "xestrata: timing the int8 expert products' forms: %s\n", e.what());
+        a_s = b_s = 0;
+    }
+    const bool pick = a_s > 0 && b_s > 0 && a_s * 1.05 < b_s;
+    std::lock_guard<std::mutex> lock(c.mu);
+    c.picks[key] = pick;
+    return pick;
+}
+bool intel_sub_group_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int64_t N, int64_t K,
+                           const std::function<sycl::event()>& sg, const std::function<sycl::event()>& wg) {
+    static const char* const env = strata::env_get("IQ_MMQ_SUB_GROUP");
+    if (env != nullptr && (env[0] == '0' || env[0] == '1')) return env[0] == '1';
+    return timed_first(q, ty, mean_rows, n, N, K, 8, sg, wg);
+}
+
+// Whether an expert group's product on RDNA3's or RDNA4's WMMA takes the FP16 form (iq_mmq_f16_grouped: the weights
+// dequantized to FP16 in local memory, the int8 activations times their scales) before the int8 one: timed for the
+// classes of 512 and 1024 rows an expert (the last takes every larger mean) as Intel's two forms are
+// (iq_mmq_choose_forms; the first takes 257 rows on), and taken where it is 5% faster; fewer rows keep the int8 form
+// untimed.  RX 9060 XT (2026-11-13, Qwen3.8-Flash-Next IQ3_XXS, generate, three starts each): a 32K prompt (about 1000
+// rows an expert) 1209-1211 tok/s with the int8 form, 1249-1259 with this choice, 1259 with the FP16 form at every
+// class; a 4K prompt (about 110) 949-952, 948-950 and 915-930.  The two give other last bits (FP16 products against
+// exact int8 sums), so a class may answer otherwise from GPU to GPU, not from start to start (kept for the GPU).
+// XESTRATA_IQ_MMQ_F16: unset, by the timing; 0, never; 1, at every class where it runs.  Unset on an integrated GPU on
+// the HIP backend (XeStrata-890M), the int8 form, untimed: its experts' products were measured and kept in that form.
+constexpr int kF16TopClass = 10, kF16FirstClass = 9;
+bool f16_untimed(const sycl::queue& q) {
+    const sycl::device d = q.get_device();
+    return d.get_backend() == sycl::backend::ext_oneapi_hip && core::integrated_gpu(d);
+}
+int f16_env() {
+    static const int v = [] {
+        const char* e = strata::env_get("IQ_MMQ_F16");
+        return e == nullptr || e[0] == '\0' ? -1 : (int) std::strtol(e, nullptr, 10) != 0;
+    }();
+    return v;
+}
+bool f16_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int64_t N, int64_t K,
+               const std::function<sycl::event()>& f16, const std::function<sycl::event()>& i8) {
+    if (f16_env() >= 0) return f16_env() == 1;
+    if (f16_untimed(q) || rows_class(mean_rows, kF16TopClass) < kF16FirstClass) return false;
+    const bool timing = t_choosing;
+    const bool pick = timed_first(q, ty, mean_rows, n, N, K, kF16TopClass, f16, i8);
+    if (timing && pick)
+        std::fprintf(stderr, "xestrata: the experts' int8 products of type %d (%lld x %lld) take the FP16 form at %lld rows "
+                             "an expert (timed faster; XESTRATA_IQ_MMQ_F16=0 keeps the int8 one)\n",
+                     ty, (long long) N, (long long) K, (long long) mean_rows);
+    return pick;
 }
 
 // Whether the GPU runs kernel KT with its full work-group (NSG sub-groups of SG work-items) and its local memory,
@@ -1294,6 +2135,16 @@ bool takes_work_group(sycl::queue& q) {
     });
 }
 
+// The fixed-point products' tiles: a sub-group's rows halved (twice the sub-groups for the tile), so its int64 sums fit
+// its registers.  XESTRATA_IQ_MMQ_FX_SPLIT=0: the int8 products' shapes (an experiment, measured on the RX 8060S only)
+bool fx_split() {
+    static const bool on = [] {
+        const char* v = strata::env_get("IQ_MMQ_FX_SPLIT");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
 template<int TY>
 sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                     int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
@@ -1304,6 +2155,12 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
 #define STRATA_MMQ_ROWS(DP4A, TAIL, IS)                                                        \
     do {                                                                                        \
         if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, DP4A, TAIL, IS);                     \
+        if constexpr (fx_form<TY>())                                                            \
+            if (fx_split()) {                                                                   \
+                if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH(1, 2, DP4A, TAIL, IS); \
+                if (takes_work_group<Kernel<TY, 1, 4, DP4A, TAIL, (IS)>>(q))                      \
+                    return STRATA_MMQ_LAUNCH(1, 4, DP4A, TAIL, IS);                             \
+            }                                                                                   \
         if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, DP4A, TAIL, IS);  \
         return STRATA_MMQ_LAUNCH(2, 2, DP4A, TAIL, IS);                                         \
     } while (0)
@@ -1333,13 +2190,34 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
             return STRATA_MMQ_LAUNCH(2, 4, false, TAIL, IS);                                \
         return STRATA_MMQ_LAUNCH(2, 2, false, TAIL, IS);                                    \
     } while (0)
-    if (const int is = intel_shape_of(q); is == 1) {
-        if (tail) STRATA_MMQ_ROWS_INTEL(true, 1);
-        STRATA_MMQ_ROWS_INTEL(false, 1);
-    } else if (is == 2) {
-        if (tail) STRATA_MMQ_ROWS_INTEL(true, 2);
-        STRATA_MMQ_ROWS_INTEL(false, 2);
+#define STRATA_MMQ_ROWS_SG(IS)                                                                         \
+    do {                                                                                               \
+        if (max_rows <= 16) return STRATA_MMQ_LAUNCH_SG(1, 1, IS);                                     \
+        if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH_SG(2, 1, IS);                  \
+        return STRATA_MMQ_LAUNCH_SG(2, 2, IS);                                                         \
+    } while (0)
+#define STRATA_MMQ_LAUNCH_SG(SGM, NSGM, IS)                                                                          \
+    launch<TY, SGM, NSGM, false, false, IS, true>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, \
+                                                  bounds, max_rows, ids, dst, ld_dst, half_dst)
+    // the sub-group form needs no K tail of its own (it walks the blocks of 32, not the steps), nor more local memory
+    // than a few KiB
+    if (const int is = intel_shape_of(q); is != 0) {
+        const auto wg = [&]() -> sycl::event {
+            if (is == 1) {
+                if (tail) STRATA_MMQ_ROWS_INTEL(true, 1);
+                STRATA_MMQ_ROWS_INTEL(false, 1);
+            }
+            if (tail) STRATA_MMQ_ROWS_INTEL(true, 2);
+            STRATA_MMQ_ROWS_INTEL(false, 2);
+        };
+        const auto sg = [&]() -> sycl::event {
+            if (is == 1) STRATA_MMQ_ROWS_SG(1);
+            STRATA_MMQ_ROWS_SG(2);
+        };
+        return intel_sub_group_first(q, TY, mean_rows, n, w_rows, w_cols, sg, wg) ? sg() : wg();
     }
+#undef STRATA_MMQ_ROWS_SG
+#undef STRATA_MMQ_LAUNCH_SG
 #undef STRATA_MMQ_ROWS_INTEL
     // XeStrata-890M: a dense projection (one expert of many rows: prefill.cpp's dense_proj) takes a 128-row tile of
     // 8 sub-groups (4 row tiles by 2 column tiles each): a step's decoded weights serve twice the rows.  iq_mmq_parity
@@ -1347,22 +2225,29 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
     // (11.7), 2560 x 6144 13.8 -> 9.3 (10.6); 512 rows of 10240 x 2560 3.7 -> 2.9 (5.4).  256-row tiles and 512-lane
     // work-groups lost (2 x 4: 16.9 ms, 4 x 4: 18.8, 8 x 1: 33.6).  STRATA_MMQ_BIG=0 keeps the 64-row tile, =1 gives
     // the 128-row one to the experts' groups too.
-    static const int big = [] { const char* v = std::getenv("STRATA_MMQ_BIG"); return v ? (int) std::strtol(v, nullptr, 10) : -1; }();
+    static const int big = [] { const char* v = strata::env_get("MMQ_BIG"); return v ? (int) std::strtol(v, nullptr, 10) : -1; }();
     if ((big == 1 || (big < 0 && n == 1)) && max_rows > 64 && !tail) return STRATA_MMQ_LAUNCH(4, 2, false, false, 0);
+    // RDNA3 and RDNA4: an expert group's product in FP16 where it was timed faster for its class of rows (f16_first);
+    // not for FP16 rows out (half_dst), which that form does not write
+    if (n > 1 && !half_dst && f16_env() != 0 && iq_mmq_f16_ok(q, TY, w_rows, w_cols)) {
+        const auto f16 = [&] {
+            return iq_mmq_f16_grouped(q, TY, w, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids,
+                                      dst, ld_dst, wtab, woff);
+        };
+        const auto i8 = [&]() -> sycl::event {
+            if (tail) STRATA_MMQ_ROWS(false, true, 0);
+            STRATA_MMQ_ROWS(false, false, 0);
+        };
+        return f16_first(q, TY, mean_rows, n, w_rows, w_cols, f16, i8) ? f16() : i8();
+    }
     if (tail) STRATA_MMQ_ROWS(false, true, 0);
     STRATA_MMQ_ROWS(false, false, 0);
 #undef STRATA_MMQ_ROWS
 #undef STRATA_MMQ_LAUNCH
 }
 
-bool env_on(const char* name) {
-    const char* v = std::getenv(name);
-    return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-}
-
 bool shape_reported(const sycl::device& d) {
-    const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
-    if (std::find(sgs.begin(), sgs.end(), (size_t) SG) == sgs.end()) return false;
+    if (!xe::has_sub_group(d, (size_t) SG)) return false;
     for (const auto& c : matrix_combinations(d)) {
         const bool m = c.msize == (size_t) TM || (c.msize == 0 && c.max_msize >= (size_t) TM);
         const bool n = c.nsize == (size_t) TN || (c.nsize == 0 && c.max_nsize >= (size_t) TN);
@@ -1404,12 +2289,13 @@ struct LayoutCheck {
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
 };
 
+
 }  // namespace
 
 bool iq_mmq_usable(sycl::queue& q) {
     static core::PerDevice<bool> per_device;
     return per_device.get(q.get_device(), [&q] {
-        if (env_on("STRATA_NO_XMX")) return false;
+        if (no_xmx()) return false;
         const sycl::device d = q.get_device();
         const bool wmma = xe::amd_wmma(d);   // its int8 WMMA: the STRATA_IQ_MMQ_WMMA body
         if (!wmma && !shape_reported(d)) return intel_shape_of(q) != 0;   // Intel's XMX shapes (intel_body)
@@ -1429,11 +2315,11 @@ bool iq_mmq_usable(sycl::queue& q) {
             });
             q.memcpy(&res, out, sizeof(int)).wait();
         } catch (const sycl::exception& e) {
-            std::fprintf(stderr, "strata: the int8 expert products' layout check did not run (%s)\n", e.what());
+            std::fprintf(stderr, "xestrata: the int8 expert products' layout check did not run (%s)\n", e.what());
             res = 0;
         }
         sycl::free(out, q);
-        if (!res) std::fprintf(stderr, "strata: the GPU's int8 and FP32 accumulators differ in layout: the experts' "
+        if (!res) std::fprintf(stderr, "xestrata: the GPU's int8 and FP32 accumulators differ in layout: the experts' "
                                "prompt products stay in FP16\n");
         return res == 1;
     });
@@ -1452,7 +2338,9 @@ bool iq_mmq_dp4a_usable(sycl::queue& q) {
 const char* iq_mmq_path(sycl::queue& q) {
     if (iq_mmq_usable(q)) {
         const sycl::device d = q.get_device();
-        return xe::amd_wmma(d) ? "WMMA" : shape_reported(d) ? "joint_matrix" : "XMX";
+        const int intel = intel_shape_of(q);   // by_rows chooses this before the other matrix forms
+        if (intel) return intel == 1 ? "XMX SG16" : "XMX SG8";
+        return xe::amd_wmma(d) ? "WMMA" : "joint_matrix";
     }
     return iq_mmq_dp4a_usable(q) ? "DP4a" : nullptr;
 }
@@ -1461,10 +2349,16 @@ bool iq_mmq_type_sums(int t) { return t == 7 || t == 12 || t == 13; }   // has_m
 
 bool iq_mmq_type_ok(int t) {
     switch (t) {
-        case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
-        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 42: return true;
+        case 2: case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows: case kBih3Planes: case kBih3Code:
+        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 40: case 42:
+        case kIqMmqFx + 16: case kIqMmqFx + 17: case kIqMmqFx + 18: case kIqMmqFx + 20: case kIqMmqFx + 21:
+        case kIqMmqFx + 22: case kIqMmqFx + 42: return true;
         default: return false;
     }
+}
+
+int iq_mmq_fx(int t) {
+    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 42 ? kIqMmqFx + t : 0;
 }
 
 size_t iq_mmq_row_bytes(int t, int64_t cols) {
@@ -1475,20 +2369,24 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
         case 11: return (size_t) (cols / Dec<11>::QK) * Dec<11>::BSZ;
         case 12: return (size_t) (cols / Dec<12>::QK) * Dec<12>::BSZ;
         case 13: return (size_t) (cols / Dec<13>::QK) * Dec<13>::BSZ;
+        case 2: return (size_t) (cols / Dec<2>::QK) * Dec<2>::BSZ;
         case 8: return (size_t) (cols / Dec<8>::QK) * Dec<8>::BSZ;
         case 14: return (size_t) (cols / Dec<14>::QK) * Dec<14>::BSZ;
         case kNativeQ6KRows: return (size_t) (cols / Dec<kNativeQ6KRows>::QK) * Dec<kNativeQ6KRows>::BSZ;
         case kNativeQ8Rows: return (size_t) (cols / Dec<kNativeQ8Rows>::QK) * Dec<kNativeQ8Rows>::BSZ;
-        case 16: return (size_t) (cols / Dec<16>::QK) * Dec<16>::BSZ;
-        case 17: return (size_t) (cols / Dec<17>::QK) * Dec<17>::BSZ;
-        case 18: return (size_t) (cols / Dec<18>::QK) * Dec<18>::BSZ;
-        case 20: return (size_t) (cols / Dec<20>::QK) * Dec<20>::BSZ;
-        case 21: return (size_t) (cols / Dec<21>::QK) * Dec<21>::BSZ;
-        case 22: return (size_t) (cols / Dec<22>::QK) * Dec<22>::BSZ;
+        case kBih3Planes: return (size_t) (cols / Dec<kBih3Planes>::QK) * Dec<kBih3Planes>::BSZ;
+        case kBih3Code: return (size_t) (cols / Dec<kBih3Code>::QK) * Dec<kBih3Code>::BSZ;
+        case 16: case kIqMmqFx + 16: return (size_t) (cols / Dec<16>::QK) * Dec<16>::BSZ;
+        case 17: case kIqMmqFx + 17: return (size_t) (cols / Dec<17>::QK) * Dec<17>::BSZ;
+        case 18: case kIqMmqFx + 18: return (size_t) (cols / Dec<18>::QK) * Dec<18>::BSZ;
+        case 20: case kIqMmqFx + 20: return (size_t) (cols / Dec<20>::QK) * Dec<20>::BSZ;
+        case 21: case kIqMmqFx + 21: return (size_t) (cols / Dec<21>::QK) * Dec<21>::BSZ;
+        case 22: case kIqMmqFx + 22: return (size_t) (cols / Dec<22>::QK) * Dec<22>::BSZ;
         case 23: return (size_t) (cols / Dec<23>::QK) * Dec<23>::BSZ;
         case 29: return (size_t) (cols / Dec<29>::QK) * Dec<29>::BSZ;
         case 19: return (size_t) (cols / Dec<19>::QK) * Dec<19>::BSZ;
-        case 42: return (size_t) (cols / Dec<42>::QK) * Dec<42>::BSZ;
+        case 42: case kIqMmqFx + 42: return (size_t) (cols / Dec<42>::QK) * Dec<42>::BSZ;
+        case 40: return (size_t) (cols / Dec<40>::QK) * Dec<40>::BSZ;
         default: return 0;
     }
 }
@@ -1497,100 +2395,78 @@ size_t iq_mmq_act_bytes(int64_t rows, int64_t cols) { return (size_t) (rows * co
 
 bool iq_mmq_type_dup(int t) { return t == 10; }
 
-// float rows, or FP16 / BF16 rows as uint16_t (XeStrata-890M: the dense projections' 16-bit-only inputs)
-template <class X, bool BF16 = false>
-sycl::event quantize_rows(sycl::queue& q, const X* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
-                          int64_t rows, bool sums, bool dup) {
-    // dup (Q2_K, Dec<10>): each block written twice, as a row of 2 cols values
-    const int64_t oc = dup ? 2 * cols : cols, rep = dup ? 2 : 1;
+// FP16 or BF16 rows, `ld` values apart (XeStrata-890M: the dense projections' 16-bit-only inputs), as q8_act.hpp's
+// sources read FP32 ones.  In this namespace, not an anonymous one: SYCL names the quantize kernel by its source's type.
+template<bool BF16>
+struct IqMmqHalfRows {
+    static constexpr bool kRows = true;
+    const uint16_t* x;
+    int64_t ld;
+    float operator()(int64_t r, int64_t c, int j) const {
+        const uint16_t v = x[r * ld + c * q8act::kBlock + j];
+        if constexpr (BF16) return sycl::bit_cast<float>((uint32_t) v << 16);
+        else return (float) sycl::bit_cast<sycl::half>(v);
+    }
+};
+
+// The rows of src into MMQ's activations (iq_mmq_quantize): FP32 rows, or FP16 / BF16 ones (IqMmqHalfRows)
+template<class Src>
+sycl::event quantize_rows(sycl::queue& q, const Src& src, void* xq, int64_t cols, int64_t rows, bool sums, bool dup,
+                          int canon) {
+    // dup (Q2_K, Dec<10>): each block written twice, as a row of 2 cols values.  8 values a lane (a block 4 lanes):
+    // 8,192 rows of 3,072 took the B70 264 us and the RTX 4070 285 where a block a work-item took 299 and 296, and a
+    // block a sub-group (a value a lane) 626 and 394 (2026-11-05)
+    const int64_t oc = dup ? 2 * cols : cols, nb = cols / 32;
     auto* x8 = static_cast<int8_t*>(xq);
     auto* xs = reinterpret_cast<float*>(x8 + rows * oc);
-    const int64_t nb = cols / 32, onb = oc / 32;
-    float* xu = xs + rows * onb;
-    return q.parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> i) {
-        const int64_t r = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
-        const X* xr = x + (int64_t) (ids ? ids[r] : r) * ld + b * 32;
-        float v[32], amax = 0.0f;
-        // (16-byte vector loads here were no faster on the 890M: the kernel runs at the memory's rate)
-        for (int j = 0; j < 32; ++j) {
-            if constexpr (std::is_same_v<X, float>) v[j] = xr[j];
-            else if constexpr (BF16) v[j] = sycl::bit_cast<float>((uint32_t) xr[j] << 16);
-            else v[j] = (float) sycl::bit_cast<sycl::half>(xr[j]);
-            amax = sycl::fmax(amax, sycl::fabs(v[j]));
-        }
-        const float d = amax / 127.0f, id = amax > 0.0f ? 1.0f / d : 0.0f;
-        uint32_t p[8];
-        int sum = 0;
-        for (int j = 0; j < 8; ++j) {
-            uint32_t u = 0;
-            for (int k = 0; k < 4; ++k) {
-                const int q = (int) sycl::round(v[4 * j + k] * id);
-                sum += q;
-                u |= (uint32_t) (uint8_t) (int8_t) q << (8 * k);
-            }
-            p[j] = u;
-        }
-        for (int64_t c = 0; c < rep; ++c) {
-            const int64_t ob = b * rep + c;
-            u32x4* o = reinterpret_cast<u32x4*>(x8 + r * oc + ob * 32);
-            o[0] = u32x4{p[0], p[1], p[2], p[3]};
-            o[1] = u32x4{p[4], p[5], p[6], p[7]};
-            xs[r * onb + ob] = d;
-            if (sums) xu[r * onb + ob] = d * (float) sum;
-        }
-    });
+    float* xu = xs + rows * (oc / 32);
+    if (canon != 0) {   // the fixed-point sums' (iq_mmq_fx): the CPU's canonical rows' values and fp16 scales
+        q8act::Rows<false, false, true> out{x8, xs, xu, oc, oc / 32, 1};
+        if (canon == 32) return q8act::quantize<8, q8act::Canon<32>>(q, rows * nb, nb, src, out);
+        return q8act::quantize<8, q8act::Canon<256>>(q, rows * nb, nb, src, out);
+    }
+    if (sums) {
+        q8act::Rows<true> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1};
+        return q8act::quantize<8, q8act::Mul>(q, rows * nb, nb, src, out);
+    }
+    q8act::Rows<false> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1};
+    return q8act::quantize<8, q8act::Mul>(q, rows * nb, nb, src, out);
 }
 
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
-                            int64_t rows, bool sums, bool dup) {
-    return quantize_rows<float>(q, x, ids, xq, cols, ld, rows, sums, dup);
+                            int64_t rows, bool sums, bool dup, int canon, const float* col_scale) {
+    if (col_scale != nullptr)
+        return quantize_rows(q, q8act::ScaledFloatRows{x, ids, ld, col_scale}, xq, cols, rows, sums, dup, canon);
+    return quantize_rows(q, q8act::FloatRows{x, ids, ld}, xq, cols, rows, sums, dup, canon);
 }
 sycl::event iq_mmq_quantize_f16(sycl::queue& q, const uint16_t* x, void* xq, int64_t cols, int64_t ld, int64_t rows,
                                 bool sums, bool dup) {
-    return quantize_rows<uint16_t>(q, x, nullptr, xq, cols, ld, rows, sums, dup);
+    return quantize_rows(q, IqMmqHalfRows<false>{x, ld}, xq, cols, rows, sums, dup, 0);
 }
 sycl::event iq_mmq_quantize_bf16(sycl::queue& q, const uint16_t* x, void* xq, int64_t cols, int64_t ld, int64_t rows,
                                  bool sums, bool dup) {
-    return quantize_rows<uint16_t, true>(q, x, nullptr, xq, cols, ld, rows, sums, dup);
+    return quantize_rows(q, IqMmqHalfRows<true>{x, ld}, xq, cols, rows, sums, dup, 0);
 }
 
 sycl::event iq_mmq_quantize_scatter(sycl::queue& q, const float* x, const int32_t* slot, void* xq, int64_t cols,
-                                    int64_t ld, int64_t tokens, int k_used, bool sums, bool dup) {
+                                    int64_t ld, int64_t tokens, int k_used, bool sums, bool dup, int canon) {
     // as iq_mmq_quantize, with the rows reached from the token: the block of token t goes to its k_used rows
-    const int64_t oc = dup ? 2 * cols : cols, rep = dup ? 2 : 1, rows = tokens * k_used;
+    const int64_t oc = dup ? 2 * cols : cols, rows = tokens * k_used, nb = cols / 32;
     auto* x8 = static_cast<int8_t*>(xq);
     auto* xs = reinterpret_cast<float*>(x8 + rows * oc);
-    const int64_t nb = cols / 32, onb = oc / 32;
-    float* xu = xs + rows * onb;
-    return q.parallel_for(sycl::range<1>((size_t) (tokens * nb)), [=](sycl::id<1> i) {
-        const int64_t t = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
-        const float* xr = x + t * ld + b * 32;
-        float v[32], amax = 0.0f;
-        for (int j = 0; j < 32; ++j) { v[j] = xr[j]; amax = sycl::fmax(amax, sycl::fabs(v[j])); }
-        const float d = amax / 127.0f, id = amax > 0.0f ? 1.0f / d : 0.0f;
-        uint32_t p[8];
-        int sum = 0;
-        for (int j = 0; j < 8; ++j) {
-            uint32_t u = 0;
-            for (int k = 0; k < 4; ++k) {
-                const int qv = (int) sycl::round(v[4 * j + k] * id);
-                sum += qv;
-                u |= (uint32_t) (uint8_t) (int8_t) qv << (8 * k);
-            }
-            p[j] = u;
-        }
-        for (int k = 0; k < k_used; ++k) {
-            const int64_t r = slot[t * k_used + k];
-            for (int64_t c = 0; c < rep; ++c) {
-                const int64_t ob = b * rep + c;
-                u32x4* o = reinterpret_cast<u32x4*>(x8 + r * oc + ob * 32);
-                o[0] = u32x4{p[0], p[1], p[2], p[3]};
-                o[1] = u32x4{p[4], p[5], p[6], p[7]};
-                xs[r * onb + ob] = d;
-                if (sums) xu[r * onb + ob] = d * (float) sum;
-            }
-        }
-    });
+    float* xu = xs + rows * (oc / 32);
+    const q8act::FloatRows src{x, nullptr, ld};
+    if (canon != 0) {
+        q8act::Rows<false, true, true> out{x8, xs, xu, oc, oc / 32, 1, slot, k_used};
+        if (canon == 32) return q8act::quantize<8, q8act::Canon<32>>(q, tokens * nb, nb, src, out);
+        return q8act::quantize<8, q8act::Canon<256>>(q, tokens * nb, nb, src, out);
+    }
+    if (sums) {
+        q8act::Rows<true, true> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1, slot, k_used};
+        return q8act::quantize<8, q8act::Mul>(q, tokens * nb, nb, src, out);
+    }
+    q8act::Rows<false, true> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1, slot, k_used};
+    return q8act::quantize<8, q8act::Mul>(q, tokens * nb, nb, src, out);
 }
 
 sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_bytes, int64_t w_rows, int64_t w_cols,
@@ -1602,6 +2478,7 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         return by_rows<TY>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, bounds, max_rows, ids, \
                            dst, ld_dst, rows > 0 ? rows : total_rows, half_dst)
     switch (t) {
+        STRATA_MMQ_CASE(2);
         STRATA_MMQ_CASE(6);
         STRATA_MMQ_CASE(7);
         STRATA_MMQ_CASE(8);
@@ -1612,9 +2489,18 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         STRATA_MMQ_CASE(14);
         STRATA_MMQ_CASE(kNativeQ6KRows);
         STRATA_MMQ_CASE(kNativeQ8Rows);
+        STRATA_MMQ_CASE(kBih3Planes);
+        STRATA_MMQ_CASE(kBih3Code);
         STRATA_MMQ_CASE(16);
         STRATA_MMQ_CASE(17);
         STRATA_MMQ_CASE(18);
+        STRATA_MMQ_CASE(kIqMmqFx + 16);
+        STRATA_MMQ_CASE(kIqMmqFx + 17);
+        STRATA_MMQ_CASE(kIqMmqFx + 18);
+        STRATA_MMQ_CASE(kIqMmqFx + 20);
+        STRATA_MMQ_CASE(kIqMmqFx + 21);
+        STRATA_MMQ_CASE(kIqMmqFx + 22);
+        STRATA_MMQ_CASE(kIqMmqFx + 42);
         STRATA_MMQ_CASE(20);
         STRATA_MMQ_CASE(21);
         STRATA_MMQ_CASE(22);
@@ -1622,9 +2508,81 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         STRATA_MMQ_CASE(29);
         STRATA_MMQ_CASE(19);
         STRATA_MMQ_CASE(42);
+        STRATA_MMQ_CASE(40);
         default: return {};
     }
 #undef STRATA_MMQ_CASE
+}
+
+
+void iq_mmq_choose_forms(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols, int n) {
+    if (!iq_mmq_type_ok(t)) return;
+    if (intel_shape_of(q) != 0) {   // Intel's two forms (intel_sub_group_first)
+        if (const char* env = strata::env_get("IQ_MMQ_SUB_GROUP"); env != nullptr && (env[0] == '0' || env[0] == '1'))
+            return;
+    } else if (f16_env() >= 0 || std::max(n, 1) == 1 || f16_untimed(q) || !iq_mmq_f16_ok(q, t, w_rows, w_cols)) {   // f16_first
+        return;   // one form only
+    }
+    // the classes timed: Intel's forms 8 to 256 rows an expert, the FP16 form 512 and 1024 (f16_first)
+    const bool intel = intel_shape_of(q) != 0;
+    const int top = intel ? 8 : kF16TopClass;
+    const int64_t kTop = (int64_t) 1 << top, kFirst = intel ? 8 : (int64_t) 1 << kF16FirstClass;
+    n = std::max(n, 1);
+    // the buffers hold n experts of 256 rows: a class of more rows takes fewer experts (at least 2), so that the
+    // timing takes no more memory than Intel's (taken with the engine's caches already in place)
+    const int64_t cols = iq_mmq_type_dup(t) ? 2 * w_cols : w_cols, R = n * std::min<int64_t>(kTop, 256);
+    {
+        SgChoice& c = sg_choice(q);
+        std::lock_guard<std::mutex> lock(c.mu);
+        if (c.picks.count(std::make_tuple(t, rows_class(kTop, top), n == 1, w_rows, cols)) != 0) return;   // timed before
+    }
+    const size_t eb = (size_t) w_rows * iq_mmq_row_bytes(t, w_cols);
+    // the products' buffers: n experts' weights (any bits are valid blocks; the values do not change the time), the
+    // rows' int8 activations (zeros) and their outputs
+    auto* w = sycl::malloc_device<uint8_t>(eb * (size_t) n, q);
+    auto* xq = sycl::malloc_device<uint8_t>(iq_mmq_act_bytes(R, cols), q);
+    auto* dst = sycl::malloc_device<float>((size_t) (R * w_rows), q);
+    auto* bounds = sycl::malloc_device<int32_t>((size_t) n + 1, q);
+    auto* ids = sycl::malloc_device<int32_t>((size_t) R, q);
+    if (w != nullptr && xq != nullptr && dst != nullptr && bounds != nullptr && ids != nullptr) {
+        t_choosing = true;
+        try {
+            q.memset(w, 0x11, eb * (size_t) n);
+            q.memset(xq, 0, iq_mmq_act_bytes(R, cols));
+            q.parallel_for(sycl::range<1>((size_t) R), [=](sycl::id<1> i) { ids[i] = (int32_t) i[0]; });
+            std::vector<int32_t> hb((size_t) n + 1);
+            for (int64_t r = kFirst; r <= kTop; r *= 2) {
+                const int nr = n == 1 ? 1 : (int) std::max<int64_t>(2, std::min<int64_t>(n, R / r));
+                for (int e = 0; e <= nr; ++e) hb[(size_t) e] = (int32_t) (e * r);
+                q.memcpy(bounds, hb.data(), (size_t) (nr + 1) * sizeof(int32_t)).wait();
+                if ((int64_t) nr * r <= R)
+                    iq_mmq_grouped(q, t, w, eb, w_rows, cols, nr, xq, nr * r, bounds, r, ids, dst, w_rows, nullptr, 0,
+                                   nr * r);
+            }
+            q.wait_and_throw();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "xestrata: timing the int8 expert products' forms: %s\n", e.what());
+        }
+        t_choosing = false;
+    } else {
+        std::fprintf(stderr, "xestrata: no device memory to time the int8 expert products' forms: the work-group form\n");
+    }
+    for (void* p : {(void*) w, (void*) xq, (void*) dst, (void*) bounds, (void*) ids})
+        if (p != nullptr) sycl::free(p, q);
+}
+
+bool iq_mmq_split_reserve(sycl::queue& q, size_t floats) {
+    SplitBuf& b = core::Runtime::of_queue(q).queue_item<SplitBuf>(q);
+    std::lock_guard<std::mutex> lock(b.mu);
+    if (b.n >= floats) return true;
+    q.wait();
+    if (b.p != nullptr) {
+        sycl::free(b.p, q);
+        core::graph_epoch_bump();   // a recorded step may hold the old one
+    }
+    b.p = sycl::malloc_device<float>(floats, q);
+    b.n = b.p != nullptr ? floats : 0;
+    return b.p != nullptr;
 }
 
 }  // namespace strata::kernels

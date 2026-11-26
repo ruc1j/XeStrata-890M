@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #pragma once
 
@@ -11,6 +12,18 @@
 namespace strata::core {
 class WeightTable;
 struct WeightRef;
+
+/// A packed dense replacement for a native GGUF matrix. Its bytes stay in dense_nq.bin until read.
+struct DenseNqEntry {
+    int type = -1;
+    int64_t ne0 = 0, ne1 = 0;
+    uint64_t offset = 0, bytes = 0;
+};
+bool dense_nq_init(const std::string& pack_dir, std::string& err);
+bool dense_nq_active();
+const DenseNqEntry* dense_nq_find(const std::string& name);
+bool dense_nq_read(const std::string& name, int64_t ne0, int64_t ne1, std::vector<uint8_t>& data,
+                   std::string& err);
 
 /// STRATA_HC_Q8 with the BF16 copies dropped (NativeDense::drop_hc_bf16): `w`'s BF16 values, its Q8_0 copy
 /// dequantized on `stream` into scratch `slot` (0-1 the prompt path's down and up, 2-3 the single-token read's),
@@ -58,16 +71,44 @@ public:
     /// `drop_hc_bf16`): no VRAM-share rule for the choice, since the Q8_0 copies then take less than they free.
     void set_hc_side(bool on) { hc_side_ = on; }
     /// After `load`: the Q8_0 read was chosen.
-    bool hc_q8_chosen() const { return !hc_q8_.empty(); }
+    bool hc_q8_chosen() const { return !hc_q8_refs_.empty(); }
+    /// The Q8_0 hyper-connection projections' VRAM (0 once they are in pinned memory).
+    uint64_t hc_q8_device_bytes() const { return hc_q8_host_ ? 0 : hc_q8_bytes_; }
+    /// Moves the Q8_0 hyper-connection projections to pinned host memory, the kernels reading them there in place
+    /// (a card the expert cache would leave short otherwise).  Before any graph captures them.
+    bool hc_q8_to_host(WeightTable& table, std::string& err);
+    /// The blocks the layers' projections are allocated in (`load`), some layers each: the last step for a card the
+    /// expert cache would leave short moves the fewest of them to pinned host memory, the kernels reading them there in
+    /// place (a window reads them whole over the link).  Before any graph captures them.
+    size_t layer_blocks() const { return blocks_.size(); }
+    /// Block `i`'s VRAM (0 once in pinned memory, or a block of rows outside the layers), and its first and last layer.
+    uint64_t block_device_bytes(size_t i) const {
+        return blocks_[i].p != nullptr && blocks_[i].l0 >= 0 ? blocks_[i].used : 0;
+    }
+    int block_first_layer(size_t i) const { return blocks_[i].l0; }
+    int block_last_layer(size_t i) const { return blocks_[i].l1; }
+    bool block_to_host(WeightTable& table, size_t i, std::string& err);
     /// The layers' BF16 down / up rows that have Q8_0 copies become non-resident (data null) and the dequantization
     /// scratch hc_bf16_view uses is allocated here, at load, not on first use (a graph may capture the first use).
     bool drop_hc_bf16(WeightTable& table, std::string& err);
     uint64_t weight_bytes() const { return bytes_; }
-    size_t tensor_count() const { return weights_.size(); }
+    size_t tensor_count() const { return count_; }
+
+    /// A device allocation projections are carved from (layers l0..l1; -1: rows outside the layers)
+    struct Block {
+        void* p = nullptr;
+        uint64_t cap = 0, used = 0;
+        int l0 = -1, l1 = -1;
+    };
 
 private:
-    std::vector<void*> weights_;
-    std::vector<void*> hc_q8_;   ///< STRATA_HC_Q8=1: the hyper-connection projections' Q8_0 copies
+    std::vector<Block> blocks_;            ///< the projections'
+    std::vector<Block> hc_blocks_;         ///< the Q8_0 hyper-connection copies'
+    std::vector<void*> host_;              ///< the pinned copies of moved blocks
+    size_t count_ = 0;
+    std::vector<WeightRef*> hc_q8_refs_;   ///< the rows with a Q8_0 copy
+    uint64_t hc_q8_bytes_ = 0;
+    bool hc_q8_host_ = false;
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
     bool hc_side_ = false;

@@ -27,7 +27,7 @@ decode の行は、temperature 0.7 で 1 つの会話に 400 トークンを出�
 
 > **目次:** [XeStrata-890M とは](#xestrata-890m-とは) · [必要なもの](#必要なもの) · [モデル](#モデル) ·
 > [インストール](#インストール)（[Releases](https://github.com/ruc1j/XeStrata-890M/releases)） · [使い方](#使い方) · [困ったとき](#困ったとき) · [しくみ](#しくみ) ·
-> [開発する人へ](#開発する人へ) · [詳しい説明](docs/DETAILS.ja.md) · [画像の生成](docs/IMAGE.ja.md)
+> [開発する人へ](#開発する人へ) · [詳しい説明](docs/DETAILS.ja.md) · [モデルの一覧](docs/MODELS.ja.md) · [画像の生成](docs/IMAGE.ja.md) · [翻訳](docs/TRANSLATE.ja.md)
 
 ## XeStrata-890M とは
 
@@ -37,7 +37,9 @@ AMD の GPU では intel/llvm の DPC++ の HIP のターゲットでその SYCL
 モデル、インストールの流れ、画面、API は Strata と XeStrata のままです。
 
 ビルドは自由ソフトウェアだけの free 方式だけです（ROCm は自由ソフトウェアです）。oneMKL や CUDA は使いません。
-元の XeStrata の xe0.2.8-1（2026-10-30 の main）までの変更と、upstream の Strata 0.2.22（エンジン 0.1.69）のエンジン・serve・setup の変更を取り込んでいます（[docs/XE.ja.md](docs/XE.ja.md)）。
+元の XeStrata の 2026-11-25 の main（xe0.2.20-1 のあと）までの変更と、upstream の Strata 0.2.22（エンジン 0.1.69）のエンジン・serve・setup の変更を取り込んでいます（[docs/XE.ja.md](docs/XE.ja.md)）。
+元の XeStrata から来た機能、つまり画像の生成、動画の拡大、翻訳、LoRA の学習、ほかの文章のモデル（Inkling-2-Mini（QSA）など）も入っています。
+ただし、このフォークが 890M で速さを詰めているのは Qwen3.8-Flash-Next だけです。
 
 **890M の性質と、このフォークの使い方**
 
@@ -145,7 +147,7 @@ AMD の GPU では intel/llvm の DPC++ の HIP のターゲットでその SYCL
      `STRATA_PREFILL_HC_MMQ=1` もありますが、890M では hc read が 1,313 → 1,397 ms と遅くなるので既定はオフです。
    - AMD のデバイスコンパイルではカーネルに必要なワークグループの大きさを付け（`STRATA_AMD_REQD_WG`）、intel/llvm への修正
      `hip-reqd-work-group-size` がそれをバックエンドのレジスター予算に渡します（それまでは全カーネルが 128 VGPR で spill していました）。
-     そのため密な積は長い prompt の大きい積に 64 x 128 のタイル（`STRATA_MMA_SHAPE=5`、2048 行以上かつ 2048 列以上など）を取り、
+     そのため密な積は長い prompt の大きい積に 64 x 128 のタイル（`STRATA_MMA_SHAPE=7`、2048 行以上かつ 2048 列以上など）を取り、
      MMQ は decoder を load と decode に分けてステップの load を先に出し、格子表をローカルメモリに置き、スケールを 1 つの fma で掛けます。
    - エキスパートのキャッシュの host USM は、HIP では GPU がキャッシュできるメモリ（`hipHostMalloc` の NonCoherent、`STRATA_HOST_NC=0` で元の
      host USM）に取ります: その場で読む MMQ が 2 倍ほど速くなります（523 トークンの prefill 3.16 -> 2.68 s）。
@@ -190,6 +192,22 @@ AMD の GPU では intel/llvm の DPC++ の HIP のターゲットでその SYCL
 ダウンロード 68 GB）です。`--expert-cache 24576` でエキスパートをすべて RAM に置き、約 34 GiB を使います。
 ほかの大きさや版はこのフォークでは動かしていません。エキスパートの全部を RAM に置けなければ、`--expert-cache` を小さくします
 （起動時のログの空きのメモリを見て決めます）。
+元の XeStrata が扱うほかの文章のモデル（SC117 Swift、Signal-2、Sync、Inkling-2-Mini（QSA）、SenseNova-Loop-9B ほか）も setup で選べます。
+このフォークでは動かしていません。一覧は [docs/MODELS.ja.md](docs/MODELS.ja.md) にあります。
+
+### 画像の生成（任意）
+
+文章のモデルと一緒に、Qwen-Image-2.1、Mage-Flow、MageTrail、HunyuanImage 3.0、MOSS-Image、Anima から
+画像のモデルを入れられます。`xestrata --setup` で選ぶか、`xestrata --setup --images qwen-image-turbo` のように指定します。
+画像のモデルには文章のモデルとは別に 16〜20 GB の RAM が要ります（HunyuanImage 3.0 は約 50 GB）。
+LoRA の学習もブラウザからできます（[LORA_TRAIN](docs/LORA_TRAIN.ja.md#ブラウザからの作成)）。
+既定の組み合わせは -uncensored 版です。
+選び方、使い方、API は [docs/IMAGE.ja.md](docs/IMAGE.ja.md) にあります。
+
+### 翻訳（任意）
+
+PLaMo 3 Translate の 2B・0.8B・8B を入れると、DeepL と LibreTranslate の API、OpenAI 互換の API、
+Web の Translate タブで訳します。既定は RAM に合わせて 2B か 0.8B です（[docs/TRANSLATE.ja.md](docs/TRANSLATE.ja.md)）。
 
 ## インストール
 
@@ -217,6 +235,8 @@ Fedora 44 で、次の 3 つのどれかで入れます。rpm がいちばん簡
    - モデルと大きさ: Qwen3.8-Flash-Next の IQ2_XS。
    - 文脈の長さ: 一度に覚えておける文章の量です。Enter でこの PC への推奨になります（RAM 64 GB の 890M では 128K）。
    - 画像: 画像も読ませるかどうか。
+   - 画像を作るモデル: どのモデルを入れるか。none で入れません（[画像の生成](docs/IMAGE.ja.md)）。
+   - 翻訳のモデル: 既定は auto（RAM に合わせて PLaMo 3 Translate の 2B か 0.8B）で、no で入れません（[翻訳](docs/TRANSLATE.ja.md)）。
    - 実験的な速度向上用の射影: 答え方が変わる実験的な機能で、既定ではオフです。使う前に
      [説明](docs/DETAILS.ja.md#実験的な速度向上用の射影実験的既定はオフ)を読んでください。
 1. 次からは `xestrata` で起動します。止めるときはそのウィンドウを閉じます。
@@ -267,12 +287,12 @@ podman compose up -d                         # http://127.0.0.1:8095（podman co
    ./setup.sh --license free
    ```
 
-   setup は GPU と RAM と CPU を確かめ、intel/llvm（v7.2.0、ROCm の HIP のターゲット付き）をここでビルドするかを尋ね、
+   setup は GPU と RAM と CPU を確かめ、intel/llvm（v7.2.1、ROCm の HIP のターゲット付き）をここでビルドするかを尋ね、
    エンジンをビルドし、モデルをダウンロードして起動し、ブラウザで `http://127.0.0.1:8095` を開きます。質問は rpm のときと同じです。
 
 - 時間: 初回はダウンロード（68 GB）と intel/llvm とエンジンのビルドに時間がかかります。途中で止めても、次は続きから始まります。
   GPU のコードは初めて使うときにドライバーがコンパイルするので、最後にモデルを一度動かしてそれを済ませます。
-- 置き場所: モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data`、モデルの設定（`xestrata-<モデル>.json`）とログは XeStrata のフォルダーに置きます。
+- 置き場所: モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data`、モデルの設定（`xestrata-<モデル>.json`）は `~/.config/xestrata`、ログは `~/.local/state/xestrata` に置きます（rpm と同じ）。
 - **次からは** `./setup.sh` を実行すると、すぐに起動します。止めるときはそのウィンドウを閉じます。
   端末での会話は `.venv/bin/python chat.py` です。
 - **更新**: `git pull` のあと `./update.sh` を実行すると、エンジンと Python のパッケージとモデルの設定を更新します（モデルは起動しません）。
@@ -284,7 +304,7 @@ podman compose up -d                         # http://127.0.0.1:8095（podman co
 
 setup は、GPU の名前ではなく性質を見て、890M 向けの設定を書きます。
 統合 GPU の AMD の GPU で、BIOS の割り当て（VRAM）がエキスパートを収めず、RAM がモデルを収める PC（この 890M の PC）では、
-モデルの設定 `xestrata-iq2_xs.json`（rpm と Podman では `~/.config/xestrata/`、ソースからのときは XeStrata のフォルダー）に次が入ります。
+モデルの設定 `xestrata-iq2_xs.json`（`~/.config/xestrata/`）に次が入ります。
 
 ```json
 "args": [ ..., "--expert-cache", "24576", ..., "--mmap-experts", "--no-prefill-borrow" ],
@@ -309,30 +329,40 @@ RAM がモデルを収めない PC（low-RAM モード）では、この設定�
 
 **ログインしている間ずっと動かす**: `systemctl --user enable --now xestrata` で、最後に設定したモデルを起動しておきます
 （ブラウザは開きません）。先に一度設定しておきます。
+そのモデルをもう一度起動すると（`xestrata`）、2 つ目のサーバーは立てずに、動いているものにつなぎます。
 
 **自分の PC に合わせる**: `xestrata --calibrate`（ソースからは `./setup.sh --calibrate`）は、エンジンの設定のいくつかをこの PC で測り、速いものを残します（5〜10 分ほど）。
 
 **速さを測る**: `xestrata --bench` は、入れたモデル（`--model IQ2_XS` などで指定）のこの PC での速さと、どこに時間がかかっているかを測り、
 データフォルダの `records/bench-<日時>/` に記録を書きます（40 分ほど。動いている XeStrata は先に止めます）。
-測るものと記録の中身は [docs/BENCH.ja.md](docs/BENCH.ja.md) にあります。
+記録はどこにも送りません。測るものと記録の中身は [docs/BENCH.ja.md](docs/BENCH.ja.md) にあります。
 
 ## 使い方
 
-- ブラウザ: `http://127.0.0.1:8095`（モデルが起動すると自動で開きます）。**Chat**、モデルと GPU・CPU・RAM の様子を
-  見る **Monitor**、設定とアドレスを見る **About**、画像の生成を入れたときは **Images** のタブがあります。
-- 端末で会話: `.venv/bin/python chat.py`
+- ブラウザ: `http://127.0.0.1:8095`（モデルが起動すると自動で開きます）。**Chat**（会話）、**Images**（画像）、
+  **Tools**（道具）、**Video**（動画）、**Translate**（翻訳）、**Monitor**（モデルと GPU・CPU・RAM の様子）、
+  **About**（設定とアドレス）の 7 つのタブがあります。
+- 端末で会話: `xestrata chat`（ソースから入れたときは `.venv/bin/python chat.py`）
 - アプリやコーディングエージェント: 「OpenAI 互換」の接続先として、ベース URL **`http://127.0.0.1:8095/v1`** を指定します。
   API キーとモデル名は何でも構いません。Anthropic の API を使うアプリは `http://127.0.0.1:8095/v1/messages` です。
+  Responses API（`/v1/responses`）もあります。
 - 思考の深さ: モデルは答える前に考えます。深さは **Off、Low、Medium、High** から選べます。チャットの画面のメニュー、
   `chat.py` の `/think low`、アプリの「reasoning effort」の設定で変えられます。Off がいちばん速く、難しい質問には High が向きます。
 - 画像: チャットの画面では **Picture** を押します。`chat.py` では `/image <パス>` と入力します。アプリでは添付します。
 - 画像を作る: Images のタブか、チャットで頼みます（[画像の生成](docs/IMAGE.ja.md)）。
+- 画像・動画・翻訳の API: `/v1/images/generations`、`/v1/videos`、`/v2/translate` のほか、LoRA の学習は
+  `/v1/lora/jobs` から使えます（[IMAGE](docs/IMAGE.ja.md#api)、[TRANSLATE](docs/TRANSLATE.ja.md)、
+  [LORA_TRAIN](docs/LORA_TRAIN.ja.md)）。
+- スキルと MCP: 同梱のスキルは `GET /v1/skills`、`GET /v1/skills/<name>` で外から読み、
+  XeStrata は MCP のツールを呼び、MCP サーバーとしても動きます（[DETAILS](docs/DETAILS.ja.md#api)）。
 - スマートフォンや別の PC から: `./setup.sh --host 0.0.0.0 --api-key <秘密の文字列>` を実行し、
   サーバーのウィンドウに出るアドレスを開きます（[詳細](docs/DETAILS.ja.md#ストリーミングと接続)）。
 
-**知っておくと良いこと**: 要求は 1 つずつ処理します（複数を同時に処理するには `"parallel": 2`、[BATCHING](docs/BATCHING.ja.md)）。会話の最初のメッセージはすべて読み込みますが、
-そのあとは会話を覚えておき、新しく足された部分だけを読むので、続きの返事はすぐに始まります。
-API の一覧、MCP のツール、llama-swap との組み合わせは [DETAILS](docs/DETAILS.ja.md#api) と [LLAMA_SWAP](docs/LLAMA_SWAP.ja.md) にあります。
+**知っておくと良いこと**: 要求は 1 つずつ処理します（複数をまとめて decode するには `"parallel": N`、
+[BATCHING](docs/BATCHING.ja.md)）。会話の最初のメッセージはすべて読み、あとは足された部分だけを読むので、
+続きの返事はすぐに始まります。SearXNG 互換の検索サーバーを設定すると Web を検索できます
+（[Web 検索](docs/DETAILS.ja.md#web-検索)）。llama-swap との組み合わせは
+[LLAMA_SWAP](docs/LLAMA_SWAP.ja.md) にあります。
 
 ## 困ったとき
 
@@ -374,7 +404,7 @@ APU の電力の上限（PPT）を上げても、長い生成では熱で遅く�
 **解決しないとき**
 [詳しい対処の表](docs/DETAILS.ja.md#困ったとき)を見てください（画像の生成は [IMAGE](docs/IMAGE.ja.md#困ったとき)）。
   端末を操作できる LLM エージェントには、[復旧と原因調査の指示書](docs/DIAGNOSE.ja.md)と症状を渡せます。
-[issue](https://github.com/ruc1j/XeStrata-890M/issues) を立て、XeStrata のフォルダーの `xestrata-<モデル>.log` を添付してください。
+[issue](https://github.com/ruc1j/XeStrata-890M/issues) を立て、`~/.local/state/xestrata` の `xestrata-<モデル>.log` を添付してください。
 
 ## しくみ
 
@@ -391,13 +421,15 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
 - **長い文章は大きな塊で読みます**（一度に最大 32,768 トークン）。prefill の密な行列積は 890M の WMMA で、
   エキスパートの積は int8 の WMMA で計算します。
 
+文章の 2 つのエンジンも、画像の DiT や VAE も、行列積・注意・エキスパートの配分などの部品は共通です。
 各部分の詳しい説明は [docs/DETAILS.ja.md](docs/DETAILS.ja.md#しくみ) にあります（元の XeStrata の説明です）。
 
 ## 開発する人へ
 
-報告やプルリクエストを送る前に、[CONTRIBUTING.ja.md](CONTRIBUTING.ja.md)（型番に依存しないこと、ライセンス、GPL 第 7 条の追加の許可、取り込む変更の条件、報告の仕方）を読んでください。
+報告やプルリクエストを送る前に、[CONTRIBUTING.ja.md](CONTRIBUTING.ja.md)（機器に依存しないこと、ライセンス、
+GPL 第 7 条の追加の許可、取り込む変更の条件、報告の仕方）を読んでください。
 
-- ビルド: free 方式だけです（`build/free`、`-DSTRATA_LICENSE=free`、intel/llvm v7.2.0 を `tools/intel_llvm_build.py` で HIP 付きにビルドしたもの）。
+- ビルド: free 方式だけです（`build/free`、`-DSTRATA_LICENSE=free`、intel/llvm v7.2.1 を `tools/intel_llvm_build.py` で HIP 付きにビルドしたもの）。
   手順は [docs/BUILD.ja.md](docs/BUILD.ja.md) にあります。この機械の事実（パス、設定、道具）は `LOCAL.md`（git には入れません）に書きます。
 - カーネル単体の計測: `build/free/gemm_bench`（密な積）、`iq_mmq_parity --bench`（エキスパートの int8 の積）、`expert_bench`、`gdn_bench`、`gr_bench`、`mmvq_bench`。
   単体はクロックを固定せず高い側（`dpm high`）で測り、A/B は同じ条件で交互に、GPU を冷ましてから測ります（熱で数 % 動きます）。
@@ -409,6 +441,7 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
 - 守ること: [AGENTS.md](AGENTS.md)。890M 向けの分岐は GPU の名前ではなく報告される性質（統合 GPU、HIP の backend、WMMA の有無）か環境変数の opt-in で選びます。
   リント（`tools/lint/run.sh`）、テスト（CTest、`python -m unittest`）、ライセンスの表示もそこにあります。
   計測の記録は git に入れません。
+- モデルの情報: 版・大きさ・勧め方は [docs/MODELS.ja.md](docs/MODELS.ja.md) にあります（元の XeStrata のものです）。
 - README と docs: 日本語版（README.ja.md、docs/*.ja.md）を先に書き、英語版（README.md、docs/*.md）はその訳です。
   `docs/` は元の XeStrata のものです。
 
@@ -428,6 +461,8 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
      Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
    - Thinking Machines の [Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)（`.strata` のファイルは upstream の [Strata](https://huggingface.co/strata-engine/Inkling-2-Mini-Strata)。専用のエンジンで動きます: [詳しい説明](docs/DETAILS.ja.md#inkling-2-mini専用のエンジンで動くモデル)）。
    - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
+   - 元の XeStrata から来たほかのモデル: hiruhiru2005、SC117、SenseNova、Preferred Networks（PLaMo 3 Translate）、CircleStone Labs ほか。
+     個別の名前とライセンスは [モデルの一覧](docs/MODELS.ja.md) と [DETAILS のクレジット](docs/DETAILS.ja.md#クレジットとライセンス) にあります。
    - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image、文の読み手の Qwen3-VL と Qwen3.5-9B（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
 
   モデルのファイルには、それぞれのライセンスが適用されます。
@@ -443,6 +478,9 @@ XeStrata-890M は **RAM 全体を GPU のメモリとして使います**。
      そのビルドに渡す機能の指定は、Debian の [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) のパッケージ（Expat）の `debian/rules` から写しました。
    - 画像のエンジンの注意の計算: [oneDNN](https://github.com/uxlfoundation/oneDNN)（Apache-2.0、Intel の GPU）、[AOTriton](https://github.com/ROCm/aotriton)（MIT、AMD の GPU）、
      [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend)（Apache-2.0、一部 MIT、NVIDIA の GPU）。参照画像の読み込みに [stb_image](https://github.com/nothings/stb)（MIT か Unlicense）。
+   - AMD の GPU の int8 の積と注意: Comfy Org の [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen)（Apache-2.0）。
+   - 翻訳の言語の判定: [py3langid](https://github.com/adbar/py3langid)（BSD-3-Clause）。チャットの図: [mermaid](https://mermaid.js.org/)（MIT）。
+   - YASAKANI、Sync-Strata、vLLM-Omni など、元の XeStrata が取り込んだもの（[NOTICE](NOTICE)）。
    - [quantscope](https://github.com/1872183316/quantscope)（MIT か Apache-2.0）: `setup.py --inspect` が GGUF の中身を確かめるのに使います。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
    - チャットの数式を描く [KaTeX](https://katex.org/)（MIT）。
@@ -474,16 +512,21 @@ XeStrata は自由ソフトウェアです。MistVVK と XeStrata の貢献者�
 - **例外**: `third_party/` の次のものは、元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
    - intel/llvm への XeStrata の修正のパッチ（`third_party/main/intel-llvm/`）: Apache-2.0 WITH LLVM-exception。
    - oneMath への XeStrata の変更（フォーク、`third_party/main/oneMath/`）: Apache-2.0。
+   - oneDNN に当てるパッチ（`third_party/main/oneDNN/patches/`、oneDNN の pull request を CMake が取る tag に移したもの）: Apache-2.0。
+   - comfy-kitchen に当てる XeStrata のパッチ（`third_party/main/comfy-kitchen/patches/`）: comfy-kitchen のライセンス（Apache-2.0）。
    - AOTriton を Windows 向けにビルドするための XeStrata のパッチ（`third_party/main/aotriton/`）: AOTriton のライセンス（MIT）。
+   - Podman の seccomp の設定に io_uring を足したもの（`third_party/main/containers-common/`）: Apache-2.0。
    - 変えていない写し: ggml の `ggml-common.h` と、agentionai の llama.cpp の `ggml-common-tq.h`（`third_party/main/ggml/`、MIT）、
-     `quantscope.py`（`third_party/main/quantscope/`、MIT か Apache-2.0）、`stb_image.h`（`third_party/main/stb/`、MIT か Unlicense）。
+     `quantscope.py`（`third_party/main/quantscope/`、MIT か Apache-2.0）、`stb_image.h`（`third_party/main/stb/`、MIT か Unlicense）、
+     py3langid（`third_party/main/py3langid/`、BSD-3-Clause）、mermaid の `mermaid.min.js`（`third_party/main/mermaid/`、MIT。束ねたパッケージのライセンスは `BUNDLED.md`）。
    - 画面のフォント Outfit（`third_party/main/outfit/`）: SIL Open Font License 1.1。
    - チャットの数式を描く KaTeX（`third_party/main/katex/`）: MIT。
    - `third_party/nonfree/`: 自由ソフトウェアでないもの。元のモデルのチャットテンプレートと、実験的な速度向上用の射影のベクトルで、
      どちらも Qwen Community License 1.0 です。
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。パッケージには入れていません。
 - **パッケージに入れているほかのもの**: intel/llvm の SYCL の実行時（Apache-2.0 WITH LLVM-exception）、llama.cpp の gguf-py（MIT）、
-  oneMath（Apache-2.0）、oneDNN（Apache-2.0）、AOTriton のライブラリとカーネル（MIT。中のカーネルは aiter（MIT）、FlyDSL（Apache-2.0）、Triton（MIT）の一部を含むことがあります）を、それぞれのライセンスの文書と一緒に入れています。
+  oneMath（Apache-2.0）、oneDNN（Apache-2.0）、AOTriton のライブラリとカーネル（MIT。中のカーネルは aiter（MIT）、FlyDSL（Apache-2.0）、Triton（MIT）の一部を含むことがあります）、
+  comfy-kitchen の AMD の GPU 向けのモジュール（Apache-2.0）、py3langid（BSD-3-Clause）、mermaid（MIT ほか）を、それぞれのライセンスの文書と一緒に入れています。
   AMD の GPU 向けのコードは ROCm のデバイスライブラリ（NCSA）の一部を、画像のエンジンは stb_image（MIT）と、contrib-llvm の版では cuDNN Frontend（Apache-2.0、一部 MIT）を含むので、そのライセンスの文書も入れています。
   contrib-llvm の版の NVIDIA の GPU 向けのコードは、NVIDIA の libdevice の一部を含むことがあり、その部分は NVIDIA の CUDA Toolkit の使用許諾契約に従います。
   そのほかの自由ソフトウェアでないもの（oneMKL、cuBLAS、cuDNN、NVIDIA のドライバー）は入れていません。

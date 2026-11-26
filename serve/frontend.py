@@ -24,7 +24,6 @@ import json
 import logging
 import math
 import mimetypes
-import os
 import re
 import threading
 import uuid
@@ -36,8 +35,30 @@ from urllib.parse import unquote
 import jinja2
 import jinja2.ext
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+from serve import envvars
 
 LOGGER = logging.getLogger(__name__)
+# The earlier turns' thinking kept where a template drops it unless asked (Qwen3.6-35B-A3B's preserve_thinking; the
+# Qwen3.8-Flash-Next and GLM-5.3-Flash templates keep it already).  A client that sends the thinking back, as an agent
+# harness does in its tool loop, then gets the earlier turns rendered as the model wrote them: the prompt keeps its
+# start and the conversation cache serves it, instead of reading it again from the first assistant turn after each
+# new user message.  A request's own chat_template_kwargs win.
+TEMPLATE_DEFAULTS = {"preserve_thinking": True}
+# A template that drops the earlier turns' thinking with no switch (Qwen3.5-9B's: `{%- if loop.index0 >
+# ns.last_query_index %}` right before the assistant turn's `<think>` and reasoning_content) gets Qwen3.6-35B-A3B's
+# switch there, so TEMPLATE_DEFAULTS reaches it too.  Only that branch, and only in a template that has no
+# preserve_thinking of its own; MOSS-Image's text encoder writes its own prompt form (images.prompt_ids) and never
+# renders a chat template.
+_DROPS_THINKING = re.compile(r"(\{%-?\s*if\s+)(loop\.index0\s*>\s*ns\.last_query_index)"
+                             r"(\s*-?%\}[^\n]*\n[^\n]*<think>[^\n]*reasoning_content)")
+
+
+def keep_thinking_switch(source: str) -> str:
+    """`source` with the thinking switch in its dropping branch (see _DROPS_THINKING), else as it is."""
+    if "preserve_thinking" in source:
+        return source
+    return _DROPS_THINKING.sub(r"\1(preserve_thinking is defined and preserve_thinking is true) or (\2)\3", source,
+                               count=1)
 
 
 # ------------------------------------------------------------------------------------------------ template
@@ -74,7 +95,10 @@ class ChatTemplate:
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = strftime_now
-        self.source = Path(path).read_text(encoding="utf-8")
+        # Hugging Face's {% generation %} ... {% endgeneration %} only mark the assistant's tokens for training
+        # (Inkling-2-Mini's template has them): Jinja has no such tag, and rendering needs nothing of them
+        self.source = re.sub(r"\{%-?\s*(?:end)?generation\s*-?%\}", "",
+                             keep_thinking_switch(Path(path).read_text(encoding="utf-8")))
         self.template = env.from_string(self.source)
         # the Harmony format's templates (llm-jp-4.1, GPT-OSS): its replies are channels, read by HarmonyParser
         self.harmony = "<|channel|>" in self.source
@@ -89,6 +113,11 @@ class ChatTemplate:
         # objects, thinking always off
         self.inkling2mini = ("<|content_invoke_tool_json|>" in self.source
                              or "tool_declare<|content_xml|>" in self.source)
+        # Inkling-2-Mini's template: its replies are channel tokens (serve/inkling_dialect.py reads them), its calls'
+        # arguments parsed objects, and no thinking (upstream inkling2's no-thinking mode).  The same template as
+        # inkling2mini above; this one is for the .strata engine's serve path (serve/inkling_kind.py), which wraps the
+        # parser by it.  Rendering prepares the messages once, through inkling2mini_dialect (the same functions)
+        self.inkling = "<|content_invoke_tool_json|>" in self.source
         self.caps = self._detect_caps()
         self.thinking = self._thinking_levels()
 
@@ -112,8 +141,8 @@ class ChatTemplate:
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
         # Do not use completed empty assistant turns as examples for the next reply. Keep the final message.
-        # (#843.  STRATA_KEEP_EMPTY_TURNS=1 renders them as before.)
-        keep_empty = os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1"
+        # (#843.  XESTRATA_KEEP_EMPTY_TURNS=1 renders them as before.)
+        keep_empty = envvars.get("KEEP_EMPTY_TURNS") == "1"
         messages = [m for i, m in enumerate(messages)
                     if i == len(messages) - 1 or keep_empty or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                                     and not _text_of(m.get("content")).strip()
@@ -141,7 +170,7 @@ class ChatTemplate:
         elif self.harmony and kwargs.get("reasoning_effort") == "xhigh":   # Harmony's efforts: low, medium and high
             kwargs = {**kwargs, "reasoning_effort": "high"}
         text = self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
-                                    **kwargs)
+                                    **{**TEMPLATE_DEFAULTS, **kwargs})
         if (self.call_form == "glm" and add_generation_prompt and kwargs.get("enable_thinking", True) is False
                 and text.endswith("<think>")):   # GLM's template always opens the thinking: closed at once
             text += THINK_END
@@ -842,6 +871,10 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+    # the earlier turns' thinking, where the template takes the switch (TEMPLATE_DEFAULTS keeps it otherwise)
+    keep = ctk.get("preserve_thinking")
+    if isinstance(keep, bool):
+        kwargs["preserve_thinking"] = keep
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
@@ -1235,6 +1268,9 @@ def invoke_to_template(raw: str) -> str:
 _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\s*$")
 
 
+# The output's end right after a call's own `</function>` (and `</tool_call>`), the parameter before it left open:
+# OutputParser._closed_at_end
+_OPEN_PARAM_AT_END = re.compile(r"\n?" + re.escape(FUNC_END) + r"\s*(?:" + re.escape(CALL_END) + r")?\s*\Z")
 # a quoted call's opener in a value: `<function=NAME>` and its first parameter or close; a bare FUNC_START is text
 _QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 
@@ -2990,9 +3026,14 @@ class OutputParser:
                     self.sp += end + close_len(rest, end, self.scloser)
                     self.ss = "between"
                     continue
-                # an undecided </parameter> (-2) is held from its start, like a tag still arriving
+                # an undecided </parameter> (-2) is held from its start, like a tag still arriving; so is a
+                # </function>, which a later </parameter> makes part of the value and the output's end makes the
+                # call's own close (_closed_at_end)
                 safe = min(k for k in (rest.find(c) for c in closers) if k >= 0) if end == -2 \
-                    else len(rest) - self._hold(rest, closers)
+                    else len(rest) - self._hold(rest, closers + (FUNC_END,))
+                f = rest.find(FUNC_END)
+                if f >= 0:
+                    safe = min(safe, f)
                 if safe > 0 and rest[safe - 1] == "\n":   # may be the trailing newline before </parameter>
                     safe -= 1
                 if safe > 0:
@@ -3046,6 +3087,18 @@ class OutputParser:
         out.append(Event("tool_args", tail, call=self.scall))
         self.ss = "done"
         return out
+
+    def _closed_at_end(self, body: str) -> str | None:
+        """The call body `body` (after `<tool_call>`) as the output's end leaves it: a parameter left open whose value
+        runs into the call's own `</function>` (and `</tool_call>`), nothing after them.  Within the output a value may
+        hold those tags; at its end nothing can follow, so they close the call (a model's slip in an agent loop:
+        `<parameter=worker>admin>` then `</function>`, which left an announced call unfinished, #211, and the turn
+        stopped).  The body with the parameter closed, or None when it is not that case."""
+        m = _OPEN_PARAM_AT_END.search(body)
+        if m is None or function_end(body) >= 0:
+            return None
+        fixed = body[:m.start()] + "\n" + PARAM_END + "\n" + FUNC_END
+        return fixed if function_end(fixed) >= 0 else None
 
     def _hold(self, text: str, tags: tuple[str, ...]) -> int:
         """Length of the longest suffix of `text` that is a proper prefix of one of `tags`."""
@@ -3597,6 +3650,39 @@ class OutputParser:
             return out
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
+            fixed = self._closed_at_end(self.buf) if self.ss in ("str", "raw") and reason in (None, "stop") else None
+            closer = _OPEN_PARAM_AT_END.search(self.buf) if fixed is not None else None
+            if fixed is not None and closer is not None:
+                # the open parameter's value runs into the call's own </function> at the output's end: it closes there
+                rest = self.buf[self.sp:closer.start()]
+                if self.ss == "str":
+                    if not self.sval_started and rest.startswith("\n"):   # the value's leading newline
+                        rest = rest[1:]
+                    if rest:
+                        out.append(Event("tool_args", json.dumps(rest, ensure_ascii=False)[1:-1], call=self.scall))
+                else:
+                    value = rest[1:] if rest.startswith("\n") else rest
+                    v = param_value(value, self.sprops.get(self.spname), self.sroot) if self.spname is not None \
+                        else _SKIP
+                    if v is not _SKIP:          # held with the other non-string parameters, as a closed value is
+                        self.sheld.pop(self.spname, None)
+                        self.sheld[self.spname] = v
+                        self.sset.add(self.spname)
+                    self.ss = "between"         # _close_scan does not take the raw text (and its closers) again
+                out += self._close_scan()
+                closed: ToolCall | None = self.scall
+                try:            # the final event carries the call's arguments, as the one _finish_call sends does
+                    read = parse_tool_call(fixed, self.schemas.get(self.scall.name), self.notes, recover=self.recover)
+                    read.name, read.id = self.scall.name, self.scall.id
+                    closed = read
+                except ValueError as e:
+                    if "no readable parameter" in str(e):
+                        closed = None           # #6032 R5: never run with no arguments (it stays announced, unfinished)
+                if closed is not None:
+                    out.append(Event("tool_call", call=closed))
+                self.buf = ""
+                self._reset_scan()
+                return out
             if self.ss == "function_done" and not self.buf[self.sp:].strip() and reason in (None, "stop"):
                 # A natural end immediately after </function> retains native streaming recovery.
                 out += self._close_scan()
@@ -3616,6 +3702,11 @@ class OutputParser:
             self.buf = ""
             self._reset_scan()
             return out
+        if self.state == "call" and not self.bare and reason in (None, "stop"):
+            fixed = self._closed_at_end(self.buf)
+            if fixed is not None:               # as the streamed case above: its </function> closes it
+                self.buf = ""
+                return out + self._finish_call(fixed)
         if self.state == "reasoning" and self.buf == THINK_END:   # the output ends on a held `</think>`: its end
             self.buf, self.state = "", "content"
         if self.buf:

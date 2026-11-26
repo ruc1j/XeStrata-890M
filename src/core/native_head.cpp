@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/native_head.hpp"
+#include "strata/core/native_dense.hpp"
+#include "strata/core/run_manifest.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -10,6 +13,7 @@
 #include "strata/platform/memory.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/platform/env.hpp"
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -45,9 +49,13 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
             err = "native head: expected a natively supported output.weight with the canonical head dimensions";
             return false;
         }
-        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out);
+        const DenseNqEntry* nq = dense_nq_find("output.weight");
+        std::vector<uint8_t> nq_data;
+        if (nq && !dense_nq_read("output.weight", n_in, n_out, nq_data, err)) return false;
+        const int source_type = nq ? nq->type : (int) tensor->type;
+        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes(source_type, (int) n_in, (int) n_out);
         const uint64_t payload = gguf.file_size() - gguf.data_start();
-        if (tensor->offset > payload || bytes > payload - tensor->offset) {
+        if (!nq && (tensor->offset > payload || bytes > payload - tensor->offset)) {
             err = "native head: truncated output.weight payload";
             return false;
         }
@@ -56,16 +64,16 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
         bool status = strata::gpu::alloc_device(&weights, bytes);
         if (status)
             status = strata::gpu::alloc_device(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
-        strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
+        if (!nq) strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
         if (status)
-            status = strata::gpu::copy(weights, gguf.tensor_data(*tensor), bytes);
+            status = strata::gpu::copy(weights, nq ? nq_data.data() : gguf.tensor_data(*tensor), bytes);
         if (!status) {
             if (scratch) strata::gpu::free(scratch);
             if (weights) strata::gpu::free(weights);
             err = std::string("native head upload: ") + strata::gpu::last_error();
             return false;
         }
-        int type = (int) tensor->type;
+        int type = source_type;
         if (type == 14 && strata::kernels::native_q6_k_rows_ok((int) n_in)) {   // aligned loads (native_mmvq.hpp)
             sycl::queue& q = strata::core::Runtime::get().compute();
             strata::kernels::native_q6_k_to_rows(weights, (int) n_in, (int) n_out, &q);
@@ -83,6 +91,14 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
         type_ = type;
+        if (strata::core::manifest::enabled()) {   // upstream 89f4fa18 (XESTRATA_MANIFEST): what the head holds and where
+            namespace mf = strata::core::manifest;
+            mf::instance().tensors("head", strata::ggml_type_name((uint32_t) source_type), 1, bytes);
+            mf::instance().path("head", "output.weight", true, "held in VRAM",
+                                std::string("type ") + strata::ggml_type_name((uint32_t) source_type) +
+                                    (type == strata::kernels::kNativeQ6KRows ? ", repacked (aligned rows)" : "") +
+                                    (type == strata::kernels::kNativeQ8Rows ? ", repacked (aligned rows)" : ""));
+        }
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();
@@ -121,7 +137,7 @@ NativeEmbed::~NativeEmbed() {
     for (void* c : copies_)
         if (c) strata::gpu::free(c);
     if (host_) strata::gpu::free(host_);
-    else if (dev_) strata::gpu::free(dev_);   // STRATA_EMBED_VRAM: the table itself in VRAM
+    else if (dev_) strata::gpu::free(dev_);   // a table placed in its own VRAM block
 }
 
 const void* NativeEmbed::table_for(void* stream) const {
@@ -140,8 +156,8 @@ const void* NativeEmbed::table_for(void* stream) const {
                                          " MiB for GPU " + std::to_string(dev));
             std::memcpy(c, host_, bytes_);
         } else {
-            // STRATA_EMBED_VRAM: the table is in table_rt's VRAM, which another GPU's context cannot read; that
-            // GPU gets a VRAM copy of its own, through the host
+            // a table in one GPU's VRAM, which another GPU's context cannot read: that GPU gets a copy of its own,
+            // through the host
             std::vector<uint8_t> bounce(bytes_);
             bool ok = false;
             {
@@ -185,33 +201,6 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
             return false;
         }
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
-        // STRATA_EMBED_VRAM=1 (upstream 884e37dfd): the table in the current device's VRAM instead of mapped host
-        // memory.  The same bytes, read by the same gather kernels through dev_; what changes is where a prompt's
-        // scattered row reads go, which over a slow host link cost more than the table's size in VRAM is worth.
-        // Taken only with the table plus 512 MiB free; otherwise, or when the upload fails, the mapped placement
-        // below is used as before, and the fallback is said.
-        if (const char* ev = std::getenv("STRATA_EMBED_VRAM"); ev != nullptr && ev[0] == '1') {
-            size_t free_b = 0, total_b = 0;
-            const bool have_free = strata::gpu::mem_info(&free_b, &total_b);
-            void* d = nullptr;
-            if (have_free && (uint64_t) free_b > bytes_ + ((uint64_t) 512 << 20) &&
-                strata::gpu::alloc_device(&d, bytes_)) {
-                if (strata::gpu::copy(d, gguf.tensor_data(*t), bytes_)) {
-                    std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1: %llu MiB placed in VRAM "
-                                         "(%llu MiB were free)\n",
-                                 (unsigned long long) (bytes_ >> 20), (unsigned long long) (free_b >> 20));
-                    dev_ = d;   // host_ stays null: the destructor frees dev_
-                    type_ = (int) t->type;
-                    n_embd_ = n_embd;
-                    n_vocab_ = n_vocab;
-                    return true;
-                }
-                strata::gpu::free(d);
-            }
-            std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1 not taken (%llu MiB free, the table "
-                                 "needs %llu MiB plus 512 MiB): kept in mapped host memory\n",
-                         (unsigned long long) (have_free ? free_b >> 20 : 0), (unsigned long long) (bytes_ >> 20));
-        }
         if (!strata::gpu::alloc_host(&host_, bytes_)) {
             host_ = nullptr;
             err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB";
@@ -234,13 +223,14 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
     }
 }
 
-void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {
-    strata::kernels::iq_embed_rows(type_, table_for(stream), row_, tokens, n_tok, n_embd_, out, stream);
-}
-
-void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
-    strata::kernels::iq_dequant_f32(type_, (const uint8_t*) table_for(stream) + (size_t) token * row_, n_embd_, out,
-                                    stream);
+strata::kernels::EmbedTable NativeEmbed::table(void* stream) const {
+    strata::kernels::EmbedTable t;
+    t.type = type_;
+    t.rows = table_for(stream);
+    t.row_bytes = row_;
+    t.n_rows = n_vocab_;
+    t.n_embd = n_embd_;
+    return t;
 }
 
 }  // namespace strata::core

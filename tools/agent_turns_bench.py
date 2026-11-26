@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Decode A/B on coding-agent turns over this repository: arms restarted per round, per-turn ratios.
 
-    python tools/agent_turns_bench.py strata-iq2_xs.json base: hcq8:STRATA_HC_Q8=2 [--rounds 2]
+    python tools/agent_turns_bench.py strata-iq2_xs.json base: hcq8:XESTRATA_HC_Q8=2 [--rounds 2]
 
 The workload is five simulated coding-agent sessions over this repository's own files (README, serve/, setup.py, the
 expert cache, the hyper-connection kernels, the tokenizer): a system prompt, four tools, a task (three in English, two
@@ -33,7 +33,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ab_engine import wait_ready  # noqa: E402
+from ab_engine import start_server, stop_server, wait_ready  # noqa: E402
 
 SYSTEM = ("You are an autonomous coding agent working in the user's repository. You can read files, search the code, "
           "edit files and run commands with the tools below. Work step by step: read the code you need before changing "
@@ -134,8 +134,9 @@ def turns() -> list[tuple[str, list[dict]]]:
 
 
 def post(port: int, messages: list[dict], max_tokens: int, seed: int) -> dict:
+    # never the script guard in a measurement
     body = {"messages": messages, "tools": TOOLS, "max_tokens": max_tokens, "temperature": 1.0, "top_p": 0.95,
-            "top_k": 20, "seed": seed, "reasoning_effort": "high"}
+            "top_k": 20, "seed": seed, "reasoning_effort": "high", "script_guard": "off"}
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=3600) as r:
@@ -175,10 +176,7 @@ def main() -> int:
             cfg["log"] = str(Path(tempfile.gettempdir()) / f"agent_turns_{name}_r{rnd}.log")
             cpath = Path(tempfile.gettempdir()) / f"agent_turns_{name}.json"
             cpath.write_text(json.dumps(cfg, indent=1))
-            proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata",
-                                     "--config", str(cpath), "--port", str(a.port)],
-                                    cwd=str(ROOT), env=dict(os.environ, **e),
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = start_server(cpath, a.port, dict(os.environ, **e))
             try:
                 t0 = time.time()
                 wait_ready(a.port, proc)
@@ -194,12 +192,7 @@ def main() -> int:
                     res[name].setdefault(tag, []).append(row)
                     print(f"  {tag:16s} decode {row['decode']} tok/s  prompt {row['prompt_n']} tokens", flush=True)
             finally:
-                proc.terminate()
-                try:
-                    proc.wait(60)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                time.sleep(5)
+                stop_server(proc)
     first = arms[0][0]
 
     def per_turn(name: str, tag: str) -> float:

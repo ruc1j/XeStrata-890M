@@ -10,24 +10,36 @@
 #include "../kernels/xe/amd_wmma.hpp"
 #include "../kernels/xe/device_target.hpp"
 #include "../kernels/xe/xe_shuffle.hpp"
+#include "gdn_chunk.hpp"
 #include "gdn_tc.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/bf16_to_f16.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/f16_gpu.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/rope.hpp"
 #include "strata/kernels/rope_scaling.hpp"
+#include "strata/kernels/rows_cols.hpp"
+#include "strata/kernels/rows16.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU prefill_kernels
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
+#include <algorithm>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 
 namespace strata::prefill {
@@ -36,7 +48,7 @@ namespace {
 constexpr int N = strata::core::kCompiledGeometry.n_embd, HC = strata::core::kCompiledGeometry.hc, D = N * HC, LR = strata::core::kCompiledGeometry.hc_lr;
 constexpr int KU = strata::core::kCompiledGeometry.n_expert_used;   // routed experts per token (10 for Flash-Next)
 constexpr int64_t FFC = strata::core::kCompiledGeometry.n_ff;       // the routed (and shared) expert width: 640 for Flash-Next
-constexpr int NHQ = strata::core::kCompiledGeometry.n_head, NKVH = strata::core::kCompiledGeometry.n_head_kv;   // query heads (24) and KV heads (2), head width 256
+constexpr int NHQ = strata::core::kCompiledGeometry.n_head;   // query heads (24), head width 256
 constexpr int S = strata::core::kCompiledGeometry.ssm_state_size;   // a GDN head's width (the shapes: struct Gdn below)
 constexpr int WARP = 32;
 
@@ -61,7 +73,7 @@ inline uint16_t bf(float f) {
 // itself in BF16.  W.hi + W.lo carries ~16 mantissa bits of the activation - decode's FP32 x to within ~1e-5.
 inline uint16_t bf_lo(float f, uint16_t hi) { return bf(f - sycl::bit_cast<float>((uint32_t) hi << 16)); }
 inline float sigm(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
-inline uint16_t hf(float f) { return kernels::f16_from_f32(f); }
+inline uint16_t hf(float f) { return kernels::f16_gpu::f16_from_f32(f); }   // the GPU's conversion (f16_gpu.hpp)
 // A SwiGLU product for an FP16 GEMM: saturated, so a token with a massive activation cannot turn into inf and then
 // NaN in the down projection (decode's q8_1 has room to ~8e6; FP16 ends at 65504).  A NaN stays NaN; finite values
 // below 65504 round exactly as before (upstream 7bc505d, f8fe938).
@@ -161,106 +173,31 @@ void blob_dequant_launch(sycl::queue& q, const uint8_t* blob, uint16_t* gu16, ui
 // resident (table >= 0), and the host copy and the prompt path's staging pool (both identity layout) when given.
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-               void* stream, const strata::kernels::KvHostPools* host_p, const strata::kernels::KvHostPools* stage_p) {
+               void* stream, const strata::kernels::KvHostPools* host, const strata::kernels::KvHostPools* stage) {
     if (T <= 0) return;
-    const strata::kernels::KvHostPools host = host_p ? *host_p : strata::kernels::KvHostPools{};
-    const strata::kernels::KvHostPools stage = stage_p ? *stage_p : strata::kernels::KvHostPools{};
-    const int32_t* table = page_table;
-    // upstream 5a0df898 (its sycl/ port): the host copy and the staging pool are written 4 bytes a lane, 64 contiguous
-    // bytes a group, instead of one 1- or 2-byte store a lane, which ran at ~30 MB/s into pinned host memory on a B70
-    // (2 s of a 4K prompt there with --kv-resident).  STRATA_KV_WIDE_HOST=0: the narrow stores.
-    static const bool wide_env = [] {
-        const char* v = std::getenv("STRATA_KV_WIDE_HOST");
-        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-    }();
-    const bool wide = wide_env;   // (a kernel captures a copy, not the static)
-    Q(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> wm(sycl::range<1>(2), h);
-        sycl::local_accessor<uint32_t, 1> lane(sycl::range<1>(64), h);   // the group's 64 values, for the wide stores
-        h.parallel_for(sycl::nd_range<3>({(size_t) T, 2, 8 * 64}, {1, 1, 64}), [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const sycl::sub_group sg = it.get_sub_group();
-            const int64_t t = (int64_t) it.get_group(0);
-            const int kvh = (int) it.get_group(1), z = (int) it.get_group(2), g = z >> 1;
-            const bool is_v = (z & 1) != 0;
-            const int tid = (int) it.get_local_id(2);
-            const int d = g * 64 + tid;
-            const float x = (is_v ? V : K)[t * (NKVH * 256) + kvh * 256 + d];
-            const int64_t pos = pos0 + t;
-            const int64_t page = table[pos / page_size];
-            const int64_t row = (page * 2 + kvh) * page_size + pos % page_size;
-            const int64_t row_id = ((pos / page_size) * 2 + kvh) * page_size + pos % page_size;
-            if (k_pool != nullptr) {   // uniform
-                const uint16_t hv = hf(x);
-                if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = hv;
-                if (wide && (host.k_pool != nullptr || stage.k_pool != nullptr)) {   // uniform
-                    lane[tid] = hv;
-                    sycl::group_barrier(it.get_group());
-                    if (tid < 32) {
-                        const size_t l2 = 2 * (size_t) tid;
-                        const uint32_t w = lane[l2] | (lane[l2 + 1] << 16);
-                        if (host.k_pool != nullptr)
-                            reinterpret_cast<uint32_t*>((is_v ? host.v_pool : host.k_pool) + row_id * 256 + (int64_t) g * 64)[tid] = w;
-                        if (stage.k_pool != nullptr)
-                            reinterpret_cast<uint32_t*>((is_v ? stage.v_pool : stage.k_pool) + row_id * 256 + (int64_t) g * 64)[tid] = w;
-                    }
-                    return;
-                }
-                if (host.k_pool != nullptr) (is_v ? host.v_pool : host.k_pool)[row_id * 256 + d] = hv;
-                if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * 256 + d] = hv;
-                return;
-            }
-            float a = sycl::fabs(x);
-            for (int o = 16; o > 0; o >>= 1) a = sycl::fmax(a, strata_shfl_xor(sg, a, o));
-            if ((tid & 31) == 0) wm[tid >> 5] = a;
-            sycl::group_barrier(it.get_group());
-            const float amax = sycl::fmax(wm[0], wm[1]);
-            const uint16_t sb = hf(amax / 127.0f);
-            const float sf = kernels::f32_from_f16(sb);
-            int qv = 0;
-            if (sf > 0.0f) { qv = (int) sycl::rint(x / sf); qv = qv < -127 ? -127 : (qv > 127 ? 127 : qv); }
-            if (page >= 0) {
-                (is_v ? v_q : k_q)[row * 256 + d] = (int8_t) qv;
-                if (tid == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
-            }
-            if (wide && (host.k_q != nullptr || stage.k_q != nullptr)) {   // uniform
-                lane[tid] = (uint32_t) (uint8_t) (int8_t) qv;
-                sycl::group_barrier(it.get_group());
-                if (tid < 16) {
-                    const size_t l4 = 4 * (size_t) tid;
-                    const uint32_t w = lane[l4] | (lane[l4 + 1] << 8) | (lane[l4 + 2] << 16) | (lane[l4 + 3] << 24);
-                    if (host.k_q != nullptr)
-                        reinterpret_cast<uint32_t*>((is_v ? host.v_q : host.k_q) + row_id * 256 + (int64_t) g * 64)[tid] = w;
-                    if (stage.k_q != nullptr)
-                        reinterpret_cast<uint32_t*>((is_v ? stage.v_q : stage.k_q) + row_id * 256 + (int64_t) g * 64)[tid] = w;
-                }
-                if (tid == 0) {
-                    if (host.k_q != nullptr) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
-                    if (stage.k_q != nullptr) (is_v ? stage.v_scale : stage.k_scale)[row_id * 4 + g] = sb;
-                }
-                return;
-            }
-            if (host.k_q != nullptr) {
-                (is_v ? host.v_q : host.k_q)[row_id * 256 + d] = (int8_t) qv;
-                if (tid == 0) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
-            }
-            if (stage.k_q != nullptr) {
-                (is_v ? stage.v_q : stage.k_q)[row_id * 256 + d] = (int8_t) qv;
-                if (tid == 0) (is_v ? stage.v_scale : stage.k_scale)[row_id * 4 + g] = sb;
-            }
-        });
-    });
+    // the K/V cache's one append (kv_q8.hpp), the decode's arithmetic: 2 KV heads of 256
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.page_size = page_size;
+    strata::kernels::KvAppend a;
+    a.pos0 = pos0;
+    a.k = K;
+    a.v = V;
+    a.n_tok = T;
+    a.k_pool = k_pool;
+    a.v_pool = v_pool;
+    a.k_q = k_q;
+    a.v_q = v_q;
+    a.k_scale = k_scale;
+    a.v_scale = v_scale;
+    a.page_table = page_table;
+    a.host = host;
+    a.stage = stage;
+    strata::kernels::kv_append_cells(a, s, stream);
 }
 
-void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
-    if (n <= 0) return;
-    Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { y[i] = hf(x[i]); });
-}
 void bf16_to_f16(const uint16_t* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
-    Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        const float f = sycl::bit_cast<float>((uint32_t) x[i] << 16);
-        y[i] = sycl::isinf(f) ? hf(f) : hf_sat(f);
-    });
+    kernels::bf16_to_f16<kernels::F16Range::finite_saturate>(Q(stream), x, y, n);
 }
 void round_f16(const float* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;
@@ -335,7 +272,7 @@ void gr_mix_r(const float* R, const float* rs, const float* w, const float* g, f
         const int64_t i = (int64_t) id[0], t = i / N, d = i % N;
         float s = 0.0f;
         for (int c = 0; c < HC; ++c) {
-            const int64_t j = t * D + c * N + d;
+            const int64_t j = t * D + (int64_t) c * N + d;
             const float x = R[j] * rs[t * HC + c] * w[(int64_t) c * N + d];   // gr_norm's value, bit for bit
             s = sycl::fma(x, sigm(g[j]), s);
         }
@@ -439,7 +376,7 @@ struct GrUpmix {
 // (2026-11-18).
 bool gr_upmix_on(void* stream) {
     static const bool env = [] {
-        const char* v = std::getenv("STRATA_HC_UPMIX");
+        const char* v = strata::env_get("HC_UPMIX");
         return !(v != nullptr && v[0] == '0');
     }();
     if (!env) return false;
@@ -450,7 +387,7 @@ bool gr_upmix_on(void* stream) {
         const bool ok = kernels::xe::amd_gfx1150(dev) &&
                         dev.get_info<sycl::info::device::max_work_group_size>() >= (size_t) UM_NT &&
                         dev.get_info<sycl::info::device::local_mem_size>() >= (size_t) HC * UM_D * UM_LD * 2;
-        if (ok && std::getenv("STRATA_HC_UPMIX") != nullptr)
+        if (ok && strata::env_get("HC_UPMIX") != nullptr)
             std::fprintf(stderr, "prefill: the hc read's up projection and mix in one kernel (STRATA_HC_UPMIX)\n");
         return ok;
     });
@@ -660,7 +597,7 @@ inline void lds_barrier() {
 
 // The kernels of one GDN shape: HK key heads and HV value heads of S, conv channels C = 2 HK S + HV S.  The engine's
 // is the compiled shape's (kCompiledGeometry: Qwen3.8-Flash-Next <16, 48>), the plain models' Ornith-1.5's (qwen35moe)
-// <16, 32>; the public functions below dispatch on the shape.
+// and Qwen3.5-9B's <16, 32>, Qwen3.5's 2B and 0.8B <16, 16>; the public functions below dispatch on the shape.
 template <int HK, int HV>
 struct Gdn {
     static constexpr int C = 2 * HK * S + HV * S;
@@ -702,9 +639,8 @@ struct Gdn {
     }
 
     static void conv(float* hist, const float* qkv, const float* w, float* h, int64_t T, float eps, void* stream) {
-        static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
         auto& q = Q(stream);
-        if (serial || T <= CONV_TILE) {
+        if (T <= CONV_TILE) {
             // one work-item per channel walks the chunk
             q.parallel_for(sycl::range<1>(C), [=](sycl::id<1> id) {
                 const int c = (int) id[0];
@@ -723,7 +659,7 @@ struct Gdn {
             // the same expression per element, then the history written afterwards
             const size_t tiles = (size_t) ((T + CONV_TILE - 1) / CONV_TILE);
             static const bool fused = [] {   // upstream 9668e324; STRATA_GDN_CONVL2=0: the conv, then the norm kernel
-                const char* v = std::getenv("STRATA_GDN_CONVL2");
+                const char* v = strata::env_get("GDN_CONVL2");
                 return v == nullptr || std::strtol(v, nullptr, 10) != 0;
             }();
             if (fused) {
@@ -1335,7 +1271,7 @@ struct Gdn {
     static bool gdn_lane_ok(sycl::queue& q) {
         static core::PerDevice<bool> per_device;
         return per_device.get(q.get_device(), [&] {
-            const char* v = std::getenv("STRATA_GDN_REC_LANE");
+            const char* v = strata::env_get("GDN_REC_LANE");
             if (v != nullptr && v[0] == '0') return false;
             const sycl::device d = q.get_device();
             if (!d.has(sycl::aspect::ext_intel_gpu_eu_simd_width) ||
@@ -1346,7 +1282,7 @@ struct Gdn {
                     q.get_context(), {d}, {sycl::get_kernel_id<GdnRecLane<16>>()});
                 return true;
             } catch (const sycl::exception& e) {
-                std::fprintf(stderr, "strata: the GPU does not build the DeltaNet recurrence with the large register file "
+                std::fprintf(stderr, "xestrata: the GPU does not build the DeltaNet recurrence with the large register file "
                              "(%s): the prompt path keeps the work-group kernel\n", e.what());
                 return false;
             }
@@ -1354,62 +1290,30 @@ struct Gdn {
     }
 
     // `with_out` false (KVA's state-only layer): the same recurrence kernels without the output normalization, so z,
-    // gamma and y16 are not read; the one-group-per-head kernel fuses that norm, so it runs only with the output
+    // gamma and y16 are not read
     static void recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                            const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, bool silu, void* stream,
                            bool with_out = true) {
-        static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-group-per-head kernel (A/B)
         auto& q = Q(stream);
         // STRATA_GDN_CHUNKED (the default; =0 the FP32 kernels below): the chunked recurrence on GFX11's matrix cores
         // (gw above), other bits.  On the 890M (Qwen3.8 IQ2_XS) one layer's recurrence and norm take 8.0 ms for 3,481
         // tokens against 14.4 ms, the prompt 2-3% less time; the next token's KL after 20 prompts 0.020 (top-1 equal;
         // run to run 0.0002).  Splitting the state into two FP16 operands left the error as it was (the rounding of k,
         // q, T, P and D is most of it).  A state-only layer (`with_out` false, KVA) takes the FP32 kernels below.
-        static const bool chunked = [] {
-            const char* v = std::getenv("STRATA_GDN_CHUNKED");
+        // The same variable switches upstream XeStrata's chunked scan (gdn_chunk.cpp, `chunked` below) on where these
+        // kernels do not run: unset, that scan stays off; =1, it takes the calls it is timed faster on.
+        static const bool wmma_on = [] {
+            const char* v = strata::env_get("GDN_CHUNKED");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
-        if (chunked && with_out && !serial && rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, silu, q)) return;
-        if (!with_out && T <= 0) return;
-        if ((serial && with_out) || T <= 0) {
-            q.submit([&](sycl::handler& hd) {
-                sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
-                    red(sycl::range<1>((size_t) RG * S), hd), wsum(sycl::range<1>(16), hd);
-                hd.parallel_for(sycl::nd_range<1>((size_t) HV * S * RG, (size_t) S * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-                    const sycl::sub_group sg = it.get_sub_group();
-                    const int head = (int) it.get_group(0), tid = (int) it.get_local_id(0), col = tid % S, rg = tid / S;
-                    const int qh = head % HK;
-                    float s[RPG];
-                    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
-                    const size_t rs = (size_t) HV * S;
-                    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
-                    const float g_col = gamma[col];
-                    for (int64_t t = 0; t < T; ++t) {
-                        const float oc_all = rec_step<S>(it, s, h + t * C, gate, beta, t, head, qh, rg, col, col, tid,
-                                                         &sk[0], &sq[0], &red[0]);
-                        float oc = 0.0f, sp = 0.0f;
-                        if (rg == 0) { oc = oc_all; sp = oc * oc; }
-                        sp = warp_sum(sg, sp);
-                        if ((tid & 31) == 0) wsum[tid >> 5] = sp;
-                        sycl::group_barrier(it.get_group());
-                        if (rg == 0) {
-                            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-                            const float v = oc * sycl::rsqrt(ss / (float) S + eps) * g_col * zgate(z[t * HV * S + (int64_t) head * S + col], silu);
-                            y[t * HV * S + (int64_t) head * S + col] = v;
-                            y16[t * HV * S + (int64_t) head * S + col] = hf(v);
-                        }
-                    }
-                    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
-                });
-            });
-            return;
-        }
-        // D-2: the value columns split over 4 work-groups per head, then the output norm in its own kernel; per column
-        // the same arithmetic in the same order as the kernel above.  The next token's inputs (its q and k rows, v, gate,
-        // beta) are loaded into registers while this one computes (upstream ac6aad4, 04f4a53): the same bits.
+        if (wmma_on && with_out && rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, silu, q)) return;
+        if (T <= 0) return;
+        // D-2: the value columns split over 4 work-groups per head, then the output norm in its own kernel.  The next
+        // token's inputs (its q and k rows, v, gate, beta) are loaded into registers while this one computes
+        // (upstream ac6aad4, 04f4a53): the same bits.
         // STRATA_GDN_PIPELINE=0: each token's inputs loaded when it starts (rec_step), to compare.
         static const bool pipe_on = [] {
-            const char* v = std::getenv("STRATA_GDN_PIPELINE");
+            const char* v = strata::env_get("GDN_PIPELINE");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
         const bool pipe = pipe_on;   // the kernel takes a copy
@@ -1419,7 +1323,7 @@ struct Gdn {
         // and took 908 ms for the recurrence of a 3,474-token prompt against D-2's 820; with the budget 602 ms, the
         // same bits.
         static const bool kh_on = [] {
-            const char* v = std::getenv("STRATA_GDN_KEYHEAD");
+            const char* v = strata::env_get("GDN_KEYHEAD");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
         auto launch_kh = [&](float* st, float* yy, const int64_t n) {
@@ -1504,15 +1408,14 @@ struct Gdn {
         static int pick = -1;   // 1: the key-head form
         // STRATA_GDN_TC=1 (opt-in, upstream 8c2a84694): the recurrence of a prompt chunk of kGdnTcMin+ tokens as a
         // chunked scan on the matrix engines (gdn_tc.cpp; not these kernels' bits).  A GPU without them, a shorter
-        // chunk or no room for its scratch takes the kernels below
+        // chunk or no room for its scratch takes the kernels below.  (Upstream XeStrata removed it in e64c33984; this
+        // fork keeps it opt-in.)
         static const bool tc_on = [] {
-            const char* v = std::getenv("STRATA_GDN_TC");
+            const char* v = strata::env_get("GDN_TC");
             return v != nullptr && std::strtol(v, nullptr, 10) != 0;
         }();
-        if (tc_on && T >= kGdnTcMin && gdn_rec_tc(q, HK, HV, state, h, gate, beta, y, T)) {
-        } else if (gdn_lane_ok(q))
-            q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
-        else {
+        const bool tc = tc_on && T >= kGdnTcMin && gdn_rec_tc(q, HK, HV, state, h, gate, beta, y, T);
+        if (!tc && !gdn_lane_ok(q)) {
             if (pick < 0 && kh_on && T >= 64) {
                 const int64_t tn = std::min<int64_t>(T, 1024);
                 const size_t ns = (size_t) S * HV * S, ny = (size_t) tn * HV * S;
@@ -1532,38 +1435,161 @@ struct Gdn {
                     };
                     const double d2 = time(launch_d2), kh = time(launch_kh);
                     pick = kh < d2 ? 1 : 0;
-                    std::fprintf(stderr, "strata: the DeltaNet recurrence, %lld tokens: D-2 %.0f us, the key-head form %.0f "
+                    std::fprintf(stderr, "xestrata: the DeltaNet recurrence, %lld tokens: D-2 %.0f us, the key-head form %.0f "
                                  "us: %s\n", (long long) tn, d2, kh, pick ? "the key-head form" : "D-2");
                 } else {
                     static bool said = false;   // D-2 meanwhile; the next call tries again
                     if (!said)
-                        std::fprintf(stderr, "strata: the DeltaNet recurrence: no VRAM to time the two forms on %lld "
+                        std::fprintf(stderr, "xestrata: the DeltaNet recurrence: no VRAM to time the two forms on %lld "
                                              "tokens, D-2 until it can be timed\n", (long long) tn);
                     said = true;
                 }
                 if (st != nullptr) sycl::free(st, q);
                 if (yy != nullptr) sycl::free(yy, q);
             }
-            if (kh_on && pick == 1) launch_kh(state, y, T);
-            else launch_d2(state, y, T);
+        }
+        // the token-by-token form this device takes, on `st` and `yy` over n tokens
+        auto seq = [&](float* st, float* yy, const int64_t n) {
+            if (gdn_lane_ok(q))
+                q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{st, h, gate, beta, yy, n});
+            else if (kh_on && pick == 1) launch_kh(st, yy, n);
+            else launch_d2(st, yy, n);
+        };
+        auto launch_norm = [&](const float* yy, uint16_t* yo, const int64_t n) {
+            q.submit([&](sycl::handler& hd) {
+                sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
+                hd.parallel_for(sycl::nd_range<2>({(size_t) n, (size_t) HV * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                    const sycl::sub_group sg = it.get_sub_group();
+                    const int64_t t = (int64_t) it.get_group(0);
+                    const int head = (int) it.get_group(1), col = (int) it.get_local_id(1);
+                    const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
+                    const float oc = yy[at];
+                    const float sp = warp_sum(sg, oc * oc);
+                    if ((col & 31) == 0) wsum[col >> 5] = sp;
+                    sycl::group_barrier(it.get_group());
+                    const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+                    // FP16 only: the out projection reads y16, nothing reads the normalized value in FP32 (upstream
+                    // a7ce31b)
+                    yo[at] = hf(oc * sycl::rsqrt(ss / (float) S + eps) * gamma[col] * zgate(z[at], silu));
+                });
+            });
+        };
+        const GdnChunkNorm nm{z, gamma, eps, silu, y16};
+        if (tc) {
+        } else if (chunked(q, T, with_out, seq, launch_norm, state, h, gate, beta, z, gamma, eps, silu)) {
+            if (gdn_chunk_run(q, chunk_pick(q).form, HK, HV, state, h, gate, beta, y, with_out ? &nm : nullptr, T))
+                return;   // the scan normalized the outputs itself
+        } else {
+            seq(state, y, T);
         }
         if (!with_out) return;
-        q.submit([&](sycl::handler& hd) {
-            sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
-            hd.parallel_for(sycl::nd_range<2>({(size_t) T, (size_t) HV * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
-                const sycl::sub_group sg = it.get_sub_group();
-                const int64_t t = (int64_t) it.get_group(0);
-                const int head = (int) it.get_group(1), col = (int) it.get_local_id(1);
-                const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
-                const float oc = y[at];
-                const float sp = warp_sum(sg, oc * oc);
-                if ((col & 31) == 0) wsum[col >> 5] = sp;
-                sycl::group_barrier(it.get_group());
-                const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-                // FP16 only: the out projection reads y16, nothing reads the normalized value in FP32 (upstream a7ce31b)
-                y16[at] = hf(oc * sycl::rsqrt(ss / (float) S + eps) * gamma[col] * zgate(z[at], silu));
-            });
-        });
+        launch_norm(y, y16, T);
+    }
+
+    // The chunked scan (gdn_chunk.cpp) or the token-by-token kernels, for each device.  XESTRATA_GDN_CHUNKED=1: the
+    // scan, timed once on copies of the state at the first call of kChunkTimeMin tokens or more (each
+    // with its output norm), at 256 tokens and at the call's first 2048 at most.  A scan form at least 3% faster at
+    // the longer length takes the calls from where the two lines (time = a + b tokens) cross: a device where the scan
+    // is slower at both lengths never takes it.  Nothing is written down: every start times again.  =0: never; =1:
+    // every call of 64 tokens or more, in the first form that fits.
+    struct ChunkPick {
+        bool decided = false;
+        int form = -1;   // -1: the token-by-token kernels
+        int64_t min_t = INT64_MAX;
+    };
+    static constexpr int64_t kChunkTimeMin = 512;
+    static ChunkPick& chunk_pick(sycl::queue& q) {
+        static core::PerDevice<std::unique_ptr<ChunkPick>> per_device;
+        return *per_device.get(q.get_device(), [] { return std::make_unique<ChunkPick>(); });
+    }
+    template <class Seq, class Norm>
+    static bool chunked(sycl::queue& q, int64_t T, bool with_out, Seq&& seq, Norm&& launch_norm, const float* state,
+                        const float* h, const float* gate, const float* beta, const float* z, const float* gamma,
+                        float eps, bool silu) {
+        // Opt-in for now (2026-11-14): the FP16-operand scan's state error (~5e-4) is over the contract's 1e-4
+        // floor (gdn_chunk_parity on the B70 and the RX 9060 XT; GDN_CONTRACT.md's tiers keep the floor for the mixed
+        // precision too).  The token-by-token kernels keep the default until GDN settles the state update's precision.
+        static const int mode = [] { const int m = strata::env_auto("GDN_CHUNKED"); return m < 0 ? 0 : m; }();
+        if (mode == 0 || T < 64) return false;
+        ChunkPick& cp = chunk_pick(q);
+        if (!cp.decided && mode == 1) {
+            const auto& forms = gdn_chunk_forms(q, HK, HV);
+            cp.decided = true;
+            if (!forms.empty()) {
+                cp.form = forms.front();
+                cp.min_t = 64;
+            }
+        }
+        if (!cp.decided && T >= kChunkTimeMin) {
+            const auto& forms = gdn_chunk_forms(q, HK, HV);
+            if (forms.empty()) {
+                cp.decided = true;
+                return false;
+            }
+            const int64_t n1 = 256, n2 = std::min<int64_t>(T, 2048);
+            const size_t ns = (size_t) S * HV * S, ny = (size_t) n2 * HV * S;
+            float* st = sycl::malloc_device<float>(ns, q);
+            float* yy = sycl::malloc_device<float>(ny, q);
+            uint16_t* yo = with_out ? sycl::malloc_device<uint16_t>(ny, q) : nullptr;
+            if (st != nullptr && yy != nullptr && (yo != nullptr || !with_out)) {
+                auto time = [&](auto&& launch, int64_t n) {   // the second run: the first may compile the kernels
+                    double us = 0;
+                    for (int r = 0; r < 2; ++r) {
+                        q.copy(state, st, ns).wait();
+                        const auto t0 = std::chrono::steady_clock::now();
+                        launch(n);
+                        q.wait();
+                        us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                    }
+                    return us;
+                };
+                auto tok = [&](int64_t n) {
+                    seq(st, yy, n);
+                    if (with_out) launch_norm(yy, yo, n);
+                };
+                const GdnChunkNorm nt{z, gamma, eps, silu, yo};
+                const double s1 = time(tok, n1), s2 = time(tok, n2);
+                double c1 = 0, c2 = 0;
+                int best = -1;
+                for (const int f : forms) {
+                    auto chunk = [&](int64_t n) {
+                        const bool normed = gdn_chunk_run(q, f, HK, HV, st, h, gate, beta, yy,
+                                                          with_out ? &nt : nullptr, n);
+                        if (with_out && !normed) launch_norm(yy, yo, n);
+                    };
+                    const double b2 = time(chunk, n2);
+                    if (best < 0 || b2 < c2) {
+                        best = f;
+                        c2 = b2;
+                        c1 = time(chunk, n1);
+                    }
+                }
+                cp.decided = true;
+                if (c2 < 0.97 * s2) {
+                    cp.form = best;
+                    const double bs = (s2 - s1) / (double) (n2 - n1), bc = (c2 - c1) / (double) (n2 - n1);
+                    const double cross = c1 <= s1 ? 0.0 : bs > bc ? (double) n1 + (c1 - s1) / (bs - bc) : (double) n2;
+                    cp.min_t = std::max<int64_t>(64, std::min<int64_t>(n2, (int64_t) std::ceil(cross)));
+                }
+                if (cp.form >= 0)
+                    std::fprintf(stderr, "xestrata: the DeltaNet recurrence, %lld / %lld tokens: token by token %.0f / "
+                                 "%.0f us, the chunked scan (form %d) %.0f / %.0f us: the scan from %lld tokens\n",
+                                 (long long) n1, (long long) n2, s1, s2, best, c1, c2, (long long) cp.min_t);
+                else
+                    std::fprintf(stderr, "xestrata: the DeltaNet recurrence, %lld tokens: token by token %.0f us, the "
+                                 "chunked scan %.0f us: token by token\n", (long long) n2, s2, c2);
+            } else {
+                static bool said = false;   // token by token meanwhile; the next call tries again
+                if (!said)
+                    std::fprintf(stderr, "xestrata: the DeltaNet recurrence: no VRAM to time the chunked scan on %lld "
+                                         "tokens, token by token until it can be timed\n", (long long) n2);
+                said = true;
+            }
+            if (st != nullptr) sycl::free(st, q);
+            if (yy != nullptr) sycl::free(yy, q);
+            if (yo != nullptr) sycl::free(yo, q);
+        }
+        return cp.decided && cp.form >= 0 && T >= cp.min_t;
     }
 };
 
@@ -1574,6 +1600,7 @@ constexpr int kGdnHK = (int) strata::core::kCompiledGeometry.ssm_k_heads, kGdnHV
 template <class F> void gdn_dispatch(int64_t h_k, int64_t h_v, const char* what, F&& f) {
     if (h_k == kGdnHK && h_v == kGdnHV) f(Gdn<kGdnHK, kGdnHV>{});
     else if (h_k == kGdnPlainKeyHeads && h_v == kGdnPlainValueHeads) f(Gdn<kGdnPlainKeyHeads, kGdnPlainValueHeads>{});
+    else if (h_k == 16 && h_v == 16) f(Gdn<16, 16>{});   // Qwen3.5's 2B and 0.8B
     else throw core::DeviceError(std::string(what) + ": no kernels for " + std::to_string(h_k) + " key and " +
                                  std::to_string(h_v) + " value heads");
 }
@@ -1606,6 +1633,7 @@ void gdn_recurrence_state_only(float* state, const float* h, const float* gate, 
 
 // ---------------------------------------------------------------- MoE
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
+    if (T <= 0) return;
     if (n_expert == 512) route_launch<16>(Q(stream), logits, ids, weights, T);
     else if (n_expert == 256) route_launch<8>(Q(stream), logits, ids, weights, T);
     else strata::kernels::router_top10(logits, (int) T, (int) n_expert, KU, ids, weights, stream);
@@ -1618,18 +1646,44 @@ void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, voi
 }
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream) {
     if (n <= 0) return;
-    Q(stream).parallel_for(sycl::range<1>((size_t) (n * FFC)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], r = i / FFC, k = i % FFC;
-        const float g = gu[r * (2 * FFC) + 2 * k], u = gu[r * (2 * FFC) + 2 * k + 1];
-        h16[i] = hf_sat(g / (1.0f + sycl::exp(-g)) * u);
+    kernels::rows16::saturated(Q(stream), n * FFC, h16, [=](int64_t i) {
+        const int64_t r = i / FFC, k = i % FFC;
+        return kernels::rows16::swiglu(gu[r * (2 * FFC) + 2 * k], gu[r * (2 * FFC) + 2 * k + 1]);
     });
 }
-void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width) {
+void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width, int64_t ld) {
+    if (n <= 0) return;
+    if (ld <= 0 || ld == width) {   // one run of n x width values (a row index per value cost the shared expert 40%)
+        kernels::rows16::saturated(Q(stream), n * width, h16, [=](int64_t i) {
+            return kernels::rows16::swiglu(g[i], u[i]);
+        });
+        return;
+    }
+    // the rows in the first of two dimensions (no division a value), which takes 65,535: more, one dimension
+    if (n > 65535) {
+        Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> id) {
+            const int64_t i = (int64_t) id[0], r = i / width, at = r * ld + (i - r * width);
+            const float a = g[at];
+            h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[at]);
+        });
+        return;
+    }
+    Q(stream).parallel_for(sycl::range<2>((size_t) n, (size_t) width), [=](sycl::id<2> id) {
+        const int64_t r = (int64_t) id[0], c = (int64_t) id[1], at = r * ld + c;
+        const float a = g[at];
+        h16[r * width + c] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[at]);
+    });
+}
+void swiglu_pair_h(const uint16_t* g16, const uint16_t* u16, uint16_t* h16, int64_t n, void* stream, int64_t width) {
     if (n <= 0) return;
     Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> i) {
-        const float a = g[i];
-        h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[i]);
+        const float a = kernels::f32_from_f16(g16[i]);
+        h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * kernels::f32_from_f16(u16[i]));
     });
+}
+void add_h(float* x, const uint16_t* y16, int64_t n, void* stream) {
+    if (n <= 0) return;
+    Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { x[i] += kernels::f32_from_f16(y16[i]); });
 }
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream) {
     if (n <= 0) return;
@@ -1657,6 +1711,7 @@ void scatter_rows(const float* src, const int32_t* dst_row, float* dst, int64_t 
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
+    if (T <= 0) return;
     Q(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0], t = i / N, d = i % N;
         float s = 0.0f;
@@ -1666,6 +1721,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
 }
 void moe_combine_h(const uint16_t* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
                    float* bo, int64_t T, void* stream) {
+    if (T <= 0) return;
     const sycl::half* D = reinterpret_cast<const sycl::half*>(Dm);
     Q(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0], t = i / N, d = i % N;
@@ -1683,17 +1739,25 @@ void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T
 }
 // one work-item per (token of the group, column): the token's rows summed in the group's row order
 void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
-                     const float* u_w, int64_t n_u, float* acc, void* stream) {
+                     const float* u_w, int64_t n_u, float* acc, void* stream, int64_t width) {
     if (n_u <= 0) return;
-    Q(stream).parallel_for(sycl::range<2>((size_t) n_u, (size_t) N), [=](sycl::id<2> id) {
-        const int64_t u = (int64_t) id[0], d = (int64_t) id[1];
+    const int64_t W = width > 0 ? width : N;
+    if (u_off == nullptr) {   // one row a token, the sum's one term (a loop and its bounds cost HunyuanImage 3.0 0.6%)
+        strata::kernels::for_rows_cols(Q(stream), n_u, W, [=](int64_t u, int64_t d) {
+            acc[(int64_t) u_tok[u] * W + d] += sycl::fma(u_w[u], Dm[u * W + d], 0.0f);
+        });
+        return;
+    }
+    strata::kernels::for_rows_cols(Q(stream), n_u, W, [=](int64_t u, int64_t d) {
         float s = 0.0f;
-        for (int32_t j = u_off[u]; j < u_off[u + 1]; ++j) s = sycl::fma(u_w[j], Dm[(int64_t) u_rows[j] * N + d], s);
-        acc[(int64_t) u_tok[u] * N + d] += s;
+        for (int32_t j = u_off[u]; j < u_off[u + 1]; ++j) s = sycl::fma(u_w[j], Dm[(int64_t) u_rows[j] * W + d], s);
+        acc[(int64_t) u_tok[u] * W + d] += s;
     });
 }
 
 // ---------------------------------------------------------------- QSA helpers
+// The prompt path's own RMSNorm of rows (upstream XeStrata moved its callers to kernels::rms_norm_rows; XeStrata-890M
+// keeps this one, whose 256-item sum gives the bits its prompt path has had)
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;
     Q(stream).submit([&](sycl::handler& h) {
@@ -1710,35 +1774,12 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
     });
 }
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, const strata::kernels::RopeScaling& scaling, void* stream) {
-    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / 64.0f);
-    const int32_t* mtab = strata::kernels::mrope_table();
-    const bool scaled = scaling.type != strata::kernels::RopeScalingType::None;
-    const strata::kernels::RopeKernelArgs ka = scaling.kernel_args(64);
-    const strata::kernels::RopeTab tab = strata::kernels::rope_table_for(scaling);
-    Q(stream).parallel_for(sycl::range<2>((size_t) (T * heads), 32), [=](sycl::id<2> id) {
-        const int64_t row = (int64_t) id[0];   // t * heads + h
-        const int pair = (int) id[1];          // 0..31
-        const int64_t t = row / heads, hh = row % heads;
-        float* p = x + t * ld + hh * dim;
-        const int rp = strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair);
-        float c, s;
-        if (!strata::kernels::rope_tab_cs(tab, rp, pair, c, s))
-            strata::kernels::rope_cos_sin((float) rp * sycl::pow(theta_scale, (float) pair), scaled, ka, pair, c, s);
-        const float a = p[pair], b = p[pair + 32];
-        p[pair] = a * c - b * s;
-        p[pair + 32] = a * s + b * c;
-    });
+    strata::kernels::rope_rows(x, x, T, heads, (int) dim, ld, ld, 64, scaling, nullptr, pos0, stream);
 }
 void split_q(const float* qf, float* q, int64_t T, void* stream) {
     Q(stream).parallel_for(sycl::range<1>((size_t) (T * NHQ * 256)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], t = i / (NHQ * 256), h = (i / 256) % NHQ, d = i % 256;
+        const int64_t i = (int64_t) id[0], t = i / ((int64_t) NHQ * 256), h = (i / 256) % NHQ, d = i % 256;
         q[i] = qf[t * NHQ * 512 + h * 512 + d];
-    });
-}
-void gate_attn(const float* a, const float* qf, uint16_t* o16, int64_t T, void* stream) {
-    Q(stream).parallel_for(sycl::range<1>((size_t) (T * NHQ * 256)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], t = i / (NHQ * 256), h = (i / 256) % NHQ, d = i % 256;
-        o16[i] = hf(a[i] * (1.0f / (1.0f + sycl::exp(-qf[t * NHQ * 512 + h * 512 + 256 + d]))));
     });
 }
 

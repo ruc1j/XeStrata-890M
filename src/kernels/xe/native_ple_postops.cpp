@@ -31,7 +31,7 @@ template <int BlockSize> class RmsRepKernel;   // asked for its work-group (work
 
 namespace {
 
-constexpr int N = strata::core::kCompiledGeometry.n_embd, H = strata::core::kCompiledGeometry.hc, D = N * H, HISTORY = 9;
+constexpr int N = NG_N_EMBD, H = NG_HC, D = NG_HC_DIM, HISTORY = 9;
 constexpr int WARP = 32;
 
 inline float warp_sum(const sycl::sub_group& sg, float x) {
@@ -120,11 +120,11 @@ void rms_rep(sycl::queue& q, const float* input, const float* gamma, float* outp
 }
 
 struct Span { const void* p; size_t bytes; size_t alignment; };
-bool overlaps(Span a, Span b) {
+bool overlaps(const Span& a, const Span& b) {
     const auto x = reinterpret_cast<uintptr_t>(a.p), y = reinterpret_cast<uintptr_t>(b.p);
     return x < y + b.bytes && y < x + a.bytes;
 }
-void validate(Span span) {
+void validate(const Span& span) {
     const auto p = reinterpret_cast<uintptr_t>(span.p);
     if (!p || p % span.alignment || p > std::numeric_limits<uintptr_t>::max() - span.bytes)
         throw std::invalid_argument("native PLE postops require nonnull aligned bounded spans");
@@ -136,11 +136,12 @@ void native_ple_postops(const float* projected_key, const float* hidden,
                         const float* value, const float* history,
                         const PleWeights& w, const NativePlePostopsBuffers& b, void* stream) {
     if (!stream) throw std::invalid_argument("native PLE postops require an explicit stream");
-    const Span inputs[] = {{projected_key,D*4,4}, {hidden,D*4,4}, {value,N*4,4},
-        {history,HISTORY*D*4,4}, {w.norm_key,D*4,4}, {w.norm_query,D*4,4},
-        {w.norm_conv,D*4,4}, {w.conv1d_f16,4*D*2,2}};
-    const Span outputs[] = {{b.key,D*4,4}, {b.query,D*4,4}, {b.gate,H*4,4},
-        {b.gated,D*4,4}, {b.normalized,D*4,4}, {b.conv,D*4,4}, {b.result,D*4,4}};
+    constexpr size_t F = sizeof(float), F16 = sizeof(uint16_t);
+    const Span inputs[] = {{projected_key,F*D,F}, {hidden,F*D,F}, {value,F*N,F},
+        {history,F*HISTORY*D,F}, {w.norm_key,F*D,F}, {w.norm_query,F*D,F},
+        {w.norm_conv,F*D,F}, {w.conv1d_f16,F16*4*D,F16}};
+    const Span outputs[] = {{b.key,F*D,F}, {b.query,F*D,F}, {b.gate,F*H,F},
+        {b.gated,F*D,F}, {b.normalized,F*D,F}, {b.conv,F*D,F}, {b.result,F*D,F}};
     for (const auto& span : inputs) validate(span);
     for (const auto& span : outputs) validate(span);
     for (size_t i = 0; i < 7; ++i) {

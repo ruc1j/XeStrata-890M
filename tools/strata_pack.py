@@ -28,8 +28,8 @@ import argparse
 import hashlib
 import json
 import pathlib
-import struct
 import sys
+from typing import Any
 
 import numpy as np
 
@@ -242,7 +242,7 @@ def build(gguf: pathlib.Path, out_dir: pathlib.Path, n_layers: int | None, skip_
     print("source %s: %d tensors, data at %d" % (gguf.name, len(g.tensors), data_off))
 
     n_layers = 48 if n_layers is None else n_layers
-    man = {
+    man: dict[str, Any] = {
         "format": "strata-pack", "format_version": FORMAT_VERSION,
         "source": {"shard1": str(gguf), "shard2": str(SHARD2)},
         "n_layers": n_layers, "align": ALIGN,
@@ -265,8 +265,8 @@ def build(gguf: pathlib.Path, out_dir: pathlib.Path, n_layers: int | None, skip_
                       "scales_fp16": True, "source_type": "Q2_0", "form": "S2"}
 
     # ---- dense.bin and embd.bin
-    dense = []
-    embd = []
+    dense: list[G.TensorInfo] = []
+    embd: list[G.TensorInfo] = []
     for t in g.tensors:
         if is_expert(t.name):
             continue
@@ -318,18 +318,18 @@ def rebuild_role(blob: bytes, role: str) -> bytes:
     the only independent statement about the blob layout in the tree, and if it and `pack_layer` were the
     same code the arena would be unverified by construction.
     """
-    O, out = PL.OFF, bytearray()
+    off, out = PL.OFF, bytearray()
     n_blk = PL.H * PL.FF // PL.QK
     for blk in range(n_blk):
         if role == "down":
             row, b_in = blk // PL.SCALES_D, blk % PL.SCALES_D
-            co = O["down_codes"] + row * PL.ROW_BYTES_D + b_in * 16
-            so = O["down_scales"] + (row * PL.SCALES_D + b_in) * 2
+            co = off["down_codes"] + row * PL.ROW_BYTES_D + b_in * 16
+            so = off["down_scales"] + (row * PL.SCALES_D + b_in) * 2
         else:
             row, b_in = blk // PL.SCALES_GU, blk % PL.SCALES_GU
             slot = 2 * row + (0 if role == "gate" else 1)
-            co = O["gate_up_codes"] + slot * PL.ROW_BYTES_GU + b_in * 16
-            so = O["gate_up_scales"] + (slot * PL.SCALES_GU + b_in) * 2
+            co = off["gate_up_codes"] + slot * PL.ROW_BYTES_GU + b_in * 16
+            so = off["gate_up_scales"] + (slot * PL.SCALES_GU + b_in) * 2
         out += blob[so:so + 2]          # fp16 d first, as block_q2_0 has it
         out += blob[co:co + 16]         # then the 16 packed code bytes
     return bytes(out)
@@ -416,7 +416,7 @@ def info(out_dir: pathlib.Path) -> int:
     print("strata-pack v%d  layers=%d" % (man["format_version"], man["n_layers"]))
     for f, n in man.get("files", {}).items():
         print("  %-12s %12.3f GiB" % (f, n / 2**30))
-    forms = {}
+    forms: dict[str, int] = {}
     for e in man["tensors"].values():
         forms[e["form"]] = forms.get(e["form"], 0) + 1
     print("  dense/embd by form: %s" % ", ".join("%s=%d" % kv for kv in sorted(forms.items())))

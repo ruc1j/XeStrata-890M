@@ -4,19 +4,19 @@
 """serve/server.py - plan v0.3 P8: OpenAI and Anthropic endpoints over any engine that maps token ids to tokens.
 
     python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
-    python -m serve.server --engine strata --config strata.json --port 8095   (the real engine, resident)
+    python -m serve.server --engine xestrata --config xestrata-<model>.json --port 8095   (the real engine, resident)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time
 behind a FIFO (plan: one resident sequence).
 Image generation (optional, when the config has an "images" section): POST /v1/images/generations and
 /v1/images/edits (OpenAI's shapes, plus seed) run the image model setup --images installed (Qwen-Image-2.1-Turbo,
-Qwen-Image-2.1 or Mage-Flow) on XeStrata's own image engine (strata-image, resident after the first image), one job at
+Qwen-Image-2.1 or Mage-Flow) on XeStrata's own image engine (xestrata-image, resident after the first image), one job at
 a time on the GPU the text engine uses (serve/images.py; docs/IMAGE.md).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
-data, http(s) URLs or local file paths) go through `strata-vision` (the model's mmproj file) and reach the engine as
+data, http(s) URLs or local file paths) go through `xestrata-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
 converted to PNG first with Pillow.
 A request whose prompt alone does not fit the engine's context is REJECTED with 400, never truncated.  When the prompt
@@ -26,13 +26,14 @@ brings back the strict 400 of llama.cpp.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
-`StrataEngine` keeps one `strata --serve` process resident (weights, expert arena and VRAM tier load once) and
+`StrataEngine` keeps one `xestrata-engine --serve` process resident (weights, expert arena and VRAM tier load once) and
 talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes every API path testable without a GPU.
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import collections
 import base64
 import hashlib
@@ -55,6 +56,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.request
 import uuid
 from http.client import HTTPException
@@ -79,16 +81,43 @@ from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_EN
                             literal_tags, thinking_signature, mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
-from serve import runconfig  # noqa: E402
+from serve import hardware, runconfig, sampling  # noqa: E402
+from serve import places  # noqa: E402
+from serve import downgrades  # noqa: E402
+from serve import model_terms  # noqa: E402
+from serve import notices  # noqa: E402
+from serve import envvars, inkling_kind  # noqa: E402
+from serve import autotune  # noqa: E402
+from serve import search as search_api  # noqa: E402
+from serve import skills as skills_api  # noqa: E402
+from serve import tool_parallel  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
+from serve import kernel_check  # noqa: E402
 from serve import release_check  # noqa: E402
 from serve import loop_guard  # noqa: E402
 from serve import inkling2mini_dialect, inkling2mini_kind  # noqa: E402
+from serve import debuglog  # noqa: E402
+from serve import script_guard  # noqa: E402
 from serve.structured import (StructuredOutputError, answer_grammar, checked_calls, constrained_tools,  # noqa: E402
-                              extract_json, prepare_format, strict_schemas, tool_grammar, validated_json)
+                              call_names_grammar, extract_json, prepare_format, strict_schemas, tool_grammar,
+                              validated_json)
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve import image_aux  # noqa: E402
+from serve import image_controls as controls_api  # noqa: E402
+from serve import image_regions as regions_api  # noqa: E402
+from serve import videos as videos_api  # noqa: E402
+from serve import lora_train as lora_train_api  # noqa: E402
+from serve import loras as lora_api  # noqa: E402
+from serve import translate as translate_mod  # noqa: E402
+from serve import translate_api  # noqa: E402
+from serve import vram_ledger  # noqa: E402
+from serve import idle_watch  # noqa: E402
+from serve import disk_watch  # noqa: E402
+from serve import line_process  # noqa: E402
+from serve import reader_room  # noqa: E402
+from serve.line_process import end_gpu_process, popen  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -108,47 +137,33 @@ def rttime_limit_note() -> str:
         return ""
     return (f"This session has a real-time CPU limit (RLIMIT_RTTIME hard limit {hard}; the desktop's audio system sets "
             "it to 0 when rtkit is not installed). Linux can then end a program with signal 9 for no visible reason. "
-            "Install rtkit, or start Strata outside the desktop session's limits, for example: "
-            "systemd-run --user --collect -p LimitRTTIME=infinity -- strata serve ...")
-
-
-def popen(what: str, args: list, **kw):
-    """#735: subprocess.Popen, but Windows' refusal to start a program (WinError 4551, or 1260 when a policy blocks it:
-    Smart App Control on a clean Windows 11 blocks an exe that is not signed) is said in words instead of a bare
-    OSError."""
-    try:
-        return subprocess.Popen(args, **kw)
-    except OSError as e:
-        if getattr(e, "winerror", None) in (4551, 1260):
-            raise OSError(f"Windows blocked {what} ({args[0]}): Smart App Control, or an application-control policy, "
-                          "does not let a program that is not signed run. Turn Smart App Control off (Windows "
-                          "Security > App & browser control > Smart App Control settings), or - for the image encoder "
-                          "only - run setup with --vision no (see docs/TROUBLESHOOTING.md)") from e
-        raise
+            "Install rtkit, or start XeStrata outside the desktop session's limits, for example: "
+            "systemd-run --user --collect -p LimitRTTIME=infinity -- xestrata")
 
 
 # How long close() gives the engine at each step of ending it (seconds). Module values so that a test can shorten them.
 ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 20, 20, 20
 
 
-def listen_problem(host: str, port: int, e: OSError) -> str:
+def listen_problem(host: str, port: int, e: OSError, windows: bool = os.name == "nt") -> str:
     """#769: why the server cannot listen.  Only an address that is taken says "already in use"; anything else (a port
-    Windows keeps reserved, an address this PC does not have, no permission) says what the OS said."""
+    Windows keeps reserved, an address this PC does not have, no permission) says what the OS said.  `windows`: the
+    system this sentence is for (the tests give both)."""
     import errno
     code = getattr(e, "winerror", None) or e.errno
     if code in (errno.EADDRINUSE, 10048):
-        return (f"port {port} is already in use - is Strata (or another server) already running? "
+        return (f"port {port} is already in use - is XeStrata (or another server) already running? "
                 f"Close it, or start this one with a different --port")
     what = e.strerror or str(e)
     if code in (10013, errno.EACCES):
-        if sys.platform == "win32":
+        if windows:              # Windows keeps whole ranges of ports for Hyper-V, WSL and Docker (upstream 8768e95f)
             hint = ("Windows may keep this port for itself (see `netsh int ipv4 show excludedportrange protocol=tcp`) "
                     "or a firewall rule forbids it: start this one with a different --port")
-        else:
-            hint = ("This system does not allow it (on Linux and macOS, ports below 1024 need administrator rights): "
-                    "start this one with a different --port")
+        else:                    # Linux and macOS keep none of them: below 1024 is where a privilege is needed
+            hint = (f"this system does not let XeStrata use port {port}: on Linux and macOS, ports below 1024 need "
+                    "administrator rights. Start this one with a different --port, for example 8801")
     elif code in (10049, errno.EADDRNOTAVAIL):
-        hint = f"{host} is not an address of this PC: check \"host\" in the model's strata-<model>.json or --host"
+        hint = f"{host} is not an address of this PC: check \"host\" in the model's xestrata-<model>.json or --host"
     else:
         hint = "check --host and --port"
     return f"cannot listen on {host}:{port}: {what} [{code}]. {hint}"
@@ -165,7 +180,7 @@ def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
     if os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
         try:
             if shutil.disk_usage(shm).free > 2 * nbytes + (16 << 20):
-                return shm / f"strata-vision-{os.getpid()}-{name}"
+                return shm / f"xestrata-vision-{os.getpid()}-{name}"
         except OSError:
             pass
     return Path(vision_dir) / name
@@ -199,9 +214,9 @@ def trailing_reminder(messages):
     one, so the engine's checkpoint of the conversation (taken up to the newest turn) never matched the next request
     and the prompt was read again from the last periodic checkpoint (5-19 s at 18K tokens).  With `effort_end` that
     text goes into the trailing system turn the engine (--tail-role-token) checkpoints in front of, and the next turn
-    reuses the conversation (Ben1078/Strata 8b90ab807: 18,271 of 18,822 tokens reused).  STRATA_TRAILING_REMINDER=0
+    reuses the conversation (Ben1078/Strata 8b90ab807: 18,271 of 18,822 tokens reused).  XESTRATA_TRAILING_REMINDER=0
     turns it off."""
-    if os.environ.get("STRATA_TRAILING_REMINDER", "1") == "0" or not isinstance(messages, list) or len(messages) < 3:
+    if envvars.get("TRAILING_REMINDER", "1") == "0" or not isinstance(messages, list) or len(messages) < 3:
         return None
     last = messages[-1]
     if not isinstance(last, dict) or last.get("role") != "user":
@@ -312,7 +327,7 @@ KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet:
 # ends in /v1 (copied from an OpenAI-style setup) makes them post /v1/v1/messages; these
 # two paths mean the same as the real ones. Nothing else is aliased.
 V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_tokens": "/v1/messages/count_tokens"}
-CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+CTX_SLACK = 8               # `xestrata-engine --serve` rejects prompt + max_new + 8 > context: the same margin here
 
 
 class ContextOverflow(ValueError):
@@ -344,10 +359,6 @@ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean s
 # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
 # the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
 ENGINE_SILENCE_S = 300.0
-# #4271: a streaming client that stops reading (a hung process, a network that dropped) leaves the thread that writes to
-# it blocked once the socket buffers are full - and that thread holds the engine's turn.  A write that makes no progress
-# for this long ends the request as a disconnect (the engine is stopped, the turn given back).  0: no limit, as before.
-STREAM_WRITE_TIMEOUT_S = float(os.environ.get("STRATA_STREAM_WRITE_TIMEOUT_S", "60") or 0)
 # Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
 # single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
 SESSION_WAIT_MAX_S = 3600
@@ -362,12 +373,13 @@ PP_SLACK = 3.0
 # fire and every later request queued behind it (the "lost step" class of #481).  Generous on purpose: a cold model
 # load, a slow disk or a slow CPU encode is not a hang.  Only a process that says nothing at all for this long is
 # ended; the next request starts it again.
-# STRATA_ENGINE_READY_S / STRATA_VISION_READY_S / STRATA_VISION_ENCODE_S override them (0 = wait for ever, as before).
+# XESTRATA_ENGINE_READY_S / XESTRATA_VISION_READY_S / XESTRATA_VISION_ENCODE_S override them (0 = wait for ever, as
+# before).
 
 
 def _timeout_env(name: str, default: float) -> float | None:
     try:
-        v = float(os.environ.get(name, default))
+        v = float(envvars.get(name) or default)
     except ValueError:
         v = default
     return None if v <= 0 else v
@@ -378,18 +390,23 @@ def _timeout_env(name: str, default: float) -> float | None:
 # no CPU time and moves no bytes of I/O in that time is not slow, it is idle or frozen (a deadlock in a CUDA call, a
 # driver stall, a lost step), and waiting longer cannot help: it is ended, and the next request starts it again.  An
 # engine that is silent but still working is never ended by this, only reported once (the recommendation:
-# engine_silence_s, or this variable). STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it);
-# without it nothing is ended.
-ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
+# engine_silence_s, or this variable). XESTRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs
+# it); without it nothing is ended.
+ENGINE_STALL_S = _timeout_env("ENGINE_STALL_S", 90.0)
+# #4271 (upstream), part 1: a streaming client that stops reading (a hung process, a network that dropped) leaves the
+# thread that writes to it blocked once the socket buffers are full, and that thread holds the engine's turn.  A write
+# that makes no progress for this long ends the request as a disconnect (the engine is stopped, the turn given back).
+# XESTRATA_STREAM_WRITE_TIMEOUT_S=0: no limit, as before.
+STREAM_WRITE_TIMEOUT_S = _timeout_env("STREAM_WRITE_TIMEOUT_S", 60.0) or 0.0
 # --batch: new requests take the control lines (one prompt read at a time) short prompts first: a prompt of at most
-# STRATA_ADMIT_SHORT_FIRST tokens goes before longer ones (opt-in; unset or 0: whoever gets the lock first), and a
-# longer one that waited STRATA_ADMIT_MAX_WAIT_S (default 30) counts as short.  A chat question then waits for the one
+# XESTRATA_ADMIT_SHORT_FIRST tokens goes before longer ones (opt-in; unset or 0: whoever gets the lock first), and a
+# longer one that waited XESTRATA_ADMIT_MAX_WAIT_S (default 30) counts as short.  A chat question then waits for the one
 # read in progress, not for every agent read that came before it.
 try:
-    ADMIT_SHORT_FIRST = max(0, int(os.environ.get("STRATA_ADMIT_SHORT_FIRST") or 0))
+    ADMIT_SHORT_FIRST = max(0, int(envvars.get("ADMIT_SHORT_FIRST") or 0))
 except ValueError:
     ADMIT_SHORT_FIRST = 0
-ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
+ADMIT_MAX_WAIT_S = _timeout_env("ADMIT_MAX_WAIT_S", 30.0) or 0.0
 STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
 
@@ -399,12 +416,15 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int]) -> bool:
     return (now[0] - base[0]) <= STALL_CPU_EPS_S and (now[1] - base[1]) <= STALL_IO_EPS_B
 
 
-VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 600.0)   # a first GPU start compiles its kernels (JIT)
-VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
-ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
+#: what the GPU picture reader takes from the card (1,342 MiB measured on an RTX A6000 and an R9700; upstream
+#: 79dc46376): a start with less free VRAM than this reads the picture on the CPU where a CPU reader exists
+READER_NEEDS_MIB = 1536
+VISION_READY_S = _timeout_env("VISION_READY_S", 600.0)   # a first GPU start compiles its kernels (JIT)
+VISION_ENCODE_S = _timeout_env("VISION_ENCODE_S", 300.0)
+ENGINE_READY_S = _timeout_env("ENGINE_READY_S", 900.0)
 
 # A stalled peer must release the request turn; 0 preserves unbounded socket waits.
-PEER_STALL_S = _timeout_env("STRATA_PEER_STALL_S", 120.0)
+PEER_STALL_S = _timeout_env("PEER_STALL_S", 120.0)
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -478,6 +498,117 @@ class ModelBusy(RuntimeError):
     """Explicit model controls must not interrupt active or queued requests."""
 
 
+REPLY_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
+
+
+class Reply:
+    """A streamed chat reply kept apart from its connection (xestrata_reply): its SSE lines as they were made, so that a
+    client whose connection broke (a browser that put the tab to sleep, a network that dropped for a moment) reads the
+    rest again, and the answer, an image job's included, is not cancelled with the connection.  It is cancelled only
+    by its own cancel (POST /v1/xestrata/replies/<id>/cancel: the web app's Stop).  The client says when it has read it
+    (POST /v1/xestrata/replies/<id>/ack): `read_by_client`."""
+
+    def __init__(self, cancel: threading.Event):
+        self.cancel = cancel
+        self.lines: list[bytes] = []
+        self.done = False
+        self.read_by_client = False
+        self.ended_at: float | None = None
+        self.cond = threading.Condition()
+
+    def put(self, line: bytes) -> None:
+        with self.cond:
+            self.lines.append(line)
+            self.cond.notify_all()
+
+    def finish(self) -> None:
+        with self.cond:
+            self.done, self.ended_at = True, time.time()
+            self.cond.notify_all()
+
+    def read(self, start: int, wait_s: float) -> tuple[list[bytes], bool]:
+        """The lines from `start`, waiting up to wait_s for one, and whether the reply has ended."""
+        with self.cond:
+            if len(self.lines) <= start and not self.done:
+                self.cond.wait(wait_s)
+            return self.lines[start:], self.done
+
+
+class Replies:
+    """The replies kept for their clients: a finished one until its client has read it (ack), for KEEP_S at most - a
+    page closed while it was written gets it when it is opened again, up to 12 hours later - and at most MAX of them
+    (the oldest finished go first; one still running is never dropped)."""
+    KEEP_S = 12 * 3600.0
+    MAX = 256
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.items: dict[str, Reply] = {}
+
+    def open(self, rid: str, cancel: threading.Event) -> Reply:
+        with self.lock:
+            now = time.time()
+            for k, r in list(self.items.items()):
+                if r.done and (r.read_by_client or (r.ended_at is not None and now - r.ended_at > self.KEEP_S)):
+                    del self.items[k]
+            ended = sorted((r.ended_at or 0, k) for k, r in self.items.items() if r.done)
+            while len(self.items) >= self.MAX and ended:
+                del self.items[ended.pop(0)[1]]
+            old = self.items.get(rid)
+            if old is not None and not old.done:
+                raise ValueError("xestrata_reply: a reply with this id is still running")
+            r = self.items[rid] = Reply(cancel)
+            return r
+
+    def get(self, rid: str) -> Reply | None:
+        with self.lock:
+            r = self.items.get(rid)
+            if r is not None and r.done and r.ended_at is not None and time.time() - r.ended_at > self.KEEP_S:
+                del self.items[rid]
+                return None
+            return r
+
+    def ack(self, rid: str) -> bool:
+        """The client has the reply: a finished one goes now, one still running when it finishes.  False when there is
+        none."""
+        with self.lock:
+            r = self.items.get(rid)
+            if r is None:
+                return False
+            r.read_by_client = True
+            if r.done:
+                del self.items[rid]
+            return True
+
+
+REPLIES = Replies()
+
+
+def own_field(req: dict, name: str):
+    """A field of XeStrata's own in a request: xestrata_<name>, else its earlier name strata_<name>."""
+    v = req.get("xestrata_" + name)
+    return req.get("strata_" + name) if v is None else v   # its earlier name
+
+
+def own_path(path: str) -> str:
+    """XeStrata's own routes are /v1/xestrata/...; their earlier /v1/strata/... reaches the same."""
+    old = "/v1/strata/"                                 # their earlier name
+    return "/v1/xestrata/" + path[len(old):] if path.startswith(old) else path
+
+
+def reply_id(req: dict) -> str | None:
+    """A streamed request's xestrata_reply id (the web app's: {"id": ...}), or None."""
+    r = own_field(req, "reply")
+    if r is None:
+        return None
+    rid = r.get("id") if isinstance(r, dict) else None
+    if not isinstance(rid, str) or not REPLY_ID.fullmatch(rid):
+        raise ValueError("xestrata_reply: {\"id\": 8 to 64 letters, digits, - or _}")
+    if not req.get("stream"):
+        raise ValueError("xestrata_reply needs stream: true")
+    return rid
+
+
 class EngineSilent(EngineDied):
     """#481: the engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
     step - the engine waiting for its next command, the server for this request's end - and the server ended it.  An
@@ -512,6 +643,40 @@ class SessionRefused(ValueError):
 class EngineStuck(RuntimeError):
     """The engine process did not end after QUIT, terminate and kill: the server keeps it (and says so) rather than
     reporting its GPU and RAM as given back."""
+
+
+HOOK_REASON_MAX = 300   # 台帳 0740/0821: before_load の拒否理由として API に出す長さの上限
+
+
+def hook_text(output) -> str:
+    """before_load の出力をテキストにする。UTF-8 で読めなければ機械の文字コードで読む。"""
+    if not isinstance(output, bytes):
+        return output or ""
+    try:
+        return output.decode("utf-8")
+    except UnicodeDecodeError:
+        import locale
+        return output.decode(locale.getpreferredencoding(False) or "utf-8", "replace")
+
+
+def hook_reason(output, limit: int = HOOK_REASON_MAX, stderr=None) -> str:
+    """コマンドが書いた最後の非空行を API 向けに整える。stderr を優先し、制御文字を空白に、
+    空白を 1 つに、長さを limit に制限する（#5987）。"""
+    for text in (stderr, output):
+        for line in reversed(hook_text(text).splitlines()):
+            s = " ".join("".join(" " if unicodedata.category(c)[0] == "C" else c for c in line).split())
+            if s:
+                return s if len(s) <= limit else s[:limit - 3].rstrip() + "..."
+    return ""
+
+
+def hook_echo(output, stream=None) -> None:
+    """コマンドの出力をサーバーの出力へそのまま流す（#5987 で読む前の動作を保つ）。"""
+    if not output:
+        return
+    lines = hook_text(output).splitlines()
+    if lines:
+        print("\n".join(lines), file=stream or sys.stdout, flush=True)
 
 
 class GpuBusy(RuntimeError):
@@ -574,7 +739,7 @@ def exit_text(rc: int | None) -> str:
 
 def start_failure_hint(log: str | None, offset: int) -> str:
     """#474 (upstream f2aaba1): what to change when the engine stopped at the start because the MTP draft head did not
-    fit the VRAM left: the engine's own `strata mtp:` lines after that failure (what it needs, what is free, the
+    fit the VRAM left: the engine's own `xestrata mtp:` lines after that failure (what it needs, what is free, the
     smaller subsets), else the same advice in words.  "" for any other failure: the log says why."""
     if not log:
         return ""
@@ -586,8 +751,8 @@ def start_failure_hint(log: str | None, offset: int) -> str:
         return ""
     if DRAFT_HEAD_FAIL not in text:
         return ""
-    said = [x.strip()[len("strata mtp: "):] for x in text.splitlines()
-            if x.strip().startswith("strata mtp: ") and ("draft head over" in x or "hint:" in x)]
+    said = [x.strip()[len("xestrata mtp: "):] for x in text.splitlines()
+            if x.strip().startswith("xestrata mtp: ") and ("draft head over" in x or "hint:" in x)]
     return ". mtp: " + DRAFT_HEAD_FAIL + ". " + (" ".join(said) if said else "Hint: " + DRAFT_HEAD_HINT)
 
 
@@ -656,7 +821,7 @@ def cpu_isa_words() -> tuple:
     """(text, missing): the CPU's model and which of AVX / AVX2 / FMA / F16C it reports (Linux: /proc/cpuinfo), and the
     ones of those it lacks.  ("", []) where it cannot be read."""
     try:
-        text = Path("/proc/cpuinfo").read_text(errors="replace")
+        text = hardware.proc_text("cpuinfo", errors="replace")
     except OSError:
         return "", []
     model = next((x.split(":", 1)[1].strip() for x in text.splitlines() if x.lower().startswith("model name")), "")
@@ -702,9 +867,9 @@ def start_log_marks(log: str | None, offset: int) -> list:
 # A start that ends at once with the GPU runtime's own failure and none of the engine's lines: on ROCm, a start right
 # after the previous engine exited can fail inside the runtime's device/queue set-up while the old process's queues are
 # still being torn down ("terminate called after throwing an instance of 'rocr::AMD::hsa_exception'", or an exit with
-# nothing in the log).  Such a start is tried again after a short wait (STRATA_START_RETRIES, default 3; 0: never).
+# nothing in the log).  Such a start is tried again after a short wait (XESTRATA_START_RETRIES, default 3; 0: never).
 TRANSIENT_START_MARKS = ("hsa_exception", "HSA_STATUS_ERROR", "hsaKmt")
-START_RETRIES = max(0, int(os.environ.get("STRATA_START_RETRIES", "3") or 0))
+START_RETRIES = max(0, int(envvars.get("START_RETRIES", "3") or 0))
 
 
 def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: int | None = None) -> bool:
@@ -720,7 +885,7 @@ def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: 
     except (OSError, ValueError):
         return False
     lines = [x.strip() for x in text.splitlines() if x.strip()]
-    engine_lines = [x for x in lines if not x.startswith("[strata]")]
+    engine_lines = [x for x in lines if not x.startswith("[xestrata]")]
     if any(m in text for m in TRANSIENT_START_MARKS):
         return all(x.startswith("terminate called") or x.startswith("what()") or
                    any(m in x for m in TRANSIENT_START_MARKS) for x in engine_lines)
@@ -732,7 +897,7 @@ def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: 
 
 
 def echo_requests(log_path: str, offset: int) -> None:
-    """STRATA_REQUEST_LINES=1: one stdout line per finished request, from the engine's own summary in its log.
+    """XESTRATA_REQUEST_LINES=1: one stdout line per finished request, from the engine's own summary in its log.
 
     The engine's stderr goes to the log file (the start narrator reads it), so a supervisor that only sees this
     process's output - a tray, llama-swap - has no per-request numbers. This re-states the engine's line with the
@@ -749,7 +914,7 @@ def echo_requests(log_path: str, offset: int) -> None:
             m = ENGINE_REQUEST.search(line)
             if m:
                 read_ms, gen_ms = float(m["read"]), float(m["gen_ms"])
-                print("[strata] request prompt %s cached %s output %s prompt_read %.0f ms total %.0f ms prefill %s "
+                print("[xestrata] request prompt %s cached %s output %s prompt_read %.0f ms total %.0f ms prefill %s "
                       "tok/s decode %s tok/s" % (m["prompt"], m["reused"], m["gen"], read_ms, read_ms + gen_ms, m["pp"],
                                                  m["tg"]), flush=True)
 
@@ -801,7 +966,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             last = time.time()
             print(text, flush=True)
 
-    say("weights", "[strata] starting the engine: reading the model's weights ...")
+    say("weights", "[xestrata] starting the engine: reading the model's weights ...")
     pos = offset
     while not done.wait(0.5):
         try:
@@ -815,32 +980,38 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # #505: mapped
-                    say("arena", f"[strata] {loading}\n"
+                    say("arena", f"[xestrata] {loading}\n"
                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is "
                                  "normal.\n"
                                  "         Please wait and don't close this window"
                                  + ("; the browser opens when it is ready." if OPENS_BROWSER
                                     else "; the server says when it is ready."))
                 elif " loaded " in line and "GiB at" in line:
-                    say("loaded", "[strata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
+                    say("loaded", "[xestrata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
-                    say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
+                    say("cache", f"[xestrata] filling the GPU's expert cache ({n}) ...")
                 elif "IGC's GEP simplification is off" in line:   # Intel's compiler 2.27 to 2.30 (AGENTS.md)
                     v = line.split("; IGC ", 1)[1].split(")", 1)[0] if "; IGC " in line else "?"
-                    say("igc", f"[strata] Intel's compiler IGC {v} has a bug XeStrata works around: the decode of "
+                    say("igc", f"[xestrata] Intel's compiler IGC {v} has a bug XeStrata works around: the decode of "
                         "short prompts is up to 10% slower.\n"
-                        "         For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman "
-                        "(Fedora 44 inside).")
+                        "         For full speed, use Fedora 44 or 45 (their IGC is 2.32 or later), or install "
+                        "with Podman (Fedora 45 inside).")
+                elif "the xe driver's SVM is broken on Linux" in line:   # Ubuntu's 7.0.0 kernel (AGENTS.md)
+                    v = line.split("on Linux ", 1)[1].split(" (Ubuntu", 1)[0] if "on Linux " in line else "?"
+                    say("svm", f"[xestrata] Linux {v} has the xe driver's bug: a page its SVM moves can oops the "
+                        "kernel or leak memory silently. XeStrata works around nothing; use Fedora 44 or 45, or a "
+                        "kernel without the error (Ubuntu's 7.0.0-38 or earlier, or the build with the fix). "
+                        "A container runs on the host's kernel, so change the host's.")
                 elif "session is up" in line:
-                    say("up", "[strata] almost ready ...")
+                    say("up", "[xestrata] almost ready ...")
         if time.time() - last > heartbeat:
             last = time.time()
-            print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
+            print(f"[xestrata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
-_BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))
+_BTRACE = bool(envvars.get("BATCH_TRACE"))
 
 
 def btrace(*a):
@@ -877,14 +1048,15 @@ FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed ou
 
 
 class ConvCacheLog:
-    """upstream #596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
-    cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
-    which is the log): read on from where it was last read, from the start of the engine's current run."""
+    """upstream #596: the engine's conversation cache as its log tells it (the engine writes "xestrata serve:
+    conversation cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P
+    bytes=B" to stderr, which is the log): read on from where it was last read, from the start of the engine's current
+    run."""
     # #879: these two completed recovery messages follow ConversationCache::clear(), which removes every parked
     # entry and its retained K/V.  Keep history counters: the clear is not a cache park or restore event.
     CLEARED = re.compile(
-        r"strata serve: after non-finite logits \(#879\): (?:the restored session replaces the live one; dropped \d+ "
-        r"parked "
+        r"(?:xe)?strata serve: after non-finite logits \(#879\): (?:the restored session replaces the live one; "
+        r"dropped \d+ parked "
         r"conversations?|dropped the live session, \d+ checkpoints?, \d+ parked conversations? and \d+ idle slots? "
         r"\(\d+ running slots? not kept after their reply\); reading this prompt from token 0)$")
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
@@ -973,6 +1145,9 @@ class ConvCacheLog:
         return dict(self.state)
 
 
+PROMPT_KEEP_MAX = 32   # the prompts the encoder keeps at most (#567): the conversations a client interleaves
+
+
 def conversation_slots(engine) -> int | None:
     """How many conversations the engine's cache holds: its --conversation-cache-slots argument, which is known
     before the engine has started (a lazy start has reported no INFO line yet), else the INFO line it reported."""
@@ -1026,8 +1201,48 @@ class _RequestOwned:
         self._store(obj)[self.name] = value
 
 
+def hip_igpu_present() -> bool:
+    """Linux AMD: whether a KFD GPU node is integrated — its node reports CPU cores (cpu_cores_count > 0), an APU that
+    shares the system RAM and usually draws the desktop.  The device's own report, not a gfx name (AGENTS.md).  False
+    off Linux or without the ROCm driver."""
+    try:
+        nodes = sorted(int(n) for n in os.listdir("/sys/class/kfd/kfd/topology/nodes") if n.isdigit())
+    except OSError:
+        return False
+    for n in nodes:
+        try:
+            with open(f"/sys/class/kfd/kfd/topology/nodes/{n}/properties") as fh:
+                props = dict(line.split() for line in fh if len(line.split()) == 2)
+            if int(props.get("simd_count", "0")) > 0 and int(props.get("cpu_cores_count", "0")) > 0:
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def engine_nice(env: dict | None = None, platform: str | None = None) -> int:
+    """Linux only: the nice value the engine starts with (upstream v0.2.13.1's engine_nice, a sync gap).  The engine's
+    CPU pool spins on every physical core but one and its host thread on another; with the desktop drawn by a built-in
+    Radeon (an APU) the compositor competes for the CPU and the screen reads as frozen.  +5 gives the desktop its share
+    and costs nothing when nothing else runs.  XESTRATA_ENGINE_NICE=N sets it (0 = off, also for any PC without such a
+    chip).  Not on Windows / macOS.  The integrated judgement is the KFD node's cpu_cores_count, not a gfx name list.
+    XeStrata-890M: off unless asked.  Its decode speed on the integrated Radeon is measured and tuned at nice 0, so
+    the +5 of an APU is an opt-in here: XESTRATA_ENGINE_NICE=auto gives it where the KFD node is integrated."""
+    if not (platform or sys.platform).startswith("linux"):
+        return 0
+    asked = envvars.get("ENGINE_NICE", env=env)
+    if asked is not None and str(asked).strip().lower() == "auto":
+        return 5 if hip_igpu_present() else 0
+    if asked is not None and str(asked).strip() != "":
+        try:
+            return max(0, min(19, int(str(asked).strip())))
+        except ValueError:
+            return 0
+    return 0
+
+
 class StrataEngine:
-    """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
+    """The resident engine: `xestrata-engine --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
 
     Per-request sampling rides the same line as engine-side keys between max_new and the ids
@@ -1049,6 +1264,8 @@ class StrataEngine:
     DRAIN_TIMEOUT_S = 300.0              # how long an interrupted request waits, silent, for its engine's DONE / BADM
     QUARANTINE_S = 600.0                 # ... and how long a slot or the control lines stay held after that, silent
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+    kept_arena: "KeptArena | None" = None   # main() sets it: the experts' arena kept across an image job's unload
+    ledger_key: str | None = None           # main() sets it: its card's VRAM ledger (image, translation)
     eos_ids = EOS_IDS                    # the tokens that end a reply (Service sets the model's: stop_token_ids)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
@@ -1111,13 +1328,13 @@ class StrataEngine:
             threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
                              daemon=True).start()
             # once per log: the follower keeps reading the same (appended) log across restarts and reloads
-            if os.environ.get("STRATA_REQUEST_LINES") and os.path.abspath(log) not in _echoing:
+            if envvars.get("REQUEST_LINES") and os.path.abspath(log) not in _echoing:
                 _echoing.add(os.path.abspath(log))
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
         if log:                                          # #779: when an engine started (a crash report has the time)
             try:
                 assert not isinstance(self.log, int)
-                self.log.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} engine started: {exe} --serve "
+                self.log.write(f"[xestrata] {time.strftime('%Y-%m-%d %H:%M:%S')} engine started: {exe} --serve "
                                f"{' '.join(args)}\n")
                 self.log.flush()
             except OSError:
@@ -1126,13 +1343,19 @@ class StrataEngine:
         pin: dict[str, Any] = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
+        nice = engine_nice(env)   # Linux with a built-in Radeon: the desktop keeps its share of the CPU
+        if nice:
+            say_nice = pin.get("preexec_fn")
+            pin["preexec_fn"] = lambda: (say_nice() if say_nice else None, os.nice(nice))[0]
         if fds:
             pin["pass_fds"] = tuple(fds)
         spawned_at = time.monotonic()
         try:
-            self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+            # errors="replace" (upstream b3c633868): a byte that is not UTF-8 on the engine's stdout (a Windows console
+            # code page, a path in another encoding) ended the reader thread, and with it every reply
+            self.proc = popen("the XeStrata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", errors="replace",
-                              bufsize=1, env=env, **pin)    # (#5044: a byte that is not UTF-8 killed the reader thread)
+                              bufsize=1, env=env, **pin)
         except OSError:                                  # nothing started: the narrator stops, the log handle goes back
             loading.set()
             if log and not isinstance(self.log, int):
@@ -1152,15 +1375,16 @@ class StrataEngine:
         # log (R9700 x2, IQ3_S, 30.8 GiB page-locked, the GPU caches filled at 88 MB/s).
         work_base = None
         work_window = min(x for x in (ENGINE_STALL_S, ENGINE_READY_S) if x is not None) if ENGINE_STALL_S else None
+        start_err = None                                # an ERR line before READY: the engine said it cannot start
         while True:
             left = None if ready_deadline is None else ready_deadline - time.monotonic()
             if left is not None and left <= 0:
                 now = self._activity() if work_window else None
                 if work_window and now is not None and (work_base is None or not engine_frozen(work_base, now)):
                     if work_base is None:
-                        print(f"[strata] the engine has not reported READY within {ENGINE_READY_S:.0f} s but is still "
-                              "loading (CPU or disk at work): waiting while it works (STRATA_ENGINE_READY_S, "
-                              "STRATA_ENGINE_STALL_S)", flush=True)
+                        print(f"[xestrata] the engine has not reported READY within {ENGINE_READY_S:.0f} s but is "
+                              "still loading (CPU or disk at work): waiting while it works (XESTRATA_ENGINE_READY_S, "
+                              "XESTRATA_ENGINE_STALL_S)", flush=True)
                     work_base, ready_deadline = now, time.monotonic() + work_window
                     continue
                 timed_out = True
@@ -1171,6 +1395,8 @@ class StrataEngine:
                 continue
             if line is None:
                 break
+            if downgrades.from_info_line(line, "text engine"):
+                continue
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
@@ -1182,13 +1408,15 @@ class StrataEngine:
                 self.can_hold = "hold" in f[2:]
                 self.can_hold_batch = "holdb" in f[2:]
                 break
+            if line.startswith("ERR"):
+                # not waited for to exit: a process that failed to load and then hung in its clean-up (two engines on
+                # one pair of GPUs, 2026-11-01) kept a CPU busy, which the READY wait above reads as still loading
+                start_err = line[3:].strip()
+                break
         loading.set()
         if self.max_context <= 0:
-            if timed_out:                               # still loading, or hung: end it, so the turn is not held
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
+            if timed_out or start_err is not None:      # still loading, hung or failed: end it, so the turn is not held
+                end_gpu_process(proc)
             try:                                        # its pipes and our handle on its log (the log stays)
                 proc.wait(timeout=5)
                 if proc.stdin is not None:
@@ -1199,17 +1427,17 @@ class StrataEngine:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
-            if not timed_out and _attempt < START_RETRIES and \
+            if not timed_out and start_err is None and _attempt < START_RETRIES and \
                     transient_start_failure(log, log_start, time.monotonic() - spawned_at, proc.returncode):
                 wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
                 exit_words = engine_exit_words(proc.returncode)
                 if start_log_marks(log, log_start):         # the runtime said so itself (hsa_exception ...)
-                    print(f"[strata] the engine stopped while the GPU runtime was starting (most often right after "
+                    print(f"[xestrata] the engine stopped while the GPU runtime was starting (most often right after "
                           f"another engine exited, whose GPU queues were still being released"
                           f"{'; ' + exit_words if exit_words else ''}): starting it again in {wait_s:.0f} s "
                           f"(try {_attempt + 2} of {START_RETRIES + 1})", flush=True)
                 else:                                       # an exit with nothing in the log: say only what is known
-                    print(f"[strata] the engine exited before it wrote anything to its log"
+                    print(f"[xestrata] the engine exited before it wrote anything to its log"
                           f"{' (' + exit_words + ')' if exit_words else ''}; it may be a GPU runtime that was not "
                           f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
                           flush=True)
@@ -1217,13 +1445,14 @@ class StrataEngine:
                 StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1, fds=fds)
                 return
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
+                   f"the engine could not start: {start_err}" if start_err is not None else
                    f"the engine exited before it was ready ({exit_text(proc.poll())})")
             # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
             # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
-            note = "" if timed_out else start_exit_note(proc.returncode)
+            note = "" if timed_out or start_err is not None else start_exit_note(proc.returncode)
             tail = start_log_tail(log, log_start)
             lines = [x for x in tail.split("\n")[2:] if x.strip()]
-            if tail and lines and all(x.strip().startswith("[strata]") for x in lines):
+            if tail and lines and all(x.strip().startswith("[xestrata]") for x in lines):
                 tail += "\n  (those are the launcher's own lines: the engine itself wrote nothing)"
             raise EngineDied(why + (f" (see {log})" if log else "") + note +
                              start_failure_hint(log, log_start) + tail)
@@ -1244,7 +1473,7 @@ class StrataEngine:
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args[:-1]), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
         if asked and self.batch != asked:
-            print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
+            print(f"[xestrata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
         # the engine resolves the groups (a number, auto, or auto by default on a layer split) and says what it runs:
         # INFO batch_groups=G (upstream 1bf6344c, ca001df5); an engine without it runs what --batch-groups asked
@@ -1269,6 +1498,9 @@ class StrataEngine:
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
+        # the prompt_cache_key of the request each slot last took (OpenAI's field: an agent harness such as Mainplane
+        # sends one per session), so a session whose prompt no slot starts overwrites its own slot first (pick_slot)
+        self.slot_key: list[str | None] = [None] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
@@ -1294,6 +1526,9 @@ class StrataEngine:
         slot_busy = self.slot_busy                      # this process's (a restart makes new ones)
         self.__dict__.setdefault("lp_lines", LPLines())   # (token id, LP line): logprobs
         last_t = None
+        # a request asking for logprobs: its T line is held until the LP line after it is read, so that the token is
+        # never spelled before its logprob is there (it went to the next token's text, and the last token had none)
+        held = None
         slot_q: list[queue.Queue] = getattr(self, "slot_q", [])
         log = getattr(self, "log", None)                # retain this process's log across a restart
         line = None
@@ -1302,10 +1537,13 @@ class StrataEngine:
             # protocol pipe, so they are written there too
             if line.startswith("ERR ") and log not in (None, subprocess.DEVNULL):
                 try:
-                    log.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} native {line.rstrip()}\n")
+                    log.write(f"[xestrata] {time.strftime('%Y-%m-%d %H:%M:%S')} native {line.rstrip()}\n")
                     log.flush()
                 except (OSError, ValueError):          # a closed/full log must not prevent EOF publication
                     pass
+            if held is not None and not line.startswith("LP "):   # no LP line for it after all
+                lines.put(held)
+                held = None
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -1334,13 +1572,21 @@ class StrataEngine:
                     pass
             if line.startswith("LP "):                  # beside the token before it, not in the queue: in the lines of
                 self.lp_lines.append((last_t, line))    # the request that has the control lines now (LPLines)
+                if held is not None:
+                    lines.put(held)
+                    held = None
                 continue
             if line.startswith("T "):
                 try:
                     last_t = int(line[2:])
                 except ValueError:
                     last_t = None
+                if getattr(self.lp_lines, "owner", None) is not None:
+                    held = line
+                    continue
             lines.put(line)
+        if held is not None:
+            lines.put(held)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
             rc = proc.poll() if hasattr(proc, "poll") else getattr(proc, "returncode", None)
@@ -1353,7 +1599,9 @@ class StrataEngine:
             q.put(None)
 
     def death_note(self) -> str:
-        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
+        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM.  Only
+        this start's lines (log_start): the log is appended across starts, and an earlier engine's watchdog line is
+        not why this one ended (#59)."""
         if self.silent_note:                            # #481: the server ended it, not the OS or the engine itself
             return self.silent_note
         tail = wide = ""
@@ -1361,13 +1609,14 @@ class StrataEngine:
             if self.log_path is None:
                 raise OSError("no log")
             with open(self.log_path, "rb") as f:
-                f.seek(0, 2)
-                f.seek(max(0, f.tell() - 262144))
+                size = f.seek(0, 2)
+                start = getattr(self, "log_start", 0) or 0
+                f.seek(max(start if start <= size else 0, size - 262144))
                 wide = f.read().decode("utf-8", "replace")
             tail = wide[-4096:]
         except (OSError, TypeError):
             pass
-        # #1705: STRATA_VERIFY_TRACE dumps are ~30 KB and push the watchdog's line out of a 4 KB tail
+        # #1705: XESTRATA_VERIFY_TRACE dumps are ~30 KB and push the watchdog's line out of a 4 KB tail
         for line in reversed(wide.splitlines()):
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught (issue "
@@ -1382,7 +1631,8 @@ class StrataEngine:
         if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
             return (f"The engine exited (code {rc}) after it reported: {self.last_err} - please report it at "
                     "github.com/MistVVK/XeStrata/issues with the log.")
-        last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("strata", "ERR"))), "")
+        last = next((x.strip() for x in reversed(tail.splitlines())
+                     if x.strip().startswith(("xestrata", "ERR", "Xe runtime"))), "")
         if rc is not None and rc < 0 and -rc != signal.SIGKILL:   # issue #12: a crash, not the OS ending it for RAM
             return (f"The engine crashed ({exit_text(rc)}). " + (f"It reported: {self.last_err}" if self.last_err
                     else f"Its last log line: {last}" if last else "It wrote nothing about it") +
@@ -1439,7 +1689,7 @@ class StrataEngine:
         raw = [x.strip() for x in text.splitlines() if x.strip()]
         if not raw:
             return ""
-        own = [x for x in raw if not x.startswith("[strata]")]
+        own = [x for x in raw if not x.startswith(("[xestrata]", "[strata]"))]   # (the earlier launchers' prefix too)
         return " | ".join((own or raw)[-max_lines:])[:280]
 
     def _engine_died(self, proc=None) -> EngineDied:
@@ -1453,10 +1703,43 @@ class StrataEngine:
         tail = self._crash_tail()
         return EngineDied(f"the engine stopped unexpectedly ({status})" + (f": {tail}" if tail else ""))
 
-    def unload(self):
-        """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
+    def unload(self, keep_arena: bool = False):
+        """Release GPU/RAM between requests, retaining the spawn config for automatic reloading.  `keep_arena`: an image
+        job's unload, after which the experts stay in the server's arena (kept_arena) but for those arena_drop gave
+        up; any other unload gives the whole arena back."""
         self.close()
         self.unloaded = True
+        kept = getattr(self, "kept_arena", None)
+        if kept is not None:
+            kept.after_unload(keep_arena)
+
+    def arena_drop(self, mib: int, path: str, timeout: float = 60.0) -> dict:
+        """`ARENA DROP <mib> <file>` before an image job's unload (the caller holds the service's FIFO): the engine
+        marks at least `mib` of its coldest experts dropped from the shared arena and writes their ranges in the file
+        to `path` -> {"dropped_mib", "ranges"}; ValueError with the engine's reason, EngineDied when it ended."""
+        proc = self.proc
+        if not self.alive() or proc is None or proc.stdin is None:
+            raise EngineDied("the engine is not running")
+        if any(c in path for c in "\r\n\0"):
+            raise ValueError("invalid arena drop path")
+        proc.stdin.write(f"ARENA DROP {int(mib)} {path}\n")
+        proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the ARENA command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the ARENA command")
+            if line.startswith("ARENA "):
+                out = {k: int(v) for k, _, v in (kv.partition("=") for kv in line.split()[1:]) if v.isdigit()}
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the ARENA command")
 
     @contextlib.contextmanager
     def _exclusive_control(self):
@@ -1487,6 +1770,7 @@ class StrataEngine:
         proc = self.proc
         if not self.alive() or proc is None or proc.stdin is None:
             raise EngineDied("the engine is not running")
+        self._ledger_cache(None)
         proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
         proc.stdin.flush()
         deadline = time.time() + timeout
@@ -1507,9 +1791,57 @@ class StrataEngine:
                     out[k] = int(v) if v.lstrip("-").isdigit() else v
                 self.info.update({k: out[k] for k in ("expert_slots", "vram_free_mib") if k in out})
                 self.info["vram"] = out
+                self._ledger_cache(out)
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
+
+    def _ledger_cache(self, out: dict | None) -> None:
+        """The expert cache in its card's VRAM ledger (serve/vram_ledger.py; ledger_key, set where the server's image or
+        translation engine may share the card): its entry, under the engine's pid, set to the MiB the VRAM answer `out`
+        says the cache maps.  Before the process's first answer (None) it is entered as in the base at its size at the
+        start: the cache was on the card before the ledger knew of it, so what it gives back is room and what it takes
+        back charged."""
+        key, pid = getattr(self, "ledger_key", None), getattr(self.proc, "pid", None)
+        if not key or pid is None:
+            return
+        led = vram_ledger.Ledger(key)
+        with contextlib.suppress(OSError):
+            if out is None:
+                mib = self.info.get("expert_cache_mib")    # the start's INFO: no VRAM answer yet from this process
+                if isinstance(mib, int) and led.find("text", pid) is None:
+                    led.hold("text", mib, pid, in_base=True)
+            elif isinstance(out.get("expert_cache_mib"), int) and led.find("text", pid) is not None:
+                led.hold("text", out["expert_cache_mib"], pid)
+
+    def helper(self, on: bool, timeout: float = 120.0) -> dict:
+        """`HELPER off|on` between requests (the caller holds the service's FIFO): the helper GPU's expert cache closed,
+        its VRAM given back for an image job there, or filled again from the RAM copy (a second or two).  -> the
+        engine's figures (experts, vram_free_mib, ms); ValueError with the engine's reason, EngineDied when it ended."""
+        proc = self.proc
+        if not self.alive() or proc is None or proc.stdin is None:
+            raise EngineDied("the engine is not running")
+        proc.stdin.write(f"HELPER {'on' if on else 'off'}\n")
+        proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the HELPER command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the HELPER command")
+            if line.startswith("HELPER "):
+                out: dict = {}
+                for kv in line.split()[2:]:
+                    k, _, v = kv.partition("=")
+                    out[k] = int(v) if v.lstrip("-").isdigit() else v
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the HELPER command")
 
     def encode(self, ids_path: str, out_path: str, timeout: float = 600.0) -> dict:
         """`ENCODE <ids file> <states file>` between requests (the caller holds the service's FIFO; images.text_states):
@@ -1545,18 +1877,7 @@ class StrataEngine:
     @staticmethod
     def _ready_pump(proc, out: queue.Queue) -> None:
         """The engine's first lines up to READY, for a read that can time out; None when its output closed first."""
-        done = False
-        try:
-            for line in proc.stdout:
-                out.put(line)
-                if line.startswith("READY"):
-                    done = True
-                    return
-        except (OSError, ValueError):                   # the pipe closed under us (the engine was killed)
-            pass
-        finally:
-            if not done:
-                out.put(None)
+        line_process.pump_lines(proc, out, ready_only=True)
 
     def restart(self, tries: int = 3):
         """Start the engine again (the same command) after it died; the new process has its own line queue.
@@ -1584,7 +1905,7 @@ class StrataEngine:
                         pass
                     if i == tries - 1:
                         raise
-                    print(f"[strata] the engine did not start (try {i + 1} of {tries}); again in "
+                    print(f"[xestrata] the engine did not start (try {i + 1} of {tries}); again in "
                           f"{self.RESTART_RETRY_S:g} s", flush=True)
                     time.sleep(self.RESTART_RETRY_S)
         finally:
@@ -1615,6 +1936,15 @@ class StrataEngine:
         if getattr(self, "inkling2mini_engine", False):
             return self.sampling_keys(sampling, inkling2mini=True)
         return self.sampling_keys(sampling)
+
+    def leg_keys(self, sampling: dict, written: int) -> str:
+        """sampling_keys for a leg of a --batch request that continues a reply (a slot after the one-at-a-time path, or
+        that path again): the prompt's last `written` tokens are the reply so far, which its grammar goes on from.
+        This engine's own set (_gen_keys), without the thinking budget's hold: generate() adds the hold per leg."""
+        grammar = sampling.get("strata_grammar")
+        if isinstance(grammar, dict) and written > 0:
+            sampling = {**sampling, "strata_grammar": {**grammar, "reply_tokens": written}}
+        return self._gen_keys({k: v for k, v in sampling.items() if k != HOLD_KEY})
 
     @staticmethod
     def sampling_keys(sampling: dict, *, inkling2mini: bool = False) -> str:
@@ -1658,6 +1988,12 @@ class StrataEngine:
             for path in sampling.get("strata_inkling2mini_images") or []:
                 keys += " image=" + inkling2mini_kind.encode_path(path)
             return keys
+        if sampling.get("strata_route_prior") is False:   # the loop guard saw a loop: route exactly from here on
+            keys += " route_prior=0"
+        # "xestrata_draft": this request's drafter under the engine's --draft auto (a new field: no strata_ name)
+        dr = sampling.get("xestrata_draft")
+        if isinstance(dr, str) and dr in ("mtp", "dflash2", "df2", "auto"):
+            keys += f" draft={dr}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -1702,6 +2038,12 @@ class StrataEngine:
         grammar = sampling.get("strata_grammar")
         if isinstance(grammar, dict):
             keys += " grammar=" + base64.b64encode(json.dumps(grammar, ensure_ascii=False).encode()).decode("ascii")
+        # the script guard's table (serve/script_guard.py; src/core/script_guard.hpp), its path in hex (spaces)
+        sgt = sampling.get("strata_script")
+        if isinstance(sgt, dict):
+            keys += " script_table=" + str(sgt["table"]).encode().hex()
+            keys += f" script_allow={sgt['allow']}" if sgt.get("allow") else ""
+            keys += f" script_pending={sgt['pending']}" if sgt.get("pending") else ""
         return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod
@@ -1883,7 +2225,8 @@ class StrataEngine:
         return None
 
     def _apply_bdone(self, f: list[str]) -> None:
-        """BDONE counts the admission token too, but its clock starts after the admission's DONE."""
+        """BDONE counts the admission token too, but its clock starts after the admission's DONE: the slot time includes
+        the admission time and the token is not counted twice; a figure the engine never reported stays unknown."""
         if len(f) >= 5 and isinstance(self.last, dict):
             admission_ms = self.last.get("decode_ms")
             self.last = {**self.last, "finish": f[3],
@@ -2036,7 +2379,7 @@ class StrataEngine:
             else:
                 self._orphan_seen.pop(b, None)
         if freed:
-            print(f"[strata] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request "
+            print(f"[xestrata] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request "
                   "using them "
                   "(issue #1603); freed, the waiting request goes on", flush=True)
             self.slot_cv.notify_all()
@@ -2047,8 +2390,8 @@ class StrataEngine:
     def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
         `after_epoch`: a request whose read gave way lets the requests waiting then go first.
-        `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
-        entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
+        `new`: the request's first admission (XESTRATA_ADMIT_SHORT_FIRST orders only these)."""
+        entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: XESTRATA_ADMIT_SHORT_FIRST)
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -2107,9 +2450,9 @@ class StrataEngine:
         return True
 
     def _admit_next(self):
-        """STRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
+        """XESTRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
         next - one whose prompt is at most that long (it reads little) before a longer one, in arrival order within
-        each; a longer one that has waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
+        each; a longer one that has waited XESTRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
         Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read."""
         now = time.monotonic()
         ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
@@ -2124,9 +2467,9 @@ class StrataEngine:
     def _may_go_solo(self, left: int, times: int, embeddings) -> bool:
         """A request decoding in a slot that is alone now (no other slot busy, nobody waiting) goes back to the solo
         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
-        slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
+        slot_cache=1).  XESTRATA_PARALLEL_SOLO=0 keeps it in the slot."""
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
-                not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
+                not (self.info or {}).get("slot_cache") or envvars.get("PARALLEL_SOLO") == "0"):
             return False
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
@@ -2146,7 +2489,7 @@ class StrataEngine:
                 self.lp_lines = LPLines()
             return None
         lines = LPLines(cancel)
-        cancel._strata_lp_lines = lines
+        cancel._xestrata_lp_lines = lines
         if make_current:
             self.lp_lines = lines
         return lines
@@ -2168,6 +2511,8 @@ class StrataEngine:
         # </think>'s id; its key goes on per leg (leg_keys below)
         hold = (sampling or {}).get(HOLD_KEY)
         keys = self._gen_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY})
+        cache_key = (sampling or {}).get("prompt_cache_key")
+        cache_key = cache_key if isinstance(cache_key, str) and cache_key else None
         # logprobs: only a request the server let through (max_tokens 1, see the handler) asks for them here; its LP
         # lines go to its own LPLines, made the engine's while it has the control lines (below)
         own_lp = self.own_lp_lines(sampling, cancel, make_current=False)
@@ -2192,6 +2537,8 @@ class StrataEngine:
                     and hold[0] > 0 and hold[1] >= 0 and hold[1] not in out):
                 return keys + f" hold={max(1, hold[0] - len(out))}:{hold[1]}"
             return keys
+        orig_len = len(prompt)   # a leg that continues an earlier one (prompt + what it generated) names where its
+        # reply began: pen_from, the penalty window's start (solo -> slot, slot -> solo)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         carry = {}
@@ -2221,7 +2568,9 @@ class StrataEngine:
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
                 if alone and left > 1:
-                    head = f"GENI {left}{leg_keys()} {embeddings}" if embeddings else f"GEN {left}{leg_keys()}"
+                    pf = f" pen_from={orig_len - 1}" if len(prompt) > orig_len else ""
+                    head = (f"GENI {left}{leg_keys()}{pf} {embeddings}" if embeddings
+                            else f"GEN {left}{leg_keys()}{pf}")
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     if own_lp is not None:
                         self.lp_lines = own_lp
@@ -2240,10 +2589,11 @@ class StrataEngine:
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt)
+                                reserved = self.pick_slot(prompt, cache_key)
                                 if reserved is not None:
                                     self.slot_busy[reserved] = True
                                     self.slot_claims.add(reserved)
+                                    self.slot_key[reserved] = cache_key
                             if reserved is not None:
                                 self._send_for(born, f"BYIELD {reserved}")
                     for x in self._control(cancel, arrived, stop_when=others, on_quiet=give_way,
@@ -2284,6 +2634,7 @@ class StrataEngine:
                         # prompt_read 1) and BDONE replace them
                         carry_leg(carry, self.last)
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
+                        keys = self.leg_keys(sampling or {}, len(out))
                 while True:
                     if slot is None:
                         # a free slot (they free themselves at BDONE, which needs no control lines): the one that holds
@@ -2293,10 +2644,11 @@ class StrataEngine:
                         # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
                         while True:
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                                slot = self.pick_slot(prompt, cache_key)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
+                                    self.slot_key[slot] = cache_key
                                     if admit_wait:
                                         admit_wait = False
                                         self.admitting = max(0, self.admitting - 1)
@@ -2308,7 +2660,7 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt, cache_key) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
@@ -2316,11 +2668,11 @@ class StrataEngine:
                                             admit_said = True
                                             busy = [b for b, v in enumerate(self.slot_busy) if v]
                                             waited = time.monotonic() - admit_since
-                                            print(f"[strata] parallel: a request has waited {waited:.0f} s "
+                                            print(f"[xestrata] parallel: a request has waited {waited:.0f} s "
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt, cache_key) is None:
                                     self.slot_cv.wait(timeout=1.0)
                             if cancel.is_set():
                                 return
@@ -2348,8 +2700,9 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not sq[slot].empty():
                         sq[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{leg_keys()} {embeddings}" if embeddings else \
-                        f"BGEN {slot} {left}{leg_keys()}"
+                    pf = f" pen_from={orig_len - 1}" if len(prompt) > orig_len else ""
+                    head = (f"BGENI {slot} {left}{leg_keys()}{pf} {embeddings}" if embeddings
+                            else f"BGEN {slot} {left}{leg_keys()}{pf}")
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": began, "first_token": None}
                     self.slot_live[slot] = live
@@ -2386,7 +2739,7 @@ class StrataEngine:
                         if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
                             raise
                         refused += 1
-                        print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
+                        print(f"[xestrata] parallel: the engine refused slot {slot} ({e}); trying another slot "
                               f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
                         if refused > self.BGEN_REFUSALS_MAX:
                             raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
@@ -2476,6 +2829,7 @@ class StrataEngine:
                             if reused0 is None:
                                 reused0 = (self.last or {}).get("reused")
                             prompt, left = list(ids) + out, int(max_new) - len(out)
+                            keys = self.leg_keys(sampling or {}, len(out))
                             solo_again += 1
                             btrace("back to the solo path")
                             break
@@ -2571,14 +2925,15 @@ class StrataEngine:
     BRANCH_BOUNDARY_MIN = 8192
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
+    def pick_slot(self, prompt: list[int], key: str | None = None) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
-        prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
-        conversations other slots hold stay for their next turns.  None: every slot is busy."""
+        prompt (the engine then reads only the rest), else one the same session (`key`, the request's
+        prompt_cache_key) took last - what it holds is that session's own, which this prompt supersedes - else an
+        empty one, else the one used longest ago - so the conversations other slots hold stay for their next turns.
+        None: every slot is busy."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
-
         agreed = {}
 
         def agree(b):
@@ -2635,6 +2990,9 @@ class StrataEngine:
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
             return best
+        own = [b for b in free if key is not None and self.slot_key[b] == key]
+        if own:
+            return min(own, key=lambda b: self.slot_used[b])
         # pipelined groups: a group's window spans its slots up to its last busy one, so a free slot below a busy one
         # of its group costs no extra row: such a hole is filled first (upstream 2c7c02ab, #793: picks that left
         # leading holes, [_ B], cost a whole row each).  After a held prefix, as a pipelined slot is a cache again
@@ -2775,6 +3133,7 @@ class StrataEngine:
                 elif line.startswith("ERR"):
                     done = True
                     self._raise_if_fatal_gpu(line)
+                    self._swallow_trailing_done()   # an engine that ended the request on ERR may still print its DONE
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
@@ -2812,6 +3171,24 @@ class StrataEngine:
                     if not self.can_stop:
                         heard = time.monotonic()
 
+    def _swallow_trailing_done(self, wait: float = 0.3) -> None:
+        """A request that ends on `ERR ...` is over, but an engine that also prints the request's `DONE` after it (the
+        DeepSeek engine did, after its NaN stop) would hand that DONE to the NEXT request as its own: 0 tokens at
+        once, and every answer after it one request late.  So a short wait for a trailing DONE (or ERR) of the same
+        request, taken off the queue and dropped, before the request is reported failed and the FIFO released.  An
+        engine that prints only the ERR costs the wait."""
+        end = time.monotonic() + wait
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            try:
+                late = self.lines.get(timeout=left)
+            except queue.Empty:
+                return
+            if late is None or late.startswith(("DONE", "ERR")):
+                return
+
     def _activity(self) -> tuple[float, int] | None:
         """#1317: (CPU seconds, I/O bytes) the engine process has used so far, or None when they cannot be read."""
         try:
@@ -2842,12 +3219,12 @@ class StrataEngine:
             gpu_working = False
         if now is not None and not gpu_working and engine_frozen(state["base"], now):
             raise self._silent(f"the engine said nothing for {age:.0f} s and used no CPU or disk in that time (frozen; "
-                               "STRATA_ENGINE_STALL_S sets this, 0 = off)")
+                               "XESTRATA_ENGINE_STALL_S sets this, 0 = off)")
         if now is not None:   # working: look again after another window from here, and say so once
             state["base"], state["next"] = now, age + stall_s
             if not state.get("warned"):
                 state["warned"] = True
-                print(f"[strata] the engine has said nothing for {age:.0f} s but is still working; it is not ended "
+                print(f"[xestrata] the engine has said nothing for {age:.0f} s but is still working; it is not ended "
                       "(the limit is engine_silence_s). If it is stuck, \"engine_silence_s\" can be set lower.",
                       flush=True)
         else:
@@ -2861,9 +3238,9 @@ class StrataEngine:
                             "the end of the engine log to an issue at github.com/ruc1j/XeStrata-890M/issues.")
         self.ended = True                               # not alive from now: the next request restarts it
         proc = self.proc
+        end_gpu_process(proc)
         try:
             if proc is not None:
-                proc.kill()
                 proc.wait(timeout=20)                       # restart() -> close() handles one that is still exiting
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
@@ -2913,8 +3290,8 @@ class StrataEngine:
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
+            end_gpu_process(proc)
             try:
-                proc.kill()
                 proc.wait(timeout=20)
             except (OSError, AttributeError, subprocess.TimeoutExpired):
                 pass
@@ -2985,6 +3362,7 @@ class StrataEngine:
                 return {"tokens": tokens, "bytes": size, "ms": ms}
             if head == "INFO" or head == "WARN":          # engine log lines may interleave; they are not answers
                 heard = time.monotonic()
+                downgrades.from_info_line(line, "text engine")
                 continue
             raise out_of_step(line)
 
@@ -3013,7 +3391,7 @@ class StrataEngine:
             try:
                 self.proc.wait(timeout=ENGINE_KILL_WAIT_S)
             except subprocess.TimeoutExpired:
-                raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
+                raise EngineStuck("XeStrata is still releasing GPU/RAM; retry unloading after it exits") from None
         except OSError:
             pass
         finally:
@@ -3040,10 +3418,10 @@ IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app a
 def private_url_host(url: str) -> str | None:
     """#28: the address an image URL's host resolves to when it is not a public one (loopback, link-local - the cloud
     metadata address -, private, reserved, multicast), else None.  A request's image URL must not make the server a
-    proxy into its own network; STRATA_IMAGE_URL_PRIVATE=1 allows it (pictures served from the LAN on purpose).  An
+    proxy into its own network; XESTRATA_IMAGE_URL_PRIVATE=1 allows it (pictures served from the LAN on purpose).  An
     address that changes between this check and the connection (DNS rebinding) is not caught."""
     import ipaddress
-    if (os.environ.get("STRATA_IMAGE_URL_PRIVATE") or "").strip() == "1":
+    if (envvars.get("IMAGE_URL_PRIVATE") or "").strip() == "1":
         return None
     parts = urlsplit(url)
     host = parts.hostname or ""
@@ -3066,7 +3444,7 @@ class _PublicRedirects(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if (addr := private_url_host(newurl)) is not None:
-            raise ValueError(f"the image URL redirects to a private address ({addr}); STRATA_IMAGE_URL_PRIVATE=1 "
+            raise ValueError(f"the image URL redirects to a private address ({addr}); XESTRATA_IMAGE_URL_PRIVATE=1 "
                              "allows it")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -3094,19 +3472,45 @@ def vision_attempts(cfg: dict) -> list[dict]:
     return out
 
 
-def vision_log_tail(log=None, limit: int = 16384) -> str:
-    """The last `limit` bytes of the encoder's stderr file (`log` is the file object it was started with; "" when there
-    is none or it cannot be read)."""
+def vision_log_size(log=None) -> int:
+    """How long the encoder's stderr file is now (0 when there is none): a start reads only what it wrote after this."""
+    try:
+        name = getattr(log, "name", None)
+        return os.path.getsize(name) if name else 0
+    except (OSError, TypeError):
+        return 0
+
+
+def vision_log_tail(log=None, limit: int = 16384, since: int = 0) -> str:
+    """The last `limit` bytes of the encoder's stderr file (`log` is the file object it started with; "" when there is
+    none or it cannot be read), but nothing from before `since` (the file's size when this start began: a log that
+    several starts share, as the server's does)."""
     try:
         name = getattr(log, "name", None)
         if isinstance(name, (str, bytes, os.PathLike)) and name:  # #6467: open(int) would wrap and close the log fd
             with open(name, "rb") as f:
                 f.seek(0, 2)
-                f.seek(max(0, f.tell() - limit))
+                f.seek(max(since, f.tell() - limit))
                 return f.read().decode("utf-8", "replace")
     except (OSError, ValueError):
         pass
     return ""
+
+
+class VisionNoRoom(RuntimeError):
+    """The picture reader could not start because its card has no room for it (`room`: reader_room.NoRoom)."""
+
+    def __init__(self, message: str, room):
+        super().__init__(message)
+        self.room = room
+
+
+def stray_words(strays) -> str:
+    """The tail of a picture reader's start error: the last lines it printed instead of an answer (a debugger's, a
+    library's), which say what went wrong when the reader's own answer did not come."""
+    if not strays:
+        return ""
+    return " (it also printed on its output: " + " | ".join(x[:120] for x in list(strays)[-3:]) + ")"
 
 
 # What the CUDA / HIP runtimes print when the reader has no code for the card it runs on (a binary built without that
@@ -3116,7 +3520,7 @@ _VISION_ARCH_SIGNS = ("device kernel image is invalid", "no kernel image is avai
 
 
 def vision_start_error(line: str, log=None, code: int | None = None, waited: float | None = None,
-                       strays=()) -> str:
+                       strays=(), since: int = 0) -> str:
     """The message when the image encoder answered something other than READY.  #1445: a card in the Exclusive_Process
     compute mode (or one another process holds) refuses the encoder's CUDA context with "busy or unavailable"; that
     cause is named instead of leaving the user the first line of a traceback.  `log` is the encoder's stderr file, whose
@@ -3125,9 +3529,10 @@ def vision_start_error(line: str, log=None, code: int | None = None, waited: flo
     # last lines of its stderr, its exit status (`code`) and, for a
     kernel-image error, the card/architecture hint come with it.  `waited`: it said nothing for that many seconds.
     `strays` (upstream 4cce1ee4d): lines it printed on its output before it ended that were not an answer (a
-    debugger's, a library's); they are searched for the causes below and named in the message."""
+    debugger's, a library's); they are searched for the causes below and named in the message.  `since`: where this
+    start's lines of the log begin (vision_log_size)."""
     text = line.strip()
-    tail = vision_log_tail(log)
+    tail = vision_log_tail(log, since=since)
     both = (text + chr(10) + chr(10).join(strays) + chr(10) + tail).lower()
     if "busy or unavailable" in both:
         return ("the vision encoder did not start: the GPU refused a second CUDA context (\"CUDA-capable device(s) "
@@ -3172,9 +3577,9 @@ PICTURE_FORMATS = ("JPEG", "PNG", "GIF", "BMP", "WEBP", "TIFF", "AVIF")
 
 
 class Vision:
-    """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
-    lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
-    sends the same picture again (every turn, with most clients) encodes it once.
+    """The resident image encoder: `xestrata-vision` (the engine's vision encoder + the mmproj file, on the GPU or the
+    CPU) reads `ENC <image> <out>` lines and writes each image's embeddings; results are cached by the image's hash,
+    so a conversation that sends the same picture again (every turn, with most clients) encodes it once.
 
     Every wait on it is bounded.  An encoder that stops or stops answering is marked dead: later image requests
     fail with the reason and text requests are unaffected."""
@@ -3190,7 +3595,7 @@ class Vision:
         resort (the encoder's own files are then named relative to it, see `_start`)."""
         for parent in (None, Path.cwd(), Path(os.environ.get("SystemDrive", "C:") + os.sep)):
             try:
-                d = Path(tempfile.mkdtemp(prefix="strata-vision-", dir=parent))
+                d = Path(tempfile.mkdtemp(prefix="xestrata-vision-", dir=parent))
             except OSError:
                 continue                                       # not writable, or no such drive
             if " " not in str(d):
@@ -3199,22 +3604,34 @@ class Vision:
                 d.rmdir()                                      # just created, so still empty
             except OSError:
                 pass
-        return Path(tempfile.mkdtemp(prefix="strata-vision-"))
+        return Path(tempfile.mkdtemp(prefix="xestrata-vision-"))
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
         args = self.reader_args(cfg)
         self.label = vision_label(cfg)
         self.cpu_only = not cfg.get("gpu")              # a CPU reader: its start asks the expert cache for nothing
+        self.gpu_label = self.label
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload (#208)
+        # the processor's reader (setup writes it as the vision section's "fallback"): a GPU reader that does not
+        # start - the card full, a kernel-image error, a card another program holds - reads on the processor instead
+        # of ending the launch, in every mode (resident, lazy, elastic)
+        attempts = vision_attempts(cfg)
+        self.cpu_label = vision_label(attempts[1]) if len(attempts) > 1 else None
+        self.cpu_spawn = (self.reader_args(attempts[1]), log, env) if len(attempts) > 1 else None
+        self.gpu_spawn = self.spawn
+        self.fallback = self.cpu_spawn
+        self.on_cpu = False                             # the processor's reader is what runs
+        self.cpu_note = None                            # why, in the person's words, when the card had no room
+        self.fallback_why = None                        # why the GPU one did not start (the /health "fallback")
         self.proc: subprocess.Popen | None = None
         self.dead: str | None = None
         self.stopped = True                             # until _start: a lazy encoder starts with the model
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
-        # opt-in (the vision section's "elastic": true, with the config's "vram_elastic"): the encoder starts with the
-        # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
-        # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
+        # the vision section's "elastic" (vision_elastic_on: by default with a GPU encoder and an elastic expert cache):
+        # the encoder starts with the first picture and stops after elastic_idle_s without one; while it runs, the
+        # engine's expert cache keeps elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
         self.max_tokens = self.token_limit(cfg)
         self.elastic = cfg.get("elastic") is True
         self.elastic_mib = int(cfg.get("elastic_mib") or 2048)
@@ -3230,6 +3647,12 @@ class Vision:
     # hand-edited or migrated config without vision.max_tokens left the reader unclamped, and #3690 saw one picture
     # become 93,700 image tokens (I7).  A key that is there is the person's: 0 means no limit, as before.
     DEFAULT_MAX_TOKENS = {"gpu": 1024, "cpu": 300}
+    # the fewest image tokens a picture becomes on the GPU reader: below it a small or wide picture shrank to 300 tokens
+    # or so and its text was misread (a receipt of 800 x 400 at 325 tokens, by every Qwen3.x reader and by llama.cpp's
+    # mtmd, which recommends 1,024 for Qwen-VL); at 1,024 it read right, in 1.5 s at most a picture on the B70 and with
+    # the same VRAM (the reader's buffers are sized for its maximum).  The CPU reader keeps its 300 (9-10 s a picture
+    # at 1,024 on a Ryzen 7 5700X with 8 threads, 2.4-2.7 s at 300), and a config's min_tokens sets either
+    DEFAULT_MIN_TOKENS = {"gpu": 1024, "cpu": 0}
 
     @staticmethod
     def token_limit(cfg: dict) -> int:
@@ -3256,9 +3679,22 @@ class Vision:
         limit = Vision.token_limit(cfg)                 # I7 (#3690): a default when the config names none
         if limit:
             args += ["--max-tokens", str(limit)]
-        if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
-            args += ["--min-tokens", str(cfg["min_tokens"])]
+        floor = Vision.token_floor(cfg, limit)
+        if floor:
+            args += ["--min-tokens", str(floor)]
         return args
+
+    @staticmethod
+    def token_floor(cfg: dict, limit) -> int:
+        """The --min-tokens of a reader config (#767: mtmd's image_min_tokens): its min_tokens, else the default of its
+        kind, never above the reader's own limit."""
+        floor = Vision.DEFAULT_MIN_TOKENS["gpu" if cfg.get("gpu") else "cpu"]
+        if cfg.get("min_tokens") is not None:
+            try:
+                floor = max(0, int(cfg["min_tokens"]))
+            except (TypeError, ValueError):
+                pass
+        return min(floor, limit) if limit else floor
 
     def _ensure_dir(self) -> bool:
         """#3370: a temp cleaner (Windows Storage Sense) removes the empty work folder
@@ -3272,73 +3708,189 @@ class Vision:
             return True
         return False
 
+    #: a GPU reader whose start failed the GPU runtime's transient way (TRANSIENT_START_MARKS) is tried again before
+    #: the CPU reader takes over: upstream a95046690's bounds (12 tries, 18 s of budget, 1 s apart).  A reader that
+    #: ends for its own reason (no room, a missing file, the engine's error line) is not retried.
+    START_RETRIES = 12
+    START_RETRY_BUDGET_S = 18.0
+
     def _start(self):
+        """Start the reader; a start that failed the GPU runtime's transient way is tried again (12 tries, 18 s), and a
+        GPU reader that does not start gives way to the processor's (RuntimeError only when nothing starts).  The
+        reason stays in `fallback_why` and, for a full card or any other cause, in `cpu_note`."""
+        t0 = time.monotonic()
+        failure: BaseException | None = None
+        for attempt in range(self.START_RETRIES + 1):
+            log = self.spawn[1] if self.spawn else None
+            since = vision_log_size(log)
+            try:
+                self._start_reader()
+                return
+            except (OSError, RuntimeError) as e:
+                failure = e
+                if isinstance(e, OSError):                 # a reader that is not installed: a retry repeats it
+                    break
+                if self.fallback is None or self.spawn == self.fallback:   # the CPU reader: no GPU runtime to wait for
+                    break
+                spent = time.monotonic() - t0
+                if attempt >= self.START_RETRIES or spent + 1.0 > self.START_RETRY_BUDGET_S:
+                    break
+                # upstream b90d38aa8: only the graphics runtime's own failure is worth a retry (a card that is full, a
+                # missing kernel image, a reader that ends for its own reason are not); in XeStrata that is the ROCm
+                # set-up's transient text the engine's own retry knows (TRANSIENT_START_MARKS)
+                text = str(e) + "\n" + vision_log_tail(log, since=since)
+                if not any(mark in text for mark in TRANSIENT_START_MARKS):
+                    break
+                print(f"[xestrata] the GPU picture reader failed the graphics runtime's way; starting it again in 1 s "
+                      f"(try {attempt + 2} of {self.START_RETRIES + 1})", flush=True)
+                time.sleep(1.0)
+        assert failure is not None
+        if self.fallback is None or self.spawn == self.fallback:
+            raise failure
+        why = " ".join(str(failure).split())[:240]
+        # the person is told the pictures became slow, whatever the cause: the card's size or the reader's own
+        # reason, in the engine's log (the reader's stderr)
+        self.cpu_note = (self._no_room_note(failure.room) if isinstance(failure, VisionNoRoom) else
+                         reader_room.not_started_on_processor(self._spawn_arg("--gpu-pci"),
+                                                              getattr(self.spawn[1], "name", None)))
+        self.fallback_why = why
+        again = " until it is idle" if self.elastic else ""
+        print(f"[xestrata] the GPU picture reader did not start ({why}); pictures are read on the CPU{again}",
+              flush=True)
+        self.spawn, self.fallback, self.on_cpu = self.fallback, None, True
+        self.label = self.cpu_label
+        self._start_reader()
+
+    def _spawn_arg(self, name: str) -> str | None:
+        """The value this start's command line gives `name` (None when it does not name it)."""
+        args = [str(a) for a in self.spawn[0]]
+        return args[args.index(name) + 1] if name in args[:-1] else None
+
+    def _no_room_note(self, room) -> str:
+        """The sentence for the person when the card had no room for the reader and the processor reads instead: the
+        card (by the PCI address the config names), what the reader needs (what its line says, else its mmproj's size)
+        and the card's free memory now that the reader is gone."""
+        card = self._spawn_arg("--gpu-pci")
+        need = room.need_mib or reader_room.weights_mib(self._spawn_arg("--mmproj"))
+        try:
+            from serve.telemetry import free_vram_mib
+            free = free_vram_mib(card)
+        except Exception:                               # noqa: BLE001 - a message is a convenience
+            free = None
+        return reader_room.on_processor(card, need, free)
+
+    def _start_reader(self):
         """Start the encoder process and wait (bounded) for its READY; RuntimeError when it does not come."""
         args, log, env = self.spawn
         self.dead = None
         self._ensure_dir()
+        since = vision_log_size(log)               # this start's own lines of a log that earlier starts wrote too
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
-        self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1,
-                          env=env, cwd=self.dir)
+        try:
+            # errors="replace": a byte that is not UTF-8 must not end the reader either (upstream b3c633868)
+            self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                              bufsize=1, env=env, cwd=self.dir)
+        except OSError as e:
+            # the reason later pictures get too (they got "the picture reader is not running"): a reader that is not
+            # there (a config written for another install, a package that lost it) with its path and the cure
+            self.dead = (f"the picture reader is not installed: {args[0]} is not there - run xestrata --setup to "
+                         "install it again" if isinstance(e, FileNotFoundError) else
+                         f"the picture reader {args[0]} could not start ({e})")
+            raise RuntimeError(self.dead) from e
         self.lines: queue.Queue = queue.Queue()    # its stdout, read on a thread so that a wait can time out
         threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
         strays: list[str] = []
-        line = self._await_ready(VISION_READY_S, strays)
-        if line is None or not line.startswith("READY"):
-            why = ("no answer within %d s" % VISION_READY_S if line == "" else
-                   "it exited" if line is None else line.strip())
-            # upstream c40a03e6: the last lines of its stderr, its exit
-            # status and the kernel-image hint come with the message
-            # an encoder that died by itself has its status already
-            code = self.proc.poll() if line is None and hasattr(self.proc, "poll") else None
+        try:
+            line = self._await_ready(VISION_READY_S, strays)
+        except RuntimeError as e:                  # silent for VISION_READY_S: it was ended, not left half-started
+            self._stop(str(e))
+            message, room = self._start_failure(str(e), strays, log, since, waited=VISION_READY_S)
+            raise (VisionNoRoom(message, room) if room else RuntimeError(message)) from None
+        if line is None or line == "" or not line.startswith("READY"):
+            proc = self.proc
+            code = proc.poll() if proc is not None else None
+            if code is None and proc is not None and (line is None or line == ""):   # output ended: status follows
+                try:
+                    code = proc.wait(timeout=2)
+                except (subprocess.TimeoutExpired, OSError):
+                    code = None
+            why = (f"it exited ({engine_exit_words(code)})" if engine_exit_words(code) else "it exited") \
+                if line is None or line == "" else line.strip()
             self._stop(why)
-            if line is None and code is None:
-                code = getattr(self.proc, "returncode", None)
-            raise RuntimeError(vision_start_error("" if line in (None, "") else line, log, code,
-                                                  waited=VISION_READY_S if line == "" else None, strays=strays))
+            message, room = self._start_failure(why, strays, log, since, "" if line in (None, "") else line, code)
+            raise (VisionNoRoom(message, room) if room else RuntimeError(message))
         self.stopped = False
+
+    def _start_failure(self, said_text: str, strays, log, since: int, line: str = "", code: int | None = None,
+                       waited: float | None = None):
+        """(the error of a start that did not reach READY, the card's no-room report when the reader's own lines say
+        its card was full).  The lines searched are the answer it gave (or its exit), its stray lines and the lines its
+        stderr file gained since this start began (the log is shared with earlier starts and with the engines).
+        Without a no-room report the message is vision_start_error's: `line` the answer it gave ("" for none), `code`
+        its exit status, `waited` the seconds it said nothing for."""
+        said = [said_text, *strays, *vision_log_tail(log, since=since).splitlines()]
+        # a card another process holds (CUDA's "busy or unavailable", #1445) is not a full one: vision_start_error
+        # names the compute mode
+        held = "busy or unavailable" in "\n".join(said).lower()
+        room = None if held else reader_room.find(said)
+        if room:
+            return reader_room.start_error(room, said), room
+        return vision_start_error(line, log, code, waited=waited, strays=strays, since=since), None
 
     #: how long a reader that has already ended may still hold its output pipe open (a debugger attached to it, a
     #: child it started) before the start is judged: the pipe's end does not come, the process's end is what counts
+    # (defaults, so a bare Vision built for a test without __init__ is a reader with no fallback)
+    fallback: tuple | None = None
+    cpu_spawn: tuple | None = None
+    cpu_label: str | None = None
+    on_cpu = False
+    elastic = False
+    cpu_note: str | None = None
+    fallback_why: str | None = None
+
     READY_GRACE_S = 2.0
     #: lines kept from a reader's output before its answer (and written to the log): enough to see what it said
     STRAY_KEEP = 20
 
     def _await_ready(self, timeout: float | None, strays: list) -> str | None:
-        """The reader's answer to its start (upstream 4cce1ee4d): "READY ..." or "ERR ..." (what strata-vision prints on
-        stdout; everything else it says goes to stderr), None when it has ended, "" when `timeout` s (None: for ever)
-        passed without an answer.  Any other line on stdout is a stray line - a debugger a crashing reader started, a
-        library's banner - and not an answer: it is kept in `strays` (the last STRAY_KEEP), written to the log, and the
-        wait goes on with the same one deadline, so a reader that is only printing is never ended for it.  A reader
-        whose process has ended while a debugger or a child still holds its pipe open counts as ended after
-        READY_GRACE_S.  The lines after the answer (the encode answers) stay in `self.lines`."""
+        """The reader's answer to its start: a "READY ..." or "ERR ..." line (its two answers on stdout; everything
+        else it says goes to stderr), None when its output ended, or "" when its process has ended while a debugger
+        or a child still holds the pipe open.  Any other line is a stray line - a debugger a crashing reader started,
+        a library's banner - not an answer: it is kept in `strays` (the last STRAY_KEEP), written to the log, and the
+        wait goes on, so a reader that is only printing is never killed.  The wait has ONE deadline of `timeout` s
+        (None: for ever); on it the reader is killed and the read raises RuntimeError."""
         proc = self.proc
+        if proc is None:
+            return ""
         deadline = None if timeout is None else time.monotonic() + timeout
         ended_at = None
         said = 0
         while True:
             now = time.monotonic()
             if deadline is not None and now >= deadline:
-                return ""
-            try:
-                line = self.lines.get(timeout=0.25 if deadline is None else max(0.01, min(0.25, deadline - now)))
-            except queue.Empty:
-                code = proc.poll() if proc is not None and hasattr(proc, "poll") else None
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                raise RuntimeError(f"it said nothing for {timeout:.0f} s")
+            line = self._line(max(0.01, min(0.25, deadline - now)) if deadline is not None else 0.25)
+            if line is None or line.startswith(("READY", "ERR")):
+                return line
+            if line == "":                                   # nothing yet: has the process ended under the pipe?
+                code = proc.poll() if hasattr(proc, "poll") else None
                 if code is not None:
                     ended_at = now if ended_at is None else ended_at
                     if now - ended_at >= self.READY_GRACE_S:
-                        return None
+                        return ""
                 continue
-            if line is None or line.startswith(("READY", "ERR")):
-                return line
             stray = line.strip()
             if stray:
                 strays.append(stray[:300])
                 del strays[:-self.STRAY_KEEP]
                 said += 1
                 if said <= self.STRAY_KEEP:
-                    print(f"[strata] the image encoder printed on its output, not an answer: {stray[:200]}",
+                    print(f"[xestrata] the picture reader printed on its output, not an answer: {stray[:200]}",
                           flush=True)
 
     def alive(self) -> bool:
@@ -3355,10 +3907,7 @@ class Vision:
         """Start the encoder again after an unload; the cache of encoded images is kept.  RuntimeError when it does
         not start (it is then marked dead, so images are off until the server restarts)."""
         if self.proc is not None:
-            try:
-                self.proc.kill()
-            except OSError:
-                pass
+            end_gpu_process(self.proc)
             self._close_stdin()
         try:
             self._start()
@@ -3367,9 +3916,7 @@ class Vision:
 
     @staticmethod
     def _read(proc, lines):
-        for line in proc.stdout:
-            lines.put(line)
-        lines.put(None)                             # end of output: the encoder exited
+        line_process.pump_lines(proc, lines)
 
     def _line(self, timeout: float | None) -> str | None:
         """Its next line; "" when none came within `timeout` (None: wait for ever), None when it exited."""
@@ -3383,7 +3930,7 @@ class Vision:
         proc = self.proc
         try:
             if proc is not None:
-                proc.kill()
+                end_gpu_process(proc)
                 proc.wait(timeout=10)
         except Exception:
             pass
@@ -3401,7 +3948,7 @@ class Vision:
     def load(source: str) -> bytes:
         if source.startswith("data:"):
             try:
-                return base64.b64decode(source.split(",", 1)[1])
+                return images_api.decode_inline_image(source, strict=False)
             except (IndexError, ValueError) as e:                # no comma, or not base64
                 raise ValueError(f"the image's data: URL could not be read ({e})") from None
         if source.startswith(("http://", "https://")):
@@ -3432,7 +3979,7 @@ class Vision:
     @staticmethod
     def download_public(url: str) -> bytes:
         """#28: a request's image URL, fetched by a running server (Service.public_urls): only from a public address,
-        redirects included, so the server is no proxy into its own network (STRATA_IMAGE_URL_PRIVATE=1 allows it)."""
+        redirects included, so the server is no proxy into its own network (XESTRATA_IMAGE_URL_PRIVATE=1 allows it)."""
         return Vision._fetch(url, True)
 
     @staticmethod
@@ -3441,9 +3988,9 @@ class Vision:
         opener = urllib.request.build_opener(_PublicRedirects) if public else urllib.request.build_opener()
         if public and (addr := private_url_host(url)) is not None:
             raise ValueError(f"the image URL points to a private address ({addr}): the server does not fetch from "
-                             "its own network for a request; STRATA_IMAGE_URL_PRIVATE=1 allows it")
+                             "its own network for a request; XESTRATA_IMAGE_URL_PRIVATE=1 allows it")
         try:
-            with opener.open(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
+            with opener.open(urllib.request.Request(url, headers={"User-Agent": "xestrata"}), timeout=60) as r:
                 size = r.headers.get("Content-Length") or ""
                 if size.isdigit() and int(size) > IMAGE_URL_MAX:
                     raise ValueError(too_big)
@@ -3468,11 +4015,14 @@ class Vision:
 
     @staticmethod
     def normalize(data: bytes, keep_alpha: bool = False, *, force: bool = False) -> bytes:
-        """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG.
+        """The formats xestrata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG (JPEG
+        XL by libjxl's djxl, the rest by Pillow).
         A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow).  `keep_alpha` (an image
         edit's reference: the image model reads the alpha): a transparent image stays RGBA, else it goes on white.
         `force` (upstream 91fb63284): converted to PNG whatever the format, for a file the reader's decoder refused
         (a JPEG or PNG variant stb_image does not read)."""
+        if images_api.is_jxl(data):                       # JPEG XL (this server's jxl output sent back): djxl's PNG
+            data = images_api.decode_jxl(data)
         jpeg = data[:3] == b"\xff\xd8\xff"
         if not force and ((jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n"
                           or data[:2] == b"BM" or data[:6] in (b"GIF87a", b"GIF89a")):
@@ -3537,6 +4087,25 @@ class Vision:
             out.append(self.encode(src, keep=[p for p, _ in out]))
         return out
 
+    def use_cpu(self) -> bool:
+        """The next start is the CPU reader's (the card has no room for the GPU one): False when there is no CPU reader.
+        Upstream 9f0794e99's use_cpu."""
+        if self.fallback is None:
+            return False
+        self.spawn, self.fallback, self.on_cpu = self.fallback, None, True
+        return True
+
+    def all_cached(self, sources: list) -> bool:
+        """Every picture of `sources` was encoded already (a conversation sends its pictures with each turn): no reader
+        has to start for them.  Upstream 9f0794e99.  False on any error (encode() then says what is wrong)."""
+        try:
+            with self.lock:
+                self._ensure_dir()
+                return all(hashlib.sha256(self.normalize(src if isinstance(src, bytes) else self.load(src)))
+                           .hexdigest()[:32] in self.cache for src in sources)
+        except (ValueError, OSError):
+            return False
+
     def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
         `keep`: files the caller still needs (never evicted by this call)."""
@@ -3600,33 +4169,325 @@ class Vision:
     def warn_if_over_limit(self, tokens: int) -> None:
         """I7: one picture that became more than 4 times the limit is logged with the numbers, so the next report has
         them (the reader's own stderr has the warm-up line).  A reader built before the limit was enforced inside it
-        (strata-vision refuses these now) still lets them by."""
+        (xestrata-vision refuses these now) still lets them by."""
         limit = getattr(self, "max_tokens", 0)
         if limit and tokens > 4 * limit:
-            print(f"[strata] images: one picture became {tokens} image tokens, more than 4 times the limit of {limit} "
-                  "(vision.max_tokens); the picture reader is not applying its limit. Update the engine, and send the "
-                  "line 'strata-vision: warmed up at N image tokens' from the reader's log with the report", flush=True)
+            print(f"[xestrata] images: one picture became {tokens} image tokens, more than 4 times the limit of "
+                  f"{limit} (vision.max_tokens); the picture reader is not applying its limit. Update the engine, and "
+                  "send the line 'xestrata-vision: warmed up at N image tokens' from the reader's log with the report",
+                  flush=True)
 
     def _end(self):
-        if self.proc.poll() is None:
-            try:
-                self.proc.stdin.write("QUIT\n")
-                self.proc.stdin.flush()
-                self.proc.wait(timeout=10)
-            except Exception:
-                self.proc.kill()
+        line_process.shutdown(self.proc, 10, 10)
         self._close_stdin()
 
     def close(self):
         if self.proc is not None:
             self._end()
         self.stopped = True
+        if self.elastic and self.on_cpu:                # the next start tries the card again
+            self.spawn, self.fallback, self.on_cpu = self.gpu_spawn, self.cpu_spawn, False
+            self.label = self.gpu_label
+            self.cpu_note = None
 
     def shutdown(self):
         """#914: close() for good: the server ends, so the encoder's directory (the pictures, their embeddings and the
         requests' combined files) goes with it.  unload() keeps it for the restart."""
         self.close()
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+class Translation:
+    """The translation model's engine (serve/translate.py's MODELS; the config's "translate" section): the text
+    engine's program on the model's GGUF (`xestrata-engine --serve`, the same StrataEngine), started with the first
+    translation and stopped after idle_s without one.  One translation at a time, on a lock of its own: the text
+    model's engine and its FIFO are not touched.  Its card (translation_env): "auto", the image jobs' (where the
+    config has images) or else the text model's; "same", the text model's; "cpu"; or a GPU's PCI address, separate
+    from the text model's where no text engine takes it, and the text model's helper card handed over (HELPER off,
+    the borrowers counted with the image jobs') while the engine runs there.  On a GPU the engine puts the blocks the
+    free VRAM does not hold on the CPU.
+
+    The GPU's VRAM is shared with the image engine through the GPU's ledger (serve/vram_ledger.py, the image jobs'
+    GPU key): the engine starts with at most the ledger's room (--vram-free-mib; its blocks past it on the CPU) and
+    its weights are entered for it.  An engine started with blocks on the CPU for want of room is started again, all
+    on the GPU, before a translation that finds the room back (an image job ended): the move between requests, not
+    within one (2026-11-09, the user's choice).  When an image job holds the room and says when it ends (its ledger
+    entry's `until`), a translation waits for it where that ends sooner than translating with the blocks on the CPU
+    would (wait_or_split)."""
+
+    # Before the speeds are measured, a translation waits for an image job ending within this many seconds, else
+    # makes do with the room left
+    WAIT_UNMEASURED_S = 10.0
+
+    def __init__(self, cfg: dict, exe: str, log_path: str | None, env: dict | None, svc=None, helper_card: str = ""):
+        model = translate_mod.model_for(cfg.get("model"))
+        if model is None:
+            raise ValueError(f"translate.model: {cfg.get('model')!r} is not a translation model "
+                             f"({', '.join(translate_mod.MODELS)})")
+        self.model = model
+        self.path = str(cfg.get("path") or "")
+        if not os.path.isfile(self.path):
+            raise ValueError(f"translate.path: {self.path!r} is not a file")
+        self.exe = str(cfg.get("exe") or exe)
+        self.gpu = str(cfg.get("gpu") or "auto")
+        self.max_context = int(cfg.get("max_context") or 8192)
+        self.idle_s = float(cfg.get("idle_s") or 600)
+        self.threads = int(cfg.get("threads") or 0)
+        self.log_path, self.env = log_path, env
+        self.svc, self.helper_card = svc, helper_card
+        self.helper_lock = threading.Lock()              # the helper's borrowers, where no image models count them
+        self.helper_jobs = 0
+        self.borrowed = False
+        self.lock = threading.Lock()                     # one translation at a time
+        self.engine: StrataEngine | None = None
+        self.tok = None
+        self.eos: set = set()
+        self.last_used = 0.0
+        self.error: str | None = None                    # the last start's failure (status)
+        self.ledger: vram_ledger.Ledger | None = None
+        self.entry: str | None = None                    # the engine's ledger entry
+        self.entry_mib = 0
+        self.partial = False                             # started with blocks on the CPU for want of room
+        self.rates: dict = {"whole": None, "part": None}   # tokens a second (read and written), measured
+        idle_watch.watch.add(min(30.0, max(1.0, self.idle_s / 4)), self._idle_stop, repeat=True)
+
+    def args(self) -> list:
+        # no conversation cache: a translation is one request, never continued (the engine sized 8 GiB of RAM for it)
+        args = ["--native", self.path, "--max-context", str(self.max_context), "--conversation-cache-mib", "0"]
+        if self.gpu == "cpu":
+            args += ["--device", "cpu"]
+        if self.threads > 0:
+            args += ["--cpu-threads", str(self.threads)]
+        return args
+
+    def status(self) -> dict:
+        return {"model": self.model.id, "loaded": self.engine is not None and self.engine.alive(),
+                "gpu": self.gpu, "partial": self.partial, "error": self.error}
+
+    def need_mib(self) -> int:
+        """The VRAM the whole model takes on a GPU: its weights, a reserve for its K/V, buffers and the runtime."""
+        return self.model.file_mib + 1024
+
+    def _room_back(self) -> bool:
+        """Whether an engine started short of room would now have the room for the whole model."""
+        if not self.partial or self.ledger is None:
+            return False
+        room = self.ledger.room(None)
+        return room is None or room + self.entry_mib >= self.need_mib()
+
+    def _stop(self) -> None:
+        """The engine ended and its ledger entry given back (the caller holds the lock)."""
+        if self.ledger is not None and self.entry is not None:
+            self.ledger.releasing(self.entry)
+        if self.engine is not None:
+            with contextlib.suppress(EngineStuck):
+                self.engine.close()
+        self.engine = None
+        if self.ledger is not None and self.entry is not None:
+            self.ledger.remove(self.entry)
+        self.entry, self.entry_mib, self.partial = None, 0, False
+        if self.borrowed:
+            self.borrowed = False
+            images_api.helper_return_later(self.svc, self._helper_holder(), self._say)
+
+    def _env(self) -> dict:
+        return dict(self.env or os.environ)
+
+    def _ledger(self) -> vram_ledger.Ledger:
+        env = self._env()
+        pci = envvars.get("GPU_PCI", env=env)
+        total = None
+        # Without a PCI address, a runtime selector may make its first GPU differ from telemetry's first GPU.
+        selectors = ("CUDA_VISIBLE_DEVICES", "ONEAPI_DEVICE_SELECTOR", "HIP_VISIBLE_DEVICES", "ZE_AFFINITY_MASK")
+        if pci or not any(env.get(name) for name in selectors):
+            try:
+                from serve.telemetry import total_vram_mib
+                total = total_vram_mib(pci)
+            except (OSError, ValueError):
+                pass
+        limit = envvars.get("VRAM_LIMIT_MIB", env=env)
+        if total is not None and limit:
+            try:
+                limit_mib = int(limit)
+                if limit_mib > 0:
+                    total = min(total, limit_mib)
+            except ValueError:
+                pass
+        return vram_ledger.Ledger(images_api.gpu_key(env), total_mib=total or 0)
+
+    def _say(self, words: str) -> None:
+        print(f"[xestrata] translation: {words}", flush=True)
+
+    def _helper_holder(self):
+        images = getattr(self.svc, "images", None)
+        return images if images is not None else self
+
+    def _tokenizer(self):
+        if self.tok is None:
+            from strata_plamo import PlamoTokenizer
+            self.tok = PlamoTokenizer.from_gguf(self.path)
+            self.eos = stop_token_ids(self.tok)
+        return self.tok
+
+    def wait_or_split(self, tokens: int, cancel: threading.Event) -> None:
+        """Before a start short of room (the caller holds the lock): where image jobs hold the room and say when they
+        end, wait for them if that and translating `tokens` (read and written) on the GPU end sooner than translating
+        them with the blocks on the CPU now, at the speeds measured (before they are, a wait of WAIT_UNMEASURED_S at
+        most).  An image engine idle on the card, kept warm after its job, is asked to let go of its VRAM."""
+        if self.gpu == "cpu" or (self.engine is not None and self.engine.alive() and not self.partial):
+            return
+        led = self._ledger()
+        need = self.need_mib()
+        room = led.room(None)
+        own = self.entry_mib if self.engine is not None and self.engine.alive() else 0
+        if room is None or room + own >= need:
+            return
+        now = time.time()
+        ends = [float(e["until"]) for e in led.entries() if e.get("purpose") == "image" and e.get("until")]
+        imgs = self._images()
+        if ends:
+            wait = max(0.0, max(ends) - now)
+            whole, part = self.rates["whole"], self.rates["part"]
+            if whole and part:
+                go = wait + tokens / whole < tokens / part
+            else:
+                go = wait <= self.WAIT_UNMEASURED_S
+            if not go:
+                return
+            print(f"[xestrata] translation: waiting {wait:.0f} s for an image job to give the GPU's room back",
+                  flush=True)
+            deadline = time.monotonic() + wait + 30.0
+            while time.monotonic() < deadline and not cancel.is_set():
+                r = led.room(None)
+                if r is None or r + own >= need:
+                    return
+                if imgs is not None and not imgs.busy():
+                    break
+                time.sleep(0.5)
+        # an image engine idle on the card, kept warm after its job, holds the room: it lets go of it
+        if imgs is not None and not imgs.busy() and not cancel.is_set():
+            try:
+                imgs.make_room(cancel)
+            except images_api.ImageJobFailed:
+                pass
+
+    def _images(self):
+        """The server's image models when their engines run on this engine's card, else None."""
+        imgs = getattr(self.svc, "images", None) if self.svc is not None else None
+        if not isinstance(imgs, images_api.ImageModels):
+            return None
+        same = images_api.gpu_key(imgs.default.engine.env) == images_api.gpu_key(self._env())
+        return imgs if same else None
+
+    def _start(self) -> None:
+        """The tokenizer and the engine (the caller holds the lock); RuntimeError with the reason when it fails."""
+        self._tokenizer()
+        if self.engine is not None and self.engine.alive():
+            if not self._room_back():
+                return
+            print("[xestrata] translation: the GPU has room for the whole model again, starting it there", flush=True)
+            self._stop()
+        elif self.engine is not None:
+            self._stop()                                 # it ended: its entry goes
+        env = self._env()
+        args = self.args()
+        need, cap = self.need_mib(), None
+        if self.helper_card and self.svc is not None:   # the text model's helper card: closed while the engine runs
+            self.borrowed = images_api.helper_borrow(self.svc, self.helper_card, self._helper_holder(), self._say,
+                                                     card_env=env)
+        if self.gpu != "cpu":
+            self.ledger = self._ledger()
+            cap = self.ledger.room(None)
+            if cap is not None:
+                args += ["--vram-free-mib", str(cap)]
+            self.entry_mib = need if cap is None else min(need, cap)
+            self.entry = self.ledger.reserve(self.entry_mib, "translation", None)
+            self.partial = cap is not None and cap < need
+        print(f"[xestrata] translation: starting {self.model.name} ({self.gpu}"
+              + (f", {cap} MiB of VRAM for it" if cap is not None else "") + ") ...", flush=True)
+        try:
+            self.engine = StrataEngine(self.exe, args, log=self.log_path, env=env)
+        except (OSError, RuntimeError, EngineDied) as e:
+            self.engine = None
+            self._stop()
+            self.error = str(e)
+            raise RuntimeError(f"the translation model did not start: {e}") from None
+        if self.ledger is not None and self.entry is not None and self.engine.proc is not None:
+            self.ledger.allocated(self.entry, pid=self.engine.proc.pid)
+        self.engine.eos_ids = self.eos
+        self.error = None
+
+    def _idle_stop(self) -> None:
+        if self.engine is None or time.time() - self.last_used < self.idle_s:
+            return
+        if self.lock.acquire(blocking=False):
+            try:
+                if self.engine is not None and time.time() - self.last_used >= self.idle_s:
+                    print("[xestrata] translation: the model is idle, stopping it", flush=True)
+                    self._stop()
+            finally:
+                self.lock.release()
+
+    def complete(self, prompts: list) -> list:
+        """Translate for the APIs that return the text alone: a cut-off translation is an error, not an answer.
+        With no caller's max_tokens the budget is what the context leaves, which can be shorter than the text; the
+        APIs here have no finish_reason to tell the client, so refuse instead of returning half a translation.
+        ValueError, answered 413/400 by the DeepL/LibreTranslate routes and by the translation tool."""
+        got = self.translate(prompts)
+        for r in got:
+            if r["finish_reason"] == "length":
+                raise ValueError(f"the text is {r['prompt_tokens']} tokens; the translation model's context leaves "
+                                 f"no room for the whole translation; send a shorter text")
+        return [r["text"] for r in got]
+
+    def translate(self, prompts: list, sampling: dict | None = None, max_tokens: int | None = None,
+                  cancel: threading.Event | None = None, on_text=None) -> list:
+        """Each of `prompts` (PFML3 texts, the model's own) translated, in order: {"text", "prompt_tokens",
+        "completion_tokens", "finish_reason" (stop or length)}.  on_text(i, delta): each prompt's text as it comes (a
+        stream).  RuntimeError when the model cannot start, EngineDied when it ends meanwhile, ValueError for a text
+        past the context."""
+        cancel = cancel or threading.Event()
+        out: list = []
+        with self.lock:
+            tok = self._tokenizer()
+            all_ids = [tok.encode(p, parse_special=True) for p in prompts]
+            self.wait_or_split(2 * sum(len(x) for x in all_ids), cancel)
+            self._start()
+            assert self.engine is not None and self.tok is not None
+            t0, done_tokens = time.monotonic(), 0
+            for i, ids in enumerate(all_ids):
+                room = self.max_context - CTX_SLACK - len(ids)
+                if room < 1:
+                    raise ValueError(f"the text is {len(ids)} tokens, more than the translation model's context "
+                                     f"({self.max_context})")
+                want = min(int(max_tokens if max_tokens else 2 * len(ids) + 64), room)
+                toks: list = []
+                shown = ""
+                finish = "length"
+                for t in self.engine.generate(ids, want, sampling or {}, cancel):
+                    if t is None:
+                        continue
+                    if t in self.eos:
+                        finish = "stop"
+                        break
+                    toks.append(t)
+                    if on_text is not None:
+                        text = self.tok.decode(toks, errors="ignore")
+                        if len(text) > len(shown):
+                            on_text(i, text[len(shown):])
+                            shown = text
+                if finish == "length" and len(toks) < want:
+                    finish = "stop"                      # the engine ended at its own end-of-text
+                out.append({"text": self.tok.decode(toks), "prompt_tokens": len(ids), "completion_tokens": len(toks),
+                            "finish_reason": finish})
+                done_tokens += len(ids) + len(toks)
+                self.last_used = time.time()
+            took = time.monotonic() - t0
+            if took > 0.05 and done_tokens:
+                kind = "part" if self.partial else "whole"
+                was = self.rates[kind]
+                self.rates[kind] = done_tokens / took if was is None else (was + done_tokens / took) / 2
+        return out
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -3656,10 +4517,10 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
         known = False
     role = tok.encode("system", parse_special=True)
     if not known or len(role) != 1:
-        print("[strata] effort_position \"end\" needs an engine that knows --tail-role-token (build it again): the "
+        print("[xestrata] effort_position \"end\" needs an engine that knows --tail-role-token (build it again): the "
               "reasoning effort stays at the top of the prompt", flush=True)
         return None
-    print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
+    print("[xestrata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
           "changing it keeps the cached conversation", flush=True)
     return ["--tail-role-token", str(role[0])]
 
@@ -3712,12 +4573,41 @@ def layer_split_value(cfg: dict) -> str:
     return ",".join(str(x) for x in vals)
 
 
+def vram_elastic_on(cfg: dict) -> bool:
+    """#533: the expert cache in segments it gives back and maps again (--vram-elastic): the config's "vram_elastic",
+    else on when something borrows the VRAM between requests - image generation, or a GPU vision encoder.  The engine
+    keeps one allocation where it cannot (a runtime without virtual memory, a layer split, the resident low-RAM
+    mode).
+    XeStrata-890M: on an integrated GPU (a KFD node that reports CPU cores) it stays off unless the config says
+    "vram_elastic": true, and with it the encoder that starts with the first picture (vision_elastic_on): the fork's
+    decode is measured and tuned with one allocation (main() turns the autotune's choice off there as well)."""
+    v = cfg.get("vram_elastic")
+    if isinstance(v, bool):
+        return v
+    if hip_igpu_present():
+        return False
+    vision = cfg.get("vision")
+    return isinstance(cfg.get("images"), dict) or (isinstance(vision, dict) and vision.get("gpu") is True)
+
+
+def vision_elastic_on(cfg: dict) -> bool:
+    """Upstream ca41a6b9: a GPU vision encoder started with the first picture (and stopped when none came for a while)
+    instead of with the model - the section's "elastic", else on with a GPU encoder and an elastic expert cache."""
+    vision = cfg.get("vision")
+    if not isinstance(vision, dict):
+        return False
+    v = vision.get("elastic")
+    return v if isinstance(v, bool) else vision.get("gpu") is True and vram_elastic_on(cfg)
+
+
 def engine_args(cfg: dict, exe: str | None = None) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
     layer_split_value).  `exe`: the engine program, asked what it can do where the arguments depend on it."""
-    if inkling2mini_kind.is_inkling2mini(cfg):         # the Inkling-2-Mini engine takes its own flags
+    if inkling2mini_kind.is_inkling2mini(cfg):         # the fork's Inkling-2-Mini engine takes its own flags
         return inkling2mini_kind.engine_args(cfg, exe, announce=exe is not None)
+    if inkling_kind.is_inkling(cfg):                  # Inkling-2-Mini's engine takes its own options
+        return inkling_kind.engine_args(cfg)
     args = list(cfg["args"])
     # #1322: a config with a "vision" section but without --vision in its args (written by an older setup run, or edited
     # by hand) advertised images and then refused every picture ("this engine was started without --vision").  The
@@ -3729,65 +4619,179 @@ def engine_args(cfg: dict, exe: str | None = None) -> list[str]:
         if cfg["vision"].get("gpu") and "--vram-reserve-mib" not in args:
             args += ["--vram-reserve-mib", "700"]
             note += " and --vram-reserve-mib 700"
-        print(f'[strata] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
+        print(f'[xestrata] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
               "--vision to write them)", flush=True)
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
         args += ["--layer-split", layer_split_value(cfg)]
-    # the Xe engine's layer split (setup --gpus): the later GPUs by PCI address; STRATA_LAYER_SPLIT=off (setup --gpu N
+    # the Xe engine's layer split (setup --gpus): the later GPUs by PCI address; XESTRATA_LAYER_SPLIT=off (setup --gpu N
     # for one start) runs on the first card alone
-    if cfg.get("split_pci") and "--layer-split" not in args and os.environ.get("STRATA_LAYER_SPLIT") != "off":
+    if cfg.get("split_pci") and "--layer-split" not in args and envvars.get("LAYER_SPLIT") != "off":
         args += ["--layer-split", layer_split_value(cfg), "--split-device", ",".join(cfg["split_pci"])]
         # "gpu_order": "as_given": the auto split keeps the cards in the config's order (upstream be8db787)
         if cfg.get("gpu_order") == "as_given" and "--split-order" not in args:
             args += ["--split-order", "as-given"]
+        # "split_skip_if_fits": true (opt-in, upstream 18ad40c0d): the first card alone when it holds every profiled
+        # expert with the KV
+        if cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
+            args.append("--split-skip-if-fits")
+        # the image jobs on a later card of the text model's (image_helper_card): that card is a helper expert cache
+        # or none, never a stage - the server closes a helper for each image job and opens it again after
+        if image_helper_card(cfg) and "--split-roles" not in args:
+            args += ["--split-roles", "helper"]
     if "coupled_draft" in cfg and "--coupled-draft" not in args and "--no-coupled-draft" not in args:
         args += ["--coupled-draft" if cfg["coupled_draft"] else "--no-coupled-draft"]
-    # #533 (opt-in): "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
-    # programs and take it back; "vram_segment_mib" sets the segment size (the engine's default: 512)
-    if cfg.get("vram_elastic") is True and "--vram-elastic" not in args:
+    # "drafting": which drafter proposes (setup writes it).  auto loads both the MTP and DFlash2 and each request
+    # picks (the draft= key, else the engine's --draft-rule learn); dflash2 the DFlash2 pack alone; mtp/off as before.
+    drafting = cfg.get("drafting")
+    if drafting in ("auto", "mtp", "dflash2", "off") and "--draft" not in args:
+        args += ["--draft", drafting]
+        if drafting in ("auto", "dflash2") and cfg.get("draft_model") and "--draft-model" not in args:
+            args += ["--draft-model", str(cfg["draft_model"])]
+        if cfg.get("draft_rule") and "--draft-rule" not in args:
+            args += ["--draft-rule", str(cfg["draft_rule"])]
+    # "wide_window": "auto" (the engine's default), "off" or "on" - verify and batch windows of up to 16 rows
+    # (--wide-window; auto takes them where a run's drafter measures them or a batch has more than 8 slots)
+    wide = cfg.get("wide_window")
+    if wide in ("auto", "off", "on") and "--wide-window" not in args:
+        args += ["--wide-window", wide]
+    # #533: the expert cache in segments (vram_elastic_on), so an image job, a vision encoder that starts with its
+    # picture and POST /v1/vram can take VRAM and give it back; "vram_segment_mib" sets the segment size (the engine's
+    # default: 512)
+    if vram_elastic_on(cfg) and "--vram-elastic" not in args:
         args.append("--vram-elastic")
         seg = cfg.get("vram_segment_mib")
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
+    # upstream 73ed39ae: a conversation save that its RAM check refuses (an image job's unload, when the RAM is short)
+    # first lets the caches it can build again go; "session_save_reclaim": false keeps the refusal
+    if cfg.get("session_save_reclaim") is not False and "--session-save-reclaim" not in args:
+        args.append("--session-save-reclaim")
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
-    return conversation_save_args(cfg, learned_profile_args(cfg, args))
+    args = conversation_save_args(cfg, learned_profile_args(cfg, conversation_cache_args(cfg, args)))
+    return draft_costs_args(cfg, args)
 
 
-PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
+def conversation_cache_args(cfg: dict, args: list[str]) -> list[str]:
+    """"conversation_cache_mib" in the config: the RAM budget of the engine's parked conversations, in MiB (0 turns
+    them off).  Absent or "auto": the engine sizes it from the RAM free once the model is loaded - its own rule, the
+    same in both engines (core's auto_conversation_cache_mib), which knows what the load left.  An engine argument of
+    the config's own wins."""
+    v = cfg.get("conversation_cache_mib")
+    if v is None or v == autotune.AUTO or "--conversation-cache-mib" in args[:-1]:
+        return args
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        print(f'[xestrata] "conversation_cache_mib" must be a number of MiB (0 turns it off) or "auto", not {v!r}: the '
+              "engine sizes it", flush=True)
+        return args
+    return args + ["--conversation-cache-mib", str(v)]
+
+
+PARALLEL_MAX = 16     # the engine's batch window holds at most 16 rows (kWindowMaxT); --batch-mtp waves more through it
+PARALLEL_NARROW = 8   # ... and 8 (kVerifyNarrowT) when its wide windows are off
+
+
+def parallel_cap(args: list[str]) -> int:
+    """The most requests the engine's batch window takes together: 8 when the run's wide windows are off (the engine's
+    --wide-window off / 0, else XESTRATA_WIDE_WINDOW read as the engine reads it: a number that is 0), else 16.  The
+    config's "wide_window" is in `args` by now (engine_args adds --wide-window before the batch slots)."""
+    if "--wide-window" in args[:-1]:
+        return PARALLEL_NARROW if args[args.index("--wide-window") + 1] in ("off", "0") else PARALLEL_MAX
+    env = envvars.get("WIDE_WINDOW", "").strip()
+    if env in ("", "auto"):
+        return PARALLEL_MAX
+    m = re.match(r"[+-]?\d+", env)
+    return PARALLEL_MAX if m and int(m.group()) != 0 else PARALLEL_NARROW
 
 
 def parallel_args(cfg: dict, args: list[str]) -> list[str]:
-    """#465 (opt-in): "parallel": N in the config - up to N requests decode together in the engine's batch slots
-    (--batch N); more wait their turn.  1 or absent: one request at a time, as before.  A value the engine cannot use
-    is said and passed on: the engine warns and adjusts (recommend, never force)."""
-    if "--batch" in args or "--slots" in args:
-        return []
-    n = cfg.get("parallel")
-    if n is None or n is False:
-        return []
-    if isinstance(n, bool) or not isinstance(n, int):
-        print(f'[strata] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
-              flush=True)
-        return []
-    if n <= 1:
-        return []
-    # --batch-mtp is on by default with --mtp (the engine's --no-batch-mtp / STRATA_BATCH_MTP=0 turn it off)
-    env = os.environ.get("STRATA_BATCH_MTP", "")
-    batch_mtp = "--batch-mtp" in args or env not in ("", "0") or (
-        "--mtp" in args and "--no-batch-mtp" not in args and env != "0")
-    if n > PARALLEL_MAX and not batch_mtp:
-        print(f'[strata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
-              f"{PARALLEL_MAX}", flush=True)
-    return ["--batch", str(n)]
+    """The engine's batch slots: "parallel": N in the config - up to N requests decode together (--batch N); more wait
+    their turn.  1, false or absent: one request at a time, as before.  The server fills "parallel" in from the
+    machine before the engine starts (serve/autotune.py: "auto" is the default), so an "auto" still here was not
+    resolved by its caller and runs one at a time.  "batch_groups": a number, or "auto" for the engine's own choice of
+    groups over a layer split's stages (the engine knows the slots that fit).  A value the engine cannot use is said
+    and passed on: the engine warns and adjusts (recommend, never force)."""
+    out: list[str] = []
+    if "--batch" not in args and "--slots" not in args:
+        n = cfg.get("parallel")
+        if isinstance(n, bool) or n == autotune.AUTO:
+            n = None
+        elif n is not None and not isinstance(n, int):
+            print(f'[xestrata] "parallel" must be a whole number of requests (2..{parallel_cap(args)}), not {n!r}: '
+                  "ignored", flush=True)
+            n = None
+        if isinstance(n, int) and n >= 2:
+            # --batch-mtp is on by default with --mtp (the engine's --no-batch-mtp / XESTRATA_BATCH_MTP=0 turn it off)
+            env = envvars.get("BATCH_MTP", "")
+            batch_mtp = "--batch-mtp" in args or env not in ("", "0") or (
+                "--mtp" in args and "--no-batch-mtp" not in args and env != "0")
+            cap = parallel_cap(args)
+            if n > cap and not batch_mtp:
+                print(f'[xestrata] "parallel": {n} - the engine runs at most {cap} requests together; it '
+                      f"will use {cap}", flush=True)
+            out += ["--batch", str(n)]
+    g = cfg.get("batch_groups")
+    if "--batch-groups" not in args and (g == autotune.AUTO or (
+            isinstance(g, int) and not isinstance(g, bool) and g >= 1)):
+        out += ["--batch-groups", str(g)]
+    return out
+
+
+_engine_texts: dict = {}
+
+
+def engine_has_text(exe: str, needle: bytes) -> bool | None:
+    """Does the engine program contain `needle` (an option it knows)?  None when it cannot be read.  Read once per
+    path, size and time (upstream bb21ee1f5)."""
+    import mmap
+    try:
+        st = os.stat(exe)
+    except (OSError, ValueError):
+        return None
+    key = (exe, st.st_size, st.st_mtime_ns, needle)
+    if key not in _engine_texts:
+        try:
+            with open(exe, "rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                _engine_texts[key] = data.find(needle) >= 0
+        except (OSError, ValueError):
+            _engine_texts[key] = None
+    return _engine_texts[key]
+
+
+def draft_costs_args(cfg: dict, args: list[str]) -> list[str]:
+    """"draft_costs": true in the config (opt-in, upstream 4c999bcde .. 1b11a76e8) has the engine fix its draft
+    windows' costs to a table built on this computer from its own requests (--draft-costs): the same request then gives
+    the same windows on every start.  Off by default on every GPU: upstream turned it on for Metal alone, having
+    measured the table below live costs on CUDA (code and chat 1.5% slower), and XeStrata has no Metal.  The table is
+    draft-costs/<model>-<hash of every engine argument>.costs in the engine's folder (the config's "cwd"), or in
+    XESTRATA_DRAFT_COSTS_DIR; --draft-costs-key adds the engine file's size, so a new engine builds its table again
+    (the engine itself checks the devices, the driver and the model).  An engine seen without the option is not given
+    it."""
+    if cfg.get("draft_costs") is not True or "--draft-costs" in args:
+        return args
+    exe = os.path.join(cfg.get("cwd") or ".", str(cfg["exe"])) if cfg.get("exe") else None
+    if exe and engine_has_text(exe, b"--draft-costs") is False:
+        return args
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(cfg.get("model_name") or "model"))[:64]
+    digest = hashlib.sha256("\0".join(map(str, args)).encode("utf-8", "replace")).hexdigest()[:12]
+    folder = envvars.get("DRAFT_COSTS_DIR") or "draft-costs"
+    out = args + ["--draft-costs", os.path.join(folder, f"{name}-{digest}.costs")]
+    try:
+        size = os.path.getsize(exe) if exe else 0
+    except OSError:
+        size = 0
+    if size:
+        out += ["--draft-costs-key", f"engine file {size} bytes"]
+    return out
 
 
 def conversation_save_args(cfg: dict, args: list[str]) -> list[str]:
-    """Opt-in: "conversation_save": "<folder>" in the config has the engine keep its parked conversations there
-    across restarts (it needs --conversation-cache-mib in "args"), with "conversation_save_checkpoints",
-    "conversation_save_mib" and "conversation_save_hours" (whole numbers >= 0) for the engine's defaults, and
-    "conversation_save_compress" (true: an engine built with libblosc2 compresses the files).  A relative
-    path is the engine's (the config's "cwd").  Without the key, the arguments are the config's, unchanged."""
+    """"conversation_save": "<folder>" in the config (setup writes one for each model, setup.py's
+    conversation_save_default) has the engine keep the conversations its RAM cache lets go there, and across
+    restarts, with "conversation_save_checkpoints", "conversation_save_mib" and "conversation_save_hours" (whole
+    numbers >= 0) for the engine's defaults, and "conversation_save_compress" (true: an engine built with libblosc2
+    compresses the files).  A relative path is the engine's (the config's "cwd").  Without the key, or with false,
+    the arguments are the config's, unchanged."""
     folder = cfg.get("conversation_save")
     if not isinstance(folder, str) or not folder.strip() or "--conversation-save" in args:
         return args
@@ -3830,9 +4834,8 @@ def pool_cores_args(cfg: dict, args: list[str]) -> list[str]:
     else:
         text = ""
     if not _POOL_CORES_OK.match(text):
-        print(f'[strata] "pool_cores" must be logical processor numbers like "0,2,4,6" or "2-14:2", not {value!r}: '
-              'ignored '
-              "(the CPU workers keep their default placement)", flush=True)
+        print(f'[xestrata] "pool_cores" must be logical processor numbers like "0,2,4,6" or "2-14:2", not {value!r}: '
+              "ignored (the CPU workers keep their default placement)", flush=True)
         return []
     return ["--pool-cores", text]
 
@@ -3853,12 +4856,19 @@ def profile_shape(path: str) -> tuple[int, int] | None:
 
 
 def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
-    """#477 (opt-in): "expert_profile_save": "<path>" in the config has the engine save what its adaptive
-    tier learned there - on QUIT and every "expert_profile_save_every" minutes (10 by default, 0 = at QUIT only) -
-    and the next start begins from it instead of the config's --expert-profile, when it is a profile of the same
-    model (its header's layers and experts match); otherwise from the config's own, as before.  A relative path is
-    the engine's (the config's "cwd").  Without the key, the arguments are the config's, unchanged."""
+    """#477: "expert_profile_save": "<path>" in the config has the engine save what its adaptive tier learned there -
+    on QUIT and every "expert_profile_save_every" minutes (10 by default, 0 = at QUIT only) - and the next start
+    begins from it instead of the config's --expert-profile, when it is a profile of the same model (its header's
+    layers and experts match); otherwise from the config's own, as before.  A relative path is the engine's (the
+    config's "cwd").  Without the key, expert-profile-<model>.bin there, for a config with an --expert-profile;
+    "expert_profile_save": false keeps the config's arguments as they are."""
     save = cfg.get("expert_profile_save")
+    if save is None and "--expert-profile" in args[:-1]:
+        # under the model's name, or the one an earlier name (its aliases: setup's names before 2026-11-09) saved
+        files = ["expert-profile-" + re.sub(r"[^\w.-]", "_", str(x)) + ".bin"
+                 for x in [cfg.get("model_name") or "model", *(cfg.get("aliases") or [])] if isinstance(x, str)]
+        here = cfg.get("cwd") or "."
+        save = next((f for f in files if os.path.isfile(os.path.join(here, f))), files[0])
     if not isinstance(save, str) or not save.strip() or "--expert-profile-save" in args:
         return args
     args = args + ["--expert-profile-save", save]
@@ -3886,13 +4896,184 @@ def child_env(cfg: dict) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries
         env[str(k)] = str(v)
+    if cfg.get("route_tail_skip_default") is not None:
+        envvars.put_default(env, "ROUTE_TAIL_SKIP", str(cfg["route_tail_skip_default"]))
+    args = cfg.get("args")
+    if isinstance(args, list) and "--ram-reserve-mib" in args[:-1]:   # setup's --ram-reserve-gib: the image engine too
+        envvars.put(env, "RAM_RESERVE_MIB", str(args[args.index("--ram-reserve-mib") + 1]))
     if cfg.get("gpu_pci"):                           # the Xe engine: the GPU setup chose, by PCI address
-        env.setdefault("STRATA_GPU_PCI", str(cfg["gpu_pci"]))   # a --gpu for this start (setup sets it) wins
+        envvars.put_default(env, "GPU_PCI", str(cfg["gpu_pci"]))   # a --gpu for this start (setup sets it) wins
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"   # Windows finds a program's DLLs on PATH
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
     return env
+
+
+SELECT_ENV = ("ONEAPI_DEVICE_SELECTOR", "ZE_AFFINITY_MASK", "HIP_VISIBLE_DEVICES")   # each narrows the GPUs listed
+
+
+def image_helper_card(cfg: dict) -> str:
+    """The "images" section's "gpu_pci" when it is one of the text engine's later cards ("split_pci", two cards in
+    all) and no other text engine of the server takes it: the engine then gives that card a helper expert cache's role
+    or none (--split-roles helper), and each image job runs there beside the chat while the helper is closed (images'
+    separate_turn).  On a B70 + RTX 4070 a split's later stage shrunk for an image read prompts at half the speed of
+    the first card alone (801 against 1,592 tok/s at 4K), and a helper closes in 29 ms and fills again in 1.9 s.
+    "" otherwise."""
+    images = cfg.get("images")
+    return helper_card_for(cfg, str((images or {}).get("gpu_pci") or "") if isinstance(images, dict) else "")
+
+
+def helper_card_for(cfg: dict, pci: str) -> str:
+    """`pci` (lower case) when it is the text engine's helper card (image_helper_card's conditions), else ""."""
+    want = str(pci or "").lower()
+    later = [str(p).lower() for p in cfg.get("split_pci") or []]
+    if not want or len(later) != 1 or want != later[0] or cfg.get("replicas") or cfg.get("split_serve"):
+        return ""
+    if envvars.get("LAYER_SPLIT") == "off" or cfg.get("layer_split") not in (None, "", "auto"):
+        return ""
+    return want
+
+
+def gpu_files_missing(pci: str) -> str:
+    """The card at this PCI address when its device files are not here (setup's gpu_files_missing): a container is
+    given the host's config, whose image GPU can be a card the container was not passed.  "" when they are, or the
+    card is not one sysfs knows (Windows)."""
+    dev = Path("/sys/bus/pci/devices") / pci
+    try:
+        vendor = (dev / "vendor").read_text().strip()
+    except OSError:
+        return ""
+    maker = "nvidia" if vendor == "0x10de" else "amd" if vendor == "0x1002" else "other"
+    nodes = [] if maker == "nvidia" else sorted((dev / "drm").glob("renderD*"))
+    render = f"/dev/dri/{nodes[0].name}" if nodes else None
+    gone = hardware.missing_devices(maker, render)
+    return "its device files are not here: " + ", ".join(gone) if gone else ""
+
+
+def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
+    """The image engine's environment, from the text engine's (`env`, child_env) -> (it, whether the image jobs have a
+    card of their own (images_api.ImageModels' separate), the line the log says of it).  The "images" section's
+    "gpu_pci" (setup --image-gpu) is that card unless a text engine of the server takes it (card_env)."""
+    return card_env(cfg, env, str((cfg.get("images") or {}).get("gpu_pci") or ""), "image GPU", "the image jobs")
+
+
+def translation_env(cfg: dict, gpu: str) -> tuple[dict, str, str]:
+    """The translation engine's environment for its "gpu" (Translation's) -> (it, the text model's helper card when the
+    engine takes it, "" else, the log's line)."""
+    env = child_env(cfg)
+    if gpu in ("cpu", "same"):
+        return env, "", ""
+    if gpu == "auto":
+        if not cfg.get("images"):
+            return env, "", ""
+        tenv, _sep, _said = image_env(cfg, env)
+        pci = str((cfg.get("images") or {}).get("gpu_pci") or "").lower()
+        return tenv, helper_card_for(cfg, pci) if tenv is not env else "", ""
+    tenv, sep, said = card_env(cfg, env, gpu, "translation GPU", "translations")
+    return tenv, helper_card_for(cfg, gpu) if sep else "", said
+
+
+def card_env(cfg: dict, env: dict, pci: str, what: str, who: str) -> tuple[dict, bool, str]:
+    """An engine's environment on the card `pci` (the image engine's, the translation engine's), from the text
+    engine's (`env`) -> (it, whether the card is its own, the log's line; `what` and `who` name the engine in it).  The
+    card is the engine's unless a text engine of the server takes it: the server's card, a layer split's, the
+    replicas' and a split serve's (the text engine's helper card is handed over: helper_card_for).  A helper GPU
+    (--expert-cache-device1..3, by device number), an environment that narrows the GPUs the runtime lists, or a card
+    whose device files are not here (gpu_files_missing) leaves the engine on the text engine's card."""
+    want = str(pci or "").lower()
+    if not want:
+        return env, False, ""
+    text = {str(envvars.get("GPU_PCI", env=env) or cfg.get("gpu_pci") or "").lower()}
+    text |= {str(p).lower() for p in cfg.get("split_pci") or []}
+    reps = cfg.get("replicas")
+    for r in reps if isinstance(reps, list) else []:
+        text |= {str(p).lower() for p in ((r.get("gpus") if isinstance(r, dict) else r) or [])}
+    ss = cfg.get("split_serve")
+    if isinstance(ss, dict):
+        text |= {str(ss.get(k) or "").lower() for k in ("prefill_gpu", "decode_gpu")}
+    text.discard("")
+    if want == helper_card_for(cfg, want):        # the text engine's helper card, handed over for the engine's work
+        text.discard(want)
+    args = [str(a) for a in cfg.get("args") or []]
+    from serve import gpu_select
+    # issue #41: leaving Level Zero out (setup's selector where it failed the listing) hides no card of the others
+    narrow = [k for k in SELECT_ENV
+              if env.get(k) and not (k == "ONEAPI_DEVICE_SELECTOR" and gpu_select.without_level_zero(env))]
+    why = ("a helper GPU (--expert-cache-device1..3) is named by its device number" if any(
+        a.startswith("--expert-cache-device") for a in args) else
+           f"{narrow[0]} narrows the GPUs" if narrow
+           else "the text model takes it" if want in text else
+           "no text card is named (the engine takes the first)" if not text else gpu_files_missing(want))
+    if why:
+        return env, False, f"{what}: {want} is not used ({why}); {who} share the text model's card"
+    out = dict(env, XESTRATA_GPU_PCI=want)
+    if cfg.get("gpu") not in (None, ""):          # CUDA_VISIBLE_DEVICES of the text card alone would hide this one
+        out.pop("CUDA_VISIBLE_DEVICES", None)
+    if want == helper_card_for(cfg, want):
+        return out, True, (f"{what}: {want}, the text model's second card: a helper expert cache there is closed "
+                           f"while {who} use it and opened again after")
+    return out, True, f"{what}: {want} (separate from the text model's)"
+
+
+def with_gpu(body: dict, moved: dict | None) -> dict:
+    """An image tool's answer with images_api.place's word of the card in its "xestrata" figures, when the job left the
+    image GPU."""
+    if moved and isinstance(body, dict):
+        body["xestrata"] = {**(body.get("xestrata") or {}), "gpu": moved}
+    return body
+
+
+def gpu_roles(cfg: dict, gpu_pci: str | None, groups: list | None = None, split_serve: dict | None = None,
+              image_pci: str | None = None, helper_card: str = "") -> list[dict]:
+    """The cards the server's engines run on and what each does, the Monitor's tabs (serve/telemetry.py's `gpus`):
+    [{"pci", "roles", "stage", "replica"}], the text engine's cards first.  "roles": "text" (the text engine; with
+    "prefill" or "decode" under split serving), "helper" (a layer split's later card holding a helper expert cache,
+    image_helper_card), "image" (the image engine).  "stage": a layer split's card number, "replica": the replica's.
+    `gpu_pci`: the text engine's first card (None: the one the engine takes; the config's "gpu" numbers, when they
+    name the cards, come first); `groups`: the replicas' cards;
+    `split_serve`: split serving's two; `image_pci`: the image engine's card of its own (image_env's), None when the
+    jobs share the text model's; `helper_card`: image_helper_card's."""
+    cards: list[dict] = []
+
+    def add(pci, role, **more):
+        key = str(pci).lower() if pci else None
+        card = next((c for c in cards if (c["pci"] or "").lower() == (key or "")), None)
+        if card is None:
+            card = {"pci": pci or None, "roles": []}
+            cards.append(card)
+        if role not in card["roles"]:
+            card["roles"].append(role)
+        card.update({k: v for k, v in more.items() if v is not None})
+
+    if groups:
+        for r, g in enumerate(groups):
+            for st, p in enumerate(g):
+                add(p, "text", replica=r, stage=st if len(g) > 1 else None)
+    elif split_serve:
+        add(split_serve.get("prefill_gpu"), "text")
+        add(split_serve.get("prefill_gpu"), "prefill")
+        add(split_serve.get("decode_gpu"), "text")
+        add(split_serve.get("decode_gpu"), "decode")
+    else:
+        later = [] if envvars.get("LAYER_SPLIT") == "off" else list(cfg.get("split_pci") or [])
+        numbered = gpu_list(cfg)
+        if len(numbered) > 1 or (numbered and not gpu_pci):
+            # "gpu": the cards by nvidia-smi's numbers (the CUDA engine's layer split), their addresses from NVML
+            from serve.telemetry import nvidia_pci
+            found = [nvidia_pci(i) for i in numbered]
+            if all(found):
+                gpu_pci, later = found[0], found[1:]
+        stages = [p for p in later if not (helper_card and str(p).lower() == helper_card)]
+        add(gpu_pci, "text", stage=0 if stages else None)
+        for p in later:
+            if p in stages:
+                add(p, "text", stage=stages.index(p) + 1)
+            else:
+                add(p, "helper")
+    if cfg.get("images"):
+        add(helper_card or image_pci or cards[0]["pci"], "image")
+    return cards
 
 
 class ByteTokenizer:
@@ -4110,6 +5291,7 @@ class Service:
                  fit_max_tokens: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.vision_error: str | None = None           # why the configured encoder did not start (images off)
+        self.text_only: str | None = None              # why this model reads no images by design (the CPU's forward)
         self.vision_fallback: str | None = None        # why a later encoder serves instead of the configured one
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         # Inkling-2-Mini's engine (serve/inkling2mini_kind.py): its channel tags stay text inside a message as well,
@@ -4122,6 +5304,10 @@ class Service:
         self.fit_max_tokens = fit_max_tokens
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP ("answer_room": false: off)
+        # upstream d353539037 (#6536), opt-in here (it changes the answers' default; OUT, 2026-11-23): with the MTP
+        # drafts on, a request that names no sampling stays greedy instead of taking the model card's
+        # ("mtp_greedy": true)
+        self.mtp_greedy = False
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends in it
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction rendered with its own tools
         self.codex_thread_titles = False              # #923 (opt-in): Codex's thread-title turns without the engine
@@ -4141,7 +5327,14 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.config_path = None                         # #564: the run config the web page's Settings view edits
+        self.disk_paths: list[tuple[str, Path]] = []    # the folders the disk watcher reads, from the run config
+        self.engine_exe: str | None = None              # the engine's file (About > Licenses: the parts beside it)
+        self.terms_fetch = model_terms.TermsFetch()                 # About > Model terms: the texts not fetched yet
         self.config_lock = threading.Lock()
+        self.settings_path = places.settings_path()     # the user's settings: GLOBAL keys for every model (runconfig)
+        self.search_url: str | None = None              # web search: a SearXNG-compatible server's address
+        # the web search's engine (search.py)
+        self.search_backend: search_api.Searxng | search_api.DeepSeek | search_api.TinyFish | None = None
         self.switcher: str | None = None                # the host's model swapper RPC (config model_switcher)
         self.port = 0                                   # the port this server listens on (the switcher's models)
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -4149,12 +5342,12 @@ class Service:
         self.cors_origins: list[str] = []
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         # #321: origins that count as Strata's own page for /settings and MCP tools, e.g. the web app reached through a
-        # reverse proxy or tunnel whose Host differs ("https://strata.example.com"); never a wildcard
+        # reverse proxy or tunnel whose Host differs ("https://xestrata.example.com"); never a wildcard
         self.trusted_origins: list[str] = []
         # XeStrata-890M (#43): a client on another computer may name an image file on this PC (the config's
         # remote_image_files); off, only a client on this PC may
         self.remote_image_files = False
-        # DNS rebinding: extra Host names this server answers to (the config's allowed_hosts, $STRATA_ALLOWED_HOSTS;
+        # DNS rebinding: extra Host names this server answers to (the config's allowed_hosts, $XESTRATA_ALLOWED_HOSTS;
         # "*" = any), and every name it answers to, which serve() works out from the address it listens on
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
@@ -4164,15 +5357,16 @@ class Service:
         # "parallel" (the engine's batch slots, #465): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
-        # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory,
-        # so it is off unless the config's "api_monitor" (or --api-monitor) turns it on
-        self.api_monitor = False
+        # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory;
+        # it is on by default, and "api_monitor": false in the config turns it off
+        self.api_monitor = True
         # upstream 3cf22f5ef (#6055): set when the server stops (begin_drain): a generation request that arrives while
         # the engine closes is refused with 503 server_draining instead of being cut off with 0 tokens
         self.draining = False
         # bounded I/O in memory; no headers or API keys
         self.api_requests: collections.deque[dict] = collections.deque(maxlen=100)
         self.request_trace = threading.local()
+        self.debug_log: debuglog.DebugLog | None = None   # the debug chat log (serve/debuglog.py), when on
         # the last finished requests, newest last (GET /metrics)
         self.history: collections.deque[dict] = collections.deque(maxlen=500)
         # since the server started (the Monitor's totals, issue #35)
@@ -4190,9 +5384,12 @@ class Service:
         self.engine_failure: dict | None = None   # issue #10: the last engine that died in a request, for the web app
         self.gpu_pci: str | None = None      # the engine's card (the Monitor reads it)
         self.split_pci: list | None = None   # a layer split's other cards (the Monitor reads them too)
+        self.gpu_roles: list | None = None   # every engine's cards and their roles (gpu_roles; the Monitor's tabs)
         self.updates = release_check.Checker()           # GET/POST /update: whether a newer release is out
+        self.xe_kernel: str | None = None   # a kernel whose xe driver lacks a fix (serve/kernel_check.py; the web app)
         self.status_lock = threading.Lock()
         self.mcp: McpHub | None = None                   # serve/mcp.py's McpHub when MCP servers are configured
+        self.skills = skills_api.Skills(None)           # the chat's skills (serve/skills.py): main sets the user's
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
@@ -4207,10 +5404,15 @@ class Service:
         self.vision_held = False                         # an elastic encoder holds VRAM the expert cache gave it
         self.last_image_at = 0.0                         # when an image turn last ended (the elastic encoder's idle)
         self.reasoning_loop_recovery = False
-        # the loop guard (serve/loop_guard.py; STRATA_LOOP_GUARD=0 / "loop_guard": false: off) and what it did since
+        # the loop guard (serve/loop_guard.py; XESTRATA_LOOP_GUARD=0 / "loop_guard": false: off) and what it did since
         # the start (the JSON /metrics and its Prometheus form)
         self.loop_guard = True
         self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0}
+        # the script guard (serve/script_guard.py): the server's default ("script_guard" / XESTRATA_SCRIPT_GUARD; None:
+        # off) and what it did since the start
+        self.script_guard: dict | str | None = None
+        self.script_guard_counts = {"requests": 0, "rewinds": 0, "passed": 0}
+        self.script_guard_unsupported = False            # said once: this engine takes no logit_bias
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply
         self.anthropic_think_unasked = False              # #278: "anthropic_thinking": "model" -> True
@@ -4219,11 +5421,16 @@ class Service:
         # on unless the config's "tool_call_recovery" is false: tool calls in forms next to the template's
         self.tool_call_recovery = True
         # upstream e05e6e0cc (a): a reply to a request with tools that ends in tool-call markup that is no call is
-        # written again once (default on; STRATA_TOOL_MARKUP_RETRY=0 or the config's "tool_markup_retry": false sends it
-        # as text)
-        self.tool_markup_retry = os.environ.get("STRATA_TOOL_MARKUP_RETRY", "1").strip().lower() not in (
+        # written again once (default on; XESTRATA_TOOL_MARKUP_RETRY=0 or the config's "tool_markup_retry": false sends
+        # it as text)
+        self.tool_markup_retry = envvars.get("TOOL_MARKUP_RETRY", "1").strip().lower() not in (
             "0", "off", "false", "no")
         self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
+        self.lora_jobs: Any = None                        # training jobs, recovered before serving requests
+        self.translation: Any = None                      # Translation when the config has "translate"
+        self.video_jobs: Any = None                       # serve/videos.py's VideoJobs, made at the first video request
+        self.long_job: Any = None                         # a video job's state while it holds the image engine
+        self.long_jobs: list = []                         # every video job's, one a card (videos.hold_long_job)
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = stop_token_ids(tokenizer)
         if self.inkling2mini:
@@ -4236,11 +5443,12 @@ class Service:
         self.prompts = None
         if hasattr(tokenizer, "encode_marked") and hasattr(tokenizer, "max_special_len"):
             from strata_tokenizer import PromptEncoder
-            # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
-            # encoder's own default without that setting
+            # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots), at most
+            # PROMPT_KEEP_MAX (the slots' default, 9999, leaves the count to the engine's RAM budget; a kept prompt
+            # is its token list, which grows with the conversation); the encoder's own default without the setting
             slots = conversation_slots(engine)
-            self.prompts = PromptEncoder(tokenizer, keep=slots) if slots is not None and slots > 0 \
-                else PromptEncoder(tokenizer)
+            self.prompts = PromptEncoder(tokenizer, keep=min(slots, PROMPT_KEEP_MAX)) \
+                if slots is not None and slots > 0 else PromptEncoder(tokenizer)
 
     # #28: the running server (main) sets it: a request's image URLs are fetched only from public addresses
     public_urls = False
@@ -4367,11 +5575,11 @@ class Service:
 
     def attach_grammar(self, req: dict, grammar) -> bool:
         """`grammar` (structured.answer_grammar / tool_grammar) into the request, for an engine that constrains its
-        decoding (INFO grammar=1: not with continuous batching, not the plain models' engine).  STRATA_GRAMMAR=0 keeps
+        decoding (INFO grammar=1: not with --batch-groups above 1).  STRATA_GRAMMAR=0 keeps
         every reply unconstrained (checked after it, as before).  -> whether it was attached."""
         info = getattr(self.engine, "info", None) or {}
         if grammar is None or str(info.get("grammar")) != "1" or not self.tokenizer_dir or \
-                os.environ.get("STRATA_GRAMMAR") == "0":
+                envvars.get("GRAMMAR") == "0":
             return False
         req["strata_grammar"] = {**grammar, "vocab": self.tokenizer_dir, "prefix": ""}
         return True
@@ -4413,13 +5621,13 @@ class Service:
         try:
             if not vision.alive():
                 return False
-            print("[strata] the engine is not running but its picture encoder is: stopping the encoder to give its "
+            print("[xestrata] the engine is not running but its picture encoder is: stopping the encoder to give its "
                   "memory back", flush=True)
             vision.unload()
             self.vision_held = False
             return True
         except Exception as e:                              # noqa: BLE001 - freeing memory never makes a crash
-            print(f"[strata] the picture encoder could not be stopped: {e}", flush=True)
+            print(f"[xestrata] the picture encoder could not be stopped: {e}", flush=True)
             return False
 
     def _vision_down(self) -> bool:
@@ -4449,17 +5657,38 @@ class Service:
                 v.restart()
             except Exception as e:
                 raise EngineDied(f"the image encoder failed to start: {e}") from e
-            print(f"[strata] images: the image encoder started in {time.time() - t0:.1f} s, on the CPU", flush=True)
+            print(f"[xestrata] images: the image encoder started in {time.time() - t0:.1f} s, on the CPU", flush=True)
+            return
+        if str((getattr(self.engine, "info", None) or {}).get("vram_elastic")) in ("0", "False") and self.loaded():
+            # the engine cannot give VRAM back (a runtime that keeps an unmapped segment's VRAM: ROCm 7.x's HIP): the
+            # encoder starts before the model from now on, as a non-elastic one does, the model loaded again once
+            print("[xestrata] images: the expert cache cannot give VRAM back on this GPU's runtime, so the image "
+                  "encoder starts before the model from now on (the model loads again once)", flush=True)
+            v.elastic = False
+            if getattr(self.engine, "kept_arena", None) is not None:
+                self.engine.unload(keep_arena=True)
+            else:
+                self.engine.unload()
+            self.ensure_loaded()
             return
         if hasattr(self.engine, "vram") and self.loaded():
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
                 self.vision_held = True
-                print(f"[strata] images: the expert cache keeps {v.elastic_mib} MiB free for the image encoder "
+                print(f"[xestrata] images: the expert cache keeps {v.elastic_mib} MiB free for the image encoder "
                       f"({out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB left)", flush=True)
             except ValueError as e:
-                print(f"[strata] images: the expert cache did not make room for the image encoder ({e}); starting "
-                      "it anyway", flush=True)
+                # upstream 79dc46376: the cache could not make room, so the reader goes into the VRAM that is free; when
+                # that is under what it needs and a CPU reader exists, the CPU reads this picture instead of a start
+                # that would fail (the cache keeps its room)
+                free = self.free_vram_mib()
+                need = min(v.elastic_mib, READER_NEEDS_MIB)
+                if free is not None and free < need and v.use_cpu():
+                    print(f"[xestrata] images: the expert cache cannot make room ({e}) and only {free} MiB of VRAM is "
+                          f"free (the image encoder needs about {need}): this picture is read on the CPU", flush=True)
+                else:
+                    print(f"[xestrata] images: the expert cache did not make room for the image encoder ({e}); "
+                          "starting it anyway", flush=True)
         if self.vision_held:
             time.sleep(0.2)          # the driver's free-VRAM counter shows the cache's release a moment later
         free0, t0 = self.free_vram_mib(), time.time()
@@ -4468,8 +5697,32 @@ class Service:
         except Exception as e:      # a 503 as for a non-elastic encoder at a load, not a dropped connection (#2435)
             raise EngineDied(f"the image encoder failed to start: {e}") from e
         free1 = self.free_vram_mib()
+        on_cpu = getattr(v, "on_cpu", False)
         took = f", {free0 - free1} MiB of VRAM" if free0 is not None and free1 is not None else ""
-        print(f"[strata] images: the image encoder started in {time.time() - t0:.1f} s{took}", flush=True)
+        print(f"[xestrata] images: the image encoder started in {time.time() - t0:.1f} s"
+              f"{', on the CPU' if on_cpu else took}", flush=True)
+        if on_cpu and self.vision_held and hasattr(self.engine, "vram") and self.loaded():
+            # the CPU reader needs no VRAM: the cache takes back what it made room for (upstream 9f0794e99)
+            try:
+                self.engine.vram(self._engine_reserve())
+            except ValueError as e:
+                print(f"[xestrata] images: the expert cache did not grow back ({e})", flush=True)
+            self.vision_held = False
+        self._ledger_vision()
+
+    def _ledger_vision(self) -> None:
+        """An elastic encoder started on the text engine's card: its elastic_mib entered in the card's VRAM ledger
+        (serve/vram_ledger.py) under its pid, until it stops; the expert cache's give-back for it is the cache's entry
+        (StrataEngine._ledger_cache)."""
+        v, key = self.vision, getattr(self.engine, "ledger_key", None)
+        if v is None or not key or v.proc is None or "--gpu" not in [str(a) for a in v.spawn[0]]:
+            return
+        args, proc = [str(a) for a in v.spawn[0]], v.proc
+        pci = args[args.index("--gpu-pci") + 1].lower() if "--gpu-pci" in args[:-1] else ""
+        if pci and pci != str(getattr(self, "gpu_pci", "") or "").lower():
+            return                                       # a card of its own
+        with contextlib.suppress(OSError):
+            vram_ledger.Ledger(key).hold("vision", v.elastic_mib, proc.pid, exact=False)
 
     def _vision_idle_down(self, force: bool = False) -> str:
         """An elastic encoder idle for elastic_idle_s (or force) stops, and the expert cache takes its VRAM back:
@@ -4490,7 +5743,7 @@ class Service:
                 back = (f"; the expert cache took its VRAM back ({out.get('expert_cache_mib')} of "
                         f"{out.get('expert_cache_full_mib')} MiB)")
             # also when the cache never made room (a layer split, an engine without --vram-elastic): the stop happened
-            print(f"[strata] images: the image encoder stopped after {v.elastic_idle_s:g} s without a picture{back}",
+            print(f"[xestrata] images: the image encoder stopped after {v.elastic_idle_s:g} s without a picture{back}",
                   flush=True)
             self.vision_held = False
             return "down"
@@ -4501,18 +5754,16 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False):
             return
-        print(f"[strata] images: the image encoder starts with the first picture and stops after "
+        print(f"[xestrata] images: the image encoder starts with the first picture and stops after "
               f"{v.elastic_idle_s:g} s without one; while it runs the expert cache keeps {v.elastic_mib} MiB free "
               "for it", flush=True)
 
-        def loop():
-            while True:
-                time.sleep(max(1.0, min(30.0, v.elastic_idle_s / 4)))
-                try:
-                    self._vision_idle_down()
-                except Exception as e:                 # tried again at the next turn; the thread keeps running
-                    print(f"[strata] images: stopping the idle image encoder: {e}", flush=True)
-        threading.Thread(target=loop, daemon=True).start()
+        def check():
+            try:
+                self._vision_idle_down()
+            except Exception as e:                     # tried again at the next turn
+                print(f"[xestrata] images: stopping the idle image encoder: {e}", flush=True)
+        idle_watch.watch.add(max(1.0, min(30.0, v.elastic_idle_s / 4)), check, repeat=True)
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's GPU (an Intel card by PCI address, read through Level Zero's sysman);
@@ -4545,7 +5796,7 @@ class Service:
             times.append(now)
         times[:] = [t for t in times if now - t < self.FATAL_GPU_WINDOW_S]
         minutes = f"{self.FATAL_GPU_WINDOW_S / 60:g}"
-        print(f"[strata] the GPU reported a fatal error ({why[len('fatal GPU error:'):].strip()[:160]}); the engine "
+        print(f"[xestrata] the GPU reported a fatal error ({why[len('fatal GPU error:'):].strip()[:160]}); the engine "
               f"ended (exit code {code}) and is started again; the request that was running failed and can be sent "
               f"again ({len(times)} of {self.FATAL_GPU_MAX} allowed in {minutes} minutes)", flush=True)
         if len(times) >= self.FATAL_GPU_MAX:
@@ -4598,7 +5849,7 @@ class Service:
             times.append(now)
         if len(times) >= self.CRASH_LOOP_MAX:
             why = self._engine_last_words()
-            print(f"[strata] the engine stopped {len(times)} times in {self.CRASH_LOOP_WINDOW_S / 60:g} minutes "
+            print(f"[xestrata] the engine stopped {len(times)} times in {self.CRASH_LOOP_WINDOW_S / 60:g} minutes "
                   f"({exit_text(code)}); not starting it again for now. The last thing it said: {why or 'nothing'}",
                   flush=True)
             raise EngineDied(self._crash_loop_text(len(times), why))
@@ -4608,17 +5859,24 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        if self.images is not None and hasattr(self.images, "give_back"):
+            self.images.give_back()                  # an image engine kept warm holds the VRAM the model needs
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
-            print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
-            why = None
+            print(f"[xestrata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
+            why, reason = None, ""
             try:
                 r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
-                                   stdin=subprocess.DEVNULL)
+                                   stdin=subprocess.DEVNULL, capture_output=True)
+                hook_echo(r.stdout)
+                hook_echo(r.stderr, sys.stderr)
                 if r.returncode != 0:
                     why = f"it exited with code {r.returncode}"
-            except subprocess.TimeoutExpired:
+                    reason = hook_reason(r.stdout, stderr=r.stderr)
+            except subprocess.TimeoutExpired as e:
+                hook_echo(e.output)
+                hook_echo(e.stderr, sys.stderr)
                 why = f"it did not finish in {self.before_load_timeout_s:g} s (before_load_timeout_s)"
             except (OSError, subprocess.SubprocessError) as e:
                 why = f"it could not run ({e})"
@@ -4628,18 +5886,18 @@ class Service:
                 # does not refuse: the card's free VRAM decides (min_free_vram_mib, checked just below); "strict" always
                 # refuses, "ignore" always loads.
                 if self.before_load_strict and not self.before_load_ignore_failure:
-                    print(f"[strata] the before_load command failed ({why}); the model stays unloaded and this "
+                    print(f"[xestrata] the before_load command failed ({why}); the model stays unloaded and this "
                           "request is answered 503 - try again (before_load_strict)", flush=True)
-                    raise GpuBusy(f"the before_load command failed ({why}): the GPU was not given back, so the "
-                                  "model was not loaded; try again in a moment", retry_after=15)
+                    raise GpuBusy(reason or f"the before_load command failed ({why}): the GPU was not given back, "
+                                            "so the model was not loaded; try again in a moment", retry_after=15)
                 hook_failed = why
                 if self.before_load_ignore_failure or not self.min_free_vram_mib:
-                    print(f"[strata] the before_load command failed ({why}); loading anyway"
+                    print(f"[xestrata] the before_load command failed ({why}); loading anyway"
                           + ("" if self.before_load_ignore_failure else
                              " (set min_free_vram_mib to have the free VRAM checked, or before_load_strict to refuse)"),
                           flush=True)
                 else:
-                    print(f"[strata] the before_load command failed ({why}); checking the free VRAM", flush=True)
+                    print(f"[xestrata] the before_load command failed ({why}); checking the free VRAM", flush=True)
         if self.min_free_vram_mib and not (hook_failed and self.before_load_ignore_failure):
             free = self.free_vram_mib()
             if free is not None and free < self.min_free_vram_mib and self._release_orphan_encoder():
@@ -4651,18 +5909,18 @@ class Service:
                 free = self.free_vram_mib()
             if free is not None and free < self.min_free_vram_mib:
                 if hook_failed and not self.before_load_ignore_failure:
-                    print(f"[strata] the before_load command failed ({hook_failed}) and only {free} MiB of VRAM is "
+                    print(f"[xestrata] the before_load command failed ({hook_failed}) and only {free} MiB of VRAM is "
                           f"free (the model needs {self.min_free_vram_mib}): not loading; 503", flush=True)
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
                               f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free"
                               + (f"; the before_load command failed ({hook_failed})" if hook_failed else ""),
                               retry_after=15)
             if hook_failed and not self.before_load_ignore_failure:
-                print(f"[strata] the before_load command failed ({hook_failed}), but {free} MiB of VRAM is free: "
+                print(f"[xestrata] the before_load command failed ({hook_failed}), but {free} MiB of VRAM is free: "
                       "loading", flush=True)
         vision_started = False
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
-            print("[strata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
+            print("[xestrata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
             try:
                 self.vision.restart()
             except Exception as e:
@@ -4671,7 +5929,7 @@ class Service:
         if self.loaded():
             return
         if getattr(self.engine, "unloaded", False):
-            print("[strata] loading the model again (it was unloaded) ...", flush=True)
+            print("[xestrata] loading the model again (it was unloaded) ...", flush=True)
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             try:
@@ -4681,33 +5939,42 @@ class Service:
                 if vision_started:
                     self.vision.unload()
                 raise
-            print(f"[strata] the engine had stopped ({exit_text(code)}); starting it again "
+            print(f"[xestrata] the engine had stopped ({exit_text(code)}); starting it again "
                   "(a minute or two) ...", flush=True)
+        # what the web app's chat says while a request waits for it (/metrics live.loading): after an image job
+        # (restore_after_load) the model comes back with the conversation it had
+        with self.status_lock:
+            self.status["loading"] = "after_image" if self.restore_after_load else "again"
         try:
-            self.engine.restart()
-        except Exception as e:
-            if vision_started:
-                self.vision.unload()
-            # the program could not be started at all (missing, not executable, or blocked by Windows - #735): the
-            # request path answers EngineDied with a 503, but takes a bare OSError for a client that went away (#2496)
-            if isinstance(e, OSError):
-                raise EngineDied(f"the engine could not be started: {e}") from e
-            raise
-        print("[strata] the engine is running again", flush=True)
-        if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
-            images_api.restore_session(self)
+            try:
+                self.engine.restart()
+            except Exception as e:
+                if vision_started:
+                    self.vision.unload()
+                # the program could not be started at all (missing, not executable, or blocked by Windows - #735):
+                # the request path answers EngineDied with a 503, but takes a bare OSError for a client that went
+                # away (#2496)
+                if isinstance(e, OSError):
+                    raise EngineDied(f"the engine could not be started: {e}") from e
+                raise
+            print("[xestrata] the engine is running again", flush=True)
+            if self.restore_after_load:                  # an image job unloaded it: its conversation comes back
+                images_api.restore_session(self)
+        finally:
+            with self.status_lock:
+                self.status.pop("loading", None)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
             except (ValueError, EngineDied) as e:
-                print(f"[strata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
+                print(f"[xestrata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
 
     def vram(self, reserve_mib: int | None) -> dict:
         """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
         started with), applied between requests - a request that is running finishes first (up to vram_wait_s).
-        Only an engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes
+        Only an engine started with --vram-elastic (vram_elastic_on) can do it; it never resizes
         on its own.  An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
@@ -4731,8 +5998,8 @@ class Service:
             held = self.vision.elastic_mib if self.vision_held and self.vision is not None else None
             out = self.engine.vram((reserve_mib or 0) + held if held is not None else reserve_mib)
             self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
-            print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
-                  f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
+            print(f"[xestrata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} "
+                  f"of {out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
             return {"status": "ok", **out}
         finally:
             if ctl is not None:
@@ -4746,13 +6013,18 @@ class Service:
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
         self.engine_failure = {"at": int(time.time()), "message": f"{e}. {note}".strip(), "log": log}
-        print(f"[strata] {e}. {note} The next request starts the engine again."
+        print(f"[xestrata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
     def load(self):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
+        job = self.long_job
+        if job is not None and job.get("policy") == "unload":   # a video job's GPU, the engine unloaded for it
+            left = images_api.long_job_left(self)
+            raise GpuBusy(f"a video job has the GPU for about {left} s more (the model made way for it): ask again "
+                          "then", retry_after=left)
         if self.loaded() and not self._vision_down():
             return
         trace = getattr(self.request_trace, "record", None)
@@ -4772,7 +6044,10 @@ class Service:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
                 try:
-                    self.ensure_loaded()
+                    try:
+                        self.ensure_loaded()
+                    except images_api.LongJobBusy as e:
+                        raise GpuBusy(str(e), retry_after=e.retry_after) from e
                 finally:
                     if trace is not None:
                         with self.status_lock:
@@ -4836,7 +6111,7 @@ class Service:
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
-            print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
+            print(f"[xestrata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
             return "unloaded"
         finally:
@@ -4845,16 +6120,14 @@ class Service:
     def start_idle_unload(self):
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
             return
-        print(f"[strata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
+        print(f"[xestrata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
 
-        def loop():
-            while True:
-                time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
-                try:
-                    self.unload(idle_for=self.idle_unload_s)
-                except EngineStuck as e:                # tried again at the next turn; the thread keeps running
-                    print(f"[strata] idle unload: {e}", flush=True)
-        threading.Thread(target=loop, daemon=True).start()
+        def check():
+            try:
+                self.unload(idle_for=self.idle_unload_s)
+            except EngineStuck as e:                    # tried again at the next turn
+                print(f"[xestrata] idle unload: {e}", flush=True)
+        idle_watch.watch.add(max(1.0, min(30.0, self.idle_unload_s / 4)), check, repeat=True)
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -4866,7 +6139,7 @@ class Service:
                 else:
                     Path(self.shared_path).unlink(missing_ok=True)
             except OSError as e:
-                print(f"[strata] could not save the shared settings: {e}", flush=True)
+                print(f"[xestrata] could not save the shared settings: {e}", flush=True)
         return self.shared
 
     def effort_default(self) -> str | None:
@@ -4903,19 +6176,38 @@ class Service:
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
-            # an image job's seconds are no tok/s: the speed history has a gap there, not zeros
-            self.telemetry = Telemetry(extra=lambda: {"tok_s": None if self._image_running() else self._tok_s(),
+            cards = getattr(self, "gpu_roles", None) or gpu_roles({"split_pci": getattr(self, "split_pci", None)},
+                                                                  getattr(self, "gpu_pci", None))
+            # an image job's seconds on the text model's card are no tok/s: the speed history has a gap there, not
+            # zeros; a job on a card of its own runs beside the chat, whose speed goes on
+            self.telemetry = Telemetry(extra=lambda: {"tok_s": None if self._image_shares_text() else self._tok_s(),
                                                       "tok_s_mean": self._tok_s_mean(),
-                                                      "prefill_tok_s_mean": self._prefill_tok_s_mean()},
-                                       gpu_pci=getattr(self, "gpu_pci", None),
-                                       split_pci=getattr(self, "split_pci", None))
+                                                      "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                                                      "image_step_s": self._image_step_s()},
+                                       gpus=cards)
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on
                 # a slow card keeps the GPU at work while the host thread sleeps)
                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
 
     def _image_running(self) -> bool:
-        return self.images is not None and self.images.job is not None
+        return self.images is not None and self.images.live() is not None
+
+    def image_gpu_mode(self) -> str:
+        """Where the image jobs run beside the chat: "separate" (a card of their own: they run at the same time),
+        "helper" (the text model's second card, its helper expert cache closed for each job: the chat goes on, on the
+        first) or "shared" (the text model's card: they take turns); "" without images."""
+        if self.images is None:
+            return ""
+        if getattr(self.images, "helper_card", ""):
+            return "helper"
+        return "separate" if getattr(self.images, "separate", False) else "shared"
+
+    def _image_shares_text(self) -> bool:
+        """An image job on the text model's card: the shared card's, or one on the text model's GPU lent to the images
+        (images_api.place, use_text_gpu)."""
+        live = self.images.live() if self.images is not None else None
+        return live is not None and (self.image_gpu_mode() == "shared" or bool(live.get("on_text")))
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
@@ -4947,6 +6239,14 @@ class Service:
         return sum(s["generated"] / max(1e-6, time.time() - s["first_token"]) for s in many
                    if s.get("busy") and s.get("first_token"))
 
+    def _image_step_s(self):
+        """The running image job's seconds a step while it samples (the Monitor's speed on an image card's tab), else
+        None: the history has a gap there, not zeros."""
+        if not self._image_running():
+            return None
+        live = self.images.live()
+        return live.get("step_s") if live and live.get("stage") == "sampling" else None
+
     def _prefill_tok_s_mean(self):
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""
         with self.status_lock:
@@ -4975,6 +6275,52 @@ class Service:
             self.api_requests.append(record)
         self.request_trace.record = record
         return record
+
+    def debug_begin(self, path, req):
+        """This request's debug chat log record (serve/debuglog.py), or None when the log is off.  It goes with the
+        request on this thread (request_trace.debug): prepare() adds each prompt the engine reads to it, the tool
+        loop each round, the handler the answer."""
+        if self.debug_log is None:
+            return None
+        rec = {"id": uuid.uuid4().hex[:12], "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "path": path,
+               "request": req, "prompts": [], "tools": [], "reasoning": "", "output": "", "tool_calls": {}}
+        self.request_trace.debug = rec
+        return rec
+
+    def debug_end(self, rec) -> None:
+        """The record written once (the reply's thread, or the handler when no answer started)."""
+        if rec is not None and self.debug_log is not None and not rec.get("_written"):
+            rec["_written"] = True
+            rec["tool_calls"] = list(rec["tool_calls"].values())
+            self.debug_log.request({k: v for k, v in rec.items() if not k.startswith("_")})
+
+    def debug_prompt(self, ids, keys) -> None:
+        """The prompt the engine reads, for the debug chat log: each picture's image tokens as one marker."""
+        rec = getattr(self.request_trace, "debug", None)
+        if rec is None:
+            return
+        try:
+            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+            parts: list[str] = []
+            run: list[int] = []
+            k = 0
+            i = 0
+            while i < len(ids):
+                if ids[i] == pad:
+                    j = i
+                    while j < len(ids) and ids[j] == pad:
+                        j += 1
+                    parts.append(self.tok.decode(run))
+                    key = keys[k] if keys and k < len(keys) else "?"
+                    parts.append(f"<|image_pad|>x{j - i} [picture {key}]")
+                    run, k, i = [], k + 1, j
+                else:
+                    run.append(ids[i])
+                    i += 1
+            parts.append(self.tok.decode(run))
+            rec["prompts"].append({"tokens": len(ids), "text": "".join(parts)})
+        except Exception as e:  # noqa: BLE001 - the log must not fail a request
+            rec["prompts"].append({"tokens": len(ids), "error": f"{type(e).__name__}: {e}"})
 
     def request_records(self, request_id=None):
         with self.status_lock:
@@ -5009,6 +6355,7 @@ class Service:
         else:
             state = "idle"
         live = {"state": state, "queued": s.get("queued", 0), "phase": s.get("phase") if s.get("busy") else None,
+                "loading": s.get("loading"),
                 "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
                 "max_tokens": s.get("max_tokens") if s.get("busy") else None,
@@ -5038,22 +6385,60 @@ class Service:
         image = self.images.live() if self.images is not None else None
         if image is not None:                           # an image job in the GPU's turn: its stage and steps
             live["image"] = image
+        job = self.long_job
+        if job is not None:   # a video job (videos.py): its frames, the seconds left, and whether the chat's requests
+            # run at its chunks' ends or are refused (it has the GPU the text engine gave up)
+            live["video"] = {"done": job["done"], "total": job["total"], "left_s": images_api.long_job_left(self),
+                             "chat": "refused" if job.get("policy") == "unload" else "between_chunks",
+                             "client": job.get("client")}
         # the image jobs that ended beside the chat's requests, newest first (the Monitor's Requests table); the
         # conversation cache counts the chat's only
         rows = sorted(hist + (self.images.recent() if self.images is not None else []), key=lambda r: r["time"])
+        vision = self.vision
         engine = {"model": self.model, "max_context": self.reported_ctx(),
-                  "images": self.vision is not None or self.engine_reads_images(),
+                  "images": vision is not None or self.engine_reads_images(),
+                  # the About's other models: the picture reader that serves (the configured one or its fallback) and
+                  # the image models
+                  "vision": None if vision is None else {
+                      "encoder": vision.label, "max_tokens": vision.max_tokens,
+                      "error": getattr(vision, "dead", None) or self.vision_error, "fallback": self.vision_fallback},
+                  "image_models": self.images.about() if self.images is not None else [],
                   **dict(getattr(self.engine, "info", {}) or {})}
+        person_note = getattr(vision, "cpu_note", None)    # why the processor reads, in the person's words
+        if person_note:
+            engine["vision_note"] = person_note
         tel = (self.telemetry.snapshot() if getattr(self, "telemetry", None)
                else {"now": {}, "history": {}, "static": {}})
+        engine["image_gpu"] = self.image_gpu_mode()
+        if tel["now"].get("gpus"):                      # what each card does right now (the Monitor's tabs light it)
+            # a job on the text model's GPU, lent to the images (images_api.place): that card draws it, an image card
+            # of its own only its own job
+            lent = bool(image and image.get("on_text"))
+            own = self.images is not None and (self.images.current.live() is not None if lent else image is not None)
+            doing = {"text": live["state"] in ("reading", "generating"), "image": own}
+            lend_pci = str(getattr(self.images, "lend_pci", None) or "").lower() if lent else ""
+
+            def card(g: dict) -> dict:
+                roles = list(g.get("roles") or ())
+                active = [r for r in roles if doing.get(r)]
+                if lend_pci and str(g.get("pci") or "").lower() == lend_pci:
+                    roles += [] if "image" in roles else ["image"]
+                    active += [] if "image" in active else ["image"]
+                return dict(g, roles=roles, active=active)
+            tel["now"] = dict(tel["now"], gpus=[card(g) for g in tel["now"]["gpus"]])
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": rows[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(rows), "totals": totals, "hardware": tel["now"],
                 "loop_guard": dict(self.loop_guard_counts, on=bool(self.loop_guard)),
+                "script_guard": dict(self.script_guard_counts, default=script_guard_name(self.script_guard)),
+                # the image tools' weights downloading (or failed): the page waits on them and asks again once done
+                "image_aux": image_aux.every(),
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now,
-                "engine_failure": self.engine_failure}
+                "engine_failure": self.engine_failure, "xe_kernel": self.xe_kernel,
+                # the disk watcher runs in this process, not in an engine that can die: /metrics stays 200 then
+                "disk": disk_watch.view()}
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -5137,6 +6522,9 @@ class Service:
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
+            # the slower paths an engine fell back to (serve/downgrades.py): key -> the engine that reported it
+            "downgrades": downgrades.snapshot(),
+            "training": lora_train_api.status_row(self),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
@@ -5244,7 +6632,7 @@ class Service:
             for n, item in enumerate(content):
                 if not isinstance(item, dict) or item.get("type") != "image":
                     continue
-                why = "this server has no image encoder" if self.vision is None else None
+                why = None if self.vision is not None else self.text_only or "this server has no image encoder"
                 if why is None:
                     src = item["source"]
                     try:
@@ -5259,7 +6647,7 @@ class Service:
                         # a file error's sentence without its path: the note goes into the model's prompt
                         why = (e.strerror or type(e).__name__) if isinstance(e, OSError) else str(e)
                 if why is not None:
-                    print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
+                    print(f"[xestrata] a picture a tool returned was left out of the prompt: {why}", flush=True)
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
@@ -5365,6 +6753,8 @@ class Service:
             images = []
         if images:
             if self.vision is None:
+                if self.text_only:
+                    raise ValueError("images are not available: " + self.text_only)
                 if self.vision_error:
                     raise ValueError("images are unavailable: " + self.vision_error)
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
@@ -5387,7 +6777,8 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self._turn(cancel):
-                self._vision_up()
+                if not (hasattr(self.vision, "all_cached") and self.vision.all_cached(images)):
+                    self._vision_up()
                 try:
                     encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
                                else [self.vision.encode(src) for src in images])
@@ -5419,6 +6810,8 @@ class Service:
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
+        if getattr(self, "draining", False):
+            raise EngineClosing("the server is stopping; retry against another instance")
         self.embeddings.path = None
         self.embeddings.keys = None
         # upstream 91fb63284: the request's pictures stay in the encoder's cache from their encoding until they are
@@ -5461,7 +6854,7 @@ class Service:
                 self.forget_prompt(encoded_ids)
                 raise ContextOverflow("request exceeds the context window: "
                                       f"the prompt ({len(ids)} tokens) leaves {max(0, room)} of the {ctx}-token "
-                                      f"context, fewer than the {floor} an answer needs; Strata never truncates "
+                                      f"context, fewer than the {floor} an answer needs; XeStrata never truncates "
                                       f"requests. Shorten the conversation, or send max_tokens {max(0, room)} or less",
                                       prompt=len(ids), context=ctx, max_new=max_new, min_room=floor)
             if not self.fit_max_tokens:
@@ -5469,13 +6862,12 @@ class Service:
                 raise ContextOverflow("request exceeds the context window: "
                                       f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
                                       f"({ctx}); requests are never truncated. Send a smaller "
-                                      f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true "
-                                      "to the model's xestrata-<model>.json to shorten it to the room left (#545)",
+                                      f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to "
+                                      "the model's xestrata-<model>.json to shorten it to the room left (#545)",
                                       prompt=len(ids), context=ctx, max_new=max_new)
-            print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) leaves "
-                  "that much "
-                  f"of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
-            max_new = max(1, room)          # a shorter completion beats a 400 (the default)
+            print(f"[xestrata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) "
+                  f"leaves that much of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
+            max_new = max(1, room)          # a shorter completion beats a 400 (the default; upstream f31b6efd6)
         if images:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
@@ -5487,6 +6879,7 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
+        self.debug_prompt(ids, getattr(self.embeddings, "keys", None))
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
@@ -5511,7 +6904,7 @@ class Service:
             if not isinstance(v, int) or isinstance(v, bool) or v < (0 if k == "message" else 1):
                 raise ValueError(f"strata_prefix.{k}: a whole number ({'0' if k == 'message' else '1'} or more)")
         if has_images:
-            print("[strata] strata_prefix ignored: the request has images", flush=True)
+            print("[xestrata] strata_prefix ignored: the request has images", flush=True)
             return {}
         what = ",".join(f"{k}={v}" for k, v in spec.items())
 
@@ -5545,7 +6938,7 @@ class Service:
         elif "messages" in spec:
             k = spec["messages"]
             if k >= len(messages):
-                print(f"[strata] strata_prefix.messages={k} ignored: the request has {len(messages)} message(s) and "
+                print(f"[xestrata] strata_prefix.messages={k} ignored: the request has {len(messages)} message(s) and "
                       "the prefix must leave at least the last one", flush=True)
                 return {}
             head = head_ids(messages[:k])
@@ -5554,13 +6947,13 @@ class Service:
             i, chars = spec["message"], spec["chars"]
             text = messages[i].get("content") if 0 <= i < len(messages) else None
             if not isinstance(text, str) or chars > len(text):
-                print(f"[strata] strata_prefix ignored: message {i} has no text of {chars} characters", flush=True)
+                print(f"[xestrata] strata_prefix ignored: message {i} has no text of {chars} characters", flush=True)
                 return {}
             cut = messages[:i] + [{**messages[i], "content": text[:chars] + self.PREFIX_END}]
             head = head_ids(cut)
             n = lcp(head, ids)
         if n < 1 or n >= len(ids) - 1:
-            print(f"[strata] strata_prefix {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
+            print(f"[xestrata] strata_prefix {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
                   f"(common start {n})", flush=True)
             return {}
         return {"tokens": n}
@@ -5587,6 +6980,18 @@ class Service:
                 Path(path).unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def _next_pass(self, ids: list, nxt: list, raw_ids: list) -> list:
+        """The next pass's prompt after the server wrote into the reply (a thinking budget's wrap-up, the thinking
+        closed, a forced call's opening, the loop guard's note): the reply's text encoded whole, as the template
+        renders it when the client sends the reply back, not the pieces as they were joined.  Joined, the model's
+        last token and the inserted text can split differently ("  \n" + "\n\n" against "  \n\n\n"): the
+        engine's state then is not the prompt the next turn sends, and a recurrent model reads that turn again
+        from its checkpoint at the prompt (Mainplane, the chat's segments: 11,269 tokens after one wrap-up).
+        `nxt` as it is where the reply is not exactly `raw_ids` after the prompt (a pass that cut it)."""
+        if nxt[len(ids):] != raw_ids:
+            return nxt
+        return ids + list(self.tok.encode(self.tok.decode(raw_ids), parse_special=True))
 
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
@@ -5617,13 +7022,13 @@ class Service:
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
-            print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
+            print(f"[xestrata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
             # #984: while a thinking budget applies, the thinking line shows it, not the request's max_tokens
             limit = (f"budget {s['thinking_budget']} (max {s.get('max_tokens')})"
                      if s["phase"] == "thinking" and s.get("thinking_budget") else f"max {s.get('max_tokens')}")
-            print(f"[strata] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
+            print(f"[xestrata] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
 
@@ -5632,13 +7037,38 @@ class Service:
         own = (sampling or {}).get("loop_guard")
         return own if isinstance(own, bool) else bool(self.loop_guard)
 
+    def _script_guard(self, sampling, ids):
+        """This request's script guard (serve/script_guard.py), None when off: its own "script_guard" (the body's, the
+        header's or the shared settings') when it has one, else the server's."""
+        want = (sampling or {}).get("script_guard")
+        want = self.script_guard if want is None else want
+        if not isinstance(want, dict):
+            return None
+        info = getattr(self.engine, "info", {}) or {}
+        if info.get("logit_bias") != 1 or getattr(self.engine, "batch", 0):
+            if not self.script_guard_unsupported:
+                self.script_guard_unsupported = True
+                print("[xestrata] script guard: not applied - it holds one request at a time (an engine without "
+                      "logit_bias, or \"parallel\" batch slots)", flush=True)
+            return None
+        with self.status_lock:
+            self.script_guard_counts["requests"] += 1
+        voc = script_guard.vocab(self.tok, want["lang"])
+        table = None
+        if info.get("script_table") == 1 and voc.n_vocab and voc.token_chars:   # the engine bans and masks itself
+            try:
+                table = voc.table(places.user_dir("state") / "script-tables")
+            except OSError as e:
+                print(f"[xestrata] script guard: cannot write its table ({e}); the server applies it", flush=True)
+        return script_guard.Guard(voc, ids, want["allow_context"], table)
+
     def _guard_pieces(self):
         """A fresh token-text reader for the loop guard's markers (a character split across tokens whole)."""
         return Detokenizer(self.tok).push
 
     def _loop_noted(self, act, written: int):
         """A loop the guard broke: a line in the server window, and the Monitor's count."""
-        print(f"[strata] loop guard: {act.describe()}"
+        print(f"[xestrata] loop guard: {act.describe()}"
               f"{' (now ' + format(written, ',') + ' tokens)' if act.kind != loop_guard.STOP else ''}", flush=True)
         with self.status_lock:
             c = self.loop_guard_counts
@@ -5649,7 +7079,8 @@ class Service:
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
             declared_only=False, deferred=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
-        `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        `force` (forced_call): the opening of the call the reply must make - see prepare().  `deferred` (Anthropic's
+        tool search): a call for an undeclared name is a call too - see anthropic_tools."""
         strict = (sampling or {}).get("strata_strict_tools")
         if strict:                     # the strict tools' calls, checked before they are sent (check_strict)
             rest = {k: v for k, v in sampling.items() if k != "strata_strict_tools"}
@@ -5659,8 +7090,9 @@ class Service:
             return
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
-        card = model_card_sampling(self.model_arch, thinking,
-                                   greedy=asks_greedy(sampling, self.shared, self.sampling_defaults))
+        card = {} if self.mtp_greedy and not request_asks_sampling(sampling, self.shared, self.sampling_defaults) else \
+            model_card_sampling(self.model_arch, thinking,
+                                greedy=asks_greedy(sampling, self.shared, self.sampling_defaults))
         defaults = {**card, **self.sampling_defaults, **self.shared}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
@@ -5692,24 +7124,28 @@ class Service:
             # left as it was.
             budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
             if max_new <= 32768:
-                print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
+                print(f"[xestrata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
                       "(\"answer_room\": false in the config turns this off)", flush=True)
         if budget and max_new and max_new > 0:
             # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
             # it has no answer.  Close the thinking early enough to leave room for one.
             reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
             if budget > max_new - reserve:
-                print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
+                print(f"[xestrata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         reader = (Inkling2MiniOutputParser if self.inkling2mini
                   else GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser)
-        parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
-                  reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
-                         recover=self.tool_call_recovery,
-                         declared_only=declared_only,
-                         # #4622: opt-in, as for a deferred tool
-                         deferred=deferred or self.undeclared_tool_calls == "call"))
+        # the Inkling reader wraps the parser and forwards its attributes; it shares no type with these two readers
+        parser: Any = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
+                       reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
+                              recover=self.tool_call_recovery, declared_only=declared_only,
+                              # #4622: well-formed call of an undeclared name is a call too, opt-in as deferred tool
+                              deferred=deferred or self.undeclared_tool_calls == "call"))
+        # Inkling-2-Mini's channel tokens: upstream's engine through serve/inkling_dialect.py; this fork's own
+        # (strata-inkling-2-mini) reads them in Inkling2MiniOutputParser, below
+        if getattr(self.template, "inkling", False) and not self.inkling2mini:
+            parser = inkling_kind.Reader(parser)
         # upstream #6675: Inkling-2-Mini's channel tags move its reader only as the special tokens they are; the same
         # text spelt by ordinary tokens (an answer that quotes the format) stays text
         specials = getattr(self.tok, "special_tokens", None) if self.inkling2mini else None
@@ -5723,6 +7159,8 @@ class Service:
         guard = loop_guard.ToolSafeGuard(parser.state == "reasoning", pieces=self._guard_pieces,
                                          can_close=not harmony) if self._loop_guard_on(sampling) else None
         guard_stopped = False                           # the guard ended the answer (a loop that came back)
+        # the script guard (serve/script_guard.py): its bias applies from where the thinking ends
+        sg = self._script_guard(sampling, ids)
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -5762,6 +7200,11 @@ class Service:
         if force and not thinking:                      # the parser reads it as if the model had written it
             written = force                             # (a grammar's prefix: the reply starts with it)
             opening, force = parser.feed(self.force_text(force)), None
+        # a forced call waiting for the thinking to end: the model's own call opening (one token, Qwen's <tool_call>)
+        # is not taken there, and the forced opening goes in its place - else the model's call, of a tool the force
+        # does not name (one it made up), dropped the force and was refused as undeclared, and nothing was called
+        enc = self.tok.encode(CALL_START, parse_special=True) if force else []
+        call_tok = enc[0] if len(enc) == 1 else None
         tail = ""                                       # the last characters written (the newlines before a call)
         one_done = False                                # one_call: the reply's one call has been written
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
@@ -5769,8 +7212,10 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
-        raw_ids: list = []                              # every generated id (STRATA_DEBUG: dump raw model text)
-        admission_rejected = False                      # #3040: the batch slots refused it before it read anything
+        raw_ids: list = []                              # every generated id (XESTRATA_DEBUG: dump raw model text)
+        # upstream b3c633868 (#3040): the engine's batch slots refused the request before it read anything, so its
+        # row is an error and no completed request
+        admission_rejected = False
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         own_images = getattr(self.embeddings, "inkling2mini", None)   # Inkling-2-Mini: this request's picture files
         if own_images:
@@ -5887,8 +7332,28 @@ class Service:
                             pass_sampling = sampling   # no hold: the engine gets the caller's own sampler object
                         # the loop guard's short repetition penalty after a loop: an engine call of its own, which
                         # ends where it ends (the request's own sampling after it); else the request's sampling
-                        smp_call, n_call = guard.sampling(pass_sampling, n, max_new - n) if guard is not None \
-                            else (pass_sampling, max_new - n)
+                        # the room this pass has: the reply's own, and the context's (a pass after the server wrote
+                        # into the reply - a forced call's opening, a wrap-up - reads it encoded whole, which can be a
+                        # token or two longer than the pieces counted, and the engine refuses prompt + max_new + 8 over
+                        # its context)
+                        left = max_new - n
+                        ctx = getattr(self.engine, "max_context", 0) or 0
+                        if ctx:
+                            left = min(left, ctx - CTX_SLACK - len(prompt))
+                        if left < 1:
+                            finish = "length"
+                            break
+                        smp_call, n_call = guard.sampling(pass_sampling, n, left) if guard is not None \
+                            else (pass_sampling, left)
+                        if guard is not None and guard.events:
+                            # after a loop the rest of the reply routes the experts exactly: the engine's
+                            # XESTRATA_ROUTE_PRIOR bias towards the experts in VRAM can hold a loop
+                            smp_call = {**(smp_call or {}), "strata_route_prior": False}
+                        if sg is not None:
+                            # (the thinking may have been closed by the server: a budget's wrap-up, the loop guard)
+                            sg.active = sg.active or parser.state not in ("reasoning", "rcall")
+                            sg.restart = False
+                            smp_call, n_call = sg.sampling(smp_call, n_call, raw_ids)
                         n_pass = n
                         gen = self.engine.generate(prompt, n_call, smp_call, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, n_call, smp_call, cancel)
@@ -5920,6 +7385,9 @@ class Service:
                                     finish = "stop"
                                     raw_ids.append(t)
                                     break
+                                if force and t == call_tok and parser.state == "content":
+                                    opens = True        # the model opens a call before the forced one: that one here
+                                    break
                                 raw_ids.append(t)
                                 seg.append(t)
                                 thinking_n += parser.state in ("reasoning", "rcall")
@@ -5928,7 +7396,25 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
+                                was_pending = detok.pending()
                                 piece = detok.push(t)
+                                if sg is not None and sg.active:
+                                    if piece and sg.banned(piece):
+                                        start = sg.leak(was_pending, len(raw_ids) - 1, len(seg))
+                                        with self.status_lock:
+                                            self.script_guard_counts["passed" if start is None else "rewinds"] += 1
+                                        if start is not None:
+                                            # spelt in byte tokens, none of them sent yet: they are dropped and the
+                                            # engine writes this place again with the first of them banned
+                                            drop = len(raw_ids) - start
+                                            sg.ban_next, sg.restart = raw_ids[start], True
+                                            del raw_ids[start:], seg[-drop:]
+                                            n -= drop
+                                            detok = Detokenizer(self.tok)
+                                            break
+                                        print(f"[xestrata] script guard: let {piece!r} through at {n} tokens (after "
+                                              f"{sg.rewinds} rewinds, or part of it was sent)", flush=True)
+                                    sg.follow(was_pending, piece, detok.pending(), len(raw_ids) - 1)
                                 tail = (tail + piece)[-2:]
                                 if channel_ids:         # an Inkling-2-Mini reader, which has feed_token
                                     evs = cut(parser.feed_token(  # type: ignore[union-attr]
@@ -5978,6 +7464,10 @@ class Service:
                                     elif parser.state == "content" and not parser.buf and not detok.pending():
                                         opens = True
                                         break
+                                if (sg is not None and not sg.active and parser.state not in ("reasoning", "rcall")
+                                        and not parser.buf and not detok.pending()):
+                                    sg.active = sg.restart = True   # the thinking is over: the answer with the bias
+                                    break
                         except EngineNonFinite:
                             nonfinite = True
                         except EngineDied as e:
@@ -5986,7 +7476,7 @@ class Service:
                             raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
-                            print(f"[strata] the engine reported an error: {e}", flush=True)
+                            print(f"[xestrata] the engine reported an error: {e}", flush=True)
                             raise
                         except GeneratorExit:               # the client went away: an engine that never acknowledges
                             leaving = True                  # the STOP below is ended, but no error replaces this
@@ -6017,13 +7507,13 @@ class Service:
                                 nf_retried = True
                                 # the retry reads from token 0: its DONE, not this one's, says what was reused
                                 del segments[segments_before:]
-                                print("[strata] the engine's logits became non-finite before the first token "
+                                print("[xestrata] the engine's logits became non-finite before the first token "
                                       "(upstream Strata #879); it dropped its cached state: sending the request again "
                                       "once", flush=True)
                                 continue
                             finish = "error"
                             if n == 0:
-                                print("[strata] the engine's logits became non-finite again on the retry (upstream "
+                                print("[xestrata] the engine's logits became non-finite again on the retry (upstream "
                                       "Strata #879): the request ends with an error", flush=True)
                                 raise EngineNonFinite("the model's output became non-finite (NaN) twice in a row "
                                                       "(upstream Strata #879); the engine has dropped its cached "
@@ -6031,12 +7521,18 @@ class Service:
                             # an error, as vLLM and llama.cpp end a reply their engine broke off: a stream gets its
                             # error event after the text it already has, a whole answer is not sent; a "length"
                             # finish would read as a reply cut at max_tokens
-                            print(f"[strata] the engine's logits became non-finite after {n} tokens (upstream Strata "
+                            print(f"[xestrata] the engine's logits became non-finite after {n} tokens (upstream Strata "
                                   "#879): the request ends with an error; the engine dropped its cached state, so the "
                                   "next request reads its prompt from the start", flush=True)
                             raise EngineNonFinite(f"the model's output became non-finite (NaN) after {n} tokens "
                                                   "(upstream Strata #879); the engine has dropped its cached state - "
                                                   "send the request again")
+                        if (sg is not None and (sg.restart or sg.one_token) and act is None and finish == "length"
+                                and n < max_new and not cancel.is_set()
+                                and not (wrap or opens or repeated or looped or one_done)
+                                and recover_prompt is None and (stops is None or stops.hit is None)):
+                            prompt = prompt + seg       # the script guard's pass: the answer's, a rewind, one token
+                            continue
                         if stream is not None and act is not None and not cancel.is_set():
                             g = stream.guard
                             # a loop: its repeats the client did not get are gone (never in seg); the engine goes on
@@ -6071,7 +7567,7 @@ class Service:
                             if stops is not None and stops.hit is not None:
                                 finish = "stop"
                                 break
-                            prompt = prompt + seg + extra
+                            prompt = self._next_pass(ids, prompt + seg + extra, raw_ids)
                             continue
                         if (stream is not None and stream.finished and n_call < max_new - n_pass and seg
                                 and finish == "length" and n < max_new and not cancel.is_set()
@@ -6095,7 +7591,7 @@ class Service:
                             if trace is not None:
                                 trace["reasoning_recoveries"] = recovery_count
                                 trace["reasoning_repeat_coverage"] = round(repeat_coverage, 3)
-                            print(f"[strata] repeated reasoning detected at {n} tokens "
+                            print(f"[xestrata] repeated reasoning detected at {n} tokens "
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
@@ -6109,7 +7605,7 @@ class Service:
                             close_retried = True
                             extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
+                                print("[xestrata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
                                 for t in extra:
                                     n += 1
@@ -6119,7 +7615,7 @@ class Service:
                                     self._note(n, evs, st, rate)
                                     for ev in evs:
                                         yield "event", ev
-                                prompt = prompt + seg + extra
+                                prompt = self._next_pass(ids, prompt + seg + extra, raw_ids)
                                 finish = "length"
                                 continue
                         if (held and not (wrap or opens) and not cancel.is_set() and finish != "stop" and not repeated
@@ -6160,11 +7656,11 @@ class Service:
                                         t["tool_markup_retries"] = t.get("tool_markup_retries", 0) + 1
                                         t["tool_calls_unread"] = (t.get("tool_calls_unread", 0)
                                                                   + getattr(parser, "unread", 0))
-                                    print(f"[strata] the reply ended in tool-call markup that is no call ({kind}"
+                                    print(f"[xestrata] the reply ended in tool-call markup that is no call ({kind}"
                                           + (f": {', '.join(names[:3])}" if names else "")
                                           + (f", closest declared {near}" if near else "")
                                           + f"; {len(dropped)} characters held back): writing the reply's end again "
-                                          "once (STRATA_TOOL_MARKUP_RETRY=0 turns this off)", flush=True)
+                                          "once (XESTRATA_TOOL_MARKUP_RETRY=0 turns this off)", flush=True)
                                     max_new -= len(extra)       # the note is prompt: the reply keeps inside the context
                                     prompt = prompt + seg + extra
                                     parser = reader(thinking=False, tools=with_history_tools(tools, sampling),
@@ -6196,7 +7692,7 @@ class Service:
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
                         if wrap:
-                            print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
+                            print(f"[xestrata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
                             n += 1
@@ -6209,7 +7705,7 @@ class Service:
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
-                        prompt = prompt + seg + extra
+                        prompt = self._next_pass(ids, prompt + seg + extra, raw_ids)
                     if cancel.is_set():
                         finish = "cancel"
                     elif guard_stopped and not answered:
@@ -6217,11 +7713,11 @@ class Service:
                         for ev in cut([Event("content", LOOP_STOP_NOTE)]):
                             yield "event", ev
                     elif looped:
-                        print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
+                        print(f"[xestrata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
-                              "strata-<model>.json; remove it to turn this off)", flush=True)
+                              "xestrata-<model>.json; remove it to turn this off)", flush=True)
                     elif repeated:
-                        print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
+                        print(f"[xestrata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "xestrata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it (#606)", flush=True)
@@ -6299,14 +7795,14 @@ class Service:
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             rate_txt = f"{speed:.1f} tok/s" if speed is not None else "no speed"
-                            print(f"[strata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
+                            print(f"[xestrata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
-                                print("[strata] the reply reached max tokens while still thinking, so it has no "
+                                print("[xestrata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
                                       "xestrata-<model>.json for every request) leaves room to answer", flush=True)
-                            if os.environ.get("STRATA_DEBUG") and raw_ids:
-                                print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                            if envvars.get("DEBUG") and raw_ids:
+                                print(f"[xestrata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                         st["busy"] = False
                         st.pop("tail", None)                     # #212: the answer's end is not kept once it is done
                         st.pop("tool", None)
@@ -6333,26 +7829,27 @@ class Service:
         hold.armed = False
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
-            print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
-                  f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
+            print(f"[xestrata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept "
+                  f"as reasoning (quoted, or the turn did not end on a stop)", flush=True)
         stray = getattr(parser, "stray_think", 0)
         if stray:
             # #4077: the model wrote a closing think tag while thinking; the reasoning after it was sent as the answer
             with self.status_lock:
                 self.totals["stray_think_closers"] = self.totals.get("stray_think_closers", 0) + stray
-            print(f"[strata] {stray} extra closing think tag(s) in the answer were dropped (the model "
+            print(f"[xestrata] {stray} extra closing think tag(s) in the answer were dropped (the model "
                   "wrote one while thinking, so the rest of its reasoning went out as the answer; a call after it "
                   "still counts)", flush=True)
         notes = list(getattr(parser, "notes", None) or [])
         if notes:
             with self.status_lock:
                 self.totals["tool_args_repaired"] = self.totals.get("tool_args_repaired", 0) + len(notes)
-            print(f"[strata] {len(notes)} tool call argument(s) repaired: {'; '.join(sorted(set(notes)))}", flush=True)
+            print(f"[xestrata] {len(notes)} tool call argument(s) repaired: {'; '.join(sorted(set(notes)))}",
+                  flush=True)
         unread = getattr(parser, "unread", 0)          # the Harmony reader keeps no such count
         rejected: list = []
         if unread:
             named = getattr(parser, "unread_names", None)
-            print(f"[strata] {unread} <tool_call> block(s) in the answer did not read as a call of a declared "
+            print(f"[xestrata] {unread} <tool_call> block(s) in the answer did not read as a call of a declared "
                   "tool and went back as text (a name the request did not declare, or a form the template does "
                   "not use)" + (f"; the names the model wrote: {', '.join(named)}" if named else "")
                   + "; the response carries them as strata_rejected_tool_calls, /metrics counts them", flush=True)
@@ -6666,21 +8163,24 @@ def prefill_leg_stats(earlier: list[dict], last: dict, prompt_tokens: int) -> di
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
-    """One compact line per request while diagnosing blank/empty turns. Set STRATA_DEBUG=1 to enable."""
-    if not os.environ.get("STRATA_DEBUG"):
+    """One compact line per request while diagnosing blank/empty turns. Set XESTRATA_DEBUG=1 to enable."""
+    if not envvars.get("DEBUG"):
         return
     last = messages[-1] if messages else {}
     body = last.get("content")
     if isinstance(body, list):
         body = " ".join(p.get("text", "") for p in body if isinstance(p, dict))
     preview = (str(body or "")[:80]).replace("\n", " ")
-    print(f"[strata] req {api}: msgs={len(messages)} tools={len(tools or [])} "
+    print(f"[xestrata] req {api}: msgs={len(messages)} tools={len(tools or [])} "
           f"max_tokens_raw={req.get('max_tokens')!r}/{req.get('max_completion_tokens')!r} "
           f"max_new={max_new} thinking={thinking} stream={bool(req.get('stream'))} "
           f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
 
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
+FREE_ROUNDS = 3   # run_with_mcp's rounds that only read skills or stubs' arguments, not counted in max_rounds
+
+
 class ToolHubs:
     """Hubs that run_with_mcp runs as one: the MCP servers' tools and the image tools (serve/images.py ImageTools)."""
 
@@ -6693,6 +8193,10 @@ class ToolHubs:
         for h in self.hubs:
             out.update(h.routes())
         return out
+
+    def new_tools(self) -> list:
+        """The tools a hub declares from the next round on (the image tools unlocked by load_skill)."""
+        return [t for h in self.hubs if hasattr(h, "new_tools") for t in h.new_tools()]
 
     def call(self, name: str, arguments, cancel=None) -> dict:
         for h in self.hubs:
@@ -6716,7 +8220,10 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     could not reach the model before the client's).  `force` (forced_call): the first round's reply opens that call;
     the rounds after a tool ran are the model's own."""
     max_rounds = int(hub.settings["max_rounds"])
-    total, rounds = 0, 0
+    total, rounds, free_rounds = 0, 0, 0
+    # rounds counts against max_rounds and goes back by one for a skill read; the number sent with a tool call must
+    # still tell the rounds apart, or the page groups two of them into one assistant message
+    round_id = 0
     done: dict = {}
     finalizing = False   # PR #3741 (upstream e0469a585): the round after the limit answers with no tools
     messages = list(messages)
@@ -6749,12 +8256,86 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                               "chars": 0, "truncated": False, "ms": 0}
             break
         rounds += 1
+        round_id += 1
         force = None
-        results = []
+        # a chart of the plan a call carries (an image tool's `plan`, combine-tools): put into the reply before the
+        # calls run, as a ```mermaid block the web page draws - a model that writes no text beside its calls gives it so
         for c in calls:
-            s, tool = hub.routes().get(c.name, (None, c.name))
-            yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
-                          "tool": tool, "arguments": c.arguments, "round": rounds}
+            try:
+                plan = json.loads(c.arguments).get("plan") if isinstance(c.arguments, str) else None
+            except (ValueError, AttributeError):
+                plan = None
+            if isinstance(plan, str) and plan.strip():
+                chart = plan.strip()
+                if not chart.startswith("```"):
+                    chart = "```mermaid\n" + chart + "\n```"
+                chunk = ("\n\n" if text else "") + chart + "\n\n"
+                text.append(chunk)
+                yield "event", Event("content", chunk)
+                break
+        if isinstance(sampling, dict) and sampling.get("strata_grammar_first_round"):   # the forced call's name only
+            sampling = {k: v for k, v in sampling.items() if k not in ("strata_grammar", "strata_grammar_first_round")}
+        routes = hub.routes()
+        light: list[bool] = []   # each result: a skill read, or a stub's arguments (no tool's work done)
+
+        def call_event(c):
+            s, tool = routes.get(c.name, (None, c.name))
+            return {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None, "tool": tool,
+                    "arguments": c.arguments, "round": round_id}
+
+        def finished(c, r):
+            """A call's result: logged (and kept beside the debug log) -> (the client's event, what the model reads)."""
+            light.append(c.name == skills_api.TOOL or bool(r.get("stub")) or bool(r.get("skipped")))
+            print(f"[xestrata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
+                  f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
+            dbg = getattr(svc.request_trace, "debug", None)
+            if dbg is not None:
+                made = []                                # the images the tool made, saved beside the log
+                log = cast(debuglog.DebugLog, svc.debug_log)
+                for u in r.get("images") or []:
+                    f = svc.images.file(u.rsplit("/", 1)[-1]) if isinstance(u, str) and svc.images is not None else None
+                    try:
+                        made.append(log.picture(f.read_bytes(), f.suffix[1:]) if f is not None else u)
+                    except OSError:
+                        made.append(u)
+                dbg["tools"].append({"round": round_id, "name": c.name, "arguments": c.arguments, "ok": r["ok"],
+                                     "ms": r["ms"], "result": r.get("model_content", r["text"]),
+                                     **({"images": made} if made else {}),
+                                     **({"image": r["image"]} if r.get("image") else {})})
+            # an MCP tool's pictures (mcp.image_results, upstream 7c9b6f3a2) reach the model only with a picture reader
+            seen = r.get("model_content", r["text"]) if svc.vision is not None else r["text"]
+            return ({"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")},
+                     **({"skipped": True} if r.get("skipped") else {}),
+                     **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
+                     **({"image": r["image"]} if r.get("image") else {}),
+                     **({"sources": r["sources"]} if "sources" in r else {}),  # a web search's (search.py)
+                     **{k: r[k] for k in ("requested_model", "training_model", "model_switched") if k in r}}, seen)
+
+        # the image and video calls of this reply, two or more: run side by side (serve/tool_parallel.py), their
+        # results kept in the reply's order; every other call runs in turn as before, meanwhile
+        image_hub = next((h for h in (hub.hubs if isinstance(hub, ToolHubs) else [hub])
+                          if isinstance(h, images_api.ImageTools)), None)
+        names = set(image_hub.routes()) if image_hub is not None else set()
+        side = [(i, c) for i, c in enumerate(calls) if c.name in names]
+        runner = tool_parallel.Runner(image_hub, side, cancel) if len(side) > 1 else None
+        by_index: dict[int, object] = {}
+
+        def flush():
+            for ev in runner.take() if runner is not None else []:
+                c = calls[ev[1]]
+                if ev[0] == "start":
+                    yield "mcp", call_event(c)
+                else:
+                    event, seen = finished(c, ev[2])
+                    by_index[ev[1]] = seen
+                    yield "mcp", event
+        if runner is not None:
+            runner.start()
+        stopped = False
+        for i, c in enumerate(calls):
+            if runner is not None and c.name in names:
+                continue
+            yield "mcp", call_event(c)
             # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
             # keep-alive lines, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
             box: dict = {}
@@ -6774,22 +8355,35 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                         index, data = partials.get()
                         yield "mcp", {"event": "partial", "id": c.id, "index": index,
                                       "b64": base64.b64encode(data).decode("ascii")}
+                    yield from flush()
                     if worker.is_alive():
                         yield "ping", None
             except GeneratorExit:
                 cancel.set()                             # the client is gone: stop the tool too
                 raise
             if "r" not in box:
+                stopped = True
                 break
-            r = box["r"]
-            print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
-                  f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            # an MCP tool's pictures (mcp.image_results, upstream 7c9b6f3a2) reach the model only with a picture reader
-            results.append(r.get("model_content", r["text"]) if svc.vision is not None else r["text"])
-            yield "mcp", {"event": "result", "id": c.id,
-                          **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")},
-                          **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
-                          **({"image": r["image"]} if r.get("image") else {})}
+            event, seen = finished(c, box["r"])
+            by_index[i] = seen
+            yield "mcp", event
+        if runner is not None:
+            try:
+                while runner.alive():
+                    runner.join(1.0)
+                    yield from flush()
+                    if runner.alive():
+                        yield "ping", None
+                yield from flush()
+            except GeneratorExit:
+                cancel.set()
+                raise
+        results = [by_index[i] for i in range(len(calls)) if i in by_index] if not stopped else []
+        # a round that only read skills or a stub's arguments does no tool's work: not one of max_rounds, FREE_ROUNDS
+        # such rounds at most (a chain of three image tools spent its four rounds before its last step)
+        if light and all(light) and free_rounds < FREE_ROUNDS:
+            rounds -= 1
+            free_rounds += 1
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
@@ -6800,13 +8394,18 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         if rounds >= max_rounds:
             finalizing = True
             tools = None
-            system_end = next((index for index, message in enumerate(messages)
-                               if message.get("role") not in ("system", "developer")), len(messages))
-            messages.insert(system_end, {"role": "system", "content": (
+            # a user turn after the results, not a system message: the chat templates take a system message only at
+            # the start ("System message must be at the beginning"), as _late_system_to_user turns a client's late one
+            messages.append({"role": "user", "content": (
                 f"The tool-use limit of {max_rounds} rounds has been reached. No tools are available for this final "
                 "reply. Answer the user's original request in their language using the results already obtained. "
                 "Explain any gaps in the available evidence. Do not request or emit further tool calls.")})
             yield "mcp", {"event": "limit", "max_rounds": max_rounds}
+        more = hub.new_tools() if hasattr(hub, "new_tools") and not finalizing else []
+        if more:                                         # tools given whole from this round on (their stubs' places)
+            whole = {t["name"]: t for t in more}
+            tools = [whole.pop(t["name"], t) if isinstance(t, dict) else t for t in tools or []] + list(whole.values())
+            mcp_names.update(t["name"] for t in more)
         try:
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
         except ClientGone:                                      # #1999: the client left while a picture was prepared
@@ -6877,7 +8476,7 @@ def _pdf_python(data: bytes, label: str, vision: bool) -> tuple[list, list]:
     except ImportError:                  # pypdf alone: the text alone
         if vision and not getattr(read_file, "said", False):
             read_file.said = True        # type: ignore[attr-defined]
-            print("[strata] a PDF's pages are read as text only: drawing them as pictures needs poppler's pdftoppm "
+            print("[xestrata] a PDF's pages are read as text only: drawing them as pictures needs poppler's pdftoppm "
                   "(Linux: poppler-utils) or the Python package pypdfium2", flush=True)
         vision = False
     if vision:
@@ -7048,7 +8647,7 @@ class LogprobEntries:
     def take(self, eng) -> list:
         # the request's own lines (on its cancel Event), else the engine's when they carry its Event; a later generate
         # pass of the same request (an MCP round) makes new ones, and the old ones are read to the end first
-        own = getattr(self.owner, "_strata_lp_lines", None)
+        own = getattr(self.owner, "_xestrata_lp_lines", None)
         cur, old = (own if own is not None else getattr(eng, "lp_lines", None)), None
         if cur is not self.lines and getattr(cur, "owner", None) is self.owner:
             old, self.lines = self.lines, cur
@@ -7223,6 +8822,7 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             elif ev.kind in ("tool_start", "tool_args") and call.name in customs:
                 pass                                # a custom tool's input is sent whole, with its tool_call
             elif ev.kind == "tool_call" and call.name in customs:
+                yield from first()
                 given = call.arguments
                 text = given["input"] if isinstance(given, dict) and set(given) == {"input"} \
                     and isinstance(given["input"], str) else json.dumps(given, ensure_ascii=False)
@@ -7231,6 +8831,7 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
                                              "custom": {"name": call.name, "input": text}}]})
                 calls += 1
             elif ev.kind == "tool_start":
+                yield from first()
                 streamed[call.id] = calls
                 calls += 1
                 yield from first()
@@ -7242,6 +8843,7 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             elif ev.kind == "tool_call" and call.id in streamed:
                 finished.add(getattr(ev.call, "id", None))
             elif ev.kind == "tool_call":
+                yield from first()
                 args = json.dumps(call.arguments, ensure_ascii=False)
                 yield from first()
                 yield chunk({"tool_calls": [{"index": calls, "id": call.id, "type": "function",
@@ -7275,7 +8877,7 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
         # 200 with one chunk and no finish_reason, in 0.2 s, while the engine never logged the request: #3961) used to
         # read to the client as an empty answer that worked, and /health stayed ok.  It is an error now, counted in the
         # log, so a client's retry can tell it from an answer.
-        print("[strata] a request ended without an answer and without a finish reason; it is answered as an error",
+        print("[xestrata] a request ended without an answer and without a finish reason; it is answered as an error",
               flush=True)
         # the engine is ended so "the next request restarts it" is true - but only that engine process, and only while
         # nobody is on it (the turn is taken without waiting): this runs after the run released its turn, and a request
@@ -7344,8 +8946,27 @@ def _is_json(text: str) -> bool:
         return False
 
 
+def cite_chunks(chunks, search_tools):
+    """The chunks, with one more before the finishing one: the url_citation annotations of the addresses the answer
+    writes from what the web search found (OpenAI's message.annotations)."""
+    text: list[str] = []
+    for c in chunks:
+        choice = c["choices"][0] if c is not None and c.get("choices") else None
+        if choice is not None:
+            text.append(choice["delta"].get("content") or "")
+            if choice.get("finish_reason") is not None:
+                notes = [{"type": "url_citation", "url_citation": {"start_index": x["start"], "end_index": x["end"],
+                                                                   "url": x["url"], "title": x["title"]}}
+                         for x in search_api.cited("".join(text), search_tools.sources)]
+                if notes:
+                    yield {**{k: c[k] for k in ("id", "object", "created", "model", "system_fingerprint") if k in c},
+                           "choices": [{"index": 0, "delta": {"annotations": notes}, "finish_reason": None}]}
+        yield c
+
+
 def openai_collect(chunks) -> dict:
     content, reasoning, last, mcp = [], [], None, []
+    notes: list[dict] = []                         # a web search's url_citation annotations (cite_chunks)
     by_index: dict = {}
     lps: dict[str, list] = {"content": [], "reasoning_content": []}
     for c in chunks:
@@ -7358,6 +8979,7 @@ def openai_collect(chunks) -> dict:
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
+        notes += d.get("annotations") or []
         for tc in d.get("tool_calls") or []:       # streamed calls arrive in pieces: merge them by index
             if tc.get("type") == "custom":         # a custom tool's call comes whole
                 by_index[tc.get("index", len(by_index))] = {k: v for k, v in tc.items() if k != "index"}
@@ -7381,6 +9003,8 @@ def openai_collect(chunks) -> dict:
         msg["reasoning_content"] = msg["reasoning"] = "".join(reasoning)
     if calls:
         msg["tool_calls"] = calls
+    if notes:
+        msg["annotations"] = notes
     if mcp:
         msg["strata_mcp"] = mcp
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
@@ -7485,6 +9109,9 @@ def structured_chunks(chunks, validator):
             return
         result = openai_collect(buffered)
         choice = result["choices"][0]
+        if choice["finish_reason"] == "tool_calls":
+            yield from buffered
+            return
         content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
         # logprobs: the entries spell what the model wrote, which is replaced here with the canonical JSON;
         # _structured_logprobs gives back the form the tokens spell, or None
@@ -7515,7 +9142,40 @@ def anthropic_usage(ids, reused, output_tokens: int) -> dict:
             "cache_read_input_tokens": reused, "output_tokens": output_tokens}
 
 
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, deferred=False):
+def anthropic_search_blocks(x: dict, calls: dict) -> list[dict]:
+    """A web search tool's activity (run_with_mcp's "mcp" events) as Anthropic's server tool blocks: its call a
+    server_tool_use block (web_search or web_fetch), its result a web_search_tool_result (or web_fetch_tool_result)
+    block.  `calls`: call id -> the tool's name, filled here.  The results' encrypted_content is the snippet, in
+    base64: this server keeps nothing to decrypt it with, and a client only sends it back."""
+    sid = "srvtoolu_" + str(x.get("id", "")).removeprefix("call_")
+    if x.get("event") == "call":
+        raw = x.get("arguments")
+        args: dict = raw if isinstance(raw, dict) else {}
+        fetch = x.get("name") == "fetch_page"
+        calls[x.get("id")] = "web_fetch" if fetch else "web_search"
+        return [{"type": "server_tool_use", "id": sid, "name": calls[x.get("id")],
+                 "input": {"url": args.get("url")} if fetch else {"query": args.get("query")}}]
+    if x.get("event") != "result" or x.get("id") not in calls:
+        return []
+    if calls[x.get("id")] == "web_fetch":
+        src = (x.get("sources") or [{}])[0]
+        content: dict | list = (
+            {"type": "web_fetch_result", "url": src.get("url"), "content": {
+                "type": "document", "title": src.get("title"),
+                "source": {"type": "text", "media_type": "text/plain", "data": x.get("text", "")}}}
+            if x.get("ok") else {"type": "web_fetch_tool_error", "error_code": "unavailable"})
+        return [{"type": "web_fetch_tool_result", "tool_use_id": sid, "content": content}]
+    content = ([{"type": "web_search_result", "url": r["url"], "title": r["title"], "page_age": None,
+                 "encrypted_content": base64.b64encode(r["url"].encode()).decode("ascii")}
+                for r in x.get("sources") or []] if x.get("ok") else
+               {"type": "web_search_tool_result_error", "error_code": "unavailable"})
+    return [{"type": "web_search_tool_result", "tool_use_id": sid, "content": content}]
+
+
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, run=None,
+                     deferred=False):
+    """`run`: the events to send instead of Service.run's (run_with_mcp with the web search tools): their activity
+    becomes Anthropic's server tool blocks (anthropic_search_blocks) and usage.server_tool_use."""
     mid = "msg_" + uuid.uuid4().hex[:24]
 
     def start(reused):
@@ -7537,8 +9197,9 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         yield "content_block_stop", {"type": "content_block_stop", "index": index}
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True,
-                           deferred=deferred):
+    server_calls: dict = {}                        # the web search calls run here: id -> web_search / web_fetch
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                                       declared_only=True, deferred=deferred):
         if kind == "ping":
             yield None
             continue
@@ -7546,6 +9207,22 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             started = True
             yield start(cast(dict, x).get("reused") if kind == "done" else
                         0 if getattr(svc.engine, "batch", 0) else getattr(svc.engine, "reused", 0))
+        if kind == "mcp":
+            for server_block in anthropic_search_blocks(cast(dict, x), server_calls):
+                if open_kind is not None:
+                    yield from closing()
+                index += 1
+                open_kind = server_block["type"]
+                if open_kind == "server_tool_use":       # its input as one piece, as a tool_use's
+                    yield "content_block_start", {"type": "content_block_start", "index": index,
+                                                  "content_block": {**server_block, "input": {}}}
+                    yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(server_block["input"], ensure_ascii=False)}}
+                else:
+                    yield "content_block_start", {"type": "content_block_start", "index": index,
+                                                  "content_block": server_block}
+            continue
         if kind == "event":
             ev = cast(Event, x)
             call = cast(ToolCall, ev.call)          # (None but for the tool_* events)
@@ -7599,9 +9276,13 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 and x["completion_tokens"] < asked else \
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
             # the final counts: the engine's own figure of the prompt its cache held
+            usage: dict = anthropic_usage(ids, x.get("reused"), x["completion_tokens"])
+            if server_calls:
+                usage["server_tool_use"] = {
+                    "web_search_requests": sum(v == "web_search" for v in server_calls.values()),
+                    "web_fetch_requests": sum(v == "web_fetch" for v in server_calls.values())}
             delta_event = {"type": "message_delta",
-                           "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
-                           "usage": anthropic_usage(ids, x.get("reused"), x["completion_tokens"])}
+                           "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")}, "usage": usage}
             if x.get("rejected_tool_calls"):
                 delta_event["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796
             if x.get("unread_tool_markup"):
@@ -7707,11 +9388,11 @@ def anthropic_structured(events, validator):
 # ------------------------------------------------------------------------------------------------ HTTP
 # Anthropic's error types by HTTP status (its "errors" page); a 5xx without its own is an api_error
 ANTHROPIC_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
-                         404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error",
-                         529: "overloaded_error"}
+                         404: "not_found_error", 409: "conflict_error", 413: "request_too_large",
+                         429: "rate_limit_error", 500: "api_error", 529: "overloaded_error"}
 
 
-def api_error_body(path: str, status: int, obj):
+def api_error_body(path: str, status: int, obj, request_id: str | None = None):
     """An error body in the shape of the API its path belongs to: Anthropic's routes (/v1/messages...) answer
     {"type": "error", "error": {"type", "message"}}, the other /v1/ routes OpenAI's {"error": {"message", "type",
     "param", "code"}} (param and code null when the error has none).  Anything else is left as it is."""
@@ -7720,10 +9401,17 @@ def api_error_body(path: str, status: int, obj):
         return obj
     message = str(err.get("message") or "")
     if path.startswith("/v1/messages"):
-        if obj.get("type") == "error":
+        if obj.get("type") == "error" and request_id is None:
             return obj
-        kind = ANTHROPIC_ERROR_TYPES.get(status, "api_error" if status >= 500 else "invalid_request_error")
-        return {"type": "error", "error": {"type": kind, "message": message}}
+        # 台帳 0804（upstream 25d88c4a5b）: 502/503 は overload と読ませないため既存の type を保つ
+        kind = ANTHROPIC_ERROR_TYPES.get(status)
+        if kind is None:
+            kind = err.get("type") or "api_error" if status >= 500 else "invalid_request_error"
+        error = {**err, "type": kind, "message": message}
+        body = {"type": "error", **obj, "error": error}
+        if request_id:
+            body["request_id"] = request_id
+        return body
     kind = err.get("type") or ("server_error" if status >= 500 else "invalid_request_error")
     return {**obj, "error": {**err, "message": message, "type": kind, "param": err.get("param"),
                              "code": err.get("code")}}
@@ -7734,10 +9422,10 @@ CHUNKED_BODY_MAX = 256 << 20                # #893: the most a Transfer-Encoding
 
 def body_limit() -> int:
     """The most a request body may hold, in bytes (read into memory): 256 MiB, which is a million-token conversation
-    with room to spare; STRATA_MAX_BODY_MIB changes it (0 or an unreadable value: the default).  A larger one is
+    with room to spare; XESTRATA_MAX_BODY_MIB changes it (0 or an unreadable value: the default).  A larger one is
     answered 413 before it is read (a Content-Length of 10 TB used to be read until the client gave up)."""
     try:
-        mib = int(os.environ.get("STRATA_MAX_BODY_MIB", "0"))
+        mib = int(envvars.get("MAX_BODY_MIB", "0"))
     except ValueError:
         mib = 0
     return mib << 20 if mib > 0 else CHUNKED_BODY_MAX
@@ -7747,7 +9435,8 @@ def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
     """A multipart/form-data body (OpenAI's /v1/images/edits) -> (its text fields, the bytes of its image or image[]
     files in order); the numbers the JSON request takes as numbers (n, seed, steps, num_inference_steps,
     output_compression, partial_images whole; vLLM-Omni's guidance_scale and true_cfg_scale) as numbers, stream's true
-    or false (as OpenAI's SDK writes a boolean in a form) as a bool, the mask file's bytes as "mask"."""
+    or false (as OpenAI's SDK writes a boolean in a form) as a bool, both as images.parse_number and parse_flag read
+    them, the mask file's bytes as "mask" and the control's picture's as "control_image"."""
     from email.parser import BytesParser
     from email.policy import HTTP
     msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode("latin-1") + b"\r\n\r\n" + body)
@@ -7763,19 +9452,18 @@ def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
             files.append(data)
         elif name == "mask":
             fields["mask"] = data
+        elif name == "control_image":   # the control's picture (serve/image_controls.py)
+            fields["control_image"] = data
         elif isinstance(name, str) and name:
             value = data.decode("utf-8", "replace")
-            whole = name in ("n", "seed", "steps", "num_inference_steps", "output_compression", "partial_images") \
-                and value.strip().isdigit()
-            if name == "stream" and value.strip().lower() in ("true", "false"):
-                fields[name] = value.strip().lower() == "true"
-            elif name in ("guidance_scale", "true_cfg_scale"):
-                try:
-                    fields[name] = float(value)          # out of range or not finite: the request's own 400
-                except ValueError:
-                    fields[name] = value
-            else:
-                fields[name] = int(value) if whole else value
+            fields[name] = value
+            whole = name in ("n", "seed", "steps", "num_inference_steps", "output_compression", "partial_images")
+            # read as the image entries read them (out of range, or not a number or a boolean: the request's own 400)
+            with contextlib.suppress(images_api.ImageRequestError):
+                if name == "stream":
+                    fields[name] = images_api.parse_flag(value, name, value)
+                elif whole or name in ("guidance_scale", "true_cfg_scale"):
+                    fields[name] = images_api.parse_number(value, name, -math.inf, math.inf, value, whole)
     return fields, files
 
 
@@ -7796,6 +9484,7 @@ def make_handler(svc: Service):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
         record = None                                       # #332: this request's monitor record, if kept
+        debug = None                                        # this request's debug chat log record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
         body_read = False                                   # whether a handler took this request's body
         DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
@@ -7882,7 +9571,7 @@ def make_handler(svc: Service):
                 if length > limit:
                     self.close_connection = True           # the body is not read: the connection ends with the answer
                     raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
-                                       "(STRATA_MAX_BODY_MIB raises the limit)")
+                                       "(XESTRATA_MAX_BODY_MIB raises the limit)")
                 return self.rfile.read(length)
             except TimeoutError:
                 self.close_connection = True
@@ -7932,20 +9621,22 @@ def make_handler(svc: Service):
             host = self.headers.get("Host")
             if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
                 return True
-            print(f"[strata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
-                  f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, or set an API key)",
+            print(f"[xestrata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this "
+                  f"server answers to (add it to \"allowed_hosts\" in the config or XESTRATA_ALLOWED_HOSTS, or set "
+                  "an API key)",
                   flush=True)
             self._json(403, {"error": {"type": "forbidden", "message":
-                             f"Host {host!r} is not allowed (DNS rebinding protection). Reaching Strata under this "
-                             f"name on purpose? Add it to \"allowed_hosts\" in the config (strata-<model>.json) or to "
-                             f"the STRATA_ALLOWED_HOSTS environment variable, or set an API key (\"api_key\"), which "
-                             f"turns this check off"}})
+                             f"Host {host!r} is not allowed (DNS rebinding protection). Reaching XeStrata under this "
+                             f"name on purpose? Add it to \"allowed_hosts\" in the config (xestrata-<model>.json) or "
+                             f"to the XESTRATA_ALLOWED_HOSTS environment variable, or set an API key (\"api_key\"), "
+                             f"which turns this check off"}})
             return False
 
         def _foreign_page(self, body: bool = True) -> bool:
             """Without an API key, a /v1 POST from a browser page of another site (any site can POST text/plain
             there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
-            then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before.
+            then the body must be JSON (the Video tab's upload: a form with X-XeStrata-Upload).  No Origin (curl, the
+            SDKs, other servers): any content type, as before.
             The /v1 foreign-Origin rule (owner 11-16, the same contract as the app host's /v1): an Origin header
             that is present but empty is another site too, and GET /v1 goes through the same check (body=False:
             no content type to check)."""
@@ -7954,13 +9645,22 @@ def make_handler(svc: Service):
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
-                print(f"[strata] refused an API request from the web page {origin!r} (no API key; add its host to "
+                print(f"[xestrata] refused an API request from the web page {origin!r} (no API key; add its host to "
                       f"\"allowed_hosts\" or its origin to \"cors_origins\" in the config)", flush=True)
                 msg = (f"web pages of {origin} may not use this server without an API key; set \"api_key\", "
                        f"or add the page's host to \"allowed_hosts\" (or its origin to \"cors_origins\") in the config")
                 self._json(403, {"error": {"type": "forbidden", "message": msg}})
                 return True
-            if body and not self.headers.get("Content-Type", "").startswith("application/json"):
+            ctype = self.headers.get("Content-Type", "")
+            own = self.headers.get("X-XeStrata-Upload") or self.headers.get("X-Strata-Upload")   # its earlier name
+            upath = self.path.split("?")[0].rstrip("/")
+            if ctype.startswith("multipart/form-data") and own \
+                    and (upath in ("/v1/videos", "/v1/videos/sync", "/v1/videos/files", "/v1/videos/segmentations",
+                                   "/v1/lora/jobs")
+                         or (upath.startswith("/v1/lora/jobs/") and upath.endswith("/images"))):
+                return False   # the Video tab's and the LoRA panel's upload: a header of its own, which a page
+                #                elsewhere cannot send without a CORS preflight (granted to cors_origins alone)
+            if body and not ctype.startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return True
             return False
@@ -7997,7 +9697,7 @@ def make_handler(svc: Service):
                         cancel.set()
                         return
 
-            threading.Thread(target=watch, daemon=True, name="strata-client-watch").start()
+            threading.Thread(target=watch, daemon=True, name="xestrata-client-watch").start()
 
         def _note(self, **values):
             """#332: what the monitor shows about this request (nothing when the monitor is off)."""
@@ -8034,8 +9734,49 @@ def make_handler(svc: Service):
             if path.startswith("/v1/responses/"):
                 self._json(404, responses_error_body("this server keeps no responses (stateless): there is nothing "
                                                      "to delete", code="not_found"))
+            elif path.startswith("/v1/lora/jobs/"):   # a training job, its image, or a version of it
+                if not self._authorized():
+                    return
+                parts = path.strip("/").split("/")
+                jobs = self._lora_jobs()
+                try:
+                    if len(parts) == 4:
+                        self._json(200, jobs.delete(parts[3]))
+                    elif len(parts) == 6 and parts[4] == "images":
+                        self._json(200, jobs.remove_image(parts[3], parts[5]))
+                    elif len(parts) == 6 and parts[4] == "versions":
+                        self._json(200, jobs.delete_version(parts[3], int(parts[5])))
+                    else:
+                        self._json(404, {"error": {"message": f"Invalid URL (DELETE {path})",
+                                                   "type": "invalid_request_error"}})
+                except (lora_train_api.TrainError, ValueError) as e:
+                    self._json(*lora_train_api.explain(e))
+            elif path.startswith("/v1/videos/") and path.count("/") == 3:   # a video job and its files
+                got = self._video_jobs().delete(path[len("/v1/videos/"):]) if svc.images is not None else None
+                if got is None:
+                    self._json(404, {"error": {"type": "invalid_request_error", "code": "not_found",
+                                               "message": "no such video"}})
+                else:
+                    self._json(200, got)
             else:
                 self._json(404, {"error": {"message": f"Invalid URL (DELETE {path})", "type": "invalid_request_error"}})
+
+        def do_PUT(self):
+            """PUT /v1/lora/jobs/{id}/captions: the training images' captions, edited on the panel."""
+            if not self._authorized():
+                return
+            path = self.path.split("?")[0].rstrip("/")
+            parts = path.strip("/").split("/")
+            if len(parts) == 5 and parts[:3] == ["v1", "lora", "jobs"] and parts[4] == "captions":
+                try:
+                    req = json.loads(self._body() or b"{}")
+                    if not isinstance(req, dict):
+                        raise ValueError("send a JSON object of image file name -> {caption, note}")
+                    self._json(200, self._lora_jobs().set_captions(parts[3], req))
+                except (lora_train_api.TrainError, ValueError) as e:
+                    self._json(*lora_train_api.explain(e))
+            else:
+                self._json(404, {"error": {"message": f"Invalid URL (PUT {path})", "type": "invalid_request_error"}})
 
         def do_OPTIONS(self):
             # a CORS preflight: no credentials come with it, so no API key; the headers only for cors_origins
@@ -8045,7 +9786,11 @@ def make_handler(svc: Service):
             self.end_headers()
 
         def _json(self, code, obj, headers=None):
-            obj = api_error_body(self.path.split("?")[0].rstrip("/"), code, obj)
+            request_id = "req_" + (self.record["id"] if self.record is not None else uuid.uuid4().hex[:12])
+            path = self.path.split("?")[0].rstrip("/")
+            obj = api_error_body(path, code, obj, request_id)
+            if code >= 400 and path.startswith("/v1/messages"):
+                headers = {**(headers or {}), "request-id": request_id}
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -8064,19 +9809,47 @@ def make_handler(svc: Service):
             self.end_headers()
             self.wfile.write(body)
 
-        def _authorized(self) -> bool:
+        def _has_key(self) -> bool:
+            """Whether this request carries the server's key, without answering a 401 (an open /health)."""
             if not svc.api_key:
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if key_matches(given, svc.api_key):
+            return key_matches(given, svc.api_key)
+
+        def _authorized(self) -> bool:
+            if self._has_key():
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
 
         def do_GET(self):
-            path = self.path.split("?")[0].rstrip("/")
+            path = own_path(self.path.split("?")[0].rstrip("/"))
             if path.startswith("/v1/") and self._foreign_page(body=False):
+                return
+            if path.startswith("/v1/images/loras/fetch/"):   # a Hugging Face fetch of the Images view, as it goes
+                if not self._authorized():
+                    return
+                f = lora_api.FETCHES.get(path[len("/v1/images/loras/fetch/"):])
+                if f is None:
+                    self._json(404, {"error": {"message": "no such fetch"}})
+                    return
+                self._json(200, f.view())
+                return
+            if path.startswith("/v1/xestrata/replies/"):      # a kept reply again, from its line `from`
+                if not self._authorized():
+                    return
+                reply = REPLIES.get(path[len("/v1/xestrata/replies/"):])
+                if reply is None:
+                    self._json(404, {"error": {"message": "no such reply (it ended long ago, or never began)"}})
+                    return
+                try:
+                    start = max(0, int(parse_qs(urlsplit(self.path).query).get("from", ["0"])[0]))
+                except ValueError:
+                    self._json(400, {"error": {"message": "from: a line number"}})
+                    return
+                self._sse()
+                self._stream_reply(reply, start)
                 return
             if path.startswith("/tool-media/"):
                 if not self._authorized():
@@ -8196,6 +9969,10 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, model_switcher(svc))
                 return
+            if path == "/skills" or path.startswith("/skills/"):   # the chat's skills (the web page's Skills)
+                if self._authorized():
+                    self._skills_get(path)
+                return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():
@@ -8214,18 +9991,62 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
+                tr_status = svc.translation.status() if svc.translation is not None else None
+                if tr_status is not None and tr_status.get("error") and not self._has_key():
+                    # the start failure holds the engine's log path and its last lines: for the key holder only
+                    tr_status = {**tr_status, "error": "the translation model did not start"}
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
+                                 "web_search": svc.search_backend is not None,
                                  "image_note": svc.images.note() if svc.images is not None else None,
                                  "image_defaults": svc.images.default.defaults() if svc.images is not None else None,
                                  "image_models": svc.images.models() if svc.images is not None else None,
+                                 # the text model's GPU lent to a reply's image calls (use_text_gpu): its setting, and
+                                 # whether a job runs there now (the chat waits for it)
+                                 "image_text_gpu": {"mode": images_api.text_gpu_mode(
+                                     svc.images.default.cfg.get("use_text_gpu")), "lent": svc.images.lending()}
+                                 if svc.images is not None and svc.images.lend_cfgs is not None else None,
+                                 # the cards a request may choose for its image and video jobs (gpu): the image GPU
+                                 # and the text model's; none where the images have one
+                                 "image_gpus": images_api.image_cards(svc) if svc.images is not None else [],
+                                 "video": videos_api.status(svc.images.default.cfg,
+                                                            Path(svc.images.default.dir) / "video-jobs")
+                                 if svc.images is not None else None,
                                  "thinking": getattr(svc.template, "thinking", None),
+                                 # a streamed chat reply can be kept past its connection (xestrata_reply)
+                                 "kept_replies": True,
+                                 # the page shows this before its first /metrics poll; no volume path is exposed
+                                 "disk_warning": disk_watch.warning_line(),
+                                 "debug_chat_log": svc.debug_log is not None,
+                                 "translation": tr_status,
                                  "loaded": svc.loaded(), "service": "strata"})
+            elif path.startswith("/v1/images/licenses/"):   # a tool's weights' license to agree to (SAM 3's)
+                if not self._authorized():
+                    return
+                self._image_license(path[len("/v1/images/licenses/"):], None)
+            elif path in ("/v1/licenses/models", "/v1/licenses/software"):   # About > Model terms, Licenses
+                if self._authorized():
+                    self._json(200, self._model_terms() if path.endswith("/models") else
+                               notices.software(svc.engine_exe, release_check.current_version()))
             elif path == "/update":                         # whether a newer release is out (About > Updates)
                 if not self._authorized():
                     return
                 self._json(200, svc.updates.check() if release_check.enabled() else svc.updates.info())
+            elif path == "/v1/lora/models" or path.startswith("/v1/lora/jobs"):
+                self._lora_get(path)
+            elif path.startswith("/v1/videos/files/"):   # a chat's video: its name (32 random hex digits) is the access
+                f = videos_api.file_path(self._video_jobs(), path[len("/v1/videos/files/"):]) \
+                    if svc.images is not None else None
+                if f is None:
+                    self._json(404, {"error": {"message": "not found (the server keeps a chat's videos a week)"}})
+                else:
+                    self._send_video(f, videos_api.file_mime(f))
+            elif path.startswith("/v1/videos/") and path.endswith("/content"):
+                self._videos_get(path)    # as an image file's link: the job's id (32 random hex digits) is the access
+            elif path == "/v1/videos" or path.startswith("/v1/videos/"):   # the video jobs (serve/videos.py)
+                if self._authorized():
+                    self._videos_get(path)
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
@@ -8252,7 +10073,12 @@ def make_handler(svc: Service):
                         s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
                 for k in ("started", "first_token"):
                     s.pop(k, None)
+                training = lora_train_api.status_row(svc)
+                if training is not None:
+                    s["training"] = training
                 self._json(200, s)
+            elif path in self.TRANSLATE_GET:
+                self._translate_get(path, parse_qs(urlsplit(self.path).query))
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     self._json(200, {"object": "list", "data": self._models()})
@@ -8266,6 +10092,9 @@ def make_handler(svc: Service):
                                                    "code": "model_not_found"}})
                     else:
                         self._json(200, found)
+            elif path == "/v1/skills" or path.startswith("/v1/skills/"):
+                if self._authorized():
+                    self._v1_skills_get(path)
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -8322,20 +10151,286 @@ def make_handler(svc: Service):
                           "defaults": m["defaults"],
                           "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}}
                          for m in svc.images.models()]
+                # the upscalers: POST /v1/images/upscale
+                data += [{"id": name, **common, "status": {"value": "loaded"},
+                          "architecture": {"input_modalities": ["image"], "output_modalities": ["image"]},
+                          "upscale": {"method": method, **({"variant": variant} if variant else {}),
+                                      "scale": 4 if method == "realesrgan" else None}}
+                         for name, (method, variant) in images_api.UPSCALE_MODELS.items()]
+                # the segmenters and BiRefNet: POST /v1/images/segmentations, /v1/images/remove-background
+                data += [{**m, **common, "status": {"value": "loaded"}} for m in regions_api.models()]
+            if svc.translation is not None:              # the translation model: chat, completions, DeepL, Libre
+                tm = svc.translation.model
+                data.append({"id": tm.id, **common,
+                             "status": {"value": "loaded" if svc.translation.status()["loaded"] else "unloaded"},
+                             "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                             "translation": {"languages": list(tm.codes())}})
             return data
 
+        # ------------------------------------------------------------------------------------------- translation
+        # DeepL's (/v2/translate, /v2/languages) and LibreTranslate's (/translate, /languages, /detect,
+        # /frontend/settings) APIs on the translation model, and OpenAI's chat and completions when a request names
+        # it: serve/translate_api.py reads the requests and builds the answers, Translation translates.  The server's
+        # one API key is taken in each API's own way as well (DeepL-Auth-Key, LibreTranslate's api_key); without a key
+        # set, all pass.
+        TRANSLATE_POST = ("/v2/translate", "/translate", "/detect")
+        TRANSLATE_GET = ("/v2/languages", "/languages", "/frontend/settings")
+
+        def _translate_error(self, path: str, status: int, message: str) -> None:
+            if path.startswith("/v2/"):
+                self._json(status, {"message": message})
+            elif path.startswith("/v1/"):
+                self._json(status, {"error": {"message": message, "type": "invalid_request_error"
+                                              if status < 500 else "server_error"}})
+            else:
+                self._json(status, {"error": message})
+
+        def _translate_key(self, params: dict | None) -> str | None:
+            """The key a translation request gives: DeepL's header, a Bearer or x-api-key header, or (LibreTranslate)
+            the body's api_key."""
+            auth = self.headers.get("Authorization", "")
+            for prefix in ("deepl-auth-key ", "bearer "):
+                if auth.lower().startswith(prefix):
+                    return auth[len(prefix):].strip()
+            if self.headers.get("x-api-key"):
+                return self.headers.get("x-api-key")
+            if params is not None:
+                k = translate_api.one(params, "api_key")
+                return k if isinstance(k, str) else None
+            return None
+
+        def _translate_allowed(self, path: str, params: dict | None) -> bool:
+            if not svc.api_key:
+                return True
+            given = self._translate_key(params)
+            if given and key_matches(given, svc.api_key):
+                return True
+            if path.startswith("/v2/"):
+                self._translate_error(path, 403, "Authorization failed. Please supply a valid DeepL-Auth-Key via the "
+                                                 "Authorization header.")
+            elif not given:
+                self._translate_error(path, 400, "Please contact the server operator to get an API key")
+            else:
+                self._translate_error(path, 403, "Invalid API key")
+            return False
+
+        def _translate_run(self, path: str, req) -> list | None:
+            """`req`'s translations (translate_api.translate_all), or None with the error answered."""
+            tr = svc.translation
+            try:
+                return translate_api.translate_all(
+                    req, lambda jobs: tr.complete([j.prompt(tr.model) for j in jobs]))
+            except translate_api.ApiError as e:
+                self._translate_error(path, e.status, str(e))
+            except ValueError as e:                      # a text past the model's context
+                self._translate_error(path, 413 if path.startswith("/v2/") else 400, str(e))
+            except (RuntimeError, EngineDied) as e:
+                self._translate_error(path, 503, str(e))
+            return None
+
+        def _translate_post(self, path: str) -> None:
+            if svc.translation is None:
+                self._translate_error(path, 404, "no translation model is set up (xestrata --setup --translate)")
+                return
+            # _foreign_page's check, the refusal in the API's own error shape
+            origin = self.headers.get("Origin")
+            if not svc.api_key and origin:
+                if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
+                                      [*svc.trusted_origins, *svc.cors_origins]):
+                    print(f"[xestrata] refused a translation request from the web page {origin!r} (no API key)",
+                          flush=True)
+                    self._translate_error(path, 403, f"web pages of {origin} may not use this server without an "
+                                                     "API key; set \"api_key\", or add the page's host to "
+                                                     "\"allowed_hosts\"")
+                    return
+                if not self.headers.get("Content-Type", "").startswith("application/json"):
+                    self._translate_error(path, 415, "send application/json")
+                    return
+            if path == "/v2/translate":
+                # DeepL's key is in a header and its limit is smaller than the general body limit: check both before
+                # reading a body that will be refused anyway
+                if not self._translate_allowed(path, None):
+                    return
+                try:
+                    declared = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    declared = 0
+                if declared > translate_api.DEEPL_MAX_BODY:
+                    self.close_connection = True
+                    self._translate_error(path, 413, "Request Entity Too Large")
+                    return
+            model = svc.translation.model
+            body = self._body()
+            if path == "/v2/translate" and len(body or b"") > translate_api.DEEPL_MAX_BODY:
+                self.close_connection = True
+                self._translate_error(path, 413, "Request Entity Too Large")
+                return
+            try:
+                params = translate_api.form_or_json(body, self.headers.get("Content-Type", ""))
+            except translate_api.ApiError as e:
+                self._translate_error(path, e.status, str(e))
+                return
+            if not self._translate_allowed(path, params):
+                return
+            try:
+                if path == "/detect":
+                    self._json(200, translate_api.libre_detect(params, model))
+                    return
+                if path == "/v2/translate":
+                    req = translate_api.deepl_request(params, model)
+                    got = self._translate_run(path, req)
+                    if got is not None:
+                        self._json(200, translate_api.deepl_answer(req, got))
+                    return
+                req, batch, detected = translate_api.libre_request(params, model)
+            except translate_api.ApiError as e:
+                self._translate_error(path, e.status, str(e))
+                return
+            got = self._translate_run(path, req)
+            if got is not None:
+                self._json(200, translate_api.libre_answer(req, got, batch, detected))
+
+        def _translate_get(self, path: str, query: dict) -> None:
+            if svc.translation is None:
+                self._translate_error(path, 404, "no translation model is set up (xestrata --setup --translate)")
+                return
+            model = svc.translation.model
+            if path == "/v2/languages":
+                if self._translate_allowed(path, None):
+                    kind = (query.get("type") or ["source"])[0]
+                    self._json(200, translate_api.deepl_languages(model, "target" if kind == "target" else "source"))
+            elif path == "/languages":
+                self._json(200, translate_api.libre_languages(model))
+            else:
+                self._json(200, translate_api.libre_settings(model, bool(svc.api_key)))
+
+        def _translate_openai(self, path: str, req: dict) -> None:
+            """OpenAI's chat (/v1/chat/completions) and completions (/v1/completions) for the translation model: the
+            chat rendered as the model's chat template renders it (chat_template_kwargs, the [plamo-translate] system
+            block), the completions' prompt as written (PFML3); streamed or not."""
+            tr = svc.translation
+            chat = path == "/v1/chat/completions"
+            try:
+                if chat:
+                    kwargs = req.get("chat_template_kwargs") or {}
+                    if not isinstance(kwargs, dict):
+                        raise translate_api.ApiError(400, "chat_template_kwargs must be an object")
+                    known = {k: kwargs[k] for k in ("target_lang", "source_lang", "form", "context", "glossary")
+                             if k in kwargs}
+                    try:
+                        prompt = translate_mod.pfml3(req.get("messages") or [], **known)
+                    except translate_mod.PfmlError as e:
+                        raise translate_api.ApiError(400, str(e)) from None
+                else:
+                    prompt = translate_api.completion_prompt(req)
+            except translate_api.ApiError as e:
+                self._translate_error(path, e.status, str(e))
+                return
+            sampling = {k: req[k] for k in ("temperature", "top_p", "top_k", "min_p", "seed") if k in req}
+            limit = req.get("max_completion_tokens") or req.get("max_tokens")
+            if isinstance(limit, (int, float)) and limit < 0:
+                limit = None                             # llama.cpp's -1 means "the rest"; the engine takes a count
+            stops = stop_strings(req)
+            rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex
+            created = int(time.time())
+            model_id = str(req.get("model") or tr.model.id)
+            cancel = threading.Event()
+
+            def cut(text: str) -> tuple:
+                hits = [text.find(x) for x in stops if x and x in text]
+                return (text[:min(hits)], True) if hits else (text, False)
+
+            if not req.get("stream"):
+                try:
+                    r = tr.translate([prompt], sampling, limit, cancel)[0]
+                except ValueError as e:
+                    self._translate_error(path, 400, str(e))
+                    return
+                except (RuntimeError, EngineDied) as e:
+                    self._translate_error(path, 503, str(e))
+                    return
+                text, stopped = cut(r["text"])
+                finish = "stop" if stopped else r["finish_reason"]
+                usage = {"prompt_tokens": r["prompt_tokens"], "completion_tokens": r["completion_tokens"],
+                         "total_tokens": r["prompt_tokens"] + r["completion_tokens"]}
+                if chat:
+                    choice = {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish}
+                else:
+                    choice = {"index": 0, "text": text, "finish_reason": finish, "logprobs": None}
+                self._json(200, {"id": rid, "object": "chat.completion" if chat else "text_completion",
+                                 "created": created, "model": model_id, "choices": [choice], "usage": usage})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self._cors()
+            self.end_headers()
+            if STREAM_WRITE_TIMEOUT_S > 0:
+                try:
+                    self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)     # (#4271) a stuck write: see _sse
+                except OSError:
+                    pass
+            obj = "chat.completion.chunk" if chat else "text_completion"
+            sent = {"text": ""}
+
+            def send(choice: dict) -> None:
+                try:
+                    self.wfile.write(("data: " + json.dumps({"id": rid, "object": obj, "created": created,
+                                                             "model": model_id, "choices": [choice]},
+                                                            ensure_ascii=False) + "\n\n").encode())
+                    self.wfile.flush()
+                except OSError:
+                    cancel.set()
+
+            def delta(_i: int, d: str) -> None:
+                whole, stopped = cut(sent["text"] + d)
+                new = whole[len(sent["text"]):]
+                sent["text"] = whole
+                if new:
+                    send({"index": 0, "delta": {"content": new}, "finish_reason": None} if chat else
+                         {"index": 0, "text": new, "finish_reason": None})
+                if stopped:
+                    cancel.set()
+
+            if chat:
+                send({"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None})
+            try:
+                r = tr.translate([prompt], sampling, limit, cancel, on_text=delta)[0]
+                finish = "stop" if cut(r["text"])[1] else r["finish_reason"]
+            except (ValueError, RuntimeError, EngineDied) as e:
+                send({"index": 0, "delta": {}, "finish_reason": "error"} if chat else
+                     {"index": 0, "text": "", "finish_reason": "error"})
+                print(f"[xestrata] translation: {e}", flush=True)
+                finish = None
+            if finish is not None:
+                send({"index": 0, "delta": {}, "finish_reason": finish} if chat else
+                     {"index": 0, "text": "", "finish_reason": finish})
+            with contextlib.suppress(OSError):
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+
         def do_POST(self):
+            # the page's mark of its own job (images.CLIENT_JOB), a short token or none: per request, since a
+            # connection's requests share its thread
+            mark = self.headers.get("X-XeStrata-Job") or ""
+            images_api.CLIENT_JOB.set(mark if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", mark) else None)
             try:
                 self._post()
             except BadBody as e:                              # #893: a malformed or oversized chunked body
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _post(self):
+            path = own_path(self.path.split("?")[0].rstrip("/"))   # issue #55: Claude Code posts /v1/messages?beta=true
+            if path in self.TRANSLATE_POST:                # their own keys (DeepL's header, LibreTranslate's body)
+                self._translate_post(path)
+                return
             if not self._authorized():
                 return
-            path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             # an Anthropic client given ".../v1" as its base posts /v1/v1/messages
             path = V1_V1_ALIASES.get(path, path)
+            if path == "/v1/images/loras" or path.startswith("/v1/images/loras/"):   # the Images view's adapters:
+                self._loras_post(path)                   # its own page checks (an upload is not JSON)
+                return
             if path.startswith("/v1/") and self._foreign_page():
                 return
             if path == "/settings":
@@ -8355,6 +10450,9 @@ def make_handler(svc: Service):
             if path == "/config":
                 self._config_post()
                 return
+            if path == "/skills":
+                self._skills_post()
+                return
             if path in ("/unload", "/load") and not self._control_body():
                 return
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
@@ -8362,6 +10460,37 @@ def make_handler(svc: Service):
                 return
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
+                return
+            if path == "/v1/xestrata/debug/chat":              # the web page's chat, for the debug chat log
+                if svc.debug_log is None:
+                    self._json(404, {"error": {"message": "the debug chat log is off"}})
+                    return
+                try:
+                    chat = json.loads(self._body() or b"{}")
+                except ValueError:
+                    chat = None
+                if not isinstance(chat, dict) or not svc.debug_log.chat(str(chat.get("id") or ""), chat):
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": "send a chat with its id"}})
+                    return
+                self._json(200, {"saved": True})
+                return
+            if path.startswith("/v1/xestrata/replies/") and path.endswith("/cancel"):   # the web app's Stop
+                if not self._control_body():
+                    return
+                reply = REPLIES.get(path[len("/v1/xestrata/replies/"):-len("/cancel")])
+                if reply is None:
+                    self._json(404, {"error": {"message": "no such reply"}})
+                    return
+                reply.cancel.set()
+                self._json(200, {"cancelled": not reply.done})
+                return
+            if path.startswith("/v1/xestrata/replies/") and path.endswith("/ack"):      # the web app has read it
+                if not self._control_body():
+                    return
+                if not REPLIES.ack(path[len("/v1/xestrata/replies/"):-len("/ack")]):
+                    self._json(404, {"error": {"message": "no such reply"}})
+                    return
+                self._json(200, {"released": True})
                 return
             if path == "/update":                            # About's "Check now": ask GitHub again
                 if self._control_body() and self._own_page("a check for a new release can be asked"):
@@ -8403,9 +10532,40 @@ def make_handler(svc: Service):
                 if path == "/v1/images/edits":                # a form (OpenAI's multipart) or JSON: read there
                     self._images_edit()
                     return
+                if path == "/v1/images/upscale":              # a form (LocalAI's multipart) or JSON: read there
+                    self._images_upscale()
+                    return
+                if path == "/v1/lora/jobs" or path.startswith("/v1/lora/jobs/"):
+                    self._lora_post(path)   # the browser's LoRA training (serve/lora_train.py)
+                    return
+                if path in ("/v1/videos", "/v1/videos/sync", "/v1/videos/segmentations"):
+                    self._videos_post(path)   # a video's upscale or segmentation (vLLM-Omni's): its upload streamed
+                    return
+                if path == "/v1/videos/files":                # a video the chat's page attaches (upscale_video's)
+                    self._videos_file()
+                    return
+                if path in ("/v1/images/segmentations", "/v1/images/remove-background",
+                            "/v2beta/stable-image/edit/remove-background"):   # forms or JSON (image_regions)
+                    self._images_regions(path)
+                    return
+                if path == "/v1/images/controls":   # a control image alone, to look at before sending (image_controls)
+                    self._images_controls()
+                    return
+                if path.startswith("/v1/images/licenses/"):   # agreeing to a tool's weights' license (SAM 3's)
+                    if self._own_page("a license can be agreed to"):
+                        self._image_license(path[len("/v1/images/licenses/"):], json.loads(self._body() or b"{}"))
+                    return
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if path in ("/v1/chat/completions", "/v1/completions") and svc.translation is not None \
+                        and translate_mod.model_for(req.get("model")) is svc.translation.model:
+                    self._translate_openai(path, req)      # the translation model's
+                    return
+                if path == "/v1/completions":              # (the text model takes its chat and Anthropic's messages)
+                    self._json(404, {"error": {"message": "POST /v1/completions is the translation model's: name it "
+                                                          "in \"model\"", "type": "invalid_request_error"}})
+                    return
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -8448,7 +10608,12 @@ def make_handler(svc: Service):
                     self._json(200, {"status": result, **svc.v1_status()})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    # the script guard for a client that cannot add a field to the body; the body's own field wins
+                    sg_header = self.headers.get("X-XeStrata-Script-Guard")
+                    if sg_header and isinstance(req, dict) and req.get("script_guard") is None:
+                        req["script_guard"] = script_guard.parse(sg_header, "X-XeStrata-Script-Guard")
                     self.record = svc.begin_request(path, req)
+                    self.debug = svc.debug_begin(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
@@ -8471,14 +10636,21 @@ def make_handler(svc: Service):
                 else:
                     self._json(404, {"error": {"message": f"Invalid URL (POST {path})",
                                                "type": "invalid_request_error"}})
+            except EngineClosing as e:                      # 台帳 0589: a request that arrived during the stop
+                self._json(503, {"error": {"type": "server_error", "code": "server_draining", "message": str(e)}},
+                           headers={"Retry-After": 1})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
-                print(f"[strata] 503: {e}", flush=True)
+                print(f"[xestrata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
                            else {"error": {"type": "server_error", "message": str(e)}})
             except (ValueError, OverflowError) as e:            # OverflowError: int() of a JSON number such as 1e999
-                print(f"[strata] 400 invalid request: {e}", flush=True)
+                print(f"[xestrata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
+                elif path == "/v1/chat/completions" and isinstance(e, ContextOverflow):
+                    # OpenAI's own overflow error: clients that go by the code, not the words, see it as one
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e),
+                                               "param": "messages", "code": "context_length_exceeded"}})
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except ModelBusy as e:                           # the control routes (/v1/load, /v1/vram, ...): 409
@@ -8502,7 +10674,7 @@ def make_handler(svc: Service):
                 if getattr(self, "answer_started", False):
                     raise
                 import traceback
-                print(f"[strata] 400 malformed request ({type(e).__name__}: {e}):\n" + traceback.format_exc(),
+                print(f"[xestrata] 400 malformed request ({type(e).__name__}: {e}):\n" + traceback.format_exc(),
                       flush=True)
                 body = {"error": {"type": "invalid_request_error",
                                   "message": f"the request is malformed ({type(e).__name__}: {e})"}}
@@ -8522,7 +10694,7 @@ def make_handler(svc: Service):
                     self._note(outcome="disconnected")
                     raise                                    # the server's own handling
                 import traceback
-                print(f"[strata] 500: a file error ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
+                print(f"[xestrata] 500: a file error ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
                 self._json(500, {"error": {"type": "server_error", "message": "the server could not read or write a "
                                            f"file of its own: {e.strerror or type(e).__name__}"}})
             except BadBody:
@@ -8533,7 +10705,8 @@ def make_handler(svc: Service):
                 if getattr(self, "answer_started", False):
                     raise
                 import traceback
-                print(f"[strata] 500 internal error ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
+                print(f"[xestrata] 500 internal error ({type(e).__name__}: {e}):\n" + traceback.format_exc(),
+                      flush=True)
                 self._note(error=f"{type(e).__name__}: {e}")
                 message = f"internal server error ({type(e).__name__}: {e})"
                 self._json(500, responses_error_body(message, "server_error") if path == "/v1/responses"
@@ -8549,25 +10722,74 @@ def make_handler(svc: Service):
                         record["finished_at"] = time.time()
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
+                if self.debug is not None and not self.debug.get("_streaming"):
+                    svc.debug_end(self.debug)            # no answer started: what there was
+                svc.request_trace.debug = None
+
+        def _images_available(self) -> bool:
+            if svc.images is not None:
+                return True
+            self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                       "message": images_api.not_set_up_message()}})
+            return False
+
+        def _load_image_source(self, source: str) -> bytes:
+            """A picture a request names: one this server kept, asked for by its own link, is read from the store that
+            kept it (images_api.kept_link) - a chain hands the link a previous result gave straight back as the next
+            input, and fetching one's own address is what the #28 guard refuses.  Any other http(s) URL goes through
+            svc.download, a data: URL or a path through Vision.load."""
+            name = images_api.kept_link(source, self.headers.get("Host") or "") if svc.images is not None else None
+            if name is not None:
+                kept = svc.images.file(name)
+                if kept is None:
+                    raise ValueError("the image link names no picture kept here (the server keeps the newest "
+                                     f"images only): {source}")
+                return kept.read_bytes()
+            return svc.download(source) if source.startswith(("http://", "https://")) else Vision.load(source)
 
         def _images(self, req):
             """POST /v1/images/generations (serve/images.py): one image job in the GPU's turn."""
-            if svc.images is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": images_api.not_set_up_message()}})
+            if not self._images_available():
                 return
             gen = svc.images.pick(req.get("model"))             # the image model it names, else the default
+            images_api.check_tool(gen.cfg, "generate_image")    # the config's image_tools, at every entry
+            gen, moved = images_api.place(svc, gen, images_api.gpu_field(req))   # the GPU it chose (gpu)
+            req = controls_api.gather(req)
+            if req.get("control") is not None:                  # the composition from a picture (image_controls)
+                images_api.check_tool(gen.cfg, "control")
+                job = controls_api.parse_job(req, gen.cfg, picture=self._control_picture(req))
+                self._image_job(gen, job, req.get("stream") is True, edit=job.get("refs") is not None, moved=moved)
+                return
             job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
-            self._image_job(gen, job, req.get("stream") is True)
+            self._image_job(gen, job, req.get("stream") is True, moved=moved)
+
+        def _control_picture(self, req: dict) -> bytes | None:
+            """The control's picture: the multipart control_image, else control.image given as an http(s) URL or a
+            path (as an edit's images are read; a data: URL or base64 parse_control reads itself)."""
+            picture = req.pop("control_image", None)
+            c = req.get("control")
+            src = c.get("image") if isinstance(c, dict) else None
+            if isinstance(src, dict):
+                src = src.get("image_url") or src.get("url")
+            if isinstance(src, dict):
+                src = src.get("url")
+            if picture is None and isinstance(src, str) and not src.startswith("data:"):
+                # bare base64 is an inline picture (JPEG's always starts with /9j/), not the path it resembles
+                inline = src.startswith("/9j/") or not src.startswith("/") and \
+                    re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", src) is not None
+                if not inline and (src.startswith(("http://", "https://", "/", "file:")) or "." in src[-6:]):
+                    self._no_local_sources([src])
+                    picture = self._load_image_source(src)
+                    if isinstance(c, dict):
+                        c.pop("image", None)
+            return Vision.normalize(picture) if picture else None
 
         def _images_edit(self):
             """POST /v1/images/edits (serve/images.py): reference images and a prompt in OpenAI's multipart form (image
             or image[]), or JSON (images: [{"image_url": ...}], or image: a URL or a list), one image job in the GPU's
             turn.  The images are read as a chat's are (data: URLs, http(s) URLs, local paths; formats stb_image does
             not read converted to PNG)."""
-            if svc.images is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": images_api.not_set_up_message()}})
+            if not self._images_available():
                 return
             body = self._body()
             ctype = self.headers.get("Content-Type", "") or ""
@@ -8589,7 +10811,7 @@ def make_handler(svc: Service):
                     if not isinstance(url, str) or not url:
                         raise ValueError("images: [{\"image_url\": a data: URL, an http(s) URL or a path}]")
                     self._no_local_sources([url])     # #27: as the chat routes, before anything is read
-                    files.append(svc.download(url) if url.startswith(("http://", "https://")) else Vision.load(url))
+                    files.append(self._load_image_source(url))
                 # the mask as an image is given ({"image_url": ...} or the URL), its alpha kept (not normalized)
                 mask = req.pop("mask", None)
                 if isinstance(mask, dict):
@@ -8600,39 +10822,591 @@ def make_handler(svc: Service):
                     if not isinstance(mask, str) or not mask:
                         raise ValueError("mask: {\"image_url\": a data: URL, an http(s) URL or a path}")
                     self._no_local_sources([mask])
-                    mask = svc.download(mask) if mask.startswith(("http://", "https://")) else Vision.load(mask)
+                    mask = self._load_image_source(mask)
             # the image model it names; else the default, or where that one has no edits (MageTrail), the first that
             # edits - unless the request is img2img's (a strength or a mask), which the default takes
-            gen = svc.images.pick_edit(req.get("model"), req.get("strength") is not None or mask is not None)
-            job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files], gen.cfg,
-                                                mask)
-            self._image_job(gen, job, req.get("stream") is True, edit=True)
+            region = req.pop("region", None)
+            region_model = req.pop("region_model", None)
+            gen = svc.images.pick_edit(req.get("model"), req.get("strength") is not None or mask is not None
+                                       or region not in (None, ""))
+            images_api.check_tool(gen.cfg, "edit_image")
+            gen, moved = images_api.place(svc, gen, images_api.gpu_field(req))   # the GPU it chose (gpu)
+            if region not in (None, ""):   # the words' mask (image_regions: SAM 3 or Florence-2) in the GPU's turn
+                images_api.check_tool(gen.cfg, "edit_region")
+                if mask is not None:
+                    raise ValueError("region: a mask or a region, not both")
+                if not files:
+                    raise ValueError("region: an image to find it in")
+                cancel = threading.Event()
+                self._watch_client(cancel)
+                try:
+                    mask, found = regions_api.region_mask(svc, gen, Vision.normalize(files[0]), str(region),
+                                                          region_model, cancel)
+                except (images_api.AuxPending, images_api.ImageJobFailed) as e:
+                    self._aux_failed(e)
+                    return
+                print(f"[xestrata] image: region {str(region)[:40]!r}: {len(found['instances'])} instance(s) by "
+                      f"{found['model']}", flush=True)
+            for key, tool in (("fix", "fix_image"), ("upscale", "upscale_image"), ("extend", "extend_image")):
+                if req.get(key) is not None:
+                    images_api.check_tool(gen.cfg, tool)
+            req = controls_api.gather(req)
+            if req.get("control") is not None:   # the composition from a picture (image_controls)
+                images_api.check_tool(gen.cfg, "control")
+                job = controls_api.parse_job(req, gen.cfg, [Vision.normalize(d, keep_alpha=True) for d in files],
+                                             mask, self._control_picture(req), edit=True)
+            else:
+                job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files],
+                                                    gen.cfg, mask)
+            self._image_job(gen, job, req.get("stream") is True, edit=True, moved=moved)
 
-        def _image_job(self, gen, job, stream=False, edit=False):
-            """One image job (a generation or an edit) in the GPU's turn, answered as OpenAI's images API does: one
-            JSON body, or with `stream` its events (_image_stream)."""
+        def _images_upscale(self):
+            """POST /v1/images/upscale (LocalAI's upscale; images_api.upscale_request): one image in a multipart form
+            (image), or JSON (image: a data: URL, an http(s) URL or a path, or {"image_url": ...}), made larger by an
+            upscaler and with extra_params' redraw drawn again by the image model, in the GPU's turn; the answer as
+            OpenAI's images API gives one (created, data[].b64_json or url)."""
+            if not self._images_available():
+                return
+            fields, picture = self._one_image()
+            req, model = images_api.upscale_request(fields)
+            gen = svc.images.pick_edit(model, True)
+            images_api.check_tool(gen.cfg, "upscale_image")
+            gen, moved = images_api.place(svc, gen, images_api.gpu_field(fields))   # the GPU it chose (gpu)
+            job = images_api.parse_edit_request(req, [Vision.normalize(picture, keep_alpha=True)], gen.cfg)
+            self._image_job(gen, job, edit=True, moved=moved)
+
+        def _lora_jobs(self) -> lora_train_api.TrainJobs:
+            return lora_train_api.jobs_of(svc)
+
+        def _lora_get(self, path: str) -> None:
+            """GET /v1/lora/models (the trainable models), /v1/lora/jobs (the jobs), /v1/lora/jobs/{id} (its record),
+            /v1/lora/jobs/{id}/images|samples/{file} (a picture: the job's id, 32 random hex digits, is the access,
+            as an image file's link)."""
+            if path == "/v1/lora/models":
+                if self._authorized():
+                    self._json(200, {"models": lora_train_api.model_rows(svc)})
+                return
+            jobs = self._lora_jobs()
+            if path == "/v1/lora/jobs":
+                if self._authorized():
+                    self._json(200, {"jobs": jobs.list_jobs()})
+                return
+            rest = path[len("/v1/lora/jobs/"):]
+            jid, _, tail = rest.partition("/")
+            rec = jobs.get(jid)
+            if rec is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "not_found",
+                                           "message": "no such training job"}})
+                return
+            if tail == "":
+                if self._authorized():
+                    self._json(200, rec)
+                return
+            kind, _, name = tail.partition("/")
+            if kind in ("images", "samples") and re.fullmatch(r"[0-9A-Za-z._-]+", name or ""):
+                f = jobs.dir_of(jid) / kind / name
+                if f.is_file():
+                    body = f.read_bytes()
+                    mimes = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                             ".webp": "image/webp", ".bmp": "image/bmp"}
+                    mime = mimes.get(f.suffix.lower(), "application/octet-stream")
+                    self.send_response(200)
+                    self.send_header("Content-Type", mime)
+                    self.send_header("Cache-Control", "private, max-age=86400")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+            self._json(404, {"error": {"type": "invalid_request_error", "code": "not_found", "message": "not found"}})
+
+        def _lora_post(self, path: str) -> None:
+            """POST /v1/lora/jobs (a draft: the images a multipart form, the fields name/kind/trigger/model),
+            /v1/lora/jobs/{id}/images (more images), and the JSON actions caption / start / cancel / resume /
+            register (serve/lora_train.py)."""
+            if not self._authorized():
+                return
+            jobs = self._lora_jobs()
+            folder = jobs.root / f"upload-{uuid.uuid4().hex}"
+            try:
+                parts = path.strip("/").split("/")
+                if path == "/v1/lora/jobs" or (len(parts) == 5 and parts[4] == "images"):
+                    ctype = self.headers.get("Content-Type", "") or ""
+                    length = int(self.headers.get("Content-Length") or -1)
+                    if not ctype.lower().startswith("multipart/form-data") or length < 0:
+                        raise lora_train_api.TrainError("send the images in a multipart/form-data form (images)")
+                    if length > lora_train_api.MAX_DATASET_BYTES + (1 << 20):
+                        raise lora_train_api.TrainError(
+                            f"the upload is past the limit of {lora_train_api.MAX_DATASET_BYTES >> 20} MiB", 413)
+                    folder.mkdir()
+                    fields, files = videos_api.stream_multipart(self.rfile, ctype, length, folder,
+                                                                lora_train_api.MAX_IMAGE_BYTES)
+                    pics = [(f.get("filename") or "image.png", Path(f["path"]).read_bytes())
+                            for f in files if f["field"] in ("images", "images[]", "file")]
+                    if path == "/v1/lora/jobs":
+                        self._json(200, jobs.create(fields, pics))
+                    else:
+                        rec = jobs.get(parts[3])
+                        if rec is None:
+                            raise lora_train_api.TrainError(f"{parts[3]}: no such job", 404)
+                        for fname, data in pics:
+                            jobs.add_image(parts[3], fname, data)
+                        self._json(200, jobs.get(parts[3]))
+                    return
+                req = json.loads(self._body() or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("send a JSON object")
+                if len(parts) != 5:
+                    raise lora_train_api.TrainError(f"Invalid URL (POST {path})", 404)
+                jid, action = parts[3], parts[4]
+                if action == "caption":
+                    self._json(200, jobs.caption(jid, req.get("style_words", "")))
+                elif action == "start":
+                    self._json(200, jobs.start(jid, req))
+                elif action == "cancel":
+                    self._json(200, jobs.cancel(jid))
+                elif action == "resume":
+                    self._json(200, jobs.resume(jid, req.get("steps")))
+                elif action == "register":
+                    step = req.get("step")
+                    if step is not None:
+                        step = int(step)
+                    self._json(200, jobs.register(jid, step, req.get("name")))
+                else:
+                    raise lora_train_api.TrainError(f"Invalid URL (POST {path})", 404)
+            except videos_api.VideoRequestError as e:
+                self._json(e.status, {"error": {"type": "invalid_request_error", "code": "invalid_training",
+                                                "message": str(e)}})
+            except (lora_train_api.TrainError, ValueError) as e:
+                self._json(*lora_train_api.explain(e))
+            finally:
+                shutil.rmtree(folder, ignore_errors=True)
+
+        def _video_jobs(self) -> videos_api.VideoJobs:
+            return videos_api.jobs_of(svc)
+
+        def _videos_post(self, path: str) -> None:
+            """POST /v1/videos (a job: its record answered at once, queued) and /v1/videos/sync (the file in the
+            answer): a video upscaled (serve/videos.py), its source a multipart form's file (input_references or
+            video), written to the job's folder as it arrives.  POST /v1/videos/segmentations: its objects found
+            (vLLM-Omni's answer, or a job with job true); its source the form's file, or video_url, a chat's kept
+            video (/v1/videos/files/...)."""
+            if not self._images_available():
+                return
+            seg = path.endswith("/segmentations")
+            sync = path.endswith("/sync")
+            jobs = self._video_jobs()
+            vid, folder = jobs.new_dir()
+            keep = False
+            try:
+                ctype = self.headers.get("Content-Type", "") or ""
+                if not ctype.lower().startswith("multipart/form-data"):
+                    raise videos_api.VideoRequestError("send the video in a multipart/form-data form "
+                                                       "(input_references)")
+                length = int(self.headers.get("Content-Length") or -1)
+                if length < 0:
+                    raise videos_api.VideoRequestError("the form needs its Content-Length")
+                limit = (videos_api.SYNC_MAX_BYTES if sync
+                         else videos_api.upload_limit(svc.images.default.cfg, jobs.root))
+                if length > limit + (1 << 20):
+                    raise videos_api.VideoRequestError(f"the upload is past the limit of {limit >> 20} MiB"
+                                                       + ("" if sync else " (video.max_upload_mib)"), 413)
+                fields, files = videos_api.stream_multipart(self.rfile, ctype, length, folder, limit)
+                src = next((f for f in files if f["field"] in videos_api.FILE_FIELDS), files[0] if files else None)
+                if seg:
+                    sync = not videos_api.flag_field(fields, "job")
+                    if sync and length > videos_api.SYNC_MAX_BYTES + (1 << 20):
+                        raise videos_api.VideoRequestError(
+                            f"the upload is past the limit of {videos_api.SYNC_MAX_BYTES >> 20} MiB", 413)
+                    m = videos_api.FILE_REF.search(str(fields.get("video_url") or ""))
+                    if src is None and m and (kept := videos_api.file_path(jobs, m.group(1))) is not None:
+                        if not sync:
+                            rec = videos_api.start_from_file(svc, jobs, kept, fields, svc.images.default.cfg,
+                                                             "segment")
+                            self._json(200, rec)
+                            return
+                        src = {"path": kept}
+                if src is None:
+                    raise videos_api.VideoRequestError("video: the video to find the objects of" if seg
+                                                       else "input_references: the video to upscale")
+                info = videos_api.probe(src["path"])
+                gen = svc.images.pick_edit(None, True)
+                if seg:
+                    images_api.check_tool(gen.cfg, "segment_video")
+                    job = videos_api.segment_request(fields, info, sync)
+                    images_api.card_of(svc, job["gpu"])   # a card that takes no image job: 400 before the job
+                    model = str(fields.get("model") or "sam3.1")
+                    if model not in ("auto", *regions_api.SEG_ALIASES) or \
+                            regions_api.SEG_ALIASES.get(model, regions_api.SAM3) != regions_api.SAM3:
+                        raise videos_api.VideoRequestError(f"model: sam3.1, not {model!r}")
+                    svc.last_request_at = time.time()
+                    print(f"[xestrata] video segmentation: {[w['prompt'] for w in job['segment']['words']]!r} "
+                          f"{len(job['segment']['clicks'])} clicks, {info['frames']} frames", flush=True)
+                    if not sync:
+                        rec = jobs.create(vid, model, job, src["path"])
+                        keep = True
+                        self._json(200, rec)
+                        return
+                    cancel = threading.Event()
+                    self._watch_client(cancel)
+                    gen, _ = images_api.place(svc, gen, job["gpu"])
+                    out = videos_api.segment(svc, gen, job, src["path"], folder / "out", model, None, cancel)
+                    f = Path(out["path"])
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(f.stat().st_size))
+                    self.send_header("X-Request-Id", vid)
+                    self._cors()
+                    self.end_headers()
+                    with open(f, "rb") as fh:
+                        while chunk := fh.read(1 << 20):
+                            self.wfile.write(chunk)
+                    return
+                images_api.check_tool(gen.cfg, "upscale_image")
+                job = videos_api.upscale_request(fields, info, gen.cfg, sync)
+                images_api.card_of(svc, job["gpu"])   # a card that takes no image job: 400 before the job
+                model = str(fields.get("model") or "auto")
+                svc.last_request_at = time.time()
+                if not sync:
+                    rec = jobs.create(vid, model, job, src["path"])
+                    keep = True
+                    self._json(200, rec)
+                    return
+                cancel = threading.Event()
+                self._watch_client(cancel)
+                t0 = time.monotonic()
+                gen, _ = images_api.place(svc, gen, job["gpu"])
+                out = videos_api.upscale(svc, gen, job, src["path"], folder / "out", None, cancel)
+                f = Path(out["path"])
+                self.send_response(200)
+                self.send_header("Content-Type", out["mime"])
+                self.send_header("Content-Length", str(f.stat().st_size))
+                self.send_header("X-Request-Id", vid)
+                self.send_header("X-Model", model)
+                self.send_header("X-Inference-Time-S", f"{time.monotonic() - t0:.3f}")
+                self.send_header("X-Video-Frames", str(out["figures"]["frames"]))
+                self.send_header("X-Video-Fps", f"{out['figures']['fps']:.6f}")
+                if out["figures"]["vfr"]:   # read at its average rate: the frames dropped or repeated to it
+                    self.send_header("X-Video-Vfr", "read at its average frame rate")
+                self._cors()
+                self.end_headers()
+                with open(f, "rb") as fh:
+                    while chunk := fh.read(1 << 20):
+                        self.wfile.write(chunk)
+            except images_api.AuxPending as e:
+                self._aux_failed(e)
+            except (videos_api.VideoRequestError, images_api.ImageRequestError) as e:
+                status, body = videos_api.explain(e) if isinstance(e, videos_api.VideoRequestError) else \
+                    (400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                self._json(status, body)
+            except images_api.LongJobBusy as e:
+                self._json(503, {"error": {"type": "server_error", "code": "busy", "message": str(e)}},
+                           headers={"Retry-After": e.retry_after})
+            except images_api.ImageJobFailed as e:
+                self._json(500, {"error": {"type": "server_error", "code": "video_failed", "message": str(e)}})
+            finally:
+                if not keep:
+                    shutil.rmtree(folder, ignore_errors=True)
+
+        def _videos_file(self) -> None:
+            """POST /v1/videos/files: a video the chat's page attaches, a multipart form's file, kept a week
+            (videos.store_file) -> its link and what ffprobe says of it."""
+            if not self._images_available():
+                return
+            jobs = self._video_jobs()
+            folder = videos_api.files_dir(jobs) / f"upload-{uuid.uuid4().hex}"
+            folder.mkdir()
+            try:
+                ctype = self.headers.get("Content-Type", "") or ""
+                length = int(self.headers.get("Content-Length") or -1)
+                if not ctype.lower().startswith("multipart/form-data") or length < 0:
+                    raise videos_api.VideoRequestError("send the video in a multipart/form-data form (file)")
+                limit = videos_api.upload_limit(svc.images.default.cfg, jobs.root)
+                if length > limit + (1 << 20):
+                    raise videos_api.VideoRequestError(f"the upload is past the limit of {limit >> 20} MiB "
+                                                       "(video.max_upload_mib)", 413)
+                _, files = videos_api.stream_multipart(self.rfile, ctype, length, folder, limit)
+                if not files:
+                    raise videos_api.VideoRequestError("file: the video")
+                self._json(200, videos_api.store_file(jobs, Path(files[0]["path"]), files[0].get("filename") or ""))
+            except videos_api.VideoRequestError as e:
+                self._json(*videos_api.explain(e))
+            finally:
+                shutil.rmtree(folder, ignore_errors=True)
+
+        def _videos_get(self, path: str) -> None:
+            """GET /v1/videos (the jobs, newest first: limit, after, order), /v1/videos/{id} (its record) and
+            /v1/videos/{id}/content (its file once completed)."""
+            if not self._images_available():
+                return
+            jobs = self._video_jobs()
+            if path == "/v1/videos":
+                q = {k: v[-1] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                try:
+                    limit = int(q.get("limit") or 20)
+                except ValueError:
+                    limit = 20
+                self._json(200, jobs.list(limit, q.get("after"), q.get("order") or "desc"))
+                return
+            rest = path[len("/v1/videos/"):]
+            vid, _, tail = rest.partition("/")
+            rec = jobs.get(vid)
+            if rec is None or tail not in ("", "content"):
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "not_found",
+                                           "message": "no such video"}})
+                return
+            if tail == "":
+                self._json(200, jobs.public(rec))
+                return
+            q = {k: v[-1] for k, v in parse_qs(urlsplit(self.path).query).items()}
+            got = jobs.content(vid, q.get("variant") or "")
+            if got is None and q.get("variant") and rec.get("status") == "completed":
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "not_found",
+                                           "message": f"the job has no {q['variant']} (its files: "
+                                                      f"{', '.join(rec.get('files') or {}) or 'none'})"}})
+                return
+            if got is None:
+                still = rec.get("status") in ("queued", "in_progress")
+                self._json(404 if still else 422, {"error": {
+                    "type": "invalid_request_error", "code": "not_ready" if still else "video_failed",
+                    "message": "the video is still being made" if still else "the job failed: see its record"}})
+                return
+            if got[1] == "application/json":
+                body = got[0].read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self._cors()
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self._send_video(*got)
+
+        def _send_video(self, f: Path, mime: str) -> None:
+            """A video file, or the part a Range asks for (a player's seek: 206)."""
+            size = f.stat().st_size
+            first, last = 0, size - 1
+            m = re.fullmatch(r"bytes=(\d*)-(\d*)", (self.headers.get("Range") or "").strip())
+            if m and (m.group(1) or m.group(2)):   # a player's seek: the part asked for (one range)
+                if m.group(1):
+                    first, last = int(m.group(1)), min(int(m.group(2) or last), last)
+                else:
+                    first = max(0, size - int(m.group(2)))
+                if first > last:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self._cors()
+                    self.end_headers()
+                    return
+            self.send_response(206 if m and (m.group(1) or m.group(2)) else 200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(last - first + 1))
+            if m and (m.group(1) or m.group(2)):
+                self.send_header("Content-Range", f"bytes {first}-{last}/{size}")
+            self.send_header("Content-Disposition", f'inline; filename="{f.name}"')
+            self.send_header("Cache-Control", "private, max-age=86400")
+            self._cors()
+            self.end_headers()
+            with open(f, "rb") as fh:
+                fh.seek(first)
+                left = last - first + 1
+                while left > 0 and (chunk := fh.read(min(1 << 20, left))):
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+
+        def _one_image(self) -> tuple[dict, bytes]:
+            """A request of one image: a multipart form (its image file and text fields) or JSON (image: a data: URL,
+            an http(s) URL or a path, or {"image_url": ...}) -> (the fields, the image's bytes)."""
+            body = self._body()
+            ctype = self.headers.get("Content-Type", "") or ""
+            if ctype.lower().startswith("multipart/form-data"):
+                fields, files = parse_multipart(ctype, body)
+                fields.pop("mask", None)
+            else:
+                fields = json.loads(body or b"{}")
+                if not isinstance(fields, dict):
+                    raise ValueError("send a JSON object or a multipart form")
+                src = fields.pop("image", None)
+                url = src.get("image_url") if isinstance(src, dict) else src
+                if isinstance(url, dict):
+                    url = url.get("url")
+                if not isinstance(url, str) or not url:
+                    raise ValueError("image: a data: URL, an http(s) URL or a path")
+                self._no_local_sources([url])
+                files = [self._load_image_source(url)]
+            if len(files) != 1:
+                raise ValueError("image: one image")
+            return fields, files[0]
+
+        def _aux_failed(self, e: Exception) -> None:
+            """An image tool's request that could not run: its weights downloading or failed (AuxPending: 503, 500),
+            or the engine's failure (500)."""
+            if isinstance(e, images_api.AuxPending):
+                failed = any(d.get("status") == "failed" for d in e.downloads)
+                body = {"error": {
+                    "type": "server_error", "code": "weights_download_failed" if failed else "weights_downloading",
+                    "message": str(e), "downloads": [{k: v for k, v in d.items() if k != "path"}
+                                                     for d in e.downloads]}}
+                self._json(500 if failed else 503, body, headers=None if failed else {"Retry-After": image_aux.RETRY_S})
+                return
+            if isinstance(e, images_api.LongJobBusy):
+                self._json(503, {"error": {"type": "server_error", "code": "busy", "message": str(e)}},
+                           headers={"Retry-After": e.retry_after})
+                return
+            self._json(500, {"error": {"type": "server_error", "code": "image_tool_failed", "message": str(e)}})
+
+        def _images_regions(self, path: str) -> None:
+            """POST /v1/images/segmentations (vLLM-Omni's), /v1/images/remove-background (fal's BiRefNet fields,
+            vLLM-Omni's images answer) and Stability's /v2beta/stable-image/edit/remove-background (image_regions),
+            synchronous, in the image jobs' GPU turn; on the image model the GPU has now (none: the default)."""
+            if not self._images_available():
+                return
+            fields, picture = self._one_image()
+            picture = Vision.normalize(picture)
+            gen = next((g for g in svc.images.gens.values() if g.engine.alive()), svc.images.default)
+            images_api.check_tool(gen.cfg, "find_region" if path.endswith("segmentations") else "remove_background")
+            gen, moved = images_api.place(svc, gen, images_api.gpu_field(fields))   # the GPU it chose (gpu)
             svc.last_request_at = time.time()
             cancel = threading.Event()
             self._watch_client(cancel)
-            print(f"[strata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
+            try:
+                if path == "/v1/images/segmentations":
+                    print(f"[xestrata] segmentation: {str(fields.get('prompt') or '')[:60]!r}", flush=True)
+                    self._json(200, with_gpu(regions_api.segmentation_response(svc, gen, fields, picture, cancel),
+                                             moved))
+                elif path == "/v1/images/remove-background":
+                    req = regions_api.remove_background_request(fields)
+                    print(f"[xestrata] remove background: BiRefNet {req['version']}", flush=True)
+                    addr = cast(Any, self.server.server_address)
+                    host = self.headers.get("Host") or f"{addr[0]}:{addr[1]}"
+                    scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
+                    self._json(200, with_gpu(regions_api.remove_background_response(svc, gen, req, picture,
+                                                                                    f"{scheme}://{host}", cancel),
+                                             moved))
+                else:   # Stability's: the image's bytes, or with Accept application/json {"image": base64}
+                    data, fmt = regions_api.stability_remove_background(svc, gen, fields, picture, cancel)
+                    if "application/json" in (self.headers.get("Accept") or ""):
+                        self._json(200, {"image": base64.b64encode(data).decode(), "finish_reason": "SUCCESS",
+                                         "seed": 0})
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", images_api.FORMATS[fmt])
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("finish-reason", "SUCCESS")
+                    self.send_header("seed", "0")
+                    self.end_headers()
+                    self.wfile.write(data)
+            except (images_api.AuxPending, images_api.ImageJobFailed) as e:
+                self._aux_failed(e)
+
+        def _images_controls(self) -> None:
+            """POST /v1/images/controls (image_controls.preview_*): the control image a request's control would give
+            the image model (canny, depth, pose...), synchronous, in the image jobs' GPU turn, on the image model the
+            GPU has now (none: the default)."""
+            if not self._images_available():
+                return
+            fields, picture = self._one_image()
+            gen = next((g for g in svc.images.gens.values() if g.engine.alive()), svc.images.default)
+            images_api.check_tool(gen.cfg, "control")
+            gen, _ = images_api.place(svc, gen, images_api.gpu_field(fields))   # the GPU it chose (gpu)
+            req = controls_api.preview_request(fields, Vision.normalize(picture))
+            svc.last_request_at = time.time()
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            addr = cast(Any, self.server.server_address)
+            host = self.headers.get("Host") or f"{addr[0]}:{addr[1]}"
+            scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
+            print(f"[xestrata] control image: {str(fields.get('type') or '')[:20]!r}", flush=True)
+            try:
+                self._json(200, controls_api.preview_response(svc, gen, req, f"{scheme}://{host}", cancel))
+            except (images_api.AuxPending, images_api.ImageJobFailed) as e:
+                self._aux_failed(e)
+
+        def _model_terms(self) -> dict:
+            """GET /v1/licenses/models: the terms of the models this server runs (serve/model_terms.py), each text
+            whole; the texts not here yet (a model set up before setup fetched them) are fetched in the background, and
+            the page asks again."""
+            rows = model_terms.text_model_rows(svc.config_path, svc.vision is not None)
+            if svc.images is not None:
+                gens = list(svc.images.gens.values())
+                rows += model_terms.image_rows([g.cfg for g in gens], image_aux.aux_dir(svc.images.default.cfg),
+                                               [(g.model, Path(g.loras.dir) / e["path"]) for g in gens
+                                                for e in g.loras.listing()])
+            if svc.translation is not None:
+                rows += model_terms.translation_rows(svc.translation.model)
+            missing = [r["repo"] for r in rows if r.get("repo") and any(t["text"] is None for t in r.get("texts", ()))]
+            fetching = bool(missing) and svc.terms_fetch.start(missing)
+            return {"models": rows, "fetching": fetching}
+
+        def _image_license(self, name: str, req: dict | None) -> None:
+            """GET: a tool's weights' license (image_aux.license_text: SAM 3's, fetched to show) and whether it is
+            agreed to; POST {"accept": true} (from the server's own page): agreed (image_aux.accept)."""
+            if svc.images is None:
+                self._json(404, {"error": {"message": "the image tools are not set up"}})
+                return
+            q = image_aux._qimage()
+            if name not in q.AUX or not q.AUX[name].get("consent"):
+                self._json(404, {"error": {"message": f"no license to agree to for {name!r}"}})
+                return
+            root = image_aux.aux_dir(svc.images.default.cfg)
+            if req is not None:
+                if req.get("accept") is not True:
+                    raise ValueError('send {"accept": true} to agree to the license')
+                image_aux.accept(name, root, "the web page")
+                print(f"[xestrata] image tools: the {name} license agreed to on the web page", flush=True)
+            got = image_aux.license_text(name, root, lambda m: print(f"[xestrata] {m}", flush=True))
+            self._json(200, {**{k: v for k, v in got.items() if k != "path"},
+                             "accepted": not image_aux.needs_consent(name, root)})
+
+        def _image_job(self, gen, job, stream=False, edit=False, moved=None):
+            """One image job (a generation or an edit) in the GPU's turn, answered as OpenAI's images API does: one
+            JSON body, or with `stream` its events (_image_stream).  `moved`: images_api.place's word of the card,
+            the figures' "gpu"."""
+            svc.last_request_at = time.time()
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            print(f"[xestrata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
                   f"seed {job['seed']}" + (f", {len(job['refs'])} reference image(s)" if job.get("refs") else "")
                   + ("".join(f", adapter {u['name']} at {u['scale']:g}" for u in job.get("loras") or ())),
                   flush=True)
             if job.get("lora_unknown"):
-                print(f"[strata] image: no such LoRA {', '.join(job['lora_unknown'])} in this model's folder: "
+                print(f"[xestrata] image: no such LoRA {', '.join(job['lora_unknown'])} in this model's folder: "
                       "left out of the prompt", flush=True)
+            if moved:
+                why = {"video": "has a video job",
+                       "server": "has another server's image job"}.get(moved.get("busy") or "")
+                print(f"[xestrata] image: on {moved['name']}, the text model's GPU"
+                      + (f" ({moved['busy_name']} {why})" if why else ""), flush=True)
             if stream:
-                return self._image_stream(gen, job, cancel, edit)
+                return self._image_stream(gen, job, cancel, edit, moved)
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
             scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
             try:
                 images, figures, policy = images_api.make_images(svc, gen, job, cancel)
                 figures["gpu_policy"] = policy
-                print(f"[strata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
+                if moved:
+                    figures["gpu"] = moved
+                print(f"[xestrata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
+                auto = figures.get("gpu") or {}
+                if auto.get("card") == "auto":
+                    print(f"[xestrata] image: auto put it on {auto['name']} ({auto['pci']}), "
+                          f"{auto['free_mib']} MiB free for {auto['need_mib']} MiB", flush=True)
                 body = gen.response(images, job, figures, f"{scheme}://{host}")   # cjxl may fail (jxl)
             except images_api.LoraRejected as e:   # an adapter the request names, which the engine does not take
                 self._json(400, {"error": {"type": "invalid_request_error", "code": "lora_rejected", "param": "lora",
                                            "message": str(e)}})
+                return
+            except images_api.AuxPending as e:   # a tool's weights downloading (image_aux): ask again later
+                failed = any(d.get("status") == "failed" for d in e.downloads)
+                self._json(500 if failed else 503, {"error": {
+                    "type": "server_error", "code": "weights_download_failed" if failed else "weights_downloading",
+                    "message": str(e), "downloads": [{k: v for k, v in d.items() if k != "path"}
+                                                     for d in e.downloads]}})
+                return
+            except images_api.LongJobBusy as e:
+                self._json(503, {"error": {"type": "server_error", "code": "busy", "message": str(e)}},
+                           headers={"Retry-After": e.retry_after})
                 return
             except images_api.ImageJobFailed as e:
                 self._json(500, {"error": {"type": "server_error", "code": "image_generation_failed",
@@ -8640,10 +11414,10 @@ def make_handler(svc: Service):
                 return
             self._json(200, body)
 
-        def _image_stream(self, gen, job, cancel, edit):
+        def _image_stream(self, gen, job, cancel, edit, moved=None):
             """OpenAI's streamed images: image_generation.partial_image events (image_edit.* for an edit) as the
             engine makes the job's partial_images, then one .completed event an image (b64_json, with the usage on
-            each; and as the JSON body has, its seed and the "strata" figures), as SSE.  A failure after the stream
+            each; and as the JSON body has, its seed and the "xestrata" figures), as SSE.  A failure after the stream
             started is an error event."""
             kind = "image_edit" if edit else "image_generation"
             fmt, opaque = job["output_format"], job["background"] == "opaque"
@@ -8663,13 +11437,15 @@ def make_handler(svc: Service):
                     images, figures, policy = images_api.make_images(svc, gen, job, cancel,
                                                                      preview if job.get("partial_images") else None)
                     figures["gpu_policy"] = policy
-                    print(f"[strata] image done in {figures['seconds']:.1f} s ({policy}, stream)", flush=True)
+                    if moved:
+                        figures["gpu"] = moved
+                    print(f"[xestrata] image done in {figures['seconds']:.1f} s ({policy}, stream)", flush=True)
                     result["images"], result["figures"] = images, figures
                 except Exception as e:  # noqa: BLE001 - said in the stream: its status is sent already
                     result["error"] = e
                 finally:
                     events.put(None)
-            worker = threading.Thread(target=work, daemon=True)
+            worker = threading.Thread(target=contextvars.copy_context().run, args=(work,), daemon=True)   # its mark
             worker.start()
             self._sse()
 
@@ -8708,7 +11484,7 @@ def make_handler(svc: Service):
                                                "created_at": int(time.time()), **common(),
                                                **({"lora": applied} if applied else {}),
                                                "usage": images_api.usage(job), "model": gen.model,
-                                               "seed": job["seed"] + i, "strata": result["figures"]})
+                                               "seed": job["seed"] + i, "xestrata": result["figures"]})
             except OSError:
                 self._note(outcome="disconnected")
                 cancel.set()
@@ -8721,9 +11497,9 @@ def make_handler(svc: Service):
             if not svc.loaded() and not getattr(svc.engine, "unloaded", False):
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
-            greedy = asks_greedy(svc.shared, svc.sampling_defaults)
-            defaults = {**model_card_sampling(svc.model_arch, True, greedy=greedy),
-                        **svc.sampling_defaults, **svc.shared}
+            card = {} if svc.mtp_greedy and not request_asks_sampling(svc.shared, svc.sampling_defaults) else \
+                model_card_sampling(svc.model_arch, True, greedy=asks_greedy(svc.shared, svc.sampling_defaults))
+            defaults = {**card, **svc.sampling_defaults, **svc.shared}
             names = {"repetition_penalty": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
             params = {names.get(k, k): v for k, v in defaults.items()
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
@@ -8735,12 +11511,14 @@ def make_handler(svc: Service):
                      "chat_template_caps": svc.template.caps,
                      "modalities": {"vision": svc.vision is not None},
                      "models_autoload": hasattr(svc.engine, "restart"),
-                     "is_sleeping": not svc.loaded()}
+                     "is_sleeping": not svc.loaded(),
+                     # XeStrata's: the script guard of a request that names none (serve/script_guard.py)
+                     "script_guard": script_guard_name(svc.shared.get("script_guard") or svc.script_guard)}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
             if version:
-                props["build_info"] = "Strata " + str(version)
+                props["build_info"] = "XeStrata " + str(version)
             self._json(200, props)
 
         def _control_body(self) -> bool:
@@ -8785,10 +11563,167 @@ def make_handler(svc: Service):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return False
             if self._foreign_origin():
-                self._json(403, {"error": {"message": f"{what} only from Strata's own page (or an origin in the "
+                self._json(403, {"error": {"message": f"{what} only from XeStrata's own page (or an origin in the "
                                                       f"config's trusted_origins)"}})
                 return False
             return True
+
+        def _v1_skills_get(self, path):
+            """GET /v1/skills: the built-in skills' index for an external caller; GET /v1/skills/<name>: one skill's
+            SKILL.md converted for outside use (skills_api.externalize), in markdown.  The web page's /skills, which
+            serves the raw text and the user's skills, is untouched.  The key and the base URL follow /v1/models."""
+            if path == "/v1/skills":
+                data = [{"name": s.name, "description": s.description, "kind": s.kind, "chars": len(s.body)}
+                        for s in svc.skills.external_all()]
+                self._json(200, {"object": "list", "data": data})
+                return
+            name = unquote(path[len("/v1/skills/"):])
+            s = svc.skills.external_get(name)
+            if s is None or not s.builtin:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "skill_not_found",
+                                           "message": f"no skill named {name!r}"}})
+                return
+            addr = cast(Any, self.server.server_address)
+            host = self.headers.get("Host") or f"{addr[0]}:{addr[1]}"
+            scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
+            ctx = skills_api.external_models(svc.images)
+            text = skills_api.externalize((svc.skills.builtin_dir / name / "SKILL.md").read_text(encoding="utf-8"),
+                                          ctx, f"{scheme}://{host}")
+            body = text.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            self._cors()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _skills_get(self, path):
+            """GET /skills: every skill (XeStrata's and the user's), whether each is on, and the user's that do not
+            read; GET /skills/<name>: a skill's SKILL.md (a built-in one's to read only)."""
+            if path == "/skills":
+                self._json(200, svc.skills.listing())
+                return
+            name = path[len("/skills/"):]
+            s = svc.skills.get(name)
+            if s is None:
+                self._json(404, {"error": {"message": f"no skill named {name!r}"}})
+                return
+            text = (svc.skills.text(name) if not s.builtin else
+                    (svc.skills.builtin_dir / name / "SKILL.md").read_text(encoding="utf-8"))
+            self._json(200, {"name": s.name, "builtin": s.builtin, "on": svc.skills.on(s.name), "text": text})
+
+        def _skills_post(self):
+            """POST /skills {"action": "save", "text": SKILL.md, "old": the name it had} | {"action": "import",
+            "filename", "data": base64 of a SKILL.md or a zip} | {"action": "switch", "name", "on"} | {"action":
+            "delete", "name"}: the user's skills added, changed, removed, and any switched on or off - from this
+            server's own page (or a trusted origin), as /settings."""
+            if not self._own_page("skills can be changed"):
+                return
+            try:
+                req = json.loads(self._body() or b"{}")
+            except ValueError:
+                req = None
+            if not isinstance(req, dict):
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "send a JSON object"}})
+                return
+            act = req.get("action")
+            try:
+                if act == "save":
+                    old = req.get("old")
+                    got = svc.skills.save(str(req.get("text") or ""), old if isinstance(old, str) and old else None)
+                    self._json(200, {"saved": got.name, **svc.skills.listing()})
+                elif act == "import":
+                    try:
+                        data = base64.b64decode(str(req.get("data") or ""), validate=True)
+                    except ValueError:
+                        raise skills_api.SkillError("data: the file in base64") from None
+                    got = svc.skills.import_file(data, str(req.get("filename") or "SKILL.md"))
+                    self._json(200, {"saved": got.name, **svc.skills.listing()})
+                elif act == "switch":
+                    svc.skills.switch(str(req.get("name") or ""), req.get("on") is True)
+                    self._json(200, svc.skills.listing())
+                elif act == "delete":
+                    svc.skills.delete(str(req.get("name") or ""))
+                    self._json(200, svc.skills.listing())
+                else:
+                    raise skills_api.SkillError('action: "save", "import", "switch" or "delete"')
+            except skills_api.SkillError as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except OSError as e:
+                self._json(500, {"error": {"message": f"the skills' folder could not be written ({e})"}})
+
+        def _loras_post(self, path):
+            """The Images view's adapters (serve/loras.py): an upload (POST /v1/images/loras?name=<file>, the file
+            itself the body, application/octet-stream: a page elsewhere cannot send that without a CORS preflight,
+            which this server never grants), a remove (/v1/images/loras/remove {"path"}) and a Hugging Face fetch
+            (/v1/images/loras/fetch {"url"}, read with GET /v1/images/loras/fetch/<id>).  From this server's own page
+            (or a trusted origin), as /settings."""
+            folders = svc.images.folders() if svc.images is not None else []
+            if path == "/v1/images/loras":
+                if not self.headers.get("Content-Type", "").startswith("application/octet-stream"):
+                    self._json(415, {"error": {"message": "send the file as application/octet-stream"}})
+                    return
+                if self._foreign_origin():
+                    self._json(403, {"error": {"message": "LoRA files are added only from XeStrata's own page"}})
+                    return
+                name = parse_qs(urlsplit(self.path).query).get("name", [""])[0]
+                try:
+                    length = int(self.headers.get("Content-Length", ""))
+                except ValueError:
+                    self._json(411, {"error": {"message": "the upload needs a Content-Length"}})
+                    return
+                try:
+                    lora_api.file_name(name)
+                    tmp = lora_api.staging(folders, length)
+                except (lora_api.LoraError, OSError) as e:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                    return
+                left = length
+                try:
+                    with open(tmp, "wb") as out:
+                        while left:
+                            chunk = self.rfile.read(min(1 << 20, left))
+                            if not chunk:
+                                raise OSError("the upload ended before its Content-Length")
+                            out.write(chunk)
+                            left -= len(chunk)
+                except OSError as e:
+                    tmp.unlink(missing_ok=True)
+                    self.close_connection = True
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                    return
+                finally:
+                    self.body_read = True
+                try:
+                    added = lora_api.add(folders, tmp, name)
+                except (lora_api.LoraError, OSError) as e:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                    return
+                print(f"[xestrata] LoRA added: {added['path']} ({', '.join(added['models'])})", flush=True)
+                self._json(200, {"added": added})
+                return
+            if not self._own_page("LoRA files can be added or removed"):
+                return
+            try:
+                req = json.loads(self._body() or b"{}")
+            except ValueError:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "send a JSON object"}})
+                return
+            req = req if isinstance(req, dict) else {}
+            try:
+                if path == "/v1/images/loras/remove":
+                    gone = lora_api.remove(folders, req.get("path"))
+                    print(f"[xestrata] LoRA removed: {gone['removed']}", flush=True)
+                    self._json(200, gone)
+                elif path == "/v1/images/loras/fetch":
+                    lora_api.staging(folders)                    # a model that takes one, before the download
+                    f = lora_api.FETCHES.start(folders, req.get("url"))
+                    print(f"[xestrata] LoRA fetch: {f.url}", flush=True)
+                    self._json(202, f.view())
+                else:
+                    self._json(404, {"error": {"message": f"Invalid URL (POST {path})"}})
+            except (lora_api.LoraError, OSError) as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _config_get(self):
             if not svc.config_path:
@@ -8799,7 +11734,11 @@ def make_handler(svc: Service):
             except (OSError, ValueError) as e:
                 self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be read: {e}"}})
                 return
-            self._json(200, runconfig.view(cfg, svc.config_path))
+            try:
+                settings = runconfig.load_settings(svc.settings_path)
+            except (OSError, ValueError):
+                settings = {}                           # shown as unset; a change to it is refused (POST)
+            self._json(200, runconfig.view(cfg, svc.config_path, settings, svc.settings_path))
 
         def _config_post(self):
             """#564: change a few documented keys of the run config - JSON from XeStrata's own page only, as
@@ -8810,13 +11749,28 @@ def make_handler(svc: Service):
             if not svc.config_path:
                 self._json(404, {"error": {"message": "this server was started without a run config"}})
                 return
+            scope, settings = "model", {}
             try:
                 req = json.loads(body or b"{}")
+                if isinstance(req, dict) and req.get("scope") is not None:
+                    scope = req["scope"]
                 with svc.config_lock:
                     cfg = runconfig.load(svc.config_path)
-                    new, changed = runconfig.apply(cfg, req.get("set") if isinstance(req, dict) else None)
-                    if changed:
-                        bak = runconfig.save(svc.config_path, new)
+                    try:
+                        settings = runconfig.load_settings(svc.settings_path)
+                    except (OSError, ValueError) as e:
+                        if scope == "global":           # setup's keys are in there: never written over
+                            raise ValueError(f"{svc.settings_path} cannot be read ({e}): fix or remove it first")
+                    sets = req.get("set") if isinstance(req, dict) else None
+                    if scope == "global":
+                        settings, changed = runconfig.apply(settings, sets, "global")
+                        if changed:
+                            runconfig.save_settings(svc.settings_path, settings)
+                        new = cfg
+                    else:
+                        new, changed = runconfig.apply(cfg, sets, scope)
+                        if changed:
+                            bak = runconfig.save(svc.config_path, new)
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
@@ -8825,9 +11779,11 @@ def make_handler(svc: Service):
                                            "message": f"the run config cannot be written: {e}"}})
                 return
             if changed:
-                print(f"[strata] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
-                      f"(the earlier file: {bak.name}); used from the next start", flush=True)
-            self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed})
+                where = (f"{svc.settings_path} (every model)" if scope == "global" else
+                         f"{Path(svc.config_path).name} (the earlier file: {bak.name})")
+                print(f"[xestrata] the Settings view changed {', '.join(changed)} in {where}; used from the next start",
+                      flush=True)
+            self._json(200, {**runconfig.view(new, svc.config_path, settings, svc.settings_path), "changed": changed})
 
         def _foreign_origin(self) -> bool:
             """A web page of another origin sent this.  The Origin must be this server's own address (host and port),
@@ -8877,8 +11833,8 @@ def make_handler(svc: Service):
             except (ValueError, OverflowError) as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
-            print("[strata] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
-                  if shared else "[strata] other apps use their own settings again", flush=True)
+            print("[xestrata] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
+                  if shared else "[xestrata] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
         def _sse(self):
@@ -8902,8 +11858,10 @@ def make_handler(svc: Service):
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
             are when the monitor is off)."""
-            if self.record is None:
+            if self.record is None and self.debug is None:
                 return items
+            if self.debug is not None:
+                self.debug["_streaming"] = True          # the reply's end writes it (_captured)
             return self._captured(items, api)
 
         def _captured(self, items, api):
@@ -8924,19 +11882,45 @@ def make_handler(svc: Service):
                             delta = event.get("delta", {})
                             content, reasoning = delta.get("text", ""), delta.get("thinking", "")
                             usage, timings = event.get("usage"), None
-                        with svc.status_lock:
-                            for name, value in (("output", content), ("reasoning", reasoning)):
-                                if value:
-                                    combined = self.record[name] + value
-                                    self.record[name] = combined[:262144]
-                                    self.record[name + "_truncated"] |= len(combined) > 262144
-                            if usage:
-                                self.record["usage"] = usage
-                            if timings:
-                                self.record["timings"] = timings
+                        if self.record is not None:
+                            with svc.status_lock:
+                                for name, value in (("output", content), ("reasoning", reasoning)):
+                                    if value:
+                                        combined = self.record[name] + value
+                                        self.record[name] = combined[:262144]
+                                        self.record[name + "_truncated"] |= len(combined) > 262144
+                                if usage:
+                                    self.record["usage"] = usage
+                                if timings:
+                                    self.record["timings"] = timings
+                        if self.debug is not None:
+                            self._debug_item(item, api, content, reasoning, usage, timings)
                     yield item
+            except Exception as e:
+                if self.debug is not None:
+                    self.debug["error"] = f"{type(e).__name__}: {e}"
+                raise
             finally:
                 items.close()
+                svc.debug_end(self.debug)
+
+        def _debug_item(self, item, api, content, reasoning, usage, timings):
+            d = self.debug
+            d["output"] += content or ""
+            d["reasoning"] += reasoning or ""
+            if usage:
+                d["usage"] = usage
+            if timings:
+                d["timings"] = timings
+            if api == "openai":
+                choice = item["choices"][0]
+                for tc in choice.get("delta", {}).get("tool_calls") or []:
+                    one = d["tool_calls"].setdefault(tc.get("index", 0), {"name": "", "arguments": ""})
+                    fn = tc.get("function") or {}
+                    one["name"] += fn.get("name") or ""
+                    one["arguments"] += fn.get("arguments") or ""
+                if choice.get("finish_reason"):
+                    d["finish_reason"] = choice["finish_reason"]
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
@@ -8957,9 +11941,10 @@ def make_handler(svc: Service):
             tools, choice = allowed_tools(req.get("tool_choice"), tools)   # the tools it lists, and its mode
             force = forced_call(choice, tools,                      # a bad value is a 400 before anything is sent
                                 getattr(svc.template, "call_form", "qwen"))
-            messages, validator = prepare_format(req.get("response_format"), messages, with_tools=bool(tools))
-            if validator is not None and req.get("strata_mcp"):
-                raise ValueError("structured response_format with MCP is not supported")
+            # #60: with tools the schema is the final answer's, as on /v1/responses and Messages: a turn that calls a
+            # tool goes out as it is, and the answer is checked after it is written (no answer grammar below)
+            messages, validator = prepare_format(req.get("response_format"), messages,
+                                                 with_tools=bool(tools) or req.get("strata_mcp") is True)
             svc.load()
             limit_new = token_limit(req.get("max_completion_tokens"), "max_completion_tokens")
             limit_old = token_limit(req.get("max_tokens"), "max_tokens")      # (both checked, whichever is used)
@@ -8989,19 +11974,93 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 if extra:
                     hubs.append(svc.mcp)
-            want = req.get("strata_images")                   # opt-in: the image tools (true, or {"model": name})
+            # opt-in: the image tools (true, or {"model": name}); {"force": true} (the web page's image button): the
+            # reply opens a call of one of them, as the Responses route's tool_choice image_generation does, and they
+            # are the request's only tools
+            want = own_field(req, "images")
+            image_force = isinstance(want, dict) and want.get("force") is True
+            image_force_names: list = []
+            if image_force and (svc.images is None or force or tool_choice_of(req.get("tool_choice"))[0] == "none"):
+                raise ValueError("xestrata_images.force: " + ("this server makes no images" if svc.images is None else
+                                                              "it is a tool_choice of its own; send none beside it"))
             if (want is True or isinstance(want, dict)) and svc.images is not None:
+                # what the user marked in the web page's preview: the mask over an image an edit takes, the boxes of
+                # MOSS-Image's layout (images_api.user_marks)
+                user = images_api.user_marks(want, Vision.load, lambda n: (
+                    (f := svc.images.file(n)) and f.read_bytes())) if isinstance(want, dict) else None
                 image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                     lambda d: Vision.normalize(d, keep_alpha=True),
-                                                    model=want.get("model") if isinstance(want, dict) else None)
+                                                    model=want.get("model") if isinstance(want, dict) else None,
+                                                    user=user, skills="inline" if image_force else "index",
+                                                    tools=want.get("tools") if isinstance(want, dict) else None,
+                                                    text_gpu=want.get("use_text_gpu") if isinstance(want, dict)
+                                                    else None,
+                                                    all_tools=want.get("all_tools") if isinstance(want, dict)
+                                                    else None,
+                                                    gpu=want.get("gpu") if isinstance(want, dict) else None)
+                if user:
+                    images_api.note_marks(messages, user)
                 more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
+                if image_force:
+                    if not more:
+                        raise ValueError("xestrata_images.force: the image tools are not available for this request")
+                    # the request's own tools stay declared (the page's memory tools: a call of them after the image
+                    # is the page's to run, not text in the answer); the forced call is of an image tool, its name
+                    # kept to them by a grammar where the engine takes one (call_names_grammar, the first round)
+                    extra, hubs = list(more), []
+                    force = forced_call("required", more, getattr(svc.template, "call_form", "qwen"))
+                    image_force_names = [t["name"] for t in more]
+                if more:
+                    extra += [] if image_force else more
+                    hubs.append(image_tools)
+            # opt-in (xestrata_translate: true, the web page's while a translation model is set up): translate, the
+            # translation model's (translate_api.TranslateTools), so that the chat hands translations to it
+            other_tools: tuple = ()
+            if own_field(req, "translate") is True and svc.translation is not None and not image_force:
+                tr = svc.translation
+
+                def run_jobs(jobs, tr=tr):
+                    try:
+                        return tr.complete([j.prompt(tr.model) for j in jobs])
+                    except EngineDied as e:
+                        raise RuntimeError(str(e)) from None
+
+                translate_tools = translate_api.TranslateTools(run_jobs, tr.model)
+                more = translate_tools.template_tools(exclude=own | {t["name"] for t in extra})
                 if more:
                     extra += more
-                    hubs.append(image_tools)
+                    hubs.append(translate_tools)
+                    other_tools = (translate_api.TOOL,)
+            # load_skill (serve/skills.py): the image tools' rules and skills' list with them, the other tools' skills,
+            # and the skills the web page's user added (xestrata_skills); one tool reads them all
+            image_hub = next((h for h in hubs if isinstance(h, images_api.ImageTools)), None)
+            want_skills = own_field(req, "skills") is True
+            if (image_hub is not None and not image_force) or want_skills or other_tools:
+                skill_tools = skills_api.SkillTools(svc.skills, None if image_force else image_hub, user=want_skills,
+                                                    tools=other_tools)
+                more = skill_tools.template_tools(exclude=own | {t["name"] for t in extra})
+                if more:
+                    extra += more
+                    hubs.append(skill_tools)
+            search_tools = None                               # web_search_options: the search tools (search.py)
+            ws = req.get("web_search_options")
+            if ws is not None and not isinstance(ws, dict):
+                raise ValueError("web_search_options must be an object")
+            if ws is not None and svc.search_backend is not None and not image_force:   # without one: unsearched
+                size = ws.get("search_context_size")
+                if size is not None and size not in search_api.CONTEXT:
+                    raise ValueError('web_search_options.search_context_size is "low", "medium" or "high"')
+                search_tools = search_api.SearchTools(svc.search_backend, {
+                    "context": size,
+                    "locale": search_api.locale(ws.get("user_location"), self.headers.get("Accept-Language"))})
+                more = search_tools.template_tools(exclude=own | {t["name"] for t in extra})
+                if more:
+                    extra += more
+                    hubs.append(search_tools)
             use_mcp = bool(hubs)
             if use_mcp:
                 tools = (tools or []) + extra or None
-            if force and use_mcp:
+            if force and use_mcp and not image_force:
                 raise ValueError("a forced tool_choice with MCP tools is not supported")
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
@@ -9013,17 +12072,30 @@ def make_handler(svc: Service):
             if n > 1 and use_mcp:
                 raise ValueError("n above 1 with MCP or image tools is not supported")
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            rid = reply_id(req)
+            if rid is None:                                  # a kept reply is cancelled by its own cancel alone
+                self._watch_client(cancel)                   # #430 #431 (#1999: before prepare, which can take long)
+            # prepare writes the resolved prefix back into req, or {} when it cannot mark one. Keep the words the
+            # request gave: a later choice prepares again and must not read that result as a new request.
+            prefix_spec = req.get("strata_prefix")
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             form = getattr(svc.template, "call_form", "qwen")
-            # the engine writes the answer, or a strict tool's call, under its schema when it can (structured.py)
+            # the engine writes the answer, or a strict tool's call, under its schema when it can (structured.py): one
+            # grammar cannot allow a call and hold the answer to the schema, so with tools only the calls have one
             strict, patterns = constrained_tools(req.get("tools"))
-            svc.attach_grammar(req, answer_grammar(req.get("response_format"), thinking) if validator is not None
-                               else tool_grammar(tools, strict, patterns, thinking, form))
+            grammar = answer_grammar(req.get("response_format"), thinking) if validator is not None and not tools \
+                else tool_grammar(tools, strict, patterns, thinking, form)
+            if grammar is None and image_force_names and len(image_force_names) > 1:
+                grammar = call_names_grammar(image_force_names, thinking, form)
+                req["strata_grammar_first_round"] = grammar is not None
+            svc.attach_grammar(req, grammar)
             svc.check_strict(req, tools, strict)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
+            # with `force` (the image button's call): with thinking, the call opens where the thinking ends - without it
+            # here the forced call of a thinking reply never opened, and the model wrote whatever it liked
             run = run_with_mcp(svc, hubs[0] if len(hubs) == 1 else ToolHubs(hubs), messages, tools, kw, ids,
-                               thinking, max_new, max_req, req, cancel, {t["name"] for t in extra}) if use_mcp else None
+                               thinking, max_new, max_req, req, cancel, {t["name"] for t in extra},
+                               force=force) if use_mcp else None
             if n > 1:
                 first = (ids, thinking, max_new)
 
@@ -9031,6 +12103,8 @@ def make_handler(svc: Service):
                     # each choice its own run of the same prompt (the conversation cache holds it after the first);
                     # a request's seed gives each choice its own, seed + k
                     sub = {**req, "seed": req["seed"] + k} if k and type(req.get("seed")) is int else req
+                    if k and prefix_spec is not None:
+                        sub = {**sub, "strata_prefix": prefix_spec}
                     got = first if k == 0 else svc.prepare(messages, tools, kw, max_req, force=force, req=sub,
                                                            cancel=cancel)
                     c = openai_chunks(svc, sub, *got[:2], tools, got[2], cancel, force=force)
@@ -9040,6 +12114,8 @@ def make_handler(svc: Service):
                 chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
                 if validator is not None:
                     chunks = structured_chunks(chunks, validator)
+                if search_tools is not None:
+                    chunks = cite_chunks(chunks, search_tools)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 body = openai_collect_choices(chunks) if n > 1 else openai_collect(chunks)
@@ -9048,63 +12124,103 @@ def make_handler(svc: Service):
                 return self._json(200, body)
             if legacy:
                 chunks = legacy_chunks(chunks)
+            lines = self._openai_sse(chunks, req.get("stream_options"))
+            if rid is not None:                              # kept: made on its own thread, read from the reply
+                reply = REPLIES.open(rid, cancel)
+                # the request's image embeddings, which prepare() keeps for its own thread: run() reads them on this
+                # one, and the handler's drop_embeddings() at its end leaves them to it
+                emb = (getattr(svc.embeddings, "path", None), getattr(svc.embeddings, "keys", None))
+                svc.embeddings.path = svc.embeddings.keys = None
+                dbg = getattr(svc.request_trace, "debug", None)   # ... and its debug chat log record
+
+                def make():                              # its events, one a line: what a read `from` counts
+                    svc.embeddings.path, svc.embeddings.keys = emb
+                    svc.request_trace.debug = dbg
+                    try:
+                        for line in lines:
+                            for event in line.split(b"\n\n"):
+                                if event and not event.startswith(b":"):   # a keep-alive is _stream_reply's own
+                                    reply.put(event + b"\n\n")
+                    finally:
+                        svc.drop_embeddings()            # when the reply ended before run() took them
+                        reply.finish()
+                threading.Thread(target=make, daemon=True, name="xestrata-reply").start()
+                self._sse()
+                self._stream_reply(reply, 0)
+                return
             self._sse()
-            options = req.get("stream_options")
+            try:
+                for line in lines:
+                    self.wfile.write(line)
+                    self.wfile.flush()
+            except OSError:
+                self._note(outcome="disconnected")
+                cancel.set()                                 # client went away: stop the engine
+                lines.close()
+                chunks.close()
+
+        def _openai_sse(self, chunks, options):
+            """A streamed chat completion's SSE lines: the chunks (None a keep-alive), OpenAI's usage chunk when
+            asked, [DONE]; an error after the stream started as an error event, then [DONE]."""
             last = None
             try:
                 for c in chunks:
                     if c is None:
-                        self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                        yield b": keep-alive\n\n"                # an SSE comment: clients ignore it
                     else:
-                        self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+                        yield b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n"
                         last = c
-                    self.wfile.flush()
                 if isinstance(options, dict) and options.get("include_usage") and last and last.get("usage"):
                     # OpenAI's usage chunk, after the finishing one (which also keeps its usage, as llama.cpp's)
                     usage = {k: last[k] for k in ("id", "object", "created", "model", "system_fingerprint")
                              if k in last}
-                    self.wfile.write(b"data: " + json.dumps({**usage, "choices": [], "usage": last["usage"]},
-                                                            ensure_ascii=False).encode() + b"\n\n")
-                self.wfile.write(b"data: [DONE]\n\n")
-            except OSError:
-                self._note(outcome="disconnected")
-                cancel.set()                                 # client went away: stop the engine
-                chunks.close()
+                    yield b"data: " + json.dumps({**usage, "choices": [], "usage": last["usage"]},
+                                                 ensure_ascii=False).encode() + b"\n\n"
+                yield b"data: [DONE]\n\n"
+                return
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
                 err = {"error": {"type": "server_error", "message": died_note(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
                 err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                  "message": str(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:
-                self._chat_failed(str(e))                    # _post's handler would write HTTP into the stream's body
+                # an error frame: _post's handler would write HTTP into the stream's body
+                err = {"error": {"type": "server_error", "message": str(e)}}
             except ClientGone:
                 raise
             # no silent end: the client would take it for a whole answer
-            except Exception:
-                self._chat_failed(self._stream_crashed())
+            except Exception:  # noqa: BLE001 - a bug after the stream started: said, and the stream ends
+                err = {"error": {"type": "server_error", "message": self._stream_crashed()}}
+            self._note(error=err["error"])
+            yield b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n"
 
         def _stream_crashed(self):
             """An unexpected error in a started stream: the traceback for the log, a plain sentence for the client (the
             error's text can hold what the client must not see; upstream cf0743747)."""
             import traceback
-            print("[strata] error in a started stream:\n" + traceback.format_exc(), flush=True)
+            print("[xestrata] error in a started stream:\n" + traceback.format_exc(), flush=True)
             return "the server failed while answering; the server's log has the details"
 
-        def _chat_failed(self, message):
-            err = {"error": {"type": "server_error", "message": message}}
-            self._note(error=err["error"])
+        def _stream_reply(self, reply: Reply, start: int) -> None:
+            """Write a kept reply's lines from `start` as they come, a keep-alive while none does, until it ends.  A
+            connection that breaks only ends this read: the reply goes on (GET /v1/xestrata/replies/<id> reads it
+            again)."""
+            at = start
             try:
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+                while True:
+                    got, done = reply.read(at, 1.0)
+                    for line in got:
+                        self.wfile.write(line)
+                    at += len(got)
+                    if done and not got:
+                        break
+                    if not got:
+                        self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
             except OSError:
-                self._note(outcome="disconnected")
+                self._note(outcome="disconnected (the reply goes on)")
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
@@ -9150,7 +12266,10 @@ def make_handler(svc: Service):
             def check(text, finish):
                 return validated_json(text, validator, finish)
 
-            image_tools = self.image_tools
+            image_tools, search_tools = self.image_tools, self.search_tools
+            hubs = [h for h in (image_tools, search_tools) if h is not None]
+            hub = None if not hubs else hubs[0] if len(hubs) == 1 else ToolHubs(hubs)
+            search_names = set(search_tools.routes()) if search_tools is not None else set()
 
             def image_b64(url: str) -> str | None:
                 f = svc.images.file(url.rsplit("/", 1)[-1]) if svc.images is not None else None
@@ -9162,11 +12281,11 @@ def make_handler(svc: Service):
                     asm.spell = lambda text: lp.spell(svc.engine, text)
                 yield from asm.start()
                 done = None
-                if image_tools is not None:   # the image tools run here, each an image_generation_call item
+                if hub is not None:   # the image and search tools run here: image_generation_call, web_search_call
                     messages, kw = self.prepared
-                    source = run_with_mcp(svc, image_tools, messages, tools, kw, ids, thinking, max_new,
+                    source = run_with_mcp(svc, hub, messages, tools, kw, ids, thinking, max_new,
                                           int(req.get("max_output_tokens") or 0), req, cancel,
-                                          set(image_tools.routes()), force=force)
+                                          set(hub.routes()), force=force)
                 else:
                     # Compaction may replay undeclared calls, but an explicit none still forbids calls, just as
                     # it does on the other routes.  Do not promote a quoted call to an executable output item.
@@ -9187,7 +12306,18 @@ def make_handler(svc: Service):
                             quiet = time.monotonic()
                             yield None
                     elif kind == "mcp":
-                        yield from asm.image_call(cast(dict, x), image_b64)
+                        x = cast(dict, x)
+                        held = asm.hosted.get(x.get("id")) if x.get("event") != "call" else None
+                        if held is not None:
+                            search = held["type"] == "web_search_call"
+                        elif x.get("event") == "call":
+                            search = x.get("name") in search_names
+                        else:
+                            search = asm.item is not None and asm.item["type"] == "web_search_call"
+                        if search:
+                            yield from asm.search_call(x)
+                        else:
+                            yield from asm.image_call(x, image_b64)
                     elif kind == "done":
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
@@ -9241,6 +12371,8 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 cancel.set()                                 # client went away: stop the engine
                 items.close()
+            except ServerStopping as e:                      # mid-stream: response.failed, then the stream ends
+                self._responses_failed(asm, str(e), "server_error", send)
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, died_note(e), "server_error", send)
             except ServerStopping as e:                      # server_error: ResponseErrorCode is a closed list
@@ -9291,10 +12423,10 @@ def make_handler(svc: Service):
                     if not isinstance(url, str) or not url:
                         raise ValueError('input_image_mask: {"image_url": a data: URL or an http(s) URL} (no file_id)')
                     self._no_local_sources([url])
-                    mask = svc.download(url) if url.startswith(("http://", "https://")) else Vision.load(url)
+                    mask = self._load_image_source(url)
                 self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                          lambda d: Vision.normalize(d, keep_alpha=True),
-                                                         spec, model=fixed, mask=mask)
+                                                         spec, model=fixed, mask=mask, skills="inline")
                 if req.get("stream") is True:            # the tool's partial_images, sent as the image is made
                     self.image_tools.stream_partials(spec.get("partial_images"))
                 offered = self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
@@ -9315,6 +12447,21 @@ def make_handler(svc: Service):
                 skipped = [k for k in skipped if k != "image_generation"]
             else:
                 image_names = []
+            # OpenAI's hosted web_search tool (and web_search_preview): the search tools, run here (serve/search.py)
+            self.search_tools, search_names = None, []
+            hosted = [k for k in skipped if k.startswith("web_search")]
+            if hosted and svc.search_backend is not None and req.get("tool_choice") != "none":
+                spec = next((t for t in req.get("tools") or [] if isinstance(t, dict) and t.get("type") in hosted), {})
+                domains = (spec.get("filters") or {}).get("allowed_domains") if isinstance(spec.get("filters"),
+                                                                                           dict) else None
+                self.search_tools = search_api.SearchTools(svc.search_backend, {
+                    "context": spec.get("search_context_size"),
+                    "include": domains if isinstance(domains, list) else [],
+                    "locale": search_api.locale(spec.get("user_location"), self.headers.get("Accept-Language"))})
+                offered = self.search_tools.template_tools(exclude={t["name"] for t in tools or []})
+                search_names = [t["name"] for t in offered]
+                tools = (tools or []) + offered
+                skipped = [k for k in skipped if not k.startswith("web_search")]
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
             messages = responses_api.verbosity_messages(req, messages)
             if req.get("truncation") not in (None, "auto", "disabled"):
@@ -9324,6 +12471,8 @@ def make_handler(svc: Service):
                 raise ResponsesError("max_tool_calls must be a positive whole number", "max_tool_calls")
             if self.image_tools is not None:              # the hosted tools this server runs: the image tools
                 self.image_tools.max_calls = calls
+            if self.search_tools is not None and calls is not None:   # ... and the search tools
+                self.search_tools.max_uses = calls
             include = req.get("include") if isinstance(req.get("include"), list) else []
             if "message.output_text.logprobs" in include:
                 req = {**req, "logprobs": True}           # the engine's LP lines, read into output_text's logprobs
@@ -9333,14 +12482,27 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e), "top_logprobs") from None
             # "required" or a named tool: the reply opens that call (forced_call), as on the chat route
             choice = responses_api.forced_choice(req)
+            image_forced = isinstance(choice, dict) and choice.get("type") == "image_generation"
             try:
-                if isinstance(choice, dict) and choice.get("type") == "image_generation":
+                if image_forced:
                     if not image_names:
                         raise ValueError("tool_choice image_generation: the request has no image_generation tool "
                                          "this server can run")
-                    tools, choice = [t for t in tools or [] if t["name"] in image_names], "required"
-                tools, choice = allowed_tools(choice, tools, {"image_generation": image_names})
+                    # as OpenAI's: the hosted tool's call is forced, the request's other tools stay declared (the
+                    # forced call below, among the image tools alone)
+                    choice = "auto"
+                if isinstance(choice, dict) and str(choice.get("type")).startswith("web_search"):
+                    if not search_names:
+                        raise ValueError(f"tool_choice {choice.get('type')}: the request has no web search tool this "
+                                         "server can run (search_engine, search_url)")
+                    tools, choice = [t for t in tools or [] if t["name"] == "web_search"], "required"
+                tools, choice = allowed_tools(choice, tools, {"image_generation": image_names,
+                                                              **({k: search_names for k in hosted}
+                                                                 if search_names else {})})
                 force = forced_call(choice, tools, getattr(svc.template, "call_form", "qwen"))
+                if image_forced:
+                    force = forced_call("required", [t for t in tools or [] if t["name"] in image_names],
+                                        getattr(svc.template, "call_form", "qwen"))
             except ValueError as e:
                 raise ResponsesError(str(e), "tool_choice") from None
             try:
@@ -9353,7 +12515,7 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
             if set(skipped) - noted:
-                print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
+                print(f"[xestrata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
                       f"(this server cannot run them)", flush=True)
                 noted.update(skipped)
             if req.get("max_output_tokens") is None and "max_tokens" in svc.shared:   # the shared Chat settings
@@ -9410,14 +12572,18 @@ def make_handler(svc: Service):
                 names = {**found_names, **names}
             req = dict(req)
             strict, patterns = constrained_tools(responses_api.given_tools(req))   # namespaces' and additional_tools'
-            svc.attach_grammar(req, answer_grammar(responses_api.text_format(req), thinking)
-                               if validator is not None and not tools
-                               else tool_grammar(tools, strict, patterns, thinking,
-                                                 getattr(svc.template, "call_form", "qwen")))
+            grammar = answer_grammar(responses_api.text_format(req), thinking) if validator is not None and not tools \
+                else tool_grammar(tools, strict, patterns, thinking, getattr(svc.template, "call_form", "qwen"))
+            if grammar is None and image_forced and len(image_names) > 1:   # the forced call's name: an image tool's
+                grammar = call_names_grammar(image_names, thinking, getattr(svc.template, "call_form", "qwen"))
+                req["strata_grammar_first_round"] = grammar is not None
+            svc.attach_grammar(req, grammar)
             svc.check_strict(req, tools, strict)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
+            if self.search_tools is not None:
+                asm.sources = self.search_tools.sources      # the same list: what the searches find, as they run
             self.prepared = (messages, kw)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req, force
@@ -9451,9 +12617,30 @@ def make_handler(svc: Service):
                 raise ValueError("max_tokens: a whole number of 1 or more is required")
             svc.load()
             req = svc.with_shared(req, "anthropic")
+            # Anthropic's server tools web_search and web_fetch (web_search_20250305, web_fetch_20250910): the search
+            # tools, run here (serve/search.py); without a search server they stay the client tools they were
+            given = req.get("tools") if isinstance(req.get("tools"), list) else []
+            hosted = [t for t in given if isinstance(t, dict) and str(t.get("type", "")).startswith(("web_search_",
+                                                                                                    "web_fetch_"))]
+            search_tools = None
+            if hosted and svc.search_backend is not None:
+                req = {**req, "tools": [t for t in given if t not in hosted]}
+                ws = next((t for t in hosted if t["type"].startswith("web_search_")), hosted[0])
+                uses = [t.get("max_uses") for t in hosted if isinstance(t.get("max_uses"), int)]
+                search_tools = search_api.SearchTools(svc.search_backend, {
+                    "include": ws.get("allowed_domains"), "exclude": ws.get("blocked_domains"),
+                    "max_uses": sum(uses) if uses else None,
+                    "locale": search_api.locale(ws.get("user_location"), self.headers.get("Accept-Language"))})
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
             callable_tools, deferred = anthropic_tools(req)     # #4663: the deferred tools are callable, unlisted
+            if search_tools is not None:
+                want = {"web_search": any(t["type"].startswith("web_search_") for t in hosted),
+                        "fetch_page": any(t["type"].startswith("web_fetch_") for t in hosted)}
+                offered = [t for t in search_tools.template_tools(exclude={t["name"] for t in tools or []})
+                           if want.get(t["name"])]
+                tools = (tools or []) + offered or None
+                callable_tools = (callable_tools or []) + offered
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = callable_tools = None
             force = forced_call(req.get("tool_choice"), tools,        # "any" / {"type": "tool", "name": N}
@@ -9466,17 +12653,27 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
-                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req,
+                                                     cancel=cancel)
             except ContextOverflow as overflow:
-                # #4838: Anthropic's own wording first, Strata's sentence after it
+                # #4838: Anthropic's own wording first, XeStrata's sentence after it
                 raise ValueError(overflow.anthropic_text()) from None
             strict, patterns = constrained_tools(req.get("tools"))
-            svc.attach_grammar(req, answer_grammar(anthropic_format(req), thinking) if validator is not None
+            # with tools only the calls have a grammar: the answer is checked after it is written (#60)
+            svc.attach_grammar(req, answer_grammar(anthropic_format(req), thinking)
+                               if validator is not None and not tools
                                else tool_grammar(tools, strict, patterns, thinking,
                                                  getattr(svc.template, "call_form", "qwen")))
             svc.check_strict(req, tools, strict)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            events = anthropic_events(svc, req, ids, thinking, callable_tools, max_new, cancel, force=force,
+            run = None
+            if search_tools is not None and tools:
+                if validator is not None:
+                    raise ValueError("output_config.format with the web search tools is not supported")
+                run = run_with_mcp(svc, search_tools, messages, tools, kw, ids, thinking, max_new,
+                                   int(req.get("max_tokens") or 0), req, cancel,
+                                   {t["name"] for t in tools} & set(search_tools.routes()), force=force)
+            events = anthropic_events(svc, req, ids, thinking, callable_tools, max_new, cancel, force=force, run=run,
                                       deferred=deferred)
             if validator is not None:
                 events = anthropic_structured(events, validator)
@@ -9546,8 +12743,8 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = os.name != "nt"
     # socketserver listens with a backlog of 5: a burst of 30-40 clients at once got "connection reset by peer" on the
     # first ones (measured on 4 x R9700, also with one request at a time); the requests wait in the server, not the
-    # kernel (STRATA_HTTP_BACKLOG overrides it)
-    request_queue_size = max(5, int(os.environ.get("STRATA_HTTP_BACKLOG") or 256))
+    # kernel (XESTRATA_HTTP_BACKLOG overrides it)
+    request_queue_size = max(5, int(envvars.get("HTTP_BACKLOG") or 256))
 
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
         if ":" in server_address[0]:                    # an IPv6 address (`::`): an IPv6 socket (upstream eba3106c0)
@@ -9580,10 +12777,7 @@ DESKTOP_FREE_MIB = 2048
 DESKTOP_RESERVE_MIB = 3072       # what kept KDE/Wayland alive beside a full expert cache in both reports
 
 
-def linux_desktop(env=None) -> bool:
-    """A graphical session on Linux (Wayland or X): its compositor, browser and apps take VRAM after the model has."""
-    env = os.environ if env is None else env
-    return sys.platform.startswith("linux") and bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"))
+linux_desktop = hardware.linux_desktop
 
 
 def amd_card(pci) -> bool:
@@ -9601,14 +12795,18 @@ def desktop_vram_note(amd: bool, vram_free_mib, args: list, desktop: bool) -> st
     does not apply."""
     if not amd or not desktop or not isinstance(vram_free_mib, int) or vram_free_mib >= DESKTOP_FREE_MIB:
         return ""
+    if "--resident-budget-gib" in args:
+        # upstream 530a29ea2: on a unified-memory GPU the RAM budget's page-locked complement takes that room straight
+        # back, so a larger --vram-reserve-mib cannot raise the free VRAM - the advice would only cost the cache
+        return ""
     try:
         reserve = int(args[args.index("--vram-reserve-mib") + 1]) if "--vram-reserve-mib" in args else 700
     except (ValueError, IndexError):
         reserve = 700
     if reserve >= DESKTOP_RESERVE_MIB:
         return ""
-    return (f"[strata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives your "
-            "desktop and the desktop or apps crash after the start (the driver moves the expert cache to RAM and "
+    return (f"[xestrata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives "
+            "your desktop and the desktop or apps crash after the start (the driver moves the expert cache to RAM and "
             "the OOM killer ends the session), keep more VRAM free: setup with --vram-reserve-mib "
             f"{DESKTOP_RESERVE_MIB} (remembered; the expert cache gets "
             f"{(DESKTOP_RESERVE_MIB - reserve) / 1024:.1f} GB less, a few % of speed)")
@@ -9631,7 +12829,7 @@ def warn_tight_ram(arena_mib, experts_ram=None) -> None:
     if left < 6:
         what = ("the RAM copy of the experts the GPU does not hold takes" if experts_ram == "resident"
                 else "the model's experts take")
-        print(f"[strata] WARNING: RAM is tight - {what} {arena_mib / 1024:.1f} GB of this PC's "
+        print(f"[xestrata] WARNING: RAM is tight - {what} {arena_mib / 1024:.1f} GB of this PC's "
               f"{total / 2**30:.0f} GB, leaving {left:.1f} GB for everything else. "
               + "Linux may stop the engine in the middle of an answer. "
               + f"Close other programs, or run {SETUP_CMD} --setup and pick a smaller size (Q2_0 / IQ2_XS).",
@@ -9658,7 +12856,7 @@ def warn_budget_over_ram(args) -> str | None:
            f"{free:.0f} GiB free of {total:.0f} GiB: what does not fit goes to swap or is read from disk, which can "
            "make decoding very slow. Lower it (setup sizes it for this PC) or remove the argument to let the engine "
            "choose.")
-    print("[strata] " + msg, flush=True)
+    print("[xestrata] " + msg, flush=True)
     return msg
 
 
@@ -9716,7 +12914,7 @@ def _name_in(name: str, names) -> bool:
 
 
 def allowed_hosts_of(value, env: str = "") -> list[str]:
-    """The config's allowed_hosts (a name or a list) plus $STRATA_ALLOWED_HOSTS (comma-separated): host names, "*" or
+    """The config's allowed_hosts (a name or a list) plus $XESTRATA_ALLOWED_HOSTS (comma-separated): host names, "*" or
     ".example.com" (it and every name below it).  A scheme, port or path is dropped ("https://a.example.com:8443/"
     -> "a.example.com"); a wrong entry stops the start (ValueError)."""
     items = [] if value in (None, "") else [value] if isinstance(value, str) else value
@@ -9732,7 +12930,7 @@ def allowed_hosts_of(value, env: str = "") -> list[str]:
         dot = x.startswith(".")
         name = host_name(x[1:] if dot else x)
         if not name:
-            raise ValueError(f"allowed_hosts: {raw!r} is not a host name like strata.example.com")
+            raise ValueError(f"allowed_hosts: {raw!r} is not a host name like xestrata.example.com")
         out.append("." + name if dot else name)
     return list(dict.fromkeys(out))
 
@@ -9783,7 +12981,7 @@ def host_allowed(host, names, any_host=False) -> bool:
 
 
 def key_list(value) -> list[str]:
-    """#1344: the keys a server accepts.  --api-key / STRATA_API_KEY / "api_key" take llama.cpp's form, several keys
+    """#1344: the keys a server accepts.  --api-key / XESTRATA_API_KEY / "api_key" take llama.cpp's form, several keys
     separated by commas ("k1,k2"; spaces around each are dropped), or a list in the config ("api_key": ["k1", "k2"],
     the way to give a key that contains a comma).  A list is taken as it is."""
     if value is None or value == "":
@@ -9794,7 +12992,7 @@ def key_list(value) -> list[str]:
 
 
 def explicit_no_key(value) -> bool:
-    """The owner chose to serve without a key: "api_key": "none" in the config, STRATA_API_KEY=none or --api-key none
+    """The owner chose to serve without a key: "api_key": "none" in the config, XESTRATA_API_KEY=none or --api-key none
     (or --no-api-key, handled by the caller).  Never a key called "none"."""
     return isinstance(value, str) and value.strip().lower() == "none"
 
@@ -9892,7 +13090,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
         return []
     items = [value] if isinstance(value, str) else value
     if not isinstance(items, list) or not all(isinstance(x, str) for x in items):
-        raise SystemExit(f"[strata] {key}: expected an origin or a list of origins")
+        raise SystemExit(f"[xestrata] {key}: expected an origin or a list of origins")
     out = []
     for x in items:
         x = x.strip().rstrip("/")
@@ -9901,14 +13099,21 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
             continue
         scheme, sep, rest = x.partition("://")
         if scheme not in ("http", "https") or not sep or not rest or "/" in rest or "*" in rest:
-            raise SystemExit(f"[strata] {key}: {x!r} is not an origin like https://chat.example.com"
+            raise SystemExit(f"[xestrata] {key}: {x!r} is not an origin like https://chat.example.com"
                              + ("" if wildcard else " (no wildcards here)"))
         out.append(x)
     return out
 
 
 SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
-               "experimental_speed_projection")
+               "experimental_speed_projection", "script_guard")
+
+
+def script_guard_name(value) -> str:
+    """A script guard setting as /props and /metrics show it: "off", "ja", or "ja" with ", allow_context: false"."""
+    if not isinstance(value, dict):
+        return "off"
+    return value["lang"] + ("" if value["allow_context"] else ", allow_context: false")
 
 
 def load_shared_settings(path, warn=print) -> dict:
@@ -9927,10 +13132,10 @@ def load_shared_settings(path, warn=print) -> dict:
     except FileNotFoundError:
         return {}                   # no file yet: the normal case on a first start, nothing to report
     except (OSError, ValueError) as e:
-        warn(f"[strata] the Chat settings in {path} are ignored ({e}); other apps use their own settings")
+        warn(f"[xestrata] the Chat settings in {path} are ignored ({e}); other apps use their own settings")
         return {}
     if not isinstance(doc, dict):
-        warn(f"[strata] the Chat settings in {path} are ignored (a JSON object was expected, found "
+        warn(f"[xestrata] the Chat settings in {path} are ignored (a JSON object was expected, found "
              f"{type(doc).__name__}); other apps use their own settings")
         return {}
     out = {}
@@ -9938,7 +13143,7 @@ def load_shared_settings(path, warn=print) -> dict:
         try:
             out.update(clean_shared_defaults({key: value}))
         except ValueError as e:
-            warn(f"[strata] one Chat setting in {path} is skipped ({e}); the others still apply")
+            warn(f"[xestrata] one Chat setting in {path} is skipped ({e}); the others still apply")
     return out
 
 
@@ -9952,31 +13157,34 @@ def clean_shared_defaults(d) -> dict:
     for key, value in d.items():
         if value is None or value == "":
             continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        if isinstance(value, float) and not math.isfinite(value):   # JSON's Infinity and NaN parse as floats
+            raise ValueError(f"{key}: a finite number")
         if key == "reasoning_effort":
             if value not in ("none", "low", "medium", "high", "xhigh", "max"):
                 raise ValueError("reasoning_effort: none, low, medium, high or max")
         elif key == "temperature":
-            if not number or not 0 <= value <= 2:
+            if not sampling.number(value, lo=0, hi=2, require=True):
                 raise ValueError("temperature: 0..2")
         elif key == "top_p":
-            if not number or not 0 < value <= 1:
+            if not sampling.number(value, lo=0, hi=1, lo_open=True, require=True):
                 raise ValueError("top_p: 0 < top_p <= 1")
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
+            if not sampling.number(value, whole=True, lo=1, hi=64, require=True):
                 raise ValueError("top_k: an integer 1..64")
             value = int(value)
         elif key in ("seed", "max_tokens"):
-            if not number or value != int(value) or value <= 0:
+            if not sampling.number(value, whole=True, lo=0, lo_open=True):
                 raise ValueError(f"{key}: a positive integer")
             value = int(value)
         elif key == "reasoning_budget_tokens":                 # #123: 0 means no budget, so 0 is allowed here
-            if not number or value != int(value) or value < 0:
+            if not sampling.number(value, whole=True, lo=0):
                 raise ValueError("reasoning_budget_tokens: a whole number of tokens (0: no budget)")
             value = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
                 raise ValueError("experimental_speed_projection: true or false")
+        elif key == "script_guard":
+            value = script_guard.parse(value)
         else:
             raise ValueError(f"unknown setting {key!r}")
         out[key] = float(value) if key in ("temperature", "top_p") else value
@@ -10005,8 +13213,8 @@ def split_joined_args(cfg: dict) -> None:
         changed.append(a)
     if changed:
         cfg["args"] = out
-        print("[strata] the config's args hold " + ", ".join(repr(c) for c in changed) + " as one element each: split "
-              'into the flag and its value (write them as two elements, e.g. "--ple-io", "mmap")', flush=True)
+        print("[xestrata] the config's args hold " + ", ".join(repr(c) for c in changed) + " as one element each: "
+              'split into the flag and its value (write them as two elements, e.g. "--ple-io", "mmap")', flush=True)
 
 
 def read_config(path) -> dict:
@@ -10016,10 +13224,15 @@ def read_config(path) -> dict:
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        raise SystemExit(f"[strata] {path} is not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}. Check the "
-                         'commas between the entries of "args" (each option and each value is its own quoted entry, '
-                         'e.g. "--ple-io", "mmap",) and that no entry is followed by a comma at the end of a '
+        raise SystemExit(f"[xestrata] {path} is not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}. Check "
+                         'the commas between the entries of "args" (each option and each value is its own quoted '
+                         'entry, e.g. "--ple-io", "mmap",) and that no entry is followed by a comma at the end of a '
                          'list.') from None
+
+
+def api_monitor_of(cfg: dict, flag: bool) -> bool:
+    """The request monitor is on unless the config says false; --api-monitor still turns it on."""
+    return flag or cfg.get("api_monitor") is not False
 
 
 def lift_reasoning_effort_arg(cfg: dict) -> None:
@@ -10045,8 +13258,8 @@ def lift_reasoning_effort_arg(cfg: dict) -> None:
     cfg["args"] = out
     if cfg.get("reasoning_effort") is None:
         cfg["reasoning_effort"] = value
-    print("[strata] '--reasoning-effort' in the config's args is not an engine option: taken out of them. The thinking "
-          "level is the config's 'reasoning_effort' key (outside 'args'); it is used as " +
+    print("[xestrata] '--reasoning-effort' in the config's args is not an engine option: taken out of them. The "
+          "thinking level is the config's 'reasoning_effort' key (outside 'args'); it is used as " +
           f"{cfg['reasoning_effort']!r}", flush=True)
 
 
@@ -10068,66 +13281,70 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     for alias, canon in SAMPLING_ALIASES.items():      # #1819: llama.cpp's names for the same two fields
         if block.get(alias) is not None:
             if block.get(canon) is not None:
-                raise SystemExit(f"[strata] config sampling: both {alias!r} and {canon!r} are set; they are the same "
+                raise SystemExit(f"[xestrata] config sampling: both {alias!r} and {canon!r} are set; they are the same "
                                  f"setting, keep one")
             block[canon] = block.pop(alias)
     for key, value in block.items():
         if value is None:
             continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        if isinstance(value, float) and not math.isfinite(value):   # JSON's Infinity and NaN parse as floats
+            raise SystemExit(f"[xestrata] config sampling.{key}={value!r}: expected a finite number")
         if key == "temperature":
-            if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
+            if not sampling.number(value, lo=0):
+                raise SystemExit(f"[xestrata] config sampling.temperature={value!r}: expected a number >= 0 "
+                                 "(0 = greedy)")
             out[key] = float(value)
         elif key == "top_p":
-            if not number or not 0 < value <= 1:
-                raise SystemExit(f"[strata] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
+            if not sampling.number(value, lo=0, hi=1, lo_open=True, require=True):
+                raise SystemExit(f"[xestrata] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
             out[key] = float(value)
         elif key == "min_p":
-            if not number or not 0 <= value <= 1:
-                raise SystemExit(f"[strata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
+            if not sampling.number(value, lo=0, hi=1, require=True):
+                raise SystemExit(f"[xestrata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+            if not sampling.number(value, whole=True, lo=1, hi=64, require=True):
+                raise SystemExit(f"[xestrata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
             out[key] = int(value)
         elif key == "presence_penalty":
-            if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.presence_penalty={value!r}: expected a number >= 0")
+            if not sampling.number(value, lo=0):
+                raise SystemExit(f"[xestrata] config sampling.presence_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "frequency_penalty":
-            if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.frequency_penalty={value!r}: expected a number >= 0")
+            if not sampling.number(value, lo=0):
+                raise SystemExit(f"[xestrata] config sampling.frequency_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "repetition_penalty":
-            if not number or value <= 0:
-                raise SystemExit(f"[strata] config sampling.repetition_penalty={value!r}: "
+            if not sampling.number(value, lo=0, lo_open=True):
+                raise SystemExit(f"[xestrata] config sampling.repetition_penalty={value!r}: "
                                  "expected a number > 0 (1 = off)")
             out[key] = float(value)
         elif key == "penalty_last_n":
-            if not number or value != int(value) or value < 0:
-                raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
+            if not sampling.number(value, whole=True, lo=0):
+                raise SystemExit(f"[xestrata] config sampling.penalty_last_n={value!r}: expected a non-negative "
+                                 "integer")
             out[key] = int(value)
         elif key == "seed":
-            if not number or value != int(value) or value <= 0:
-                raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
+            if not sampling.number(value, whole=True, lo=0, lo_open=True):
+                raise SystemExit(f"[xestrata] config sampling.seed={value!r}: expected a positive integer")
             out[key] = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
-                raise SystemExit(f"[strata] config sampling.experimental_speed_projection={value!r}: expected true or "
-                                 "false (the default for requests that leave it out, when the engine has the vector)")
+                raise SystemExit(f"[xestrata] config sampling.experimental_speed_projection={value!r}: expected true "
+                                 "or false (the default for requests that leave it out, when the engine has the "
+                                 "vector)")
             out[key] = value
         else:
-            print(f"[strata] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
+            print(f"[xestrata] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
     return out
 
 
 def loop_guard_setting(cfg: dict | None, env=None) -> bool:
-    """The loop guard (serve/loop_guard.py), on unless STRATA_LOOP_GUARD says 0 / off / false / no or the run config
+    """The loop guard (serve/loop_guard.py), on unless XESTRATA_LOOP_GUARD says 0 / off / false / no or the run config
     has "loop_guard": false; the environment, when set, wins over the config."""
     off = ("0", "off", "false", "no", "none")
     env = os.environ if env is None else env
-    v = env.get("STRATA_LOOP_GUARD")
+    v = envvars.get("LOOP_GUARD", env=env)
     if v is not None and str(v).strip():
         return str(v).strip().lower() not in off
     v = (cfg or {}).get("loop_guard")
@@ -10166,7 +13383,7 @@ def check_request_sampling(req) -> None:
             if num != num or num in (float("inf"), float("-inf")):
                 raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
             req[key] = value = num
-        if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
+        if not sampling.number(value, integer=integer):
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
         if isinstance(value, float) and not math.isfinite(value):   # JSON's Infinity and NaN parse as floats
             raise ValueError(f"{key}: a finite number")
@@ -10178,37 +13395,56 @@ def check_request_sampling(req) -> None:
             req["loop_guard"] = bool(guard)
         else:
             raise ValueError("loop_guard: true or false")
+    if (req or {}).get("script_guard") is not None:  # the script guard for this request (serve/script_guard.py)
+        req["script_guard"] = script_guard.parse(req["script_guard"])
 
 
 def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: list[str], lazy: bool):
     """Opt-in data-parallel replicas (serve/replicas.py, upstream 8d276c19): one StrataEngine per card group, each with
-    its own cards, log and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
+    its own cards, log and CPU cores; the ReplicaEngine in front spreads the requests.  On Linux the replicas share one
+    expert arena in RAM (upstream 3ccfd5aed, 378200894; "replica_shared_arena": false gives each its own copy), as
+    split serving's engines do: the first replica fills it, the others start after it and map what it filled."""
+    from serve import gpu_select
     from serve import replicas as rp
+    from serve import split as sp
     n = len(groups)
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
-    print(f"[strata] {n} replicas on the cards {' | '.join(','.join(g) for g in groups)}"
+    arena, arena_fd, arena_note = sp.arena_path(cfg, {"shared_arena": cfg.get("replica_shared_arena", True)})
+    print(f"[xestrata] {n} replicas on the cards {' | '.join(','.join(g) for g in groups)}"
           f"{' (own CPU cores each)' if cpus else ''}: requests go to the least busy one, "
-          "a conversation back to its own",
+          f"a conversation back to its own; {arena_note}",
           flush=True)
     engines: list = [None] * n
     errors: list = []
 
     def one(i: int):
         rc = rp.replica_cfg(cfg, i, groups[i])
-        env = child_env(rc)
-        env["STRATA_GPU_PCI"] = rc["gpu_pci"]           # its own card, whatever the server's environment names
+        if arena:
+            rc["args"] = list(rc.get("args") or []) + ["--shared-expert-arena", arena]
         try:
+            env = child_env(rc)
+            # #68: a selector inherited from the server can hide this replica's card; scope() drops the filters and
+            # picks the card by PCI.  A selector the config names is the operator's choice, so it stays.  A group of
+            # two or more cards is a layer split: one selector would hide the others from --split-device.
+            if len(groups[i]) == 1 and not any(k in (rc.get("env") or {}) for k in gpu_select.FILTERS):
+                env = gpu_select.scope(exe, env, groups[i][0])
+            envvars.put(env, "GPU_PCI", rc["gpu_pci"])       # its own card, whatever the server's environment names
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
-                                      env=env, lazy=lazy, cpus=cpus[i] if cpus else None)
+                                      env=env, lazy=lazy, cpus=cpus[i] if cpus else None,
+                                      fds=(arena_fd,) if arena_fd is not None else ())
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
     warn_budget_over_ram(engine_args(rc0) if "args" in rc0 else [])
-    if os.environ.get("STRATA_REPLICA_START", "") == "serial":
+    if envvars.get("REPLICA_START", "") == "serial":
         for i in range(n):
             one(i)
     else:
-        ts = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+        rest = range(n)
+        if arena:                         # the arena filled once: the first replica, then the others beside each other
+            one(0)
+            rest = range(1, n) if not errors else range(0)
+        ts = [threading.Thread(target=one, args=(i,)) for i in rest]
         for t in ts:
             t.start()
         for t in ts:
@@ -10220,10 +13456,150 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
                     e.close()
                 except Exception:        # noqa: BLE001
                     pass
+        if arena_fd is not None:
+            os.close(arena_fd)
         i, e = errors[0]
-        raise SystemExit(f"[strata] replica {i} did not start: {e}")
+        raise SystemExit(f"[xestrata] replica {i} did not start: {e}")
     load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
     return rp.ReplicaEngine(engines, load_tokens=load)
+
+
+class KeptArena:
+    """The one engine's expert arena in memory the server holds, when image jobs may unload the engine: started again
+    after the image, it maps the arena instead of reading the experts from the model files (the SSD, when the page
+    cache has let them go).  On Linux a memory file (--shared-expert-arena /proc/self/fd/N, as split.arena_path makes
+    it), on Windows a page-file-backed section (section:<name>, SEC_RESERVE and as large as the RAM: the engine commits
+    its arena in it).  Before such an unload, when the image needs the RAM, the engine marks its coldest experts
+    dropped (arena_drop); once it has ended their pages are given back here - punched out of the file, or reset in the
+    section (MEM_RESET: the system takes them without writing them to the page file) - and the next start reads those
+    alone.  An unload for any other reason gives the whole arena back (a new, empty one in its place)."""
+
+    PUNCH = 0x02 | 0x01                              # FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE
+    PAGE = 4096
+
+    def __init__(self, fd: int | None = None):
+        self.fd = fd
+        self.handle: int | None = None               # Windows: the section
+        self.name = ""
+        if fd is None:
+            self.name = f"Local\\xestrata-arena-{os.getpid()}-{os.urandom(4).hex()}"
+            self.handle = self._section()
+            self.path = f"section:{self.name}"
+        else:
+            self.path = f"/proc/self/fd/{fd}"
+        self.pending: str | None = None              # arena_drop's ranges file, given back after the unload
+
+    @staticmethod
+    def _k32():
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)        # type: ignore[attr-defined]
+        k.CreateFileMappingW.restype = wintypes.HANDLE
+        k.CreateFileMappingW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                         wintypes.DWORD, wintypes.LPCWSTR]
+        k.MapViewOfFile.restype = ctypes.c_void_p
+        k.MapViewOfFile.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t]
+        k.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+        k.VirtualAlloc.restype = ctypes.c_void_p
+        k.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        return k
+
+    def _section(self) -> int:
+        """A new page-file-backed section of the RAM's size, reserved (committed by the engine's view as it fills)."""
+        import ctypes
+        import psutil
+        size = psutil.virtual_memory().total
+        h = self._k32().CreateFileMappingW(ctypes.c_void_p(-1).value, None, 0x04 | 0x4000000,   # PAGE_READWRITE |
+                                           size >> 32, size & 0xFFFFFFFF, self.name)          # SEC_RESERVE
+        if not h:
+            raise OSError(ctypes.get_last_error(), "CreateFileMappingW")    # type: ignore[attr-defined]
+        return h
+
+    def after_unload(self, keep: bool) -> None:
+        pending, self.pending = self.pending, None
+        if not keep:
+            self.reset()
+        elif pending:
+            try:
+                n = self.punch(pending)
+                print(f"[xestrata] expert arena: {n / 2 ** 30:.2f} GiB of the coldest experts given back to the RAM "
+                      "(the next start reads them again)", flush=True)
+            except OSError as e:
+                print(f"[xestrata] expert arena: the dropped experts could not be given back ({e}); the whole arena "
+                      "goes", flush=True)
+                self.reset()
+        with contextlib.suppress(OSError):
+            if pending:
+                os.unlink(pending)
+
+    def punch(self, ranges_file: str) -> int:
+        """The ranges ("offset bytes" lines) given back -> their bytes.  In a section only the whole pages inside each
+        range can be reset (the page at each end stays, a few KiB an expert)."""
+        import ctypes
+        with open(ranges_file, encoding="ascii") as f:
+            ranges = [tuple(int(x) for x in line.split()) for line in f if line.strip()]
+        if self.fd is not None:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_long, ctypes.c_long]
+            for off, n in ranges:
+                if libc.fallocate(self.fd, self.PUNCH, off, n) != 0:
+                    raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+            return sum(n for _, n in ranges)
+        k = self._k32()
+        view = k.MapViewOfFile(self.handle, 0xF001F, 0, 0, 0)       # FILE_MAP_ALL_ACCESS, the whole section
+        if not view:
+            raise OSError(ctypes.get_last_error(), "MapViewOfFile")         # type: ignore[attr-defined]
+        total = 0
+        try:
+            for off, n in ranges:
+                a, e = -(-off // self.PAGE) * self.PAGE, (off + n) // self.PAGE * self.PAGE
+                if e > a:
+                    if not k.VirtualAlloc(view + a, e - a, 0x80000, 0x04):   # MEM_RESET, PAGE_READWRITE
+                        raise OSError(ctypes.get_last_error(), "VirtualAlloc MEM_RESET")   # type: ignore[attr-defined]
+                    total += e - a
+        finally:
+            k.UnmapViewOfFile(view)
+        return total
+
+    def reset(self) -> None:
+        """A new, empty arena under the same name (the engine's argument stays valid); the old one's RAM goes with it:
+        a memory file at the same descriptor, or the section closed and made again."""
+        if self.fd is None:
+            self._k32().CloseHandle(self.handle)
+            self.handle = self._section()
+            return
+        new = os.memfd_create("xestrata-arena")
+        os.dup2(new, self.fd, inheritable=False)
+        os.close(new)
+
+
+def kept_arena(cfg: dict, args: list[str]) -> tuple[KeptArena | None, str]:
+    """The one engine's KeptArena, or None and why not: only with image generation on the text model's card (an image
+    job may unload it), not with a layer split or an engine that reads its experts from the files or keeps part of
+    them in RAM, nor when the "images" section says "keep_arena": false."""
+    from serve import split as sp
+    images = cfg.get("images")
+    if not isinstance(images, dict):
+        return None, ""
+    if images.get("keep_arena") is False:
+        return None, "the experts are read again after an image job (\"keep_arena\": false)"
+    if cfg.get("split_pci"):                         # a shared mapping is not moved into host USM for the PCIe share
+        return None, "the experts are read again after an image job (a layer split)"
+    tier = next((f for f in ("--mmap-experts", "--resident-experts", "--resident-budget-gib", "--shared-expert-arena")
+                 if f in args), None)
+    if tier:
+        return None, f"the experts are read again after an image job ({tier})"
+    said = "the experts stay in RAM across an image job that unloads the model (a shared arena)"
+    if os.name == "nt":
+        try:
+            return KeptArena(), said
+        except (OSError, ImportError) as e:
+            return None, f"the experts are read again after an image job: no section for them ({e})"
+    path, fd, note = sp.arena_path({"args": args}, {"shared_arena": True})
+    if fd is None:
+        return None, f"the experts are read again after an image job: {note}"
+    return KeptArena(fd), said
 
 
 def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bool):
@@ -10234,7 +13610,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
     sp.check_cfg(cfg, spec)
     arena, arena_fd, arena_note = sp.arena_path(cfg, spec)
     work = sp.session_dir(spec)
-    print(f"[strata] split serving: the prompt is read on card {spec['prefill_gpu']}, the answer is made on card "
+    print(f"[xestrata] split serving: the prompt is read on card {spec['prefill_gpu']}, the answer is made on card "
           f"{spec['decode_gpu']} (prompts with {spec['min_prompt_tokens']}+ new tokens are handed over); {arena_note}",
           flush=True)
     engines = {}
@@ -10246,7 +13622,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
             if role == "prefill":
                 warn_budget_over_ram(engine_args(rc) if "args" in rc else [])
             env = child_env(rc)
-            env["STRATA_GPU_PCI"] = rc["gpu_pci"]       # its own card, whatever the server's environment names
+            envvars.put(env, "GPU_PCI", rc["gpu_pci"])       # its own card, whatever the server's environment names
             engines[role] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                          env=env, lazy=lazy, fds=(arena_fd,) if arena_fd is not None else ())
     except BaseException:
@@ -10280,6 +13656,9 @@ MODEL_CARD_SAMPLING = {
     # Ornith-1.5: the card's set for general tasks (its benchmarks ran at temperature 1.0)
     "ornith": {"thinking": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
                "instruct": {"temperature": 0.6, "top_p": 0.95, "top_k": 20}},
+    # dealignai's Ornith-1.5 (CRACK): its card's one set, with or without thinking
+    "dealignai": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+                  "instruct": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}},
     # GLM-5.3-Flash: its generation_config.json
     "glm5": {"thinking": {"temperature": 1.0, "top_p": 0.95}, "instruct": {"temperature": 1.0, "top_p": 0.95}},
 }
@@ -10288,16 +13667,19 @@ MODEL_CARD_SAMPLING = {
 def card_family(cfg: dict) -> str | None:
     """Which MODEL_CARD_SAMPLING set a config's model takes: Qwen3.8-Flash-Next and its variants (Swift, Gyro: upstream
     gives every qwen4exp file the set, "qwen4exp"), Qwen3.6-35B-A3B and Qwen3.5-9B ("qwen35moe"), HauhauCS's Qwen3.5-9B
-    ("hauhaucs"), Ornith-1.5 ("ornith"), GLM-5.3-Flash ("glm5"); None for llm-jp (its card names no sampling), which
-    stays greedy unless the request or the config's `sampling` block says otherwise.  By the model's name, as the
-    architecture alone does not tell Qwen3.6 from Ornith."""
+    ("hauhaucs"), Ornith-1.5 ("ornith"), dealignai's Ornith-1.5 ("dealignai"), GLM-5.3-Flash ("glm5"); None for
+    llm-jp (its card names no sampling), which stays greedy unless the request or the config's `sampling` block says
+    otherwise.  By the model's name (setup's served_name, or its name before 2026-11-09), as the architecture alone
+    does not tell Qwen3.6 from Ornith."""
     name = str(cfg.get("model_name") or "qwen3.8-flash-next").lower()
     if name.startswith(("qwen3.8", "swift")) or "gyro" in name:
         return "qwen4exp"
-    if name.startswith("qwen3.5") and "uncensored" in name:
+    if name.startswith("qwen3.5") and ("uncensored" in name or "-hauhaucs-" in name):
         return "hauhaucs"
     if name.startswith(("qwen3.6", "qwen3.5")):
         return "qwen35moe"
+    if name.startswith("ornith") and ("uncensored" in name or "-dealignai-" in name):
+        return "dealignai"
     if name.startswith("ornith"):
         return "ornith"
     if name.startswith("glm"):
@@ -10412,20 +13794,29 @@ def with_history_tools(tools, req) -> list:
                 have.add(name)
                 extra.append({"name": name, "parameters": {"type": "object", "properties": {}}})
         return [*tools, *extra] if extra else tools
-    except Exception:
+    except Exception:  # noqa: BLE001 - a shape this reader does not know leaves the tools as they were
         return tools
+
+
+SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
+                 "repetition_penalty")
+
+
+def request_asks_sampling(*layers) -> bool:
+    """A layer (request, shared settings, config) names any sampling or penalty setting (upstream d353539037)."""
+    return any(isinstance(layer, dict) and any(layer.get(k) is not None for k in SAMPLING_KEYS) for layer in layers)
 
 
 def undeclared_tool_calls_setting(cfg: dict) -> str:
     """#4622: the config's "undeclared_tool_calls": "text" (the default, when the config does not name it) keeps a
-    well-formed call of a tool the request did not declare as the text the model wrote, with strata_rejected_tool_calls
-    beside it; "call" returns it as a tool call, for a client that has its own policy for unknown names (it answers the
-    model with the tool names it has).  Anything else stops the start."""
+    well-formed call of a tool the request did not declare as the text the model wrote, with
+    strata_rejected_tool_calls beside it; "call" returns it as a tool call, for a client that has its own policy for
+    unknown names (it answers the model with the tool names it has).  Anything else stops the start."""
     mode = cfg.get("undeclared_tool_calls")
-    if mode is None:   # the environment names it too (STRATA_UNDECLARED_TOOL_CALLS); the config wins
-        mode = os.environ.get("STRATA_UNDECLARED_TOOL_CALLS") or "text"
+    if mode is None:                 # the environment names it too (XESTRATA_UNDECLARED_TOOL_CALLS); the config wins
+        mode = envvars.get("UNDECLARED_TOOL_CALLS") or "text"
     if mode not in ("text", "call"):
-        raise SystemExit(f"[strata] config \"undeclared_tool_calls\" must be \"text\" or \"call\", not {mode!r}")
+        raise SystemExit(f"[xestrata] config \"undeclared_tool_calls\" must be \"text\" or \"call\", not {mode!r}")
     return mode
 
 
@@ -10435,12 +13826,12 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
     "tool_call_recovery": false turns it off. Anything but true or false stops the start."""
     recovery = cfg.get("tool_call_recovery", True)
     if not isinstance(recovery, bool):
-        raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
+        raise SystemExit(f"[xestrata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
     return recovery
 
 
 #: #5787: the switch that turns the server's own crash reporter off.
-FAULTHANDLER_OFF = "STRATA_NO_FAULTHANDLER"
+FAULTHANDLER_OFF = "XESTRATA_NO_FAULTHANDLER"   # (STRATA_NO_FAULTHANDLER too)
 
 
 def arm_faulthandler(env: dict | None = None) -> bool:
@@ -10458,7 +13849,7 @@ def arm_faulthandler(env: dict | None = None) -> bool:
     signal with the same exit code, so the crash guard, the app's restart and the OS's own dump are unchanged.
     """
     target = os.environ if env is None else env
-    if target.get(FAULTHANDLER_OFF) == "1":
+    if target.get(FAULTHANDLER_OFF, envvars.get("NO_FAULTHANDLER", env=target)) == "1":
         return False
     try:
         import faulthandler
@@ -10469,14 +13860,14 @@ def arm_faulthandler(env: dict | None = None) -> bool:
 
 
 def main() -> int:
-    """The server.  Its console output goes through a bounded queue (serve/nonblocking_out.py, #4479 / #2481): a console
-    that stops taking output must not hold a request's turn, a cancel or an admission.  STRATA_BLOCKING_CONSOLE=1 turns
-    it off (testers)."""
+    """The server.  Its console output goes through a bounded queue (serve/nonblocking_out.py, upstream b776e1cd0): a
+    console that stops taking output must not hold a request's turn, a cancel or an admission.
+    XESTRATA_BLOCKING_CONSOLE=1 turns it off (testers)."""
     quiet_crash_env()                                  # every child inherits it: no gdb (serve/childenv.py)
     limit_own_arenas()                                 # glibc's arenas of this server only (serve/childenv.py)
     # #5787: a native death names its Python line in this server's own output
     arm_faulthandler()
-    if os.environ.get("STRATA_BLOCKING_CONSOLE") == "1":
+    if envvars.get("BLOCKING_CONSOLE") == "1":
         return _main()
     from serve.nonblocking_out import decoupled_console
     with decoupled_console():
@@ -10508,9 +13899,9 @@ def _ensure_inkling2mini_tokenizer(cfg: dict, tpath: Path) -> bool:
         try:
             IT.convert_manifest(IT.read_manifest(model_path), tpath)
         except Exception as e:                          # noqa: BLE001 - the pair below, else the plain stop
-            print(f"[strata] the tokenizer could not be made from {model_path.name}: {e}", flush=True)
+            print(f"[xestrata] the tokenizer could not be made from {model_path.name}: {e}", flush=True)
         if (tpath / "vocab.json").exists():
-            print(f"[strata] the missing tokenizer was made again from {model_path.name} in {tpath}", flush=True)
+            print(f"[xestrata] the missing tokenizer was made again from {model_path.name} in {tpath}", flush=True)
             return True
     places = [model_path.parent] if model_path is not None else []
     places += [d for d in (tpath, tpath.parent) if d not in places]
@@ -10522,17 +13913,17 @@ def _ensure_inkling2mini_tokenizer(cfg: dict, tpath: Path) -> bool:
             try:
                 IT.convert_files(tj, ct, tpath)
             except Exception as e:                      # noqa: BLE001 - the next pair, else the plain stop
-                print(f"[strata] the tokenizer could not be made from {tj}: {e}", flush=True)
+                print(f"[xestrata] the tokenizer could not be made from {tj}: {e}", flush=True)
             if (tpath / "vocab.json").exists():
-                print(f"[strata] the missing tokenizer was made again from {tj} in {tpath}", flush=True)
+                print(f"[xestrata] the missing tokenizer was made again from {tj} in {tpath}", flush=True)
                 return True
     return False
 
 
 def _main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
-    ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
+    ap.add_argument("--engine", choices=["mock", "xestrata", "strata"], default="mock")   # strata: upstream's name
+    ap.add_argument("--config", help="xestrata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), "
@@ -10552,10 +13943,10 @@ def _main() -> int:
                          "(the default; kept so older scripts keep working)")
     ap.add_argument("--no-fit-max-tokens", action="store_true",
                     help="answer 400 when prompt + max_tokens does not fit the context, like llama.cpp "
-                         "(also \"fit_max_tokens\": false in the config). A prompt that alone does not fit is always "
-                         "400")
-    ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
-                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY. "
+                         "(also \"fit_max_tokens\": false in the config). A prompt that alone does not fit is "
+                         "always 400")
+    ap.add_argument("--api-key", default=envvars.get("API_KEY", ""),
+                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $XESTRATA_API_KEY. "
                          "Several keys: separate them with commas (key1,key2), as llama.cpp does")
     ap.add_argument("--no-api-key", action="store_true",
                     help="serve on the network without an API key (anyone who can reach the port can use the model; "
@@ -10567,7 +13958,11 @@ def _main() -> int:
                     help="start the API unloaded (the engine and the vision encoder start with the first request)")
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
-                         "memory (also \"api_monitor\": true in the config; off by default)")
+                         "memory (on by default; \"api_monitor\": false in the config turns it off)")
+    ap.add_argument("--debug-chat-log", action="store_true",
+                    help="write every chat request's prompt, tool rounds, answer and pictures, and the web page's "
+                         "chats, to the state folder's debug-chat-log/ (also \"debug_chat_log\": true in the config "
+                         "or the settings; off by default)")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests, so other programs (games, other "
                          "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
@@ -10581,19 +13976,23 @@ def _main() -> int:
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
     ap.add_argument("--replicas", type=int, default=None, metavar="N",
-                    help="data-parallel replicas (opt-in): cut the cards (\"gpu_pci\" and \"split_pci\") into N equal "
-                         "groups and run one engine on each, requests spread over them (also \"replicas\" in the "
-                         "config: a number, or [{\"gpus\": [\"0000:03:00.0\"]}, {\"gpus\": [\"0000:09:00.0\"]}])")
+                    help="data-parallel replicas: cut the cards (\"gpu_pci\" and \"split_pci\") into N equal groups "
+                         "and run one engine on each, requests spread over them (also \"replicas\" in the config: a "
+                         "number, [{\"gpus\": [\"0000:03:00.0\"]}, {\"gpus\": [\"0000:09:00.0\"]}]; \"auto\", the "
+                         "default, runs none and the start log says how many this machine could run)")
     ap.add_argument("--split-serve", default=None, metavar="PREFILL,DECODE",
-                    help="split serving (opt-in): one engine on the card PREFILL reads the prompt, a second on the "
-                         "card DECODE makes the answer, the session handed over in RAM; the cards by PCI address "
+                    help="split serving: one engine on the card PREFILL reads the prompt, a second on the card DECODE "
+                         "makes the answer, the session handed over in RAM; the cards by PCI address "
                          "(0000:03:00.0,0000:09:00.0; also \"split_serve\" in the config: {\"prefill_gpu\": "
-                         "\"0000:03:00.0\", \"decode_gpu\": \"0000:09:00.0\"}; docs/MULTIGPU.md)")
+                         "\"0000:03:00.0\", \"decode_gpu\": \"0000:09:00.0\"}; \"auto\", the default, runs none "
+                         "and the start log says when two cards could; docs/MULTIGPU.md)")
     a = ap.parse_args()
     global OPENS_BROWSER
     OPENS_BROWSER = bool(a.open)
-    if a.engine == "strata" and (_rt := rttime_limit_note()):   # #3238: say it before the first unexplained -9
-        print("[strata] WARNING: " + _rt, flush=True)
+    if a.engine == "strata":                            # the name upstream's scripts and older launchers pass
+        a.engine = "xestrata"
+    if a.engine == "xestrata" and (_rt := rttime_limit_note()):   # upstream #3238: said before the first unexplained -9
+        print("[xestrata] WARNING: " + _rt, flush=True)
     cfg = read_config(a.config) if a.config else {}
     split_joined_args(cfg)
     if a.replicas is not None:
@@ -10609,6 +14008,27 @@ def _main() -> int:
     lift_reasoning_effort_arg(cfg)
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    # the settings the machine decides (serve/autotune.py): "parallel", "batch_groups", "vram_elastic",
+    # "conversation_cache_mib", "replicas", "split_serve" and "split_skip_if_fits" are "auto" unless the config says
+    # otherwise.  The cards' VRAM, the RAM, their number and the model's size choose here, and the log says what each
+    # choice is.  An explicit value in the config is the user's own and is left as it is.
+    plan = None
+    if a.engine == "xestrata" and cfg:
+        elastic_asked = cfg.get("vram_elastic", autotune.AUTO)
+        plan = autotune.resolve(cfg, autotune.read(cfg))
+        cfg = plan.cfg
+        notes = list(plan.notes)
+        # XeStrata-890M: on an integrated GPU (a KFD node that reports CPU cores, as the Radeon 890M's does) the expert
+        # cache stays one allocation unless the config asks for segments ("vram_elastic": true): the fork's decode is
+        # measured and tuned that way, and the GPU shares the system RAM with whatever would borrow it
+        if elastic_asked in (None, autotune.AUTO) and cfg.get("vram_elastic") is True and hip_igpu_present():
+            cfg["vram_elastic"] = False
+            notes = [("vram_elastic: off (an integrated GPU: the expert cache stays one allocation; \"vram_elastic\": "
+                      "true in the config makes it give VRAM back between requests)") if n.startswith("vram_elastic:")
+                     else n for n in notes]
+        print("[xestrata] the machine's choices:", flush=True)
+        for line in notes:
+            print(f"[xestrata]   {line}", flush=True)
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
@@ -10618,27 +14038,36 @@ def _main() -> int:
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
-    if a.engine == "strata" and not (tpath / "vocab.json").exists():
+    if a.engine == "xestrata" and not (tpath / "vocab.json").exists():
         _ensure_inkling2mini_tokenizer(cfg, tpath)
-    if a.engine == "strata" and not (tpath / "vocab.json").exists():
+    if a.engine == "xestrata" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
         tok = ST.Tokenizer.from_dir(tpath)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
-    if a.engine == "strata":
+    if a.engine == "xestrata":
         if not cfg:
-            ap.error("--engine strata needs --config")
+            ap.error("--engine xestrata needs --config")
         vision = None
         env = child_env(cfg)
+        if cfg.get("images") and not envvars.get("GPU_PCI", env=env):
+            # The image and training ledgers need the text engine's actual card even when setup chose it automatically.
+            from serve import gpu_select
+            iexe = str(cfg["images"]["exe"])
+            iexe = iexe if os.path.isabs(iexe) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", iexe))
+            try:
+                envvars.put(env, "GPU_PCI", gpu_select.selected_pci(iexe, env))
+            except ValueError as e:
+                raise SystemExit(f"[xestrata] image GPU: {e}") from e
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
+            print(f"[xestrata] sampling defaults from the config: {pretty}", flush=True)
         vision_error = vision_fallback = None
         lazy = a.lazy or cfg.get("lazy_load") is True
         if cfg.get("vision"):
-            elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
+            elastic = vision_elastic_on(cfg) and vram_elastic_on(cfg)
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
                   "loading the vision encoder ..." if not lazy else
                   "vision encoder unloaded; it starts with the model ...", flush=True)
@@ -10646,75 +14075,79 @@ def _main() -> int:
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
-                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
-                      "encoder its VRAM): the encoder starts with the model instead", flush=True)
+            vcfg["elastic"] = vision_elastic_on(cfg)
+            if vcfg["elastic"] and not vram_elastic_on(cfg):
+                print('[xestrata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives '
+                      "the encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
             elif vcfg.get("elastic") is True and (len(gpu_list(cfg)) > 1 or (
-                    cfg.get("split_pci") and os.environ.get("STRATA_LAYER_SPLIT") != "off")):
+                    cfg.get("split_pci") and envvars.get("LAYER_SPLIT") != "off")):
                 # the engine turns --vram-elastic off on a layer split (a cache per GPU): the encoder still starts
                 # with the first picture and stops when idle, but its VRAM has to be free already (upstream 092c7d1ef)
-                print('[strata] images: on a layer split the expert cache cannot make room for the image encoder (the '
-                      'engine turns --vram-elastic off); keep its VRAM free with "--vram-reserve-mib" on the '
+                print('[xestrata] images: on a layer split the expert cache cannot make room for the image encoder '
+                      '(the engine turns --vram-elastic off); keep its VRAM free with "--vram-reserve-mib" on the '
                       "encoder's GPU, or the first picture may not get it", flush=True)
-            failed: list = []
-            for vc in vision_attempts(vcfg):
-                if failed:
-                    print(f"[strata] images: trying {vision_label(vc)} instead", flush=True)
-                try:
-                    vision = Vision(vc, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                                    env=env, lazy=lazy)
-                    break
-                except (OSError, RuntimeError) as e:    # the next one; with none left the model still serves text
-                    failed.append(f"{vision_label(vc)}: {e}")
-                    print(f"[strata] images: {failed[-1]}", flush=True)
-            if vision is None:
-                vision_error = "; ".join(failed)
-                print("[strata] images are off: no image encoder started", flush=True)
-            elif failed:
-                vision_fallback = "; ".join(failed)
-                print(f"[strata] images: {vision.label} serves them ({vision_fallback})", flush=True)
+            try:                                        # the GPU reader, or the processor's when it does not start
+                vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                                env=env, lazy=lazy)
+            except (OSError, RuntimeError) as e:        # the model still serves text
+                vision_error = f"{vision_label(vcfg)}: {e}"
+                print(f"[xestrata] images are off: {vision_error}", flush=True)
+            else:
+                if vision.fallback_why:
+                    vision_fallback = vision.fallback_why
+                    print(f"[xestrata] images: {vision.label} serves them ({vision_fallback})", flush=True)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         try:
             split = layer_split_value(cfg)              # upstream #644: before the (minutes-long) start
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
         if len(gpu_list(cfg)) > 1:
-            print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
+            print(f"[xestrata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
         # a relative "exe" is the config's cwd's, made absolute here
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else \
             os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
+        if not os.path.isfile(exe):                     # e.g. a config older than the engine's name xestrata-engine
+            raise SystemExit(f"[xestrata] the engine the config names (\"exe\": {exe}) is not there: run xestrata "
+                             "--setup to write the config again")
         try:
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         try:
             # #458; the Inkling-2-Mini engine has no thinking levels and takes none of these arguments
             effort_end = None if inkling2mini_kind.is_inkling2mini(cfg) else effort_end_args(cfg, exe, tok)
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         from serve import replicas as rp
         try:
             groups = rp.gpu_groups(cfg)
         except rp.ReplicaConfigError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         from serve import split as split_mod
         try:
             split_serve = split_mod.split_spec(cfg)
             if split_serve:
                 split_mod.check_cfg(cfg, split_serve)
         except split_mod.SplitConfigError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
         elif split_serve:
             engine = start_split(cfg, split_serve, exe, effort_end or [], lazy)
         else:
-            engine = StrataEngine(exe, engine_args(cfg, exe) + (effort_end or []), cwd=cfg.get("cwd"),
-                                  log=cfg.get("log"),
-                                  env=env, lazy=lazy)
+            eargs = engine_args(cfg, exe) + (effort_end or [])
+            kept, said = (None, "") if image_env(cfg, env)[1] else kept_arena(cfg, eargs)
+            if said:
+                print(f"[xestrata] {said}", flush=True)
+            if kept is not None:
+                eargs += ["--shared-expert-arena", kept.path]
+            engine = StrataEngine(exe, eargs, cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
+                                  fds=(kept.fd,) if kept is not None and kept.fd is not None else ())
+            engine.kept_arena = kept                    # an attribute of its own: restart() keeps it
+            engine.ledger_key = images_api.gpu_key(env)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"), engine.info.get("experts_ram"))
         note = None if groups or split_serve else desktop_vram_note(amd_card(cfg.get("gpu_pci")),
@@ -10741,18 +14174,22 @@ def _main() -> int:
                                                       cfg.get("fit_max_tokens") is not False))
     svc.vision_error = vision_error
     svc.vision_fallback = vision_fallback
+    eargs = [str(x) for x in cfg.get("args", [])]
+    if "--device" in eargs[:-1] and eargs[eargs.index("--device") + 1] == "cpu":   # setup's model without a GPU
+        svc.text_only = "the model runs on the CPU, which reads text only (a GPU reads images)"
     if (tpath / "vocab.json").exists():
         svc.tokenizer_dir = str(tpath.resolve())
     svc.public_urls = True                             # #28: a request's image URL only from a public address
-    if a.engine == "strata":                            # the model card's sampling when nothing else is said
+    if a.engine == "xestrata":                          # the model card's sampling when nothing else is said
         svc.model_arch = card_family(cfg)
     svc.answer_room = cfg.get("answer_room") is not False
+    svc.mtp_greedy = cfg.get("mtp_greedy") is True and "--mtp" in eargs   # opt-in, off by default
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         # the default image model ("images") and the others a request can name ("image_models")
         extra = cfg.get("image_models") or []
         if not isinstance(extra, list) or not all(isinstance(m, dict) for m in extra):
-            raise SystemExit('[strata] config: "image_models" must be a list of "images" sections')
+            raise SystemExit('[xestrata] config: "image_models" must be a list of "images" sections')
         icfgs = [{k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                       if k in ("exe", "diffusion_model", "vae", "llm", "tokenizer", "system_prompt", "out_dir",
                                "lora_dir")
@@ -10761,44 +14198,76 @@ def _main() -> int:
                   for k, v in section.items()} for section in [cfg["images"], *extra]]
         try:
             ilog = open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None
-            # the text engine's environment: the same GPU (STRATA_GPU_PCI, CUDA_VISIBLE_DEVICES) and libraries
-            svc.images = images_api.ImageModels(icfgs, log=ilog, env=child_env(cfg))
+            # the text engine's environment: its libraries, and its GPU unless the images have a card of their own
+            text_env = env if a.engine == "xestrata" else child_env(cfg)
+            ienv, separate, said = image_env(cfg, text_env)
+            if said:
+                print(f"[xestrata] {said}", flush=True)
+            from serve import gpu_select
+            pci = envvars.get("GPU_PCI", env=ienv) or gpu_select.selected_pci(icfgs[0]["exe"], ienv)
+            ienv = gpu_select.scope(icfgs[0]["exe"], ienv, pci)
+            svc.images = images_api.ImageModels(icfgs, log=ilog, env=ienv, separate=separate)
+            svc.images.helper_card = image_helper_card(cfg)
+            if separate and not svc.images.helper_card:   # the text model's GPU may be lent to them (use_text_gpu)
+                text_pci = envvars.get("GPU_PCI", env=text_env) or gpu_select.selected_pci(icfgs[0]["exe"], text_env)
+                svc.images.lend_cfgs = (icfgs, ilog, gpu_select.scope(icfgs[0]["exe"], text_env, text_pci))
+                svc.images.lend_pci = str(text_pci or "").lower() or None
+            svc.images.gpu_pci = envvars.get("GPU_PCI", env=ienv) if separate else None   # the Monitor's image card
+            if not str((cfg.get("images") or {}).get("gpu_pci") or ""):
+                # no named card: an "auto" job may pick an unused card at request time (images_api.auto_pick)
+                svc.images.auto_cfgs = (icfgs, ilog, text_env)
         except ValueError as e:
-            raise SystemExit(f"[strata] config: {e}")
+            raise SystemExit(f"[xestrata] config: {e}")
         gone = svc.images.missing()
         if gone:
-            print(f"[strata] image generation: missing {', '.join(gone)} - requests fail until setup --images has run "
-                  "again", flush=True)
+            print(f"[xestrata] image generation: missing {', '.join(gone)} - requests fail until setup --images has "
+                  "run again", flush=True)
         for g in svc.images.gens.values():
-            print(f"[strata] image generation: {g.model} {g.cfg.get('quant') or ''} on strata-image "
+            print(f"[xestrata] image generation: {g.model} {g.cfg.get('quant') or ''} on xestrata-image "
                   f"(POST /v1/images/generations{'' if g is svc.images.default else ', model ' + g.model}; "
                   f"GPU policy {g.policy})", flush=True)
         if svc.images.note():
-            print(f"[strata] image generation: {svc.images.note()}", flush=True)
+            print(f"[xestrata] image generation: {svc.images.note()}", flush=True)
         import atexit
         atexit.register(svc.images.close)               # the image engine ends with the server
+        # Recover orphans before serving requests, outside status_lock, and stop our own trainer first on exit.
+        svc.lora_jobs = lora_train_api.TrainJobs(lora_train_api.data_root() / "lora-jobs", svc)
+        atexit.register(svc.lora_jobs.close)
+    if isinstance(cfg.get("translate"), dict) and cfg["translate"].get("model"):   # the translation model, first used
+        tcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                    if k in ("exe", "path") and isinstance(v, str) and not os.path.isabs(v) else v)
+                for k, v in cfg["translate"].items()}
+        try:
+            engine_exe = os.path.abspath(os.path.join(cfg.get("cwd") or ".", str(cfg.get("exe") or "")))
+            tenv, helper, said = translation_env(cfg, str(tcfg.get("gpu") or "auto"))
+            if said:
+                print(f"[xestrata] {said}", flush=True)
+            svc.translation = Translation(tcfg, engine_exe, cfg.get("log"), tenv, svc, helper)
+        except ValueError as e:
+            raise SystemExit(f"[xestrata] config: {e}")
+        print(f"[xestrata] translation: {svc.translation.model.name} starts with the first translation", flush=True)
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
             svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get(
                 "reasoning_effort")
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         if svc.config_effort:
-            print(f"[strata] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
+            print(f"[xestrata] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
                   "Chat settings shared with other apps, can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
-        raise SystemExit(f"[strata] config {e}")
+        raise SystemExit(f"[xestrata] config {e}")
     if svc.aliases:
-        print(f"[strata] model aliases: {', '.join(svc.aliases)}", flush=True)
-    if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or \
+        print(f"[xestrata] model aliases: {', '.join(svc.aliases)}", flush=True)
+    if (envvars.get("API_KEY") is not None and not str(envvars.get("API_KEY")).strip()) or \
             any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
                 for i, x in enumerate(sys.argv)):
         # #213: an empty key would switch authentication off without a word
-        print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
+        print("[xestrata] an API key was given but it is empty: set a key, or leave --api-key / XESTRATA_API_KEY out",
               file=sys.stderr)
         return 2
     raw_key = a.api_key or cfg.get("api_key", "")
@@ -10808,31 +14277,31 @@ def _main() -> int:
     try:
         svc.api_key = api_key_of(raw_key)
     except ValueError as e:
-        print(f'[strata] {e}: set a key, or leave --api-key / STRATA_API_KEY / "api_key" out', file=sys.stderr)
+        print(f'[xestrata] {e}: set a key, or leave --api-key / XESTRATA_API_KEY / "api_key" out', file=sys.stderr)
         return 2
     # #569: written, but empty: the server has none (a warning, not a stop)
     if not svc.api_key and "api_key" in cfg and not no_key_chosen:
-        print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
+        print("[xestrata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     svc.remote_image_files = cfg.get("remote_image_files") is True
     try:
-        svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"), os.environ.get("STRATA_ALLOWED_HOSTS", ""))
+        svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"), envvars.get("ALLOWED_HOSTS", ""))
     except ValueError as e:
-        raise SystemExit(f"[strata] config {e}")
+        raise SystemExit(f"[xestrata] config {e}")
     if svc.allowed_hosts:
-        print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")"
+        print("[xestrata] Host check off: any name reaches this server (allowed_hosts \"*\")"
               if "*" in svc.allowed_hosts
-              else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)",
+              else f"[xestrata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)",
               flush=True)
-    svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
+    svc.api_monitor = api_monitor_of(cfg, a.api_monitor)
     if svc.api_monitor:
-        print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
-              "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
+        print("[xestrata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept "
+              "in memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
               flush=True)
     if svc.cors_origins:
-        print(f"[strata] CORS on /v1/* for {', '.join(svc.cors_origins)}"
+        print(f"[xestrata] CORS on /v1/* for {', '.join(svc.cors_origins)}"
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
@@ -10842,7 +14311,7 @@ def _main() -> int:
     try:
         svc.before_load_timeout_s = float(cfg.get("before_load_timeout_s") or svc.before_load_timeout_s)
     except (TypeError, ValueError):
-        print("[strata] \"before_load_timeout_s\" in the config is not a number; using "
+        print("[xestrata] \"before_load_timeout_s\" in the config is not a number; using "
               f"{svc.before_load_timeout_s:g} s", flush=True)
     svc.before_load_ignore_failure = cfg.get("before_load_ignore_failure") is True
     svc.before_load_strict = cfg.get("before_load_strict") is True
@@ -10853,55 +14322,113 @@ def _main() -> int:
             svc.slot_save_path = slot_save_dir(a.slot_save_path) if a.slot_save_path else \
                 slot_save_dir(cfg["slot_save_path"], cfg.get("cwd"))
         except (ValueError, OSError) as e:
-            raise SystemExit(f"[strata] {e}")
-        print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
+            raise SystemExit(f"[xestrata] {e}")
+        print(f"[xestrata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "on_request")   # #278: "model" thinks unasked too
     if mode not in ("model", "on_request"):
-        raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
+        raise SystemExit(f"[xestrata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
     svc.undeclared_tool_calls = undeclared_tool_calls_setting(cfg)
-    # (a): false (or STRATA_TOOL_MARKUP_RETRY=0) sends the markup as text
+    # (a): false (or XESTRATA_TOOL_MARKUP_RETRY=0) sends the markup as text
     retry = cfg.get("tool_markup_retry", True)
     if not isinstance(retry, bool):
-        raise SystemExit(f"[strata] config \"tool_markup_retry\" must be true or false, not {retry!r}")
+        raise SystemExit(f"[xestrata] config \"tool_markup_retry\" must be true or false, not {retry!r}")
     svc.tool_markup_retry = svc.tool_markup_retry and retry
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
-        raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
+        raise SystemExit(f"[xestrata] config \"env_to_user\" must be true or false, not {etu!r}")
     import serve.frontend as _frontend
     _frontend.ENV_TO_USER = etu
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
-        raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
+        raise SystemExit(f"[xestrata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
-    svc.loop_guard = loop_guard_setting(cfg)            # (STRATA_LOOP_GUARD=0 or "loop_guard": false: off)
+    svc.loop_guard = loop_guard_setting(cfg)            # (XESTRATA_LOOP_GUARD=0 or "loop_guard": false: off)
     if not svc.loop_guard:
-        print("[strata] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
+        print("[xestrata] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]
             budget = svc.reasoning_budget({})
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         if budget:
-            print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
+            print(f"[xestrata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
     recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
     if recovery is True:
         recovery = "recover"
     if recovery is not False and recovery not in ("stop", "recover"):
-        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
+        raise SystemExit("[xestrata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
-    svc.gpu_pci = os.environ.get("STRATA_GPU_PCI") or cfg.get("gpu_pci")   # the Monitor reads the engine's card
+    svc.gpu_pci = envvars.get("GPU_PCI") or cfg.get("gpu_pci")   # the Monitor reads the engine's card
     svc.split_pci = cfg.get("split_pci") or None       # and a layer split's other cards
-    if a.engine == "strata" and split_serve:            # split serving: the decode card, and the prefill card beside it
+    if a.engine == "xestrata" and split_serve:          # split serving: the decode card, and the prefill card beside it
         svc.gpu_pci, svc.split_pci = split_serve["decode_gpu"], [split_serve["prefill_gpu"]]
+    strata = a.engine == "xestrata"
+    svc.gpu_roles = gpu_roles(cfg, svc.gpu_pci, groups if strata else None, split_serve if strata else None,
+                              getattr(svc.images, "gpu_pci", None), getattr(svc.images, "helper_card", ""))
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
+    svc.disk_paths = disk_watch.paths(cfg, a.config)    # the folders the watcher reads, from this run's config
+    if cfg.get("exe"):
+        svc.engine_exe = os.path.abspath(os.path.join(cfg.get("cwd") or ".", str(cfg["exe"])))
+    try:                                                # the user's settings: the keys every model shares (runconfig)
+        user_settings = runconfig.load_settings(svc.settings_path)
+    except (OSError, ValueError) as e:
+        print(f"[xestrata] WARNING: {svc.settings_path} cannot be read ({e}); started without it", flush=True)
+        user_settings = {}
+    try:                                                # the script guard: the model's config over the settings'
+        svc.script_guard = script_guard.setting(
+            {"script_guard": runconfig.effective(cfg, user_settings, "script_guard")}, os.environ)
+    except ValueError as e:
+        raise SystemExit(f"[xestrata] {e}") from None
+    if isinstance(svc.script_guard, dict):
+        print(f"[xestrata] script guard: {script_guard_name(svc.script_guard)} for every request that names none "
+              "(a request's \"script_guard\": \"off\" turns it off for that request)", flush=True)
+    try:                                                # the debug chat log (debuglog.py): model over settings
+        on = a.debug_chat_log or runconfig.check(
+            "debug_chat_log", runconfig.effective(cfg, user_settings, "debug_chat_log"), cfg)
+        mib = runconfig.check("debug_chat_log_mib", runconfig.effective(cfg, user_settings, "debug_chat_log_mib"), cfg)
+    except ValueError as e:
+        raise SystemExit(f"[xestrata] {e}") from None
+    if on:
+        svc.debug_log = debuglog.DebugLog(places.user_dir("state") / "debug-chat-log", mib or 1024)
+        print(f"[xestrata] debug chat log on: every chat request's prompt, tool rounds, answer and pictures, and the "
+              f"web page's chats, are written to {svc.debug_log.folder} (at most {mib or 1024:g} MiB)" +
+              ("" if svc.api_key else "; set an API key if others can reach this server"), flush=True)
+        svc.debug_log.pack_soon()                       # the days before today's and the idle chats, with xz
+    searcher = None
+    try:                                                # web search: the engine and its address (search.py)
+        searcher = runconfig.check("search_engine", runconfig.effective(cfg, user_settings, "search_engine"),
+                                   cfg) or "searxng"
+        svc.search_url = runconfig.check("search_url", runconfig.effective(cfg, user_settings, "search_url"),
+                                         cfg) or None
+    except ValueError as e:
+        print(f"[xestrata] WARNING: web search is off: {e}", flush=True)
+    deepseek_key = user_settings.get("deepseek_api_key")   # the settings' only (runconfig.GLOBAL_ONLY): never logged
+    tinyfish_key = user_settings.get("tinyfish_api_key")
+    if searcher == "deepseek" and isinstance(deepseek_key, str) and deepseek_key.strip():
+        svc.search_backend = search_api.DeepSeek(deepseek_key.strip())
+        print("[xestrata] web search: DeepSeek's search API (for requests that ask for it; billed per search)",
+              flush=True)
+    elif searcher == "deepseek":
+        print(f"[xestrata] WARNING: web search is off: search_engine is deepseek, but {svc.settings_path} has no "
+              "deepseek_api_key", flush=True)
+    elif searcher == "tinyfish" and isinstance(tinyfish_key, str) and tinyfish_key.strip():
+        svc.search_backend = search_api.TinyFish(tinyfish_key.strip())
+        print("[xestrata] web search: TinyFish's search API (for requests that ask for it; free up to a daily "
+              "allowance)", flush=True)
+    elif searcher == "tinyfish":
+        print(f"[xestrata] WARNING: web search is off: search_engine is tinyfish, but {svc.settings_path} has no "
+              "tinyfish_api_key", flush=True)
+    elif searcher == "searxng" and svc.search_url:
+        svc.search_backend = search_api.Searxng(svc.search_url)
+        print(f"[xestrata] web search: {svc.search_url} (for requests that ask for it)", flush=True)
     # A host that runs one model at a time and swaps them (a GPU shared with other work) can name the RPC that does
     # the swap: the web app then offers the models served on this port. {"mode": m} switches, {} only reports.
     svc.switcher = cfg.get("model_switcher") or None
@@ -10910,17 +14437,22 @@ def _main() -> int:
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         svc.shared = load_shared_settings(svc.shared_path)      # #4933: one unknown key no longer clears the rest
         if svc.shared:
-            print("[strata] other apps use the Chat settings: " +
+            print("[xestrata] other apps use the Chat settings: " +
                   ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
+    # the skills the web page's user adds (serve/skills.py): the config's "skills_dir" (setup writes the data folder's
+    # skills/), else that of the data folder in the settings
+    svc.skills = skills_api.Skills(cfg.get("skills_dir") or skills_api.default_dir())
     if hub is not None:
         import atexit
         svc.mcp = hub
         if hub.settings["image_results"]:
             hub.media_dir = Path(a.config).with_suffix(".tool-media") if a.config else Path.cwd() / ".tool-media"
-        print(f"[strata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
+        print(f"[xestrata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
+    disk_watch.start(svc.disk_paths,
+                     say=lambda line: print(f"[xestrata] {disk_watch.severity(line)}: {line}", flush=True))
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     svc.start_vision_idle()
@@ -10946,11 +14478,17 @@ def _main() -> int:
         if os.name == "nt":
             print("       nothing arrives? Windows Firewall blocks it until allowed: accept its prompt for Python, or "
                   "run "
-                  "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Strata " + str(a.port) + "\" "
+                  "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"XeStrata " + str(a.port) + "\" "
                   "-Direction Inbound -Protocol TCP -LocalPort " + str(a.port) + " -Action Allow -Profile Private\n"
                   "       (and set this network to Private in Windows' network settings)", flush=True)
+
+    def check_kernel():                                 # Debian's debsecan asks the security tracker: off the start
+        svc.xe_kernel = kernel_check.unfixed_release()
+        if svc.xe_kernel:
+            print("[xestrata] WARNING: " + kernel_check.text(svc.xe_kernel), flush=True)
+    threading.Thread(target=check_kernel, daemon=True, name="kernel-check").start()
     if release_check.enabled():                         # at the start and every six hours, said here once
-        svc.updates.watch(lambda line: print("[strata] " + line, flush=True))
+        svc.updates.watch(lambda line: print("[xestrata] " + line, flush=True))
     if a.open and cfg.get("open_browser") is not False:   # #609: the config's "open_browser": false wins (an older
         import webbrowser                                  # run-<model>.sh still passes --open)
         webbrowser.open(f"http://{here}:{a.port}/")
@@ -10971,7 +14509,7 @@ def _main() -> int:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+        print("\n[xestrata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
         # upstream 3cf22f5ef (#6055): a request that arrives while the engine closes (one accepted before the listening
         # loop ended, or whose headers come in later) is refused (503 server_draining), not cut off with 0 tokens
         svc.begin_drain()
@@ -10997,10 +14535,10 @@ def _main() -> int:
             pass
         try:
             from serve import cache_drop
-            cache_drop.drop_after_exit(engine)           # opt-in (STRATA_DROP_CACHE_ON_EXIT=1), default unchanged
+            cache_drop.drop_after_exit(engine)           # opt-in (XESTRATA_DROP_CACHE_ON_EXIT=1), default unchanged
         except Exception as e:  # noqa: BLE001 - never block the exit
-            print(f"[strata] could not release the model files' cache: {e}", flush=True)
-        print("[strata] stopped", flush=True)
+            print(f"[xestrata] could not release the model files' cache: {e}", flush=True)
+        print("[xestrata] stopped", flush=True)
     return 0
 
 

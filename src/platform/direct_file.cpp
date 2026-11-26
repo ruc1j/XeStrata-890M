@@ -4,9 +4,12 @@
 // src/platform/direct_file.cpp - see include/strata/platform/direct_file.hpp.
 #include "strata/platform/direct_file.hpp"
 #include "strata/platform/aux_cpus.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
+#include <climits>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -14,6 +17,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -69,9 +73,15 @@ struct Pending {
 /// i7-14700, 16 threads 1.18 s, 32 0.71 s, 64 0.49 s, 64 with twice the slots the same; a drive that cannot serve
 /// the depth queues the reads and the threads wait).
 int io_threads(int dflt) {
-    const char* v = std::getenv("STRATA_IO_THREADS");
-    const int n = v ? std::atoi(v) : dflt;
-    return std::clamp(n, 1, 64);
+    const char* v = strata::env_get("IO_THREADS");
+    if (!v) return std::clamp(dflt, 1, 64);
+    errno = 0;
+    char* end = nullptr;
+    const long n = std::strtol(v, &end, 10);
+    if (end != v) while (std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (end == v || *end || errno == ERANGE || n < INT_MIN || n > INT_MAX)
+        throw std::invalid_argument("XESTRATA_IO_THREADS: expected an integer");
+    return std::clamp(static_cast<int>(n), 1, 64);
 }
 #if !defined(_WIN32)
 int io_threads_linux() { return io_threads(std::clamp(4 * (int) std::thread::hardware_concurrency(), 16, 64)); }
@@ -331,7 +341,7 @@ bool DirectFile::open(const std::string& path, std::string& err) {
 #ifdef POSIX_FADV_RANDOM
                 (void) posix_fadvise(impl_->fd, 0, 0, POSIX_FADV_RANDOM);   // random 4 KiB reads: no read-ahead
 #endif
-                std::fprintf(stderr, "strata: DirectFile: %s does not support O_DIRECT (%s): reading it through the "
+                std::fprintf(stderr, "xestrata: DirectFile: %s does not support O_DIRECT (%s): reading it through the "
                                      "page cache instead\n", path.c_str(), std::strerror(e));
             }
         }

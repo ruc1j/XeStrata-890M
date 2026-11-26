@@ -9,11 +9,13 @@
 // `maddubs` and a `madd`.  The arithmetic is ggml's (ggml-cpu/quants.c, the `_generic` references): integer sums
 // per block, times d_x * d_y * the format's constant - only the order of the float additions differs.
 //
-// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).  IQ1_M stays on ggml-cpu (no shipped
+// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23; XESTRATA_IQ512_IQ4XS=0 turns it off; its rows round differently from ggml-cpu's).  IQ1_M stays on ggml-cpu (no shipped
 // model has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
+#include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
+#include "strata/platform/env.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -26,7 +28,10 @@
 #include <cpuid.h>
 #endif
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -40,21 +45,14 @@ inline uint16_t u16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); retur
 inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
 
 // E-2: the IQ3 grids by one AVX-512 gather (the same words, the same results) - measured 3-5% SLOWER than the scalar
-// lookups on a Ryzen 5 7600 (Zen 4 gathers are microcoded), so opt-in: STRATA_IQ_GATHER=1
-// 0.2.5: DEFAULT on where gathers are fast (Intel server and HEDT cores with AVX-512: cpu_gather_fast), off on Zen 4 (microcoded);
-// STRATA_IQ_GATHER=1 / 0 force it either way.  The same words are loaded, so the results are bit for bit the scalar decode's.
-const bool gather = [] {
-    const char* v = std::getenv("STRATA_IQ_GATHER");
-    return v != nullptr && v[0] != '\0' ? std::atoi(v) != 0 : cpu_gather_fast();
-}();
+// lookups on a Ryzen 5 7600 (Zen 4 gathers are microcoded) and faster on a core whose gather is one instruction.
+// 0.2.5: unset, the gather is on where gathers are fast (cpu_gather_fast: the CPUID feature bits, never a model), off
+// elsewhere; XESTRATA_IQ_GATHER=auto times the two decodes once at the first use (iq3_gather_probe) instead, and
+// XESTRATA_IQ_GATHER=0/1 fixes one.  The same words are loaded, so the results are bit for bit the scalar decode's.
+// Set once by iq3_gather_decide(), before the first row of every entry point below.
+bool gather = false;
 // the grid lookups by one 64-bit gather of eight entries (IQ2_XXS / IQ2_XS / IQ2_S): `idx` = eight 32-bit indices
 inline __m512i gather64(__m256i idx, const void* grid) { return _mm512_i32gather_epi64(idx, grid, 8); }
-// E-2: software prefetch distance in bytes (STRATA_IQ_PREFETCH; 0 = off): -2-3% gate/up time on IQ3_S decode
-// (the rows are read at ~30 GB/s by 6 cores, near what DDR5 with 4 KB pages gives: the pool is memory-bound)
-const int prefetch_ahead = [] {
-    const char* v = std::getenv("STRATA_IQ_PREFETCH");
-    return v ? std::atoi(v) : 2048;
-}();
 
 // lanes 0-7 -> s0, 8-15 -> s1, 16-23 -> s2, 24-31 -> s3 (int16 lanes of a maddubs result: two values each)
 inline __m512i scales4(int s0, int s1, int s2, int s3) {
@@ -72,7 +70,7 @@ template <> struct Fmt<16> {   // IQ2_XXS: d, qs[32] u16
     static constexpr int bytes = 66;
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const uint8_t* q = b + 2 + 16 * j;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j;
         const uint32_t a0 = u32(q), a1 = u32(q + 4), b0 = u32(q + 8), b1 = u32(q + 12);
         g = gather ? gather64(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128((long long) ((uint64_t) a0 | ((uint64_t) b0 << 32)))), iq2xxs_grid)
                    : _mm512_set_epi64((long long) iq2xxs_grid[b0 >> 24], (long long) iq2xxs_grid[(b0 >> 16) & 255],
@@ -93,7 +91,7 @@ template <> struct Fmt<17> {   // IQ2_XS: d, qs[32] u16 (9-bit grid index + 7-bi
     static constexpr int bytes = 74;
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const uint8_t* q = b + 2 + 16 * j;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j;
         uint16_t v[8];
         std::memcpy(v, q, 16);
         g = gather ? gather64(_mm256_and_si256(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) q)), _mm256_set1_epi32(511)), iq2xs_grid)
@@ -113,7 +111,8 @@ template <> struct Fmt<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign bytes
     static constexpr int bytes = 82;
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const uint8_t* qs = b + 2 + 8 * j;
+        const int o = 8 * j;   // int, not ptrdiff_t: the wider product changed this decode's AVX-512 code
+        const uint8_t* qs = b + 2 + o;
         const uint8_t h0 = b[66 + 2 * j], h1 = b[66 + 2 * j + 1];
         if (gather) {   // the 10-bit indices: the byte plus two high bits from qh (h0 for lanes 0-3, h1 for 4-7), one 64-bit gather
             const __m256i hi = _mm256_and_si256(_mm256_sllv_epi32(_mm256_setr_epi32(h0, h0, h0, h0, h1, h1, h1, h1),
@@ -124,7 +123,7 @@ template <> struct Fmt<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign bytes
                              (long long) iq2s_grid[qs[5] | ((h1 << 6) & 0x300)], (long long) iq2s_grid[qs[4] | ((h1 << 8) & 0x300)],
                              (long long) iq2s_grid[qs[3] | ((h0 << 2) & 0x300)], (long long) iq2s_grid[qs[2] | ((h0 << 4) & 0x300)],
                              (long long) iq2s_grid[qs[1] | ((h0 << 6) & 0x300)], (long long) iq2s_grid[qs[0] | ((h0 << 8) & 0x300)]);
-        m = _cvtu64_mask64(u64(b + 2 + 32 + 8 * j));
+        m = _cvtu64_mask64(u64(b + 2 + 32 + o));
         const uint8_t s0 = b[74 + 2 * j], s1 = b[74 + 2 * j + 1];
         sc = scales4(2 * (s0 & 15) + 1, 2 * (s0 >> 4) + 1, 2 * (s1 & 15) + 1, 2 * (s1 >> 4) + 1);
     }
@@ -134,14 +133,14 @@ template <> struct Fmt<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x 7-
     static constexpr int bytes = 98;
     static constexpr float K = 0.25f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const uint8_t* q = b + 2 + 16 * j;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j;
         // E-2: one gather of the 16 grid words (the scalar lookups assembled with set_epi32 cost ~30 uops)
-        g = gather ? _mm512_i32gather_epi32(_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) q)), iq3xxs_grid, 4)
+        g = gather ? _mm512_i32gather_epi32(_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(q))), iq3xxs_grid, 4)
                    : _mm512_set_epi32((int) iq3xxs_grid[q[15]], (int) iq3xxs_grid[q[14]], (int) iq3xxs_grid[q[13]], (int) iq3xxs_grid[q[12]],
                              (int) iq3xxs_grid[q[11]], (int) iq3xxs_grid[q[10]], (int) iq3xxs_grid[q[9]], (int) iq3xxs_grid[q[8]],
                              (int) iq3xxs_grid[q[7]], (int) iq3xxs_grid[q[6]], (int) iq3xxs_grid[q[5]], (int) iq3xxs_grid[q[4]],
                              (int) iq3xxs_grid[q[3]], (int) iq3xxs_grid[q[2]], (int) iq3xxs_grid[q[1]], (int) iq3xxs_grid[q[0]]);
-        const uint32_t a = u32(b + 2 + 64 + 8 * j), c = u32(b + 2 + 64 + 8 * j + 4);
+        const uint32_t a = u32(b + 2 + 64 + 8 * (ptrdiff_t) j), c = u32(b + 2 + 64 + 8 * (ptrdiff_t) j + 4);
         const uint64_t s = (uint64_t) ksigns_iq2xs[a & 127] | ((uint64_t) ksigns_iq2xs[(a >> 7) & 127] << 8) |
                            ((uint64_t) ksigns_iq2xs[(a >> 14) & 127] << 16) | ((uint64_t) ksigns_iq2xs[(a >> 21) & 127] << 24) |
                            ((uint64_t) ksigns_iq2xs[c & 127] << 32) | ((uint64_t) ksigns_iq2xs[(c >> 7) & 127] << 40) |
@@ -156,33 +155,122 @@ template <> struct Fmt<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
     static constexpr int bytes = 110;
     static constexpr float K = 1.0f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const uint8_t* q = b + 2 + 16 * j;
+        const uint8_t* q = b + 2 + 16 * (ptrdiff_t) j;
         const uint32_t h0 = b[66 + 2 * j], h1 = b[66 + 2 * j + 1];
         if (gather) {   // E-2: the 9-bit indices (the high bit from qh under a mask), one gather
-            __m512i idx = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) q));
+            __m512i idx = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(q)));
             idx = _mm512_mask_add_epi32(idx, (__mmask16) (h0 | (h1 << 8)), idx, _mm512_set1_epi32(256));
             g = _mm512_i32gather_epi32(idx, iq3s_grid, 4);
         } else {
-#define G3(k, h, kk) (int) iq3s_grid[q[k] | (((h >> kk) & 1) << 8)]
+#define G3(k, h, kk) (int) iq3s_grid[q[(k)] | ((((h) >> (kk)) & 1) << 8)]
         g = _mm512_set_epi32(G3(15, h1, 7), G3(14, h1, 6), G3(13, h1, 5), G3(12, h1, 4),
                              G3(11, h1, 3), G3(10, h1, 2), G3(9, h1, 1), G3(8, h1, 0),
                              G3(7, h0, 7), G3(6, h0, 6), G3(5, h0, 5), G3(4, h0, 4),
                              G3(3, h0, 3), G3(2, h0, 2), G3(1, h0, 1), G3(0, h0, 0));
 #undef G3
         }
-        m = _cvtu64_mask64(u64(b + 74 + 8 * j));
+        m = _cvtu64_mask64(u64(b + 74 + 8 * (ptrdiff_t) j));
         const uint8_t s = b[106 + j];
         const int sa = 2 * (s & 15) + 1, sb = 2 * (s >> 4) + 1;
         sc = scales4(sa, sa, sb, sb);
     }
 };
 
+template <> struct Fmt<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 136 B, 8 signed sub-scales
+    // The same 16-value codebook as IQ4_NL (kvalues_iq4nl), a 32-value sub-block from 16 bytes of nibbles (the low
+    // nibbles first, then the high ones).  Each of the eight 32-value sub-blocks carries its own signed 6-bit scale
+    // (a nibble of scales_l and two bits of scales_h, less 32), which folds into the int16 operand of madd_epi16 as in
+    // the AVX-2 kernel (iq_avx2.cpp's Fmt32<23>); the codebook's sign becomes the activation's mask.
+    static constexpr int bytes = 136;
+    static constexpr float K = 1.0f;
+    static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
+        const __m512i tab = _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl)));
+        // int, not ptrdiff_t: the wider products changed this decode's AVX-512 code
+        const int o0 = 16 * (2 * j), o1 = 16 * (2 * j + 1);
+        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + o0));
+        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + o1));
+        const __m128i m4 = _mm_set1_epi8(0x0f);
+        const __m256i h0 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q0, 4), m4), _mm_and_si128(q0, m4));
+        const __m256i h1 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q1, 4), m4), _mm_and_si128(q1, m4));
+        const __m512i idx = _mm512_inserti64x4(_mm512_castsi256_si512(h0), h1, 1);
+        const __m512i q = _mm512_permutexvar_epi8(idx, tab);
+        g = _mm512_abs_epi8(q);
+        m = _mm512_movepi8_mask(q);
+        const int H0 = 2 * j, H1 = H0 + 1;
+        const uint8_t l = b[4 + j];
+        const uint16_t h = u16(b + 2);
+        const int s0 = ((l & 15) | ((h >> (2 * H0) & 3) << 4)) - 32;
+        const int s1 = ((l >> 4) | ((h >> (2 * H1) & 3) << 4)) - 32;
+        sc = scales4(s0, s0, s1, s1);
+    }
+};
+
+// XESTRATA_IQ_GATHER=auto: the two decodes, gather and scalar lookups, on 256 blocks of each IQ3 format, in
+// turn after a warm-up; the gather is taken when it is 2% faster.  The margin keeps a start from moving the choice
+// where the two are close, and the difference the gather makes is 3-5%: one instruction on some cores, microcode on
+// others, which a CPU's name does not say.
+bool iq3_gather_probe() {
+    constexpr int kBlocks = 256, kReps = 64;
+    static uint8_t blocks18[kBlocks * Fmt<18>::bytes], blocks21[kBlocks * Fmt<21>::bytes];
+    static bool filled = false;
+    if (!filled) {
+        uint32_t x = 2463534242u;
+        for (uint8_t& c : blocks18) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; c = (uint8_t) x; }
+        for (uint8_t& c : blocks21) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; c = (uint8_t) x; }
+        filled = true;
+    }
+    static volatile int64_t sink = 0;
+    auto time = [](bool g) {
+        gather = g;
+        __m512i acc = _mm512_setzero_si512();
+        auto pass = [&acc]() {
+            for (int b = 0; b < kBlocks; ++b)
+                for (int j = 0; j < 4; ++j) {
+                    __m512i gg, sc;
+                    __mmask64 m;
+                    Fmt<18>::decode(blocks18 + (size_t) b * Fmt<18>::bytes, j, gg, m, sc);
+                    acc = _mm512_add_epi64(acc, gg);
+                    Fmt<21>::decode(blocks21 + (size_t) b * Fmt<21>::bytes, j, gg, m, sc);
+                    acc = _mm512_add_epi64(acc, gg);
+                }
+        };
+        for (int w = 0; w < 4; ++w) pass();   // the clocks up
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < kReps; ++r) pass();
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        sink += _mm512_reduce_add_epi64(acc);
+        return us;
+    };
+    const double scalar = std::min(time(false), time(false));
+    const double gathered = std::min(time(true), time(true));
+    gather = false;
+    const bool on = gathered * 1.02 < scalar;
+    std::fprintf(stderr, "xestrata: the IQ3 decode: AVX-512 gather %.0f us, scalar lookups %.0f us (%d blocks x 4; "
+                         "XESTRATA_IQ_GATHER=0/1 picks one)\n", gathered, scalar, kBlocks);
+    return on;
+}
+
+void iq3_gather_decide() {
+    static const bool once = [] {
+        // unset: cpu_gather_fast() (the fork's default, Strata 0.2.5); "auto": the probe; 0/1: fixed
+        const char* e = strata::env_get("IQ_GATHER");
+        if (e == nullptr || e[0] == '\0') gather = cpu_gather_fast();
+        else if (std::strcmp(e, "auto") == 0) gather = iq3_gather_probe();
+        else gather = std::strtol(e, nullptr, 10) != 0;
+        return true;
+    }();
+    (void) once;
+}
+
+// prefetch_ahead: E-2's software prefetch distance in bytes (iq_prefetch_bytes, STRATA_IQ_PREFETCH; 0 = off): -2-3%
+// gate/up time on IQ3_S decode (the rows are read at ~30 GB/s by 6 cores, near what DDR5 with 4 KB pages gives: the
+// pool is memory-bound)
 template <bool Singleton> struct RowAccumulator;
 template <> struct RowAccumulator<false> { using Type = __m512; };
 template <> struct RowAccumulator<true> { using Type = __m256; };
 
 template <int TY, int NT, bool Singleton = false>
-inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res, int prefetch_ahead) {
     // Decode weights once for the group; select the accumulation order at compile time.
     using Acc = typename RowAccumulator<Singleton>::Type;
     Acc accf[NT];
@@ -207,7 +295,7 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
             __mmask64 m;
             Fmt<TY>::decode(blk, j, g, m, sc);
             for (int t = 0; t < NT; ++t) {
-                const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
+                const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * (ptrdiff_t) j));
                 const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);
                 acci[t] = _mm512_add_epi32(acci[t], _mm512_madd_epi16(_mm512_maddubs_epi16(g, ys), sc));
             }
@@ -247,10 +335,11 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     const int nb = n / QK_K;
     float g[NT], u[NT];
+    const float lim = expert_swiglu_limit();
+    const int pf = iq_prefetch_bytes();
     for (int r = r0; r < r1; ++r) {
-        row_dot<TY, NT, Singleton>(blob + (size_t) r * gu_row, nb, y, g);
-        row_dot<TY, NT, Singleton>(blob + up_off + (size_t) r * gu_row, nb, y, u);
-        const float lim = expert_swiglu_limit();
+        row_dot<TY, NT, Singleton>(blob + (size_t) r * gu_row, nb, y, g, pf);
+        row_dot<TY, NT, Singleton>(blob + up_off + (size_t) r * gu_row, nb, y, u, pf);
         for (int t = 0; t < NT; ++t) ff[t][r] = swiglu_host(g[t], u[t], lim);
     }
 }
@@ -260,8 +349,9 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     float res[NT];
+    const int pf = iq_prefetch_bytes();
     for (int r = r0; r < r1; ++r) {
-        row_dot<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        row_dot<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res, pf);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
@@ -369,7 +459,7 @@ inline float hsum8_ggml(__m256 x) {
 }
 
 template <int TY, int NT>
-inline void row_dot_x(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+inline void row_dot_x(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res, int prefetch_ahead) {
     __m256 accf[NT];
     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
     const __m512i zero = _mm512_setzero_si512();
@@ -404,8 +494,9 @@ void dot_rows_x(const uint8_t* w, size_t row_bytes, int n, const void* const* ac
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     float res[NT];
+    const int pf = iq_prefetch_bytes();
     for (int r = r0; r < r1; ++r) {
-        row_dot_x<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        row_dot_x<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res, pf);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }
@@ -417,6 +508,7 @@ template <int TY>
 void dot_rows_wide(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int T, float* const* out, int r0, int r1) {
     constexpr int kTile = 16, kRows = 8;
     const int nb = n / QK_K;
+    const int prefetch_ahead = iq_prefetch_bytes();
     static thread_local std::vector<uint8_t> ubuf;
     static thread_local std::vector<float> accb;
     ubuf.resize((size_t) (T < kTile ? T : kTile) * n);
@@ -501,6 +593,7 @@ inline void iq1m_pre(const block_q8_K* y, int nb, int16_t* p) {
 template <int NT>
 void rows_m(const uint8_t* w, size_t rb, int n, const block_q8_K* const* y, const int16_t* const* P, float* const* out, int r0, int r1) {
     const int nb = n / QK_K;
+    const int prefetch_ahead = iq_prefetch_bytes();
     const __m256i mask = _mm256_set1_epi16(0x7), mone = _mm256_set1_epi16(1), mtwo8 = _mm256_set1_epi8(2);
     const __m256i scales_shift = _mm256_set_epi64x(9, 3, 6, 0);
     const __m512i zero = _mm512_setzero_si512();
@@ -596,12 +689,14 @@ void rows_m_nt(int nt, const uint8_t* w, size_t rb, int n, const void* const* ac
 
 void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
+    iq3_gather_decide();
     switch (type) {
         case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 23: gu_rows_nt<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         default: break;
     }
 }
@@ -609,6 +704,7 @@ void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
 // The linked ggml AVX2 singleton order, for the formats validated against its production dot.
 void iq512_reference_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                              const void* const* act, int nt, float* const* ff, int r0, int r1) {
+    iq3_gather_decide();
     switch (type) {
         case 18: gu_rows_nt<18, true>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 21: gu_rows_nt<21, true>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
@@ -618,12 +714,14 @@ void iq512_reference_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_
 
 void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                 int r0, int r1) {
+    iq3_gather_decide();
     switch (type) {
         case 16: dot_rows_nt<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 17: dot_rows_nt<17>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 18: dot_rows_nt<18>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 21: dot_rows_nt<21>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 22: dot_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 23: dot_rows_nt<23>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
 }
@@ -643,7 +741,10 @@ static bool has_vpopcnt() {
     return ok;
 }
 
-bool iq512_gather_on() noexcept { return gather; }
+bool iq512_gather_on() noexcept {
+    iq3_gather_decide();
+    return gather;
+}
 
 bool iq512x_supported(int type) noexcept {
     return has_vpopcnt() && (type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 29);
@@ -651,6 +752,7 @@ bool iq512x_supported(int type) noexcept {
 
 void iq512x_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                  int r0, int r1) {
+    iq3_gather_decide();
     switch (type) {
         case 16: dot_rows_x_nt<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 17: dot_rows_x_nt<17>(nt, w, row_bytes, n, act, out, r0, r1); break;

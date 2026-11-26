@@ -72,6 +72,11 @@ async function loadUpdate() {}
 function thinkingButtons() {}
 function browserLanguage() { return "en"; }
 function languageChoices() {}
+// and what XeStrata's start() calls (the text size, the segments' storage, the kept replies, the skills)
+function textSizeChoices() {}
+function askPersist() {}
+function resumeReplies() {}
+async function loadSkills() { await fetch("skills"); }
 const setInterval = () => {};
 async function send() {
   sends.push(input.value);

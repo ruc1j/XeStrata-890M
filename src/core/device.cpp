@@ -1,28 +1,33 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+#include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/kfd_quiet.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_device
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/env.hpp"
 
 
 #if defined(__has_include)
 #if __has_include(<level_zero/ze_api.h>) && __has_include(<sycl/ext/oneapi/backend/level_zero.hpp>)
 #include <level_zero/ze_api.h>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
-#include <dlfcn.h>
 #define STRATA_HAVE_ZE_API 1
 #endif
 #endif
 
 #ifndef _WIN32
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <link.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 #if defined(__has_include)
 #if __has_include(<drm/xe_drm.h>)
@@ -42,12 +47,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -59,6 +69,22 @@
 
 namespace strata::core {
 namespace {
+#ifdef STRATA_HAVE_ZE_API
+// A function of the Level Zero loader the SYCL runtime has loaded (libze_loader.so.1, Windows' ze_loader.dll); `load`:
+// load it where it has not.  Null where there is none.
+void* ze_function(const char* name, bool load) {
+#if defined(_WIN32)
+    HMODULE lib = GetModuleHandleA("ze_loader.dll");
+    if (lib == nullptr && load) lib = LoadLibraryA("ze_loader.dll");
+    return lib != nullptr ? reinterpret_cast<void*>(GetProcAddress(lib, name)) : nullptr;
+#else
+    void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
+    if (lib == nullptr && load) lib = dlopen("libze_loader.so.1", RTLD_NOW);
+    return lib != nullptr ? dlsym(lib, name) : nullptr;
+#endif
+}
+#endif
+
 // The backends the engine runs on: Level Zero for Intel GPUs, CUDA and HIP where the build has their targets.  The
 // same Intel GPU is listed by OpenCL as well, which the engine does not use.
 bool engine_backend(const sycl::device& d) {
@@ -98,6 +124,20 @@ std::string pci_of(const sycl::device& d) {
     return s;
 }
 
+// The sysfs files are present only for devices whose driver reports a CPU-visible VRAM window.
+bool visible_vram(const std::string& pci, uint64_t& total, uint64_t& used) {
+#if defined(_WIN32)
+    (void) pci; (void) total; (void) used;
+    return false;
+#else
+    if (pci == "?") return false;
+    const std::string base = "/sys/bus/pci/devices/" + pci + "/";
+    if (!(std::ifstream(base + "mem_info_vis_vram_total") >> total) || total == 0) return false;
+    if (!(std::ifstream(base + "mem_info_vis_vram_used") >> used)) used = UINT64_MAX;
+    return true;
+#endif
+}
+
 // No GPU on Level Zero, CUDA or HIP at all: the GPU's driver is missing, or the SYCL runtime did not load its adapter
 // for the backend.  A user who started the engine without the libraries setup gave it (the config's lib_dirs) read
 // only "no usable GPU" and looked for the fault in the card; say what the runtime lists and which libsycl it is.
@@ -121,6 +161,26 @@ std::string no_gpu_listed() {
            "SYCL_UR_TRACE=1 shows which adapters load";
 }
 
+// The same device/OS limit used by gpu::mem_info, before the context holds any tracked allocations. A unified-memory
+// device's changing system-RAM limit cannot be reconstructed from a single free-memory delta.
+std::optional<uint64_t> free_before_context_probe(const sycl::device& d) {
+    try {
+        if (integrated_gpu(d)) return std::nullopt;
+        uint64_t free = 0;
+        if (!device_free_memory(d, free) || free == 0) return std::nullopt;
+        const uint64_t total = d.get_info<sycl::info::device::global_mem_size>();
+        const std::string pci = pci_of(d);
+        apply_os_budget(pci, free);
+        const uint64_t margin = unreported_vram_margin(pci, total);
+        if (margin > 0) free = std::min(free, total > margin ? total - margin : 0);
+        return free > 0 ? std::optional<uint64_t>(free) : std::nullopt;
+    } catch (const std::exception&) { return std::nullopt; }
+}
+
+// Read before the executable-kernel probe creates a context: the later process-memory delta must include that
+// probe's retained runtime allocations as well as the main context's.
+std::map<std::string, uint64_t> g_free_before_probe;
+
 // The GPUs the engine can drive, device 0 first: the GPU chosen below, then the others in the same order of
 // preference.  Read once.
 std::vector<sycl::device> find_devices() {
@@ -128,6 +188,13 @@ std::vector<sycl::device> find_devices() {
     std::string refused;
     for (const auto& d : sycl::device::get_devices(sycl::info::device_type::gpu)) {
         if (!engine_backend(d)) continue;
+        try {
+            const std::string pci = pci_of(d);
+            if (const auto free = free_before_context_probe(d); pci != "?" && free)
+                g_free_before_probe.emplace(pci, *free);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "xestrata: pre-probe GPU memory unavailable: %s\n", e.what());
+        }
         if (const std::string why = unusable(d); !why.empty()) {
             refused += "; " + d.get_info<sycl::info::device::name>() + " (" + pci_of(d) + "): " + why;
             continue;
@@ -136,19 +203,19 @@ std::vector<sycl::device> find_devices() {
     }
     if (candidates.empty()) throw DeviceError(refused.empty() ? no_gpu_listed() : "no usable GPU" + refused);
     // setup names the card by PCI address: Level Zero's own numbering can include GPUs that setup does not list
-    if (const char* want = std::getenv("STRATA_GPU_PCI"); want != nullptr && *want != '\0') {
+    if (const char* want = strata::env_get("GPU_PCI"); want != nullptr && *want != '\0') {
         std::string w = want;
         for (auto& c : w) c = (char) std::tolower((unsigned char) c);
         std::vector<sycl::device> match;
         for (const auto& d : candidates)
             if (pci_of(d) == w) match.push_back(d);
         if (match.size() != 1)
-            throw DeviceError(std::string("STRATA_GPU_PCI=") + want + ": no usable GPU at that PCI address" +
+            throw DeviceError(std::string("XESTRATA_GPU_PCI=") + want + ": no usable GPU at that PCI address" +
                               refused);
     }
     // A discrete card before the processor's own graphics, then the most memory, then the most compute units (whose
     // size differs between GPU makers, so they only break a tie); the GPU STRATA_GPU_PCI names goes first.
-    const char* want = std::getenv("STRATA_GPU_PCI");
+    const char* want = strata::env_get("GPU_PCI");
     std::string w = want ? want : "";
     for (auto& c : w) c = (char) std::tolower((unsigned char) c);
     std::stable_sort(candidates.begin(), candidates.end(), [&w](const sycl::device& x, const sycl::device& y) {
@@ -181,6 +248,23 @@ std::string g_workaround_version;   // set by engine_devices when the workaround
 #if !defined(_WIN32) && defined(__has_include)
 #if __has_include(<drm/xe_drm.h>)
 #define STRATA_XE_QUERY 1
+// The kernel's GT-list entry gained ip_ver_major with Linux 6.16 (the IP version a GMD_ID GPU has); a header from
+// before it (Ubuntu 24.04's linux-libc-dev, a 6.8 UAPI) has no such member, and no kernel of that header's time
+// reports one, so the workaround cannot be decided there and stays off.
+template <typename T, typename = void>
+struct has_ip_ver_major : std::false_type {};
+template <typename T>
+struct has_ip_ver_major<T, std::void_t<decltype(std::declval<T>().ip_ver_major)>> : std::true_type {};
+template <typename List>
+bool gt_list_is_xe2(const List* list) {
+    if constexpr (has_ip_ver_major<drm_xe_gt>::value) {
+        for (uint32_t i = 0; i < list->num_gt; ++i)
+            if (list->gt_list[i].type == DRM_XE_QUERY_GT_TYPE_MAIN && list->gt_list[i].ip_ver_major >= 20) return true;
+    } else {
+        (void) list;
+    }
+    return false;
+}
 #endif
 #endif
 
@@ -206,9 +290,7 @@ bool xe_gpu_from_xe2() {
                 q.data = (uint64_t) (uintptr_t) buf.data();
                 if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &q) == 0) {
                     const auto* list = reinterpret_cast<const drm_xe_query_gt_list*>(buf.data());
-                    for (uint32_t i = 0; i < list->num_gt; ++i)
-                        if (list->gt_list[i].type == DRM_XE_QUERY_GT_TYPE_MAIN && list->gt_list[i].ip_ver_major >= 20)
-                            found = true;
+                    found = gt_list_is_xe2(list);
                 }
             }
         }
@@ -254,6 +336,35 @@ CompilerWorkaround intel_compiler_workaround() {
     return done;
 }
 
+// Ubuntu 26.04's kernel update ("resolute", 7.0.0 ABI 40 and later; -40 through -44 at 2026-11-19, and the first
+// build with the fix will end the range) took upstream's "drm/pagemap: Prevent double migration of device pages"
+// (c4126f1db36e, Ubuntu's cherry-pick 180caa211989) without the upstream series that reads the flag it writes
+// (2e03c0c5c59a and its fellows, 2026-03-12): the flag lands in the low bits of a page's zone_device_data, and
+// drm_pagemap_folio_free, which Ubuntu's 7.0.0 still reads without the mask, frees the zdd through a pointer that
+// carries it - a refcount warning, a kernel oops at 256 to 511 references (a shifted pointer into complete_all; the
+// SeedVR2 upscaler's streamed blocks hit it on the B70, 2026-11-18), silent corruption above.  Ubuntu's own
+// cherry-pick note concedes the readers ("missing some commits"); checked against the source of Ubuntu's 7.0.0-14
+// to -44 (the flag is absent through -38, so those are safe).  Upstream is whole: 7.2.y and 7.3.y carry the writer
+// and the masked readers (get_flags' DRM_PAGEMAP_ZDD_FLAG_MASK, the zone_device_data accessor's ~mask, folio_split;
+// SVMFIX/evidence/fedora-kernels), so Fedora 44 and 45 (7.2.15 and 7.3.3/7.3.4 at 2026-11-19) do not carry the error;
+// whether Fedora's own patches add anything is not checked (unverified: its kernels track upstream stable, and the
+// one-sided backport is Ubuntu's own).  The engine works around nothing: it tells the user to leave the kernel
+// (Fedora 44 or 45, or 7.0.0-38 or earlier, or the build with the fix).  The notice's conditions, in one place as
+// the IGC workaround's are: Linux, the kernel's release carries the error (svm_broken_kernel), and an xe GPU of
+// graphics IP 20 or later is present (the IGC workaround's xe2 query).
+std::string g_svm_workaround_release;   // set by engine_devices when the notice applies to a listed GPU
+
+std::string svm_notice_release() {
+#if defined(_WIN32)
+    return {};
+#else
+    utsname u;
+    if (uname(&u) != 0 || !svm_broken_kernel(u.release)) return {};
+    if (!xe_gpu_from_xe2()) return {};   // the GPUs the SVM runs on are the xe2 query's
+    return u.release;
+#endif
+}
+
 // The SYCL runtime's on-disk cache of the device code it builds (SYCL_CACHE_PERSISTENT), on unless the user set it:
 // without it every start builds each kernel module it uses from the SPIR-V again, linking the device libraries in, and
 // the GPU driver's own cache does not spare that.  GLM-5.3-Flash on the B70 (2026-10-19): a 1K-token prompt took 54.7 s
@@ -281,8 +392,8 @@ static void hip_staged_copies() {
     if (const char* v = kfd_quiet::xfer_value(cls, std::getenv("STRATA_KFD_QUIET"), std::getenv("STRATA_KFD_QUIET_XFER"),
                                               std::getenv("GPU_PINNED_MIN_XFER_SIZE"))) {
         setenv("GPU_PINNED_MIN_XFER_SIZE", v, 0);
-        if (std::getenv("STRATA_TRACE") != nullptr)
-            std::fprintf(stderr, "strata trace: kfd quiet: GPU_PINNED_MIN_XFER_SIZE=%s (pageable copies staged by the HIP "
+        if (strata::env_get("TRACE") != nullptr)
+            std::fprintf(stderr, "xestrata trace: kfd quiet: GPU_PINNED_MIN_XFER_SIZE=%s (pageable copies staged by the HIP "
                                  "runtime)\n", v);
     }
 #endif
@@ -332,21 +443,82 @@ static void hip_runtime_defaults() {
 #endif
 }
 
+// The HIP runtime's hardware queues a process takes (GPU_MAX_HW_QUEUES, ROCclr's; 4 by default), 2 unless the user
+// set it.  With 4, the expert streaming of a prompt ran at one of two speeds from start to start, the same binary and
+// settings (RX 9060 XT, ROCm 7.1, Linux, 2026-11-13: Qwen3.8-Flash-Next IQ3_XXS, a 4K prompt 692-727 or 913-977
+// tok/s, about half the starts each; a 1K prompt 429 or 632; a 32K one 1138-1151), the slow starts losing 10-40 ms
+// at random layers to the copies and the products around them; another GPU program run between two starts moved
+// which start was slow, and nothing the engine logs differed.  With 2: 945-949, 666-683 and 1210-1211, three starts
+// each, the decode alike; Qwen3.6-35B-A3B's 4K prompt 1541-1545 -> 1575-1579.  Only the HIP runtime reads it.
+// Linux only: Windows's HIP runtime was not measured.
+// XeStrata-890M: where every AMD GPU is a processor's own graphics (kfd_gpus_all_integrated), ROCm's default stays:
+// the window graph's side branches fork and join three queues in every layer there, and 2 was not measured on the 890M.
+static void hip_hw_queues() {
+#if !defined(_WIN32)
+#if defined(__linux__)
+    if (kfd_gpus_all_integrated()) return;
+#endif
+    setenv("GPU_MAX_HW_QUEUES", "2", 0);
+#endif
+}
+
+// What the RAM and the kernel's memory compaction did between the engine's start and a stop on a GPU fault, said with
+// the fault: the B70's copy engine faulted (Fault response -EBUSY) while the page cache turned over, and the xe driver
+// mapped the registered host memory again after each move of its pages (#42; 2026-10-22's trace: 83k to 134k
+// invalidations where a healthy run has one).  The start's numbers are taken as the engine lists its GPUs.  Linux only.
+struct HostCounters {
+    long long compact_stall = -1, compact_success = 0, pgmigrate_success = 0;
+};
+HostCounters host_counters() {
+    HostCounters c;
+#if !defined(_WIN32)
+    if (std::FILE* f = std::fopen("/proc/vmstat", "r")) {
+        char line[128];
+        c.compact_stall = 0;
+        while (std::fgets(line, sizeof line, f) != nullptr) {
+            char* sp = std::strchr(line, ' ');
+            if (sp == nullptr) continue;
+            *sp = '\0';
+            const long long v = std::strtoll(sp + 1, nullptr, 10);
+            if (std::strcmp(line, "compact_stall") == 0) c.compact_stall = v;
+            else if (std::strcmp(line, "compact_success") == 0) c.compact_success = v;
+            else if (std::strcmp(line, "pgmigrate_success") == 0) c.pgmigrate_success = v;
+        }
+        std::fclose(f);
+    }
+#endif
+    return c;
+}
+HostCounters g_start_counters;
+
 const std::vector<sycl::device>& engine_devices() {
     static const std::vector<sycl::device> devices = [] {
         sycl_code_cache();
         hip_staged_copies();
         hip_runtime_defaults();
+        hip_hw_queues();
+        g_start_counters = host_counters();
         const CompilerWorkaround w = intel_compiler_workaround();
+        const std::string svm = svm_notice_release();
         std::vector<sycl::device> found = find_devices();
-        if (w.set && std::any_of(found.begin(), found.end(), [](const sycl::device& d) {
-                return d.get_backend() == sycl::backend::ext_oneapi_level_zero;
-            })) {
+        const bool level_zero = std::any_of(found.begin(), found.end(), [](const sycl::device& d) {
+            return d.get_backend() == sycl::backend::ext_oneapi_level_zero;
+        });
+        if (w.set && level_zero) {
             g_workaround_version = w.version.empty() ? "unknown" : w.version;
             std::fprintf(stderr, "Xe runtime: IGC's GEP simplification is off (IGC_EnableGEPSimplification=0; IGC %s): "
                                  "2.27 to 2.30 miscompile some reads for Xe2 and later GPUs. The decode of short "
-                                 "prompts is up to 10%% slower. For full speed, use Fedora 44 (its IGC is 2.32 or "
-                                 "later), or install with Podman (Fedora 44 inside)\n", g_workaround_version.c_str());
+                                 "prompts is up to 10%% slower. For full speed, use Fedora 44 or 45 (their IGC is "
+                                 "2.32 or later), or install with Podman (Fedora 45 inside)\n",
+                         g_workaround_version.c_str());
+        }
+        if (!svm.empty() && level_zero) {
+            g_svm_workaround_release = svm;
+            std::fprintf(stderr, "Xe runtime: the xe driver's SVM is broken on Linux %s (Ubuntu's 7.0.0 from ABI 40 on): "
+                                 "a page the SVM moves can oops the kernel or leak memory silently on xe GPUs such as this one. "
+                                 "XeStrata works around nothing here; use Fedora 44 or 45, or a kernel without the error "
+                                 "(Ubuntu's 7.0.0-38 or earlier, or the build with the fix). A container (Podman, incus) runs on "
+                                 "the host's kernel, so it is no escape.\n", svm.c_str());
         }
         return found;
     }();
@@ -360,21 +532,70 @@ thread_local int t_current = 0;
     q.single_task<ProbeKernel>([] {});
 }
 
+// The start's counters against the fault's, with the RAM's state then (HostCounters).
+void report_host_at_fault() {
+#if !defined(_WIN32)
+    long long free_kb = -1, cached_kb = -1, dirty_kb = -1;
+    if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[128];
+        // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): /proc never blocks, and the process ends next
+        while (std::fgets(line, sizeof line, f) != nullptr) {
+            char* colon = std::strchr(line, ':');
+            if (colon == nullptr) continue;
+            *colon = '\0';
+            const long long v = std::strtoll(colon + 1, nullptr, 10);
+            if (std::strcmp(line, "MemFree") == 0) free_kb = v;
+            else if (std::strcmp(line, "Cached") == 0) cached_kb = v;
+            else if (std::strcmp(line, "Dirty") == 0) dirty_kb = v;
+        }
+        std::fclose(f);
+    }
+    const HostCounters now = host_counters();
+    if (free_kb < 0 || now.compact_stall < 0 || g_start_counters.compact_stall < 0) return;
+    std::fprintf(stderr, "Xe runtime: at the fault: RAM free %lld MiB, page cache %lld MiB, dirty %lld MiB; since the "
+                         "start the kernel compacted memory %lld times (%lld stalls) and moved %lld pages\n",
+                 free_kb >> 10, cached_kb >> 10, dirty_kb >> 10, now.compact_success - g_start_counters.compact_success,
+                 now.compact_stall - g_start_counters.compact_stall,
+                 now.pgmigrate_success - g_start_counters.pgmigrate_success);
+#endif
+}
+
 [[noreturn]] void fatal(const char* message) {
     std::fprintf(stderr, "Xe runtime: %s; terminating without releasing in-flight allocations\n", message);
+    report_host_at_fault();
     std::fflush(stderr);
     std::_Exit(1);
 }
 
 // The xe driver resets a job after its job_timeout_ms (5 s here, at most 10 s), which completes the event with an
 // error, so a healthy wait - even a drain of many queued jobs - returns well inside this.  A wait that outlives it
-// is stuck in the driver or the host, and only a thread other than the waiter can report that.
-constexpr auto kHangLimit = std::chrono::seconds(120);
+// is stuck in the driver or the host, and only a thread other than the waiter can report that.  #59: other drivers
+// (Windows', CUDA's, HIP's) may not end a job that long, so XESTRATA_GPU_WAIT_LIMIT_S sets it (seconds; 0: no limit).
+std::chrono::seconds hang_limit() {
+    static const std::chrono::seconds limit = [] {
+        const char* v = strata::env_get("GPU_WAIT_LIMIT_S");
+        const long s = v != nullptr ? std::strtol(v, nullptr, 10) : 120;
+        return std::chrono::seconds(s > 0 ? s : 0);
+    }();
+    return limit;
+}
 }  // namespace
 
 std::string compiler_workaround() {
     (void) engine_devices();
     return g_workaround_version;
+}
+
+bool svm_broken_kernel(const char* release) {
+    if (release == nullptr || std::strncmp(release, "7.0.0-", 6) != 0) return false;
+    char* end = nullptr;
+    const long abi = std::strtol(release + 6, &end, 10);
+    return end != release + 6 && abi >= 40;   // no ABI number: upstream's 7.0.0, or an -rc, or another build's suffix
+}
+
+std::string svm_workaround() {
+    (void) engine_devices();
+    return g_svm_workaround_release;
 }
 
 int current_device() { return t_current; }
@@ -393,6 +614,17 @@ std::mutex g_runtimes_mutex;
 std::vector<std::unique_ptr<Runtime>>& runtimes() {
     static std::vector<std::unique_ptr<Runtime>> all;
     return all;
+}
+
+// Set by the stop signal's thread (route_stop_signals, issue #62): any other thread that then comes to an engine wait
+// or submission (Runtime::wait and so a stream's or event's sync, copy_async, compute_after, free) stays there until
+// the process ends, so the queues the stop drains get no work after their drain.  Never set otherwise.
+std::atomic<bool> g_stopping{false};
+thread_local bool t_stopper = false;
+
+void hold_if_stopping() {
+    if (!g_stopping.load(std::memory_order_acquire) || t_stopper) return;
+    for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
 }
 }  // namespace
 
@@ -415,8 +647,14 @@ Runtime& Runtime::at(int ordinal) {
 Runtime* Runtime::owner(const void* pointer) {
     if (!pointer) return nullptr;
     std::lock_guard<std::mutex> lock(g_runtimes_mutex);
-    for (auto& r : runtimes())
-        if (r && sycl::get_pointer_type(pointer, r->context_) != sycl::usm::alloc::unknown) return r.get();
+    for (auto& r : runtimes()) {
+        if (!r) continue;
+        // ROCm (RX 9060 XT) sometimes refuses the query (UR_RESULT_ERROR_UNKNOWN) with a large streamed KV host
+        // copy beside the expert arena; treat that as "not this runtime's" rather than letting it abort the start.
+        try {
+            if (sycl::get_pointer_type(pointer, r->context_) != sycl::usm::alloc::unknown) return r.get();
+        } catch (const std::exception&) { continue; }
+    }
     return nullptr;
 }
 
@@ -428,15 +666,45 @@ Runtime* Runtime::owner_of_stream(const void* stream) {
 }
 
 sycl::async_handler Runtime::handler() {
-    return [this](sycl::exception_list errors) {
+    return [this](const sycl::exception_list& errors) {
         std::lock_guard<std::mutex> lock(error_mutex_);
         if (!error_ && errors.size()) error_ = *errors.begin();
     };
 }
 
-Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), device_(device), context_(device_),
+namespace {
+void settle_vram(const sycl::device& d);
+}  // namespace
+
+namespace {
+std::optional<uint64_t> measure_before_context(const sycl::device& device) {
+    try {
+        if (const auto it = g_free_before_probe.find(pci_of(device)); it != g_free_before_probe.end()) return it->second;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+}  // namespace
+
+Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), pci_(pci_of(device)), device_(device),
+    free_before_context_(measure_before_context(device_)), context_(device_),
     compute_(context_, device_, handler(), sycl::property::queue::in_order{}),
     transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {
+    uint64_t visible = 0, used = 0, vram = 0;
+#if !defined(_WIN32)
+    if (visible_vram(pci_, visible, used) &&
+        (std::ifstream("/sys/bus/pci/devices/" + pci_ + "/mem_info_vram_total") >> vram) &&
+        vram > visible) {
+        std::fprintf(stderr, "Xe runtime: GPU %d CPU-visible VRAM is %llu of %llu MiB; copies can be slower, "
+                     "AMD GPUs can appear stalled and LoRA training can fail. Enable Above 4G Decoding and "
+                     "Resizable BAR in the BIOS.\n", ordinal_, (unsigned long long) (visible >> 20),
+                     (unsigned long long) (vram >> 20));
+    }
+#else
+    (void) visible; (void) used; (void) vram;
+#endif
+    settle_vram(device_);
     marks_by_barrier_ = measure_marks();
 }
 
@@ -453,7 +721,7 @@ Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), d
 // on the B70 with 26.05, 22 to 25 us with 26.35 and 4.1 to 4.3 us on the RTX 4070 (an i7-14700's submissions).
 // STRATA_EVENT_MARK=tag or barrier chooses instead.
 bool Runtime::measure_marks() {
-    if (const char* v = std::getenv("STRATA_EVENT_MARK")) return std::strcmp(v, "barrier") == 0;
+    if (const char* v = strata::env_get("EVENT_MARK")) return std::strcmp(v, "barrier") == 0;
     constexpr int kMarks = 64;
     constexpr double kCostUs = 6.0;
     try {
@@ -499,17 +767,15 @@ sycl::queue* Runtime::create_stream(bool high_priority) {
 sycl::queue* Runtime::create_copy_stream() {
 #ifdef STRATA_HAVE_ZE_API
     static const bool off = [] {
-        const char* v = std::getenv("STRATA_COPY_ENGINE");
+        const char* v = strata::env_get("COPY_ENGINE");
         return v != nullptr && std::strtol(v, nullptr, 10) == 0;
     }();
     if (!off && device_.get_backend() == sycl::backend::ext_oneapi_level_zero) {
         try {
-            void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);   // the SYCL runtime has loaded it
-            if (lib == nullptr) lib = dlopen("libze_loader.so.1", RTLD_NOW);
             using GroupsFn = decltype(&zeDeviceGetCommandQueueGroupProperties);
             using ImmFn = decltype(&zeCommandListCreateImmediate);
-            auto groups = lib ? reinterpret_cast<GroupsFn>(dlsym(lib, "zeDeviceGetCommandQueueGroupProperties")) : nullptr;
-            auto imm = lib ? reinterpret_cast<ImmFn>(dlsym(lib, "zeCommandListCreateImmediate")) : nullptr;
+            auto groups = reinterpret_cast<GroupsFn>(ze_function("zeDeviceGetCommandQueueGroupProperties", true));
+            auto imm = reinterpret_cast<ImmFn>(ze_function("zeCommandListCreateImmediate", true));
             const auto zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device_);
             const auto zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(context_);
             uint32_t n = 0;
@@ -542,12 +808,12 @@ sycl::queue* Runtime::create_copy_stream() {
                     sycl::make_queue<sycl::backend::ext_oneapi_level_zero>(in, context_, handler()));
                 static std::atomic<bool> said{false};
                 if (!said.exchange(true))
-                    std::fprintf(stderr, "strata: the prompt's expert copies on the GPU's copy engine (queue group %u; "
-                                         "STRATA_COPY_ENGINE=0 turns it off)\n", i);
+                    std::fprintf(stderr, "xestrata: the prompt's expert copies on the GPU's copy engine (queue group %u; "
+                                         "XESTRATA_COPY_ENGINE=0 turns it off)\n", i);
                 return q;
             }
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "strata: no copy-engine queue (%s): an ordinary stream\n", e.what());
+            std::fprintf(stderr, "xestrata: no copy-engine queue (%s): an ordinary stream\n", e.what());
         }
     }
 #endif
@@ -558,9 +824,8 @@ std::string Runtime::device_status() {
 #ifdef STRATA_HAVE_ZE_API
     if (device_.get_backend() == sycl::backend::ext_oneapi_level_zero) {
         try {
-            void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
             using StatusFn = decltype(&zeDeviceGetStatus);
-            auto status = lib ? reinterpret_cast<StatusFn>(dlsym(lib, "zeDeviceGetStatus")) : nullptr;
+            auto status = reinterpret_cast<StatusFn>(ze_function("zeDeviceGetStatus", false));
             if (status == nullptr) return "unknown";
             const ze_result_t r = status(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device_));
             if (r == ZE_RESULT_SUCCESS) return "answers";
@@ -573,9 +838,9 @@ std::string Runtime::device_status() {
         }
     }
 #endif
-    // no status query here (CUDA, HIP, Windows): whether the driver still answers a question about the device's free
-    // memory, which CUDA refuses once a kernel has faulted its context (its errors stick).  A failure report on these
-    // said "the GPU: unknown" every time (#36, #39).
+    // no status query here (CUDA, HIP, a build without Level Zero's headers): whether the driver still answers a
+    // question about the device's free memory, which CUDA refuses once a kernel has faulted its context (its errors
+    // stick).  A failure report on these said "the GPU: unknown" every time (#36, #39).
     if (device_.has(sycl::aspect::ext_intel_free_memory)) {
         try {
             (void) device_.get_info<sycl::ext::intel::info::device::free_memory>();
@@ -591,9 +856,23 @@ void Runtime::destroy_stream(sycl::queue* stream) {
     if (!stream) return;
     if (!owns(stream) || stream == &compute_ || stream == &transfer_)
         throw DeviceError("destroy_stream: not an engine stream of the Xe runtime");
+    if (stream->ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording)
+        throw DeviceError("destroy_stream: the stream is recording a graph");
     finish(*stream);
+    {
+        // the queue's belongings (queue_item) go here: the queue is drained and still alive, so their destructors
+        // can free what they hold on it; the next queue at this address finds none of them
+        std::lock_guard<std::mutex> lock(items_mutex_);
+        items_.erase(stream);
+    }
     std::lock_guard<std::mutex> lock(streams_mutex_);
     streams_.remove_if([stream](const sycl::queue& q) { return &q == stream; });
+}
+
+Runtime& Runtime::of_queue(sycl::queue& q) {
+    Runtime* r = owner_of_stream(&q);
+    if (!r) throw DeviceError("the queue is not one of the Xe runtime's");
+    return *r;
 }
 
 bool Runtime::owns(const sycl::queue* queue) {
@@ -625,8 +904,8 @@ void Runtime::preload_kernels() {
                 ++skipped;
             }
         }
-        if (std::getenv("STRATA_TRACE"))
-            std::fprintf(stderr, "strata trace: %d kernels built ahead, %d not for this GPU\n", built, skipped);
+        if (strata::env_get("TRACE"))
+            std::fprintf(stderr, "xestrata trace: %d kernels built ahead, %d not for this GPU\n", built, skipped);
     });
 }
 
@@ -643,21 +922,55 @@ Runtime::~Runtime() {
     watchdog_.join();
 }
 
+Runtime::CopyWatch::CopyWatch(Runtime& runtime, const char* what, uint64_t bytes, int layer) : runtime_(runtime) {
+    std::lock_guard<std::mutex> lock(runtime_.watch_mutex_);
+    entry_ = &*runtime_.waiters_.insert(runtime_.waiters_.end(),
+        Waiter{std::chrono::steady_clock::now(), what, bytes, {}, true, layer});
+}
+
+Runtime::CopyWatch::~CopyWatch() {
+    std::lock_guard<std::mutex> lock(runtime_.watch_mutex_);
+    for (auto it = runtime_.waiters_.begin(); it != runtime_.waiters_.end(); ++it) {
+        if (&*it == entry_) { runtime_.waiters_.erase(it); break; }
+    }
+}
+
 void Runtime::watch() {
     std::unique_lock<std::mutex> lock(watch_mutex_);
+    const std::chrono::seconds limit = hang_limit();
+    // A healthy copy of even a large layer is far shorter than a minute; 60 s leaves room for slow storage and
+    // paging. The observed blocked submission lasted 19 minutes. Repeat only every 5 minutes if it remains blocked.
+    constexpr auto copy_limit = std::chrono::seconds(60);
+    constexpr auto repeat = std::chrono::minutes(5);
     while (!watch_cv_.wait_for(lock, std::chrono::seconds(1), [this] { return stop_; })) {
         const auto now = std::chrono::steady_clock::now();
-        for (const Waiter& w : waiters_) {
-            if (now - w.since < kHangLimit) continue;
-            const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now - w.since).count();
-            std::fprintf(stderr, "Xe runtime: waiting for %s for %lld s (%zu waits in progress)\n", w.what,
-                         (long long) seconds, waiters_.size());
-            fatal("GPU wait exceeded the hang limit");
+        for (Waiter& w : waiters_) {
+            const auto elapsed = now - w.since;
+            if (w.copy) {
+                if (elapsed < copy_limit || (w.reported != decltype(w.reported){} && now - w.reported < repeat)) continue;
+                w.reported = now;
+                uint64_t total = 0, used = 0;
+                std::fprintf(stderr, "Xe runtime: GPU %d copy submission %s", ordinal_, w.what);
+                if (w.layer >= 0) std::fprintf(stderr, " layer %d", w.layer);
+                std::fprintf(stderr, " (%llu bytes) has taken %lld s", (unsigned long long) w.bytes,
+                             (long long) std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+                if (visible_vram(pci_, total, used)) {
+                    std::fprintf(stderr, "; CPU-visible VRAM %llu MiB", (unsigned long long) (total >> 20));
+                    if (used != UINT64_MAX) std::fprintf(stderr, ", %llu MiB used", (unsigned long long) (used >> 20));
+                }
+                std::fprintf(stderr, "\n");
+            } else if (limit.count() && elapsed >= limit) {
+                const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+                std::fprintf(stderr, "Xe runtime: waiting for %s for %lld s (%zu waits in progress)\n", w.what,
+                             (long long) seconds, waiters_.size());
+                fatal("GPU wait exceeded the hang limit (XESTRATA_GPU_WAIT_LIMIT_S)");
+            }
         }
     }
 }
 
 void Runtime::check_async() {
+    hold_if_stopping();
     std::lock_guard<std::mutex> lock(error_mutex_);
     if (error_) std::rethrow_exception(error_);
 }
@@ -665,6 +978,7 @@ void Runtime::check_async() {
 sycl::event Runtime::copy_async(void* dst, const void* src, uint64_t bytes,
                                const std::vector<sycl::event>& dependencies) {
     check_async();
+    CopyWatch watch(*this, "transfer queue", bytes);
     return transfer_.memcpy(dst, src, bytes, dependencies);
 }
 
@@ -719,20 +1033,172 @@ void Runtime::finish() {
     for (auto* q : streams) finish(*q);
 }
 
-void Runtime::finish_all() noexcept {
+void Runtime::wait_preload_all() {
     std::vector<Runtime*> made;
     {
         std::lock_guard<std::mutex> lock(g_runtimes_mutex);
         for (auto& r : runtimes())
             if (r) made.push_back(r.get());
     }
+    for (Runtime* r : made) r->wait_preload();
+}
+
+// One pass over every queue of every runtime made so far (it makes none): a barrier on each, waited for, a queue's
+// failure not keeping the others undrained.  A queue recording a graph is skipped: a barrier there would only be
+// recorded.  The waits bypass check_async, so an earlier asynchronous error does not fail every queue.  Says what it
+// could not drain; returns whether every queue is idle at the end (no queue recording, none with work submitted
+// after its barrier), and sets `failed` when a drain threw.
+bool Runtime::drain_pass(bool& failed, bool quiet) noexcept {
+    std::vector<Runtime*> made;
+    {
+        std::lock_guard<std::mutex> lock(g_runtimes_mutex);
+        for (auto& r : runtimes())
+            if (r) made.push_back(r.get());
+    }
+    bool idle = true;
     for (Runtime* r : made) {
-        try {
-            r->finish();
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "Xe runtime: GPU %d not drained before the exit: %s\n", r->ordinal(), e.what());
+        // held for the pass: no stream is made or destroyed under it
+        std::lock_guard<std::mutex> lock(r->streams_mutex_);
+        std::vector<std::pair<sycl::queue*, const char*>> queues{{&r->compute_, "compute queue"},
+                                                                 {&r->transfer_, "transfer queue"}};
+        for (auto& q : r->streams_) queues.emplace_back(&q, "engine stream");
+        for (auto& [q, what] : queues) {
+            try {
+                if (q->ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) {
+                    idle = false;
+                    if (!quiet)
+                        std::fprintf(stderr, "Xe runtime: GPU %d %s not drained before the exit: recording a graph\n",
+                                     r->ordinal_, what);
+                    continue;
+                }
+                q->ext_oneapi_submit_barrier().wait();
+                if (!q->ext_oneapi_empty()) {
+                    idle = false;
+                    if (!quiet)
+                        std::fprintf(stderr, "Xe runtime: GPU %d %s not drained before the exit: work submitted after "
+                                     "its drain\n", r->ordinal_, what);
+                }
+            } catch (const std::exception& e) {
+                failed = true;
+                std::fprintf(stderr, "Xe runtime: GPU %d %s not drained before the exit: %s\n", r->ordinal_, what,
+                             e.what());
+            }
         }
     }
+    return idle;
+}
+
+void Runtime::finish_all() noexcept {
+    bool failed = false;
+    (void) drain_pass(failed, false);
+}
+
+#if !defined(_WIN32)
+namespace {
+// The sum of this process's GPU engine counters in its DRM files' fdinfo: xe's drm-cycles-<engine> (the engine's
+// cycles in this process's contexts; not drm-total-cycles-, the GPU's clock) and i915's and amdgpu's
+// drm-engine-<engine> (busy nanoseconds; not drm-engine-capacity-).  0 where the process has none.
+uint64_t drm_engine_counters() {
+    uint64_t sum = 0;
+    DIR* dir = opendir("/proc/self/fdinfo");
+    if (dir == nullptr) return 0;
+    for (dirent* e; (e = readdir(dir)) != nullptr;) {
+        if (e->d_name[0] == '.') continue;
+        std::ifstream info(std::string("/proc/self/fdinfo/") + e->d_name);
+        for (std::string line; std::getline(info, line);) {
+            const bool cycles = line.rfind("drm-cycles-", 0) == 0;
+            const bool engine = line.rfind("drm-engine-", 0) == 0 && line.rfind("drm-engine-capacity-", 0) != 0;
+            if (!cycles && !engine) continue;
+            const size_t colon = line.find(':');
+            if (colon != std::string::npos) sum += std::strtoull(line.c_str() + colon + 1, nullptr, 10);
+        }
+    }
+    closedir(dir);
+    return sum;
+}
+}  // namespace
+#endif
+
+// The stop signal's drain: new waits and submissions are held (g_stopping), then passes over every queue until one
+// finds them all idle - a graph whose recording ends after a pass is launched and drained by the next - for at most
+// `limit`.  A failed drain ends the passes.  Whether every queue was drained.
+// Then, on Linux, until the process's engine counters (fdinfo) stand still over 5 ms, for at most 200 ms: on the B70
+// (xe, 2026-11-23) the compute engine went on counting this process's cycles for 5 to 10 ms after the drain's last
+// wait returned, and an exit inside that time faulted the engine at one address and reset it (5 of 9 stops after a
+// drain, 9 of 15 after other waits); with 20, 100 or 300 ms between the drain and the exit, none of 9.
+bool Runtime::drain_for_stop(std::chrono::milliseconds limit) noexcept {
+    t_stopper = true;
+    g_stopping.store(true, std::memory_order_release);
+    const auto end = std::chrono::steady_clock::now() + limit;
+    bool failed = false, drained = false;
+    for (;;) {
+        const bool last = std::chrono::steady_clock::now() >= end;
+        if (drain_pass(failed, !last)) { drained = !failed; break; }
+        if (failed || last) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+#if !defined(_WIN32)
+    try {
+        uint64_t before = drm_engine_counters();
+        for (int i = 0; i < 40; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            const uint64_t now = drm_engine_counters();
+            if (now == before) break;
+            before = now;
+        }
+    } catch (const std::exception& e) {   // the files' reads (allocation): the exit goes on
+        std::fprintf(stderr, "Xe runtime: the GPU engines' counters not read before the exit: %s\n", e.what());
+    }
+#endif
+    return drained;
+}
+
+#if !defined(_WIN32)
+namespace {
+// write(2), not stdio: the thread that holds stderr's lock may be the one stuck in the driver
+void say_raw(const char* text) {
+    const ssize_t written = ::write(STDERR_FILENO, text, std::strlen(text));
+    (void) written;
+}
+}  // namespace
+#endif
+
+// SIGTERM and SIGINT end the engine at once, as their default action does, but on a thread of their own.  While the GPU
+// compiler (IGC) translates a kernel it takes them over and longjmps to the translating thread, so one delivered to any
+// other thread aborted the engine ("longjmp causes uninitialized stack frame"; the server's SIGTERM after a QUIT, or a
+// stop while the kernels are built).  Blocked before any thread exists, so every thread inherits the mask.
+// The GPUs' queues are drained first, for at most 5 s: on the B70 (xe driver) a copy-engine job still queued when the
+// process ended read memory the exit had unmapped (an engine memory fault, and a reset).  Of 7 engines ended as everyday
+// use's bench ends them (the server's process group at once) 4 faulted, with STRATA_COPY_ENGINE=0 as well (the
+// runtime's own copies), and none once drained, 2026-10-15.  Issue #62 (a B60 whose next engine hung after a stop
+// during GPU work): the drain holds the engine's other threads at their next wait or submission, so nothing is queued
+// behind it, passes again over a queue that was recording a graph, goes on past a queue that failed, and lets the
+// engines come to rest before the exit (drain_for_stop); what it could not drain, and a drain cut at 5 s, are said
+// on stderr.  Queues the runtime does not own (a timing's own queue,
+// made and waited for in one function) are not drained.
+void route_stop_signals() {
+#if defined(_WIN32)
+    // Windows has no signal masks; Ctrl+C reaches a thread of its own already, and the server ends the engine with
+    // taskkill, not a signal
+#else
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGINT);
+    if (pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0) return;
+    std::thread([set] {
+        int sig = 0;
+        while (sigwait(&set, &sig) != 0) {}
+        std::thread([sig] {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            say_raw("Xe runtime: the GPUs' queues not drained within 5 s of the stop signal; ending without them\n");
+            _exit(128 + sig);
+        }).detach();
+        if (!Runtime::drain_for_stop(std::chrono::milliseconds(4500)))
+            std::fprintf(stderr, "Xe runtime: ending on the stop signal with GPU work not drained (above)\n");
+        _exit(128 + sig);
+    }).detach();
+#endif
 }
 
 void Runtime::free(void* pointer) noexcept {
@@ -744,7 +1210,8 @@ void Runtime::free(void* pointer) noexcept {
 }
 
 uint64_t env_mib(const char* name, uint64_t fallback_mib) {
-    const char* v = std::getenv(name);
+    // a STRATA_<name> is read as XESTRATA_<name> first (strata::env_get), the name the user's scripts may give
+    const char* v = std::strncmp(name, "STRATA_", 7) == 0 ? strata::env_get(name + 7) : std::getenv(name);
     if (v == nullptr || v[0] == '\0') return fallback_mib << 20;
     const char* p = v;
     while (*p == ' ' || *p == '\t') ++p;
@@ -755,7 +1222,7 @@ uint64_t env_mib(const char* name, uint64_t fallback_mib) {
     // << 20 wraps to 0 or a small number.  A limit read as 0 would be no limit at all, silently: say it and keep the
     // default instead.
     if (*p == '-' || *p == '+' || end == p || *end != '\0' || errno == ERANGE || mib >= (1ull << 44)) {
-        std::fprintf(stderr, "strata: %s=%s is not a size in MiB (a whole number below %llu): ignored\n", name, v,
+        std::fprintf(stderr, "xestrata: %s=%s is not a size in MiB (a whole number below %llu): ignored\n", name, v,
                      1ull << 44);
         return fallback_mib << 20;
     }
@@ -813,6 +1280,135 @@ bool hip_backend() {
     return on;
 }
 
+namespace {
+// The VRAM a GPU of the xe kernel driver has free, asked of the driver (DRM_XE_DEVICE_QUERY_MEM_REGIONS: its VRAM
+// regions' size and what is used of them) through the render node of the card at the PCI address `pci`.  False on
+// another driver, and where the driver gives no use: it may give it only to a process with CAP_PERFMON and 0 to
+// others (Linux 7.0 gives a user the VRAM's use, the system memory's 0), and its own allocations are never none.
+bool xe_vram(const std::string& pci, uint64_t& total, uint64_t& used) {
+#if defined(STRATA_XE_QUERY)
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/sys/bus/pci/devices/" + pci + "/drm", ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("renderD", 0) != 0) continue;
+        const int fd = open(("/dev/dri/" + name).c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) continue;
+        char drv[16] = {};
+        drm_version ver{};
+        ver.name_len = sizeof(drv) - 1;
+        ver.name = drv;
+        uint64_t size = 0, in_use = 0;
+        if (ioctl(fd, DRM_IOCTL_VERSION, &ver) == 0 && std::strcmp(drv, "xe") == 0) {
+            drm_xe_device_query q{};
+            q.query = DRM_XE_DEVICE_QUERY_MEM_REGIONS;
+            if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &q) == 0 && q.size >= sizeof(drm_xe_query_mem_regions)) {
+                std::vector<uint64_t> buf((q.size + 7) / 8);
+                q.data = (uint64_t) (uintptr_t) buf.data();
+                if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &q) == 0) {
+                    const auto* r = reinterpret_cast<const drm_xe_query_mem_regions*>(buf.data());
+                    for (uint32_t i = 0; i < r->num_mem_regions; ++i)
+                        if (r->mem_regions[i].mem_class == DRM_XE_MEM_REGION_CLASS_VRAM) {
+                            size += r->mem_regions[i].total_size;
+                            in_use += r->mem_regions[i].used;
+                        }
+                }
+            }
+        }
+        close(fd);
+        if (size == 0 || in_use == 0) return false;
+        total = size;
+        used = in_use;
+        return true;
+    }
+#else
+    (void) pci; (void) total; (void) used;
+#endif
+    return false;
+}
+
+// Whether the render node of the card at the PCI address `pci` is the i915 driver's.
+bool i915_gpu(const std::string& pci) {
+#if defined(STRATA_XE_QUERY)
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/sys/bus/pci/devices/" + pci + "/drm", ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("renderD", 0) != 0) continue;
+        const int fd = open(("/dev/dri/" + name).c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) continue;
+        char drv[16] = {};
+        drm_version ver{};
+        ver.name_len = sizeof(drv) - 1;
+        ver.name = drv;
+        const bool i915 = ioctl(fd, DRM_IOCTL_VERSION, &ver) == 0 && std::strcmp(drv, "i915") == 0;
+        close(fd);
+        return i915;
+    }
+#else
+    (void) pci;
+#endif
+    return false;
+}
+
+// A card of the xe driver whose VRAM a process that just ended is still giving back: the driver clears and frees it with
+// jobs of its own on the copy engine, and a start that took tens of GB meanwhile was refused its memory, then the
+// driver's own copy job faulted again and again and the GPU was wedged until a reboot (the B70, Linux 7.0, 2026-10-21:
+// an engine started right after the one before it ended on SIGTERM).  The start waits while the driver's count of the
+// VRAM in use falls, at most 20 s; where nothing is being given back that is one reading 100 ms after the first.
+void settle_vram(const sycl::device& d) {
+    if (integrated_gpu(d) || !d.has(sycl::aspect::ext_intel_pci_address)) return;
+    std::string pci = d.get_info<sycl::ext::intel::info::device::pci_address>();
+    for (auto& c : pci) c = (char) std::tolower((unsigned char) c);
+    uint64_t total = 0, used = 0;
+    if (!xe_vram(pci, total, used)) return;
+    constexpr uint64_t kStill = 64ull << 20;   // less than this given back in 100 ms: settled
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t first = used;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        uint64_t now = 0;
+        if (!xe_vram(pci, total, now)) return;
+        const bool falling = now + kStill < used;
+        used = now;
+        if (!falling || std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) break;
+    }
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (s > 0.5)
+        std::fprintf(stderr, "Xe runtime: GPU %s: waited %.1f s while the driver gave back %llu MiB of VRAM\n",
+                     pci.c_str(), s, (unsigned long long) ((first > used ? first - used : 0) >> 20));
+}
+
+bool driver_free_memory(const sycl::device& d, uint64_t& free) {
+    if (integrated_gpu(d) || !d.has(sycl::aspect::ext_intel_pci_address)) return false;
+    std::string pci = d.get_info<sycl::ext::intel::info::device::pci_address>();
+    for (auto& c : pci) c = (char) std::tolower((unsigned char) c);
+    uint64_t total = 0, used = 0;
+    if (!xe_vram(pci, total, used)) return false;
+    total = std::min(total, (uint64_t) d.get_info<sycl::info::device::global_mem_size>());
+    free = total > used ? total - used : 0;
+    return true;
+}
+}  // namespace
+
+// The SYCL runtime's free memory (ext_intel_free_memory) comes on Level Zero from the driver's usable-memory property,
+// or, from a driver without it (compute-runtime 26.05), from sysman, whose zesInit fails for every GPU when one of
+// them is not the driver's (a Coffee Lake UHD 630 beside an Arc Pro B60: the B60's free VRAM read 0, and the warm-up
+// kept the 0 in the config; technicalife.net, 2026-11-01).  There the xe driver is asked; capped at the size the SYCL
+// runtime reports, the B60's 23256 MiB of the driver's 24480.
+bool device_free_memory(const sycl::device& d, uint64_t& free) {
+    if (d.has(sycl::aspect::ext_intel_free_memory)) {
+        try {
+            free = d.get_info<sycl::ext::intel::info::device::free_memory>();
+            // ROCm's figure can come back below zero as an unsigned value: 140 MiB short read as 17592186044276 MiB
+            // free (RX 9060 XT, ROCm 7.14, 2026-11-15).  More than the device has is none left.
+            if (free > d.get_info<sycl::info::device::global_mem_size>()) free = 0;
+            return true;
+        } catch (const sycl::exception&) {
+            return driver_free_memory(d, free);
+        }
+    }
+    return driver_free_memory(d, free);
+}
+
 // upstream 004b15cd (#409): an integrated GPU's memory is the system RAM, and what its runtime reports free need not
 // subtract the CPU's allocations (an AMD APU's figure counts its whole shared pool).  The engine takes the smaller of
 // that figure and what the OS can give back, less STRATA_UMA_HEADROOM_GIB (default 6) for the system.
@@ -823,49 +1419,131 @@ void apply_os_budget(const std::string& pci, uint64_t& free) {
         free = std::min(free, budget > usage ? budget - usage : 0);
 }
 
-void apply_uma_limit(uint64_t& free) {
+void apply_uma_limit(uint64_t& free, uint64_t total) {
     static const uint64_t headroom = [] {
-        const char* v = std::getenv("STRATA_UMA_HEADROOM_GIB");
+        const char* v = strata::env_get("UMA_HEADROOM_GIB");
         const long long g = v != nullptr ? std::strtoll(v, nullptr, 10) : 6;
         return (uint64_t) std::max(0LL, g) << 30;
     }();
+    uint64_t os_total = 0, avail = 0;
 #if defined(_WIN32)
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
-    if (GlobalMemoryStatusEx(&ms)) {
-        const uint64_t avail = (uint64_t) ms.ullAvailPhys;
-        free = std::min(free, avail > headroom ? avail - headroom : 0);
-    }
+    if (!GlobalMemoryStatusEx(&ms)) return;
+    os_total = (uint64_t) ms.ullTotalPhys;
+    avail = (uint64_t) ms.ullAvailPhys;
 #else
     std::ifstream meminfo("/proc/meminfo");
     std::string key;
     uint64_t kb = 0;
-    while (meminfo >> key >> kb) {
-        if (key == "MemAvailable:") {
-            const uint64_t avail = kb << 10;
-            free = std::min(free, avail > headroom ? avail - headroom : 0);
-            return;
-        }
+    while ((os_total == 0 || avail == 0) && meminfo >> key >> kb) {
+        if (key == "MemTotal:")
+            os_total = kb << 10;
+        else if (key == "MemAvailable:")
+            avail = kb << 10;
         meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     }
+    if (avail == 0) return;   // no figure to cut to: the device's own stands
 #endif
+    // A BIOS carve-out is a pool of its own: the device reports more memory than the OS has, so what the OS can give
+    // back says nothing about it (the Strix Halo's 64 GiB carve-out beside the 62 GiB the OS sees; the free figure is
+    // the carve-out's).  Where the device's total is within the OS's RAM, the two are the same pool and the OS's
+    // figure binds (an Intel iGPU, an APU with a small carve-out).
+    if (os_total != 0 && total > os_total) return;
+    free = std::min(free, avail > headroom ? avail - headroom : 0);
 }
 
 // The used memory is the larger of the report's and what the process holds: the B70 reports its global_mem_size
 // (31023 MiB) less than its 32 GiB and its free memory as the smaller of that and what is free, so the first 1.4 GiB a
 // process takes do not show (2026-10-19); llm-jp-4.1 Q4_K_M under 6144 MiB took 7.3 GiB.
-void apply_vram_limit(uint64_t& free, uint64_t& total, uint64_t held) {
+void apply_vram_limit(uint64_t& free, uint64_t& total, uint64_t held, uint64_t* short_b) {
+    if (short_b) *short_b = 0;
     const uint64_t lim = vram_limit_bytes();
     if (lim == 0 || lim >= total) return;
     const uint64_t used = std::max(total > free ? total - free : 0, held);
     total = lim;
     free = lim > used ? lim - used : 0;
+    if (short_b) *short_b = used > lim ? used - lim : 0;
+}
+
+// The room no plan counts, of any device's memory: see the declaration.  A caller that cannot read the device's
+// memory (total 0) gets its own floor, the room measured on the smallest card.
+uint64_t vram_room(uint64_t total_bytes, uint64_t parts, uint64_t least_bytes, uint64_t most_bytes) {
+    const uint64_t floor_b = std::min(least_bytes, most_bytes);
+    const uint64_t room = std::clamp<uint64_t>(total_bytes / 32, floor_b, std::max(floor_b, most_bytes));
+    return parts > 1 ? room / parts : room;
+}
+
+uint64_t unreported_vram_margin(const std::string& pci, uint64_t total) {
+    static std::mutex mu;
+    static std::vector<std::pair<std::string, bool>> seen;   // the driver of each card asked once
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = std::find_if(seen.begin(), seen.end(), [&](const auto& e) { return e.first == pci; });
+    if (it == seen.end()) it = seen.insert(seen.end(), {pci, i915_gpu(pci)});
+    // Measured on an A380 (6 GB, i915, compute-runtime 26.05, 2026-11-03): with the engine's own allocations counted, a
+    // cache that left 320 MiB of the 5783 lost its contents and one that left 440 MiB ran, and a probe filled 5120 MiB
+    // in 256 MiB blocks and read all of it back.  A sixteenth (361 MiB there) beside the engines' own reserves (the
+    // plain engine's 1/32, Qwen3.8's 700 MiB); a larger card's runtime takes more (its scratch grows with its units)
+    return it->second ? total / 16 : 0;
 }
 
 uint64_t max_alloc_bytes() {
-    const uint64_t dev = Runtime::get().device().get_info<sycl::info::device::max_mem_alloc_size>();
-    const uint64_t lim = max_alloc_limit_bytes();
-    return lim != 0 && lim < dev ? lim : dev;
+    static std::mutex mu;
+    static std::map<int, uint64_t> limits;
+    std::lock_guard<std::mutex> lock(mu);
+    const int ordinal = Runtime::get().ordinal();
+    const auto found = limits.find(ordinal);
+    if (found != limits.end()) return found->second;
+    const uint64_t v = [] {
+        const uint64_t dev = Runtime::get().device().get_info<sycl::info::device::max_mem_alloc_size>();
+        const uint64_t lim = max_alloc_limit_bytes();
+        const uint64_t claim = lim != 0 && lim < dev ? lim : dev;
+        // HIP's adapter can report a largest allocation far below what the device gives: 32 MiB for a gfx1151 that
+        // hands out 24 GiB in one call (Strix Halo, 2026-11-13).  A claim that small splits the expert tier into
+        // pieces too small for the prompt path to borrow its chunk across (74 MiB for 16 tokens), so it is measured:
+        // allocations twice the claim up to 1 GiB, the largest that succeeds.  Where the claim is the device's
+        // limit the first try fails and the claim stands; the tier's own allocation is what reports a refusal, and
+        // its pieces fallback covers that.
+        const uint64_t total = Runtime::get().device().get_info<sycl::info::device::global_mem_size>();
+        if (claim >= (1ull << 30) || total < (8ull << 30)) return claim;
+        uint64_t good = claim;
+        for (uint64_t want = claim * 2; want <= (1ull << 30); want *= 2) {
+            void* p = strata::gpu::alloc_device((size_t) want);
+            if (p == nullptr) break;
+            strata::gpu::free(p);
+            good = want;
+        }
+        return good;
+    }();
+    limits.emplace(ordinal, v);
+    return v;
+}
+
+int device_selector_index(int ordinal) {
+    if (ordinal < 0 || ordinal >= Runtime::count())
+        throw DeviceError("no engine device " + std::to_string(ordinal));
+    const auto& target = engine_devices()[(size_t) ordinal];
+    std::map<sycl::backend, int> next;
+    // Match SYCL's selector numbering: all root devices across platforms of each backend, before the engine's
+    // usability checks and preference sort. The caller must run without device filters.
+    for (const auto& platform : sycl::platform::get_platforms()) {
+        const auto backend = platform.get_backend();
+        for (const auto& device : platform.get_devices()) {
+            const int index = next[backend]++;
+            if (device == target) return index;
+        }
+    }
+    throw DeviceError("the GPU is not in the SYCL platform list");
+}
+
+std::string devices_key_text() {
+    std::string k = "engine " STRATA_VERSION "|devices " + std::to_string(Runtime::count());
+    for (int i = 0; i < Runtime::count(); ++i) {
+        const DeviceInfo d = device_info(i);
+        k += "|" + d.backend + " " + d.name + " " + std::to_string(d.total_bytes >> 20) + " MiB cu " +
+             std::to_string(d.compute_units) + " driver " + d.driver_version + " runtime " + d.platform_version;
+    }
+    return k;
 }
 
 DeviceInfo device_info(int ordinal) {
@@ -884,12 +1562,7 @@ DeviceInfo device_info(int ordinal) {
     out.driver_version = d.get_info<sycl::info::device::driver_version>();
     out.platform_version = d.get_platform().get_info<sycl::info::platform::version>();
     out.total_bytes = d.get_info<sycl::info::device::global_mem_size>();
-    if (d.has(sycl::aspect::ext_intel_free_memory)) {
-        try {
-            out.free_bytes = d.get_info<sycl::ext::intel::info::device::free_memory>();
-            out.free_bytes_known = true;
-        } catch (const sycl::exception&) { /* Optional telemetry; never substitute zero for unknown. */ }
-    }
+    out.free_bytes_known = device_free_memory(d, out.free_bytes);   // never zero for unknown
     uint64_t free = out.free_bytes_known ? out.free_bytes : out.total_bytes;
     if (out.free_bytes_known && !integrated(d)) apply_os_budget(pci_of(d), free);
     apply_vram_limit(free, out.total_bytes);

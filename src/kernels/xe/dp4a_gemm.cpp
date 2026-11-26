@@ -15,6 +15,8 @@
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_dp4a_gemm
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
+#include "device_caps.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -121,10 +123,9 @@ int narrow_sub_group(const sycl::queue& q) {
     static core::PerDevice<int> per_device;
     return per_device.get(q.get_device(), [&q] {
         // STRATA_SUB_GROUP_32=1 takes 32 where 16 is listed too, to compare the two on one GPU
-        if (const char* v = std::getenv("STRATA_SUB_GROUP_32"); v != nullptr && std::strtol(v, nullptr, 10) != 0)
+        if (const char* v = strata::env_get("SUB_GROUP_32"); v != nullptr && std::strtol(v, nullptr, 10) != 0)
             return 32;
-        const auto s = q.get_device().get_info<sycl::info::device::sub_group_sizes>();
-        return std::find(s.begin(), s.end(), size_t(16)) != s.end() ? 16 : 32;
+        return xe::has_sub_group(q.get_device(), 16) ? 16 : 32;
     });
 }
 

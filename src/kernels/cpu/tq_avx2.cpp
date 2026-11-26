@@ -18,6 +18,12 @@
 #include "tq_states.hpp"
 
 #include <immintrin.h>
+#include <cstring>
+#include <cstdlib>
+
+#if !defined(STRATA_AVXVNNI)
+#define STRATA_AVXVNNI 0
+#endif
 
 namespace strata::kernels::cpu::tq_detail {
 namespace {
@@ -47,6 +53,7 @@ inline __m256i pairs8(const int32_t* tab, const uint8_t* qs, uint64_t wr, int t0
 template <int TY, int NT>
 void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, float* const* out, int r0, int r1) {
     constexpr int nt = NT;
+    // i < n / 128 and n is int, so i * 128 and i * 4 fit int.
     const int nb = n / 128;
     constexpr size_t bsz = 2 + TqFmt<TY>::NB;
     const long long* tab = (const long long*) tq_state_table();
@@ -71,7 +78,7 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, fl
             }
             const __m128 dx = _mm_set1_ps(tq_half_to_float(tq_ld16(blk)));
             for (int t = 0; t < nt; ++t) {
-                const __m256i* q = (const __m256i*) (a[t]->q + 128 * i);
+                const __m256i* q = (const __m256i*) (a[t]->q + static_cast<size_t>(i * 128));
                 const __m256i p0 = _mm256_add_epi32(_mm256_madd_epi16(wv[0], _mm256_load_si256(q + 0)),
                                                     _mm256_madd_epi16(wv[1], _mm256_load_si256(q + 1)));
                 const __m256i p1 = _mm256_add_epi32(_mm256_madd_epi16(wv[2], _mm256_load_si256(q + 2)),
@@ -83,7 +90,7 @@ void rows_t(const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, fl
                 // per 128-bit lane [p0, p1, p2, p3] partial sums, then the two lanes added: S[0..3], exact
                 const __m256i h = _mm256_hadd_epi32(_mm256_hadd_epi32(p0, p1), _mm256_hadd_epi32(p2, p3));
                 const __m128i s = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
-                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + 4 * i));
+                const __m128 sc = _mm_mul_ps(dx, _mm_loadu_ps(a[t]->d + static_cast<size_t>(i * 4)));
                 acc[t] = _mm_fmadd_ps(_mm_cvtepi32_ps(s), sc, acc[t]);
             }
         }
@@ -124,6 +131,53 @@ void tq_rows_avx2(int ty, const uint8_t* w, size_t row_bytes, int n, const TqAct
         case 148: rows_nt<148>(w, row_bytes, n, a, nt, out, r0, r1); break;
         case 149: rows_nt<149>(w, row_bytes, n, a, nt, out, r0, r1); break;
         default: break;
+    }
+}
+
+
+namespace {
+// `code` has its first two bytes appended, so a wrapped 15-bit window never reads past the block.
+inline uint32_t bih3_state_padded(const uint8_t* code, int k, int step) {
+    if (k == 8) return (((uint32_t) code[(step + 31) & 31] << 8) | code[step]) & 0x7fffu;
+    const int bit = (31 - step) * k, i = bit / 8;
+    const uint32_t window = (uint32_t) code[i] | ((uint32_t) code[i + 1] << 8) | ((uint32_t) code[i + 2] << 16);
+    return (window >> (bit % 8)) & 0x7fffu;
+}
+
+namespace bih3_avx2 {
+#define BIH3_MODE 0
+#define BIH3_FN
+#include "tq_bih3_rows.inl"
+#undef BIH3_FN
+#undef BIH3_MODE
+}
+#if STRATA_AVXVNNI
+namespace bih3_avxvnni {
+#define BIH3_MODE 1
+#define BIH3_FN __attribute__((target("avxvnni")))
+#include "tq_bih3_rows.inl"
+#undef BIH3_FN
+#undef BIH3_MODE
+}
+#endif
+namespace bih3_avx512vnni {
+#define BIH3_MODE 2
+#define BIH3_FN __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni")))
+#include "tq_bih3_rows.inl"
+#undef BIH3_FN
+#undef BIH3_MODE
+}
+}  // namespace
+
+void bih3_rows_x86(Bih3Isa isa, int type, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a,
+                    int nt, float* const* out, int r0, int r1, const TqR1q2Scales& scales) {
+    switch (isa) {
+        case Bih3Isa::avx512vnni: bih3_avx512vnni::rows(type, w, row_bytes, n, a, nt, out, r0, r1, scales); return;
+#if STRATA_AVXVNNI
+        case Bih3Isa::avxvnni: bih3_avxvnni::rows(type, w, row_bytes, n, a, nt, out, r0, r1, scales); return;
+#endif
+        case Bih3Isa::avx2: bih3_avx2::rows(type, w, row_bytes, n, a, nt, out, r0, r1, scales); return;
+        default: std::abort();
     }
 }
 

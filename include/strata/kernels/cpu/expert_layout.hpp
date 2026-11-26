@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/cpu/expert_layout.hpp - plan v0.3 P6: where each routed expert lives in experts.bin.
 //
@@ -35,6 +36,24 @@ struct ExpertLayout {
     /// same numbers.
     std::vector<int64_t> block;
     int version = 0;                      ///< native_experts.txt's header version (0 = none given)
+    /// v6 (the latent MoE, Edge0): the experts' own widths from the header, 0 when it does not name them.
+    /// They differ from the shell's hidden width and expert FF: the experts run at the latent width.
+    int64_t expert_embd = 0, expert_ff = 0;
+    /// Sync's v6 has a different format and size for each expert, unlike Edge0's v6.
+    std::vector<NativeFmt> expert_fmt;
+    std::vector<uint64_t> expert_off;
+    std::vector<uint64_t> layer_size;
+    bool mixed() const { return !expert_fmt.empty(); }
+    size_t expert_index(int64_t layer, int64_t expert) const { return (size_t) (layer * n_expert + expert); }
+    const NativeFmt& format(int64_t layer, int64_t expert) const {
+        return mixed() ? expert_fmt[expert_index(layer, expert)] : fmt[(size_t) layer];
+    }
+    uint64_t blob_bytes(int64_t layer, int64_t expert) const {
+        return mixed() ? format(layer, expert).bytes : blob_bytes(layer);
+    }
+    uint64_t layer_bytes(int64_t layer) const {
+        return mixed() ? layer_size[(size_t) layer] : blob_bytes(layer) * (uint64_t) n_expert;
+    }
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size
 
@@ -44,7 +63,8 @@ struct ExpertLayout {
         return native ? offset[(size_t) layer] : (uint64_t) layer * (uint64_t) n_expert * (uint64_t) BLOB;
     }
     uint64_t blob_offset(int64_t layer, int64_t expert) const {
-        return layer_offset(layer) + (uint64_t) expert * blob_bytes(layer);
+        return mixed() ? expert_off[expert_index(layer, expert)] :
+                         layer_offset(layer) + (uint64_t) expert * blob_bytes(layer);
     }
 };
 
@@ -68,6 +88,17 @@ bool cpu_gather_fast_here();
 /// Whether the AVX-VNNI kernels run here: the build has them (STRATA_HAVE_AVXVNNI), the CPU has AVX2 and AVX-VNNI
 /// (CPUID 7.1 EAX bit 4).  STRATA_NO_AVXVNNI=1 answers no (to compare with the AVX2 kernels).
 bool cpu_avxvnni_ok();
+/// Whether this CPU (and its OS) runs the int8 product's AVX-512 kernel (i8_gemm.hpp): AVX512F and AVX512_VNNI, and the
+/// OS saving the opmask and ZMM state (XCR0 bits 1, 2, 5, 6, 7).  Only what that kernel uses: cpu_avx512_ok's VBMI and BW
+/// would leave out the Cascade Lake servers, which have AVX-512 VNNI.  XESTRATA_FORCE_AVX2=1 answers no.
+bool cpu_avx512vnni_ok();
+/// AVX-512 VNNI with BW, VL, AVX2, FMA and F16C, for the latent U-row kernel.
+bool cpu_avx512_latent_ok();
+/// Whether this CPU (and its OS) runs AVX-VNNI-INT8 (vpdpbssd: s8 x s8; CPUID 7.1 EDX bit 4, Arrow Lake, Lunar Lake and
+/// later) beside AVX2.  XESTRATA_NO_AVXVNNI=1 answers no, as for AVX-VNNI.
+bool cpu_avxvnniint8_ok();
+/// The bytes of one core's level-2 cache, from CPUID (leaf 4 on Intel, 0x8000001D on AMD); 0 when the CPU does not say.
+uint64_t cpu_l2_bytes();
 /// The CPU's brand string (CPUID 0x80000002..4), for messages; "unknown" when it has none.
 std::string cpu_name();
 /// Q2_0 GGUF rows / activation quantizer on the kernels this CPU has.
@@ -84,6 +115,14 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
 void expert_layout_set(const ExpertLayout& layout);
 /// The newest native_experts.txt this engine reads.  v4 = v3 plus the per-role shard column `gate,up,down`,
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
-inline constexpr int kExpertLayoutVersion = 4;
+/// v5 = v4 plus `hadamard.txt` beside it: Hadamard-folded experts (hadamard.hpp), written only for such models,
+/// so an engine that cannot rotate the activations refuses the pack instead of running it wrong.
+/// v6 = the latent MoE's A-only pack (Edge0): the header names expert_embd / expert_ff (the experts' widths),
+/// there is no hadamard.txt, and scales/l*.f32 beside the manifest hold the Q3_K shared column scales.
+inline constexpr int kExpertLayoutVersion = 6;
+
+/// The layer's Q3_K column-scale reciprocals (NativeFmt::gu_colscale) and their width, for the GPU side to
+/// upload.  nullptr when the pack has no scales; *width 0 then.
+const float* latent_gu_colscale(int layer, int* width);
 
 }  // namespace strata::kernels::cpu

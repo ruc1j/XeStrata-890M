@@ -17,10 +17,12 @@
 #include "cuda_intrinsics.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
-#include "q8_1_finite.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/core/timed_choice.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_verify_kernels
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 // sycl_ext_oneapi_clock is newer than some DPC++ releases (intel/llvm 6.2 lacks it): without it there is no stamp
 #if __has_include(<sycl/ext/oneapi/experimental/clock.hpp>)
@@ -37,6 +39,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace strata::kernels {
@@ -71,9 +74,10 @@ inline void q8_1_store(const sycl::sub_group& sg, const float xi, uint8_t* block
         amax = sycl::fmax(amax, strata_shfl_xor(sg, amax, o));
         sum += strata_shfl_xor(sg, sum, o);
     }
-    const float d = xe::q8_1_finite(amax / 127.0f);
-    block[4 + lane] = (uint8_t) xe::q8_1_quant(xi, d, amax);
-    if (lane == 0) *reinterpret_cast<sycl::half2*>(block) = sycl::half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+    // q8_act.hpp's Ggml rule and Q8_1 layout (q8act::q8_1_block's bytes)
+    const float d = q8act::Ggml::scale(amax);
+    block[4 + lane] = (uint8_t) q8act::Ggml::value(xi, d, 0.0f, amax);
+    if (lane == 0) *reinterpret_cast<sycl::half2*>(block) = sycl::half2(sycl::half(d), sycl::half(q8act::finite(sum)));
 }
 inline uint32_t read_host(const uint32_t* p) {
     const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);
@@ -83,14 +87,24 @@ inline uint32_t read_host(const uint32_t* p) {
 
 }  // namespace
 
-void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
-                       int qk_heads, float eps, int n_tok, void* stream, int t_begin, bool commit) {
-    if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT ||
-        (commit && (n_tok != 1 || t_begin != 0)))
-        fail("gdn_conv_l2_multi: invalid arguments");
-    float* hist_out = commit ? const_cast<float*>(history) : nullptr;   // a work-item reads and writes its channel only
-    const int C = channels;
-    const auto e = Q(stream).submit([&](sycl::handler& hd) {
+namespace {
+// The narrow form of a window's row copies: a window of up to kVerifyNarrowT rows passes the kernels the argument it
+// always did (the wide form only past it)
+using GdnRowCopiesNarrow = GdnRowCopiesN<kVerifyNarrowT>;
+GdnRowCopiesNarrow narrow_copies(const GdnRowCopies& c) {
+    GdnRowCopiesNarrow r;
+    r.n = c.n;
+    for (int t = 0; t < c.n && t < kVerifyNarrowT; ++t) r.p[t] = c.p[t];
+    return r;
+}
+
+// COPIES: the rows' histories also to cp (the plain engine's drafts); its own instance, so the verify window's kernel
+// is the one it was
+template <bool COPIES, typename CP>
+sycl::event gdn_conv_l2_launch(sycl::queue& q, const float* history, const float* qkv, const float* conv_w, float* h,
+                               int C, int qk_heads, float eps, int n_tok, int t_begin, float* hist_out,
+                               const CP cp) {
+    return q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> part(sycl::range<1>(S / WARP), hd);
         hd.parallel_for(sycl::nd_range<2>({(size_t) n_tok, (size_t) C}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
@@ -104,7 +118,7 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                 win[j] = src < 3 ? history[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
             }
             const float v0 = win[0], v1 = win[1], v2 = win[2], x = qkv[(size_t) t * C + c];
-            const float sum = v0 * conv_w[c * 4] + v1 * conv_w[c * 4 + 1] + v2 * conv_w[c * 4 + 2] + x * conv_w[c * 4 + 3];
+            const float sum = v0 * conv_w[(size_t) c * 4] + v1 * conv_w[c * 4 + 1] + v2 * conv_w[c * 4 + 2] + x * conv_w[c * 4 + 3];
             float y = sum / (1.0f + sycl::exp(-sum));
             if ((int) it.get_group(1) < qk_heads) {   // uniform over the work-group
                 const float sq = warp_sum(sg, y * y);
@@ -120,8 +134,36 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                 ho[1] = v2;
                 ho[2] = x;
             }
+            // the history after token t, beside the window's own; cp.n is the array's size at most (gdn_conv_l2_multi
+            // checks it), so t < cp.n keeps to the array
+            if constexpr (COPIES)
+                if (t < cp.n && cp.p[t] != nullptr) {   // NOLINT(clang-analyzer-security.ArrayBound)
+                    float* ho = cp.p[t] + (size_t) c * 3;
+                    ho[0] = v1;
+                    ho[1] = v2;
+                    ho[2] = x;
+                }
         });
     });
+}
+}  // namespace
+
+void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
+                       int qk_heads, float eps, int n_tok, void* stream, int t_begin, bool commit,
+                       const GdnRowCopies* copies) {
+    if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT ||
+        (commit && (n_tok != 1 || t_begin != 0)) || (copies != nullptr && copies->n > kVerifyMaxT))
+        fail("gdn_conv_l2_multi: invalid arguments");   // the kernel reads copies->p[t] for t < copies->n
+    float* hist_out = commit ? const_cast<float*>(history) : nullptr;   // a work-item reads and writes its channel only
+    auto& q = Q(stream);
+    const auto e = copies != nullptr && copies->n > kVerifyNarrowT
+                       ? gdn_conv_l2_launch<true>(q, history, qkv, conv_w, h, channels, qk_heads, eps, n_tok, t_begin,
+                                                  hist_out, *copies)
+                   : copies != nullptr && copies->n > 0
+                       ? gdn_conv_l2_launch<true>(q, history, qkv, conv_w, h, channels, qk_heads, eps, n_tok, t_begin,
+                                                  hist_out, narrow_copies(*copies))
+                       : gdn_conv_l2_launch<false>(q, history, qkv, conv_w, h, channels, qk_heads, eps, n_tok, t_begin,
+                                                   hist_out, GdnRowCopiesNarrow{});
     done(stream, e, "gdn_conv_l2_multi");
 }
 
@@ -140,7 +182,7 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
             const int src = n + j;   // the last three of [hist(3) | x_0..x_{n-1}]
             seq[j] = src < 3 ? history[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
         }
-        history[c * 3] = seq[0];
+        history[(size_t) c * 3] = seq[0];
         history[c * 3 + 1] = seq[1];
         history[c * 3 + 2] = seq[2];
     });
@@ -174,8 +216,8 @@ void gdn_conv_commit_layers(float* hist0, int64_t hist_stride, const float* qkv0
 namespace {
 // gdn_ab_multi for at most MAX_T tokens; EXACT: exactly MAX_T (the token loop fixed at compile time, upstream ae3b249f).
 // A lane unpacks its eight BF16 weights once for all tokens; the FMA order is the same as before.
-template <int MAX_T, bool EXACT>
-sycl::event gdn_ab_launch(sycl::queue& q, const float* x, const uint16_t* w_alpha, const uint16_t* w_beta,
+template <int MAX_T, bool EXACT, typename WT>
+sycl::event gdn_ab_launch(sycl::queue& q, const float* x, const WT* w_alpha, const WT* w_beta,
                           const float* dt, const float* ssm_a, float* gate, float* beta, int n, int h_v, int T_arg) {
     const size_t groups = (size_t) ((2 * h_v + 7) / 8);
     return q.parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
@@ -186,21 +228,27 @@ sycl::event gdn_ab_launch(sycl::queue& q, const float* x, const uint16_t* w_alph
         if (row >= 2 * h_v) return;   // uniform over the sub-group
         const bool is_beta = row >= h_v;
         const int r = is_beta ? row - h_v : row;
-        const uint32_t* w = reinterpret_cast<const uint32_t*>((is_beta ? w_beta : w_alpha) + (size_t) r * n);
+        const WT* wr = (is_beta ? w_beta : w_alpha) + (size_t) r * n;
         auto lo = [](uint32_t u) { return sycl::bit_cast<float>(u << 16); };
         auto hi = [](uint32_t u) { return sycl::bit_cast<float>(u & 0xffff0000u); };
         float acc[MAX_T];
         #pragma unroll
         for (int t = 0; t < MAX_T; ++t) acc[t] = 0.0f;
         for (int j = lane; j < n / 8; j += 32) {
-            const uint32_t* wj = w + (size_t) j * 4;
-            const uint32_t u0 = wj[0], u1 = wj[1], u2 = wj[2], u3 = wj[3];
-            const float w0 = lo(u0), w1 = hi(u0), w2 = lo(u1), w3 = hi(u1);
-            const float w4 = lo(u2), w5 = hi(u2), w6 = lo(u3), w7 = hi(u3);
+            float w0, w1, w2, w3, w4, w5, w6, w7;
+            if constexpr (std::is_same_v<WT, float>) {   // F32 weights (widened as the plain engine loads them)
+                const float* wj = wr + (size_t) j * 8;
+                w0 = wj[0]; w1 = wj[1]; w2 = wj[2]; w3 = wj[3]; w4 = wj[4]; w5 = wj[5]; w6 = wj[6]; w7 = wj[7];
+            } else {
+                const uint32_t* wj = reinterpret_cast<const uint32_t*>(wr) + (size_t) j * 4;
+                const uint32_t u0 = wj[0], u1 = wj[1], u2 = wj[2], u3 = wj[3];
+                w0 = lo(u0); w1 = hi(u0); w2 = lo(u1); w3 = hi(u1);
+                w4 = lo(u2); w5 = hi(u2); w6 = lo(u3); w7 = hi(u3);
+            }
             #pragma unroll
             for (int t = 0; t < MAX_T; ++t) {
                 if (!EXACT && t >= T) break;
-                const float* xa = x + (size_t) t * n + j * 8;
+                const float* xa = x + (size_t) t * n + (size_t) j * 8;
                 float a = acc[t];
                 a = sycl::fma(w0, xa[0], a); a = sycl::fma(w1, xa[1], a);
                 a = sycl::fma(w2, xa[2], a); a = sycl::fma(w3, xa[3], a);
@@ -226,8 +274,10 @@ sycl::event gdn_ab_launch(sycl::queue& q, const float* x, const uint16_t* w_alph
 }
 }  // namespace
 
-void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
-                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
+namespace {
+template <typename WT>
+void gdn_ab_run(const float* x, const WT* w_alpha, const WT* w_beta, const float* dt, const float* ssm_a, float* gate,
+                float* beta, int n_embd, int h_v, int n_tok, void* stream) {
     if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) fail("gdn_ab_multi: invalid arguments");
     auto& q = Q(stream);
     sycl::event e;
@@ -238,9 +288,31 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         case 4: e = gdn_ab_launch<4, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         case 5: e = gdn_ab_launch<5, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         case 6: e = gdn_ab_launch<6, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
-        default: e = gdn_ab_launch<kVerifyMaxT, false>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+        case 7:
+        case 8:
+            e = gdn_ab_launch<kVerifyNarrowT, false>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+            break;
+        default:   // a wide window: its first 8 rows and the rest, each by the 8-row instance (a 16-row instance's
+                   // token loop is not unrolled, and each row's arithmetic is its own either way)
+            gdn_ab_launch<kVerifyNarrowT, false>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v,
+                                                 kVerifyNarrowT);
+            e = gdn_ab_launch<kVerifyNarrowT, false>(q, x + (size_t) kVerifyNarrowT * n_embd, w_alpha, w_beta, dt, ssm_a,
+                                                     gate + (size_t) kVerifyNarrowT * h_v,
+                                                     beta + (size_t) kVerifyNarrowT * h_v, n_embd, h_v,
+                                                     n_tok - kVerifyNarrowT);
     }
     done(stream, e, "gdn_ab_multi");
+}
+}  // namespace
+
+void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
+                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
+    gdn_ab_run(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, stream);
+}
+
+void gdn_ab_multi(const float* x, const float* w_alpha, const float* w_beta, const float* dt, const float* ssm_a,
+                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
+    gdn_ab_run(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, stream);
 }
 
 namespace {
@@ -253,10 +325,14 @@ constexpr int GS_COLS = 32;
 #ifndef STRATA_GDN_STAGE
 #define STRATA_GDN_STAGE 1
 #endif
-template <bool Q8>
+// SNAP: the state after each of the first sn.n tokens also to sn.p[t] (the plain engine's drafts); its own instance, so
+// the forms the verify window takes keep their registers (a copy in the prefetch form took the RTX 4070's 512
+// work-items past the registers it has).
+template <bool Q8, bool SNAP = false, typename CP = GdnRowCopiesNarrow>
 sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
-                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1, const GdnPending* pend = nullptr) {
+                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1,
+                           const CP sn, const GdnPending* pend = nullptr) {
 #if STRATA_GDN_STAGE
     // XeStrata-890M: every token's k, q, v (the group's columns), exp(gate) and beta staged in local memory before the
     // recurrence, and the two reductions a token in their own slots, so a token costs two barriers and no global load
@@ -297,9 +373,11 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
             for (int p0 = 0; p0 < np; p0 += (int) mt) {
                 const int pc = sycl::min(np - p0, (int) mt);
                 const float* pht = ph + (size_t) p0 * C;
-                for (int i = tid; i < pc * S; i += GS_COLS * RG) skf[i] = pht[(size_t) (i / S) * C + qk + qh * S + i % S];
+                const float* phk = pht + qk;   // k and v stepped from the row, not pht[qk + ...] beside pht[2 * qk + ...]
+                const float* phv = phk + qk;   // (IGC's GEP simplification, as the unstaged form)
+                for (int i = tid; i < pc * S; i += GS_COLS * RG) skf[i] = phk[(size_t) (i / S) * C + qh * S + i % S];
                 for (int i = tid; i < pc * GS_COLS; i += GS_COLS * RG)
-                    sv[i] = pht[(size_t) (i / GS_COLS) * C + 2 * qk + head * S + c0 + i % GS_COLS];
+                    sv[i] = phv[(size_t) (i / GS_COLS) * C + head * S + c0 + i % GS_COLS];
                 if (tid < pc) {
                     sg[2 * tid] = sycl::exp(pg[(size_t) (p0 + tid) * h_v + head]);
                     sg[2 * tid + 1] = pb[(size_t) (p0 + tid) * h_v + head];
@@ -341,13 +419,15 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) wb[r * row_stride] = s[r];
             }
+            const float* const hbk = hbuf + qk;   // k and v stepped from the row (IGC's GEP simplification)
+            const float* const hbv = hbk + qk;
             for (int i = tid; i < n * S; i += GS_COLS * RG) {
-                const float* ht = hbuf + (size_t) (i / S) * C;
-                skf[i] = ht[qk + qh * S + i % S];
-                sqf[i] = ht[qh * S + i % S];
+                const size_t row = (size_t) (i / S) * C;
+                skf[i] = hbk[row + qh * S + i % S];
+                sqf[i] = hbuf[row + qh * S + i % S];
             }
             for (int i = tid; i < n * GS_COLS; i += GS_COLS * RG)
-                sv[i] = hbuf[(size_t) (i / GS_COLS) * C + 2 * qk + head * S + c0 + i % GS_COLS];
+                sv[i] = hbv[(size_t) (i / GS_COLS) * C + head * S + c0 + i % GS_COLS];
             if (tid < n) {
                 sg[2 * tid] = sycl::exp(gate[(size_t) tid * h_v + head]);
                 sg[2 * tid + 1] = beta[(size_t) tid * h_v + head];
@@ -386,6 +466,12 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
                     s[r + 3] = sycl::fma(g, s[r + 3], kr.w() * delta);
                     o = sycl::fma(s[r + 3], qv.w(), o);
                 }
+                if constexpr (SNAP)
+                    if (t < sn.n && sn.p[t] != nullptr) {   // the state after token t, to go back to
+                        float* d = sn.p[t] + (base - state);
+                        #pragma unroll
+                        for (int r = 0; r < RPG; ++r) d[r * row_stride] = s[r];
+                    }
                 ro[rg * GS_COLS + lc] = o;
             }
             // XeStrata-890M: the rows' outputs after the loop, behind one barrier.  Every row has its own slots for the
@@ -425,8 +511,10 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
             for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
             for (int t = 0; t < n; ++t) {
                 const float* ht = hbuf + (size_t) t * C;
+                const float* hk = ht + qk;
+                const float* hv = hk + qk;
                 sycl::group_barrier(it.get_group());
-                if (tid < S) { sk[tid] = ht[qk + qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
+                if (tid < S) { sk[tid] = hk[qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
                 sycl::group_barrier(it.get_group());
                 const float g = sycl::exp(gate[(size_t) t * h_v + head]);
                 float kv = 0.0f;
@@ -435,13 +523,19 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
                 red[rg * GS_COLS + lc] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red[lc] + red[GS_COLS + lc] + red[2 * GS_COLS + lc] + red[3 * GS_COLS + lc];
-                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                const float delta = (hv[head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 float o = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) {
                     s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
                     o = sycl::fma(s[r], sq[rg * RPG + r], o);
                 }
+                if constexpr (SNAP)
+                    if (t < sn.n && sn.p[t] != nullptr) {   // the state after token t, to go back to
+                        float* d = sn.p[t] + (base - state);
+                        #pragma unroll
+                        for (int r = 0; r < RPG; ++r) d[r * row_stride] = s[r];
+                    }
                 sycl::group_barrier(it.get_group());
                 red[rg * GS_COLS + lc] = o;
                 sycl::group_barrier(it.get_group());
@@ -527,9 +621,11 @@ sycl::event gdn_state_commit(sycl::queue& q, float* state0, const float* hbuf0, 
             for (int p0 = 0; p0 < n; p0 += (int) mt) {
                 const int pc = sycl::min(n - p0, (int) mt);
                 const float* hp = hbuf + (size_t) p0 * C;
-                for (int i = tid; i < pc * S; i += GS_COLS * RG) sk[i] = hp[(size_t) (i / S) * C + qk + qh * S + i % S];
+                const float* hpk = hp + qk;   // k and v stepped from the row, not hp[qk + ...] beside hp[2 * qk + ...]
+                const float* hpv = hpk + qk;  // (IGC's GEP simplification, as gdn_step_split)
+                for (int i = tid; i < pc * S; i += GS_COLS * RG) sk[i] = hpk[(size_t) (i / S) * C + qh * S + i % S];
                 for (int i = tid; i < pc * GS_COLS; i += GS_COLS * RG)
-                    sv[i] = hp[(size_t) (i / GS_COLS) * C + 2 * qk + head * S + c0 + i % GS_COLS];
+                    sv[i] = hpv[(size_t) (i / GS_COLS) * C + head * S + c0 + i % GS_COLS];
                 if (tid < pc) {
                     sg[2 * tid] = sycl::exp(gate[(size_t) (p0 + tid) * h_v + head]);
                     sg[2 * tid + 1] = beta[(size_t) (p0 + tid) * h_v + head];
@@ -579,8 +675,10 @@ sycl::event gdn_state_commit(sycl::queue& q, float* state0, const float* hbuf0, 
             for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
             for (int t = 0; t < n; ++t) {
                 const float* ht = hbuf + (size_t) t * C;
+                const float* hk = ht + qk;   // k and v stepped from the row, not ht[qk + ...] beside ht[2 * qk + ...]
+                const float* hv = hk + qk;   // (IGC's GEP simplification, as gdn_step_split)
                 sycl::group_barrier(it.get_group());
-                if (tid < S) sk[tid] = ht[qk + qh * S + tid];
+                if (tid < S) sk[tid] = hk[qh * S + tid];
                 sycl::group_barrier(it.get_group());
                 const float g = sycl::exp(gate[(size_t) t * h_v + head]);
                 float kv = 0.0f;
@@ -589,7 +687,7 @@ sycl::event gdn_state_commit(sycl::queue& q, float* state0, const float* hbuf0, 
                 red[rg * GS_COLS + lc] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red[lc] + red[GS_COLS + lc] + red[2 * GS_COLS + lc] + red[3 * GS_COLS + lc];
-                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                const float delta = (hv[head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
             }
@@ -610,7 +708,7 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
     return q.submit([&](sycl::handler& hd) {
         const bool silu = gdn_silu_gate();   // the closing norm's gate (gdn.hpp)
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
-            red(sycl::range<1>(RG * S), hd), wsum(sycl::range<1>(S * RG / WARP), hd);
+            red(sycl::range<1>((size_t) RG * S), hd), wsum(sycl::range<1>(S * RG / WARP), hd);
         // one work-group per head; work-item tid = rg * 128 + col, as CUDA's (col, rg) block linearises
         // the q8_1 image takes registers: CUDA needs the work-group size bound for that kernel only
         const auto body = [=](const sycl::nd_item<1>& it) {
@@ -627,8 +725,10 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
             for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
             for (int t = 0; t < n; ++t) {
                 const float* ht = hbuf + (size_t) t * C;
+                const float* hk = ht + qk;   // k and v stepped from the row, not ht[qk + ...] beside ht[2 * qk + ...]
+                const float* hv = hk + qk;   // (IGC's GEP simplification, as gdn_step_split)
                 sycl::group_barrier(it.get_group());   // the previous token is done with sk/sq/red/wsum
-                if (tid < S) { sk[tid] = ht[qk + qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
+                if (tid < S) { sk[tid] = hk[qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
                 sycl::group_barrier(it.get_group());
                 const float g = sycl::exp(gate[(size_t) t * h_v + head]);
                 float kv = 0.0f;
@@ -637,7 +737,7 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
                 red[rg * S + col] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red[col] + red[S + col] + red[2 * S + col] + red[3 * S + col];
-                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                const float delta = (hv[head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 float o = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) {
@@ -659,7 +759,7 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
                 if (rg == 0) {
                     const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
                     const float scale = sycl::rsqrt(ss / (float) S + eps);
-                    const float zz = z[(size_t) t * value_dim + head * S + col];
+                    const float zz = z[(size_t) t * value_dim + (size_t) head * S + col];
                     const float gz = 1.0f / (1.0f + sycl::exp(-zz));
                     const float out = oc * scale * gamma[col] * (silu ? zz * gz : gz);
                     y[(size_t) t * value_dim + (size_t) (head * S + col)] = out;
@@ -700,7 +800,8 @@ sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, i
             const int value_dim = S * h_v;
             const int n = n_keep ? *n_keep : T;
             if (n > 0) {
-                if (rg == 0) sk[col] = hbuf[qk + qh * S + col];
+                const float* hk = hbuf + qk;   // k stepped from the row, not hbuf[qk + ...] beside hbuf[2 * qk + ...]
+                if (rg == 0) sk[col] = hk[qh * S + col];   // (IGC's GEP simplification, as gdn_step_split)
                 else if (rg == 1) sq[col] = hbuf[qh * S + col];
             }
             float s[RPG];
@@ -711,11 +812,14 @@ sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, i
             for (int t = 0; t < n; ++t) {
                 const int cur = (t & 1) * S, nxt = ((t + 1) & 1) * S;
                 const float* ht = hbuf + (size_t) t * C;
+                const float* hk = ht + qk;   // k and v stepped from the row (IGC's GEP simplification)
+                const float* hv = hk + qk;
                 // every work-item is done with the previous token (and its buffer, now nxt); the current one is staged
                 sycl::group_barrier(it.get_group());
                 if (t + 1 < n) {
                     const float* hn = ht + C;
-                    if (rg == 0) sk[nxt + col] = hn[qk + qh * S + col];
+                    const float* hnk = hn + qk;
+                    if (rg == 0) sk[nxt + col] = hnk[qh * S + col];
                     else if (rg == 1) sq[nxt + col] = hn[qh * S + col];
                 }
                 const float g = sycl::exp(gate[(size_t) t * h_v + head]);
@@ -725,7 +829,7 @@ sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, i
                 red_kv[rg * S + col] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red_kv[col] + red_kv[S + col] + red_kv[2 * S + col] + red_kv[3 * S + col];
-                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                const float delta = (hv[head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 float o = 0.0f;
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) {
@@ -777,7 +881,7 @@ core::PerDevice<GdnChoice>& gdn_choices() {
 std::atomic<int> g_gdn_form_override{-1};   // gdn_step_force_form
 int gdn_forced() {   // STRATA_GDN_STEP=0|1|2: one form always (one group a head, split, prefetch)
     static const int forced = [] {
-        const char* v = std::getenv("STRATA_GDN_STEP");
+        const char* v = strata::env_get("GDN_STEP");
         const long f = v == nullptr ? -1 : std::strtol(v, nullptr, 10);
         return f >= 0 && f < kGdnForms ? (int) f : -1;
     }();
@@ -786,11 +890,19 @@ int gdn_forced() {   // STRATA_GDN_STEP=0|1|2: one form always (one group a head
 }
 sycl::event gdn_step_form(int form, sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
-                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1) {
+                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1,
+                           const GdnRowCopiesNarrow sn) {
+    if (sn.n > 0) {   // the rows' copies: the split form's own instance
+        if (y_q8_1 != nullptr)
+            return gdn_step_split<true, true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep,
+                                              t_out_begin, y_q8_1, sn);
+        return gdn_step_split<false, true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep,
+                                           t_out_begin, nullptr, sn);
+    }
     if (y_q8_1 != nullptr) {
         if (form == kGdnSplit)
             return gdn_step_split<true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin,
-                                        y_q8_1);
+                                        y_q8_1, sn);
         if (form == kGdnPrefetch)
             return gdn_step_prefetch<true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep,
                                            t_out_begin, y_q8_1);
@@ -799,7 +911,7 @@ sycl::event gdn_step_form(int form, sycl::queue& q, float* state, const float* h
     }
     if (form == kGdnSplit)
         return gdn_step_split<false>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin,
-                                     nullptr);
+                                     nullptr, sn);
     if (form == kGdnPrefetch)
         return gdn_step_prefetch<false>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin,
                                         nullptr);
@@ -823,8 +935,8 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
             return c;
         }
         // scratch inputs of the model's shape; small values keep the recurrence finite
-        const size_t n_state = (size_t) S * S * h_v, n_h = (size_t) kVerifyMaxT * C;
-        const size_t n_g = (size_t) kVerifyMaxT * h_v, n_y = (size_t) kVerifyMaxT * S * h_v;
+        const size_t n_state = (size_t) S * S * h_v, n_h = (size_t) kVerifyNarrowT * C;
+        const size_t n_g = (size_t) kVerifyNarrowT * h_v, n_y = (size_t) kVerifyNarrowT * S * h_v;
         float* buf = sycl::malloc_device<float>(n_state + n_h + 2 * n_g + 2 * n_y + S + n_y / 32 * 9, q);
         if (buf == nullptr) fail("gdn_step_tune: device allocation failed");
         float *state = buf, *h = state + n_state, *gate = h + n_h, *beta = gate + n_g, *z = beta + n_g;
@@ -836,13 +948,14 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
         // its clock under the first ones), the first round a warm-up, each form's fastest round kept
         namespace sx = sycl::ext::oneapi::experimental;
         using Exec = sx::command_graph<sx::graph_state::executable>;
-        for (int T = 1; T <= kVerifyMaxT; ++T) {
+        for (int T = 1; T <= kVerifyNarrowT; ++T) {
             std::vector<Exec> exec;
             for (int form = 0; form < kGdnForms; ++form) {
                 sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
                 graph.begin_recording(q);
                 for (int i = 0; i < 32; ++i)
-                    gdn_step_form(form, q, state, h, C, gate, beta, z, gamma, 1e-6f, y, h_k, h_v, T, nullptr, 0, yq);
+                    gdn_step_form(form, q, state, h, C, gate, beta, z, gamma, 1e-6f, y, h_k, h_v, T, nullptr, 0, yq,
+                                  GdnRowCopiesNarrow{});
                 graph.end_recording(q);
                 exec.push_back(graph.finalize());
             }
@@ -860,10 +973,13 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
                 if (t_min[form] < t_min[c.form[T]]) c.form[T] = (int8_t) form;
         }
         sycl::free(buf, q);
-        char forms[kVerifyMaxT + 1] = {};
-        for (int T = 1; T <= kVerifyMaxT; ++T) forms[T - 1] = (char) ('0' + c.form[T]);
-        std::fprintf(stderr, "strata: GDN step forms for windows of 1..%d tokens: %s (0 one group a head, 1 split, "
-                     "2 prefetch)\n", kVerifyMaxT, forms);
+        // a wider window takes the eighth's form (untimed: the wide windows are a run's choice, the timing is not
+        // worth its start-up time to every run)
+        for (int T = kVerifyNarrowT + 1; T <= kVerifyMaxT; ++T) c.form[T] = c.form[kVerifyNarrowT];
+        char forms[kVerifyNarrowT + 1] = {};
+        for (int T = 1; T <= kVerifyNarrowT; ++T) forms[T - 1] = (char) ('0' + c.form[T]);
+        std::fprintf(stderr, "xestrata: GDN step forms for windows of 1..%d tokens: %s (0 one group a head, 1 split, "
+                     "2 prefetch)\n", kVerifyNarrowT, forms);
         return c;
     });
 }
@@ -875,7 +991,7 @@ namespace {
 // reports it (no device printf, which CUDA's link warns about).  The default path is unchanged.
 struct GdnDbg { int32_t* keep; int32_t* bad; };
 const int32_t* gdn_dbg_keep(sycl::queue& q, const int32_t* n_keep, int n_max) {
-    static const bool dbg = [] { const char* e = std::getenv("STRATA_DBG_GDN"); return e && e[0] == '1'; }();
+    static const bool dbg = [] { const char* e = strata::env_get("DBG_GDN"); return e && e[0] == '1'; }();
     if (!dbg) return n_keep;
     static core::PerDevice<GdnDbg> per_device;
     const GdnDbg d = per_device.get(q.get_device(), [&q] {
@@ -887,7 +1003,7 @@ const int32_t* gdn_dbg_keep(sycl::queue& q, const int32_t* n_keep, int n_max) {
     });
     sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::system> seen(d.bad[0]);
     if (const int32_t n = seen.exchange(0); n != 0)
-        std::fprintf(stderr, "strata DBG: gdn_step commit: n_keep %d is past the window's %d rows: commit skipped (#937)\n",
+        std::fprintf(stderr, "xestrata DBG: gdn_step commit: n_keep %d is past the window's %d rows: commit skipped (#937)\n",
                      n, d.bad[1]);
     int32_t *keep = d.keep, *bad = d.bad;
     q.single_task([=] {
@@ -901,25 +1017,40 @@ const int32_t* gdn_dbg_keep(sycl::queue& q, const int32_t* n_keep, int n_max) {
 
 void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin, void* y_q8_1) {
+                         const int32_t* n_keep, void* stream, int t_out_begin, void* y_q8_1,
+                         const GdnRowCopies* snaps) {
     if (!state || !hbuf || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
-        n_tok > kVerifyMaxT)
-        fail("gdn_step_norm_multi: invalid arguments");
+        n_tok > kVerifyMaxT ||
+        (snaps != nullptr && ((snaps->n > 0 && t_out_begin >= n_tok) || snaps->n > kVerifyMaxT)))
+        fail("gdn_step_norm_multi: invalid arguments");   // the kernels read snaps->p[t] for t < snaps->n
     auto& q = Q(stream);
     const int forced = gdn_forced();
     const int form = forced >= 0 ? forced : gdn_choices().get(q.get_device(), [] { return GdnChoice{}; }).form[n_tok];
     if (y_q8_1 != nullptr && (S * h_v) % 32 != 0) fail("gdn_step_norm_multi: q8_1 blocks need 32 | value_dim");
     if (n_keep != nullptr && t_out_begin >= n_tok) n_keep = gdn_dbg_keep(q, n_keep, n_tok);
     static const bool commit_state = [] {   // STRATA_GDN_COMMIT_SPLIT=0: the commit runs the window's form
-        const char* v = std::getenv("STRATA_GDN_COMMIT_SPLIT");
+        const char* v = strata::env_get("GDN_COMMIT_SPLIT");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     if (commit_state && n_keep != nullptr && t_out_begin >= n_tok) {   // the commit: no outputs
         done(stream, gdn_state_commit(q, state, hbuf, C, gate, beta, h_k, h_v, n_keep), "gdn_step_norm_multi");
         return;
     }
+    // more copies than the narrow form holds: the split's wide instance
+    if (snaps != nullptr && snaps->n > kVerifyNarrowT) {
+        uint8_t* yq = static_cast<uint8_t*>(y_q8_1);
+        const auto e = yq != nullptr
+                           ? gdn_step_split<true, true, GdnRowCopies>(q, state, hbuf, C, gate, beta, z, gamma, eps, y,
+                                                                      h_k, h_v, n_tok, n_keep, t_out_begin, yq, *snaps)
+                           : gdn_step_split<false, true, GdnRowCopies>(q, state, hbuf, C, gate, beta, z, gamma, eps, y,
+                                                                       h_k, h_v, n_tok, n_keep, t_out_begin, nullptr,
+                                                                       *snaps);
+        done(stream, e, "gdn_step_norm_multi");
+        return;
+    }
+    const GdnRowCopiesNarrow sn = snaps != nullptr ? narrow_copies(*snaps) : GdnRowCopiesNarrow{};
     done(stream, gdn_step_form(form, q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin,
-                               static_cast<uint8_t*>(y_q8_1)),
+                               static_cast<uint8_t*>(y_q8_1), sn),
          "gdn_step_norm_multi");
 }
 
@@ -928,8 +1059,8 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
                        int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream) {
     // only the per-layer commit's state-only kernel is batched (gdn_step_norm_multi above): its other choices keep the loop
     static const bool per_layer = [] {
-        const char* cs = std::getenv("STRATA_GDN_COMMIT_SPLIT");
-        const char* dbg = std::getenv("STRATA_DBG_GDN");
+        const char* cs = strata::env_get("GDN_COMMIT_SPLIT");
+        const char* dbg = strata::env_get("DBG_GDN");
         return (cs != nullptr && std::strtol(cs, nullptr, 10) == 0) || (dbg != nullptr && dbg[0] == '1');
     }();
     if (per_layer || n_layers <= 0 || n_max < 1 || n_max > kVerifyMaxT || n_keep == nullptr || h_v <= 0 || h_k <= 0 ||
@@ -952,11 +1083,11 @@ void gdn_step_norm_pending(float* state, const float* hbuf, int C, const float* 
     auto& q = Q(stream);
     if (y_q8_1 != nullptr)
         done(stream, gdn_step_split<true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep,
-                                          t_out_begin, static_cast<uint8_t*>(y_q8_1), &pend),
+                                          t_out_begin, static_cast<uint8_t*>(y_q8_1), GdnRowCopiesNarrow{}, &pend),
              "gdn_step_norm_pending");
     else
         done(stream, gdn_step_split<false>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep,
-                                           t_out_begin, nullptr, &pend),
+                                           t_out_begin, nullptr, GdnRowCopiesNarrow{}, &pend),
              "gdn_step_norm_pending");
 }
 
@@ -1077,7 +1208,7 @@ bool graph_branch_pays(void* stream, void* side0, void* side1) {
             if (round > 0 && (t_min[v] == 0.0 || us < t_min[v])) t_min[v] = us;
         }
     sycl::free(buf, q);
-    std::fprintf(stderr, "strata: graph side branches: %.1f us in a row, %.1f us branched: %s\n", t_min[0], t_min[1],
+    std::fprintf(stderr, "xestrata: graph side branches: %.1f us in a row, %.1f us branched: %s\n", t_min[0], t_min[1],
                  t_min[1] <= 0.95 * t_min[0] ? "used" : "not used");
     return t_min[1] <= 0.95 * t_min[0];
 }
@@ -1346,16 +1477,21 @@ sycl::event launch_resident_plan_top10(sycl::queue& q, const float* logits, int3
 void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
                    const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
                    uint32_t ring, void* stream, int keep, float* w, int ser_kmin, float ser_t) {
-    constexpr int WG = 128;
-    if (n > WG) throw std::invalid_argument("resident_plan: more entries than a work-group");
+    constexpr int kNarrow = 128;   // a narrow window's 8 rows of 10 experts; a wider window's take 256 (upstream 9d3c8c366)
+    if (n > 2 * kNarrow) throw std::invalid_argument("resident_plan: more entries than a work-group");
     const ResidentPlan a = resident_plan_args(ids, n, k, res, n_expert, cache_base, slot_off, blob, pl, capx, skip, ring,
                                               keep, w, ser_kmin, ser_t);
-    const auto e = Q(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
-        sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG + 1), h);   // + 1: the scan's total
-        h.parallel_for(sycl::nd_range<1>(WG, WG),
-                       [=](sycl::nd_item<1> it) { resident_plan_group<WG>(it, a, s_ids, s_excl); });
-    });
+    const auto launch = [&](auto wg) {
+        constexpr int WG = decltype(wg)::value;
+        return Q(stream).submit([&](sycl::handler& h) {
+            sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
+            sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG + 1), h);   // + 1: the scan's total
+            h.parallel_for(sycl::nd_range<1>(WG, WG),
+                           [=](sycl::nd_item<1> it) { resident_plan_group<WG>(it, a, s_ids, s_excl); });
+        });
+    };
+    const auto e = n <= kNarrow ? launch(std::integral_constant<int, kNarrow>{})
+                                : launch(std::integral_constant<int, 2 * kNarrow>{});
     done(stream, e, "resident_plan");
 }
 
@@ -1420,26 +1556,6 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     });
 }
 
-void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
-                          int n_tok, int64_t n, int code_bits, int code_bias, int group_elems, uint64_t row_codes,
-                          uint64_t row_groups, float* out, void* stream) {
-    const auto e = Q(stream).parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n), [=](sycl::id<2> id) {
-        const int t = (int) id[0];
-        const int64_t i = (int64_t) id[1];
-        const uint64_t token = (uint64_t) tokens[t];
-        const uint8_t* c = codes + token * row_codes;
-        const float* sc = scales + token * row_groups;
-        const float* of = offsets ? offsets + token * row_groups : nullptr;
-        const int per_byte = 8 / code_bits;
-        const unsigned mask = (1u << code_bits) - 1u;
-        const int code = (c[i / per_byte] >> ((i % per_byte) * code_bits)) & mask;
-        const int64_t group = i / group_elems;
-        const float product = (float) (code + code_bias) * sc[group];
-        out[(size_t) t * n + i] = product + (of ? of[group] : 0.0f);
-    });
-    done(stream, e, "embedding_gather_dev");
-}
-
 void broadcast_streams(const float* x, float* R, int64_t n_embd, int hc, int n_tok, void* stream) {
     const auto e = Q(stream).parallel_for(sycl::range<2>((size_t) n_tok, (size_t) (n_embd * hc)), [=](sycl::id<2> id) {
         const int t = (int) id[0];
@@ -1491,7 +1607,7 @@ core::PerDevice<int>& fetch_groups() {
 }
 int fetch_groups_fixed() {
     static const int fixed = [] {
-        const char* v = std::getenv("STRATA_FETCH_GROUPS");
+        const char* v = strata::env_get("FETCH_GROUPS");
         const long f = v == nullptr ? 0 : std::strtol(v, nullptr, 10);
         return f > 0 ? (int) f : 0;
     }();
@@ -1556,7 +1672,7 @@ void fetch_blobs_tune(void* stream) {
         size_t pick = counts.size() - 1;
         for (size_t c = 0; c < counts.size(); ++c)
             if (t_min[c] <= best * 1.02) { pick = c; break; }
-        std::fprintf(stderr, "strata: the PCIe share's fetch runs %d work-groups (%.1f GB/s; %d: %.1f GB/s)\n", counts[pick],
+        std::fprintf(stderr, "xestrata: the PCIe share's fetch runs %d work-groups (%.1f GB/s; %d: %.1f GB/s)\n", counts[pick],
                      (double) nb * blob * 8 / t_min[pick] / 1e3, most, (double) nb * blob * 8 / t_min.back() / 1e3);
         return counts[pick];
     });
@@ -1569,6 +1685,37 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
     const int fixed = fetch_groups_fixed();
     const int groups = fixed > 0 ? fixed : fetch_groups().get(q.get_device(), [&] { return fetch_groups_default(q); });
     done(stream, fetch_blobs_on(q, src, n, dst, (long long) (blob_bytes / 16), (size_t) groups), "fetch_blobs");
+}
+
+void fetch_r1q2_blobs(const unsigned long long* src, const int32_t* count, uint8_t* dst, int64_t stride, int cap,
+                      const int32_t* starts, const int32_t* entries, const int32_t* route_ids, const uint8_t* k_pairs,
+                      int n_embd, int n_ff, void* stream) {
+    if (cap <= 0) return;
+    if (stride <= 0 || stride % 16 || n_embd <= 0 || n_embd % 128 || n_ff <= 0 || n_ff % 128)
+        fail("fetch_r1q2_blobs: invalid geometry");
+    using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+    auto& q = Q(stream);
+    const int fixed = fetch_groups_fixed();
+    const int groups = fixed > 0 ? fixed : fetch_groups().get(q.get_device(), [&] { return fetch_groups_default(q); });
+    const size_t items = (size_t) groups * 256, per = (size_t) stride / 16;
+    auto event = q.parallel_for(sycl::nd_range<1>(items, 256), [=](sycl::nd_item<1> it) {
+        // the groups this window fetches, not the staging's cap: a layer with no PCIe share (every expert in VRAM)
+        // walked cap x stride / 16 items for nothing, 80 us a layer on the B70 (Sync-S, 2026-11-20)
+        const size_t n = (size_t) sycl::clamp(*count, 0, cap);
+        for (size_t i = it.get_global_linear_id(); i < n * per; i += items) {
+            const size_t g = i / per, off = i % per;
+            // The host-built plan supplies in-range entry, route and expert indices for each fetched group.
+            const int expert = route_ids[entries[starts[g]]];  // NOLINT(clang-analyzer-security.ArrayBound)
+            const size_t gk = k_pairs[(size_t) 2 * expert], dk = k_pairs[(size_t) 2 * expert + 1];
+            const size_t gb = (size_t) n_embd / 128, db = (size_t) n_ff / 128;
+            const size_t codes = 2 * (size_t) n_ff * gb * 4 * gk + (size_t) n_embd * db * 4 * dk;
+            const size_t gu = (size_t) n_ff * 2 + gb * 2 + (size_t) n_ff * ((gb + 3) / 4);
+            const size_t ds = (size_t) n_embd * 2 + db * 2 + (size_t) n_embd * ((db + 3) / 4);
+            const size_t bytes = (((codes + 15) & ~(size_t) 15) + 2 * gu + ds + 255) & ~(size_t) 255;
+            if (off < bytes / 16) reinterpret_cast<u32x4*>(dst)[i] = reinterpret_cast<const u32x4*>(src[g])[off];
+        }
+    });
+    done(stream, event, "fetch_r1q2_blobs");
 }
 
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
@@ -1607,7 +1754,7 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
 
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs, float* out_p) {
-    const size_t items = 16 * 256;
+    const size_t items = (size_t) 16 * 256;
     const auto e = Q(stream).parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
         const int row = *row_dev;
         for (int64_t i = (int64_t) id[0]; i < R_stride; i += (int64_t) items) R_dst[i] = R_src[(size_t) row * R_stride + i];
@@ -1656,7 +1803,8 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
         const long long total = (long long) n * row_e;
         return Q(stream).parallel_for(sycl::range<1>((size_t) total), [=](sycl::id<1> id) {
             const long long i = (long long) id[0], r = i / row_e, o = i - r * row_e;
-            d[i] = s[(long long) ids[r] * row_e + o];
+            const long long at = ids[r];   // -1: no row (topk's mark for a slot it could not fill), zeros
+            d[i] = at >= 0 ? s[at * row_e + o] : E{};
         });
     };
     if (n <= 0) return;
@@ -1887,7 +2035,7 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
     auto& q = Q(stream);
     const int wg = xe::work_group_upto_1024(q);   // the draft probabilities sum in another order below 1024
     static const bool split = [] {   // STRATA_TOP_PROB_SPLIT=0: one work-group a row
-        const char* v = std::getenv("STRATA_TOP_PROB_SPLIT");
+        const char* v = strata::env_get("TOP_PROB_SPLIT");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     // the split for the main model's head (248,320 tokens: RTX 4070 15.1 -> 10.2 us a row, B70 38.95 -> 38.79), not
@@ -1933,9 +2081,9 @@ void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* fla
 
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream) {
     const long long stride = (long long) ids_stride;
-    const auto e = Q(stream).parallel_for(sycl::nd_range<2>({(size_t) n, 8 * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
+    const auto e = Q(stream).parallel_for(sycl::nd_range<2>({(size_t) n, (size_t) 8 * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
         const int q = (int) it.get_group(0);
-        int32_t* st = steps + q * 4;
+        int32_t* st = steps + (size_t) q * 4;
         const int n_kv = st[1];
         const int start = n_kv > window ? n_kv - window : 0;
         const int width = n_kv - start;
@@ -2010,7 +2158,7 @@ bool gpu_stamp_available() {
             (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(ctx, {d}, {sycl::get_kernel_id<StampKernel>()});
             return true;
         } catch (const sycl::exception& e) {
-            std::fprintf(stderr, "strata verify: the stamp kernel does not build on this device (%s)\n", e.what());
+            std::fprintf(stderr, "xestrata verify: the stamp kernel does not build on this device (%s)\n", e.what());
             return false;
         }
     });

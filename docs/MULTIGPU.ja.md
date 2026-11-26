@@ -9,7 +9,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 各 GPU は自分の層の密な重み（PLE のテンソルはどの GPU にも）、セッション（GDN の再帰状態、QSA の K/V）、エキスパートのキャッシュを持ちます。
 VRAM が増えた分だけ多くのエキスパートを GPU に置けるので、CPU が計算するエキスパートが減ります。
 そのため、1 枚では窓が CPU のエキスパートの計算を待っている PC（RAM を読む速さの遅い CPU）ほど、分割で速くなります。
-どれだけ待っているかは、エンジンの環境に `STRATA_DECODE_TIMING=1` を置くと、要求ごとのログの `strata decode timing:` の行に出ます（ウィンドウあたりの GPU の待ち `GPU-reach wait` と、層・ウィンドウあたりの CPU のエキスパートの数 `CPU experts`）。
+どれだけ待っているかは、エンジンの環境に `XESTRATA_DECODE_TIMING=1` を置くと、要求ごとのログの `xestrata decode timing:` の行に出ます（ウィンドウあたりの GPU の待ち `GPU-reach wait` と、層・ウィンドウあたりの CPU のエキスパートの数 `CPU experts`）。
 メーカーの違う GPU（Intel・AMD・NVIDIA。NVIDIA を含むときは contrib-llvm のビルド）も組み合わせられます。
 
 GPU の間の受け渡しは検証のウィンドウごとに 1 回、CPU のメモリを通します（1 トークンあたり 12,804 個の float）。
@@ -30,6 +30,7 @@ setup で使う GPU を `--gpus` に並べます（番号は `--check` の表の
 
 setup は最初の GPU を `"gpu_pci"` に、後の GPU を `"split_pci"` に PCI アドレスで書き、サーバーがエンジンに
 `--layer-split` と `--split-device` を渡します。
+`--gpus` で 2 枚を選び、その 1 枚にモデルが収まるときは、setup と起動のログが、レプリカか split serving にしたときのエンジン数を表示します（[レプリカ](#独立したエンジンを並べるレプリカ)・[split serving](#prompt-を-1-枚で読み答えを別の-1-枚で作るsplit-serving)）。自動では層の分割のままで、その 2 つは設定の `"replicas"`・`"split_serve"` で選びます（要求 1 つだけの decode を遅くしないため）。
 エンジンを直接動かすときのオプションは次のとおりです。
 
 | オプション | 意味 |
@@ -51,12 +52,12 @@ setup は最初の GPU を `"gpu_pci"` に、後の GPU を `"split_pci"` に PC
 会話の退避（`--conversation-cache-mib`、`--conversation-save`）は、各 GPU のセッションを写して戻します。
 保存したファイルは同じ分割点のエンジンだけが読みます。`--layer-split auto` は測った値で分割点が変わることがあり、そのときは前のファイルを読みません。
 
-prefill のチャンクの行は、8 つに分けて次の GPU に渡します（upstream 1d9758f8。upstream では opt-in）。分けた 1 つが RAM に着いたところで次の GPU が取り込み始めるので、2 枚の PCIe の転送が重なります。次の GPU のチャンクは、一度だけ立てたスレッドで読みます。`STRATA_HANDOFF_PIPE=P`（2〜16）で分ける数を、`STRATA_HANDOFF_PIPE=0` で前の 1 回の転送に戻します。
+prefill のチャンクの行は、8 つに分けて次の GPU に渡します（upstream 1d9758f8。upstream では opt-in）。分けた 1 つが RAM に着いたところで次の GPU が取り込み始めるので、2 枚の PCIe の転送が重なります。次の GPU のチャンクは、一度だけ立てたスレッドで読みます。`XESTRATA_HANDOFF_PIPE=P`（2〜16）で分ける数を、`XESTRATA_HANDOFF_PIPE=0` で前の 1 回の転送に戻します。
 
 ## GPU の番号
 
 エンジンが使える GPU に、0 から番号を付けます。
-0 は setup が `STRATA_GPU_PCI` で選んだ GPU です（エンジンを直接動かすときは `--gpu <PCI アドレス>` でも同じ、upstream #852）。
+0 は setup が `XESTRATA_GPU_PCI` で選んだ GPU です（エンジンを直接動かすときは `--gpu <PCI アドレス>` でも同じ、upstream #852）。
 残りは、CPU 内蔵でない GPU、メモリの多い GPU、計算ユニットの多い GPU の順です。
 CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定したときだけ使います。
 
@@ -68,6 +69,7 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
 
 - 各 GPU が VRAM を読む速さと、空いている VRAM。
 - CPU が RAM を読む速さ（CPU が計算するエキスパートの速さを決めます）。
+- CPU のプールがその pack のエキスパートを 1 個計算する時間（どちらのエンジンも同じ部品で測ります。RAM を読む速さより遅い形式では、こちらで CPU の分を見積もります。Sync の R1Q2 がそうです）。
 - 各 GPU が持つ重みとセッション（どちらも自分の層だけ）、出力ヘッド（最後の GPU）、prefill に残す分。
 - 各 GPU のリンク（ホストから GPU への転送の速さ）。
 
@@ -79,8 +81,7 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
 - 選んだ分割に 1〜2 層だけの GPU があれば、どの GPU も 3 層以上になる分割の中から選び直します（upstream 1c6c82ef）。
   層の少ない GPU のキャッシュは小さく、prefill のチャンクがその大きさに縮むためです。
   GPU が 2 枚なら、その前に、どの GPU もエキスパートの置き場所の広さの割合だけ層を持つ分割の中から選びます（upstream 3b848837、#2644）。速い方に層を寄せる見積もりでは、3 層の決まりがその縁（遅い方が 3 層）に落ち、遅い方の GPU が遊んでいたためです（upstream: RTX 4060 Ti 16 GB と RTX 3060 12 GB で、prefill 802 tok/s のところが 452）。ログにどの決まりで選んだかを出します。
-  `STRATA_SPLIT_SPEED_SCALE=1,0.55` は、各段の読みの速さにこの倍率をかけます（同じ 2 枚で速さの違う組を試すため、upstream 4a1ef86b）。
-- `STRATA_SPLIT_UNIFORM=1`（opt-in、upstream b8844516）は、段ごとのリンクでの外れの値付けをやめます（upstream 0.1.41 より前の一様な値）。x16 と x4 の組のように、どの倍率でも自動の分割が釣り合った分割から外れるとき（upstream: RTX 3090 2 枚で decode −4〜−8%）のためです。
+  `XESTRATA_SPLIT_SPEED_SCALE=1,0.55` は、各段の読みの速さにこの倍率をかけます（同じ 2 枚で速さの違う組を試すため、upstream 4a1ef86b）。
 - 速さかリンクの違う GPU の組で、分割点が 3 層以上離れた別の分割の見積もりが 4% 以内なら、その分割をログに出します（`NEAR TIE`、upstream 8bb250d8）。
   見積もりは decode だけを見ていて prefill を見ていないので、試す価値があります。選ぶ分割は変えません。
 - 2 枚目以降の GPU をどの段に置くかも、同じ見積もりで選びます（upstream be8db787 などの「速いカードを最後に」に当たります）。
@@ -88,23 +89,41 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
   4 枚まではすべての並びを、5 枚以上は帯域の遅い順（速いカードを最後）を試し、2% 以上速いときだけ設定の順を変えます。
   1 枚目の GPU はエンジンの起動のときに決まるので入れ替えませんが、1 枚目を替えた方が速いと見積もったときは、そのカードの順をログで勧めます。
 - 段のあいだの受け渡しの時間は、各 GPU のリンクの速さと小さなコピーの時間から見積もります。
+- CPU に回る外れからは、route tail skip（入れたとき、[DETAILS](DETAILS.ja.md)）で読まずに済む分を差し引きます。
+- `--pipeline-windows 2` のときは、段の時間の和ではなく、いちばん長い段の時間で窓を見積もります。後の GPU が今の窓を検証する間に、最初の GPU が次の窓を進めるので、段の釣り合った分割が速くなるためです。
+- 最後に 1 枚目だけとも比べ、2 枚目の役（分割か補助）が 5% 以上短いと見積もらなければ、1 枚目だけで動かします（`XESTRATA_SPLIT_GAIN_PCT`）。B70 + RTX 4070 の IQ3_XXS では 1 枚目だけが最も速く（32K の decode 104 tok/s、補助 96、分割 79。見積もりも 12.0・12.1・12.3 ms）、IQ3_S と 12 GiB × 2 では補助が勝ちました（見積もりで 9% 以上）。
+- `--split-roles helper`（画像を 2 枚目で作るとき、サーバーが渡す）は、2 枚目を補助のキャッシュか使わないかに限ります。補助は要求の合間の `HELPER off` / `HELPER on` で閉じて開き直せるためです（[IMAGE](IMAGE.ja.md)）。
+- `--split-skip-if-fits`（設定ファイルの `"split_skip_if_fits"`。upstream 18ad40c0d）は、1 枚目のキャッシュがプロファイルの組を全部、セッション・下書き・予約の横に持てるときは分割せず、1 枚目だけで動かします。分割は受け渡しを足すだけになるためです。既定は `"auto"` で、層の分割があるときにサーバーが渡し、エンジンが起動のときに収まるかを見て決めます。`false` で切ります（`--layer-split K` と自分で分割点を決めたときも、`"auto"` は渡しません）。
 - GPU が 2 枚のときは、2 枚目を分割の段にせず、補助のキャッシュ（`--expert-cache-device1` と同じ）にした場合の時間も同じ式で見積もり、補助が 5% より短いときだけ補助を選びます。
   見積もりは decode だけのもので、分割は prompt を 2 枚で読み、補助では 1 枚目が全部の層を読みます。同じカード 2 枚では、わずかに速いと見積もった補助が、prompt で分割の 1.8 倍の時間がかかりました。
   1 枚目は全部の層を受け持ち、2 枚目は 1 枚目のキャッシュに入らないエキスパートを空いている VRAM の分だけ持って、decode で CPU に回るはずだったもののうち自分が持つものを計算します（短いプロンプトの prefill でも、トークンの少ないものを計算します、[DETAILS](DETAILS.ja.md#prefillトークン秒)）。
-  層ごとに入力と結果をリンクで往復する時間も見積もりに入れます。
+  起動時に 2 枚目で測った層ごとの投入と待ちの時間と、入力と結果をリンクで往復する時間も見積もりに入れます。
   選んだ方はログに出ます（`as a helper expert cache instead: ... -> the helper`）。
   `--pipeline-windows`、`--no-pool`、`--batch` のときは分割のままです。
+  エキスパートが BF16 のモデルは、補助の GPU がそのエキスパートを計算しないので、補助を選びません。`--expert-cache-device1..3` を付けるとエラーで止まります。Inkling-2-Mini も、この指定をエラーで断ります。
+
+plain のエンジン（Qwen3.6-35B-A3B・Ornith-1.5 など）も、2 枚目の役目のこの選び（補助のキャッシュか分担か単独か）を
+同じ共通の部品（`core/split_role.hpp`）で行います。ただし分割点は上の探索ではなく各 GPU の空いたメモリの割合
+（`choose_split_by_room`）で決め、役目の選びは `--expert-profile` があるときだけ働きます（無いときはメモリの割合の分担のまま）。
+`--split-roles`・`--split-skip-if-fits` と上の環境変数も同じ意味で取ります。見積もりは 1 トークンの decode の窓だけのもの
+で、plain の MTP の検証の窓（段を GPU 間でパイプラインする）には当てになりません。実測（B70 + RTX 4070、どちらも MTP あり）:
+Ornith-1.5 は 1 枚だけが分担より decode 6.7% 速く（選びは正しい）、Qwen3.6-35B-A3B は 1 枚だけが 1K で 6%・32K で 18.5% 遅く、
+prompt も 32K で 13.5% 遅かった（選びは誤り）。見積もりは両者にほぼ同じ差を出すので、見分けられません。そこで plain では
+既定でこの選びをせず（`XESTRATA_SPLIT_ROLE_AUTO=1` で有効）、メモリの割合の分担のままにします。
+`XESTRATA_SPLIT_ROLE=split|helper` は役目を決めます（明示の指定。この選びの有効・無効にかかわらず）。
 
 見積もりの前提は環境変数で変えられます。
 
 | 変数 | 既定 | 意味 |
 | --- | --- | --- |
-| `STRATA_SPLIT_ROWS` | 3 | 1 ウィンドウで計算するトークンの数（MTP の下書きを含む平均） |
-| `STRATA_SPLIT_MASS_EXP` | 0.8 | よく使われる順で r 番目のエキスパートが使われる割合を (r+1)^-a としたときの a |
-| `STRATA_SPLIT_CPU_GBPS` | 測った値 | CPU が RAM を読む速さ（GB/s） |
-| `STRATA_SPLIT_NEAR_TIE_PCT` | 4 | 別の分割をログに出す差（%）。0 で出しません |
-| `STRATA_SPLIT_HELPER_GAIN_PCT` | 5 | 補助のキャッシュを選ぶのに要る、分割より短い見積もりの差（%）。0 で少しでも短ければ選びます |
-| `STRATA_SPLIT_ROLE` | 見積もり | 2 枚のときの 2 枚目の役割。`split` で分割の段、`helper` で補助のキャッシュに決めます |
+| `XESTRATA_SPLIT_ROWS` | 3 | 1 ウィンドウで計算するトークンの数（MTP の下書きを含む平均） |
+| `XESTRATA_SPLIT_MASS_EXP` | 0.8 | よく使われる順で r 番目のエキスパートが使われる割合を (r+1)^-a としたときの a |
+| `XESTRATA_SPLIT_CPU_GBPS` | 測った値 | CPU が RAM を読む速さ（GB/s）。指定すると、エキスパート 1 個の時間は測らず、この値で見積もります |
+| `XESTRATA_SPLIT_NEAR_TIE_PCT` | 4 | 別の分割をログに出す差（%）。0 で出しません |
+| `XESTRATA_SPLIT_HELPER_GAIN_PCT` | 5 | 補助のキャッシュを選ぶのに要る、分割より短い見積もりの差（%）。0 で少しでも短ければ選びます |
+| `XESTRATA_SPLIT_ROLE` | 見積もり | 2 枚のときの 2 枚目の役割。`split` で分割の段、`helper` で補助のキャッシュに決めます |
+| `XESTRATA_SPLIT_GAIN_PCT` | 5 | 2 枚目の役が 1 枚目だけより短いと見積もるのに要る差（%）。補助と分割の比べにも使います（`XESTRATA_SPLIT_HELPER_GAIN_PCT` があればそちら） |
+| `XESTRATA_REMOTE_SPIN` | 1 | 補助のキャッシュの層ごとの結果を、ホストが見て回って待ちます（upstream の CUDA の補助のスピンと同じ考え）。0 でドライバーの中で待ちます |
 
 `--vram-reserve-later-mib N` は 2 枚目以降の GPU に残す VRAM です（既定は `--vram-reserve-mib` と同じ、upstream 5c4105c0）。
 モニターをつないだ GPU は、つないでいない GPU より多くの余裕が要ります。
@@ -122,18 +141,18 @@ G は N を割り切る数です。
 層の分割で `--batch-groups` を渡さなければ、既定は `auto` です（upstream ca001df5。組を 1 つにするには `--batch-groups 1`）。
 既定の組は `--batch-mtp`（`--mtp` があれば既定で有効）に譲らず、そのとき `--batch-mtp` を切って、そうログに出します（upstream a0116b27）。
 組に分けたウィンドウは MTP の下書きを確かめませんが、2x RTX A4000 の 4 本の同時の要求では、組に分けたほうが MTP の下書きを確かめる 1 組より 25〜30% 速かったためです。
-`--batch-groups 1` か `STRATA_BATCH_MTP_SERIAL=1` で、前と同じく 1 組で `--batch-mtp` を使います（同時の要求が少ないときや、prompt がまれにしか来ないときは、こちらが速いことがあります）。
-`STRATA_PIPED_MTP=N`（明示的に有効にする機能）を付けると、組に分けたまま各スロットが MTP の下書きを確かめます（[BATCHING](BATCHING.ja.md#流れ作業の組でも-mtp-の下書きを確かめるstrata_piped_mtp明示的に有効にする機能)）。
+`--batch-groups 1` か `XESTRATA_BATCH_MTP_SERIAL=1` で、前と同じく 1 組で `--batch-mtp` を使います（同時の要求が少ないときや、prompt がまれにしか来ないときは、こちらが速いことがあります）。`XESTRATA_BATCH_MTP_SERIAL` の `auto`（既定）は流れ作業の組です。
+`XESTRATA_PIPED_MTP=N`（明示的に有効にする機能）を付けると、組に分けたまま各スロットが MTP の下書きを確かめます（[BATCHING](BATCHING.ja.md#流れ作業の組でも-mtp-の下書きを確かめるxestrata_piped_mtp明示的に有効にする機能)）。
 エンジンが選んだ組の数はログと `INFO batch_groups` に出て、サーバーはそれに合わせてスロットを割り当てます。
 組の中の使用中のスロットより前が空いていれば、そのスロットを先に使います（upstream 2c7c02ab）。
 
 `--batch-mtp` は層の分割でも動きます（upstream 48f2c47d）。
 スロットごとの下書き器は最後の GPU に置き、各スロットの 2 行が全部の GPU を通ります。
-組に分けるとき（既定の `auto` を含む。`STRATA_PIPED_MTP` を除く）、1 枚の GPU に 2 段を置くとき、補助のキャッシュ（`--expert-cache-device1..3`）があるときは無効です。
-層の分割でも、下書き層の prefill の K/V を、1 枚のときと同じく最後の GPU の prefill の経路でまとめて作ります（upstream a22a0e8c。upstream では `STRATA_SPLIT_MTP_BATCH=1` で入れる opt-in、ここでは既定）。
+組に分けるとき（既定の `auto` を含む。`XESTRATA_PIPED_MTP` を除く）、1 枚の GPU に 2 段を置くとき、補助のキャッシュ（`--expert-cache-device1..3`）があるときは無効です。
+層の分割でも、下書き層の prefill の K/V を、1 枚のときと同じく最後の GPU の prefill の経路でまとめて作ります（upstream a22a0e8c。upstream では `XESTRATA_SPLIT_MTP_BATCH=1` で入れる opt-in、ここでは既定）。
 B70 + RTX 4070（IQ2_XS、K=45、32K のプロンプト）では prefill が 2,350 → 2,424 tok/s になりました。
 
-> **注意: エキスパートが全部 VRAM に入る構成では、`STRATA_SPLIT_MTP_BATCH=0` で外すことを検討してください。**
+> **注意: エキスパートが全部 VRAM に入る構成では、`XESTRATA_SPLIT_MTP_BATCH=0` で外すことを検討してください。**
 > upstream は、全部のエキスパートが VRAM にある 2 枚の R9700 で 21.9% 遅くなったと測っています。
 > 速くなるのは、エキスパートが VRAM に入りきらないときだけです。
 > 下書きの K/V の作り方が変わるので、下書きは少し変わることがあります（出るトークンは検証の窓で決まるので変わりません）。
@@ -144,7 +163,7 @@ B70 + RTX 4070（IQ2_XS、K=45、32K のプロンプト）では prefill が 2,3
 N0 と N1 のスレッドの 2 つの組に分け、2 つの段の CPU の計算を同時に進めます。
 RAM を読む速さが足りない PC では遅くなります（下の測定）。RAM の速い PC 向けの実験的な機能で、既定は無効です。
 
-## 独立したエンジンを並べる（レプリカ、opt-in）
+## 独立したエンジンを並べる（レプリカ）
 
 モデルが少ない枚数の GPU に収まるときは、全部の GPU で 1 つの分割を組むより、GPU の組ごとに独立したエンジンを動かし、要求を振り分けた方が、合計の処理量が増えます（upstream 8d276c19）。
 分割は段が互いを待つ 1 本の流れですが、レプリカはそれぞれが自分の流れを持つためです。
@@ -158,17 +177,20 @@ RAM を読む速さが足りない PC では遅くなります（下の測定）
 エントリーには `"env"` と `"args"` も足せます。
 `serve/server.py --replicas N` でも同じです。
 
+`"replicas"` の既定は `"auto"` で、レプリカは置きません。カードが 2 枚以上あり、どのカード 1 枚でもモデルが収まり（重み・K/V・エキスパートのキャッシュ）、RAM がエキスパートの写しをカードの数だけ持てるときは、setup と起動のログが「この機械なら N エンジン」と表示します（要求 1 つだけの decode は層の分割の方が速いので、自動では選びません）。`"replicas": N` で使い、`"replicas": 1` で切り、`--layer-split K` と自分で分割点を決めたときは選びません。
+
 - 要求は、そのレプリカが読み直す prompt のトークンの数と、動いている要求の数から決まる費用の小さいレプリカへ送ります。会話の次のターンは、ほかのレプリカがよほど空いていない限り、同じレプリカに戻ります。
 - Linux では、各レプリカに別々の物理コアを割り当てます（`"replica_cpus": false` で切ります）。
 - 止まったレプリカは、裏でもう一度起動します。ほかのレプリカはそのあいだも動きます。
-- 各レプリカは、モデルのエキスパートの写しを RAM に自分で持ちます。RAM が足りるかを確かめてください。
+- Linux では、レプリカはエキスパートの写しを RAM に 1 つだけ持ち、共有します（upstream 3ccfd5aed・378200894）。最初のレプリカがそれを埋め、ほかのレプリカはその後に起動して読み込みを省きます。`"replica_shared_arena": false` で、各レプリカが自分の写しを持ちます（RAM はレプリカの数だけ要ります）。Windows では各レプリカが自分の写しを持ちます。
 
-## prompt を 1 枚で読み、答えを別の 1 枚で作る（split serving、opt-in）
+## prompt を 1 枚で読み、答えを別の 1 枚で作る（split serving）
 
 モデルを丸ごと載せられる GPU が 2 枚あるとき、1 枚で prompt を読み（prefill）、もう 1 枚で答えを作る（decode）こともできます（upstream 690172c46。考えと手作りの構成は upstream の issue #4000 の @MarcoTool のもの）。
 層は分けません。サーバーがそれぞれ 1 枚の GPU で 2 つのエンジンを起動し、prefill のエンジンが読み終えたセッションを RAM のファイルで decode のエンジンへ渡します。
 クライアントから見えるのは 1 つのエンドポイントのままです。
-設定しなければ何も変わりません。
+
+`"split_serve"` の既定は `"auto"` で、選びません。カードが 2 枚あり、どちらのカード 1 枚でもモデルが収まるときは、setup と起動のログが「prefill を 2 枚目で読む形にできる」と表示します（要求 1 つだけの decode は 1 枚で行うので、自動では選びません）。下のようにカードを書くか `--split-serve` で使います。`--layer-split K` と自分で分割点を決めたときは選びません。
 
 設定ファイル（`xestrata-<model>.json`）では、カードを `"gpu_pci"` と同じく PCI アドレスで書きます。
 
@@ -179,7 +201,7 @@ RAM を読む速さが足りない PC では遅くなります（下の測定）
 ```
 
 `serve/server.py --split-serve 0000:03:00.0,0000:09:00.0`（prefill のカードが先）でも同じです。
-2 つのカードが設定の `"gpu_pci"` と `"split_pci"` に代わり、各エンジンは `STRATA_GPU_PCI` で自分のカードを受け取ります。
+2 つのカードが設定の `"gpu_pci"` と `"split_pci"` に代わり、各エンジンは `XESTRATA_GPU_PCI` で自分のカードを受け取ります。
 `"replicas"`、`--layer-split`、`--split-device`、`--batch`・`--slots`・`"parallel"`、`--prompt-cache 0` とは一緒に使えず、`--mtp` が要ります（起動のときに理由を言って止まります）。
 
 | キー | 既定 | 意味 |
@@ -222,7 +244,7 @@ RAM を読む速さが足りない PC では遅くなります（下の測定）
 - RAM には、エキスパートの写し 1 つ（共有の領域、Linux）か 2 つと、受け渡しのあいだのセッションファイルが要ります。
 - `"conversation_save"` は decode のエンジンだけが使います。
 
-`tools/split_serve_check.py` が、1 枚のエンジンの答えと split の答えをトークンと状態の指紋（`STRATA_STATE_HASH`）で比べ（`exact`）、層の分割・1 枚・split の速さを測ります（`bench`）。
+`tools/split_serve_check.py` が、1 枚のエンジンの答えと split の答えをトークンと状態の指紋（`XESTRATA_STATE_HASH`）で比べ（`exact`）、層の分割・1 枚・split の速さを測ります（`bench`）。
 
 ## 1 つの会話で複数の GPU を働かせる（`--pipeline-windows`）
 
@@ -238,14 +260,13 @@ RAM を読む速さが足りない PC では遅くなります（下の測定）
 `--pipeline-windows 1` は、検証の窓を通る短い prefill（`--short-read`）だけを重ねます。これは 2 段のときだけです。
 
 各段が自分の GPU を持つ 2 段以上の分割と、`--serve` のときに使えます。
-指定がなければ、Xe2（Battlemage）の GPU ちょうど 2 枚の分割で、`--serve` と下書きの層があり、`--batch` と補助のキャッシュがないときは `2` にします（upstream a6fd78856。upstream は Arc Pro B65 2 枚で decode が直列より 17〜28% 速く、1 時間の serve でトークンの違いがなかったと測っています）。
-`--pipeline-windows 0` か `STRATA_PIPELINE_AUTO=0` で切れます。ほかの構成は直列のままです。
+指定がなければ `0` で、直列のままです。
 3 段以上で `--pipeline-windows 2` を使うときは、`--adapt-async` を切り、適応する段は判定のときに動かします。
 
 - 費用: 各 GPU に 2 つ目の検証の窓。各 GPU のエキスパートのキャッシュから 160 MiB を外し、`2` では最後の段より前の各 GPU に再帰の状態のコピーを 2 つ置きます（その GPU の GDN の層 1 つあたり約 3 MiB）。
 - 出る文章: 最後の GPU は検証の済んだ窓だけを計算し、直列のときと同じ規則でトークンを選びます。
   ただし、窓の区切り方は直列のときと変わります。検証の窓の丸めは窓の行の数で変わることがあるので、貪欲な出力でも僅差の選択が入れ替わることがあります。
-  直列でも `--spec` や `--spec-min-p` を変えると同じように変わります（B70 + RTX 4070、IQ2_XS、`STRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 0`、エキスパートのキャッシュをそろえて、3 つの答えのうち 2 つ。B70 だけでも同じ）。
+  直列でも `--spec` や `--spec-min-p` を変えると同じように変わります（B70 + RTX 4070、IQ2_XS、`XESTRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 0`、エキスパートのキャッシュをそろえて、3 つの答えのうち 2 つ。B70 だけでも同じ）。
   パイプラインは自分の VRAM をキャッシュから外すので、このフラグのない実行と比べるといくつかのエキスパートが GPU から CPU に移り、丸めが変わって僅差の選択が入れ替わることがあります。
 - 使えない構成（ログに理由を 1 行出して無効にします）: `--batch` のスロット、補助のキャッシュ（`--expert-cache-device1..3`）、1 枚の GPU 上の分割（`--split-device 0`）、3 段以上での `--pipeline-windows 1`、下書きの層なし。
   繰り返しのペナルティ（`penalty_last_n`）、組み合わせた下書きのサンプリング、対数確率（`logprobs`）を求める要求と `--lookup-chain` は、直列で decode します。
@@ -253,7 +274,7 @@ RAM を読む速さが足りない PC では遅くなります（下の測定）
   そのため、prefill では窓の commit をその窓の完了後に積みます（上流は窓、commit、次の窓を続けて積みます）。
   適応する段は、どちらのカードにも窓がない判定のときに動かします（上流は窓の横の別スレッドで動かします）。
   `--adapt-async 1` では、各カードのコピーを、そのカードに窓がないときに decode のループが積みます（upstream 13eee452）。
-- `STRATA_PIPELINE_*` の調整・試験の変数（THETA、FORCE_MISS、SWITCH、LOG、TRACE など）は、`STRATA_PIPELINE_DEBUG=1` のときだけ読みます（upstream 2bfac510）。
+- `XESTRATA_PIPELINE_*` の調整・試験の変数（THETA、FORCE_MISS、SWITCH、LOG、TRACE など）は、`XESTRATA_PIPELINE_DEBUG=1` のときだけ読みます（upstream 2bfac510）。
 
 ## 測定
 

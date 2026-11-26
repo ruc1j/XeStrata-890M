@@ -29,7 +29,8 @@
 
 // A kernel's required work-group size, in AMD's device compile only (XeStrata-890M): the AMDGPU backend budgets a
 // kernel's registers by the work-group size its attribute states, 1024 work-items without one (128 VGPRs on
-// gfx1150), and clang sets that attribute from reqd_work_group_size (third_party/main/intel-llvm/patches/20-...).
+// gfx1150), and clang sets that attribute from reqd_work_group_size (v7.2.0's clang; the property form through
+// third_party/main/intel-llvm/patches/33-hip-reqd-work-group-size.patch).
 // The other compiles are left as they were (unverified with the attribute).
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
 #define STRATA_AMD_REQD_WG(...) [[sycl::reqd_work_group_size(__VA_ARGS__)]]

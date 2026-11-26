@@ -22,6 +22,7 @@
 #include "strata/image/img_start.hpp"
 #include "strata/image/qi_dit.hpp"
 #include "strata/image/safetensors.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -109,6 +110,7 @@ bool HunyuanImage3Pipeline::open(const std::string& dit, const std::string& vae,
         }
     }
     auto_budget_ = vram_cap(free);
+    note_others();
     return true;
 }
 
@@ -145,6 +147,7 @@ void HunyuanImage3Pipeline::ensure_open() {
 
 void HunyuanImage3Pipeline::set_budget(uint64_t bytes) {
     budget_ = bytes;
+    note_others();
     if (dit_ == nullptr) return;   // released: the next request plans with it
     const QiPlan p = plan(dit_->tokens(), 0, 0);
     (void) p;   // a shrink takes effect at once; a grown budget is taken at the next request
@@ -174,13 +177,6 @@ void HunyuanImage3Pipeline::release(bool all) {
     dit_->set_bank_budget(dit_->bank_min());   // the streamed regions stay, the resident prefix gives its VRAM back
     dit_->drop_bank_homes();                   // and the streamed banks' copies their RAM
     banks_set_ = dit_->bank_min();
-}
-
-void HunyuanImage3Pipeline::fit(uint64_t reserve) {
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    const uint64_t have = held() + (uint64_t) free;
-    set_budget(have > reserve ? have - reserve : 0);
 }
 
 uint64_t HunyuanImage3Pipeline::held() const {
@@ -414,11 +410,7 @@ QiNeed HunyuanImage3Pipeline::need(int64_t n_text, int64_t width, int64_t height
     // turn - the decode runs after the walk gives them back.  full: every bank resident as well, both buffers kept.
     n.least = fixed + dit_size_->bank_min() + std::max(act, vae_least);
     n.full = fixed + dit_size_->bank_bytes() + act + vae;
-    n.held = held();
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    n.free = free;
-    n.cap = vram_cap(total);
+    vram_into(n);
     const uint64_t room = n.cap > fixed + std::max(act, vae) ? n.cap - fixed - std::max(act, vae) : 0;
     n.host = dit_size_->bank_bytes() - std::min(dit_size_->bank_bytes(), room);
     return n;
@@ -491,7 +483,7 @@ uint64_t HunyuanImage3Pipeline::refs_encode_bytes(const std::vector<HunyuanImage
 
 QiPlan HunyuanImage3Pipeline::size_plan(int64_t T, int64_t th, int64_t tw, bool refs, uint64_t encode) const {
     QiPlan p;
-    p.budget = budget_ > 0 ? budget_ : auto_budget_;
+    p.budget = budget();
     const HunyuanImage3Vision* vision = vision_ ? vision_.get() : vision_size_.get();
     // the VAE's encoder and the vision model are an edit's: put on the card with its first reference image
     p.fixed = dit_->dense_bytes() + vae_->weight_bytes() + around_->weight_bytes() +
@@ -690,7 +682,7 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
     std::vector<float> m;
     if (mask) {
         mask_px = crop_rgba8(r.mask, r.width, r.height);
-        m = latent_mask(mask_px, r.width, r.height, kDownsample);
+        m = request_latent_mask(r, mask_px, r.width, r.height, kDownsample);
     }
 
     const auto t1 = clock::now();
@@ -704,7 +696,7 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
             // STRATA_HUNYUANIMAGE3_HOST_ENDS=patch|final|both: a check's - the host FP32 pieces in place of the
             // card's, so one run at a time can tell either piece's cost in the picture (see the pipeline header)
             static const std::string kHostEnds = [] {
-                const char* v = std::getenv("STRATA_HUNYUANIMAGE3_HOST_ENDS");
+                const char* v = strata::env_get("HUNYUANIMAGE3_HOST_ENDS");
                 return std::string(v != nullptr ? v : "");
             }();
             const bool host_patch = kHostEnds == "patch" || kHostEnds == "both";

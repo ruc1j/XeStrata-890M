@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/cpu/pool_stress.cpp - issue #29: the expert pool under the load a big-VRAM card gives it.
 //
 // With most experts resident on the GPU, many layers hand the pool nothing, the workers go to sleep in the middle
@@ -25,7 +26,15 @@
 namespace cpu = strata::kernels::cpu;
 
 int main(int argc, char** argv) {
-    const double seconds = argc > 1 ? std::atof(argv[1]) : 20.0;
+    double seconds = 20.0;
+    if (argc > 1) {
+        char* end = nullptr;
+        seconds = std::strtod(argv[1], &end);
+        if (end == argv[1] || *end != '\0' || !(seconds > 0.0)) {
+            std::fprintf(stderr, "pool_stress: invalid seconds '%s'\n", argv[1]);
+            return 2;
+        }
+    }
     const cpu::CpuFeatures feat = cpu::cpu_features();
     if (!feat.usable()) {
         std::printf("CPU lacks %s: pool_stress SKIPPED\n", feat.reason());
@@ -67,7 +76,7 @@ int main(int argc, char** argv) {
         }
     });
 
-    std::mt19937 rng(29);
+    std::mt19937 rng(29);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
     const float SENTINEL = -1.2345e33f;
     long long batches = 0, sleeps = 0, missed = 0;
     const auto t0 = std::chrono::steady_clock::now();

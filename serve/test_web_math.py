@@ -32,7 +32,7 @@ class MathInNode(unittest.TestCase):
 class Vendored(unittest.TestCase):
     def test_the_files_are_the_ones_in_provenance(self):
         prov = json.loads((KATEX / "PROVENANCE.json").read_text(encoding="utf-8"))
-        self.assertEqual((prov["package"], prov["version"], prov["license"]), ("katex", "0.19.0", "MIT"))
+        self.assertEqual((prov["package"], prov["version"], prov["license"]), ("katex", "0.19.1", "MIT"))
         self.assertTrue(prov["integrity"].startswith("sha512-"))
         on_disk = {p.relative_to(KATEX).as_posix() for p in KATEX.rglob("*") if p.is_file() and p.name != "PROVENANCE.json"}
         self.assertEqual(on_disk, set(prov["sha256"]), "a file was added or removed without PROVENANCE.json")
@@ -58,9 +58,9 @@ class Vendored(unittest.TestCase):
         self.assertIn('src="web/math.js"', html)
         self.assertIn('src="web/math-adapter.js"', html)
         self.assertNotIn("katex", html.lower().replace("math-adapter", ""), "KaTeX is not named in the page: the adapter loads it")
-        self.assertIn("math: false", js, "off by default")
+        self.assertIn("math: true", js, "on by default (XeStrata's a9aee2d6a); the switch still turns it off")
         self.assertIn('id="s-math"', html)
-        self.assertIn('aria-checked="false"', re.search(r'<button[^>]*id="s-math"[^>]*>', html).group(0))
+        self.assertIn('aria-checked="true"', re.search(r'<button[^>]*id="s-math"[^>]*>', html).group(0))
         adapter = re.sub(r"^\s*//.*$", "", (WEB / "math-adapter.js").read_text(encoding="utf-8"), flags=re.M)   # the code, not its comments
         self.assertIn("trust: false", adapter)
         self.assertNotIn("innerHTML", adapter)

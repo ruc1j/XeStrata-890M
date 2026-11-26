@@ -12,17 +12,21 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "device_caps.hpp"
 #include "device_target.hpp"
 #include "amd_wmma.hpp"
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_select
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <utility>
+#include <vector>
 #include <unordered_map>
 #include <string>
 
@@ -277,7 +281,7 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     const size_t gx = active_blocks > 0 ? size_t((reach + SCORE_WARPS - 1) / SCORE_WARPS) : score_grid(queue, max_blocks);
     const int64_t stride = (int64_t) gx * SCORE_WARPS;
     const auto e = queue.parallel_for(
-        sycl::nd_range<2>({size_t(nq), gx * SCORE_WARPS * WARP}, {1, SCORE_WARPS * WARP}),
+        sycl::nd_range<2>({size_t(nq), gx * SCORE_WARPS * WARP}, {1, (size_t) SCORE_WARPS * WARP}),
         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int64_t qi = int64_t(it.get_group(0));
@@ -287,11 +291,13 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
             const int lane = int(sg.get_local_linear_id());
             for (int64_t b = first; b <= n_bid && b < max_blocks; b += stride) {   // uniform over the sub-group
                 const float* key = (b == n_bid) ? dead : pooled + b * IDX_DIM;
-                const float* kp = key + lane * 4;
-                const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane * 4;
+                const int lane4 = lane * 4;   // a lane's 4 of the 128 dims: 32-bit, as the device counts
+                const float* kp = key + lane4;
+                const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane4;
                 float score = 0.0f;
                 for (int h = 0; h < IDX_HEADS; ++h) {
-                    const float* q4 = q + h * IDX_DIM;
+                    const int ho = h * IDX_DIM;
+                    const float* q4 = q + ho;
                     float d = kp[0] * q4[0] + kp[1] * q4[1] + kp[2] * q4[2] + kp[3] * q4[3];
                     for (int o = 16; o > 0; o >>= 1) d += strata_shfl_xor(sg, d, o);
                     score += d > 0.0f ? d : 0.0f;
@@ -303,6 +309,130 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
             }
         });
     finish(stream, e, "qsa_block_scores");
+}
+
+namespace {
+// qsa_block_scores_rows' reduction for one (block, row): the four heads' lane sums with qsa_block_scores' pairings.
+inline void score_row_heads(const sycl::sub_group& sg, const int lane, float kp0, float kp1, float kp2, float kp3,
+                            const float* q, bool& hi16, bool& hi8, float& c, float& e1, float& e2, float& e3) {
+    hi16 = (lane & 16) != 0;
+    hi8 = (lane & 8) != 0;
+    float d[IDX_HEADS];
+    for (int h = 0; h < IDX_HEADS; ++h) {
+        const float* q4 = q + (ptrdiff_t) h * IDX_DIM;
+        d[h] = kp0 * q4[0] + kp1 * q4[1] + kp2 * q4[2] + kp3 * q4[3];
+    }
+    const float s0 = sycl::permute_group_by_xor(sg, hi16 ? d[0] : d[2], 16);
+    const float s1 = sycl::permute_group_by_xor(sg, hi16 ? d[1] : d[3], 16);
+    const float a0 = (hi16 ? d[2] : d[0]) + s0, a1 = (hi16 ? d[3] : d[1]) + s1;
+    const float s2 = sycl::permute_group_by_xor(sg, hi8 ? a0 : a1, 8);
+    c = (hi8 ? a1 : a0) + s2;
+    for (int o = 4; o > 0; o >>= 1) c += sycl::permute_group_by_xor(sg, c, o);
+    e1 = sycl::select_from_group(sg, c, 8);
+    e2 = sycl::select_from_group(sg, c, 16);
+    e3 = sycl::select_from_group(sg, c, 24);
+}
+}  // namespace
+
+void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (nq <= 0) return;
+    if (rows.n != nq)
+        throw core::DeviceError("qsa_block_scores_rows: a row's keys are missing");
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R)
+        throw core::DeviceError("qsa_block_scores_rows: unsupported indexer geometry");
+    const size_t gx = size_t((max_blocks + SCORE_WARPS - 1) / SCORE_WARPS);
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<1>(gx * (size_t) (SCORE_WARPS * WARP), (size_t) (SCORE_WARPS * WARP)),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int64_t b = int64_t(it.get_group(0)) * SCORE_WARPS + int64_t(sg.get_group_linear_id());
+            if (b >= max_blocks) return;   // uniform over the sub-group
+            const int lane = int(sg.get_local_linear_id());
+            for (int64_t qi = 0; qi < nq; ++qi) {
+                const int32_t* st = steps + qi * kStepCount;
+                const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+                if (b > n_bid) continue;   // uniform
+                float kp0 = 0.0f, kp1 = 0.0f, kp2 = 0.0f, kp3 = 0.0f;
+                if (b < n_bid) {   // this row's own completed block
+                    const float* kp = rows.pooled[qi] + b * IDX_DIM + (ptrdiff_t) lane * 4;
+                    kp0 = kp[0]; kp1 = kp[1]; kp2 = kp[2]; kp3 = kp[3];
+                } else {   // its tail block: its own dead key
+                    const float* kd = rows.dead[qi] + (ptrdiff_t) lane * 4;
+                    kp0 = kd[0]; kp1 = kd[1]; kp2 = kd[2]; kp3 = kd[3];
+                }
+                bool hi16 = false, hi8 = false;
+                float c = 0.0f, e1 = 0.0f, e2 = 0.0f, e3 = 0.0f;
+                score_row_heads(sg, lane, kp0, kp1, kp2, kp3, q_idx + qi * IDX_HEADS * IDX_DIM + (ptrdiff_t) lane * 4,
+                                hi16, hi8, c, e1, e2, e3);
+                if (lane == 0) {
+                    float score = 0.0f;
+                    score += c > 0.0f ? c : 0.0f;
+                    score += e1 > 0.0f ? e1 : 0.0f;
+                    score += e2 > 0.0f ? e2 : 0.0f;
+                    score += e3 > 0.0f ? e3 : 0.0f;
+                    if (b == n_bid && n_kv % R != 0) score += 1e9f;
+                    scores[qi * max_blocks + b] = score;
+                }
+            }
+        });
+    finish(stream, e, "qsa_block_scores_rows");
+}
+
+bool qsa_rows_pays(int n_rows, int64_t blocks, const QsaShapes& s, void* stream) {
+    if (n_rows <= 1 || n_rows > kQsaRowsMax || blocks <= 0 || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS ||
+        s.idx_block != R)
+        return false;
+    auto& q = queue_for(stream);
+    using Key = std::pair<int, int64_t>;
+    static core::TimedCache<sycl::device, Key, bool> choices;
+    const Key key{n_rows, blocks};
+    if (const auto c = choices.get(q.get_device(), key)) return *c;
+    if (core::timing_depth != 0 || q.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording)
+        return false;
+    const size_t nb = (size_t) blocks, nq = (size_t) n_rows;
+    const size_t buf_n = nq * (nb * IDX_DIM + IDX_DIM + (size_t) IDX_HEADS * IDX_DIM) + nq * nb + 64;
+    float* buf = sycl::malloc_device<float>(buf_n, q);
+    int32_t* steps = sycl::malloc_device<int32_t>(nq * kStepCount, q);
+    if (buf == nullptr || steps == nullptr) {
+        sycl::free(buf, q);
+        sycl::free(steps, q);
+        return false;
+    }
+    float* pooled = buf;
+    float* dead = pooled + nq * nb * IDX_DIM;
+    float* qidx = dead + nq * IDX_DIM;
+    float* scores = qidx + nq * (size_t) IDX_HEADS * IDX_DIM;
+    q.fill(buf, 0.01f, buf_n);
+    std::vector<int32_t> st(nq * kStepCount, 0);
+    for (int r = 0; r < n_rows; ++r) {
+        int32_t* p = st.data() + (size_t) r * kStepCount;
+        p[kStepNKv] = (int32_t) (blocks * R);
+        p[kStepNBid] = (int32_t) (blocks - 1);
+        p[kStepWidth] = (int32_t) (blocks * R);
+    }
+    q.memcpy(steps, st.data(), st.size() * sizeof(int32_t)).wait_and_throw();
+    QsaScoreRows rows;
+    rows.n = n_rows;
+    for (int r = 0; r < n_rows; ++r) {
+        rows.pooled[r] = pooled + (size_t) r * nb * IDX_DIM;
+        rows.dead[r] = dead + (size_t) r * IDX_DIM;
+    }
+    auto one_row = [&] {
+        for (int r = 0; r < n_rows; ++r)
+            qsa_block_scores(rows.pooled[r], rows.dead[r], qidx + (size_t) r * IDX_HEADS * IDX_DIM,
+                             steps + (size_t) r * kStepCount, 1, blocks, s, scores + (size_t) r * nb, stream);
+    };
+    auto all_rows = [&] { qsa_block_scores_rows(rows, qidx, steps, n_rows, blocks, s, scores, stream); };
+    const auto measured = core::timed_choice({{[&] { one_row(); return true; }}, {[&] { all_rows(); return true; }}},
+                                             [&] { q.wait_and_throw(); }, 5, 1.05, 0.0);
+    const bool on = measured.pick == 1;
+    std::fprintf(stderr, "xestrata: QSA block scores %s (%d rows, %lld blocks; %.1f / %.1f us)\n",
+                 on ? "one launch" : "a row a launch", n_rows, (long long) blocks, measured.seconds[0] * 1e6,
+                 measured.seconds[1] * 1e6);
+    sycl::free(buf, q);
+    sycl::free(steps, q);
+    return choices.put(q.get_device(), key, on);
 }
 
 void qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
@@ -609,7 +739,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
     // no TF32 matrix scorer here (CUDA's mma.sync): the FP32 tiled one (a 38,738-token prompt on the B70 1,451 -> 1,536
     // tok/s, the RTX 4070 1,013 -> 1,057); STRATA_SELECT_SIMT=0: refused, and the caller runs qsa_block_scores
     static const bool simt = [] {
-        const char* v = std::getenv("STRATA_SELECT_SIMT");
+        const char* v = strata::env_get("SELECT_SIMT");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     if (!simt || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) return false;
@@ -683,7 +813,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
                     const QsaShapes& s, int32_t* ids, void* stream) {
     // STRATA_TOPK_OLD=1: the kernel with one shared histogram, which a device whose wide kernel takes no TK_T-item
     // work-group (topk_wide_fits) runs as well; the same ids
-    static const bool old = std::getenv("STRATA_TOPK_OLD") != nullptr;
+    static const bool old = strata::env_get("TOPK_OLD") != nullptr;
     if (nq <= 0) return;
     if (old || !topk_wide_fits(queue_for(stream))) {
         qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream);
@@ -692,6 +822,39 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s))
         throw core::DeviceError("qsa_block_topk: unsupported geometry or cap");
     finish(stream, launch_topk_wide(queue_for(stream), scores, steps, nq, max_blocks, cap, ids), "qsa_block_topk");
+}
+
+void qsa_block_topk_with_current(const float* scores, int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                                 const QsaShapes& s, int32_t* ids, void* stream) {
+    if (nq <= 0) return;
+    if (!stream || s.idx_block != R || s.idx_top_k <= 0 || s.idx_top_k > INT32_MAX - R ||
+        s.idx_top_k % R || cap < s.idx_top_k + R || !steps || !ids)
+        throw core::DeviceError("qsa_block_topk_with_current: unsupported geometry or cap");
+    auto& q = queue_for(stream);
+    const int budget = (int) s.idx_top_k;
+    // Rank whole blocks only. The tail is unioned afterwards, so even an arbitrarily large block score cannot
+    // displace a tail cell. kStepPos keeps n_kv - 1 while the top-k reads the temporary complete-cell count.
+    q.parallel_for(sycl::range<1>((size_t) nq), [=](sycl::id<1> id) {
+        int32_t* st = steps + id[0] * kStepCount;
+        const int n = st[kStepNKv];
+        const int complete = n - n % R;
+        st[kStepNKv] = complete;
+        st[kStepWidth] = complete < budget ? complete : budget;
+    });
+    qsa_block_topk(scores, steps, nq, max_blocks, cap, s, ids, stream);
+    q.parallel_for(sycl::range<1>((size_t) nq), [=](sycl::id<1> id) {
+        int32_t* st = steps + id[0] * kStepCount;
+        const int n = st[kStepPos] + 1, complete = n - n % R;
+        int width = st[kStepWidth];
+        int32_t* out = ids + id[0] * cap;
+        if (n != complete) {
+            for (int cell = complete; cell < n; ++cell) out[width++] = cell;
+        } else if (n > width && out[width - 1] != n - 1) {
+            for (int cell = n - R; cell < n; ++cell) out[width++] = cell;
+        }
+        st[kStepNKv] = n;
+        st[kStepWidth] = width;
+    });
 }
 
 }  // namespace strata::kernels

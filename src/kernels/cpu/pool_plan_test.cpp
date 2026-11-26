@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // pool_plan_test: the default CPU expert worker count on mock CPUs (include/strata/kernels/cpu/pool_plan.hpp).
 // Pure arithmetic, no threads and no OS calls: it runs on any machine.
 #include "strata/kernels/cpu/pool_plan.hpp"
@@ -231,6 +232,7 @@ int main() {
 
         // Windows-style numbering of 16 cores / 32 threads: core k = logical 2k and 2k+1
         std::vector<cpu::LogicalCpuInfo> win;
+        win.reserve(32);
         for (int i = 0; i < 32; ++i) win.push_back({i, i / 2});
         std::vector<int> w;
         for (int c = 1; c < 16; ++c) w.push_back(2 * c);

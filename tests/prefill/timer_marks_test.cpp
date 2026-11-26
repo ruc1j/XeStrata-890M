@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// STRATA_PREFILL_TIMING mark coalescing (PR #4006): repeated marks in the running phase add nothing to the totals.
+// STRATA_PREFILL_TIMING mark coalescing (upstream #4006): repeated marks in the running phase add nothing to the totals.
 // No GPU: the timeline is simulated, one fake clock tick per launch.
 #include <cstdio>
 #include <vector>

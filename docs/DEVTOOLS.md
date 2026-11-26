@@ -34,10 +34,10 @@ sudo apt install clang-tidy cppcheck markdownlint tidy
 `tools/lint/run.sh` runs oneAPI's clang-tidy, which knows SYCL (found under `/opt/intel/oneapi/compiler`), not the distribution's.
 Without oneAPI it takes the clang-tidy of the intel/llvm built from source (`.tools/intel-llvm/install/bin/clang-tidy`). `tools/intel_llvm_build.py` does not build it, so add clang-tools-extra to that build tree with `cmake -S .tools/intel-llvm/src/llvm -B .tools/intel-llvm/build -DLLVM_ENABLE_PROJECTS='<the list as it is>;clang-tools-extra'`, build it with `ninja -C .tools/intel-llvm/build clang-tidy` and copy `bin/clang-tidy` there (the list as it is: `LLVM_ENABLE_PROJECTS` in `CMakeCache.txt`). It reads the SYCL sources as they are.
 A clang-tidy elsewhere is named with `STRATA_CLANG_TIDY`.
-clang-tidy reads `compile_commands.json` from the build folder (by default `build/free`; `STRATA_LINT_BUILD` changes it).
+clang-tidy reads `compile_commands.json` from the build folder (by default `build/free`; `XESTRATA_LINT_BUILD` changes it):
 
 ```sh
-cmake -S . -B build/free -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+cmake -S . -B build/free -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON   # Ninja, as in BUILD.md (with Make the SYCL device code's dependencies do not connect)
 ```
 
 The ones the distribution does not package, or packages too old, go into `.lint/`.
@@ -109,7 +109,7 @@ sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocmin
   ROCm 7.14's packages from AMD install no ld.so.conf, so setup adds their `lib` to the engine's library path (the config's `lib_dirs`).
   Without it the build has no HIP.
 - Code for AMD GPUs needs libclc's libspirv for AMD and ROCm's device libraries.
-  A compiler reads bitcode of its own LLVM or an older one only (ROCm 10.1's device libraries are LLVM 24's, which intel/llvm 7.2.0's LLVM 23 cannot read),
+  A compiler reads bitcode of its own LLVM or an older one only (ROCm 10.1's device libraries are LLVM 24's, which intel/llvm 7.2.1's LLVM 23 cannot read),
   so the script fetches the device libraries of the ROCm release on intel/llvm's LLVM (ROCm 7.14.1: `amd/device-libs` of ROCm's llvm-project at the commit TheRock's tag `therock-7.14.1` pins, under the University of Illinois/NCSA license), builds them in the same tree and installs them into `install/amdgcn/bitcode`.
   It installs those a SYCL program's AMD code links (`ocml`, `ockl`, `oclc_*`) and `opencl`, whose presence the driver asks for.
   CMake takes the installed ROCm's device libraries where the compiler reads them, and these where it does not; when they fail to build, intel/llvm is still built.
@@ -133,7 +133,8 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are twenty fixes now, for v7.2.0 (2026-10-31). The seventh (`hip-libclc-target`) and the eleventh (`hip-libclc-fma`) of the v7.1.1 set are no longer needed in v7.2.0 and were dropped, the seventeenth keeps only its lowered-attribute part (its clang part is in v7.2.0), and an eighteenth and a nineteenth were added. The others only had their context updated for the SPDX headers upstream added.
+  There are twenty-nine fixes now, for intel/llvm v7.2.1 (v7.2.0's twenty-nine apply to it as they are; v7.2.1 has no tag, and the script takes sycl-rel-7_2's commit ea269d5f7, which raised the version to 7.2.1, 2026-11-24). Of the sixteen v7.1.1 took, libclc's AMD target name is no longer needed, libclc being built otherwise since v7.2.0, and the AMD FMA is fixed in v7.2.0 (2026-10-22).
+  This fork adds one more, `hip-reqd-work-group-size` (the twenty-fifth below): thirty in all.
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -181,13 +182,48 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Sixteenth, the device libraries (libdevice) depended on the compiler being built and all its tools (`sycl-compiler`) even when `LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR` gives the tools that compile them.
   The cross build for Windows (`--windows`) built a Windows `clang.exe` and tools nobody runs, most of its time.
   Fixed, with the tools given they depend on the SYCL headers alone (`build-libdevice-custom-tools`; a build without them is unchanged). A fix to the build only, it asks no finished toolchain to be built again.
-  Seventeenth, the AMDGPU backend budgets a kernel's registers by the "amdgpu-flat-work-group-size" attribute, which clang set only from OpenCL's reqd_work_group_size and HIP's --gpu-max-threads-per-block. As a result, a SYCL kernel was budgeted for 1024 work-items (128 VGPRs on gfx1150) whatever its [[sycl::reqd_work_group_size(N)]] or work_group_size property said, and the larger tiles of the products spilled registers.
+  Fifteenth, v7.2.0's `configure.py` builds libclc's AMD libspirv as the LLVM runtime target `amdgcn-amd-amdhsa-llvm`, into `lib/clang/<N>/lib/amdgcn-amd-amdhsa-llvm`, but the driver compiles SYCL's AMD device code for `amdgcn-amd-amdhsa` and looks for `libspirv.l64.signed_char.bc` under that name.
+  Every compile for an AMD GPU stopped ("cannot find 'libspirv.l64.signed_char.bc'"), and with the folder linked under the other name, every link warned that the two modules' targets differ.
+  Fixed, the AMD libspirv is built for `amdgcn-amd-amdhsa` (`hip-libclc-triple`).
+  Sixteenth, since v7.2.0 the SYCL build refuses the CUDA and HIP adapters unless libclc is built as an LLVM runtime.
+  The cross build for Windows builds the runtime alone, with the contrib-llvm toolchain's device tools and its libspirv, and builds no libclc, so its configuration stopped.
+  Fixed, with the tools given (`LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR`) the adapters are configured without libclc (`build-cross-adapters`; a build without them is unchanged). A fix to the build only, it asks no finished toolchain to be built again.
+  Seventeenth, since v7.2.0 SYCL's sub-group shuffles (Shuffle, ShuffleXor, ShuffleUp and ShuffleDown in `sycl/detail/spirv.hpp`) call the SPIR-V GroupNonUniform forms on every target but NVIDIA's, and AMD's libspirv has only the SubgroupShuffle*INTEL ones.
+  Every AMD program with a shuffle stopped at its link ("undefined symbol: __spirv_GroupNonUniformShuffleXor(int, float, unsigned int)").
+  Fixed, AMD's libspirv defines the four GroupNonUniform shuffles for the scalar types with SubgroupShuffle*INTEL (`hip-group-shuffle`).
+  Eighteenth, the HIP adapter answered every virtual memory call (`urVirtualMem*`, `urPhysicalMem*`) with UNSUPPORTED and reported no support, so SYCL's `ext_oneapi_virtual_mem` was not there on AMD GPUs, and `--vram-elastic` and `--kv-grow` fell back to one allocation.
+  intel/llvm implemented them after the release (commit c13ad6c7e3, "[UR][HIP] Implement virtual and physical memory management", pull request 22671): with HIP's virtual memory (`hipMemAddressReserve`, `hipMemCreate`, `hipMemMap` and the others) as the CUDA adapter implements them with CUDA's, the support reported as HIP's `hipDeviceAttributeVirtualMemoryManagementSupported` says.
+  The patch applies that commit's diff to v7.2.1 as it is (`hip-virtual-mem`; nothing of XeStrata's in it, and it goes when intel/llvm is raised to a release that has the commit).
+  Nineteenth, a SYCL kernel that asks for a global id calls `__spirv_BuiltInGlobalOffset`, which the GlobalOffset pass replaces in codegen (with a parameter of the kernel's `_with_offset` clone, or 0).
+  The AMDGPU attributor runs before that and took the call as an unknown callee, so every such kernel kept all the implicit inputs, the hostcall buffer among them (14,304 of XeStrata 0.2.2's 32,556 AMD kernels; 0 of 48,084 with v7.1.1).
+  HIP launches no kernel with a hostcall buffer on a GPU without PCIe atomics (one passed through to a virtual machine, or in a slot behind a chipset), so the first kernel stopped with `hipErrorIllegalState` (XeStrata's issues #40 and #54).
+  Fixed, the attributor takes the builtin as reading no implicit argument (`amdgpu-global-offset-hostcall`).
+  Twentieth, linked without RDC (`-fno-sycl-rdc`), a static library's device code goes through `sycl-post-link` once per object in it, and the output is a list of file tables.
+  The SPIR-V path extracts the code column of each table and merges the lists and the tables; the NVIDIA and AMD path extracted the code column from the list itself, so every link of a program with a static library of SYCL code for an NVIDIA or AMD GPU stopped with "column not found Code".
+  Fixed, that path extracts and merges as the SPIR-V one does (`offload-nordc-archive`).
+  Twenty-first, on Linux a range unmapped with `hipMemUnmap` and mapped again on other physical memory was still reached through its old translation by the GPU's engines that had reached it before.
+  The copy engine wrote a copy into the range to the physical memory that had been given back, and a kernel read what was there before (on the RX 9060 XT with ROCm 7.1.1 and Linux 7.2; `--vram-elastic`, `--kv-grow` and the draft head parked during prefill run into it).
+  ROCm unmaps virtual memory with the DRM driver's GEM_VA call, and for an address space of compute queues whose page tables amdgpu writes from the CPU (its default where all of the VRAM is visible to the CPU) that call clears the page table entries and flushes no TLB.
+  The flush comes with the next mapping KFD itself makes.
+  Fixed, right after the unmap `urVirtualMemUnmap` allocates and frees 4 MiB of device memory on each of the context's devices, which KFD maps (larger than the 2 MiB blocks ROCr serves smaller allocations from without calling KFD; where a device has no memory for it, pinned host memory of that size).
+  It costs about 0.1 ms an unmap (`hip-virtual-mem-unmap`; `vmm_test` checks it).
+  Twenty-second, with a ROCr that leaves its own mapping at an unmapped range, the physical memory of a range unmapped with `hipMemUnmap` stayed allocated after `hipMemRelease` (the device's free memory did not grow, and neither another program nor another allocation of this process could take it; seen with ROCm 7.1.1 on the RX 9060 XT).
+  `--vram-elastic` could not lend VRAM to an image job (the engine sees it at start and refuses), and the draft head parked during prefill made no room.
+  ROCr maps the physical memory to the CPU at the same range, inaccessible, when it maps it to the GPU (a mapping of the DRM device). ROCm 7.1.1's ROCr does not take it away at the unmap, and the physical memory stays until the range is mapped again or freed. ROCm 10.1's ROCr makes the range an anonymous mapping again.
+  Fixed, `urVirtualMemUnmap` looks at the range in `/proc/self/maps` after the first unmap, and where the DRM device's mapping is still there it makes every unmapped range the anonymous inaccessible mapping it was reserved with from then on. The physical memory goes back when it is released (`hip-virtual-mem-release`).
+  Where the range is anonymous again (or its line is not found, or is of another file) it does nothing. What the runtime does decides, not ROCm's version, and `UR_LOG_HIP=level:info` says which it was.
+  Twenty-third, intel/llvm's `urPhysicalMemCreate` (the eighteenth's commit) calls `hipMemCreate` without making its device current.
+  `hipMemCreate` takes the memory from the current device whatever device its properties name (ROCm 7.1.1 and 10.1), so on a PC with two AMD GPUs a thread whose current device is the other one gets that one's memory.
+  Fixed, it makes its device current first (`hip-physical-mem-device`).
+  Twenty-fourth, `hipModuleLoadDataEx` refuses a module the GPU has no room for with `hipErrorNoBinaryForGpu` (ROCm 10.1, an RX 9060 XT with every block of its memory taken), and the HIP adapter passed that on as a failed build.
+  The SYCL runtime keeps a failed build in its program cache and throws it again at every use of the program, so the kernels of a program first used while the GPU was full never ran in that process, also after the memory was free again (an image engine started beside a text model whose expert cache filled the VRAM failed every image job with "The program was built for 1 devices").
+  Out of device memory is not kept: the runtime drops its cache and builds the program again at the next use.
+  Fixed, a load refused for no binary or no memory while the device has less than 256 MiB and twice the binary free is reported as out of device memory (`hip-load-oom`).
+  Twenty-fifth (XeStrata-890M's), the AMDGPU backend budgets a kernel's registers by the "amdgpu-flat-work-group-size" attribute, which clang set only from OpenCL's reqd_work_group_size and HIP's --gpu-max-threads-per-block. As a result, a SYCL kernel was budgeted for 1024 work-items (128 VGPRs on gfx1150) whatever its [[sycl::reqd_work_group_size(N)]] or work_group_size property said, and the larger tiles of the products spilled registers.
   Fixed, the attribute is set from SYCL's reqd_work_group_size too, the attribute's and the property's (`hip-reqd-work-group-size`; the 890M's int8 expert product went from 12-26 spilled registers to none, and the dense product's 64 x 128 tile became usable).
   In v7.2.0 clang sets the attribute from SYCL's reqd_work_group_size attribute itself, so the fix keeps only its lowered-attribute (property) part.
-  Eighteenth: libclc's `configure.py` builds the AMD libspirv as the target `amdgcn-amd-amdhsa-llvm`, but the driver compiles SYCL's AMD device code for `amdgcn-amd-amdhsa` and looks for `libspirv.l64.signed_char.bc` under that name, so every compile for an AMD GPU stopped. Fixed, it is built for `amdgcn-amd-amdhsa` (`hip-libclc-triple`, from MarchRaBBiT/XeStrata).
-  Nineteenth: since v7.2.0 SYCL's sub-group shuffles call the SPIR-V GroupNonUniform forms on every target but NVIDIA's, and AMD's libspirv defines only the SubgroupShuffle*INTEL ones, so every AMD program with a shuffle failed to link (`__spirv_GroupNonUniformShuffleXor` undefined). Fixed, AMD's libspirv defines the four GroupNonUniform shuffles for the scalar types with its SubgroupShuffle*INTEL (`hip-group-shuffle`, from MarchRaBBiT/XeStrata).
-  The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
-  `offload-bundle-arch` and `l0-static-graph` ask every toolchain.
+  The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones and `amdgpu-global-offset-hostcall` only a toolchain with HIP (or one that would have it, ROCm being installed now).
+  `offload-bundle-arch`, `l0-static-graph` and `offload-nordc-archive` ask every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
 - Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).
@@ -240,7 +276,7 @@ It needs three things:
 - lld-link (LLVM's `lld`): `sudo apt install lld-21` (21.1)
 - the MSVC CRT and the Windows SDK: downloaded from Microsoft with [xwin](https://github.com/Jake-Shadle/xwin) (0.10.0).
   They are not free software; Microsoft's license is accepted with `--accept-license`. They do not go into the repository.
-- intel/llvm's Windows SYCL tree (headers, import libraries, the runtime's DLLs): `tools/intel_llvm_build.py --windows` cross-builds the release XeStrata uses (v7.2.0), with XeStrata's patches, for Windows here ("intel/llvm for Windows" below).
+- intel/llvm's Windows SYCL tree (headers, import libraries, the runtime's DLLs): `tools/intel_llvm_build.py --windows` cross-builds the release XeStrata uses (v7.2.1), with XeStrata's patches, for Windows here ("intel/llvm for Windows" below).
 
 ```sh
 mkdir -p .tools/xwin
@@ -249,7 +285,7 @@ curl -L https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0
 .tools/xwin/xwin-0.10.0-x86_64-unknown-linux-musl/xwin --accept-license --cache-dir .tools/xwin/cache --arch x86_64 \
     splat --output .tools/xwin/sdk
 python3 tools/intel_llvm_build.py --contrib && python3 tools/intel_llvm_build.py --windows
-export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+export CCACHE_DIR=$HOME/.cache/ccache-win CCACHE_COMPILERCHECK=content
 cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON \
     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-windows-msvc.cmake \
     -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++ -DSTRATA_LICENSE=free \
@@ -262,11 +298,11 @@ For an everyday change, only the objects of the sources it touches are compiled 
 ninja builds a source's object when given the source's path with `^` after it (a full path).
 
 ```sh
-export CCACHE_DIR=$PWD/build/win-ccache CCACHE_COMPILERCHECK=content
+export CCACHE_DIR=$HOME/.cache/ccache-win CCACHE_COMPILERCHECK=content
 ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$|^|")
 ```
 
-- ccache is the one of "Faster builds" above. The Windows objects never hit the Linux ones (their settings differ), so a `CCACHE_DIR` of their own keeps them from pushing the Linux cache out. `CCACHE_COMPILERCHECK=content` tells the compiler by its content when intel/llvm is built again.
+- ccache is the one of "Faster builds" above. The Windows objects never hit the Linux ones (their settings differ), so a `CCACHE_DIR` of their own keeps them from pushing the Linux cache out. That `CCACHE_DIR` is one for the machine (`~/.cache/ccache-win`), not one per working tree: its `ccache.conf` sets `base_dir` (a folder above the working trees, `$HOME` for one) and `max_size` (20G or so), so that every worktree hits the same cache (with `CCACHE_DIR` set, `~/.config/ccache/ccache.conf` is not read). `CCACHE_COMPILERCHECK=content` tells the compiler by its content when intel/llvm is built again.
 - When only a header changed, `ninja -C build/win` builds everything (ccache returns the files that did not change).
 - xwin's `cache` is not needed after the splat and may be deleted (`sdk` is 0.8 GB).
 - lld-link warns `skipping imported DllMain symbol` about `sycl9.lib`: it comes from lld reading an import library MSVC made, and does not change the link.
@@ -278,6 +314,7 @@ It builds the parts the engine uses only (`sycl9.dll` with UR's loader in it, th
 
 - The clang-cl of the toolchain `--contrib` built, of the same release, compiles and lld-link links. The tools that make the device libraries are that toolchain's too (`--contrib`'s build also copies `opt`, which it does not install, into its install folder). No compiler is built, for Windows or for this machine. Build `--contrib` first.
 - The MSVC CRT and the Windows SDK are xwin's splat (`--xwin`, by default `.tools/xwin/sdk`). `llvm-lib`, `llvm-rc`, `llvm-mt` and `llvm-ml` are the distribution's LLVM's (`sudo apt install llvm`).
+- `sycl9.dll` links zstd statically (BSD-3-Clause; its license text is `install/licenses/zstd-LICENSE`). oneMKL's SYCL DLLs carry zstd-compressed device images, and with a runtime without zstd their load fails with WinError 1114. The script fetches the zstd release it names, checks its SHA-256 and builds it for Windows with the same toolchain. The install also gets Level Zero's headers (MIT), for the engine's calls into the loader.
 - The Windows CUDA headers and import libraries the CUDA adapter links come from NVIDIA's redistributable archives (CUDA 12.4.1's `cuda_cudart`, `cuda_nvml_dev` and `cuda_cccl`). They are not free software and do not go into the 7z.
 - The HIP adapter (AMD GPUs) is built where this machine has ROCm's HIP (Ubuntu's `libamdhip64-dev`) and `--contrib` was built with the HIP target. Its headers are that HIP's (MIT; the license text in `install/licenses/hip-headers.txt`), and the `amdhip64.lib` it links is an import library of `amdhip64_7.dll`, made with `llvm-dlltool` from the C names Linux's `libamdhip64.so.7` exports. AMD's driver (Adrenalin 26.5.1 and later) puts `amdhip64_7.dll` into System32.
 - A Windows engine's code for NVIDIA and AMD GPUs links the Windows l32 libspirv the Linux toolchain builds since v7.2.0 (`lib/clang/<version>/lib/<target>`) and that toolchain's ROCm device libraries: neither carries `wchar_size`, so neither is built again for Windows.
@@ -290,8 +327,8 @@ For oneMKL add `-DSTRATA_ONEMKL=ON -DMKL_ROOT=<oneMKL for Windows' Library/>`: o
 
 ### Running on a Windows PC
 
-Put `build/win`'s `strata*.exe` in one folder with `.tools/intel-llvm-win/install/bin`'s `sycl9.dll`, `ur_win_proxy_loader.dll`, the adapter of the GPU (`ur_adapter_cuda.dll` for NVIDIA, `ur_adapter_level_zero.dll` for Intel) and `xptifw.dll`.
-When `strata-device.exe --list-devices` lists the GPU, the engine runs.
+Put `build/win`'s `xestrata*.exe` in one folder with `.tools/intel-llvm-win/install/bin`'s `sycl9.dll`, `ur_win_proxy_loader.dll`, the adapter of the GPU (`ur_adapter_cuda.dll` for NVIDIA, `ur_adapter_level_zero.dll` for Intel) and `xptifw.dll`.
+When `xestrata-device.exe --list-devices` lists the GPU, the engine runs.
 
 ## Intel SDE (the AVX-512 paths)
 
@@ -309,13 +346,36 @@ chmod +x ~/.local/bin/sde64
 sde64 -version
 ```
 
+## Intel Graphics Compiler (IGC): the GEP simplification of 2.27 to 2.30
+
+IGC 2.27.10, 2.28.4 and 2.30.1 miscompile, for Xe2 and Xe3 GPUs (the targets `bmg`, `lnl` and `ptl`: the Arc B-series, Lunar Lake, Panther Lake), a kernel that reads from one pointer at a runtime index and at constant multiples of it.
+With `const float* xt = x + base; xt[0] + xt[N] + xt[2 * N] + xt[3 * N]`, intel/llvm's optimizer writes `xt[2 * N]` and `xt[3 * N]` as byte offsets (8N and 12N bytes) from the pointer it already offset for `xt[N]`, and IGC's GEP simplification takes those byte offsets for element indices.
+The kernel reads `xt[8 * N]` and `xt[9 * N]`: a fault past the buffer (`DEVICE_LOST`, `Engine memory CAT error` in the kernel's log) or wrong values inside it.
+2.24.8 and earlier and 2.32.7 and later compile the reads right (each release's libigc from GitHub on the reproducer's SPIR-V, 2026-10-19); Alchemist (`dg2`) is not affected (IGC reads its buffers there another way).
+Ubuntu 26.04, Debian and Arch ship 2.28.4; Fedora 44 ships 2.24.8 and updates to 2.41.9.
+The reproducer and the checks are in the data folder's `records/igc-gep-check/`.
+
+### The engine's workaround
+
+- The runtime sets `IGC_EnableGEPSimplification=0` in its environment before the SYCL runtime lists the devices (`engine_devices` in `src/core/device.cpp`), unless the user set the variable; IGC reads it when it first compiles a kernel, which the runtime does as it lists the devices.
+- Off, the pass costs the B70 5 to 10% of the decode of a 1K prompt and nothing at 32K (generate, 2026-10-19), so the variable is set only where the `libigc.so.2` the loader finds is 2.25 to 2.31 by its file name (`libigc.so.2.28.4+0`) or carries no version, and a GPU on the xe driver is Xe2 or later by its graphics IP (`xe_gpu_from_xe2`: the main GT's `ip_ver_major` of `DRM_XE_DEVICE_QUERY_GT_LIST` 20 or more; 0, a GPU without GMD_ID, is Alchemist or older; asked of the kernel driver before Level Zero loads).
+- Linux only: Windows sets nothing and keeps its driver's compiler as it is.
+- The start log says so (`IGC's GEP simplification is off`), the engine reports it as `INFO igc_workaround=<version>` (the web app's notice and its About page), and `xestrata --setup` (`check_igc` in `setup.py`, on the same two conditions) warns of it. They send the user to Fedora 44 or 45 (IGC 2.32 or later) or the Podman container (Fedora 45 inside); setup, the documents (BUILD's packages, DETAILS's troubleshooting) and the release notes name Intel's graphics PPA as well (compute-runtime 26.31 and IGC 2.40 for Ubuntu 24.04/26.04): with the HWE kernel straight to the PPA, from the GA kernel to the HWE kernel first (the PPA installs the driver with the IGC, and that driver is the one for the HWE kernel).
+- The same `xestrata --setup` (`check_level_zero`) stops the start when the Level Zero driver predates the build that stops it refusing device memory while the VRAM is free (26.22.38646.4; intel/compute-runtime #916, xe's kernel bug fixed in Linux 7.1; on XeStrata's side #34 and #15) on Ubuntu 24.04/26.04 with the HWE kernel (`--old-driver` starts anyway); on the GA kernel and elsewhere it only says so and goes on.
+
+### Writing and checking kernels
+
+- Write kernels that compile right either way: step a pointer by N from the last read (`glm5_hc_mean`), or index the stream in one product (`x[(t * HC + s) * N + n]`), not `xt[k * N]` with a constant k of 2 or more beside `xt[N]`.
+- To see what IGC makes of a kernel without running it, compile ahead for Xe2 with IGC's dumps on (`IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=dump clang++ -fsycl -fsycl-targets=intel_gpu_bmg_g31 ...`) and read `dump/*_entry_*.asm`: the miscompile shows as a scalar `mul ... 0x1C:uw` (28N: the 32N bytes of the misread `xt[8 * N]`, less the 4N of `xt[N]`) ahead of the loads; `*_beforeUnification.ll` is the IR IGC received.
+- `IGC_EnableGEPSimplification=1 ./igc_gep_probe` runs the pattern on the GPU with room for the wrong reads and fails on an affected IGC; CTest runs it through the runtime's workaround, where it passes on every GPU.
+
 ## Measuring the GPU
 
 ### What works without extra tools
 
-- The engine's own timings: `STRATA_PREFILL_TIMING=1` for the prefill path.
+- The engine's own timings: `XESTRATA_PREFILL_TIMING=1` for the prefill path.
   The decode's `verify window` line (the host's wait for the GPU, the CPU pool) is always printed.
-- `STRATA_VERIFY_NODES=1` prints how many kernels a decode window's graph holds.
+- `XESTRATA_VERIFY_NODES=1` prints how many kernels a decode window's graph holds.
 - Scratch probes that time single kernels with SYCL event profiling.
 - `STRATA_VERIFY_PROFILE=1` prints the stages of a decode window's layers (device clock ticks) on the `verify profile` line of `--stats`; in serve it is the `strata decode GPU stages` line of the engine's log, one a request.
   Level Zero does not report the device clock aspect on the B70, but its compiler runs SPIR-V's OpReadClockKHR, so the engine builds the stamp kernel once at start and uses it where that works (NVIDIA: %globaltimer; AMD: no profile).

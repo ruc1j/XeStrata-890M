@@ -38,6 +38,18 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
 /// is written while the last row's selection is every cell (n_kv <= width): qsa_block_topk then reads no score.
 void qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
                            int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
+/// The same with each row's own indexer keys (a batch window: a slot's pooled blocks and dead key; upstream
+/// 7a9245b6c).  `rows.n` must be nq; every row's keys are read for its own blocks only.
+struct QsaScoreRows {
+    const float* pooled[kQsaRowsMax] = {};
+    const float* dead[kQsaRowsMax] = {};
+    int n = 0;
+};
+void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
+/// Whether the one-launch form beats a qsa_block_scores call a row on this device for `n_rows` rows of `blocks`
+/// blocks (timed once per device and shape on dummy keys; the caller's own choice).
+bool qsa_rows_pays(int n_rows, int64_t blocks, const QsaShapes& s, void* stream);
 
 /// The same scores on tensor cores (3xTF32, FP32-level accuracy but another summation order: not bitwise; the tail
 /// block n_bid is the warp kernel's arithmetic). For the prompt path; false (nothing launched) on another geometry.
@@ -54,6 +66,12 @@ bool qsa_block_scores_wmma(const float* pooled, const float* dead, const float* 
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream);
+/// Select complete blocks up to the token budget, plus all causal cells in the query's current block.
+/// The latter includes a just-completed block even when it was not in the ranked set. Updates each step's width;
+/// ids need a capacity of at least idx_top_k + idx_block cells per query.
+void qsa_block_topk_with_current(const float* scores, int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
+                                 const QsaShapes& s, int32_t* ids, void* stream);
+
 /// The original kernel (keys read from memory on every radix pass), for tests: the same ids.
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                         const QsaShapes& s, int32_t* ids, void* stream);

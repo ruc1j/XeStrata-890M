@@ -9,9 +9,14 @@
 #include <condition_variable>
 #include <exception>
 #include <list>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <typeindex>
+#include <unordered_map>
 
 namespace strata::core {
 
@@ -23,9 +28,23 @@ bool integrated_gpu(const sycl::device& d);
 bool kfd_igpu_class();
 /// Whether an engine GPU runs on the HIP backend (AMD; the KFD counters of gpu_pause_time.hpp are read only then).
 bool hip_backend();
+/// The device's free memory as its runtime reports it, or for a GPU of the xe driver whose runtime cannot say, as the
+/// driver does.  False when neither knows.
+bool device_free_memory(const sycl::device& d, uint64_t& free);
 /// The version of the Intel Graphics Compiler whose GEP simplification the runtime turned off for the engine's
 /// Level Zero GPU ("2.28.4"; "unknown" when the library carries none), empty when it did not (src/core/device.cpp).
 std::string compiler_workaround();
+/// Whether a Linux kernel's release (uname's) is one whose drm/pagemap frees a page the xe driver's SVM moved back
+/// to RAM with the moved flag still set (Ubuntu's 7.0.0 from ABI 40 on until the build with the fix; src/core/device.cpp).
+/// The engine works around nothing: it tells the user to leave the kernel (svm_workaround's notice).
+bool svm_broken_kernel(const char* release);
+/// The kernel's release the engine tells the user to leave ("7.0.0-43-generic"), empty when there is nothing to
+/// tell: Linux, svm_broken_kernel's release, and an xe GPU (src/core/device.cpp).  The start log, the web app's
+/// notice and About, and xestrata --setup say it.
+std::string svm_workaround();
+/// Ends the process on SIGTERM and SIGINT after the GPUs' queues are drained (at most 5 s), on a thread of its own; called
+/// first in main, before any thread exists (src/core/device.cpp).
+void route_stop_signals();
 
 // One runtime per engine device: its context owns its queues and every USM allocation made on it. Cross-queue
 // consumers must depend on the producer event; in-order applies within a queue.  Device 0 is the GPU find_devices
@@ -48,6 +67,8 @@ public:
     sycl::queue& transfer() { return transfer_; }
     const sycl::device& device() const { return device_; }
     const sycl::context& context() const { return context_; }
+    /// Free device memory read immediately before this runtime created its context, where the device reports it.
+    std::optional<uint64_t> free_before_context() const { return free_before_context_; }
 
     // Engine streams: further in-order queues on this context, for the work CUDA put on its own streams.  A void*
     // stream handed to a kernel is one of these, compute() or null (compute()), or a queue of another device's
@@ -63,17 +84,49 @@ public:
     std::string device_status();
     void destroy_stream(sycl::queue* stream);
     sycl::queue& stream(void* stream);
+    /// The runtime that owns `q` (its compute, transfer or an engine stream); throws where none does.
+    static Runtime& of_queue(sycl::queue& q);
+    // A belonging tied to a queue's life (a kernel's scratch, a library's stream on it): made on the queue's first
+    // use, held by this runtime, and destroyed once the queue is drained when its stream is destroyed
+    // (destroy_stream) or the runtime ends.  A queue's address is reused after its destruction; an item keyed by the
+    // bare address would outlive it and meet the next queue there, so the items go with the queue itself.  T is built
+    // with the queue (T(sycl::queue&), keeping its own copy where its destructor frees GPU memory) and the queue is
+    // idle when T's destructor runs.  The lookup is locked; two threads using the T itself synchronize as they would
+    // any shared state (a mutex in T).  The queue must be this runtime's (of_queue).
+    template <class T> T& queue_item(sycl::queue& q) {
+        std::lock_guard<std::mutex> lock(items_mutex_);
+        auto& slot = items_[&q][std::type_index(typeid(T))];
+        if (!slot) slot.reset(new Item<T>(q));
+        return static_cast<Item<T>*>(slot.get())->value;
+    }
 
     sycl::event copy_async(void* dst, const void* src, uint64_t bytes,
                            const std::vector<sycl::event>& dependencies = {});
     sycl::event compute_after(const std::vector<sycl::event>& dependencies);
+    // Watches the host submission itself: some backends can block inside an asynchronous copy call.
+    // `what` must outlive the watch.
+    class CopyWatch {
+    public:
+        CopyWatch(Runtime& runtime, const char* what, uint64_t bytes, int layer = -1);
+        ~CopyWatch();
+        CopyWatch(const CopyWatch&) = delete;
+        CopyWatch& operator=(const CopyWatch&) = delete;
+    private:
+        Runtime& runtime_;
+        void* entry_;
+    };
     // `what` names the wait in the watchdog's report; it must outlive the call.
     void wait(sycl::event event, const char* what = "event");
     void finish(sycl::queue& queue);
     // Drains compute, transfer and every engine stream.
     void finish();
-    // finish() on every runtime made so far (it makes none), errors ignored: before the process ends on a signal.
+    // Drains every queue of every runtime made so far (it makes none) before the process ends, going on past a queue
+    // that fails or records a graph and saying which on stderr.
     static void finish_all() noexcept;
+    // The stop signal's drain (route_stop_signals): holds every other thread at its next engine wait or submission,
+    // then drains as finish_all until every queue is idle, for at most `limit`, and on Linux waits (at most 200 ms)
+    // for the process's GPU engine counters to stand still.  Whether all were drained.
+    static bool drain_for_stop(std::chrono::milliseconds limit) noexcept;
     // Exceptional teardown cannot unwind past memory still in use by the GPU.
     void free(void* pointer) noexcept;
     // Builds every kernel the binary carries for the device, on a thread of its own (the program: strata generate),
@@ -83,6 +136,8 @@ public:
     void preload_kernels();
     // Waits for preload_kernels' thread to end (timings taken beside it read its CPU work as theirs).
     void wait_preload() { if (preload_.joinable()) preload_.join(); }
+    // wait_preload() on every runtime made so far (it makes none): before a timing of the CPU beside them.
+    static void wait_preload_all();
     // Stops it after the kernel it is building, and waits.  Before main returns: exit() tears the GPU compiler (IGC)
     // down before the runtimes, and a build still running in it then hung or crashed the engine at QUIT.
     void stop_preload() {
@@ -97,21 +152,36 @@ private:
     struct Waiter {
         std::chrono::steady_clock::time_point since;
         const char* what;
+        uint64_t bytes = 0;
+        std::chrono::steady_clock::time_point reported{};
+        bool copy = false;
+        int layer = -1;
     };
     Runtime(int ordinal, const sycl::device& device);
     void check_async();
+    static bool drain_pass(bool& failed, bool quiet) noexcept;
     sycl::async_handler handler();
     bool owns(const sycl::queue* queue);
     void watch();
     bool measure_marks();
     int ordinal_;
+    std::string pci_;
     std::mutex error_mutex_;
     std::exception_ptr error_;
     sycl::device device_;
+    std::optional<uint64_t> free_before_context_;
     sycl::context context_;
     sycl::queue compute_, transfer_;
     std::mutex streams_mutex_;
     std::list<sycl::queue> streams_;
+    // the queues' belongings (queue_item), destroyed before the queues and the context they free memory on
+    struct ItemBase { virtual ~ItemBase() = default; };
+    template <class T> struct Item : ItemBase {
+        explicit Item(sycl::queue& q) : value(q) {}
+        T value;
+    };
+    std::mutex items_mutex_;
+    std::unordered_map<const sycl::queue*, std::map<std::type_index, std::unique_ptr<ItemBase>>> items_;
     std::mutex watch_mutex_;
     std::condition_variable watch_cv_;
     std::list<Waiter> waiters_;

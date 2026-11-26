@@ -10,8 +10,10 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
 import os
 import queue
+import re
 import shutil
 import socket
 import sys
@@ -28,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite,  # noqa: E402
                           MockEngine,
-                          PP_DONE_TAIL, Service,
+                          PP_DONE_TAIL, REPLIES, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
                           parse_multipart, prompt_tokens_seen, request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
@@ -128,14 +130,14 @@ class MaxTokens(unittest.TestCase):
         self.assertEqual(b["input_tokens"], n_in)
 
     def test_request_line_parses_the_engine_summary(self):
-        line = ("strata serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
+        line = ("xestrata serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
                 "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
         from serve.server import ENGINE_REQUEST
         m = ENGINE_REQUEST.search(line)
         self.assertIsNotNone(m)
         self.assertEqual((m["prompt"], m["reused"], m["gen"], m["tg"]), ("1200", "1000", "30", "100.0"))
         # #471: a request cancelled while its prompt was read says how far it got
-        m = ENGINE_REQUEST.search("strata serve: prompt 98179 tokens = 0 reused + 12288 of 98179 read in 17565 ms "
+        m = ENGINE_REQUEST.search("xestrata serve: prompt 98179 tokens = 0 reused + 12288 of 98179 read in 17565 ms "
                                   "(699.6 tok/s), 0 generated in 0 ms (0.0 tok/s), drafts accepted 0 of 0, "
                                   "0 checkpoints (cancelled)")
         self.assertIsNotNone(m)
@@ -269,7 +271,7 @@ class MaxTokens(unittest.TestCase):
     def test_debug_log_shows_the_resolved_budget(self):
         import contextlib
         import io
-        os.environ["STRATA_DEBUG"] = "1"
+        os.environ["XESTRATA_DEBUG"] = "1"
         try:
             for api in ("openai",):                 # (Anthropic's max_tokens is required: no unset budget there)
                 with self.subTest(api=api):
@@ -278,7 +280,7 @@ class MaxTokens(unittest.TestCase):
                         _, _, pt, _ = self.call(api, max_tokens=-1)
                     self.assertIn(f"max_new={CTX - CTX_SLACK - pt} ", out.getvalue())
         finally:
-            del os.environ["STRATA_DEBUG"]
+            del os.environ["XESTRATA_DEBUG"]
 
 
 class FitMaxTokens(unittest.TestCase):
@@ -754,7 +756,7 @@ class VisionWorkDir(unittest.TestCase):
 
         pipe = Pipe()
         v = Vision.__new__(Vision)
-        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="strata-vision-test-")), threading.Lock(), {}
+        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="xestrata-vision-test-")), threading.Lock(), {}
         v.proc = mock.Mock(stdin=pipe, stdout=mock.Mock(readline=lambda: "OK 7 1 1 1\n"))
         v.dead, v._line = None, lambda timeout: "OK 7 1 1 1\n"
         try:
@@ -798,7 +800,7 @@ class VisionWorkDir(unittest.TestCase):
             err.winerror = code
             with self.subTest(winerror=code), mock.patch.object(subprocess, "Popen", side_effect=err):
                 with self.assertRaises(OSError) as cm:
-                    popen("the image encoder", ["strata-vision.exe"])
+                    popen("the image encoder", ["xestrata-vision.exe"])
                 self.assertIn("Smart App Control", str(cm.exception))
                 self.assertIn("--vision no", str(cm.exception))
         with mock.patch.object(subprocess, "Popen", side_effect=FileNotFoundError("gone")):
@@ -823,22 +825,20 @@ class ListenProblem(unittest.TestCase):
         self.assertIn("10.9.9.9 is not an address of this PC", text)
         self.assertNotIn("already in use", text)
 
-    def test_denied_text_follows_the_platform_0213_f12(self):
-        """F12: Linux and macOS must not blame Windows port reservations or a firewall rule."""
+    def test_a_denied_port_names_the_cause_of_that_system(self):
+        """upstream 8768e95f: Windows keeps ranges of ports for Hyper-V, WSL and Docker; Linux and macOS keep none, and
+        what does not let the server listen there is a port below 1024."""
         import errno
-        from unittest import mock
         from serve.server import listen_problem
-        e = OSError(errno.EACCES, "Permission denied")
-        with mock.patch("serve.server.sys.platform", "win32"):
-            win = listen_problem("127.0.0.1", 80, e)
+        win = listen_problem("127.0.0.1", 80, OSError(errno.EACCES, "denied"), windows=True)
         self.assertIn("Windows may keep this port for itself", win)
-        self.assertIn("netsh int ipv4 show excludedportrange protocol=tcp", win)
-        for plat in ("linux", "darwin"):
-            with mock.patch("serve.server.sys.platform", plat):
-                other = listen_problem("127.0.0.1", 80, e)
-            self.assertIn("This system does not allow it (on Linux and macOS, ports below 1024 need administrator "
-                          "rights): start this one with a different --port", other)
-            self.assertNotIn("Windows", other)
+        self.assertIn("excludedportrange", win)
+        for port in (80, 8080):
+            other = listen_problem("127.0.0.1", port, OSError(errno.EACCES, "denied"), windows=False)
+            self.assertIn(f"does not let XeStrata use port {port}", other)
+            self.assertIn("ports below 1024 need administrator rights", other)
+            self.assertIn("different --port, for example 8801", other)
+            self.assertNotIn("Hyper-V", other)
             self.assertNotIn("netsh", other)
 
 
@@ -1188,7 +1188,7 @@ class ConfigApiKey(unittest.TestCase):
         err = io.StringIO()
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ), \
                 mock.patch.object(S, "serve", fake_serve), mock.patch.object(sys, "stderr", new=err):
-            os.environ.pop("STRATA_API_KEY", None)
+            os.environ.pop("XESTRATA_API_KEY", None)
             p = Path(d) / "cfg.json"
             p.write_text(json.dumps(cfg), encoding="utf-8")
             with mock.patch.object(sys, "argv", ["server.py", "--engine", "mock", "--port", "0", "--config", str(p)]):
@@ -1848,7 +1848,7 @@ class ClientShapes(unittest.TestCase):
                 pass
 
         v = Vision.__new__(Vision)
-        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="strata-vision-test-")), threading.Lock(), {}
+        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="xestrata-vision-test-")), threading.Lock(), {}
         v.proc, v.dead = mock.Mock(stdin=Gone()), None
         with mock.patch.object(Vision, "load", return_value=b""), \
                 mock.patch.object(Vision, "normalize", return_value=b"png"):
@@ -2172,6 +2172,16 @@ class SharedPrefix(unittest.TestCase):
 
 class GpuChoice(unittest.TestCase):
     """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
+
+    def test_route_tail_default_respects_explicit_environment(self):
+        from serve.server import child_env
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(child_env({"route_tail_skip_default": 0})["XESTRATA_ROUTE_TAIL_SKIP"], "0")
+            self.assertNotIn("XESTRATA_ROUTE_TAIL_SKIP", child_env({}))
+            env = child_env({"route_tail_skip_default": 0, "env": {"XESTRATA_ROUTE_TAIL_SKIP": "7"}})
+            self.assertEqual(env["XESTRATA_ROUTE_TAIL_SKIP"], "7")
+        with mock.patch.dict(os.environ, {"XESTRATA_ROUTE_TAIL_SKIP": "7"}, clear=True):
+            self.assertEqual(child_env({"route_tail_skip_default": 0})["XESTRATA_ROUTE_TAIL_SKIP"], "7")
 
     def test_env(self):
         from serve.server import child_env
@@ -2664,15 +2674,16 @@ class VisionSection(unittest.TestCase):
 
     def test_a_vision_section_starts_the_engine_with_images_1322(self):
         args = ["--native", "x"]
-        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": True}})
+        off = {"vram_elastic": False, "session_save_reclaim": False}            # this test's arguments alone
+        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": True}, **off})
         self.assertEqual(got, args + ["--vision", "--vram-reserve-mib", "700"])
-        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": False}})
+        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": False}, **off})
         self.assertEqual(got, args + ["--vision"])
         mine = args + ["--vram-reserve-mib", "1500"]
-        self.assertEqual(engine_args({"args": list(mine), "vision": {"gpu": True}}), mine + ["--vision"])
+        self.assertEqual(engine_args({"args": list(mine), "vision": {"gpu": True}, **off}), mine + ["--vision"])
         done = args + ["--vision", "--vram-reserve-mib", "700"]                  # setup wrote it: unchanged
-        self.assertEqual(engine_args({"args": list(done), "vision": {"gpu": True}}), done)
-        self.assertEqual(engine_args({"args": list(args)}), args)                # no section: no images
+        self.assertEqual(engine_args({"args": list(done), "vision": {"gpu": True}, **off}), done)
+        self.assertEqual(engine_args({"args": list(args), **off}), args)        # no section: no images
 
 
 class LayerSplit(unittest.TestCase):
@@ -2680,7 +2691,7 @@ class LayerSplit(unittest.TestCase):
     not."""
 
     def cfg(self, split, gpus=(2, 0, 1, 3)):
-        c = {"args": ["--native", "x"], "gpu": list(gpus)}
+        c = {"args": ["--native", "x"], "gpu": list(gpus), "session_save_reclaim": False}
         if split is not ...:
             c["layer_split"] = split
         return c
@@ -2704,8 +2715,8 @@ class LayerSplit(unittest.TestCase):
             self.assertIn('"12,24,36"', str(e.exception))   # the example for 4 GPUs
 
     def test_one_gpu_ignores_it(self):
-        self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": [0], "layer_split": "24,16"}),
-                         ["--native", "x"])
+        self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": [0], "layer_split": "24,16",
+                                      "session_save_reclaim": False}), ["--native", "x"])
 
 
 class DesktopVramNote(unittest.TestCase):
@@ -2734,9 +2745,45 @@ class DesktopVramNote(unittest.TestCase):
             self.assertFalse(server.linux_desktop({}))
 
 
+class DraftCosts(unittest.TestCase):
+    """"draft_costs": true in the config: --draft-costs <folder>/<model>-<hash>.costs and the engine file's size as
+    --draft-costs-key; off without the key or with false (the default on every GPU); an engine program seen without
+    the option is not given it (upstream bb21ee1f5, a32d1b368, 1b11a76e8)."""
+
+    def run_args(self, **cfg):
+        from serve import server
+        base = {"args": ["--native", "m.gguf", "--spec", "4"], "model_name": "qwen3.8/iq3",
+                "session_save_reclaim": False, "expert_profile_save": False}
+        base.update(cfg)
+        return server.engine_args(base)
+
+    def test_off_by_default(self):
+        self.assertNotIn("--draft-costs", self.run_args())
+        self.assertNotIn("--draft-costs", self.run_args(draft_costs=False))
+
+    def test_on_names_a_file_per_model_and_arguments(self):
+        d = Path(tempfile.mkdtemp())
+        exe = d / "xestrata-engine"
+        exe.write_bytes(b"\0 --draft-costs FILE \0")
+        with mock.patch.dict(os.environ, {"XESTRATA_DRAFT_COSTS_DIR": str(d / "dc")}):
+            got = self.run_args(draft_costs=True, exe=str(exe))
+            other = self.run_args(draft_costs=True, exe=str(exe), args=["--native", "m.gguf", "--spec", "6"])
+        i = got.index("--draft-costs")
+        self.assertTrue(got[i + 1].startswith(str(d / "dc" / "qwen3.8-iq3-")) and got[i + 1].endswith(".costs"))
+        self.assertEqual(got[i + 2:i + 4], ["--draft-costs-key", f"engine file {exe.stat().st_size} bytes"])
+        self.assertNotEqual(other[other.index("--draft-costs") + 1], got[i + 1])
+
+    def test_an_engine_without_the_option_is_not_given_it(self):
+        d = Path(tempfile.mkdtemp())
+        exe = d / "old-engine"
+        exe.write_bytes(b"\0 --draft-rule \0")
+        self.assertNotIn("--draft-costs", self.run_args(draft_costs=True, exe=str(exe)))
+
+
 class LearnedProfile(unittest.TestCase):
     """#477: "expert_profile_save" in the config: the engine saves its learned profile there, and the next start
-    begins from it when it is a profile of the same model; without the key the arguments are unchanged."""
+    begins from it when it is a profile of the same model; without the key expert-profile-<model>.bin, and false
+    leaves the arguments unchanged."""
 
     def write(self, path, nl=48, ne=512, n=4):
         sys.path.insert(0, str(ROOT / "tools"))
@@ -2748,16 +2795,19 @@ class LearnedProfile(unittest.TestCase):
         finally:
             make_profile.N_LAYER = old
 
-    def test_without_the_key_nothing_changes(self):
+    def test_without_the_key_the_model_s_file_and_false_nothing(self):
         args = ["--native", "x", "--expert-profile", "data/expert-profile.bin", "--adapt-every", "4"]
-        self.assertEqual(engine_args({"args": list(args)}), args)
-        self.assertEqual(engine_args({"args": list(args), "expert_profile_save": ""}), args)
+        base = {"session_save_reclaim": False}
+        self.assertEqual(engine_args({"args": list(args), "model_name": "qwen3.8/iq3", **base}),
+                         args + ["--expert-profile-save", "expert-profile-qwen3.8_iq3.bin"])
+        self.assertEqual(engine_args({"args": list(args), "expert_profile_save": False, **base}), args)
+        self.assertEqual(engine_args({"args": list(args), "expert_profile_save": "", **base}), args)
 
     def test_save_and_start_from_it(self):
         d = Path(tempfile.mkdtemp())
         self.write(d / "base.bin")
         cfg = {"args": ["--expert-profile", "base.bin"], "cwd": str(d), "expert_profile_save": "learned.bin",
-               "expert_profile_save_every": 5}
+               "expert_profile_save_every": 5, "session_save_reclaim": False}
         # nothing saved yet: the config's profile, and the engine is told where to save
         self.assertEqual(engine_args(cfg), ["--expert-profile", "base.bin", "--expert-profile-save", "learned.bin",
                                             "--expert-profile-save-every", "5"])
@@ -2772,7 +2822,7 @@ class LearnedProfile(unittest.TestCase):
         self.assertEqual(engine_args(cfg)[:2], ["--expert-profile", "base.bin"])
 
     def test_no_profile_in_the_args(self):
-        cfg = {"args": ["--native", "x"], "expert_profile_save": "learned.bin"}
+        cfg = {"args": ["--native", "x"], "expert_profile_save": "learned.bin", "session_save_reclaim": False}
         self.assertEqual(engine_args(cfg), ["--native", "x", "--expert-profile-save", "learned.bin"])
 
 
@@ -2912,24 +2962,24 @@ class DraftHeadHint(unittest.TestCase):
         return str(p), len(before.encode())
 
     def test_the_engines_hint_is_relayed(self):
-        p, off = self.log("strata mtp: the draft head over 106299 tokens needs 348 MiB of VRAM and 120 MiB is free.\n"
-                          "strata mtp: hint: a smaller draft vocabulary needs less VRAM: --draft-vocab en (...)\n"
-                          "strata serve: mtp: the draft head does not fit\n")
+        p, off = self.log("xestrata mtp: the draft head over 106299 tokens needs 348 MiB of VRAM and 120 MiB is free.\n"
+                          "xestrata mtp: hint: a smaller draft vocabulary needs less VRAM: --draft-vocab en (...)\n"
+                          "xestrata serve: mtp: the draft head does not fit\n")
         h = start_failure_hint(p, off)
         self.assertIn("the draft head does not fit", h)
         self.assertIn("348 MiB", h)
         self.assertIn("--draft-vocab en", h)
 
     def test_an_older_engine_gets_the_advice_in_words(self):
-        p, off = self.log("strata serve: mtp: the draft head does not fit\n")
+        p, off = self.log("xestrata serve: mtp: the draft head does not fit\n")
         self.assertIn("--draft-vocab en", start_failure_hint(p, off))
 
     def test_other_failures_and_earlier_starts_add_nothing(self):
-        p, off = self.log("strata serve: cannot open the pack\n")
+        p, off = self.log("xestrata serve: cannot open the pack\n")
         self.assertEqual(start_failure_hint(p, off), "")
         # an earlier start's failure (before this start's offset) is not this one's
-        p, off = self.log("strata serve: cannot open the pack\n",
-                          before="strata serve: mtp: the draft head does not fit\n")
+        p, off = self.log("xestrata serve: cannot open the pack\n",
+                          before="xestrata serve: mtp: the draft head does not fit\n")
         self.assertEqual(start_failure_hint(p, off), "")
         self.assertEqual(start_failure_hint(None, 0), "")
         self.assertEqual(start_failure_hint(str(Path(tempfile.mkdtemp()) / "missing.log"), 0), "")
@@ -2942,9 +2992,9 @@ class StartFailureLog(unittest.TestCase):
         from serve.server import start_log_tail
         d = tempfile.mkdtemp()
         p = Path(d) / "engine.log"
-        before = "strata serve: an earlier start's line\n"
-        p.write_text(before + "".join(f"strata serve: line {i}\n" for i in range(30)) + "\n"
-                     "strata serve: cannot open the pack\n", encoding="utf-8")
+        before = "xestrata serve: an earlier start's line\n"
+        p.write_text(before + "".join(f"xestrata serve: line {i}\n" for i in range(30)) + "\n"
+                     "xestrata serve: cannot open the pack\n", encoding="utf-8")
         tail = start_log_tail(str(p), len(before.encode()))
         self.assertIn("the engine log's last lines:", tail)
         self.assertIn("cannot open the pack", tail)
@@ -2960,7 +3010,7 @@ class StartFailureLog(unittest.TestCase):
 
     def test_the_start_error_has_them(self):
         import serve.server as server
-        fake = "import sys\nsys.stderr.write('strata serve: cannot open the pack packs/x\\n')\nsys.exit(2)\n"
+        fake = "import sys\nsys.stderr.write('xestrata serve: cannot open the pack packs/x\\n')\nsys.exit(2)\n"
         with tempfile.TemporaryDirectory() as d:
             script, log = Path(d) / "fake_strata.py", Path(d) / "strata.log"
             script.write_text(fake, encoding="utf-8")
@@ -3008,14 +3058,14 @@ class StartNarrator(unittest.TestCase):
         return out.getvalue()
 
     def test_a_mapped_start(self):
-        said = self.narrate(["--mmap-experts"], ["strata generate: experts via mmap (--mmap-experts; the GGUF shards "
+        said = self.narrate(["--mmap-experts"], ["xestrata generate: experts via mmap (--mmap-experts; the GGUF shards "
                                                  "in place, no experts.bin)"])
         self.assertIn("mapping the experts from the model files", said)
         self.assertNotIn("loading the experts into RAM", said)
 
     def test_an_arena_start(self):
-        said = self.narrate([], ["strata generate: expert arena: resident, 31.64 GiB",
-                                 "strata generate: loaded 31.64 GiB at 3.17 GiB/s"])
+        said = self.narrate([], ["xestrata generate: expert arena: resident, 31.64 GiB",
+                                 "xestrata generate: loaded 31.64 GiB at 3.17 GiB/s"])
         self.assertIn("loading the experts into RAM (tens of GB)", said)
         self.assertIn("experts loaded: 31.64 GiB at 3.17 GiB/s", said)
 
@@ -3228,6 +3278,118 @@ class LiveRate(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+class KeptReplies(unittest.TestCase):
+    """A web app's reply (xestrata_reply) lives on past its connection: a client whose connection broke reads the rest
+    again (GET /v1/xestrata/replies/<id>), and only its own cancel stops it (the web app's Stop)."""
+
+    TOKENS = 120
+    PACE_S = 0.01                    # about 1.2 s for the whole answer
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = MockEngine(self.tok, "y" * self.TOKENS, max_context=CTX, delay_s=self.PACE_S)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.port = self.httpd.server_address[1]
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def request(self, method, path, body=None):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        c.request(method, path, json.dumps(body) if body is not None else None, {"Content-Type": "application/json"})
+        return c, c.getresponse()
+
+    def chat(self, rid):
+        return self.request("POST", "/v1/chat/completions", {"model": "m", "stream": True,
+                                                             "xestrata_reply": {"id": rid},
+                                                             "messages": [{"role": "user", "content": "hi"}]})
+
+    @staticmethod
+    def text(raw):
+        out = ""
+        for line in raw.split(b"\n"):
+            if line.startswith(b"data: {"):
+                for ch in json.loads(line[6:]).get("choices", []):
+                    d = ch.get("delta") or {}
+                    out += (d.get("content") or "") + (d.get("reasoning_content") or "")
+        return out
+
+    def test_a_dropped_connection_reads_the_rest_again(self):
+        c, r = self.chat("kept-drop-0001")
+        r.read1(1024)                                    # the start of the answer, then the connection breaks
+        c.close()
+        reply = REPLIES.get("kept-drop-0001")
+        t0 = time.time()
+        while not reply.done and time.time() - t0 < 10:
+            time.sleep(0.02)
+        self.assertTrue(reply.done)                      # made to the end without its client
+        c, r = self.request("GET", "/v1/xestrata/replies/kept-drop-0001?from=0")
+        raw = r.read()
+        self.assertEqual(r.status, 200)
+        self.assertEqual(self.text(raw), "y" * self.TOKENS)
+        self.assertTrue(raw.rstrip().endswith(b"data: [DONE]"))
+        c.close()
+
+    def test_its_cancel_stops_it(self):
+        c, r = self.chat("kept-cancel-0001")
+        r.read1(256)
+        c2, r2 = self.request("POST", "/v1/xestrata/replies/kept-cancel-0001/cancel", {})
+        self.assertEqual(r2.status, 200)
+        self.assertEqual(json.loads(r2.read()), {"cancelled": True})
+        raw = r.read()                                   # the stream ends, short of the whole answer
+        self.assertTrue(raw.rstrip().endswith(b"data: [DONE]"))
+        self.assertLess(len(self.text(raw)), self.TOKENS)
+        c.close()
+        c2.close()
+
+    def test_ids(self):
+        c, r = self.chat("bad id!")
+        self.assertEqual(r.status, 400)
+        c.close()
+        c, r = self.request("GET", "/v1/xestrata/replies/no-such-reply-0001")
+        self.assertEqual(r.status, 404)
+        c.close()
+
+    def test_the_earlier_names(self):
+        """The names before XeStrata's own (strata_reply, /v1/strata/..., strata_images, X-Strata-Upload, STRATA_*)
+        reach what the new ones do."""
+        from serve import envvars
+        c, r = self.request("POST", "/v1/chat/completions", {"model": "m", "stream": True,
+                                                             "strata_reply": {"id": "kept-old-0001"},
+                                                             "messages": [{"role": "user", "content": "hi"}]})
+        r.read()
+        c.close()
+        c, r = self.request("GET", "/v1/strata/replies/kept-old-0001?from=0")
+        self.assertEqual((r.status, self.text(r.read())), (200, "y" * self.TOKENS))
+        c.close()
+        c, r = self.request("POST", "/v1/strata/replies/kept-old-0001/ack", {})
+        self.assertEqual(r.status, 200)
+        c.close()
+        for field in ("strata_images", "xestrata_images"):   # this server makes no images: the same refusal
+            c, r = self.request("POST", "/v1/chat/completions", {"model": "m", field: {"force": True},
+                                                                 "messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(r.status, 400)
+            self.assertIn("xestrata_images.force", json.loads(r.read())["error"]["message"])
+            c.close()
+        import http.client
+        seen = {}
+        for header in ("X-Strata-Upload", "X-XeStrata-Upload", None):   # the Video tab's form from the own page
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+            c.request("POST", "/v1/videos/files", b"--b--\r\n",
+                      {"Content-Type": "multipart/form-data; boundary=b", "Origin": f"http://127.0.0.1:{self.port}",
+                       **({header: "1"} if header else {})})
+            seen[header] = c.getresponse().status
+            c.close()
+        self.assertEqual(seen["X-Strata-Upload"], seen["X-XeStrata-Upload"])
+        self.assertEqual(seen[None], 415)                # without the header the form is refused
+        self.assertNotEqual(seen["X-Strata-Upload"], 415)
+        self.assertEqual(envvars.get("KVA", env={"STRATA_KVA": "1"}), "1")
+        self.assertEqual(envvars.get("KVA", env={"STRATA_KVA": "1", "XESTRATA_KVA": "0"}), "0")
 
 
 class PromptProgress(unittest.TestCase):
@@ -3816,7 +3978,7 @@ class WebApp(unittest.TestCase):
         try:
             props = json.loads(self.get("/props")[2])
             self.assertEqual(props["model_path"], engine.model_path)
-            self.assertEqual(props["build_info"], "Strata 0.1.21")
+            self.assertEqual(props["build_info"], "XeStrata 0.1.21")
             for busy in (True, False):
                 with self.svc.status_lock:
                     self.svc.status["busy"] = busy
@@ -4326,6 +4488,65 @@ class SharingTheGpu(unittest.TestCase):
     def test_off_by_default(self):
         self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
         self.assertEqual(self.req("/health")[1]["loaded"], True)
+
+    def _strict_hook(self, code: str):
+        self.svc.before_load = [sys.executable, "-c", code]
+        self.svc.before_load_strict = True
+        self.svc.unload()
+        return self._raw_chat()
+
+    def test_before_load_refusal_carries_the_commands_own_reason(self):
+        """#5987: a scheduler's launcher refuses with its own line; the 503 says that line, at once, with no start."""
+        status, headers, body = self._strict_hook(
+            "import sys; print('checking'); "
+            "print('no room on this server for 23500 MiB on GPU 0 and 76G of RAM: "
+            "the hold needs 76.0 GB', file=sys.stderr); "
+            "sys.exit(75)")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["message"],
+                         "no room on this server for 23500 MiB on GPU 0 and 76G of RAM: the hold needs 76.0 GB")
+        self.assertTrue(int(headers["Retry-After"]) > 0)
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_before_load_refusal_without_output_keeps_the_generic_sentence(self):
+        status, _, body = self._strict_hook("import sys; sys.exit(75)")
+        self.assertEqual(status, 503)
+        self.assertIn("the before_load command failed (it exited with code 75)", body["error"]["message"])
+        self.assertEqual(self.engine.starts, 0)
+
+    def test_before_load_reason_is_made_safe(self):
+        status, _, body = self._strict_hook(
+            "import sys; sys.stdout.write('first line\\n\\x1b[31mred \\x07alert\\ttab\\u200b\\x00 ' + 'x' * 400 "
+            "+ '\\n  \\n'); sys.exit(1)")
+        msg = body["error"]["message"]
+        self.assertEqual(status, 503)
+        self.assertLessEqual(len(msg), 300)
+        self.assertTrue(msg.startswith("[31mred alert tab ") and msg.endswith("..."), msg[:60])
+        self.assertFalse(any(ord(c) < 32 or 0x7f <= ord(c) < 0xa0 or c == "\u200b" for c in msg), repr(msg[:60]))
+        from serve.server import hook_reason
+        self.assertEqual(hook_reason(b"a\r\nb \x1b\x00 c\n"), "b c")
+        self.assertEqual(hook_reason(""), "")
+        self.assertEqual(hook_reason(None), "")
+        self.assertEqual(hook_reason("x" * 300), "x" * 300)
+        self.assertEqual(len(hook_reason("y" * 301)), 300)
+
+    def test_before_load_that_allows_loads_and_its_output_reaches_the_log(self):
+        status, _, _ = self._strict_hook("print('room reserved: 76.0 GB')")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.engine.starts, 1)
+
+    def test_before_load_stderr_line_wins_over_stdout(self):
+        # 台帳 0821: stdout と stderr を分けて読み、stderr の最後の非空行を理由にする
+        from serve.server import hook_reason, hook_text
+        self.assertEqual(hook_reason(b"progress\nlater progress\n", stderr=b"no room for 76G of RAM\n"),
+                         "no room for 76G of RAM")
+        self.assertEqual(hook_reason(b"progress\n", stderr=b"  \n"), "progress")
+        self.assertEqual(hook_text(b"\xff\xfe"), "\ufffd\ufffd")   # never raises on a bad byte
+        status, _, body = self._strict_hook(
+            "import sys; print('done checking', flush=True); "
+            "print('no room for 76G of RAM', file=sys.stderr, flush=True); sys.exit(1)")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"]["message"], "no room for 76G of RAM")
 
 
 class ThinkingEngine(MockEngine):
@@ -4879,21 +5100,20 @@ class ForcedToolChoice(unittest.TestCase):
 
     def test_undeclared_tool_calls_setting(self):
         from serve.server import undeclared_tool_calls_setting
-        old = os.environ.pop("STRATA_UNDECLARED_TOOL_CALLS", None)
+        old = os.environ.pop("XESTRATA_UNDECLARED_TOOL_CALLS", None)
         try:
             self.assertEqual(undeclared_tool_calls_setting({}), "text")
             self.assertEqual(undeclared_tool_calls_setting({"undeclared_tool_calls": "call"}), "call")
-            os.environ["STRATA_UNDECLARED_TOOL_CALLS"] = "call"
+            os.environ["XESTRATA_UNDECLARED_TOOL_CALLS"] = "call"
             self.assertEqual(undeclared_tool_calls_setting({}), "call")
-            # the config wins
-            self.assertEqual(undeclared_tool_calls_setting({"undeclared_tool_calls": "text"}), "text")
+            self.assertEqual(undeclared_tool_calls_setting({"undeclared_tool_calls": "text"}), "text")   # config wins
             for bad in ("yes", True, 1):
                 with self.assertRaises(SystemExit):
                     undeclared_tool_calls_setting({"undeclared_tool_calls": bad})
         finally:
-            os.environ.pop("STRATA_UNDECLARED_TOOL_CALLS", None)
+            os.environ.pop("XESTRATA_UNDECLARED_TOOL_CALLS", None)
             if old is not None:
-                os.environ["STRATA_UNDECLARED_TOOL_CALLS"] = old
+                os.environ["XESTRATA_UNDECLARED_TOOL_CALLS"] = old
 
     def test_no_marker_when_nothing_was_rejected(self):
         """An ordinary answer and a declared call carry no extra field: the API is what it was."""
@@ -5374,6 +5594,29 @@ class ModelAliases(unittest.TestCase):
             httpd.server_close()
 
 
+class IntelTelemetry(unittest.TestCase):
+    """A card with a product name in udev's PCI database is not named by the die in pci.ids."""
+
+    def test_name(self):
+        from serve import hardware, telemetry
+        with tempfile.TemporaryDirectory() as d:
+            dev = Path(d) / "0000:03:00.0"
+            dev.mkdir()
+            (dev / "vendor").write_text("0x8086\n")
+            (dev / "device").write_text("0xe223\n")
+            db = Path(d) / "pci.hwdb"
+            db.write_text("pci:v00008086d0000E223*\n ID_MODEL_FROM_DATABASE=Battlemage G31 [Arc Pro B70]\n")
+            ids = Path(d) / "pci.ids"
+            ids.write_text("8086  Intel Corporation\n\te223  Battlemage G31 [Intel Graphics]\n")
+            g = telemetry._XeGpu.__new__(telemetry._XeGpu)
+            g.dev, g.pci = str(dev), "0000:03:00.0"
+            with mock.patch.object(hardware, "UDEV_PCI_HWDB", (str(db),)):
+                self.assertEqual(g.name(), "Intel Arc Pro B70 at 0000:03:00.0")
+            with mock.patch.object(hardware, "UDEV_PCI_HWDB", ()), \
+                    mock.patch.object(telemetry, "PCI_IDS", (str(ids),)):
+                self.assertEqual(g.name(), "Intel Battlemage G31 [Intel Graphics] at 0000:03:00.0")
+
+
 class AmdTelemetry(unittest.TestCase):
     """upstream #301 and #1733: an AMD card's readings from a fake amdgpu sysfs tree, chosen by its PCI address."""
 
@@ -5415,6 +5658,26 @@ class AmdTelemetry(unittest.TestCase):
             self.assertTrue(telemetry._AmdGpu(None, sysfs=d).ok())                 # the first amdgpu card
         with tempfile.TemporaryDirectory() as d:                     # no amdgpu: nothing, and nothing breaks
             self.assertFalse(telemetry._AmdGpu(None, sysfs=d).ok())
+
+    def test_name_without_product_name(self):
+        """A board without product_name (no FRU EEPROM, the R9700 on a rented machine) is named from libdrm's
+        amdgpu.ids by device ID and revision, before the PCI ID list and the bare "AMD Radeon"."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            amd = Path(d) / "devices" / "pci0000:00" / "0000:00:01.0" / "0000:0a:00.0"
+            (amd / "product_name").unlink()
+            for name, text in (("vendor", "0x1002"), ("device", "0x7551"), ("revision", "0xc0")):
+                (amd / name).write_text(text + "\n")
+            ids = Path(d) / "amdgpu.ids"
+            ids.write_text("# device_id,\trevision_id,\tproduct_name\n1.0.0\n"
+                           "7551,\tC1,\tAMD Radeon AI Pro R9700S\n7551,\tC0,\tAMD Radeon AI PRO R9700\n")
+            g = telemetry._AmdGpu("0000:0a:00.0", sysfs=d)
+            with mock.patch.object(telemetry, "PCI_IDS", ()):
+                with mock.patch.object(telemetry, "AMDGPU_IDS", (str(Path(d) / "missing.ids"), str(ids))):
+                    self.assertEqual(g.name(), "AMD Radeon AI PRO R9700")
+                with mock.patch.object(telemetry, "AMDGPU_IDS", ()):
+                    self.assertEqual(g.name(), "AMD Radeon")
 
     def test_pcie_link_is_the_narrowest_slowest_hop(self):
         """#1733: the link is the slowest/narrowest hop between the root port and the card; the bottleneck is only
@@ -5503,7 +5766,7 @@ class SilentEngine(unittest.TestCase):
             next(gen)
         self.assertIsInstance(cm.exception, EngineDied)          # every EngineDied path handles it
         self.assertLess(time.monotonic() - t0, 5)
-        engine.proc.kill.assert_called_once()
+        engine.proc.terminate.assert_called_once()   # SIGTERM first: the engine drains its GPU queues
         self.assertFalse(engine.alive())                          # the next request restarts it
         self.assertIn("#481", engine.death_note())
         self.assertNotIn("STOP", engine.proc.stdin.getvalue())    # nothing is listening: no STOP, no drain
@@ -5533,14 +5796,14 @@ class SilentEngine(unittest.TestCase):
             self.assertIn("crashed", engine.death_note())
 
     def test_death_note_finds_the_watchdog_line_under_a_long_trace(self):
-        # #1705: STRATA_VERIFY_TRACE dumps (~30 KB) after the watchdog's line must not hide it
+        # #1705: XESTRATA_VERIFY_TRACE dumps (~30 KB) after the watchdog's line must not hide it
         import tempfile
         engine = self.bare(0.3)
         with tempfile.TemporaryDirectory() as d:
             engine.log_path = os.path.join(d, "e.log")
             with open(engine.log_path, "w", encoding="utf-8") as f:
-                f.write("strata serve: no progress for 60 s during a request (issue #29)\n")
-                f.write("strata verify trace: dump\n" * 1500)
+                f.write("xestrata serve: no progress for 60 s during a request (issue #29)\n")
+                f.write("xestrata verify trace: dump\n" * 1500)
             engine.proc.poll.return_value = -6
             self.assertIn("a hang it caught", engine.death_note())
 
@@ -5551,14 +5814,14 @@ class SilentEngine(unittest.TestCase):
         engine.lines.put("PP 100 300 1000 100.0")
         self.later(engine, 1.0, "PP 200 300 2000 100.0", "T 7", "DONE 1 300 2000 1 length")
         self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [None, None, 7])
-        engine.proc.kill.assert_not_called()
+        engine.proc.terminate.assert_not_called()
 
     def test_a_long_first_chunk_is_allowed(self):
         # 100 prompt tokens at the slowest prompt reading (50 tok/s): 2 s on top of the silence before the first PP
         engine = self.bare(0.3)
         self.later(engine, 1.0, "PP 100 100 1000 100.0", "DONE 0 100 1000 0 length")
         self.assertEqual(list(engine.generate([1] * 100, 10, {}, threading.Event())), [None])
-        engine.proc.kill.assert_not_called()
+        engine.proc.terminate.assert_not_called()
 
     def test_a_stop_never_acknowledged(self):
         from serve.server import EngineSilent
@@ -5569,7 +5832,7 @@ class SilentEngine(unittest.TestCase):
         with self.assertRaises(EngineSilent):
             gen.close()                                           # the consumer stopped: STOP, then the drain
         self.assertIn("STOP", engine.proc.stdin.getvalue())
-        engine.proc.kill.assert_called_once()
+        engine.proc.terminate.assert_called_once()   # SIGTERM first: the engine drains its GPU queues
         self.assertFalse(engine.alive())
 
     def test_frozen_engine_is_ended_by_the_stall_watchdog(self):
@@ -5587,7 +5850,7 @@ class SilentEngine(unittest.TestCase):
                 next(gen)
         self.assertLess(time.monotonic() - t0, 10)
         self.assertIn("frozen", str(cm.exception))
-        engine.proc.kill.assert_called_once()
+        engine.proc.terminate.assert_called_once()   # SIGTERM first: the engine drains its GPU queues
 
     def test_a_working_silent_engine_is_not_ended_by_the_stall_watchdog(self):
         from serve import server
@@ -5597,7 +5860,7 @@ class SilentEngine(unittest.TestCase):
         self.later(engine, 3.0, "T 7", "DONE 1 1 1 1 length")
         with mock.patch.object(server, "ENGINE_STALL_S", 1.0):
             self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [7])
-        engine.proc.kill.assert_not_called()
+        engine.proc.terminate.assert_not_called()
 
     def test_a_busy_gpu_is_not_a_frozen_engine(self):
         # #1317: no CPU and no disk, but the GPU is at work (a long prompt chunk on a slow card): not ended
@@ -5608,7 +5871,7 @@ class SilentEngine(unittest.TestCase):
         self.later(engine, 2.5, "T 7", "DONE 1 1 1 1 length")
         with mock.patch.object(server, "ENGINE_STALL_S", 1.0):
             self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [7])
-        engine.proc.kill.assert_not_called()
+        engine.proc.terminate.assert_not_called()
 
     def test_no_reading_means_no_kill_and_zero_is_off(self):
         from serve import server
@@ -5618,7 +5881,7 @@ class SilentEngine(unittest.TestCase):
             self.later(engine, 2.5, "T 7", "DONE 1 1 1 1 length")
             with mock.patch.object(server, "ENGINE_STALL_S", stall):
                 self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [7])
-            engine.proc.kill.assert_not_called()
+            engine.proc.terminate.assert_not_called()
 
     def test_engine_frozen_samples(self):
         from serve.server import engine_frozen
@@ -6186,7 +6449,9 @@ class AnswerBeforeTheBody(unittest.TestCase):
                          "HTTP/1.0 403 Forbidden")
 
     def test_a_method_with_no_handler(self):
-        self.assertEqual(self.status("PUT", "/v1/chat/completions"), "HTTP/1.0 501 Unsupported method ('PUT')")
+        self.assertEqual(self.status("PATCH", "/v1/chat/completions"), "HTTP/1.0 501 Unsupported method ('PATCH')")
+        # PUT has a handler now (the LoRA captions): an unknown path is its 404
+        self.assertEqual(self.status("PUT", "/v1/chat/completions"), "HTTP/1.0 404 Not Found")
 
 
 class PromptProgressBatch(unittest.TestCase):
@@ -6220,7 +6485,7 @@ class VisionArgs(unittest.TestCase):
             return Proc()
 
         with mock.patch.object(server.subprocess, "Popen", popen):
-            server.Vision({"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf", **cfg})
+            server.Vision({"exe": "xestrata-vision", "mmproj": "m.gguf", "model": "t.gguf", **cfg})
         return seen[0]
 
     def test_min_tokens_is_passed_only_when_set(self):
@@ -6329,6 +6594,8 @@ class LazyVision(unittest.TestCase):
             def kill(self):
                 self.killed = True
 
+            terminate = kill                            # ends as an engine ends on SIGTERM
+
             def wait(self, timeout=None):
                 return 0
 
@@ -6338,7 +6605,7 @@ class LazyVision(unittest.TestCase):
             return p
 
         with mock.patch.object(server, "popen", popen):
-            v = server.Vision({"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf"}, lazy=True)
+            v = server.Vision({"exe": "xestrata-vision", "mmproj": "m.gguf", "model": "t.gguf"}, lazy=True)
             self.addCleanup(lambda: shutil.rmtree(v.dir, ignore_errors=True))
             return v, started, popen
 
@@ -6365,8 +6632,13 @@ class LazyVision(unittest.TestCase):
             class P:
                 stdin, stdout, killed = io.StringIO(), io.StringIO("oops" + chr(10)), False
 
+                def poll(self):
+                    return 0 if P.killed else None
+
                 def kill(self):
                     P.killed = True
+
+                terminate = kill                        # ends as an engine ends on SIGTERM
 
                 def wait(self, timeout=None):
                     return 0
@@ -6385,7 +6657,7 @@ class VisionShutdown(unittest.TestCase):
     def test_shutdown_removes_the_work_dir_but_close_keeps_it(self):
         import serve.server as server
         with tempfile.TemporaryDirectory() as t:
-            d = Path(t) / "strata-vision-x"
+            d = Path(t) / "xestrata-vision-x"
             d.mkdir()
             (d / "k.sve").write_bytes(b"x")
             v = server.Vision.__new__(server.Vision)
@@ -6402,6 +6674,8 @@ class VisionShutdown(unittest.TestCase):
 
                 def kill(self):
                     pass
+
+                terminate = kill
 
             v.proc = Proc()
             v.close()
@@ -6562,10 +6836,11 @@ class UntimedReads(unittest.TestCase):
 
     def silent_vision(self, server, silent):
         v = server.Vision.__new__(server.Vision)
-        v.dir, v.lock, v.cache, v.dead = Path(tempfile.mkdtemp(prefix="strata-vision-test-")), threading.Lock(), {}, \
+        v.dir, v.lock, v.cache, v.dead = Path(tempfile.mkdtemp(prefix="xestrata-vision-test-")), threading.Lock(), {}, \
             None
         v.stopped = False
-        v.proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill, wait=silent.wait,
+        v.proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill, terminate=silent.kill,
+                                 wait=silent.wait,
                                  poll=lambda: 1 if silent.killed else None)
         v.lines = queue.Queue()
         threading.Thread(target=server.Vision._read, args=(v.proc, v.lines), daemon=True).start()
@@ -6592,11 +6867,11 @@ class UntimedReads(unittest.TestCase):
     def test_vision_ready_read_times_out(self):
         import serve.server as server
         silent = self.Silent()
-        proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill, wait=silent.wait,
-                               poll=lambda: None)
+        proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill, terminate=silent.kill,
+                               wait=silent.wait, poll=lambda: None)
         v = server.Vision.__new__(server.Vision)
-        v.spawn = (["strata-vision"], None, None)
-        v.dir = Path(tempfile.mkdtemp(prefix="strata-vision-test-"))
+        v.spawn = (["xestrata-vision"], None, None)
+        v.dir = Path(tempfile.mkdtemp(prefix="xestrata-vision-test-"))
         try:
             with mock.patch.object(server, "popen", lambda *a, **k: proc), \
                     mock.patch.object(server, "VISION_READY_S", 0.3):
@@ -7330,3 +7605,140 @@ class OpenAIModelOutputLimit(unittest.TestCase):
             self.assertEqual((m["limit"]["context"], m["limit"]["output"]), (8192, 8192 - CTX_SLACK))
         finally:
             self.svc.engine.max_context = CTX
+
+
+class SeedVR2File(unittest.TestCase):
+    def test_selection(self):
+        from serve import images
+
+        files = {f"seedvr2-{v}-{t}": (None, None, size << 20)
+                 for v, size in (("7b", 12000), ("3b", 6000)) for t in ("fp16", "int8")}
+        files["seedvr2-7b-int8"] = (None, None, 7000 << 20)
+        files["seedvr2-3b-int8"] = (None, None, 3500 << 20)
+
+        def ready(name, root):
+            return present is not None and name == f"seedvr2-7b-{present}"
+
+        for present in (None, "fp16", "int8"):
+            for takes in (True, False, None):
+                with self.subTest(present=present, takes_w8=takes):
+                    gen = SimpleNamespace(cfg={}, total_mib=lambda: 20000, takes_w8=lambda: takes,
+                                          _say=lambda message: None)
+                    with (mock.patch.object(images.image_aux, "_qimage", return_value=SimpleNamespace(FILES=files)),
+                          mock.patch.object(images.image_aux, "aux_dir", return_value="unused"),
+                          mock.patch.object(images.image_aux, "ready", side_effect=ready),
+                          mock.patch.object(images, "ram_available_mib", return_value=20000)):
+                        expected = "fp16" if present == "fp16" or (present is None and not takes) else "int8"
+                        self.assertEqual(images.seedvr2_file(gen, "7b"), f"seedvr2-7b-{expected}")
+        gen = SimpleNamespace(cfg={}, total_mib=lambda: 1000, takes_w8=lambda: False, _say=lambda message: None)
+        with (mock.patch.object(images.image_aux, "_qimage", return_value=SimpleNamespace(FILES=files)),
+              mock.patch.object(images.image_aux, "aux_dir", return_value="unused"),
+              mock.patch.object(images.image_aux, "ready", return_value=False)):
+            with mock.patch.object(images, "ram_available_mib", return_value=20000):
+                self.assertEqual(images.seedvr2_file(gen, "7b"), "seedvr2-7b-int8")
+            with mock.patch.object(images, "ram_available_mib", return_value=0):
+                self.assertEqual(images.seedvr2_file(gen, "7b"), "seedvr2-3b-int8")
+
+
+class ImageRequestWords(unittest.TestCase):
+    """images.parse_flag and parse_number: the one reading of the image and video entries' booleans and numbers, a
+    JSON value or a form's text of one."""
+
+    def test_flag_words(self):
+        from serve import images as images_api
+        for word in images_api.FLAG_TRUE:
+            self.assertIs(images_api.parse_flag(word.upper(), "f"), True, word)
+        for word in images_api.FLAG_FALSE:
+            self.assertIs(images_api.parse_flag(f" {word} ", "f", True), False, word)
+        self.assertIs(images_api.parse_flag(False, "f", True), False)
+        # vLLM-Omni's words (pydantic's bool) besides the long ones: t, y, f and n, and a JSON 1.0 or 0.0
+        self.assertEqual([images_api.parse_flag(w, "f") for w in ("T", "y", "f", "N", 1, 0, 1.0, 0.0)],
+                         [True, True, False, False, True, False, True, False])
+        for absent in (None, "", "  "):
+            self.assertEqual(images_api.parse_flag(absent, "f", "default"), "default")
+
+    def test_flag_other_word_is_400(self):
+        # a word that is neither is refused, as vLLM-Omni's form booleans are (FastAPI's bool), on every entry: the
+        # upscale's redraw and the videos' mask_video and job read it as true or false no more
+        from serve import images as images_api
+        from serve import videos as videos_api
+        with self.assertRaisesRegex(images_api.ImageRequestError, r"^f: true or false, not 'banana'$"):
+            images_api.parse_flag("banana", "f")
+        with self.assertRaisesRegex(images_api.ImageRequestError, r"^upscale\.redraw: true or false"):
+            images_api.parse_upscale({"upscale": {"scale": 2, "redraw": "banana"}}, b"", {})
+        with self.assertRaises(videos_api.VideoRequestError) as e:
+            videos_api.flag_field({"mask_video": "banana"}, "mask_video")
+        self.assertEqual((e.exception.status, str(e.exception)), (400, "mask_video: true or false, not 'banana'"))
+
+    def test_numbers(self):
+        from serve import images as images_api
+        n = images_api.parse_number
+        self.assertEqual((n("3", "x", 0, 9, whole=True), n(" 2.5 ", "x", 0, 9), n(4, "x", 0, 9)), (3, 2.5, 4.0))
+        # a whole number given as a float equal to one, as pydantic's int takes it (vLLM-Omni's fields): 17.0 is 17
+        self.assertEqual((n(17.0, "x", 0, 99, whole=True), n("17.0", "x", 0, 99, whole=True)), (17, 17))
+        self.assertIsInstance(n(17.0, "x", 0, 99, whole=True), int)
+        self.assertIsInstance(n(4, "x", 0, 9), float)
+        for absent in (None, "", " "):
+            self.assertEqual(n(absent, "x", 0, 9, 7), 7)
+        for bad in (True, "2.5", 2.5, 10, "nan", "17.5", 17.5, "17."):
+            with self.assertRaisesRegex(images_api.ImageRequestError, r"^x: a whole number from 0 to 9$"):
+                n(bad, "x", 0, 9, whole=True)
+        with self.assertRaisesRegex(images_api.ImageRequestError, r"^x: a number from 0 to 9$"):
+            n(float("inf"), "x", 0, 9)
+        with self.assertRaisesRegex(images_api.ImageRequestError, r"^x: a whole number 0 or more$"):
+            n(-1, "x", 0, math.inf, whole=True)
+
+    def test_a_number_wider_than_a_float_is_400(self):
+        # an integer too wide for a float, as JSON's number or a form's text of it (steps, seed, n, output_compression):
+        # the bound answers, not OverflowError (math.isfinite() of such an int raises, and no entry catches it: a 500)
+        from serve import images as images_api
+        for wide in (10 ** 400, str(10 ** 400)):
+            with self.assertRaisesRegex(images_api.ImageRequestError, r"^x: a whole number from 0 to 9$"):
+                images_api.parse_number(wide, "x", 0, 9, whole=True)
+            with self.assertRaisesRegex(images_api.ImageRequestError, r"^x: a number from 0 to 9$"):
+                images_api.parse_number(wide, "x", 0, 9)
+
+
+class UpscaleRequests(unittest.TestCase):
+    """An image's upscale (/v1/images/upscale, LocalAI's) and a video's (/v1/videos, vLLM-Omni's) read their shared
+    fields (extra_params, model, color_correction_method) one way, each refusing as its own entry does."""
+
+    SOURCE = {"width": 640, "height": 360, "fps": 30.0, "vfr": False, "frames": 90, "duration": 3.0, "audio": False}
+
+    def test_same_fields_same_upscaler(self):
+        from serve import images as images_api
+        from serve import videos as videos_api
+        fields = {"model": "seedvr2-7b-sharp", "scale": "2",
+                  "extra_params": json.dumps({"color_correction_method": "wavelet"})}
+        req, _ = images_api.upscale_request(fields)
+        self.assertEqual(req["upscale"], {"method": "seedvr2", "scale": 2.0, "redraw": False, "variant": "7b-sharp",
+                                          "color": "wavelet"})
+        job = videos_api.upscale_request(fields, self.SOURCE, {}, False)
+        self.assertEqual(job["upscaler"], {"method": "seedvr2", "asked": "seedvr2-7b-sharp", "color": "wavelet",
+                                           "variant": "7b-sharp"})
+        self.assertEqual((job["width"], job["height"], job["ups_only"], job["video"]), (1280, 720, True, True))
+
+    def test_refusals(self):
+        from serve import images as images_api
+        from serve import videos as videos_api
+        for fields, message in (({"model": "esrgan"}, "model: an upscaler"),
+                                ({"extra_params": "{"}, "extra_params: a JSON object"),
+                                ({"extra_params": {"color_correction_method": "sepia"}},
+                                 "color_correction_method: one of none, lab, adain, wavelet, not 'sepia'")):
+            with self.assertRaisesRegex(images_api.ImageRequestError, "^" + re.escape(message)):
+                images_api.upscale_request(fields)
+            with self.assertRaises(videos_api.VideoRequestError) as e:   # the video entries' own 400
+                videos_api.upscale_request(fields, self.SOURCE, {}, False)
+            self.assertEqual(e.exception.status, 400)
+            self.assertTrue(str(e.exception).startswith(message), str(e.exception))
+
+    def test_video_side_limit_is_the_upscale_s(self):
+        # the config's max_side is the drawing's (an image model's), not a video upscale's: its limit is an image
+        # upscale's, UPSCALE_MAX_SIDE
+        from serve import images as images_api
+        from serve import videos as videos_api
+        top = images_api.UPSCALE_MAX_SIDE
+        job = videos_api.upscale_request({"size": f"{top}x2160"}, self.SOURCE, {"max_side": 1024}, False)
+        self.assertEqual((job["width"], job["height"]), (top, 2160))
+        with self.assertRaisesRegex(videos_api.VideoRequestError, f"^size: each side from 16 to {top}$"):
+            videos_api.upscale_request({"size": f"{top + 16}x2160"}, self.SOURCE, {}, False)

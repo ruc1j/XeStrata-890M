@@ -17,7 +17,7 @@ namespace strata::kernels {
 
 /// ggml type ids handled here.
 bool iq_supported(int ggml_type) noexcept;
-/// The token-embedding types iq_embed_rows and iq_dequant_f32 read: the i-quants above and BF16 (30).
+/// The GGUF token-embedding types embed_rows and iq_dequant_f32 read: the i-quants above and BF16 (30).
 bool embed_type_supported(int ggml_type) noexcept;
 /// Bytes of one row of `n` values of `ggml_type` (n a multiple of the type's block).
 size_t iq_row_bytes(int ggml_type, int64_t n) noexcept;
@@ -28,13 +28,98 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
 
+/// One R1Q2 matrix: `codes` has n_out rows, each row_bytes apart; scales have one FP16 row base per row, one FP16
+/// column scale per 128 values, and packed two-bit scale indices in row-major order. All pointers are device pointers.
+struct Bih3R1q2Matrix {
+    const uint8_t* codes = nullptr;
+    const uint8_t* rowbase = nullptr;
+    const uint8_t* colscale = nullptr;
+    const uint8_t* q = nullptr;
+    size_t row_bytes = 0;
+    float p2[4] = {};
+    int k = 0, n_in = 0, n_out = 0;
+};
+/// y[c][r] = W[r] . x[c], with q8_1 activations and the R1Q2 scales above.
+void bih3_r1q2_mmvq(const Bih3R1q2Matrix& w, const void* x_q8_1, float* y, int ncols, void* stream);
+
+/// Gather the matrix into iq_mmq's kBih3Planes format. Output has n_out rows of 3*n_in/32 blocks, 36 bytes each.
+void bih3_r1q2_gather_mmq(const Bih3R1q2Matrix& w, void* dst, void* stream);
+/// Repeat each q8_1 input block three times into iq_mmq's activation layout (iq_mmq_act_bytes for 3*n_in columns).
+void bih3_r1q2_expand_mmq(const void* x_q8_1, void* dst, int n_in, int ncols, void* stream);
+
+/// A mixed R1Q2 layer. `k_pairs` is a device array of (gate/up K, down K) bytes per expert; `route_ids` maps the
+/// grouped entries' destination indices to expert IDs. p2 and the geometry are shared by the layer.
+struct Bih3R1q2Layer {
+    int n_embd = 0, n_ff = 0, n_expert = 0, had_block = 0;
+    const uint8_t* k_pairs = nullptr;
+    const int32_t* route_ids = nullptr;
+    const float* d_signs = nullptr;
+    float p2[3][4] = {};
+};
+/// Scratch for one gathered expert and up to cap_entries routed rows, reused across the groups on the same stream.
+size_t bih3_r1q2_grouped_scratch_bytes(int64_t cap_entries, int64_t n_embd, int64_t n_ff);
+/// A grouped layer in the same pointer / start / entry layout as native_expert_grouped. Its mixed experts take the
+/// device's int8 matrix engines where present, else the existing tiled DP4a path.
+void bih3_r1q2_grouped(const Bih3R1q2Layer& layer, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                       const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                       int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
+
+/// The prompt's experts of a layer, many to a launch, straight from their blobs: group g (of n_groups, on the device)
+/// the expert at ptr[g] (0: one computed elsewhere, its rows left as they are), its K in k_pack[g] (gate/up | down
+/// << 8), its rows start[g] .. start[g + 1] (start_host: the same on the host).  Row r's activation is x_q8_1's row
+/// tok[r], its output out's row r.  Taken in passes of whole groups whose rows fit cap (the scratch's, as
+/// bih3_r1q2_prompt_scratch_bytes(cap)); an expert's rows are at most cap.
+void bih3_r1q2_prompt_groups(const Bih3R1q2Layer& layer, const unsigned long long* ptr, const int32_t* start,
+                             const int32_t* k_pack, const int32_t* start_host, int n_groups, const int32_t* tok,
+                             const void* x_q8_1, void* scratch, int64_t cap, float* out, void* stream);
+/// One expert's R1Q2 weights (`blob`, gate/up K and down K) to FP16 in iq_dequant_expert_f16's layout: `gu` the gate and
+/// up rows interleaved (2 n_ff rows of n_embd), `d` the down rows (n_embd of n_ff), each value its integer numerator /
+/// 128 times its row base, column scale and p2 (the decode's weights, rounded to FP16), for the shared FP16 products.
+void bih3_r1q2_dequant_f16(const Bih3R1q2Layer& layer, const uint8_t* blob, int gate_k, int down_k, uint16_t* gu,
+                           uint16_t* d, void* stream);
+/// Bytes an expert takes in bih3_r1q2_prompt_mmq's `weights` (its gate/up and down codes as kBih3Code rows).
+size_t bih3_r1q2_code_bytes(int64_t n_embd, int64_t n_ff);
+/// A pass of the prompt's experts through the matrix products (iq_mmq_grouped's kBih3Code): n experts at ptr[e]
+/// (K in k_pack[e], gate/up | down << 8), their rows bounds[e] .. bounds[e + 1] of the pass's R (max_rows the most an
+/// expert has), the pass's row c the layer's routed row rows[c], whose activation is x_q8_1's row tok[rows[c]] and
+/// whose output is out's row rows[c].  scratch: bih3_r1q2_grouped_scratch_bytes(R) at least; weights: n
+/// bih3_r1q2_code_bytes.
+void bih3_r1q2_prompt_mmq(const Bih3R1q2Layer& layer, int n, const unsigned long long* ptr, const int32_t* k_pack,
+                          const int32_t* bounds, int64_t max_rows, const int32_t* rows, const int32_t* tok, int64_t R,
+                          const void* x_q8_1, void* scratch, void* weights, float* out, void* stream);
+/// Untiled grouped product for devices too small for the matrix or DP4a tile.
+void bih3_r1q2_grouped_scalar(const Bih3R1q2Layer& layer, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                              const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                              int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
+
+/// One prompt expert, using the same grouped product. Scratch includes its device-side routing tables.
+size_t bih3_r1q2_prompt_scratch_bytes(int64_t cap_entries, int64_t n_embd, int64_t n_ff);
+void bih3_r1q2_prompt(const Bih3R1q2Layer& layer, const uint8_t* blob, int gate_k, int down_k,
+                       const int32_t* token_rows, int64_t rows, int64_t cap_entries, const void* x_q8_1,
+                       void* scratch, float* out, void* stream);
+
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32.
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);
-/// Rows `tokens[0..n_tok)` (device ids) of a GGUF embedding table (`row_bytes` per row; the table may be mapped
-/// host memory) dequantized to fp32, `n_embd` per row (a multiple of 256).
-void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok,
-                   int64_t n_embd, float* out, void* stream);
+/// A token-embedding table as the GPU reads it, through a device pointer (VRAM, or mapped pinned host memory): a
+/// GGUF table (`type` one of embed_type_supported; row r at `rows` + r * `row_bytes`, `n_embd` a multiple of 256),
+/// or (`type` kPacked) the packed planes of the canonical S2/S4/S8 tensor: `rows` the codes (`row_bytes` a row, low
+/// bits first), `scales` and the optional `offsets` FP32 per group of `group_elems`, a value
+/// `(code + code_bias) * scale + offset` with the product and the sum rounded separately (s_gemv_q8k_split's
+/// decode).  `n_rows`: the vocabulary, for the caller's checks of host ids.
+struct EmbedTable {
+    static constexpr int kPacked = -1;
+    int type = kPacked;
+    const void* rows = nullptr;
+    size_t row_bytes = 0;
+    int64_t n_rows = 0, n_embd = 0;
+    const float* scales = nullptr;
+    const float* offsets = nullptr;
+    int code_bits = 0, code_bias = 0, group_elems = 0;
+};
+/// The FP32 rows of `n_tok` tokens, out[t * n_embd + i]: the ids in device memory (`ids`, which a graph can
+/// capture), or with `ids` null the one row `token`.  The ids are not checked on the device.
+void embed_rows(const EmbedTable& table, const int32_t* ids, int64_t token, int64_t n_tok, float* out, void* stream);
 /// One expert's gate and up matrices (n_ff rows of n_embd each) into the interleaved fp16 layout the prompt path
 /// uses: row 2r = gate row r, row 2r+1 = up row r.
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
@@ -57,11 +142,20 @@ constexpr int kIqGemmTileRows = 256;
 /// rows of Y (`ldy` floats apart).  With `interleave` (N / 2) the matrix is gate rows then up rows and Y's columns
 /// alternate gate, up (iq_dequant_gu_f16's layout).  The weights are dequantized in local memory to the FP16 values
 /// iq_dequant_f16 writes, so Y is that of dequantizing and multiplying with xmx_gemm_grouped (the same bits), without
-/// the dequantized weights in memory.  `max_rows`: the most rows an expert has.  Needs XMX for FP16
-/// (xmx_available).
+/// the dequantized weights in memory.  `max_rows`: the most rows an expert has.  Needs the f16_from_blocks
+/// form (matrix_report.hpp).
 void iq_gemm_grouped_f16(int ggml_type, const uint16_t* X, const void* const* W, int64_t interleave, float* Y,
                          int64_t ldy, const int32_t* bounds, int G, int64_t max_rows, int64_t N, int64_t K,
                          void* stream);
+/// iq_gemm_grouped_f16 for R1Q2 experts (a mixed layer's bih3 blobs): expert e < G's blob at device address blob[e]
+/// (a host array), its K in k[e] (gate/up | down << 8, as bih3_r1q2_prompt_groups' k_pack).  `down` picks the
+/// product: false the gate and up rows interleaved (N = 2 n_ff, K = n_embd: iq_dequant_gu_f16's layout), true the down
+/// rows (N = n_embd, K = n_ff).  The weights are dequantized in local memory to the values bih3_r1q2_dequant_f16
+/// writes, so Y is that of dequantizing and multiplying with xmx_gemm_grouped, without the FP16 weights in memory.
+/// Needs the f16_from_blocks form and n_embd, n_ff multiples of 128.
+void bih3_r1q2_gemm_grouped_f16(const Bih3R1q2Layer& layer, bool down, const uint16_t* X, const void* const* blob,
+                                const int32_t* k, float* Y, int64_t ldy, const int32_t* bounds, int G,
+                                int64_t max_rows, void* stream);
 
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
 struct NativeExpertLayout {
@@ -72,6 +166,9 @@ struct NativeExpertLayout {
     size_t up_row = 0;                  // bytes per up row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
+    // NVFP4 (nvfp4.hpp): the blob ends with the expert's {s_gate, s_up, s_down, 0} at this offset, each on its
+    // projection's FP32 output.  0: no tail (every other type).
+    size_t tail_off = 0;
     // APR (prism.hadamard): the down weights are Hadamard-folded, so native_expert_grouped rotates h before
     // quantizing it (hadamard_rows).  had_block 0 = none; d_signs is a DEVICE vector of n_ff signs or nullptr.
     int had_block = 0;
@@ -82,6 +179,11 @@ struct NativeExpertLayout {
 /// `up_type` (-1: the gate's): the up rows' type where it differs.
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type = -1) noexcept;
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type = -1);
+
+/// Time the latent A gate/up's LPR / entries-a-pass candidates for this layout and keep the faster per device
+/// (the current GU_LPR / kEntriesPass are candidates).  Call at the window's init; XESTRATA_LATENT_A_LPR /
+/// XESTRATA_LATENT_A_ENTRIES force a value.
+void native_expert_latent_a_tune(const NativeExpertLayout& L, void* stream);
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
@@ -94,7 +196,7 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups = 0);
+                           int64_t grid_groups = 0, int mode8_override = -1);
 /// XeStrata-890M: whether `native_expert_grouped` takes upstream's canon rows on the stream's device, whose sums are
 /// the CPU's canonical rows' bit for bit (#152); false where it takes the fork's rows for an integrated GPU on the HIP
 /// backend, which round otherwise.  STRATA_GPU_CANON=1 / 0 forces either.

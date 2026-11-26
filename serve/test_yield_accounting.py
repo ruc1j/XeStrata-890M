@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""Real serving flow over a fake native engine with accurate partial-read DONE fields."""
+"""Real serving flow over a fake native engine with accurate partial-read DONE fields (upstream #5318): a prompt read
+that gives way (BYIELD) and resumes keeps the request's external prefix boundary, and the prompt time and tokens of
+every leg are summed exactly once."""
 
 import threading
 import time

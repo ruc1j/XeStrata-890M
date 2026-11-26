@@ -42,10 +42,12 @@ class OffIsThePageFromBefore(unittest.TestCase):
         cls.store = (WEB / "chatstore.js").read_text(encoding="utf-8")
 
     def test_the_three_switches_start_off(self):
-        self.assertIn('chatList: false, chatEdit: false, whileBusy: "wait"', self.app)
+        # XeStrata turned the list and the edits on by default (a9aee2d6a) and sends while busy through a queue, with
+        # "wait" read as "queue" (1864872af); the sidebar's markup still starts hidden until the list is set up
+        self.assertIn('chatList: true, chatEdit: true, whileBusy: "queue"', self.app)
         for el in ("s-list", "s-edit"):
-            self.assertIn('aria-checked="false"', re.search(rf'<button[^>]*id="{el}"[^>]*>', self.html).group(0))
-        self.assertIn('data-v="wait"', self.html)
+            self.assertIn('aria-checked="true"', re.search(rf'<button[^>]*id="{el}"[^>]*>', self.html).group(0))
+        self.assertIn('data-v="queue"', self.html)
         self.assertRegex(self.html, r'<aside class="chat-sidebar"[^>]*\bhidden>')              # no list until it is switched on
 
     def test_the_browser_store_is_opened_only_for_the_list(self):
@@ -56,7 +58,7 @@ class OffIsThePageFromBefore(unittest.TestCase):
         self.assertIn("if (settings.chatList) await setChatList(true, false);", self.app)
 
     def test_with_the_list_off_one_chat_is_kept_as_before(self):
-        self.assertIn('if (!listOn) { store.set("chat", H.cleanMessages(messages)); return; }', self.ui)
+        self.assertRegex(self.ui, r'if \(!listOn\) \{[^\n]*\n\s*store\.set\("chat", H\.cleanMessages\(messages\)\);')
         self.assertIn('$("new-btn").hidden = on;', self.ui)                  # only the list's own New chat shows while it is on
 
     def test_pictures_and_files_are_kept_as_names_only(self):
@@ -66,7 +68,9 @@ class OffIsThePageFromBefore(unittest.TestCase):
     def test_nothing_about_a_chat_goes_to_the_server(self):
         for name, src in (("app.js", self.app), ("chats-ui.js", self.ui), ("chatstore.js", self.store)):
             for call in re.findall(r'fetch\(\s*([^,)]+)', src):
-                if call != '"v1/chat/completions"':                    # the question itself, as ever
+                if call == '"v1/xestrata/debug/chat"':   # XeStrata's debug chat log: only when the server asks
+                    self.assertIn("if (!health.debug_chat_log || !c || !c.id) return;", src)
+                elif call != '"v1/chat/completions"':                  # the question itself, as ever
                     self.assertNotRegex(call, r"chat|histor", f"{name}: {call}")
 
     def test_the_edit_controls_wait_for_a_finished_answer(self):
@@ -79,8 +83,9 @@ class OffIsThePageFromBefore(unittest.TestCase):
         self.assertIn("settlePending(cut, !m.stopped && !m.error);", self.app)
 
     def test_sending_while_busy_parks_nothing_unless_asked(self):
-        self.assertIn('const parksWhileBusy = () => settings.whileBusy === "queue" || settings.whileBusy === "interject";', self.app)
-        self.assertIn("if (!parksWhileBusy()) return;", self.app)
+        # XeStrata always parks a message sent while busy in the chat's queue (1864872af); a saved "wait" reads as
+        # "queue"
+        self.assertIn('if (settings.whileBusy === "wait") settings.whileBusy = "queue";', self.app)
 
 
 class NothingOnTheServer(unittest.TestCase):

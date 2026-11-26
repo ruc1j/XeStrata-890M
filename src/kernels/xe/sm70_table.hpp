@@ -8,6 +8,7 @@
 #pragma once
 
 #include "strata/core/per_device.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -19,8 +20,8 @@ namespace strata::kernels::xe {
 inline bool sm70_table(sycl::queue& q) {
     namespace syclex = sycl::ext::oneapi::experimental;
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_SM70_TABLE");
-        return v != nullptr && std::atoi(v) != 0;
+        const char* v = strata::env_get("SM70_TABLE");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
     }();
     if (!on) return false;
     static core::PerDevice<bool> volta;

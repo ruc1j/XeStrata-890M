@@ -30,10 +30,15 @@ setup checks the GPU, RAM and CPU, chooses a SYCL compiler and builds the engine
   `--license free` builds with free software only (Intel and AMD GPUs).
 - Time: the first run takes a while for the download (60-110 GB) and the build. If it stops, the next run continues.
 - Where things go: the model files in `XeStrata-data` next to the XeStrata folder, the model configs
-  (`xestrata-<model>.json`) and logs in the XeStrata folder.
+  (`xestrata-<model>.json`) in `~/.config/xestrata` and the logs in `~/.local/state/xestrata` (as with the packages).
 
 **Afterwards**, `./setup.sh` starts the model right away.
 The README's `xestrata` options work the same with `./setup.sh`. The terminal chat is `.venv/bin/python chat.py`.
+
+**The window**: `./setup.sh gui` opens the window.
+It builds `launcher/` into `build/launcher` with the .NET 10 SDK (Ubuntu: `sudo apt install dotnet-sdk-10.0`, Fedora:
+`sudo dnf install dotnet-sdk-10.0`) and opens it.
+Without the SDK it says how to install it and stops. Nothing else here uses .NET.
 
 **Updating**: run `./update.sh`. In a git checkout it runs `git pull`, then updates the engine, the Python packages and
 the model settings (it does not start the model). You can also download a new version, unpack it elsewhere and run
@@ -47,7 +52,7 @@ The split follows the Debian archive's main, contrib and non-free.
 
 - free (`-DSTRATA_LICENSE=free`): built with intel/llvm's DPC++ 7 or later (its SYCL runtime is libsycl 9).
   Free software only; no oneAPI environment is used.
-  Validated with intel/llvm v7.2.0 (and v7.1.1) built from source by `tools/intel_llvm_build.py` (see [Setup](#setup)).
+  Validated with intel/llvm v7.2.1 built from source by `tools/intel_llvm_build.py` (see [Setup](#setup)).
   A distribution's package of version 7 or later serves as well; an older one (Ubuntu 26.04's `dpclang++` 6.2) is refused by CMake and setup.
   6.2's SYCL runtime reported no XMX for the Arc Pro B70, and the prefill path took about 1.6 times as long.
   With intel/llvm built with ROCm's HIP, `STRATA_HIP_ARCHS` (`gfx1200`, for example) makes the code for AMD GPUs (RDNA2 and later: gfx103x, gfx11xx, gfx12xx) as well.
@@ -64,7 +69,7 @@ The split follows the Debian archive's main, contrib and non-free.
 - contrib-llvm (the default, `-DSTRATA_LICENSE=contrib`): intel/llvm built with its CUDA target (`tools/intel_llvm_build.py --contrib`), and with `STRATA_CUDA_ARCHS` (`sm_89`, for example) the code for NVIDIA GPUs as well.
   XeStrata's source is the free mode's and stays free software,
   but the build needs NVIDIA's CUDA toolkit and a run NVIDIA's driver, neither of them free software (XeStrata ships neither).
-  Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.2.0.
+  Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.2.1.
   Validated to run on an RTX 4070 (sm_89).
   The engine links no maker's driver library: the SYCL runtime and oneMath open the ones that are there at run time.
   So it runs without NVIDIA's driver and CUDA on a PC with only Intel GPUs, and without Level Zero on one with only NVIDIA GPUs
@@ -93,7 +98,7 @@ A driver older than the toolkit cannot load it, so `STRATA_CUDA_PTX`'s default, 
 A PTX 7.8 build passed its 52 CTest tests on an RTX 4070.
 The driver needs CUDA 12.0 or later (525 or later) for the functions intel/llvm's CUDA adapter calls (SYCL graphs: `cuGraphAddKernelNode_v2`).
 Both variables default to `auto`; a value given is used as it is (to build for another machine).
-CMake fetches oneMath from XeStrata's fork on GitHub when it configures ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), tag `xestrata-12`, checking the archive's SHA-256): oneMath with XeStrata's changes (cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend, the int8 products in the rocBLAS and cuBLAS backends, the cuBLAS and rocBLAS backends' targets kept apart, so that one build makes both, the rocBLAS backend without what HIP and SYCL deprecate, and Windows built by the GNU-style clang++ of the cross build, its cuBLAS and rocBLAS backends with Windows' import libraries, and oneMKL's SYCL link there without `-fsycl-allow-device-image-dependencies`), with oneMath's `develop` merged into it.
+CMake fetches oneMath from XeStrata's fork on GitHub when it configures ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), tag `xestrata-13`, checking the archive's SHA-256): oneMath with XeStrata's changes (cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend, the int8 products in the rocBLAS and cuBLAS backends, the cuBLAS and rocBLAS backends' targets kept apart, so that one build makes both, the rocBLAS backend without what HIP and SYCL deprecate, and Windows built by the GNU-style clang++ of the cross build, its cuBLAS and rocBLAS backends with Windows' import libraries, and oneMKL's SYCL link there without `-fsycl-allow-device-image-dependencies`, and the rocBLAS backend's work recorded into a SYCL graph), with oneMath's `develop` merged into it.
 On a machine without the network, give it the same archive with `STRATA_ONEMATH_SOURCE` (a local file or URL).
 The changes are listed in [third_party/main/README.md](../third_party/main/README.md).
 Where oneMath has no backend for the GPU the own kernels take the products.
@@ -104,47 +109,51 @@ Without them it takes the path that uses another shape the GPU reports (the Arc 
 and without that the DP4a path, and says once which.
 The Arc A series takes `mma_gemm` because its SYCL runtime refuses the Intel extensions the XMX kernels use (joint_matrix's prefetches and checked loads and stores).
 On the A380 it ran 17–38% faster than DP4a, and closer to FP64 (relative error 0.0001% against 0.53%).
-`STRATA_NO_XMX=1` takes the DP4a path even when the GPU has matrix engines.
-`STRATA_MMA=1` takes `mma_gemm` even where XMX is there, if the GPU reports a shape it carries (Xe2's 8 x 16 x 16 and others; to check that path).
-`STRATA_NO_BF16_MMA=1` drops the BF16 matrix combinations from what the GPU reports, `STRATA_NO_INT8_MMA=1` the int8 ones (`src/kernels/xe/matrix_report.cpp`),
+`XESTRATA_NO_XMX=1` takes the DP4a path even when the GPU has matrix engines.
+`XESTRATA_MMA=1` takes `mma_gemm` even where XMX is there, if the GPU reports a shape it carries (Xe2's 8 x 16 x 16 and others; to check that path).
+`XESTRATA_NO_BF16_MMA=1` drops the BF16 matrix combinations from what the GPU reports, `XESTRATA_NO_INT8_MMA=1` the int8 ones (`src/kernels/xe/matrix_report.cpp`),
 to imitate a GPU whose matrix engines lack the type (NVIDIA's before sm_80 have no BF16, before sm_72 no int8) on one that has it.
-With `STRATA_NO_BF16_MMA=1` the contrib-llvm mode does not hand the BF16 products to oneMath either; with FP16 matrix engines they take the path through FP16 below.
-`STRATA_NO_BLAS=1` computes the dense matrix products with the own kernels in the contrib-llvm mode too (to compare).
+With `XESTRATA_NO_BF16_MMA=1` the contrib-llvm mode does not hand the BF16 products to oneMath either; with FP16 matrix engines they take the path through FP16 below.
+`XESTRATA_NO_BLAS=1` computes the dense matrix products with the own kernels in the contrib-llvm mode too (to compare).
+On a GPU where `mma_gemm` runs on the matrix engines (RDNA3's and RDNA4's WMMA, NVIDIA's tensor cores), the dense FP16 and BF16 products, and a training step's dgrad form (W read as it is), are measured the first time they are used, a 1024 x 4096 x 4096 product on the own kernels and on the maker's library, and take the faster (said once).
+`XESTRATA_BLAS=1` takes the maker's library without measuring.
 On the RTX 4070 CTest gave the same results under each of them, and the top token of all 16 positions agreed.
 Where oneMath fails a BF16 product on the GPU (a small one is tried at start), the BF16 products alone take the own kernels.
 On a GPU whose matrix engines take FP16 and not BF16 (NVIDIA's before sm_80, Volta and Turing), the prefill path's BF16 products convert both operands to FP16 and run as FP16 products (`src/prefill/gemm.cpp`, upstream f2fb7c1 and ff6f9f1).
 On such a GPU cuBLAS computes BF16 products without the tensor cores, and the own kernels fall to DP4a.
 The conversion is exact within FP16's normal range; finite values past it saturate at ±65504. An accumulating product and one of a single output row stay BF16.
-With sm_70 code on the RTX 4070 and `STRATA_NO_BF16_MMA=1` to imitate it, the relative error against FP64 was 2e-6 or less, 2.5–3.2 times as fast as the DP4a path (0.7%).
-`STRATA_BF16_TC=0` turns it off.
-`tools/xmx_probe.cpp` asks every GPU the same without building the engine.
+With sm_70 code on the RTX 4070 and `XESTRATA_NO_BF16_MMA=1` to imitate it, the relative error against FP64 was 2e-6 or less, 2.5–3.2 times as fast as the DP4a path (0.7%).
+`XESTRATA_BF16_TC=0` turns it off.
+`tools/xmx_probe.cpp` asks every GPU, without building the engine, whether it reports FP16 and BF16 matrix engines in the XMX kernels' shape or in `mma_gemm`'s Intel one (8 x 8 x 16).
 
 Where the GPU reports the int8 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores), the prefill path's expert products run on the int8 matrix engines (`src/kernels/xe/iq_mmq.cpp`, llama.cpp's MMQ written anew on joint_matrix).
 The weights are read in their GGUF blocks and the activations rounded to int8, a scale for each 32 values.
 That reads and writes less than dequantizing to FP16 and multiplying, and the relative error against FP64 is about 0.4% (the activations' rounding).
 It covers the i-quants but IQ1_M, and Q2_0; a layer of another type keeps the FP16 path.
 
-On a GPU without XMX that reports the FP16 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores, from sm_70 on), prefill's attention runs a kernel written on joint_matrix's portable API (`src/kernels/xe/qsa_prompt_attn.cpp`).
+On a GPU without XMX that reports the FP16 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores, from sm_70 on), prefill's attention runs a kernel written on joint_matrix's portable API (the selection form of `src/kernels/xe/flash_attn.cpp`).
 It takes FP16, INT8 and K8V4 KV; Q4_0 keeps the FP32 kernel (the range of upstream's Volta kernel 06a90a2).
 INT8's and Q4_0's codes are exact in FP16 and go to the matrix engines as they are, with the scales applied in FP32.
 With sm_70 code on the RTX 4070, `qsa_prompt_attn_parity` was off FP64 by at most 3 times the FP32 kernel's error, and a chunk of 2,048 queries over 32K cells ran 1.6 times as fast at INT8 and 1.5 times at FP16 and K8V4.
 Intel GPUs do not report that shape and keep the XMX FP16 path.
-Qwen3.8's prefill takes the faster of the int8 and the FP16 expert products for each layer of a chunk, by the rows its experts average. Where one stops beating the other is measured at the start on each GPU, both timed at 16 to 256 rows an expert in the shape of the model's first layer, and logged (181 rows on the B70; int8 at every count on the RTX 4070). `STRATA_PREFILL_MMQ=0` takes the FP16 path, `1` the int8 products.
+Qwen3.8's prefill takes the faster of the int8 and the FP16 expert products for each layer of a chunk, by the rows its experts average. Where one stops beating the other is measured at the start on each GPU, both timed at 16 to 256 rows an expert in the shape of the model's first layer, and logged (181 rows on the B70; int8 at every count on the RTX 4070). `XESTRATA_PREFILL_MMQ=0` takes the FP16 path, `1` the int8 products.
+On RDNA3 and RDNA4, the int8 products of groups of experts that average more than 256 rows (a long prompt's large chunks) are also timed at the start in a form that dequantizes the weights to FP16 for the WMMA instructions, which is taken for the types and row counts where it is 5% faster or more (+4% on a 32K prompt on the RX 9060 XT; the output's last bits change). `XESTRATA_IQ_MMQ_F16=0` never takes it, `1` takes it at every row count.
 
 Pascal (sm_60, sm_61: P100, P40, the GTX 10 series) gets code too, from a CUDA 12 toolkit.
 It has no tensor cores, so no matrix-engine path is chosen and it runs on the DP4a and FP32 paths.
 sm_60 has no dp4a instruction, so that one product is computed a byte at a time there, to the same integer (`src/kernels/xe/cuda_intrinsics.hpp`, upstream e200e08f).
 The kernels for the tensor cores compile an empty body in code for an architecture before sm_70 and are never launched on such a GPU.
-Built with sm_60 code only and run on the RTX 4070 (the driver compiles the PTX), CTest passed its 59 tests, and with the matrix engines left out (`STRATA_NO_XMX=1`)
+Built with sm_60 code only and run on the RTX 4070 (the driver compiles the PTX), CTest passed its 59 tests, and with the matrix engines left out (`XESTRATA_NO_XMX=1`)
 IQ2_XS gave the same answers as sm_89 code on all 8 questions (the expert cache size pinned; decode 3-5% slower).
-On a GPU of compute capability 6.0 (GP100: the P100), `STRATA_DOWN_WS=1` copies the routed experts' IQ4_NL and Q2_0 down weight rows into the work-group's local memory before their products (upstream 6a6d58ad0, opt-in; the output is bitwise the same, and other GPUs ignore it).
+On a GPU of compute capability 6.0 (GP100: the P100), `XESTRATA_DOWN_WS=1` copies the routed experts' IQ4_NL and Q2_0 down weight rows into the work-group's local memory before their products (upstream 6a6d58ad0, opt-in; the output is bitwise the same, and other GPUs ignore it).
 Maxwell and older (compute capability below 6.0) do not run it: the SYCL runtime reports no FP16 for an NVIDIA GPU below 5.3, and the engine takes no GPU without FP16 (`xestrata --setup` says so).
 
-On Volta (sm_70), `STRATA_SM70_TABLE=1` takes two decode kernels upstream measured on a V100 (opt-in until confirmed, as in upstream's c85b7c87).
+On Volta (sm_70), `XESTRATA_SM70_TABLE=1` takes two decode kernels upstream measured on a V100 (opt-in until confirmed, as in upstream's c85b7c87).
 One is the routed experts' "mode 8": gate/up, SwiGLU and the q8_1 quantization in one pass, with the codebook grid and the activations in the work-group's local memory (`src/kernels/xe/iq_kernels.cpp`, upstream f6330507: 227 -> 159 µs on a V100).
 The other is the hyper-connection read's norm and up projection, with the weights loaded ahead to hide the latency (`src/kernels/xe/fused_gr.cpp`, upstream aaa323fe: 50.9 -> 46.7 µs a read on a V100).
-Both give the default kernels' output bit for bit, and `STRATA_GR_FAST=1` takes the second on any GPU.
-Mode 8 is the default on every GPU whose local memory holds it (B70 decode +0.8-1.1% at 1K and 32K, RTX 4070 equal; the idea of upstream f7eaf2de's STRATA_EXPDEC). `STRATA_EXP_MODE=0` keeps the former kernels.
+Both give the default kernels' output bit for bit.
+The read's norm and up are the default on every GPU (Qwen3.8-Flash-Next's decode on the RTX 4070 23.75 -> 24.8 tok/s, the B70 and the RX 9060 XT equal). `XESTRATA_GR_FAST=0` keeps the former kernels.
+Mode 8 is the default on every GPU whose local memory holds it (B70 decode +0.8-1.1% at 1K and 32K, RTX 4070 equal; the idea of upstream f7eaf2de's STRATA_EXPDEC). `XESTRATA_EXP_MODE=0` keeps the former kernels.
 Built with sm_70 code only and run on an RTX 3070, CTest passed its 71 tests with and without them, and the experts' and the read's outputs were the default's bit for bit (on an RX 9060 XT as well).
 
 ### The engine's parts and tests
@@ -152,14 +161,18 @@ Built with sm_70 code only and run on an RTX 3070, CTest passed its 71 tests wit
 The parts and tests that need no model build without llama.cpp (`STRATA_NATIVE_EXPERTS=OFF`).
 The free mode (intel/llvm in `.tools/intel-llvm/install`) is built like this.
 
+Every command configures with Ninja (`-G Ninja`; the generator setup, the packages and the Windows cross build use
+as well: with Make the SYCL device code's dependencies do not connect), so install Ninja first: `sudo dnf install
+ninja-build` on Fedora, `sudo apt install ninja-build` on Ubuntu, `sudo pacman -S --needed ninja` on Arch.
+
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/free \
+cmake -S . -B build/free -G Ninja \
   -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_LICENSE=free \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
-cmake --build build/free --target strata-device strata-load elementwise_parity \
+cmake --build build/free --target xestrata-device xestrata-load elementwise_parity \
   gguf_reader_test suffix_drafter_test controller_test draft_policy_test conv_cache_test \
   platform_memory_test ple_reader_test -j4
 ```
@@ -177,13 +190,13 @@ cmake --build build/free --target strata-device strata-load elementwise_parity \
 
 ### The engine
 
-The engine (the `strata` executable) uses llama.cpp for the native i-quant experts.
+The engine (the `xestrata-engine` executable) uses llama.cpp for the native i-quant experts.
 llama.cpp goes in `third_party/main/llama.cpp` at the pinned commit (`3cf03257f219afbe7334045ff7c6a06ac68c627d`).
 setup.py fetches it; the image encoder also uses its `tools/mtmd`.
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
-cmake -S . -B build/free -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
+cmake -S . -B build/free -G Ninja -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_LICENSE=free -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/free --target strata -j6
 ```
@@ -192,11 +205,11 @@ For NVIDIA GPUs (contrib-llvm), use intel/llvm built by `tools/intel_llvm_build.
 
 ```bash
 C=$PWD/.tools/intel-llvm-contrib/install
-cmake -S . -B build/contrib-llvm -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
+cmake -S . -B build/contrib-llvm -G Ninja -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
   -DSTRATA_LICENSE=contrib \
   -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/contrib-llvm --target strata -j6
-LD_LIBRARY_PATH=$C/lib build/contrib-llvm/strata-device
+LD_LIBRARY_PATH=$C/lib build/contrib-llvm/xestrata-device
 ```
 
 For another machine, `STRATA_CUDA_ARCHS` lists the GPUs' architectures (`sm_89` for the RTX 40 series, `sm_86` for the RTX 30).
@@ -226,6 +239,7 @@ The same executable runs on Intel GPUs too.
    An AMD GPU on amdgpu has its gfx (`gfx1200`, for example) read from the kernel's KFD topology, and `/dev/kfd`'s permissions checked too.
    A GPU older than RDNA2, or one the distribution's rocBLAS (in a package, its engine) has no code for, is shown as not usable ([README](../README.md#amd-gpus)).
 1. It checks RAM and CPU and asks its questions.
+   After the image models, choose whether to prepare the bases for LoRA training too. On the command line, use `--images qwen-image-turbo --image-lora-training`. Omit the second option for inference alone.
 1. It chooses the SYCL compiler ([below](#the-sycl-compiler)) and compiles the engine in `build-xe`.
 
 The engine goes to `engine/` with `BUILD.json` (`"backend": "xe"` and the compiler it was built with).
@@ -303,37 +317,37 @@ The packages it needs are in [the table below](#packages) and in [DEVTOOLS.md](D
 setup.py installs no system packages and runs no package manager and no sudo.
 setup.sh installs Python 3 with venv through `sudo apt-get` (`sudo dnf` on Fedora, `sudo pacman -S` on Arch) only when there is none.
 Install the other packages first.
+When some are missing, setup stops at its first step with one command that installs them all (after the commands that add Intel's oneAPI repository or NVIDIA's CUDA one, where they are not added yet).
 
 From the table, take the common row of the mode you build and the rows of the GPU makers the PC has (any number of them), and put them after `sudo apt install` (`sudo dnf install` on Fedora, `sudo pacman -S` on Arch).
 `./setup.sh --packages` prints that line for this PC's distribution and GPUs and the mode of `--license` (contrib-llvm unless given).
-It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --license free`.
+It prints other choices too, as in `./setup.sh --packages fedora45/intel,amd --license free`.
 
-| Choice | Ubuntu 26.04 | Fedora 44 | Arch |
+| Choice | Ubuntu 26.04 | Fedora 44 / 45 | Arch |
 | --- | --- | --- | --- |
-| common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc spirv-headers opencl-headers blosc2` |
-| Intel GPUs | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime vulkan-intel` |
+| common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev opencl-headers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static opencl-headers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd opencl-headers blosc2` |
+| Intel GPUs | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime` |
 | Intel GPUs (contrib-llvm) | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` | none (oneMKL is not in Arch's repositories) |
-| AMD GPUs (free, contrib-llvm) | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon` |
-| NVIDIA GPUs (contrib-llvm) | `nvidia-cuda-toolkit` and NVIDIA's driver | `cuda-toolkit-13-4` (NVIDIA's CUDA repository) and NVIDIA's driver | `cuda` and NVIDIA's driver |
+| AMD GPUs (free, contrib-llvm) | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common` |
+| NVIDIA GPUs (contrib-llvm) | `nvidia-cuda-toolkit` and NVIDIA's driver | `cuda-toolkit-13-4` (44) / `cuda-toolkit-13-5` (45) (NVIDIA's CUDA repository) and NVIDIA's driver | `cuda` and NVIDIA's driver |
 
 - The packages starting with `intel-oneapi-` are in Intel's oneAPI repository (Intel's guides show how to add it: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html), [DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)).
 - Intel GPU drivers (`libze-intel-gpu1` and the rest) ship old on Ubuntu 24.04/26.04 (26.04 has compute-runtime 26.05 and IGC 2.28).
   Below compute-runtime 26.22 a driver state can refuse device allocations while the VRAM is free (Intel's [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916); the driver works around an xe kernel bug fixed in Linux 7.1 — on XeStrata's side, [#34](https://github.com/MistVVK/XeStrata/issues/34)).
   On Ubuntu 24.04/26.04 with the HWE kernel, setup points to [Intel's graphics PPA](https://launchpad.net/~kobuk-team/+archive/ubuntu/intel-graphics) (a newer compute-runtime and IGC) and stops the start until it is updated (`--old-driver` starts anyway).
-  On the GA kernel it recommends moving to the HWE kernel with the PPA, or Fedora 44 / Podman (whose IGC is 2.32 or later; [Troubleshooting](DETAILS.md#troubleshooting)).
-- The common row's Vulkan packages (`libvulkan-dev` and the others) are for the GPU image encoder, and `libblosc2-dev` (`blosc2-devel`) for compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)).
+  On the GA kernel it recommends moving to the HWE kernel with the PPA, or Fedora 44 or 45 / Podman (whose IGC is 2.32 or later; [Troubleshooting](DETAILS.md#troubleshooting)).
+- The common row's `libblosc2-dev` (`blosc2-devel`) is for compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-on-the-disk)).
 - The AMD row's `clang-21` and `libclang-rt-21-dev` (on Fedora `rocm-clang` and `rocm-clang-runtime-devel`: ROCm's clang and its runtime) compile nothing (intel/llvm does the compiling).
   HIP's CMake package, which oneMath's rocBLAS backend reads, asks the compiler for clang's runtime builtins (`libclang_rt.builtins`) to add them to the link.
   intel/llvm has no such builtins, so ROCm's clang is made `HIP_CXX_COMPILER` to answer (`strata_hip_cxx` in `cmake/StrataHip.cmake`).
   They are needed to build only, not to run.
-- On Arch the Vulkan ICD is the GPU maker's own package (`vulkan-intel`, `vulkan-radeon`), not the one `mesa-vulkan-drivers` carries for both on Ubuntu and Fedora.
 - Arch's `zstd` has no `libzstd.a` (`zstd-static` is an AUR package).
   intel/llvm's `configure.py` asks for the static zstd (`LLVM_USE_STATIC_ZSTD=ON`), so `tools/intel_llvm_build.py` turns that off where there is none and links the shared one (intel/llvm handles it from v7.1.1: [intel/llvm#22294](https://github.com/intel/llvm/pull/22294)).
 - Arch's ROCm clang is in `/opt/rocm/lib/llvm`, and its runtime builtins (`libclang_rt.builtins`) are in the same `rocm-llvm` package (one package where the AMD row's `clang-21` and `libclang-rt-21-dev` are two).
 - Arch's ROCm lies under AMD's own tree, `/opt/rocm` (its CMake packages in `/opt/rocm/lib/cmake`, its libraries in `/opt/rocm/lib`).
   Neither CMake's default search nor ld.so's looks there, so `cmake/StrataHip.cmake` puts `/opt/rocm` on `CMAKE_PREFIX_PATH`, and setup records `/opt/rocm/lib` among the engine's library folders.
-- On Arch `opencl-headers` is installed as well: intel/llvm's build installs the SYCL tools too, and `sycl-ls` includes `CL/cl.h` through `sycl/detail/cl.h` while its target gets no include for the OpenCL headers the configuration fetches (those belong to the runtime's own objects).
-  Ubuntu's and Fedora's builds have that header (their compilers bring it in); Arch's clang does not.
+- `opencl-headers` is installed on every distribution: intel/llvm's build installs the SYCL tools too, and `sycl-ls` includes `CL/cl.h` through `sycl/detail/cl.h` while its target gets no include for the OpenCL headers the configuration fetches (those belong to the runtime's own objects).
+  No compiler brings that header in (a fresh Fedora (44 and 45) lacks it, as Arch does).
 - oneMKL is not in Arch's repositories: install Intel's offline installer for it if it is wanted.
   The contrib-llvm mode hands an Intel GPU's dense products to oneMKL, so it needs oneMKL for an Intel GPU.
   Without it, use the free mode: it builds intel/llvm from the source, and an Intel GPU's dense products are XeStrata's own kernels' work.
@@ -363,6 +377,8 @@ tools/package/build.sh ubuntu26.04 cuda13.1   # xestrata-contrib-cuda13.1
 tools/package/build.sh ubuntu26.04 cuda12.4   # xestrata-contrib-cuda12.4
 tools/package/build.sh fedora44 free
 tools/package/build.sh fedora44 cuda13.4
+tools/package/build.sh fedora45 free
+tools/package/build.sh fedora45 cuda13.5
 ```
 
 - The input is a commit: `git archive` passes the commit's files, nothing else, to the container.
@@ -370,11 +386,15 @@ tools/package/build.sh fedora44 cuda13.4
   Nothing of the work tree (`build-xe`, `.tools`, `.venv`) is used.
 - A clean container each time: the images are pinned by digest in `build.sh`.
   In the container it installs the build tools and the distribution's ROCm and builds intel/llvm (`tools/intel_llvm_build.py`,
-  with the HIP target, and the CUDA target for the cuda variants), the image encoders (CPU and Vulkan) and the engine, and CPack makes the packages
+  with the HIP target, and the CUDA target for the cuda variants), the CPU image encoder and the engine (with the GPU picture reader), and CPack makes the packages
   (`tools/package/container.sh`, `cmake/packaging.cmake`).
   The container is removed at the end. intel/llvm is built every time, so a build takes a while.
-  The one thing kept between builds is the compiler cache (ccache, `build/pkg-ccache/<distro>/`, at most `XESTRATA_CCACHE_MAX`, default 30G):
-  a second package of the same distribution takes most of intel/llvm's and the engine's objects from it. Deleting the folder makes the next build compile everything again.
+  Kept between builds: the compiler cache (ccache, `build/pkg-ccache/<distro>/`, at most `XESTRATA_CCACHE_MAX`, default 30G),
+  from which a second package of the same distribution takes most of intel/llvm's and the engine's objects.
+  `build/pkg-cache/<distro>/` also keeps the packages apt and dnf fetched and the finished intel/llvm toolchains (used while the version, the patches, the base image and the CUDA and ROCm packages stay the same).
+  `XESTRATA_PKG_CLEAN=1` leaves those two out: the build tools are fetched and intel/llvm is built again (a release's builds do this).
+  Deleting a folder makes the next build start without it.
+  The packages are compressed on every thread (the deb with zstd, the rpm with zstd 19).
   `XESTRATA_JOBS=16 tools/package/build.sh …` sets how many files compile at once (default: the threads; intel/llvm links as many at once as the free RAM allows).
 - No GPU needed: the container gets no GPU and nothing of this PC's.
   CMake values that come from this PC's GPUs or CPU (`auto` for `STRATA_CUDA_ARCHS`, `STRATA_HIP_ARCHS`, `STRATA_ONEMKL`, `STRATA_CUDA_PATH` and
@@ -387,20 +407,23 @@ tools/package/build.sh fedora44 cuda13.4
 
 | Variant | Distribution | CUDA toolkit | NVIDIA code |
 | --- | --- | --- | --- |
-| free | Ubuntu 26.04, Fedora 44 | — | — |
+| free | Ubuntu 26.04, Fedora 44 and 45 | — | — |
 | cuda13.1 | Ubuntu 26.04 | `cuda-toolkit-13-1` from multiverse | sm_75, sm_80, sm_86, sm_89, sm_90 |
 | cuda13.4 | Fedora 44 | `cuda-toolkit-13-4` from NVIDIA's repository | sm_75, sm_80, sm_86, sm_89, sm_90 |
+| cuda13.5 | Fedora 45 | `cuda-toolkit-13-5` from NVIDIA's repository | sm_75, sm_80, sm_86, sm_89, sm_90 |
 | cuda12.4 | Ubuntu 26.04 | `nvidia-cuda-toolkit` | sm_60, sm_61, sm_70, sm_75, sm_80, sm_86, sm_89, sm_90 |
 
-Every variant has AMD code for the GPUs the distribution's rocBLAS (ROCm 7.1) has code for (but gfx1152 and gfx1153, which intel/llvm 7.2.0 has no target for).
+Every variant has AMD code for the GPUs the distribution's rocBLAS (ROCm 7.1; Fedora 45's is 7.2) has code for (but gfx1152 and gfx1153, which intel/llvm 7.2.0 has no target for).
 
 | Distribution | AMD code |
 | --- | --- |
 | Ubuntu 26.04 | gfx1030, gfx1100, gfx1101, gfx1151, gfx1200, gfx1201 |
 | Fedora 44 | gfx1030, gfx1031, gfx1035, gfx1036, gfx1100, gfx1101, gfx1102, gfx1103, gfx1150, gfx1151, gfx1200, gfx1201 |
+| Fedora 45 | gfx1030, gfx1031, gfx1035, gfx1036, gfx1100, gfx1101, gfx1102, gfx1103, gfx1150, gfx1151, gfx1200, gfx1201 |
 
-- A cuda variant is named after the CUDA version it is built with.
-  NVIDIA's repository for Fedora 44 has CUDA 13.3 and 13.4 only, so Fedora's is 13.4; it has no CUDA 12 either, so cuda12.4 is Ubuntu's only.
+- A cuda variant is named after the CUDA version it is built with. Fedora 44's rpm is 13.4 and Fedora 45's is 13.5.
+  NVIDIA has no repository of Fedora 45's own, so Fedora 45 uses fedora44's (switch when NVIDIA publishes one; on 2026-11-18 its fedora45
+  repository holds DCGM only). Fedora has no CUDA 12 either, so cuda12.4 is Ubuntu's only.
 - CUDA 13 builds no Pascal (sm_60, sm_61) or Volta (sm_70) code: a P100, P40 or V100 takes cuda12.4.
 - intel/llvm 7.2.0's SYCL has no name above sm_90: newer GPUs (an RTX 50) run sm_90's PTX, which their driver compiles.
 - The PTX is the toolkit's version, so the driver must support that CUDA version.
@@ -413,12 +436,41 @@ The Windows 7z is built with the same `tools/package/build.sh`, in a disposable 
 tools/package/build.sh windows cuda12.4      # XeStrata-<version>-windows-x64.7z
 ```
 
-- All of it is cross-built on Linux for Windows: intel/llvm (the Linux contrib toolchain and the SYCL runtime for Windows), the engine (the contrib-llvm mode, the NVIDIA code as the cuda12.4 deb's), the image encoder on the CPU (`strata-vision-cpu.exe`; no Vulkan one, so pictures are read on the CPU), the .NET launchers (`dotnet-sdk-10.0`), and Python's embeddable distribution with the wheels; `tools/package/windows_bundle.py` makes the folder and the 7z.
+- All of it is cross-built on Linux for Windows: intel/llvm (the Linux contrib toolchain and the SYCL runtime for Windows), the engine (the contrib-llvm mode, the NVIDIA code as the cuda12.4 deb's), the picture reader (`xestrata-vision.exe`), the .NET launchers (`dotnet-sdk-10.0`), and Python's embeddable distribution with the wheels; `tools/package/windows_bundle.py` makes the folder and the 7z.
 - The MSVC CRT and the Windows SDK come from Microsoft through xwin, its license accepted (they are not free software and do not go into the 7z). Neither do the Windows CUDA headers and import libraries.
 - It uses the Ubuntu 26.04 packages' ccache (`build/pkg-ccache/ubuntu26.04/`) and keeps xwin's and NuGet's downloads in `build/pkg-cache/windows/`.
 - Every exe, DLL and Python package in the 7z must be one of `windows_bundle.py`'s components; a Visual C++ runtime or an NVIDIA library in it stops the build.
   `THIRD-PARTY-NOTICES.md` names each component, its version, license and source, and `licenses/` holds the license texts.
 - What comes out: the 7z and `BUILDINFO` in `build/pkg/windows-cuda12.4/`.
+
+### The window's package (xestrata-gui)
+
+Linux's window (`launcher/`) is built with the same `tools/package/build.sh`, in a throwaway container of the
+distribution (`tools/package/gui.sh`).
+
+```bash
+tools/package/build.sh ubuntu26.04 gui   # xestrata-gui_<version>_amd64.deb
+tools/package/build.sh fedora44 gui      # xestrata-gui-<version>-<release>.fc44.x86_64.rpm
+tools/package/build.sh fedora45 gui      # xestrata-gui-<version>-<release>.fc45.x86_64.rpm
+```
+
+- The distribution's `dotnet-sdk-10.0` (Ubuntu's archive, Fedora's updates) publishes the window for linux-x64,
+  framework-dependent.
+  The .NET runtime is not bundled: the package depends on the distribution's `dotnet-runtime-10.0`, and it is the only
+  package that depends on .NET.
+- The NuGet packages come from nuget.org only (`launcher/nuget.config`), their versions and hashes fixed in each
+  project's `packages.lock.json`.
+  The packages and the Windows 7z restore with `RestoreLockedMode`, which takes nothing the lock files do not name.
+  After a version is changed, `dotnet restore launcher/Tests --force-evaluate` writes the lock files again.
+  The packages fetched are kept in `build/pkg-cache/<distro>/nuget/`.
+- It holds `/usr/lib/xestrata/launcher/` (`xestrata-gui` and its DLLs, `libSkiaSharp.so`, `libHarfBuzzSharp.so`), the
+  menu's entry and icon, and `THIRD-PARTY-NOTICES.md` and `licenses/` in `/usr/share/doc/xestrata-gui/`
+  (`tools/package/launcher_notices.py`, which stops on a library of the window's folder that is in no component).
+- The window draws its fields from setup's `--describe`, so it depends on the main package of the same version: each
+  variant provides `xestrata-engine` at its version, and `xestrata-gui` depends on that.
+  The main package only suggests `xestrata-gui`, and depends neither on .NET nor on the window.
+- Its parts are all free software (of Adobe's DNG SDK in libSkiaSharp.so the code only, none of its documentation,
+  whose terms are not free), so the same one package goes with the free and the contrib-llvm main packages.
 
 ### What the packages hold
 
@@ -429,10 +481,12 @@ xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
 | What | Where |
 | --- | --- |
 | the `xestrata` command (setup.py), the server, the web app, the tools setup runs, llama.cpp's gguf-py, the data files, a systemd user unit | `/usr/share/xestrata`, `/usr/bin/xestrata`, `/usr/lib/systemd/user/xestrata.service` |
-| the engine (`strata`), the image encoders, intel/llvm's SYCL runtime (`libsycl.so.9`, UR's loader, its Level Zero and HIP (AMD) adapters and in the cuda variants its CUDA adapter, `libumf`), oneMath (its rocBLAS backend, and in the cuda variants its oneMKL and cuBLAS backends) | `<libdir>/xestrata/engine` |
+| the engine (`xestrata-engine`), the image encoders, intel/llvm's SYCL runtime (`libsycl.so.9`, UR's loader, its Level Zero and HIP (AMD) adapters and in the cuda variants its CUDA adapter, `libumf`), oneMath (its rocBLAS backend, and in the cuda variants its oneMKL and cuBLAS backends) | `<libdir>/xestrata/engine` |
 
-- The packages provide and conflict with `xestrata-engine`: one is installed at a time, and installing another replaces it.
-- Neither Ubuntu 26.04 (`dpclang` up to 6) nor Fedora 44 has libsycl 9, so the packages carry it.
+- The packages provide `xestrata-engine` at their version and conflict with it: one is installed at a time, and
+  installing another replaces it.
+  They only suggest the window's package `xestrata-gui` ([the window's package](#the-windows-package-xestrata-gui)).
+- Neither Ubuntu 26.04 (`dpclang` up to 6) nor Fedora (44 and 45) has libsycl 9, so the packages carry it.
   intel/llvm's `libsycl-jit` (157 MB) is opened only to compile kernels from source, which the engine does not: it is left out.
 - The dependencies are the distribution's.
   The Python packages are the distribution's versions, not pip's pinned ones (`requirements.txt`).
@@ -449,6 +503,7 @@ xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
   and Fedora's own repositories), and carries the adapter. The AMD code the engine has is recorded in `BUILD.json`
   (`hip_archs`), from which setup decides whether a GPU can be used.
 - The makers' packages the package recommends or suggests are recorded in `BUILD.json` too, by maker (`runtime`). setup asks apt or dnf which of those of the GPUs it uses are missing, and shows how to install them (adding a repository first where needed). Without the GPU's runtime it stops; without oneMKL or cuBLAS it only shows them and goes on.
+  With AMD's own ROCm installed from AMD's packages (amdrocm, `/opt/rocm/core-<version>`), the tree holding the libraries the engine links (its executables' NEEDED) and the code of the GPUs in use, the distribution's ROCm is not asked for: the engine's library path is pointed at that tree.
 - `third_party/nonfree/` is not packaged: the chat template is the one setup writes into the model's pack.
   The experimental speed projection's vector is downloaded by setup from the version's tag on GitHub when it is turned on.
 - The Python files are compiled when the package is built, and `xestrata` runs with `PYTHONDONTWRITEBYTECODE=1`: nothing is written
@@ -477,6 +532,7 @@ The rpm that goes in is the latest one of this fork's Releases, fetched inside t
 | `XESTRATA_VERSION` | `latest` | the release's tag, when the rpm comes from the Releases |
 | `XESTRATA_VARIANT` | `free` | the rpm's variant (this fork builds free only) |
 | `XESTRATA_NONFREE` | `0` | `1` also installs oneMKL and NVIDIA's cuBLAS and cuDNN where the rpm's `BUILD.json` records them (for an upstream XeStrata contrib rpm put there; this fork's rpm records none) |
+| `XESTRATA_ROCM` | `fedora` | the ROCm for AMD GPUs: Fedora's by default. `10.1` installs the HIP runtime, rocBLAS and hipBLASLt of ROCm 10.1 from AMD's Radeon repository (its RHEL 10 one), whose hipBLASLt has code for gfx1150 as well, which Fedora's lacks. Both are free software |
 
 - GPU: `/dev/dri` and ROCm's `/dev/kfd` are passed, and `userns_mode: keep-id` with `group_add: keep-groups` opens them as the host's user, with its uid and render group
   (`keep-groups` needs the crun runtime).
@@ -498,4 +554,5 @@ services:
 
 - SELinux (Fedora and others): the container runs with `label=disable`, so the host's folders are not relabeled; only the build labels `container/` to read it (`relabel=shared`).
 - memlock: a rootless container cannot go above the host user's limit. When setup says the limit is too low, raise it on the host.
+- seccomp: Podman's default seccomp profile denies io_uring. compose runs the container with that profile plus one entry allowing io_uring's three system calls (`third_party/main/containers-common/seccomp-io_uring.json`): the engine pins its expert arena with io_uring for an Intel GPU (#42). The profile's path is relative to `container/`, so `podman compose` runs there.
 - Stopping: `podman compose down`. `init`'s PID 1 passes the signal to setup and the server, and the engine gets up to 60 seconds to stop.

@@ -19,6 +19,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
     const t = localStorage.getItem("xestrata.theme") ||
       (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     document.documentElement.dataset.theme = t;
+    // and the text size (About > Settings)
+    const z = localStorage.getItem("xestrata.textScale");
+    if (z) document.documentElement.style.setProperty("--st-text-scale", z);
   } catch (e) {}
 </script>
 </head>
@@ -32,22 +35,31 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
     <select id="model-select" aria-label="Model on the GPU" data-i18n-label="switch.label"></select>
   </label>
   <nav class="st-tabs" role="tablist" aria-label="Views" data-i18n-label="tab.views">
-    <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
+    <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat" aria-label="Chat" title="Chat" data-i18n-label="tab.chat" data-i18n-title="tab.chat">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg><span data-i18n="tab.chat">Chat</span></button>
-    <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" hidden>
+    <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" aria-label="Images" title="Images" data-i18n-label="tab.images" data-i18n-title="tab.images" hidden>
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span data-i18n="tab.images">Images</span></button>
-    <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
+    <button class="st-tab" role="tab" id="tab-btn-tools" aria-controls="view-tools" aria-selected="false" data-tab="tools" aria-label="Tools" title="Tools" data-i18n-label="tab.tools" data-i18n-title="tab.tools" hidden>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-tool"/></svg><span data-i18n="tab.tools">Tools</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-video" aria-controls="view-video" aria-selected="false" data-tab="video" aria-label="Video" title="Video" data-i18n-label="tab.video" data-i18n-title="tab.video" hidden>
+      <svg class="st-icon st-icon--sm" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 9V15L15 12Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg><span data-i18n="tab.video">Video</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-translate" aria-controls="view-translate" aria-selected="false" data-tab="translate" aria-label="Translate" title="Translate" data-i18n-label="tab.translate" data-i18n-title="tab.translate" hidden>
+      <svg class="st-icon st-icon--sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h10M8 3v2M5.5 5c.8 3.5 3.5 6.5 7 8M10.5 5c-.8 3.5-3.5 6.5-7 8M12.5 21l4.25-9 4.25 9M14 18h5.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span data-i18n="tab.translate">Translate</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor" aria-label="Monitor" title="Monitor" data-i18n-label="tab.monitor" data-i18n-title="tab.monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span data-i18n="tab.monitor">Monitor</span></button>
-    <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
+    <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about" aria-label="About" title="About" data-i18n-label="tab.about" data-i18n-title="tab.about">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg><span data-i18n="tab.about">About</span><span class="tab-dot" id="update-dot" hidden></span></button>
   </nav>
   <span class="st-header__spacer"></span>
-  <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
-    <span class="st-pill__dot"></span><span id="pill-text" data-i18n="pill.connecting">Connecting&hellip;</span></span>
-  <button class="st-btn st-btn--secondary" id="unload-btn" type="button" title="Waiting for the server" disabled>&hellip;</button>
-  <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark" data-i18n-title="theme.title" data-i18n-label="theme.label">
-    <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
+  <!-- what runs: a mark and a number for each (the text model's turn, the requests waiting, an image job); a tap lists
+       them (renderPill) -->
+  <button type="button" class="st-pill" id="pill" data-state="idle" aria-haspopup="true" aria-expanded="false" aria-controls="pill-pop">
+    <span class="st-pill__dot"></span><span id="pill-text" role="status" aria-live="polite" data-i18n="pill.connecting">Connecting&hellip;</span><span class="pill-lanes" id="pill-lanes" aria-hidden="true"></span></button>
+  <div class="pill-pop" id="pill-pop" role="dialog" aria-label="What is running" data-i18n-label="pill.open" hidden></div>
 </header>
+
+<!-- a disk that is filling up: the server watches it even when a text engine has died; /metrics fills this in -->
+<div class="st-disk-note" id="disk-note" role="status" aria-live="polite" hidden></div>
 
 <main>
   <!-- ============================ Chat ============================ -->
@@ -77,28 +89,50 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         </div>
       </div>
       <div class="composer-wrap">
+        <!-- a video job on the server (the metrics' live.video): the chat answers between its chunks, or not until it ends -->
+        <div class="chat-video-note" id="chat-video-note" role="status" hidden></div>
         <form class="st-composer" id="composer">
           <div class="attachments" id="attachments" hidden></div>
           <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message" data-i18n-placeholder="composer.placeholder" data-i18n-label="composer.message"></textarea>
           <div class="st-composer__bar">
-            <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file" data-i18n-label="composer.attachLabel">
-              <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
             <input type="file" id="file" multiple hidden>
+            <!-- the + at the row's start, its menu above it: attach, Chat settings, the image switch -->
+            <span class="composer-more-box">
+            <button type="button" class="st-btn st-btn--icon composer-more" id="more-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="more-menu"
+                    title="More" aria-label="More" data-i18n-title="composer.more" data-i18n-label="composer.more">
+              <svg class="st-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V19M5 12H19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+            <span class="composer-menu" id="more-menu" role="menu" hidden>
+              <button type="button" role="menuitem" class="composer-menu__item" id="attach-btn" title="Attach a text file (or drop it here)">
+                <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-attach"/></svg><span data-i18n="composer.attachLabel">Attach a file</span></button>
+              <button type="button" role="menuitem" class="composer-menu__item" id="sampling-btn">
+                <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-settings"/></svg><span data-i18n="drawer.title">Chat settings</span></button>
+              <button type="button" role="menuitemcheckbox" aria-checked="false" class="composer-menu__item" id="image-btn"
+                      title="Always make an image: while on, every answer makes or edits an image" data-i18n-title="composer.image" hidden>
+                <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span class="image-toggle__label">Always image: off</span></button>
+            </span>
+            </span>
             <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat" data-i18n-title="chat.new" data-i18n-label="chat.new">
               <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
             <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat" data-i18n-title="composer.save" data-i18n-label="composer.saveLabel">
               <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
-            <button type="button" class="st-btn st-btn--secondary chat-settings-button" id="sampling-btn" title="Chat settings" aria-label="Chat settings" data-i18n-title="drawer.title" data-i18n-label="drawer.title">
-              <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-settings"/></svg>
-              <span class="chat-settings-label" data-i18n="drawer.title">Chat settings</span><span class="chat-settings-short" aria-hidden="true" data-i18n="drawer.short">Settings</span></button>
+            <!-- how much of its context the open chat uses (paintCtxRing) -->
+            <button type="button" class="ctx-ring" id="ctx-ring" hidden><svg viewBox="0 0 36 36" aria-hidden="true">
+              <circle class="ctx-ring__track" cx="18" cy="18" r="15"/><circle class="ctx-ring__fill" id="ctx-ring-fill" cx="18" cy="18" r="15"/></svg><span
+              class="ctx-ring__pct" id="ctx-ring-pct" aria-hidden="true"></span></button>
+            <!-- the images choice in a box of its own that scrolls sideways: it alone gives way, so the row stays one line -->
+            <span class="chat-images-box" id="chat-images-box" hidden>
             <select class="st-input chat-images" id="chat-images" title="Images in the chat: the model makes one when the conversation asks for it" aria-label="Images in the chat"
-                    data-i18n-title="chatImages.title" data-i18n-label="chatImages.label" hidden></select>
+                    data-i18n-title="chatImages.title" data-i18n-label="chatImages.label"></select>
+            </span>
             <span class="spacer"></span>
             <span class="composer-hint" id="composer-hint"></span>
-            <button type="button" class="st-btn st-btn--secondary" id="stop-btn" hidden>
+            <!-- Stop and Send stay together at the row's end -->
+            <span class="composer-send">
+            <button type="button" class="st-btn st-btn--secondary" id="stop-btn" aria-label="Stop" data-i18n-label="composer.stop" hidden>
               <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-stop"/></svg><span data-i18n="composer.stop">Stop</span></button>
             <button type="submit" class="st-btn st-btn--primary st-btn--send" id="send-btn" aria-label="Send" data-i18n-label="composer.send">
               <svg class="st-icon"><use href="web/sprite.svg#i-send"/></svg></button>
+            </span>
           </div>
         </form>
       </div>
@@ -107,25 +141,33 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
   <!-- ============================ Images ============================ -->
   <section class="view view--images" id="view-images" role="tabpanel" aria-labelledby="tab-btn-images" hidden>
-    <div class="about">
-      <form class="st-card img-form" id="img-form">
-        <span class="card-title" id="img-title" data-i18n="img.title">Make an image</span>
+    <!-- the prompts and Generate on top, the settings on the left and the pictures on the right; one column on a phone,
+         the prompts, the pictures, the settings, with Generate held at the bottom of the screen -->
+    <form class="img-page" id="img-form">
+      <div class="st-card img-prompts">
+        <label class="st-field img-model" id="img-model-f" hidden><span data-i18n="img.model">Model</span>
+          <select class="st-input" id="img-model"></select></label>
+        <label class="st-field img-gpu" id="img-gpu-f" hidden><span data-i18n="img.gpu">GPU that makes it</span>
+          <select class="st-input" id="img-gpu"></select></label>
         <textarea class="st-input img-prompt" id="img-prompt" rows="3" placeholder="Describe the image&hellip;" aria-label="Prompt"
                   data-i18n-placeholder="img.prompt" data-i18n-label="img.promptLabel"></textarea>
-        <label class="st-field" id="img-neg-f"><span data-i18n="img.negative">Negative prompt (optional)</span>
-          <textarea class="st-input img-prompt" id="img-neg" rows="2" placeholder="What the image should not have&hellip;" data-i18n-placeholder="img.negativeHint"></textarea></label>
+        <details class="img-neg" id="img-neg-f" open><summary data-i18n="img.negative">Negative prompt (optional)</summary>
+          <textarea class="st-input img-prompt" id="img-neg" rows="2" placeholder="What the image should not have&hellip;" aria-label="Negative prompt (optional)"
+                    data-i18n-placeholder="img.negativeHint" data-i18n-label="img.negative"></textarea></details>
         <span class="composer-hint" id="img-neg-hint" hidden></span>
-        <div class="img-lora" id="img-lora" hidden>
-          <div class="img-row">
-            <label class="st-field" id="img-lora-add-f"><span data-i18n="img.lora">LoRA</span>
-              <select class="st-input" id="img-lora-add"></select></label>
-            <span class="composer-hint" id="img-lora-hint" hidden></span>
-          </div>
-          <div class="img-lora-chips" id="img-lora-chips"></div>
-        </div>
-        <div class="img-row">
-          <label class="st-field" id="img-model-f" hidden><span data-i18n="img.model">Model</span>
-            <select class="st-input" id="img-model"></select></label>
+      </div>
+      <div class="img-go-bar">
+        <button type="submit" class="st-btn st-btn--primary img-go" id="img-go"><span class="img-go__run" data-i18n="img.generate">Generate</span>
+          <span class="img-go__stop" data-i18n="img.interrupt">Interrupt</span><span class="img-go__time" id="img-go-time"></span></button>
+      </div>
+
+      <div class="st-card img-settings">
+        <label class="st-field" id="img-sampler-f" hidden><span data-i18n="img.sampler">Sampler</span>
+          <select class="st-input" id="img-sampler"></select></label>
+        <label class="st-field img-sl" id="img-steps-f"><span class="img-sl__head"><span data-info="steps" data-i18n="img.steps">Steps</span>
+          <input class="st-input" id="img-steps" type="number" min="1" max="100" step="1"></span>
+          <input class="img-sl__range" type="range" data-for="img-steps" tabindex="-1" aria-hidden="true"></label>
+        <div class="img-size">
           <label class="st-field"><span data-i18n="img.size">Size</span>
             <select class="st-input" id="img-size">
               <option>1024x1024</option><option>1536x1024</option><option>1024x1536</option>
@@ -133,43 +175,153 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
               <option>1920x1080</option><option>1080x1920</option>
               <option value="auto" data-i18n="img.sizeAuto">auto (the reference's shape)</option>
               <option value="custom" data-i18n="img.sizeCustom">Custom&hellip;</option></select></label>
-          <label class="st-field" id="img-custom" hidden><span data-i18n="img.widthHeight">Width &times; height</span>
-            <span class="img-wh"><input class="st-input" id="img-w" type="number" min="256" max="2048" step="1" value="1024" aria-label="Width" data-i18n-label="img.width">
-            <input class="st-input" id="img-h" type="number" min="256" max="2048" step="1" value="1024" aria-label="Height" data-i18n-label="img.height"></span></label>
-          <label class="st-field" id="img-ref-f"><span id="img-ref-l">Edit an image (optional)</span>
-            <input class="st-input" id="img-ref" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" multiple></label>
-          <label class="st-field" id="img-strength-f" hidden title="How much of the image may change: lower keeps more of it" data-i18n-title="img.strengthTitle"><span data-i18n="img.strength">Strength</span>
-            <input class="st-input" id="img-strength" type="number" min="0.01" max="1" step="0.01"></label>
-          <label class="st-field" id="img-steps-f"><span data-i18n="img.steps">Steps</span>
-            <input class="st-input" id="img-steps" type="number" min="1" max="100" step="1"></label>
-          <label class="st-field" id="img-cfg-f"><span id="img-cfg-l">Guidance (CFG)</span>
-            <input class="st-input" id="img-cfg" type="number" min="0" max="30" step="0.5"></label>
-          <label class="st-field"><span data-i18n="img.seed">Seed</span>
-            <input class="st-input" id="img-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom"></label>
-          <label class="st-field" id="img-n-f"><span data-i18n="img.count">Images</span>
-            <span class="img-n"><select class="st-input" id="img-n"><option>1</option></select>
-            <span class="img-n-est" id="img-n-est"></span></span></label>
-          <label class="st-field"><span data-i18n="img.format">Format</span>
-            <select class="st-input" id="img-fmt"></select></label>
-          <label class="st-field" id="img-q-f" hidden><span data-i18n="img.quality">Quality</span>
-            <input class="st-input" id="img-q" type="number" min="0" max="100" step="1" value="90" aria-label="Quality, 0 to 100" data-i18n-label="img.qualityLabel"></label>
-          <label class="st-field img-check" id="img-bg-f" hidden>
-            <input type="checkbox" id="img-bg"> <span data-i18n="img.transparent">Transparent background</span></label>
-          <label class="st-field img-check" id="img-partial-f">
-            <input type="checkbox" id="img-partial"> <span data-i18n="img.partial">Show partial images</span></label>
-          <button type="submit" class="st-btn st-btn--primary" id="img-go" data-i18n="img.generate">Generate</button>
+          <button type="button" class="st-btn st-btn--icon" id="img-swap" title="Swap the width and the height" aria-label="Swap the width and the height"
+                  data-i18n-title="img.swap" data-i18n-label="img.swap">
+            <svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 4V20M7 20L3.5 16.5M7 20L10.5 16.5M17 20V4M17 4L13.5 7.5M17 4L20.5 7.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         </div>
-        <div class="img-mask" id="img-mask" hidden>
-          <span class="img-mask-title" data-i18n="img.mask">Mask (optional): paint the part of the first image to draw again; the rest stays as it is</span>
-          <div class="img-mask-tools">
-            <label class="img-check"><span data-i18n="img.brush">Brush</span> <input type="range" id="img-brush" min="4" max="200" value="40" aria-label="Brush size" data-i18n-label="img.brushSize"></label>
-            <label class="img-check"><input type="checkbox" id="img-erase"> <span data-i18n="img.erase">Erase</span></label>
-            <button type="button" class="st-btn" id="img-mask-clear" data-i18n="img.clear">Clear</button>
+        <div class="img-wh" id="img-custom">
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="img.width">Width</span>
+            <input class="st-input" id="img-w" type="number" min="256" max="2048" step="1" value="1024"></span>
+            <input class="img-sl__range" type="range" data-step="16" data-for="img-w" tabindex="-1" aria-hidden="true"></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="img.height">Height</span>
+            <input class="st-input" id="img-h" type="number" min="256" max="2048" step="1" value="1024"></span>
+            <input class="img-sl__range" type="range" data-step="16" data-for="img-h" tabindex="-1" aria-hidden="true"></label>
+        </div>
+        <label class="st-field img-sl" id="img-cfg-f"><span class="img-sl__head"><span data-info="cfg" id="img-cfg-l">Guidance (CFG)</span>
+          <input class="st-input" id="img-cfg" type="number" min="0" max="30" step="0.5"></span>
+          <input class="img-sl__range" type="range" data-for="img-cfg" tabindex="-1" aria-hidden="true"></label>
+        <label class="st-field img-sl" id="img-n-f"><span class="img-sl__head"><span data-i18n="img.count">Images</span>
+          <span class="img-n"><span class="img-n-est" id="img-n-est"></span><select class="st-input" id="img-n"><option>1</option></select></span></span>
+          <input class="img-sl__range" type="range" data-for="img-n" tabindex="-1" aria-hidden="true"></label>
+        <div class="st-field"><label for="img-seed" data-i18n="img.seed" data-info="seed">Seed</label>
+          <span class="img-seed"><input class="st-input" id="img-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom">
+            <button type="button" class="st-btn st-btn--icon" id="img-seed-random" title="A random seed" aria-label="A random seed" data-i18n-title="img.seedDice" data-i18n-label="img.seedDice">
+              <svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3.5" stroke="currentColor" stroke-width="1.5"/><circle cx="8.75" cy="8.75" r="1.25" fill="currentColor"/><circle cx="12" cy="12" r="1.25" fill="currentColor"/><circle cx="15.25" cy="15.25" r="1.25" fill="currentColor"/></svg></button>
+            <button type="button" class="st-btn st-btn--icon" id="img-seed-reuse" title="The last image's seed" aria-label="The last image's seed" data-i18n-title="img.seedReuse" data-i18n-label="img.seedReuse" disabled>
+              <svg class="st-icon"><use href="web/sprite.svg#i-refresh"/></svg></button></span></div>
+
+        <details class="st-collapse img-sec" id="img-sec-ref"><summary><span id="img-ref-l">Edit an image (optional)</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
+            <label class="st-field" id="img-ref-f"><input class="st-input" id="img-ref" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp,image/jxl,.jxl" multiple
+                   aria-labelledby="img-ref-l"></label>
+            <label class="st-field img-sl" id="img-strength-f" hidden title="How much of the image may change: lower keeps more of it" data-i18n-title="img.strengthTitle"><span class="img-sl__head"><span data-info="strength" data-i18n="img.strength">Strength</span>
+              <input class="st-input" id="img-strength" type="number" min="0.01" max="1" step="0.01"></span>
+              <input class="img-sl__range" type="range" data-for="img-strength" tabindex="-1" aria-hidden="true"></label>
+            <label class="st-field" id="img-ext-f" hidden title="Draw past the image's edges to this shape (outpaint)" data-i18n-title="img.extendTitle"><span data-info="extend" data-i18n="img.extend">Extend to</span>
+              <select class="st-input" id="img-ext"><option value="" data-i18n="img.upNone">None</option><option value="1:1">1:1</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="16:9">16:9</option><option value="9:16">9:16</option></select></label>
+            <div class="img-mask" id="img-mask" hidden>
+              <span class="img-mask-title" data-i18n="img.mask">Mask (optional): paint the part of the first image to draw again; the rest stays as it is</span>
+              <div class="img-mask-tools">
+                <label class="img-check"><span data-i18n="img.brush">Brush</span> <input type="range" id="img-brush" min="4" max="200" value="40" aria-label="Brush size" data-i18n-label="img.brushSize"></label>
+                <label class="img-check"><input type="checkbox" id="img-erase"> <span data-i18n="img.erase">Erase</span></label>
+                <button type="button" class="st-btn" id="img-mask-clear" data-i18n="img.clear">Clear</button>
+                <span class="img-check img-region" title="Find the part the words name in the first image (SAM 3, or Florence-2) and paint it into the mask; the brush changes it after" data-i18n-title="img.regionTitle"><input class="st-input" id="img-region" type="text" placeholder="Words: hair, sky" aria-label="Words of the part" data-i18n-placeholder="img.region" data-i18n-label="img.regionLabel"> <button type="button" class="st-btn" id="img-region-go" data-i18n="img.regionGo">Make mask</button></span>
+                <a href="#" id="img-sam-license" hidden data-i18n="img.samLicense">SAM 3's license&hellip;</a>
+                <label class="img-check" title="The part around the paint is drawn at about 1024 x 1024 and put back; off draws again at the output's size" data-i18n-title="img.cropEditTitle"><input type="checkbox" id="img-crop" checked> <span data-info="cropEdit" data-i18n="img.cropEdit">Cut out the painted part and draw it larger</span></label>
+                <label class="img-check" title="Match the drawn part's colors to the image's: auto by the part kept around the paint, full by the whole cut" data-i18n-title="img.colorTitle"><span data-info="colorMatch" data-i18n="img.color">Color match</span> <select class="st-input" id="img-color"><option value="off" data-i18n="img.colorOff">Off</option><option value="auto" data-i18n="img.colorAuto">Auto</option><option value="full" data-i18n="img.colorWhole">Whole part</option></select></label>
+                <label class="img-check" id="img-refine-f" hidden title="MOSS-Image with two images or more: the whole picture first, then the painted part cut out of it and drawn again" data-i18n-title="img.refineTitle"><input type="checkbox" id="img-refine"> <span data-info="refine" data-i18n="img.refine">Draw the painted part again, finer (about 1.6 times the time)</span></label>
+              </div>
+              <div class="img-mask-stage"><img id="img-mask-img" src="data:," alt="The image to edit"><canvas id="img-mask-paint" aria-label="Paint the mask" data-i18n-label="img.paint"></canvas></div>
+            </div>
           </div>
-          <div class="img-mask-stage"><img id="img-mask-img" src="data:," alt="The image to edit"><canvas id="img-mask-paint" aria-label="Paint the mask" data-i18n-label="img.paint"></canvas></div>
-        </div>
-        <div class="img-moss" id="img-moss" hidden>
-          <div class="img-row">
+        </details>
+        <details class="st-collapse img-sec" id="img-ctrl" hidden><summary><span id="img-ctrl-l" data-i18n="img.ctrl">Composition from a picture (ControlNet)</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
+            <label class="st-field"><span data-info="ctrlType" data-i18n="img.ctrlType">Take from the picture</span>
+              <select class="st-input" id="img-ctrl-type">
+                <option value="" data-i18n="img.ctrlOff">Off</option>
+                <option value="pose" data-i18n="img.ctrlPose">Pose (people)</option>
+                <option value="depth" data-i18n="img.ctrlDepth">Depth (composition)</option>
+                <option value="canny" data-i18n="img.ctrlCanny">Outlines (Canny)</option>
+                <option value="lineart" data-i18n="img.ctrlLineart">Line art</option>
+                <option value="lineart_coarse" data-i18n="img.ctrlLineartCoarse">Line art, rough</option>
+                <option value="hed" data-i18n="img.ctrlHed">Soft outlines (HED)</option>
+                <option value="scribble_hed" data-i18n="img.ctrlScribbleHed">Sketch from the outlines</option>
+                <option value="scribble" data-i18n="img.ctrlScribble">A sketch's own lines</option>
+                <option value="scribble_xdog" data-i18n="img.ctrlXdog">Sketch (XDoG)</option>
+                <option value="mlsd" data-i18n="img.ctrlMlsd">Straight lines (M-LSD)</option>
+                <option value="normal" data-i18n="img.ctrlNormal">Surface normals (BAE)</option>
+                <option value="segmentation" data-i18n="img.ctrlSegmentation">Object regions (UniFormer)</option>
+                <option value="gray" data-i18n="img.ctrlGray">Shading (gray)</option>
+                <option value="color" data-i18n="img.ctrlColor">Where each object is (color map)</option>
+                <option value="none" data-i18n="img.ctrlNone">The picture is a map already</option>
+              </select></label>
+            <div id="img-ctrl-body" hidden>
+              <label class="st-field"><input class="st-input" id="img-ctrl-file" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" aria-label="The picture" data-i18n-label="img.ctrlPicture"></label>
+              <span class="composer-hint" id="img-ctrl-hint" hidden></span>
+              <label class="st-field img-sl" id="img-ctrl-strength-f" title="How strongly the image follows the map (ControlNet's strength)" data-i18n-title="img.ctrlStrengthTitle"><span class="img-sl__head"><span data-info="ctrlStrength" data-i18n="img.strength">Strength</span>
+                <input class="st-input" id="img-ctrl-strength" type="number" min="0" max="2" step="0.05" placeholder="1"></span>
+                <input class="img-sl__range" type="range" data-for="img-ctrl-strength" tabindex="-1" aria-hidden="true"></label>
+              <label class="st-field" id="img-ctrl-span-f" title="The share of the steps the map is followed from and to: an end below 1 keeps the composition and frees the details" data-i18n-title="img.ctrlSpanTitle"><span data-info="ctrlSpan" data-i18n="img.ctrlSpan">From and to (share of the steps)</span>
+                <span class="img-pair"><input class="st-input" id="img-ctrl-start" type="number" min="0" max="1" step="0.05" placeholder="0" aria-label="Start" data-i18n-label="img.ctrlStart">
+                <input class="st-input" id="img-ctrl-end" type="number" min="0" max="1" step="0.05" placeholder="1" aria-label="End" data-i18n-label="img.ctrlEnd"></span></label>
+              <label class="st-field" id="img-ctrl-canny-f" hidden><span data-i18n="img.ctrlThresholds">Low and high thresholds</span>
+                <span class="img-pair"><input class="st-input" id="img-ctrl-low" type="number" min="0" max="255" step="1" placeholder="100" aria-label="Low threshold" data-i18n-label="img.ctrlLow">
+                <input class="st-input" id="img-ctrl-high" type="number" min="0" max="255" step="1" placeholder="200" aria-label="High threshold" data-i18n-label="img.ctrlHigh"></span></label>
+              <div id="img-ctrl-regions-f" hidden>
+                <label class="img-check"><input type="checkbox" id="img-ctrl-color-map"> <span data-i18n="img.ctrlColorMap">The picture is already a color map</span></label>
+                <label class="st-field"><span data-i18n="img.ctrlRegions">Regions: one #rrggbb: description per line</span>
+                  <textarea class="st-input" id="img-ctrl-regions" rows="3" spellcheck="false"></textarea></label>
+              </div>
+              <label class="img-check" id="img-ctrl-drawing-f" hidden><input type="checkbox" id="img-ctrl-drawing"> <span data-i18n="img.ctrlDrawing">The picture is a hand-drawn line drawing</span></label>
+              <span class="img-check" id="img-ctrl-pose-f" hidden>
+                <label class="img-check"><input type="checkbox" id="img-ctrl-body-on" checked> <span data-i18n="img.ctrlBody">Body</span></label>
+                <label class="img-check"><input type="checkbox" id="img-ctrl-hands" checked> <span data-i18n="img.ctrlHands">Hands</span></label>
+                <label class="img-check"><input type="checkbox" id="img-ctrl-face" checked> <span data-i18n="img.ctrlFace">Face</span></label></span>
+              <label class="st-field" title="The picture's shorter side as the map is made" data-i18n-title="img.ctrlResTitle"><span data-i18n="img.ctrlRes">Map resolution</span>
+                <input class="st-input" id="img-ctrl-res" type="number" min="64" max="2048" step="64" placeholder="512"></label>
+              <div class="img-mask-tools"><button type="button" class="st-btn" id="img-ctrl-preview" data-i18n="img.ctrlPreview">Preview the map</button>
+                <label class="img-check" title="Send the map shown, as it is (not made again)" data-i18n-title="img.ctrlUseTitle"><input type="checkbox" id="img-ctrl-use" disabled> <span data-i18n="img.ctrlUse">Send this map</span></label></div>
+              <div class="img-ctrl-stage"><img id="img-ctrl-map" src="data:," alt="The control map" data-i18n-alt="img.ctrlMap" hidden></div>
+            </div>
+          </div>
+        </details>
+        <details class="st-collapse img-sec img-lora" id="img-lora" hidden><summary><span data-info="lora" data-i18n="img.lora">LoRA</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
+            <label class="st-field" id="img-lora-add-f"><select class="st-input" id="img-lora-add" aria-label="LoRA" data-i18n-label="img.lora"></select></label>
+            <span class="composer-hint" id="img-lora-hint" hidden></span>
+            <div class="img-lora-chips" id="img-lora-chips"></div>
+            <!-- adapters added to the server's LoRA folder: a file (or one dropped here), or a Hugging Face file -->
+            <div class="img-lora-new">
+              <button class="st-btn st-btn--secondary" id="img-lora-train" type="button" data-i18n="img.loraTrain">Train a LoRA…</button>
+              <button class="st-btn st-btn--secondary" id="img-lora-upload" type="button" data-i18n="img.loraUpload">Upload a LoRA…</button>
+              <input type="file" id="img-lora-file" accept=".safetensors,.gguf" hidden>
+              <input class="st-input" id="img-lora-url" type="url" autocomplete="off" placeholder="Hugging Face link to a .safetensors file"
+                     aria-label="Hugging Face link" data-i18n-placeholder="img.loraUrl" data-i18n-label="img.loraUrlLabel">
+              <button class="st-btn st-btn--secondary" id="img-lora-fetch" type="button" data-i18n="img.loraFetch">Fetch</button>
+            </div>
+            <span class="composer-hint" id="img-lora-status" role="status" hidden></span>
+            <details class="img-lora-files" id="img-lora-files" hidden><summary id="img-lora-files-sum"></summary>
+              <div class="img-lora-file-list" id="img-lora-file-list"></div></details>
+          </div>
+        </details>
+        <details class="st-collapse img-sec" id="img-guide" hidden><summary><span data-info="guide" data-i18n="img.guide">Sampling guidance</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
+            <label class="img-check" id="img-g-detail_daemon-f" title="Detail Daemon: the model asked at a slightly lower noise level, for finer detail" data-i18n-title="img.gDetailTitle"><input type="checkbox" id="img-g-detail_daemon"> <span data-i18n="img.gDetail">Detail Daemon</span>
+              <input class="st-input" id="img-g-detail_daemon-v" type="number" min="-5" max="5" step="0.05" placeholder="0.1" aria-label="Detail amount" data-i18n-label="img.gDetailAmount"></label>
+            <label class="img-check" id="img-g-skip_layer_guidance-f" title="Skip Layer Guidance: another pass of the prompt with blocks 7, 8 and 9 skipped, early in the steps" data-i18n-title="img.gSlgTitle"><input type="checkbox" id="img-g-skip_layer_guidance"> <span data-i18n="img.gSlg">Skip Layer Guidance</span>
+              <input class="st-input" id="img-g-skip_layer_guidance-v" type="number" min="0" max="10" step="0.5" placeholder="3" aria-label="Scale" data-i18n-label="img.gScale"></label>
+            <label class="img-check" id="img-g-apg-f" title="APG: guidance's push held to a size and tilted away from the prompt's own direction (less oversaturation); needs CFG" data-i18n-title="img.gApgTitle"><input type="checkbox" id="img-g-apg"> <span>APG</span>
+              <input class="st-input" id="img-g-apg-v" type="number" min="-10" max="10" step="0.1" placeholder="1" aria-label="eta" data-i18n-label="img.gEta"></label>
+            <label class="img-check" id="img-g-cfg_norm-f" title="CFG norm: the guided prediction no larger than the prompt's at each point; needs CFG" data-i18n-title="img.gNormTitle"><input type="checkbox" id="img-g-cfg_norm"> <span>CFG norm</span>
+              <input class="st-input" id="img-g-cfg_norm-v" type="number" min="0" max="100" step="0.05" placeholder="1" aria-label="Strength" data-i18n-label="img.gStrength"></label>
+            <label class="img-check" id="img-g-cfg_zero_star-f" title="CFG-Zero*: the negative prompt's prediction scaled to the prompt's before guidance; needs CFG" data-i18n-title="img.gZeroTitle"><input type="checkbox" id="img-g-cfg_zero_star"> <span>CFG-Zero*</span></label>
+          </div>
+        </details>
+        <details class="st-collapse img-sec" id="img-sec-out"><summary><span data-i18n="img.output">Output</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
+            <label class="st-field"><span data-i18n="img.format">Format</span>
+              <select class="st-input" id="img-fmt"></select></label>
+            <label class="st-field" id="img-q-f" hidden><span data-i18n="img.quality">Quality</span>
+              <input class="st-input" id="img-q" type="number" min="0" max="100" step="1" value="90" aria-label="Quality, 0 to 100" data-i18n-label="img.qualityLabel"></label>
+            <label class="st-field img-check" id="img-bg-f" hidden>
+              <input type="checkbox" id="img-bg"> <span data-i18n="img.transparent">Transparent background</span></label>
+            <label class="st-field img-check" id="img-partial-f">
+              <input type="checkbox" id="img-partial"> <span data-i18n="img.partial">Show partial images</span></label>
+          </div>
+        </details>
+        <details class="st-collapse img-sec img-moss" id="img-moss" hidden><summary><span>MOSS-Image</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
             <label class="st-field" id="img-enhance-f"><span data-i18n="img.enhance">Write the prompt out</span>
               <select class="st-input" id="img-enhance" title="The chat's model writes the short prompt out before the image is made" data-i18n-title="img.enhanceTitle">
                 <option value="" data-i18n="img.enhanceOff">Off</option>
@@ -177,45 +329,390 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
                 <option value="layout" data-i18n="img.enhanceLayout">As a layout of boxes</option></select></label>
             <label class="st-field img-check" id="img-layout-on-f">
               <input type="checkbox" id="img-layout-on"> <span data-i18n="img.layoutOn">Place things with boxes</span></label>
-          </div>
-          <details class="st-collapse img-moss-more"><summary><span data-i18n="img.more">More settings</span></summary>
-            <div class="st-collapse__body img-row">
-              <label class="st-field"><span data-i18n="img.shift">Shift</span>
-                <input class="st-input" id="img-shift" type="number" min="0.01" max="20" step="0.5"></label>
-              <label class="st-field" title="The blocks the negative prompt's pass skips: block numbers, or none" data-i18n-title="img.uncondSkipTitle"><span data-i18n="img.uncondSkip">Blocks the negative pass skips</span>
-                <input class="st-input" id="img-uskip" type="text"></label>
-              <label class="st-field" title="Skip-layer guidance: a third pass with these blocks skipped" data-i18n-title="img.slgTitle"><span data-i18n="img.slgLayers">Skip-layer guidance blocks</span>
-                <input class="st-input" id="img-slg" type="text" placeholder="none" data-i18n-placeholder="img.noBlocks"></label>
-              <label class="st-field"><span data-i18n="img.slgScale">Skip-layer guidance scale</span>
-                <input class="st-input" id="img-slg-scale" type="number" min="0" max="30" step="0.5"></label>
-              <label class="st-field" title="The share of the steps the skips start and stop at, 0 to 1" data-i18n-title="img.slgWindowTitle"><span data-i18n="img.slgWindow">Skips from &ndash; to</span>
-                <span class="img-wh"><input class="st-input" id="img-slg-start" type="number" min="0" max="1" step="0.05" aria-label="Skips start" data-i18n-label="img.slgStart">
-                <input class="st-input" id="img-slg-stop" type="number" min="0" max="1" step="0.05" aria-label="Skips stop" data-i18n-label="img.slgStop"></span></label>
+            <details class="st-collapse img-moss-more"><summary><span data-i18n="img.more">More settings</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+              <div class="st-collapse__body img-sec__body">
+                <label class="st-field"><span data-i18n="img.shift">Shift</span>
+                  <input class="st-input" id="img-shift" type="number" min="0.01" max="20" step="any"></label>
+                <label class="st-field" title="The blocks the negative prompt's pass skips: block numbers, or none" data-i18n-title="img.uncondSkipTitle"><span data-i18n="img.uncondSkip">Blocks the negative pass skips</span>
+                  <input class="st-input" id="img-uskip" type="text"></label>
+                <label class="st-field" title="Skip-layer guidance: a third pass with these blocks skipped" data-i18n-title="img.slgTitle"><span data-i18n="img.slgLayers">Skip-layer guidance blocks</span>
+                  <input class="st-input" id="img-slg" type="text" placeholder="none" data-i18n-placeholder="img.noBlocks"></label>
+                <label class="st-field"><span data-i18n="img.slgScale">Skip-layer guidance scale</span>
+                  <input class="st-input" id="img-slg-scale" type="number" min="0" max="30" step="0.5"></label>
+                <label class="st-field" title="The share of the steps the skips start and stop at, 0 to 1" data-i18n-title="img.slgWindowTitle"><span data-i18n="img.slgWindow">Skips from &ndash; to</span>
+                  <span class="img-pair"><input class="st-input" id="img-slg-start" type="number" min="0" max="1" step="0.05" aria-label="Skips start" data-i18n-label="img.slgStart">
+                  <input class="st-input" id="img-slg-stop" type="number" min="0" max="1" step="0.05" aria-label="Skips stop" data-i18n-label="img.slgStop"></span></label>
+              </div>
+            </details>
+            <div class="img-layout" id="img-layout" hidden>
+              <span class="img-mask-title" data-i18n="img.layoutHint">Drag on the canvas to draw a box; drag a box to move it, its corner to change its size. Select a box to say what goes in it.</span>
+              <div class="img-layout-stage" id="img-layout-stage" role="application" aria-label="The image's layout: draw boxes" data-i18n-label="img.layoutStage"></div>
+              <div class="img-layout-item" id="img-layout-item" hidden>
+                <label class="st-field"><span data-i18n="img.boxKind">Kind</span>
+                  <select class="st-input" id="img-box-label">
+                    <option value="object" data-i18n="img.boxObject">Object</option>
+                    <option value="character" data-i18n="img.boxCharacter">Character</option>
+                    <option value="text" data-i18n="img.boxText">Text</option></select></label>
+                <label class="st-field"><span data-i18n="img.boxCaption">What it looks like</span>
+                  <input class="st-input" id="img-box-caption" type="text"></label>
+                <label class="st-field" id="img-box-text-f"><span data-i18n="img.boxWords">The exact words</span>
+                  <input class="st-input" id="img-box-text" type="text"></label>
+                <button type="button" class="st-btn" id="img-box-delete" data-i18n="img.boxDelete">Delete the box</button>
+              </div>
+              <div class="img-mask-tools"><button type="button" class="st-btn" id="img-layout-clear" data-i18n="img.layoutClear">Delete every box</button></div>
             </div>
-          </details>
-          <div class="img-layout" id="img-layout" hidden>
-            <span class="img-mask-title" data-i18n="img.layoutHint">Drag on the canvas to draw a box; drag a box to move it, its corner to change its size. Select a box to say what goes in it.</span>
-            <div class="img-layout-stage" id="img-layout-stage" role="application" aria-label="The image's layout: draw boxes" data-i18n-label="img.layoutStage"></div>
-            <div class="img-row" id="img-layout-item" hidden>
-              <label class="st-field"><span data-i18n="img.boxKind">Kind</span>
-                <select class="st-input" id="img-box-label">
-                  <option value="object" data-i18n="img.boxObject">Object</option>
-                  <option value="character" data-i18n="img.boxCharacter">Character</option>
-                  <option value="text" data-i18n="img.boxText">Text</option></select></label>
-              <label class="st-field img-box-wide"><span data-i18n="img.boxCaption">What it looks like</span>
-                <input class="st-input" id="img-box-caption" type="text"></label>
-              <label class="st-field img-box-wide" id="img-box-text-f"><span data-i18n="img.boxWords">The exact words</span>
-                <input class="st-input" id="img-box-text" type="text"></label>
-              <button type="button" class="st-btn" id="img-box-delete" data-i18n="img.boxDelete">Delete the box</button>
-            </div>
-            <div class="img-mask-tools"><button type="button" class="st-btn" id="img-layout-clear" data-i18n="img.layoutClear">Delete every box</button></div>
           </div>
+        </details>
+      </div>
+
+      <div class="st-card img-output">
+        <div class="img-view" id="img-view">
+          <img id="img-main" src="data:," alt="" hidden>
+          <span class="img-view__empty" id="img-empty"><svg class="st-icon img-view__icon"><use href="web/sprite.svg#i-image"/></svg>
+            <span data-i18n="img.empty">The images you make show here.</span></span>
+          <span class="img-view__cap" id="img-view-cap" hidden></span>
         </div>
+        <div class="img-results" id="img-results" role="list" aria-label="The images made" data-i18n-label="img.made" hidden></div>
+        <div class="img-actions" id="img-actions" hidden>
+          <a class="st-btn st-btn--icon" id="img-save" title="Save" aria-label="Save" data-i18n-title="img.save" data-i18n-label="img.save">
+            <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></a>
+          <button type="button" class="st-btn st-btn--secondary" id="img-to-ref" title="Start the next image from this one" data-i18n-title="img.toRefTitle">
+            <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-edit"/></svg><span data-i18n="img.toRef">To img2img</span></button>
+          <button type="button" class="st-btn st-btn--icon" id="img-copy" title="Copy the request (JSON)" aria-label="Copy the request (JSON)"
+                  data-i18n-title="img.copyRequest" data-i18n-label="img.copyRequest">
+            <svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon" id="img-use-seed" title="Use this image's seed" aria-label="Use this image's seed"
+                  data-i18n-title="img.useSeed" data-i18n-label="img.useSeed">
+            <svg class="st-icon"><use href="web/sprite.svg#i-refresh"/></svg></button>
+        </div>
+        <div class="img-actions" id="img-send" hidden>
+          <span class="img-send" role="group" aria-label="Open in Tools" data-i18n-label="img.sendTools">
+            <button type="button" class="st-btn st-btn--secondary" data-send-tool="upscale" data-i18n="tool.upscale">Upscale</button>
+            <button type="button" class="st-btn st-btn--secondary" data-send-tool="fix" data-i18n="tool.fix">Fix parts</button>
+            <button type="button" class="st-btn st-btn--secondary" data-send-tool="segment" data-i18n="tool.segment">Find parts</button>
+            <button type="button" class="st-btn st-btn--secondary" data-send-tool="rembg" data-i18n="tool.rembg">Remove background</button></span>
+        </div>
+        <details class="img-info" id="img-info-box" hidden open><summary data-i18n="img.info">Generation info</summary>
+          <div class="img-info__text" id="img-info"></div></details>
         <span class="composer-hint" id="img-hint" data-i18n="img.hint">One image at a time; a chat request waits for it (and the other way round).</span>
         <span class="composer-hint" id="img-note" hidden></span>
-      </form>
-      <div class="img-results" id="img-results"></div>
-    </div>
+      </div>
+    </form>
+    <dialog class="img-full" id="img-full" aria-label="The image" data-i18n-label="img.full">
+      <img id="img-full-img" src="data:," alt="">
+      <button type="button" class="st-btn st-btn--icon img-full__close" id="img-full-close" aria-label="Close" data-i18n-label="close">
+        <svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6L18 18M18 6L6 18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+    </dialog>
+    <dialog class="ltw-dialog" id="ltw-dialog" aria-label="LoRA training" data-i18n-label="ltw.title">
+      <button type="button" class="st-btn st-btn--icon ltw-dialog__close" id="ltw-dialog-close" aria-label="Close" data-i18n-label="close">
+        <svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6L18 18M18 6L6 18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+      <div class="ltw" data-ltw-dialog></div>
+    </dialog>
+  </section>
+
+  <!-- ============================ Tools ============================ -->
+  <!-- the image tools that make no new picture, each on its own on an image of yours or one made here, as their own
+       requests are: /v1/images/upscale, the edits' fix, /v1/images/segmentations and
+       /v1/images/remove-background -->
+  <section class="view view--images" id="view-tools" role="tabpanel" aria-labelledby="tab-btn-tools" hidden>
+    <form class="img-page" id="tool-form">
+      <div class="st-card img-prompts">
+        <div class="seg" id="tool-kind" role="radiogroup" aria-label="Tool" data-i18n-label="tool.kind">
+          <button type="button" role="radio" data-tool="upscale" aria-checked="true" data-i18n="tool.upscale">Upscale</button>
+          <button type="button" role="radio" data-tool="fix" aria-checked="false" data-i18n="tool.fix">Fix parts</button>
+          <button type="button" role="radio" data-tool="segment" aria-checked="false" data-i18n="tool.segment">Find parts</button>
+          <button type="button" role="radio" data-tool="rembg" aria-checked="false" data-i18n="tool.rembg">Remove background</button>
+        </div>
+        <span class="composer-hint" id="tool-about"></span>
+        <label class="st-field" id="tool-file-f"><span data-i18n="tool.image">Image (or drop one here)</span>
+          <input class="st-input" id="tool-file" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp,image/jxl,.jxl"></label>
+        <label class="st-field img-gpu" id="tool-gpu-f" hidden><span data-i18n="img.gpu">GPU that makes it</span>
+          <select class="st-input" id="tool-gpu"></select></label>
+        <label class="st-field" id="tool-prompt-f"><span id="tool-prompt-l">Prompt</span>
+          <textarea class="st-input img-prompt" id="tool-prompt" rows="2"></textarea></label>
+      </div>
+      <div class="img-go-bar">
+        <button type="submit" class="st-btn st-btn--primary img-go" id="tool-go"><span class="img-go__run" id="tool-go-l">Upscale</span>
+          <span class="img-go__stop" data-i18n="img.interrupt">Interrupt</span><span class="img-go__time" id="tool-go-time"></span></button>
+      </div>
+
+      <div class="st-card img-settings">
+        <!-- the upscale: /v1/images/upscale's model, scale and extra_params -->
+        <div class="tool-fields" data-tool="upscale">
+          <label class="st-field"><span data-info="upModel" data-i18n="tool.upModel">Upscaler (model)</span>
+            <select class="st-input" id="tool-up-model">
+              <option value="auto" data-i18n="tool.upAuto">Auto</option>
+              <option value="lanczos">Lanczos</option>
+              <option value="realesrgan-x4plus">RealESRGAN x4plus</option>
+              <option value="seedvr2-7b">SeedVR2 7B</option>
+              <option value="seedvr2-7b-sharp" data-i18n="tool.upSharp">SeedVR2 7B sharp</option>
+              <option value="seedvr2-3b">SeedVR2 3B</option></select></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="upScale" data-i18n="tool.upScale">Scale</span>
+            <input class="st-input" id="tool-up-scale" type="number" min="1.1" max="4" step="0.1" placeholder="2"></span>
+            <input class="img-sl__range" type="range" data-for="tool-up-scale" tabindex="-1" aria-hidden="true"></label>
+          <span class="composer-hint" id="tool-up-size"></span>
+          <label class="st-field"><span data-info="upColor" data-i18n="tool.upColor">Color correction</span>
+            <select class="st-input" id="tool-up-color">
+              <option value="" data-i18n="tool.upColorOwn">The upscaler's own</option>
+              <option value="none" data-i18n="tool.upColorNone">None</option>
+              <option value="lab">LAB</option><option value="adain">AdaIN</option><option value="wavelet" data-i18n="tool.upColorWavelet">Wavelet</option></select></label>
+          <label class="st-field img-check"><input type="checkbox" id="tool-up-redraw"> <span data-info="upRedraw" data-i18n="tool.upRedraw">Draw it again with the image model, adding detail</span></label>
+          <label class="st-field img-sl" id="tool-up-strength-f" hidden><span class="img-sl__head"><span data-info="redrawStrength" data-i18n="tool.upStrength">How much is drawn again</span>
+            <input class="st-input" id="tool-up-strength" type="number" min="0.01" max="1" step="0.01" placeholder="0.35"></span>
+            <input class="img-sl__range" type="range" data-for="tool-up-strength" tabindex="-1" aria-hidden="true"></label>
+        </div>
+        <!-- the parts' fix: the edits' fix {parts, strength} -->
+        <div class="tool-fields" data-tool="fix" hidden>
+          <fieldset class="tool-parts"><legend data-info="fixParts" data-i18n="tool.fixParts">The parts to find and draw again</legend>
+            <label class="img-check"><input type="checkbox" name="tool-part" value="face" checked> <span data-i18n="img.fixFace">Faces</span></label>
+            <label class="img-check"><input type="checkbox" name="tool-part" value="hands"> <span data-i18n="tool.fixHands">Hands</span></label>
+            <label class="img-check"><input type="checkbox" name="tool-part" value="person"> <span data-i18n="img.fixPerson">People</span></label></fieldset>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="fixStrength" data-i18n="tool.upStrength">How much is drawn again</span>
+            <input class="st-input" id="tool-fix-strength" type="number" min="0.01" max="1" step="0.01" placeholder="0.5"></span>
+            <input class="img-sl__range" type="range" data-for="tool-fix-strength" tabindex="-1" aria-hidden="true"></label>
+        </div>
+        <!-- the model that draws (the upscale's redraw_model, the parts' fix's model) and its seed -->
+        <div class="tool-fields" data-tool="upscale fix">
+          <label class="st-field" id="tool-model-f" hidden><span data-info="drawModel" data-i18n="tool.drawModel">Image model that draws</span>
+            <select class="st-input" id="tool-model"></select></label>
+          <label class="st-field" id="tool-seed-f"><span data-info="seed" data-i18n="img.seed">Seed</span>
+            <input class="st-input" id="tool-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom"></label>
+        </div>
+        <!-- /v1/images/segmentations: task, model, score_threshold, mask_threshold -->
+        <div class="tool-fields" data-tool="segment" hidden>
+          <label class="st-field"><span data-info="segTask" data-i18n="tool.segTask">What to find</span>
+            <select class="st-input" id="tool-seg-task">
+              <option value="mask" data-i18n="tool.segMask">Masks of the parts the words name</option>
+              <option value="box" data-i18n="tool.segBox">Boxes around them</option>
+              <option value="grounding" data-i18n="tool.segGrounding">Every thing the words name, with its name (Florence-2)</option></select></label>
+          <label class="st-field"><span data-info="segModel" data-i18n="tool.segModel">Model</span>
+            <select class="st-input" id="tool-seg-model">
+              <option value="" data-i18n="tool.segAuto">Auto (SAM 3 where its license is agreed to, else Florence-2)</option>
+              <option value="sam3.1">SAM 3.1</option>
+              <option value="florence-2-large">Florence-2 large</option>
+              <option value="florence-2-base">Florence-2 base</option></select></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="segScore" data-i18n="tool.segScore">Least score kept</span>
+            <input class="st-input" id="tool-seg-score" type="number" min="0" max="1" step="0.05" placeholder="0.5"></span>
+            <input class="img-sl__range" type="range" data-for="tool-seg-score" tabindex="-1" aria-hidden="true"></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="segMaskT" data-i18n="tool.segMaskT">Mask threshold</span>
+            <input class="st-input" id="tool-seg-mask" type="number" min="0" max="1" step="0.05" placeholder="0.5"></span>
+            <input class="img-sl__range" type="range" data-for="tool-seg-mask" tabindex="-1" aria-hidden="true"></label>
+          <a href="#" id="tool-sam-license" data-i18n="img.samLicense">SAM 3's license&hellip;</a>
+        </div>
+        <!-- /v1/images/remove-background: model (BiRefNet's version), operating_resolution, refine_foreground,
+             mask_only, background_color, mask_grow, mask_blur, output_format -->
+        <div class="tool-fields" data-tool="rembg" hidden>
+          <label class="st-field"><span data-info="bgModel" data-i18n="tool.bgModel">BiRefNet version</span>
+            <select class="st-input" id="tool-bg-model">
+              <option value="general" data-i18n="tool.bgGeneral">general (the default)</option>
+              <option value="lite">lite</option><option value="lite-2k">lite-2k</option><option value="portrait">portrait</option>
+              <option value="matting">matting</option><option value="hr">hr</option><option value="dynamic">dynamic</option></select></label>
+          <label class="st-field"><span data-info="bgRes" data-i18n="tool.bgRes">Resolution it reads at (width x height, multiples of 32)</span>
+            <input class="st-input" id="tool-bg-res" type="text" placeholder="the version's own" data-i18n-placeholder="tool.bgResOwn"></label>
+          <label class="st-field img-check"><input type="checkbox" id="tool-bg-refine" checked> <span data-info="bgRefine" data-i18n="tool.bgRefine">Clean the edge's colors (refine_foreground)</span></label>
+          <label class="st-field img-check"><input type="checkbox" id="tool-bg-mask"> <span data-i18n="tool.bgMaskOnly">The mask only (white where the subject is)</span></label>
+          <label class="st-field img-check"><input type="checkbox" id="tool-bg-color-on"> <span data-i18n="tool.bgColorOn">Fill the background with a color</span>
+            <input type="color" id="tool-bg-color" value="#ffffff" aria-label="Background color" data-i18n-label="tool.bgColor"></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="bgGrow" data-i18n="tool.bgGrow">Grow the edge (pixels; below 0 shrinks)</span>
+            <input class="st-input" id="tool-bg-grow" type="number" min="-64" max="64" step="1" placeholder="0"></span>
+            <input class="img-sl__range" type="range" data-for="tool-bg-grow" tabindex="-1" aria-hidden="true"></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="bgBlur" data-i18n="tool.bgBlur">Soften the edge (pixels)</span>
+            <input class="st-input" id="tool-bg-blur" type="number" min="0" max="32" step="0.5" placeholder="0"></span>
+            <input class="img-sl__range" type="range" data-for="tool-bg-blur" tabindex="-1" aria-hidden="true"></label>
+        </div>
+        <!-- the picture's format and quality (the Images tab's choices): the tools that make a picture -->
+        <div class="tool-fields" data-tool="upscale fix rembg">
+          <label class="st-field"><span data-i18n="img.format">Format</span>
+            <select class="st-input" id="tool-fmt"></select></label>
+          <label class="st-field" id="tool-q-f" hidden><span data-i18n="img.quality">Quality</span>
+            <input class="st-input" id="tool-q" type="number" min="0" max="100" step="1" value="90" aria-label="Quality, 0 to 100" data-i18n-label="img.qualityLabel"></label>
+        </div>
+      </div>
+
+      <div class="st-card img-output">
+        <!-- the result over the image it came from: a divider to compare them, or the parts found drawn over it -->
+        <div class="img-view tool-view" id="tool-view">
+          <span class="img-view__empty" id="tool-empty"><svg class="st-icon img-view__icon"><use href="web/sprite.svg#i-image"/></svg>
+            <span data-i18n="tool.empty">Choose an image, or send one here from the Images tab.</span></span>
+          <div class="tool-stage" id="tool-stage" hidden>
+            <img id="tool-before" src="data:," alt="">
+            <img id="tool-after" src="data:," alt="" hidden>
+            <canvas id="tool-overlay" hidden></canvas>
+            <span class="tool-divider" id="tool-divider" hidden></span>
+          </div>
+          <span class="img-view__cap" id="tool-cap" hidden></span>
+        </div>
+        <input class="tool-split" id="tool-split" type="range" min="0" max="100" value="50" aria-label="Before and after" data-i18n-label="tool.split" hidden>
+        <div class="st-progress" id="tool-progress" hidden><div class="st-progress__bar" id="tool-bar"></div></div>
+        <div class="tool-found" id="tool-found" hidden></div>
+        <div class="img-actions" id="tool-actions" hidden>
+          <a class="st-btn st-btn--icon" id="tool-save" title="Save" aria-label="Save" data-i18n-title="img.save" data-i18n-label="img.save">
+            <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></a>
+          <button type="button" class="st-btn st-btn--secondary" id="tool-to-ref" title="Start the next image from this one" data-i18n-title="img.toRefTitle">
+            <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-edit"/></svg><span data-i18n="img.toRef">To img2img</span></button>
+          <button type="button" class="st-btn st-btn--secondary" id="tool-to-mask" hidden title="The image to img2img with the parts found as its mask" data-i18n-title="tool.toMaskTitle">
+            <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-edit"/></svg><span data-i18n="tool.toMask">Edit these parts</span></button>
+          <button type="button" class="st-btn st-btn--icon" id="tool-copy" title="Copy the request (JSON)" aria-label="Copy the request (JSON)"
+                  data-i18n-title="img.copyRequest" data-i18n-label="img.copyRequest">
+            <svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button>
+        </div>
+        <details class="img-info" id="tool-info-box" hidden open><summary data-i18n="img.info">Generation info</summary>
+          <div class="img-info__text" id="tool-info"></div></details>
+        <span class="composer-hint" id="tool-hint"></span>
+      </div>
+    </form>
+  </section>
+
+  <!-- ============================ Video ============================ -->
+  <!-- the video tools, each its API's request on a video of this browser's: the upscale /v1/videos/sync (a short one)
+       or a /v1/videos job (a longer one, run on the server: the page may close); the jobs, this page's and the API's,
+       under the player -->
+  <section class="view view--images" id="view-video" role="tabpanel" aria-labelledby="tab-btn-video" hidden>
+    <form class="img-page" id="vid-form">
+      <div class="st-card img-prompts">
+        <div class="seg" id="vid-kind" role="radiogroup" aria-label="Tool" data-i18n-label="tool.kind">
+          <button type="button" role="radio" data-vid="upscale" aria-checked="true" data-i18n="tool.upscale">Upscale</button>
+          <button type="button" role="radio" data-vid="segment" aria-checked="false" data-i18n="vid.segment">Find objects</button>
+        </div>
+        <span class="composer-hint" data-vid="upscale" data-i18n="vid.aboutUpscale">Makes the video larger on the GPU a few frames at a time (SeedVR2 in chunks of frames, the others frame by frame), its sound kept.</span>
+        <span class="composer-hint" data-vid="segment" data-i18n="vid.aboutSegment" hidden>Finds every instance of the words on every frame and follows it (SAM 3.1); points and boxes on any frame add an object or fix one.</span>
+        <label class="st-field"><span data-i18n="vid.file">Video (or drop one here)</span>
+          <input class="st-input" id="vid-file" type="file" accept="video/*,.mkv"></label>
+        <label class="st-field img-gpu" id="vid-gpu-f" hidden><span data-i18n="img.gpu">GPU that makes it</span>
+          <select class="st-input" id="vid-gpu"></select></label>
+        <span class="composer-hint" id="vid-src-info"></span>
+      </div>
+      <div class="img-go-bar">
+        <button type="submit" class="st-btn st-btn--primary img-go" id="vid-go"><span class="img-go__run" id="vid-go-label" data-i18n="tool.upscale">Upscale</span>
+          <span class="img-go__stop" data-i18n="img.interrupt">Interrupt</span><span class="img-go__time" id="vid-go-time"></span></button>
+      </div>
+
+      <div class="st-card img-settings">
+        <!-- the upscale: /v1/videos' model, scale, seed and extra_params -->
+        <div class="tool-fields" data-vid="upscale">
+          <label class="st-field"><span data-info="upModel" data-i18n="tool.upModel">Upscaler (model)</span>
+            <select class="st-input" id="vid-up-model">
+              <option value="auto" data-i18n="tool.upAuto">Auto</option>
+              <option value="lanczos">Lanczos</option>
+              <option value="realesrgan-x4plus">RealESRGAN x4plus</option>
+              <option value="seedvr2-7b">SeedVR2 7B</option>
+              <option value="seedvr2-7b-sharp" data-i18n="tool.upSharp">SeedVR2 7B sharp</option>
+              <option value="seedvr2-3b">SeedVR2 3B</option></select></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-info="upScale" data-i18n="tool.upScale">Scale</span>
+            <input class="st-input" id="vid-up-scale" type="number" min="1.1" max="4" step="0.1" placeholder="2"></span>
+            <input class="img-sl__range" type="range" data-for="vid-up-scale" tabindex="-1" aria-hidden="true"></label>
+          <span class="composer-hint" id="vid-up-size"></span>
+          <label class="st-field"><span data-info="upColor" data-i18n="tool.upColor">Color correction</span>
+            <select class="st-input" id="vid-up-color">
+              <option value="" data-i18n="tool.upColorOwn">The upscaler's own</option>
+              <option value="none" data-i18n="tool.upColorNone">None</option>
+              <option value="lab">LAB</option><option value="adain">AdaIN</option><option value="wavelet" data-i18n="tool.upColorWavelet">Wavelet</option></select></label>
+          <label class="st-field"><span data-info="seed" data-i18n="img.seed">Seed</span>
+            <input class="st-input" id="vid-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom"></label>
+          <details class="img-neg"><summary data-i18n="vid.more">SeedVR2's chunks</summary>
+            <label class="st-field"><span data-i18n="vid.chunk">Frames a chunk (1, 5, 9 &hellip; 4 n + 1; empty: as many as the GPU holds)</span>
+              <input class="st-input" id="vid-chunk" type="number" min="1" step="4" placeholder="auto" data-i18n-placeholder="vid.auto"></label>
+            <label class="st-field"><span data-i18n="vid.overlap">Chunks' overlap (latent frames of 4 frames)</span>
+              <input class="st-input" id="vid-overlap" type="number" min="0" placeholder="0"></label></details>
+        </div>
+        <!-- the segmentation: /v1/videos/segmentations' prompt, prompts, clicks, mask_video and outputs -->
+        <div class="tool-fields" data-vid="segment" hidden>
+          <label class="st-field"><span data-i18n="vid.segWords">What to find (short English words, commas between)</span>
+            <input class="st-input" id="vid-seg-words" type="text" placeholder="person, red car" data-i18n-placeholder="vid.segWordsPh"></label>
+          <span class="st-field"><span data-i18n="vid.segClick">Points and boxes: pause the video, then click or drag on it</span>
+            <span class="seg" id="vid-seg-mode" role="radiogroup" aria-label="Click" data-i18n-label="vid.segClickMode">
+              <button type="button" role="radio" data-mode="" aria-checked="true" data-i18n="vid.segOff">Off</button>
+              <button type="button" role="radio" data-mode="1" aria-checked="false" data-i18n="vid.segIn">Point: in</button>
+              <button type="button" role="radio" data-mode="0" aria-checked="false" data-i18n="vid.segOut">Point: out</button>
+              <button type="button" role="radio" data-mode="box" aria-checked="false" data-i18n="vid.segBox">Box</button></span></span>
+          <label class="st-field"><span data-i18n="vid.segTarget">They make or fix</span>
+            <span class="vid-seg-target"><select class="st-input" id="vid-seg-target"></select>
+              <button type="button" class="st-btn st-btn--secondary" id="vid-seg-new" data-i18n="vid.segNew">New object</button></span></label>
+          <div class="vid-seg-clicks" id="vid-seg-clicks"></div>
+          <fieldset class="vid-seg-outs"><legend data-i18n="vid.segOutputs">Videos to make (the frames' masks always come as JSON)</legend>
+            <label><input type="checkbox" id="vid-seg-overlay" checked> <span data-i18n="vid.segOverlay">The video with the objects colored over it</span></label>
+            <label><input type="checkbox" id="vid-seg-mask"> <span data-i18n="vid.segMask">One mask video of every object</span></label>
+            <label><input type="checkbox" id="vid-seg-masks"> <span data-i18n="vid.segMasks">A mask video of each object</span></label></fieldset>
+        </div>
+      </div>
+
+      <div class="st-card img-output">
+        <!-- the video chosen and its result: one or the other, or side by side; stepped a frame at a time together -->
+        <div class="img-view vid-view" id="vid-view" data-show="source">
+          <span class="img-view__empty" id="vid-empty"><svg class="st-icon img-view__icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 9V15L15 12Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+            <span data-i18n="vid.empty">Choose a video, or open a job's result below.</span></span>
+          <div class="vid-wrap" id="vid-src-wrap"><video id="vid-src" controls playsinline preload="metadata" hidden></video>
+            <canvas class="vid-canvas" id="vid-canvas" hidden></canvas></div>
+          <video id="vid-out" controls playsinline preload="metadata" hidden></video>
+        </div>
+        <!-- the objects found: each one's color, shown or hidden over the source, and the clicks' target -->
+        <div class="vid-objects" id="vid-objects" hidden></div>
+        <div class="img-actions" id="vid-seg-bar" hidden>
+          <button type="button" class="st-btn st-btn--secondary" id="vid-seg-edit" data-i18n="vid.segEdit">Edit these objects in this frame</button>
+          <button type="button" class="st-btn st-btn--secondary" id="vid-seg-edit-bg" data-i18n="vid.segEditBg">Edit the background in this frame</button>
+          <span class="vid-seg-files" id="vid-seg-files"></span>
+        </div>
+        <div class="img-actions" id="vid-bar" hidden>
+          <div class="seg" id="vid-show" role="radiogroup" aria-label="Show" data-i18n-label="vid.show">
+            <button type="button" role="radio" data-show="source" aria-checked="true" data-i18n="vid.source">Source</button>
+            <button type="button" role="radio" data-show="result" aria-checked="false" data-i18n="vid.result">Result</button>
+            <button type="button" role="radio" data-show="both" aria-checked="false" data-i18n="vid.both">Side by side</button>
+          </div>
+          <button type="button" class="st-btn st-btn--secondary" id="vid-prev" title="A frame back" data-i18n-title="vid.prev">&#9664;&#xFE0E;</button>
+          <button type="button" class="st-btn st-btn--secondary" id="vid-next" title="A frame on" data-i18n-title="vid.next">&#9654;&#xFE0E;</button>
+          <a class="st-btn st-btn--icon" id="vid-save" title="Save" aria-label="Save" data-i18n-title="img.save" data-i18n-label="img.save" hidden>
+            <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></a>
+          <button type="button" class="st-btn st-btn--icon" id="vid-copy" title="Copy the request (JSON)" aria-label="Copy the request (JSON)"
+                  data-i18n-title="img.copyRequest" data-i18n-label="img.copyRequest" hidden>
+            <svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button>
+        </div>
+        <div class="st-progress" id="vid-progress" hidden><div class="st-progress__bar" id="vid-bar-fill"></div></div>
+        <span class="composer-hint" id="vid-cap"></span>
+        <details class="img-info" id="vid-info-box" hidden open><summary data-i18n="img.info">Generation info</summary>
+          <div class="img-info__text" id="vid-info"></div></details>
+        <span class="composer-hint" id="vid-hint"></span>
+        <!-- the jobs on the server, newest first (GET /v1/videos): this page's and the API's -->
+        <h3 class="vid-jobs__title" data-i18n="vid.jobs">Jobs</h3>
+        <div class="vid-jobs" id="vid-jobs"><span class="composer-hint" data-i18n="vid.noJobs">No jobs yet.</span></div>
+      </div>
+    </form>
+  </section>
+
+  <!-- the translation model's page: the text translated through /v1/chat/completions (its chat_template_kwargs),
+       streamed; shown where /health says a translation model is set up -->
+  <section class="view view--translate" id="view-translate" role="tabpanel" aria-labelledby="tab-btn-translate" hidden>
+    <form class="tr-page" id="tr-form">
+      <div class="st-card tr-bar">
+        <label class="st-field"><span data-i18n="trn.from">From</span>
+          <select class="st-input" id="trn-source"><option value="" data-i18n="trn.detect">Detect the language</option></select></label>
+        <button type="button" class="st-btn st-btn--ghost tr-swap" id="trn-swap" title="Swap the languages and the texts" aria-label="Swap the languages and the texts" data-i18n-title="trn.swap" data-i18n-label="trn.swap">&#8644;</button>
+        <label class="st-field"><span data-i18n="trn.to">To</span>
+          <select class="st-input" id="trn-target"></select></label>
+        <label class="st-field" id="trn-form-field"><span data-i18n="trn.form">Style</span>
+          <select class="st-input" id="trn-form">
+            <option value="" data-i18n="trn.formAuto">As the text goes</option>
+            <option value="plain" data-i18n="trn.formPlain">Plain (da / dearu)</option>
+            <option value="polite" data-i18n="trn.formPolite">Polite (desu / masu)</option></select></label>
+      </div>
+      <div class="tr-panes">
+        <textarea class="st-input tr-text" id="trn-input" placeholder="Text to translate" data-i18n-placeholder="trn.placeholder" aria-label="Text to translate" data-i18n-label="trn.placeholder"></textarea>
+        <div class="st-card tr-out">
+          <div class="tr-text tr-result" id="trn-output" aria-live="polite"></div>
+          <div class="tr-out__foot"><span class="composer-hint" id="trn-status"></span>
+            <button type="button" class="st-btn st-btn--ghost" id="trn-copy" data-i18n="trn.copy" disabled>Copy</button></div>
+        </div>
+      </div>
+      <details class="img-neg tr-more"><summary data-i18n="trn.more">Context and glossary</summary>
+        <label class="st-field"><span data-i18n="trn.context">Context: text that helps the translation, not translated itself</span>
+          <textarea class="st-input" id="trn-context" rows="3"></textarea></label>
+        <label class="st-field"><span data-i18n="trn.glossary">Glossary: one term a line, as source =&gt; translation</span>
+          <textarea class="st-input" id="trn-glossary" rows="3" placeholder="PLaMo =&gt; PLaMo"></textarea></label>
+      </details>
+      <div class="img-go-bar tr-go-bar">
+        <button type="submit" class="st-btn st-btn--primary img-go tr-go" id="trn-go"><span class="img-go__run" data-i18n="trn.go">Translate</span>
+          <span class="img-go__stop" data-i18n="img.interrupt">Interrupt</span></button>
+      </div>
+    </form>
   </section>
 
   <!-- ============================ Monitor ============================ -->
@@ -223,19 +720,27 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
     <div class="monitor">
       <div class="st-card state-card">
         <div class="state-card__head">
-          <span class="card-title">Model state</span>
+          <span class="card-title" data-i18n="mon.state">Model state</span>
           <span class="badges" id="state-badges">
-            <span class="st-badge" data-s="idle">Idle</span>
-            <span class="st-badge" data-s="unloaded">Unloaded</span>
-            <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
-            <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
-            <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
-            <span class="st-badge st-badge--error" data-s="error">Error</span>
+            <span class="st-badge" data-s="idle" data-i18n="pill.idle">Idle</span>
+            <span class="st-badge" data-s="unloaded" data-i18n="pill.unloaded">Unloaded</span>
+            <span class="st-badge st-badge--reading" data-s="reading" data-i18n="mon.reading">Reading</span>
+            <span class="st-badge st-badge--generating" data-s="generating" data-i18n="mon.generating">Generating</span>
+            <span class="st-badge st-badge--queued" data-s="queued" data-i18n="mon.queued">Queued</span>
+            <span class="st-badge st-badge--error" data-s="error" data-i18n="tool.error">Error</span>
           </span>
         </div>
-        <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
+        <div class="state-card__row"><span id="state-label" data-i18n="mon.waiting">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
         <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+        <!-- an image job on a card of its own, beside the chat's state above (/metrics engine.image_gpu) -->
+        <div class="state-card__image" id="state-image" hidden>
+          <div class="state-card__row"><span id="state-image-label"></span><span class="muted" id="state-image-detail"></span></div>
+          <div class="st-progress"><div class="st-progress__bar" id="state-image-bar" style="width:0%"></div></div>
+        </div>
       </div>
+
+      <!-- a model on several cards, or the images on a card of their own: the GPU cards below show the one chosen here -->
+      <div class="st-tabs gpu-tabs" id="gpu-tabs" role="tablist" aria-label="GPUs" data-i18n-label="gpu.tabs" hidden></div>
 
       <div class="metrics" id="metrics">
         <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
@@ -243,7 +748,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
       <div class="monitor-row">
         <div class="st-card ctx-card">
-          <span class="card-title">Context fill</span>
+          <span class="card-title" data-i18n="mon.ctx">Context fill</span>
           <div class="ctx-gauge">
             <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
               <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
@@ -253,21 +758,24 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             </svg>
             <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct">0%</span><span class="muted" id="ctx-sub">&ndash;</span></div>
           </div>
-          <div class="bar-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
+          <div class="bar-row"><span data-i18n="mon.expertsVram">Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
           <div class="st-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div>
-          <div class="bar-row"><span>System RAM</span><span class="muted" id="ram-text">&ndash;</span></div>
+          <div class="bar-row"><span data-i18n="mon.ram">System RAM</span><span class="muted" id="ram-text">&ndash;</span></div>
           <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
-          <div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
+          <div class="bar-row"><span data-i18n="mon.temp">GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
           <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="temp-bar" style="width:0%"></div></div>
         </div>
         <div class="st-card req-card">
-          <div class="req-head"><span class="card-title">Recent requests</span>
+          <div class="req-head"><span class="card-title" data-i18n="mon.requests">Recent requests</span>
             <button class="st-btn st-btn--secondary" id="req-all" hidden>Show all</button></div>
           <div class="table-wrap" id="req-wrap">
             <table class="st-table">
-              <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Output</th>
-                <th class="num" title="New prompt tokens per second, excluding reused cache tokens (engine prompt time)">Prefill t/s</th><th class="num">Decode t/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
-              <tbody id="req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
+              <thead><tr><th data-i18n="mon.time">Time</th><th data-i18n="mon.status">Status</th><th class="num" data-i18n="mon.prompt">Prompt</th>
+                <th class="num" data-i18n="mon.reused">Reused</th><th class="num" data-i18n="mon.output">Output</th>
+                <th class="num" title="New prompt tokens per second, excluding reused cache tokens (engine prompt time)" data-i18n="mon.prefillRate"
+                    data-i18n-title="mon.prefillRateTitle">Prefill t/s</th><th class="num" data-i18n="mon.decodeRate">Decode t/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)"
+                    data-i18n="mon.hitRate" data-i18n-title="mon.hitRateTitle">VRAM hit rate</th><th class="num" data-i18n="mon.duration">Duration</th></tr></thead>
+              <tbody id="req-body"><tr><td colspan="9" class="muted" data-i18n="mon.noRequests">No requests yet</td></tr></tbody>
             </table>
           </div>
           <p class="muted req-totals" id="req-totals"></p>
@@ -275,11 +783,11 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       </div>
 
       <div class="st-card cc-card" id="cc-card">
-        <div class="req-head"><span class="card-title">Conversation cache</span><span class="muted small" id="cc-sum"></span></div>
+        <div class="req-head"><span class="card-title" data-i18n="mon.cc">Conversation cache</span><span class="muted small" id="cc-sum"></span></div>
         <div class="cc-bars" id="cc-bars" hidden>
-          <div><div class="bar-row"><span>Parked conversations</span><span class="muted" id="cc-slots-text">&ndash;</span></div>
+          <div><div class="bar-row"><span data-i18n="mon.ccParkedTitle">Parked conversations</span><span class="muted" id="cc-slots-text">&ndash;</span></div>
             <div class="st-progress"><div class="st-progress__bar" id="cc-slots-bar" style="width:0%"></div></div></div>
-          <div><div class="bar-row"><span>Their memory (RAM)</span><span class="muted" id="cc-mem-text">&ndash;</span></div>
+          <div><div class="bar-row"><span data-i18n="mon.ccMemory">Their memory (RAM)</span><span class="muted" id="cc-mem-text">&ndash;</span></div>
             <div class="st-progress"><div class="st-progress__bar" id="cc-mem-bar" style="width:0%"></div></div></div>
         </div>
         <dl class="facts" id="cc-facts"></dl>
@@ -287,9 +795,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       </div>
 
       <div class="st-card mcp-card" id="mcp-card" hidden>
-        <div class="req-head"><span class="card-title">MCP servers</span><span class="muted small" id="mcp-sum"></span></div>
+        <div class="req-head"><span class="card-title" data-i18n="mon.mcp">MCP servers</span><span class="muted small" id="mcp-sum"></span></div>
         <div class="mcp-list" id="mcp-list"></div>
-        <p class="muted small mcp-note">Their tools run on this PC with your rights, when the model decides to call them
+        <p class="muted small mcp-note" data-i18n="mon.mcpNote">Their tools run on this PC with your rights, when the model decides to call them
           (in this page's chat only; switch it off in Sampling).</p>
       </div>
     </div>
@@ -297,10 +805,26 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
   <!-- ============================ About ============================ -->
   <section class="view view--about" id="view-about" role="tabpanel" aria-labelledby="tab-btn-about" hidden>
-    <div class="about">
+    <div class="about about-head">
+      <div class="st-tabs about-tabs" id="about-tabs" role="tablist" aria-label="About" data-i18n-label="tab.about">
+        <button class="st-tab" role="tab" type="button" data-about="overview" aria-controls="about-overview" aria-selected="true" data-i18n="about.tabOverview">Overview</button>
+        <button class="st-tab" role="tab" type="button" data-about="terms" aria-controls="about-terms" aria-selected="false" data-i18n="about.tabTerms">Model terms</button>
+        <button class="st-tab" role="tab" type="button" data-about="licenses" aria-controls="about-licenses" aria-selected="false" data-i18n="about.tabLicenses">Licenses</button>
+      </div>
+    </div>
+    <div class="about" id="about-terms" role="tabpanel" hidden>
+      <p class="muted small" data-i18n="terms.note">The terms of the models this server runs now, each as its makers wrote it. The texts are kept on this PC (setup fetched them with the models).</p>
+      <div class="terms-list" id="terms-list"></div>
+    </div>
+    <div class="about" id="about-licenses" role="tabpanel" hidden>
+      <p class="muted small" data-i18n="lic.note">XeStrata and the parts from other projects this build carries or is built with, each with its license's full text.</p>
+      <div class="terms-list" id="lic-list"></div>
+    </div>
+    <div class="about" id="about-overview" role="tabpanel">
       <div class="st-card">
-        <span class="card-title">Model and engine</span>
+        <span class="card-title" data-i18n="about.engineTitle">Model and engine</span>
         <dl class="facts" id="facts-engine"></dl>
+        <div class="cfg-actions"><button class="st-btn st-btn--secondary" id="unload-btn" type="button" title="Waiting for the server" disabled>&hellip;</button></div>
       </div>
       <div class="st-card">
         <span class="card-title" data-i18n="update.title">Updates</span>
@@ -310,36 +834,42 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           <span class="muted small" id="update-msg" role="status"></span></div>
       </div>
       <div class="st-card">
-        <span class="card-title">This PC</span>
+        <span class="card-title" data-i18n="about.pc">This PC</span>
         <dl class="facts" id="facts-hw"></dl>
       </div>
       <div class="st-card">
-        <span class="card-title">Connect your tools</span>
-        <p class="muted">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
+        <span class="card-title" data-i18n="about.connect">Connect your tools</span>
+        <p class="muted" data-i18n="about.connectNote">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
         <dl class="facts" id="facts-api"></dl>
       </div>
       <div class="st-card">
-        <span class="card-title">Settings</span>
+        <span class="card-title" data-i18n="drawer.short">Settings</span>
         <div class="st-field">
-          <label class="st-label" for="api-key">API key <output>only if the server was started with one</output></label>
-          <input class="st-input" id="api-key" type="password" autocomplete="off" placeholder="Not needed">
+          <label class="st-label" for="api-key"><span data-i18n="about.apiKey">API key</span> <output data-i18n="about.apiKeyNote">only if the server was started with one</output></label>
+          <input class="st-input" id="api-key" type="password" autocomplete="off" placeholder="Not needed" data-i18n-placeholder="about.apiKeyNone">
         </div>
         <div class="st-field">
           <label class="st-label" for="lang"><span data-i18n="settings.language">Language</span></label>
           <select class="st-input" id="lang"></select>
-          <span class="muted small" data-i18n="settings.languageNote">Chat, its settings, the buttons above and the Images view are translated. The Monitor and About views are still in English for the most part.</span>
+          <span class="muted small" data-i18n="settings.languageNote">Messages from the server and the engine (errors, the stages of an image job) stay in English.</span>
         </div>
-        <div class="toggle-row"><span>Dark theme</span>
-          <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
-        <p class="muted small">Chats, settings and the key are kept in this browser only.
-          <a href="https://github.com/ruc1j/XeStrata-890M" target="_blank" rel="noopener noreferrer">XeStrata-890M on GitHub</a></p>
+        <div class="st-field">
+          <label class="st-label" for="text-size"><span data-i18n="settings.textSize">Text size</span></label>
+          <select class="st-input" id="text-size"></select>
+          <span class="muted small" data-i18n="settings.textSizeNote">Kept in this browser. The browser's own zoom makes everything larger, the layout too.</span>
+        </div>
+        <div class="toggle-row"><span data-i18n="about.dark">Dark theme</span>
+          <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme" data-i18n-label="about.dark"></button></div>
+        <p class="muted small"><a href="/api-monitor" data-i18n="about.monitorLink">API request monitor (last 100 requests and answers)</a></p>
+        <p class="muted small"><span data-i18n="about.kept">Chats, settings and the key are kept in this browser only.</span>
+          <a href="https://github.com/ruc1j/XeStrata-890M" target="_blank" rel="noopener noreferrer" data-i18n="about.github">XeStrata-890M on GitHub</a></p>
       </div>
       <div class="st-card cfg-card" id="cfg-card" hidden>
-        <div class="req-head"><span class="card-title">Model settings</span><span class="muted small" id="cfg-file"></span></div>
-        <p class="muted small">Kept in the model's run config for every client. An empty field is the default. They
-          take effect the next time the model starts (close Strata's window and start it again).</p>
+        <div class="req-head"><span class="card-title" data-i18n="about.cfgTitle">Model settings</span><span class="muted small" id="cfg-file"></span></div>
+        <p class="muted small" data-i18n="about.cfgNote">Kept in the model's run config for every client. An empty field is the default. They
+          take effect the next time the model starts (close XeStrata's window and start it again).</p>
         <form class="cfg-form" id="cfg-form"></form>
-        <div class="cfg-actions"><button class="st-btn st-btn--primary" id="cfg-save" type="button">Save</button>
+        <div class="cfg-actions"><button class="st-btn st-btn--primary" id="cfg-save" type="button" data-i18n="hist.save">Save</button>
           <span class="muted small" id="cfg-msg" role="status"></span></div>
       </div>
     </div>
@@ -385,10 +915,57 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <button class="st-toggle" id="s-show" role="switch" aria-checked="true" aria-label="Show thinking" data-i18n-label="drawer.showThinking"></button></div>
     <div class="toggle-row"><span><span data-i18n="drawer.math">Render math</span><br><span class="muted small"
       data-i18n="drawer.mathNote">draw equations in answers as formulas (works offline)</span></span>
-      <button class="st-toggle" id="s-math" role="switch" aria-checked="false" aria-label="Render math" data-i18n-label="drawer.math"></button></div>
+      <button class="st-toggle" id="s-math" role="switch" aria-checked="true" aria-label="Render math" data-i18n-label="drawer.math"></button></div>
+    <div class="st-field">
+      <label class="st-label" for="s-script"><span data-i18n="drawer.script">Keep other languages' characters out of answers</span></label>
+      <div class="seg seg--3" id="s-script" role="radiogroup" aria-label="Keep other languages' characters out of answers" data-i18n-label="drawer.script">
+        <button type="button" role="radio" data-v="off" data-i18n="drawer.scriptOff">Off</button><button type="button" role="radio" data-v="ja" data-i18n="drawer.scriptJa">Japanese</button><button type="button" role="radio" data-v="en" data-i18n="drawer.scriptEn">English etc. (non-CJKV)</button>
+        <button type="button" role="radio" data-v="ko" data-i18n="drawer.scriptKo">Korean</button><button type="button" role="radio" data-v="zh-cn" data-i18n="drawer.scriptZhCn">Chinese (Simplified)</button><button type="button" role="radio" data-v="zh-tw" data-i18n="drawer.scriptZhTw">Chinese (Traditional)</button>
+      </div>
+      <span class="muted small" data-i18n="drawer.scriptNote">The answer's language: the characters of the other CJKV languages are kept out (Japanese: Simplified Chinese, Hangul; English etc.: every CJK character; Korean: kana, Han characters Korean does not use; Chinese: kana, Hangul, Japanese-only forms and the other Chinese script), and Vietnamese letters. Turn it off to have the model write another of these languages. Does not affect the thinking.</span>
+    </div>
+    <div class="toggle-row" id="script-ctx-row"><span><span data-i18n="drawer.scriptContext">Allow the characters in the conversation</span><br><span class="muted small"
+      data-i18n="drawer.scriptContextNote">Text in another language pasted into the question can be quoted or translated in the answer</span></span>
+      <button class="st-toggle" id="s-scriptctx" role="switch" aria-checked="true" aria-label="Allow the characters in the conversation" data-i18n-label="drawer.scriptContext"></button></div>
+    <div class="st-field" id="search-row" hidden>
+      <label class="st-label" for="chat-search"><span data-i18n="chatSearch.label">Web search in the chat</span></label>
+      <select class="st-input" id="chat-search" title="Web search in the chat: the model searches when the question needs it"
+              data-i18n-title="chatSearch.title"></select>
+      <span class="muted small" data-i18n="chatSearch.title">Web search in the chat: the model searches when the question needs it</span>
+    </div>
     <div class="toggle-row" id="mcp-row" hidden><span><span data-i18n="drawer.mcp">Use tools from MCP servers</span><br><span class="muted small"
       id="mcp-row-sub">the model may call them while it answers</span></span>
       <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers" data-i18n-label="drawer.mcp"></button></div>
+    <div class="st-field" id="textgpu-row" hidden>
+      <label class="st-label" for="s-textgpu"><span data-i18n="drawer.textGpu">Lend the chat model's GPU to the image tools</span></label>
+      <select class="st-input" id="s-textgpu">
+        <option value="" data-i18n="drawer.textGpuServer">The server's setting</option>
+        <option value="off" data-i18n="drawer.textGpuOff">Never</option>
+        <option value="ask" data-i18n="drawer.textGpuAsk">When the model asks for it</option>
+        <option value="on" data-i18n="drawer.textGpuOn">Whenever it helps</option>
+      </select>
+      <span class="muted small" data-i18n="drawer.textGpuNote">The image calls of one answer then run on both GPUs at once; a chat waits while the chat model's GPU makes an image.</span>
+    </div>
+    <div class="st-field" id="imagegpu-row" hidden>
+      <label class="st-label" for="s-imagegpu"><span data-i18n="drawer.imageGpu">GPU that makes the chat's images and videos</span></label>
+      <select class="st-input" id="s-imagegpu"></select>
+      <span class="muted small" data-i18n="drawer.imageGpuNote">For this browser only; the server's settings stay as they are. On the chat model's GPU, a chat waits while it makes an image.</span>
+    </div>
+    <div class="drawer-group" role="group" aria-labelledby="g-skills">
+      <h3 class="drawer-group__title" id="g-skills" data-i18n="skills.title">Skills</h3>
+      <div class="toggle-row"><span><span data-i18n="skills.use">Use the skills added here</span><br><span class="muted small"
+        data-i18n="skills.useNote">the model reads one when a request needs it (Agent Skills' SKILL.md)</span></span>
+        <button class="st-toggle" id="s-skills" role="switch" aria-checked="true" aria-label="Use the skills added here" data-i18n-label="skills.use"></button></div>
+      <div class="skills-list" id="skills-list"></div>
+      <details class="skills-own"><summary class="small skills-own__sum" id="skills-own-sum" data-i18n="skills.own">XeStrata's skills</summary>
+        <div class="skills-list" id="skills-own-list"></div></details>
+      <div class="skills-actions">
+        <button type="button" class="st-btn st-btn--secondary" id="skills-add" data-i18n="skills.add">Add a skill</button>
+        <button type="button" class="st-btn st-btn--secondary" id="skills-import" data-i18n="skills.import">Import a file…</button>
+        <input type="file" id="skills-file" accept=".md,.zip,text/markdown,application/zip" hidden>
+      </div>
+      <span class="muted small" id="skills-dir"></span>
+    </div>
     <div class="toggle-row" id="esp-row" hidden><span>Experimental speed projection<br><span class="muted small">the
       engine's control vector; off = the stock model. Switching reads the chat again once</span></span>
       <button class="st-toggle" id="s-esp" role="switch" aria-checked="true" aria-label="Experimental speed projection"></button></div>
@@ -400,18 +977,31 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <h3 class="drawer-group__title" id="g-chats" data-i18n="drawer.chats">Chats</h3>
       <div class="toggle-row"><span><span data-i18n="drawer.list">Saved chats list</span><br><span class="muted small"
         data-i18n="drawer.listNote">keeps every chat in a list on the left, in this browser only. Off: one chat, as before</span></span>
-        <button class="st-toggle" id="s-list" role="switch" aria-checked="false" aria-label="Saved chats list" data-i18n-label="drawer.list"></button></div>
+        <button class="st-toggle" id="s-list" role="switch" aria-checked="true" aria-label="Saved chats list" data-i18n-label="drawer.list"></button></div>
       <div class="toggle-row"><span><span data-i18n="drawer.edit">Edit and rewind messages</span><br><span class="muted small"
         data-i18n="drawer.editNote">edit an answer, ask for a new one, or go back to an earlier message (with an Undo)</span></span>
-        <button class="st-toggle" id="s-edit" role="switch" aria-checked="false" aria-label="Edit and rewind messages" data-i18n-label="drawer.edit"></button></div>
+        <button class="st-toggle" id="s-edit" role="switch" aria-checked="true" aria-label="Edit and rewind messages" data-i18n-label="drawer.edit"></button></div>
+      <div class="toggle-row"><span><span data-i18n="drawer.segments">Go on past the context</span><br><span class="muted small"
+        data-i18n="drawer.segmentsNote">a chat that fills the context goes on in a new segment, with no summary: the model reads the earlier ones back when it needs them</span></span>
+        <button class="st-toggle" id="s-seg" role="switch" aria-checked="true" aria-label="Go on past the context" data-i18n-label="drawer.segments"></button></div>
+      <div class="st-field">
+        <label class="st-label" for="s-seglimit"><span data-i18n="drawer.segLimit">Segment size</span> <output data-i18n="drawer.segLimitNote">tokens; empty = the context less the answer's room</output></label>
+        <input class="st-input" id="s-seglimit" type="number" min="1024" step="1024" placeholder="Auto" data-i18n-placeholder="drawer.auto">
+      </div>
+      <div class="st-field">
+        <label class="st-label" for="s-memory"><span data-i18n="drawer.memory">This chat's memory</span> <output data-i18n="drawer.memoryNote">every segment starts with it</output></label>
+        <textarea class="st-input" id="s-memory" rows="4" placeholder="The model writes here what must carry on" data-i18n-placeholder="drawer.memoryEmpty"></textarea>
+      </div>
       <div class="st-field">
         <label class="st-label" for="s-busy"><span data-i18n="drawer.busy">When you send while it is answering</span></label>
-        <div class="seg seg--3" id="s-busy" role="radiogroup" aria-label="When you send while it is answering" data-i18n-label="drawer.busy">
-          <button type="button" role="radio" data-v="wait" data-i18n="drawer.busyWait">Wait</button><button type="button" role="radio" data-v="queue" data-i18n="drawer.busyQueue">Send after</button>
+        <div class="seg seg--2" id="s-busy" role="radiogroup" aria-label="When you send while it is answering" data-i18n-label="drawer.busy">
+          <button type="button" role="radio" data-v="queue" data-i18n="drawer.busyQueue">Send after</button>
           <button type="button" role="radio" data-v="interject" data-i18n="drawer.busyInterject">Interrupt</button>
         </div>
         <span class="muted small" id="o-busy"></span>
       </div>
+      <!-- the message box's Save, here on a narrow screen (where the box keeps its tools to one row) -->
+      <button type="button" class="st-btn st-btn--secondary drawer-export" id="drawer-export" data-i18n="composer.save">Save this chat as Markdown</button>
     </div>
 
     <div class="drawer-actions">
@@ -426,8 +1016,10 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 <script src="web/preview.js"></script>
 <script src="web/math.js"></script>
 <script src="web/math-adapter.js"></script>
+<script src="web/mermaid-view.js"></script>
 <script src="web/history.js"></script>
 <script src="web/chatstore.js"></script>
+<script src="web/segments.js"></script>
 <script src="web/chats-ui.js"></script>
 <script src="web/app.js"></script>
 </body>

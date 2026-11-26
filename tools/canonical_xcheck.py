@@ -29,11 +29,12 @@ import collections
 import mmap
 import os
 import pathlib
-import struct
 import sys
 import time
 
 import numpy as np
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))   # the checkout, for serve/envvars.py
+from serve import envvars  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -42,12 +43,11 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "ref"))
 
 import gguf_reader as G                                    # noqa: E402
-from gguf_writer import dequantize_q2_0                    # noqa: E402
 from load import _dequant_flat                             # noqa: E402
 
-# default: $STRATA_SHARD1, else the development layout (<Strata>/Q2_0 beside <Strata>/Public/Engine)
-SHARD1 = os.environ.get("STRATA_SHARD1") or os.path.join(os.path.dirname(os.path.dirname(REPO)), "Q2_0",
-                                                          "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf")
+# default: $XESTRATA_SHARD1, else the development layout (<Strata>/Q2_0 beside <Strata>/Public/Engine)
+SHARD1 = envvars.get("SHARD1") or os.path.join(
+    os.path.dirname(os.path.dirname(REPO)), "Q2_0", "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf")
 
 QK = 64          # Q2_0 block: 64 elements
 BLOCK_BYTES = 18  # 2-byte fp16 scale + 16 bytes of 2-bit codes
@@ -261,7 +261,7 @@ def from_s4_q3_k(parts):
 # Checked against two independent files before use, because a codebook is exactly the kind of constant that
 # has silent variants: ggml-cpu/llamafile/sgemm.cpp L1361 and ggml-opencl/kernels/mul_mv_iq4_nl_f32.cl L30.
 KV_IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10,
-                        1,   13,  25,  38,  53,  69,  89, 113], dtype=np.float32)
+                     1,   13,  25,  38,  53,  69,  89, 113], dtype=np.float32)
 
 
 def to_s4_iq4_nl(raw: bytes):
@@ -526,6 +526,7 @@ def from_p16_f16(parts):
 Mapping = collections.namedtuple(
     "Mapping", "enc dec block_bytes block_elems group_elems form codebook code_bias has_offset")
 
+
 def to_s2(raw: bytes):
     """Canonicalise `Q2_0` to S2: codes and scales in SEPARATE PLANES, values unchanged.
 
@@ -672,7 +673,7 @@ def run_full(args) -> int:
         nblocks_sec = max(1, args.chunk // m.block_bytes)          # WHOLE blocks per chunk
         n_t = n_b = n_bad = 0
         t0 = time.time()
-        seen = collections.Counter()
+        seen: collections.Counter[str] = collections.Counter()
         for t in by_type[tname]:
             if t.elements % m.block_elems:
                 print("  %-34s %d elements not a multiple of %d - SKIPPED" % (t.name, t.elements, m.block_elems))

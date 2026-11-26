@@ -40,7 +40,6 @@ int main() {
     const long long n_embd = strata::core::kCompiledGeometry.n_embd, hc = strata::core::kCompiledGeometry.hc, hc_lr = strata::core::kCompiledGeometry.hc_lr, hc_dim = hc * n_embd;   // the compiled shape (Q4-SYCL)
     std::mt19937 rng(783);  // NOLINT(bugprone-random-generator-seed): reproducible rows.
     std::normal_distribution<float> gauss(0.f, 1.f);
-    k::gr_set_native_mmvf(true);
     const k::GrShapes sh{n_embd, hc, hc_lr};
     void* st = P::stream();
     int cases = 0, bad = 0;

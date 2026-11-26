@@ -53,6 +53,8 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // --reply-checkpoint-every: taken in a reply, between windows (a run-time mark too): the newest replaces the last.
+    bool reply = false;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
@@ -322,7 +324,7 @@ public:
         size_t deepest = 0;
         for (const auto& c : entries_[m.index].checkpoints) {
             if (c.pinned && (int64_t) c.ids.size() <= m.tokens) return false;
-            deepest = std::max(deepest, c.ids.size());
+            if (!c.reply) deepest = std::max(deepest, c.ids.size());
         }
         return (size_t) m.tokens < deepest;
     }
@@ -429,7 +431,7 @@ public:
     size_t slots() const { return slots_; }
 
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
-    // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
+    // the same conversation a turn back, whose deepest turn-boundary checkpoint the outgoing chain still holds, so all it adds
     // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
     // checkpoints older than that one.  A subagent's successive turns parked one such copy each, and make_room's
     // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
@@ -463,7 +465,7 @@ public:
             const auto& e = entries_[i];
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+                if (!c.reply && (!deepest || c.ids.size() > deepest->ids.size())) deepest = &c;
             if (e.cvec == cvec && !(guarded_ != 0 && serials_[i] == guarded_) &&
                 ((deepest && !deepest->ids.empty() && conversation_chain_holds(*deepest, ids, images, checkpoints)) ||
                  live_extended_by(e, ids, images))) {
@@ -489,7 +491,7 @@ public:
             const auto& e = entries_[i];
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+                if (!c.reply && (!deepest || c.ids.size() > deepest->ids.size())) deepest = &c;
             // (the entries drop_superseded() drops, the live-prefix ones of upstream f87121058 among them: in the fork
             // they would take the main session's root checkpoint with them just the same)
             if (e.cvec != cvec || (guarded_ != 0 && serials_[i] == guarded_) ||
@@ -514,7 +516,7 @@ public:
             if (e.cvec != cvec) continue;
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+                if (!c.reply && (!deepest || c.ids.size() > deepest->ids.size())) deepest = &c;
             const bool has_deepest = deepest && !deepest->ids.empty();
             bool holds = has_deepest && deepest->ids == ids && deepest->imgs == images;
             for (const auto& k : checkpoints)

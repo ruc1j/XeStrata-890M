@@ -9,7 +9,9 @@
 //   1. the table of the fixed cases (DFlash2 + cost rule with and without --draft-conf / --spec-min-p);
 //   2. the DEFAULT PATH IS UNCHANGED: for every input the old inline code handled correctly (MTP as the source, any flags;
 //      DFlash2 with --draft-conf > 0 or with the cost rule off) a copy of the old code returns the same window;
-//   3. the q rule.
+//   3. the q rule;
+//   4. the calibrated DFlash2 gate;
+//   5. upstream XeStrata's helpers: DFlash2's confidence window (df2_window), mtp_cost_applies, the lookup deferral.
 #include "strata/spec/window_rule.hpp"
 
 #include <algorithm>
@@ -120,6 +122,27 @@ int main() {
         float mid[8] = {0.6f, 0.6f, 0.6f, 0.6f, 0.6f, 0.6f, 0.6f, 0.6f};
         g3.ms_per_tok = 4.0; g4.ms_per_tok = 14.0;
         check(g3.choose(mid, 6) <= g4.choose(mid, 6), "gate: a dearer token (14 ms) never gets a narrower window than a cheap one (4 ms)");
+    }
+    {   // 5. upstream XeStrata's helpers
+        const float probs[] = {0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f, 0.9f};
+        check(df2_window(probs, 8, 0.0) == 8, "conf 0: the whole cap");
+        check(df2_window(probs, 8, 0.35) == 8, "0.9^7 = 0.48 >= 0.35: all 7 drafts");
+        check(df2_window(probs, 8, 0.5) == 7, "0.9^6 = 0.53 >= 0.5 > 0.9^7 = 0.48: 6 drafts");
+        const float low[] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+        check(df2_window(low, 8, 0.35) == 2, "0.5^1 = 0.5 >= 0.35 > 0.5^2 = 0.25: 1 draft");
+        check(df2_window(low, 8, 0.9) == 1, "a first draft below conf: the anchor alone");
+        check(df2_window(probs, 4, 0.0) == 4, "the cap bounds the window");
+        check(df2_window(nullptr, 6, 0.5) == 6, "no probabilities: the cap");
+        check(mtp_cost_applies(true, true, false, false), "the MTP cost window: MTP candidates, cost on");
+        check(!mtp_cost_applies(true, true, true, false), "not DFlash2's candidates");
+        check(!mtp_cost_applies(true, true, false, true), "not the first single-row window");
+        check(!mtp_cost_applies(true, false, false, false), "not without the cost rule");
+        check(!mtp_cost_applies(false, true, false, false), "not without the MTP");
+        check(skip_draft_for_lookup(true, 8, 10, 8), "a long match defers the DFlash2 draft");
+        check(!skip_draft_for_lookup(true, 8, 10, 7), "a short match does not");
+        check(!skip_draft_for_lookup(true, 0, 10, 100), "min_match 0: off");
+        check(!skip_draft_for_lookup(false, 8, 10, 100), "not for the MTP");
+        check(!skip_draft_for_lookup(true, 8, 0, 100), "no lookup proposal: no deferral");
     }
     std::printf("%s\n", g_fail == 0 ? "window_rule_test: ok" : "window_rule_test: FAILED");
     return g_fail == 0 ? 0 : 1;

@@ -3,11 +3,16 @@
 // src/image/qi_kernels.cpp - see include/strata/image/qi_kernels.hpp.
 
 #include "strata/image/qi_kernels.hpp"
+#include "strata/image/gelu.hpp"
+#include "dit_rows.hpp"
 
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/kernels/row_stats.hpp"
 #include "strata/kernels/bf16_bits.hpp"
-#include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/f16_gpu.hpp"
+#include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/qk_norm_rope.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -15,6 +20,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::image {
 
@@ -22,9 +28,9 @@ namespace {
 
 namespace syclex = sycl::ext::oneapi::experimental;
 
-using strata::kernels::f16_from_f32;
 using strata::kernels::f32_from_bf16;
-using strata::kernels::f32_from_f16;
+using kernels::f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
+using kernels::f16_gpu::f32_from_f16;
 
 sycl::queue& queue_for(void* stream) { return core::Runtime::get().stream(stream); }
 
@@ -34,74 +40,58 @@ void finish(void* stream, const sycl::event& e, const char* what) {
 
 constexpr float kEps = 1e-6f;
 
+// a W8A8 product's scales as the kernel reads them (DitOut's sx and sw; bf: its values already scaled, as BF16)
+struct I8Scales {
+    const float *sx = nullptr, *sw = nullptr;
+    bool bf = false;
+};
+
 // qi_qk_norm_rope16 a sub-group of 32 a head (t, h), HEADS heads a work-group
 // q, k and v as FP32, or (i8) a W8A8 product's int32 sums with their scales (s[0], s[1], s[2]: q's, k's and v's,
 // the activations' shared)
 struct QkvIn {
     const float *q, *k, *v;
     bool i8;
-    QiI8 s[3];
+    I8Scales s[3];
     float at(int which, int64_t t, int64_t idx, int64_t c) const {
+        // the three by selects, not s[which]: a run-time index into the array puts it in private memory (Qwen-Image's
+        // QK kernel took the B70 twice its time, 3.3 s of an image's 6.8)
         const float* p = which == 0 ? q : which == 1 ? k : v;
         if (!i8) return p[idx];
-        return (float) sycl::bit_cast<int32_t>(p[idx]) * s[which].sx[t] * s[which].sw[c];
+        if (which == 0 ? s[0].bf : which == 1 ? s[1].bf : s[2].bf)
+            return strata::kernels::f32_from_bf16(reinterpret_cast<const uint16_t*>(p)[idx]);
+        const float* sx = which == 0 ? s[0].sx : which == 1 ? s[1].sx : s[2].sx;
+        const float* sw = which == 0 ? s[0].sw : which == 1 ? s[1].sw : s[2].sw;
+        return (float) sycl::bit_cast<int32_t>(p[idx]) * sx[t] * sw[c];
     }
 };
 
-struct QkRope {
-    static constexpr int64_t SG = 32, HEADS = 8, LANES = SG * HEADS;
-    QkvIn in;
-    const float *wq, *wk, *cos, *sin;
-    int64_t n, heads, head_dim;
-    uint16_t *q16, *k16, *v16;
-    void operator()(sycl::nd_item<1> it) const {
-        const auto sg = it.get_sub_group();
-        const int64_t g = static_cast<int64_t>(it.get_group_linear_id()) * HEADS + sg.get_group_linear_id();
-        const int64_t lane = sg.get_local_linear_id(), half = head_dim / 2;
-        if (g >= n) return;   // the whole sub-group
-        const int64_t t = g / heads, base = g * head_dim, c0 = (g - t * heads) * head_dim;
-        for (int which = 0; which < 2; ++which) {
-            const float* w = which == 0 ? wq : wk;
-            float ss = 0.f;
-            for (int64_t p = lane; p < half; p += SG) {
-                const float a = in.at(which, t, base + 2 * p, c0 + 2 * p);
-                const float b = in.at(which, t, base + 2 * p + 1, c0 + 2 * p + 1);
-                ss += a * a + b * b;
-            }
-            const float r =
-                1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) head_dim + kEps);
-            uint16_t* dst = which == 0 ? q16 : k16;
-            for (int64_t p = lane; p < half; p += SG) {
-                const float a = in.at(which, t, base + 2 * p, c0 + 2 * p) * r * w[2 * p];
-                const float b = in.at(which, t, base + 2 * p + 1, c0 + 2 * p + 1) * r * w[2 * p + 1];
-                const float c = cos[t * half + p], sn = sin[t * half + p];
-                // the pair (a, b) = (even, odd): a' = a c - b s, b' = a s + b c
-                dst[base + 2 * p] = f16_from_f32(a * c - b * sn);
-                dst[base + 2 * p + 1] = f16_from_f32(a * sn + b * c);
-            }
-        }
-        for (int64_t d = lane; d < head_dim; d += SG) v16[base + d] = f16_from_f32(in.at(2, t, base + d, c0 + d));
-    }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<SG>}; }
-};
+}  // namespace
 
-// qi_rows_i8's values: V of row r from column k, FP16 or BF16
-struct I8From16 {
-    const uint16_t* src;
-    bool bf16;
-    int64_t K;
-    template<int V> void load(int64_t r, int64_t k, float* v) const {
-        const auto raw = *reinterpret_cast<const sycl::vec<uint16_t, V>*>(src + r * K + k);
-        for (int j = 0; j < V; ++j) v[j] = bf16 ? f32_from_bf16(raw[j]) : f32_from_f16(raw[j]);
-    }
-};
+// The SwiGLU's W8A8 input (dit_rows.hpp's RowsI8Of ops), in a namespace of their own: SYCL names a kernel by its
+// type, and an anonymous namespace mangles the same in every file.  The rows' quantizer itself is kernels/rows_i8.hpp.
+namespace qi_rows {
+
+using strata::kernels::f32_from_bf16;
+using kernels::f16_gpu::f16_from_f32;
+using kernels::f16_gpu::f32_from_f16;
 
 // qi_swiglu_i8's: SwiGLU of a W8A8 product's int32 sums [gate | up]
 struct I8FromSwiglu {
+    static constexpr bool kRms = false, kKeep = false;
     const int32_t* gu;
     const float *sx, *sw;
     int64_t inter;
-    template<int V> void load(int64_t r, int64_t k, float* v) const {
+    bool bf;   // gu's values already scaled, as BF16
+    template<int V> void load_sg(const sycl::sub_group&, int64_t r, int64_t k, float* v) const {
+        if (bf) {
+            const auto* row = reinterpret_cast<const uint16_t*>(gu) + r * 2 * inter;
+            for (int j = 0; j < V; ++j) {
+                const float g = f32_from_bf16(row[k + j]), u = f32_from_bf16(row[inter + k + j]);
+                v[j] = u * g / (1.f + sycl::exp(-g));
+            }
+            return;
+        }
         const int32_t* row = gu + r * 2 * inter;
         for (int j = 0; j < V; ++j) {
             const float g = (float) row[k + j] * sx[r] * sw[k + j];
@@ -111,413 +101,93 @@ struct I8FromSwiglu {
     }
 };
 
-// qi_rows_i8 a work-group a row: a sub-group of 32 a group of 256 values (8 a lane, held in registers), up to MAXG
-// groups each; the rotation's butterflies of strides 1 to 4 within a lane, 8 to 128 across lanes
-template<class Src> struct RowsI8 {
-    static constexpr int SG = 32, V = kQiRotate / SG, MAXG = 4;
-    Src src;
-    int64_t K, gpr, nsg;
-    int8_t* q;
-    float* s;
-    const float* rs;
-    void operator()(sycl::nd_item<1> it) const {
-        const auto sg = it.get_sub_group();
-        const auto r = static_cast<int64_t>(it.get_group_linear_id());
-        const auto si = static_cast<int64_t>(sg.get_group_linear_id());
-        const int lane = static_cast<int>(sg.get_local_linear_id());
-        float v[MAXG][V];
-        float amax = 0.f;
-        for (int c = 0; c < MAXG; ++c) {
-            const int64_t g = si + c * nsg;
-            if (g >= gpr) break;   // the whole sub-group
-            src.template load<V>(r, g * kQiRotate + (int64_t) lane * V, v[c]);
-            for (int m = 1; m < V; m <<= 1)
-                for (int j = 0; j < V; ++j)
-                    if ((j & m) == 0) {
-                        const float a = v[c][j], b = v[c][j + m];
-                        v[c][j] = a + b;
-                        v[c][j + m] = a - b;
-                    }
-            for (int l = 1; l < SG; l <<= 1)
-                for (int j = 0; j < V; ++j) {
-                    const float o = sycl::permute_group_by_xor(sg, v[c][j], l);
-                    v[c][j] = (lane & l) != 0 ? o - v[c][j] : v[c][j] + o;
-                }
-            for (int j = 0; j < V; ++j) {
-                v[c][j] *= 1.f / 16.f;
-                amax = sycl::fmax(amax, sycl::fabs(v[c][j]));
-            }
-        }
-        amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
-        const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
-        for (int c = 0; c < MAXG; ++c) {
-            const int64_t g = si + c * nsg;
-            if (g >= gpr) break;
-            sycl::vec<int8_t, V> o;
-            for (int j = 0; j < V; ++j) o[j] = (int8_t) (int) sycl::round(v[c][j] * id);
-            *reinterpret_cast<sycl::vec<int8_t, V>*>(q + r * K + g * kQiRotate + (int64_t) lane * V) = o;
-        }
-        if (si == 0 && lane == 0) s[r] = rs != nullptr ? d * rs[r] : d;
-    }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<SG>}; }
-};
+}  // namespace qi_rows
 
-template<class Src>
-void rows_i8(const Src& src, int64_t rows, int64_t K, int8_t* q, float* s, const float* rs, void* stream) {
-    if (rows <= 0) return;
-    sycl::queue& qu = queue_for(stream);
-    constexpr int64_t SG = RowsI8<Src>::SG, MAXG = RowsI8<Src>::MAXG;
-    const int64_t gpr = K / kQiRotate;
-    const auto max_sg =
-        static_cast<int64_t>(qu.get_device().get_info<sycl::info::device::max_work_group_size>()) / SG;
-    const int64_t per = (gpr + max_sg - 1) / max_sg;
-    if (K % kQiRotate != 0 || per > MAXG)
-        throw std::runtime_error("image engine: a W8A8 product takes rows of a multiple of 256 values, up to " +
-                                 std::to_string(max_sg * MAXG * kQiRotate));
-    const int64_t nsg = (gpr + per - 1) / per;
-    const auto e = qu.parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (rows * nsg * SG)), sycl::range<1>((size_t) (nsg * SG))),
-        RowsI8<Src>{src, K, gpr, nsg, q, s, rs});
-    finish(stream, e, "qi_rows_i8");
-}
-
-}  // namespace
-
-void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, int64_t C, uint16_t* y16, void* stream) {
+void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, int64_t C, uint16_t* y16, void* stream,
+                 const float* shift) {
     if (T <= 0) return;
-    constexpr size_t local = 256;
+    // a work-group a row: 128 lanes up to 512 channels (the VAEs' pixels), 256 past them (the DiTs' 3,072)
+    const size_t local = C <= 512 ? 128 : 256;
     const auto e = queue_for(stream).parallel_for(
         sycl::nd_range<1>(sycl::range<1>((size_t) T * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
             const int64_t t = static_cast<int64_t>(it.get_group_linear_id()), lane = static_cast<int64_t>(it.get_local_linear_id());
             const float* r = x + t * C;
-            float s = 0.f;
-            for (int64_t c = lane; c < C; c += local) s += r[c];
-            const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
-            float v = 0.f;
-            for (int64_t c = lane; c < C; c += local) {
-                const float d = r[c] - mean;
-                v += d * d;
-            }
-            const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>()) /
-                                               (float) C + kEps);
+            const auto st = kernels::row_stats::calculate<kernels::row_stats::Kind::variance>(
+                lane, (int64_t) local, C, kEps, [=](int64_t c) { return r[c]; },
+                [&](float v) { return sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>()); });
+            const float mean = st.mean, inv = st.inv;
             const float* m = mod + (t < n_text ? C : 0);
-            for (int64_t c = lane; c < C; c += local) y16[t * C + c] = f16_from_f32((r[c] - mean) * inv * (1.f + m[c]));
+            for (int64_t c = lane; c < C; c += (int64_t) local) {
+                // one expression each, as the two kernels this replaced wrote them (the FMA they compile to)
+                y16[t * C + c] = f16_from_f32(shift != nullptr ? (r[c] - mean) * inv * (1.f + m[c]) + shift[c]
+                                                               : (r[c] - mean) * inv * (1.f + m[c]));
+            }
         });
     finish(stream, e, "qi_ln_mod16");
 }
 
 void qi_gate_add(float* x, const float* h, const float* mod, int64_t n_text, int64_t T, int64_t C, void* stream,
-                 const QiI8* i8) {
-    if (T <= 0) return;
-    const float* sx = i8 != nullptr ? i8->sx : nullptr;
-    const float* sw = i8 != nullptr ? i8->sw : nullptr;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / C, c = i - t * C;
-        const float v = sx != nullptr ? (float) sycl::bit_cast<int32_t>(h[i]) * sx[t] * sw[c] : h[i];
-        x[i] += v * sycl::tanh(mod[(t < n_text ? C : 0) + c]);
-    });
+                 const DitOut* i8) {
+    // the DiTs' gated residual (dit_rows::gate_add_by), the gate the text's or the image's row of mod, through tanh
+    DitOut in;
+    in.C = C;
+    if (i8 != nullptr && i8->bf != nullptr) {
+        in.bf = reinterpret_cast<const uint16_t*>(h);
+    } else if (i8 != nullptr) {
+        in.i = reinterpret_cast<const int32_t*>(h);
+        in.sx = i8->sx;
+        in.sw = i8->sw;
+    } else {
+        in.f = h;
+    }
+    const auto e = dit_rows::gate_add_by(
+        x, in, [=](int64_t t, int64_t c) { return sycl::tanh(mod[(t < n_text ? C : 0) + c]); }, T, C, stream);
     finish(stream, e, "qi_gate_add");
 }
 
 void qi_qk_norm_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk,
                        const float* cos, const float* sin, int64_t T, int64_t heads, int64_t head_dim,
-                       uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream, const QiI8* i8) {
+                       uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream, const DitOut* i8) {
     QkvIn in{q, k, v, i8 != nullptr, {}};
     if (i8 != nullptr)
-        for (int j = 0; j < 3; ++j) in.s[j] = i8[j];
+        for (int j = 0; j < 3; ++j) in.s[j] = I8Scales{i8[j].sx, i8[j].sw, i8[j].bf != nullptr};
     if (T <= 0) return;
     if (head_dim % 2 != 0 || head_dim > 256) throw std::invalid_argument("qi_qk_norm_rope16: head_dim");
-    const int64_t half = head_dim / 2;
-    sycl::queue& q0 = queue_for(stream);
-    // a sub-group of 32 a head, 8 heads a work-group, the sum of squares within the sub-group; where the GPU has no
-    // sub-groups of 32, a work-group a head and its sum over the work-group.  The work-group's sum went through local
-    // memory and barriers: RX 9060 XT 13.3 ms for Qwen-Image-2.1's 4,114 rows of 24 heads, RTX 4070 0.7.
-    static core::PerDevice<bool> sg32;
-    const bool by_sg = sg32.get(q0.get_device(), [&q0] {
-        const auto sizes = q0.get_device().get_info<sycl::info::device::sub_group_sizes>();
-        return std::find(sizes.begin(), sizes.end(), (size_t) 32) != sizes.end();
-    });
-    if (by_sg) {
-        const int64_t n = T * heads;
-        const auto e = q0.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t) ((n + QkRope::HEADS - 1) / QkRope::HEADS * QkRope::LANES)),
-                              sycl::range<1>((size_t) QkRope::LANES)),
-            QkRope{in, wq, wk, cos, sin, n, heads, head_dim, q16, k16, v16});
-        finish(stream, e, "qi_qk_norm_rope16");
-        return;
-    }
-    const size_t local = (size_t) head_dim;
-    const auto e = q0.parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (T * heads) * local), sycl::range<1>(local)),
-        [=](sycl::nd_item<1> it) {
-            const int64_t g = static_cast<int64_t>(it.get_group_linear_id()), d = static_cast<int64_t>(it.get_local_linear_id());
-            const int64_t t = g / heads, i = g * head_dim + d, c0 = (g - t * heads) * head_dim;
-            const int64_t j = d / 2;
-            const float c = cos[t * half + j], s = sin[t * half + j];
-            const bool odd = (d & 1) != 0;
-            for (int which = 0; which < 2; ++which) {
-                const float* w = which == 0 ? wq : wk;
-                const float val = in.at(which, t, i, c0 + d);
-                const float ss = sycl::reduce_over_group(it.get_group(), val * val, sycl::plus<float>());
-                const float n = val / sycl::sqrt(ss / (float) head_dim + kEps) * w[d];
-                const float other = sycl::permute_group_by_xor(it.get_sub_group(), n, 1);
-                // the pair (a, b) = (even, odd): a' = a c - b s, b' = a s + b c
-                const float out = odd ? other * s + n * c : n * c - other * s;
-                (which == 0 ? q16 : k16)[i] = f16_from_f32(out);
-            }
-            v16[i] = f16_from_f32(in.at(2, t, i, c0 + d));
-        });
-    finish(stream, e, "qi_qk_norm_rope16");
-}
-
-namespace {
-
-// Tiles of BQ queries of one head a work-group: the keys and values come into local memory BK rows at a time and serve
-// every query of the tile (the work-group reads K and V once per tile of queries, not once per query).  Each query
-// has 8 work-items: 4 of its tile's scores each, and 16 neighbouring of its 128 output channels each (local memory
-// read 8 halves at a time); a query's 8 work-items are
-// neighbours in a sub-group (any size a multiple of 8), so its row's max and sum go through sub-group shuffles.
-template<int64_t BQ>
-void attention_tiles(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                     int64_t n_text, const int32_t* key_lim, float* out, void* stream) {
-    constexpr int64_t D = 128, BK = 32, LANES = 8, WG = BQ * LANES;
-    constexpr int64_t S = D + 8;                        // the rows' stride in local memory: neighbouring rows in other banks
-    constexpr int SC = (int) (BK / LANES), OC = (int) (D / LANES);
-    using H8 = sycl::vec<sycl::half, 8>;
-    const int64_t row = heads * D, tiles = (T + BQ - 1) / BQ;
-    const float scale = 1.f / sycl::sqrt((float) D);
-    const auto e = queue_for(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<sycl::half, 1> qs(BQ * S, h), ks(BK * S, h), vs(BK * S, h);
-        sycl::local_accessor<float, 1> ps(BQ * BK, h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (tiles * heads * WG)), sycl::range<1>((size_t) WG)),
-                       [=](sycl::nd_item<1> it) {
-            const auto g = static_cast<int64_t>(it.get_group_linear_id());
-            const auto tid = static_cast<int64_t>(it.get_local_linear_id());
-            const auto sg = it.get_sub_group();
-            const int64_t hh = g % heads, q0 = (g / heads) * BQ;
-            const int64_t qi = tid / LANES, lane = tid % LANES, t = q0 + qi;
-            const sycl::half* qp = qs.get_multi_ptr<sycl::access::decorated::no>().get();
-            const sycl::half* kp = ks.get_multi_ptr<sycl::access::decorated::no>().get();
-            const sycl::half* vp = vs.get_multi_ptr<sycl::access::decorated::no>().get();
-            for (int64_t i = tid; i < BQ * D; i += WG) {
-                const int64_t r = i / D, d = i % D;
-                const uint16_t bits = q0 + r < T ? q16[(q0 + r) * row + hh * D + d] : (uint16_t) 0;
-                qs[r * S + d] = sycl::bit_cast<sycl::half>(bits);
-            }
-            // the keys a query sees: a prefix row its limit (a text row its own prefix), the image rows every row
-            const int64_t keys = t < n_text ? (key_lim ? key_lim[t] : t + 1) : T;
-            const int64_t lr = sycl::min(q0 + BQ, T) - 1;   // the tile's furthest key: its last row's (they never fall)
-            const int64_t last = lr < n_text ? (key_lim ? key_lim[lr] : lr + 1) : T;
-            float m = -INFINITY, l = 0.f, acc[OC];
-            for (int c = 0; c < OC; ++c) acc[c] = 0.f;
-            for (int64_t j0 = 0; j0 < last; j0 += BK) {
-                sycl::group_barrier(it.get_group());
-                for (int64_t i = tid; i < BK * D; i += WG) {
-                    const int64_t r = i / D, d = i % D, j = j0 + r;
-                    const uint16_t kb = j < T ? k16[j * row + hh * D + d] : (uint16_t) 0;
-                    const uint16_t vb = j < T ? v16[j * row + hh * D + d] : (uint16_t) 0;
-                    ks[r * S + d] = sycl::bit_cast<sycl::half>(kb);
-                    vs[r * S + d] = sycl::bit_cast<sycl::half>(vb);
-                }
-                sycl::group_barrier(it.get_group());
-                float sc[SC];
-                for (int r = 0; r < SC; ++r) sc[r] = 0.f;
-                for (int64_t d = 0; d < D; d += 8) {   // a Q value serves the work-item's keys
-                    const H8 qv = *reinterpret_cast<const H8*>(qp + qi * S + d);
-                    for (int r = 0; r < SC; ++r) {
-                        const H8 kv = *reinterpret_cast<const H8*>(kp + (lane + LANES * r) * S + d);
-                        for (int x = 0; x < 8; ++x) sc[r] += (float) qv[x] * (float) kv[x];
-                    }
-                }
-                float tm = -INFINITY;
-                for (int r = 0; r < SC; ++r) {
-                    sc[r] = j0 + lane + LANES * r < keys ? sc[r] * scale : -INFINITY;
-                    tm = sycl::fmax(tm, sc[r]);
-                }
-                for (int x = 1; x < LANES; x <<= 1) tm = sycl::fmax(tm, sycl::permute_group_by_xor(sg, tm, x));
-                const float nm = sycl::fmax(m, tm);
-                const float corr = nm == -INFINITY ? 1.f : sycl::exp(m - nm);
-                float ls = 0.f;
-                for (int r = 0; r < SC; ++r) {
-                    const float pr = sc[r] == -INFINITY ? 0.f : sycl::exp(sc[r] - nm);
-                    ps[qi * BK + lane + LANES * r] = pr;
-                    ls += pr;
-                }
-                for (int x = 1; x < LANES; x <<= 1) ls += sycl::permute_group_by_xor(sg, ls, x);
-                l = l * corr + ls;
-                m = nm;
-                for (int c = 0; c < OC; ++c) acc[c] *= corr;
-                sycl::group_barrier(it.get_group());
-                for (int64_t kj = 0; kj < BK; ++kj) {
-                    const float pr = ps[qi * BK + kj];
-                    for (int c = 0; c < OC; c += 8) {
-                        const H8 vv = *reinterpret_cast<const H8*>(vp + kj * S + lane * OC + c);
-                        for (int x = 0; x < 8; ++x) acc[c + x] += pr * (float) vv[x];
-                    }
-                }
-            }
-            if (t < T)
-                for (int c = 0; c < OC; ++c) out[t * row + hh * D + lane * OC + c] = acc[c] / l;
-        });
-    });
-    finish(stream, e, "qi_attention_plain");
-}
-
-}  // namespace
-
-// 64 queries a work-group where the device takes 512 work-items and their local memory (B70 without its matrix
-// engines: 56 ms a 1024 x 1024 block's attention, 68 ms with 32), else 32
-void qi_attention_plain(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                        int64_t head_dim, int64_t n_text, float* out, void* stream, const int32_t* key_lim) {
-    if (T <= 0) return;
-    if (head_dim != 128) throw std::invalid_argument("qi_attention_plain: head_dim 128");
-    const sycl::device dev = queue_for(stream).get_device();
-    const size_t wg = dev.get_info<sycl::info::device::max_work_group_size>();
-    const size_t slm = dev.get_info<sycl::info::device::local_mem_size>();
-    constexpr size_t kBig = (64 + 2 * 32) * (128 + 8) * 2 + 64 * 32 * 4;   // attention_tiles<64>'s local memory
-    if (wg >= 512 && slm >= kBig) attention_tiles<64>(q16, k16, v16, T, heads, n_text, key_lim, out, stream);
-    else attention_tiles<32>(q16, k16, v16, T, heads, n_text, key_lim, out, stream);
-}
-
-void qi_text_qk_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk, int64_t T,
-                       int64_t q_heads, int64_t kv_heads, int64_t head_dim, float theta, uint16_t* q16, uint16_t* k16,
-                       uint16_t* v16, void* stream, const int32_t* pos3, int sec_h, int sec_w) {
-    if (T <= 0) return;
-    if (head_dim % 2 != 0 || head_dim > 256) throw std::invalid_argument("qi_text_qk_rope16: head_dim");
-    const size_t local = (size_t) head_dim;
-    const int64_t heads = q_heads + kv_heads, half = head_dim / 2;
-    const auto e = queue_for(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> row(local, h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * heads) * local), sycl::range<1>(local)),
-                       [=](sycl::nd_item<1> it) {
-            const auto g = static_cast<int64_t>(it.get_group_linear_id());
-            const auto d = static_cast<int64_t>(it.get_local_linear_id());
-            const int64_t t = g / heads, hh = g - t * heads;
-            const bool isq = hh < q_heads;
-            const int64_t i = isq ? (t * q_heads + hh) * head_dim + d : (t * kv_heads + hh - q_heads) * head_dim + d;
-            const float val = isq ? q[i] : k[i];
-            const float ss = sycl::reduce_over_group(it.get_group(), val * val, sycl::plus<float>());
-            const float n = val / sycl::sqrt(ss / (float) head_dim + kEps) * (isq ? wq : wk)[d];
-            row[d] = n;
-            sycl::group_barrier(it.get_group());
-            const int64_t j = d < half ? d : d - half;
-            float pos = (float) t;
-            if (pos3 != nullptr)
-                pos = (float) (j % 3 == 1 && j < 3 * (int64_t) sec_h ? pos3[T + t]
-                               : j % 3 == 2 && j < 3 * (int64_t) sec_w ? pos3[2 * T + t] : pos3[t]);
-            const float ang = pos * sycl::pow(theta, -2.0f * (float) j / (float) head_dim);
-            const float c = sycl::cos(ang), s = sycl::sin(ang);
-            const float out = d < half ? n * c - row[d + half] * s : n * c + row[d - half] * s;
-            (isq ? q16 : k16)[i] = f16_from_f32(out);
-            if (!isq) v16[i] = f16_from_f32(v[i]);
-        });
-    });
-    finish(stream, e, "qi_text_qk_rope16");
-}
-
-void qi_attention_causal(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t q_heads,
-                         int64_t kv_heads, int64_t head_dim, float* out, void* stream) {
-    if (T <= 0) return;
-    if (head_dim != 128) throw std::invalid_argument("qi_attention_causal: head_dim 128");
-    constexpr int64_t D = 128, TILE = 128;
-    const int64_t qrow = q_heads * D, krow = kv_heads * D, group = q_heads / kv_heads;
-    const float scale = 1.f / sycl::sqrt((float) D);
-    const auto e = queue_for(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> qs(D, h), ps(TILE, h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * q_heads * D)), sycl::range<1>(D)),
-                       [=](sycl::nd_item<1> it) {
-            const auto g = static_cast<int64_t>(it.get_group_linear_id());
-            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-            const int64_t t = g / q_heads, hh = g - t * q_heads, kh = hh / group;
-            qs[lane] = f32_from_f16(q16[t * qrow + hh * D + lane]) * scale;
-            sycl::group_barrier(it.get_group());
-            const int64_t keys = t + 1;
-            float m = -INFINITY, l = 0.f, acc = 0.f;
-            for (int64_t j0 = 0; j0 < keys; j0 += TILE) {
-                const int64_t j = j0 + lane;
-                float s = -INFINITY;
-                if (j < keys) {
-                    const uint16_t* kr = k16 + j * krow + kh * D;
-                    s = 0.f;
-                    for (int64_t d = 0; d < D; ++d) s += qs[d] * f32_from_f16(kr[d]);
-                }
-                const float nm = sycl::fmax(m, sycl::reduce_over_group(it.get_group(), s, sycl::maximum<float>()));
-                const float p = j < keys ? sycl::exp(s - nm) : 0.f;
-                const float corr = sycl::exp(m - nm);
-                l = l * corr + sycl::reduce_over_group(it.get_group(), p, sycl::plus<float>());
-                ps[lane] = p;
-                sycl::group_barrier(it.get_group());
-                acc *= corr;
-                const int64_t n = sycl::min(TILE, keys - j0);
-                for (int64_t jj = 0; jj < n; ++jj) acc += ps[jj] * f32_from_f16(v16[(j0 + jj) * krow + kh * D + lane]);
-                sycl::group_barrier(it.get_group());
-                m = nm;
-            }
-            out[t * qrow + hh * D + lane] = acc / l;
-        });
-    });
-    finish(stream, e, "qi_attention_causal");
-}
-
-void qi_swiglu16(const float* gu, int64_t T, int64_t inter, uint16_t* h16, void* stream) {
-    if (T <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * inter)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / inter, c = i - t * inter;
-        const float g = gu[t * 2 * inter + c], u = gu[t * 2 * inter + inter + c];
-        h16[i] = f16_from_f32(u * g / (1.f + sycl::exp(-g)));
-    });
-    finish(stream, e, "qi_swiglu16");
-}
-
-void qi_quantize_q8(const uint16_t* x16, int64_t rows, int64_t cols, void* xq, void* stream) {
-    if (rows <= 0) return;
-    auto* x8 = static_cast<int8_t*>(xq);
-    auto* xs = reinterpret_cast<float*>(x8 + rows * cols);
-    const int64_t nb = cols / 32;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> i) {
-        const int64_t r = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
-        const uint16_t* xr = x16 + r * cols + b * 32;
-        float v[32], amax = 0.f;
-        for (int j = 0; j < 32; ++j) { v[j] = f32_from_f16(xr[j]); amax = sycl::fmax(amax, sycl::fabs(v[j])); }
-        const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
-        uint32_t p[8];
-        for (int j = 0; j < 8; ++j) {
-            uint32_t u = 0;
-            for (int k = 0; k < 4; ++k)
-                u |= (uint32_t) (uint8_t) (int8_t) (int) sycl::round(v[4 * j + k] * id) << (8 * k);
-            p[j] = u;
+    // the rows [T][heads][head_dim], their pairs (2j, 2j + 1)
+    struct Heads {
+        QkvIn in;
+        int64_t heads, hd;
+        auto head(int which, int64_t t, int64_t h) const {
+            // QkvIn::at's value, the row's pointers and scale taken once (the selects, not s[which]: see QkvIn)
+            const int64_t c0 = h * hd;
+            const float* p = (which == 0 ? in.q : which == 1 ? in.k : in.v) + t * heads * hd + c0;
+            const bool bf = in.i8 && (which == 0 ? in.s[0].bf : which == 1 ? in.s[1].bf : in.s[2].bf);
+            const bool i8 = in.i8 && !bf;
+            const float sxt = i8 ? (which == 0 ? in.s[0].sx : which == 1 ? in.s[1].sx : in.s[2].sx)[t] : 0.f;
+            const float* sw = i8 ? (which == 0 ? in.s[0].sw : which == 1 ? in.s[1].sw : in.s[2].sw) + c0 : nullptr;
+            // BF16 values at the same element offsets as the FP32 ones
+            const uint16_t* rb = bf ? reinterpret_cast<const uint16_t*>(
+                                          which == 0 ? in.q : which == 1 ? in.k : in.v) + t * heads * hd + c0
+                                    : nullptr;
+            return [=](int64_t d) {
+                return bf ? strata::kernels::f32_from_bf16(rb[d])
+                          : i8 ? (float) sycl::bit_cast<int32_t>(p[d]) * sxt * sw[d] : p[d];
+            };
         }
-        auto* o = reinterpret_cast<sycl::vec<uint32_t, 4>*>(x8 + r * cols + b * 32);
-        o[0] = sycl::vec<uint32_t, 4>{p[0], p[1], p[2], p[3]};
-        o[1] = sycl::vec<uint32_t, 4>{p[4], p[5], p[6], p[7]};
-        xs[r * nb + b] = d;
-    });
-    finish(stream, e, "qi_quantize_q8");
+    };
+    kernels::qk::Shape sh{T, heads, heads, head_dim};
+    sh.wq = wq;
+    sh.wk = wk;
+    sh.eps = kEps;
+    sh.neox = false;
+    finish(stream, kernels::qk::qk_norm_rope(queue_for(stream), sh, Heads{in, heads, head_dim},
+                                             kernels::qk::Tables{cos, sin, head_dim / 2},
+                                             kernels::qk::Rows16{q16, k16, v16, heads, heads, head_dim}),
+           "qi_qk_norm_rope16");
 }
 
-void qi_rows_i8(const uint16_t* src, bool bf16, int64_t rows, int64_t K, int8_t* q, float* s, const float* rs,
-                void* stream) {
-    rows_i8(I8From16{src, bf16, K}, rows, K, q, s, rs, stream);
-}
-
-void qi_swiglu_i8(const int32_t* gu, const QiI8& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream) {
-    rows_i8(I8FromSwiglu{gu, g.sx, g.sw, inter}, T, inter, q, s, nullptr, stream);
-}
-
-void qi_i8_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* sx, const float* sw, const float* bias,
-                 const float* col, void* stream) {
-    if (T <= 0 || N <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) T, (size_t) N), [=](sycl::id<2> i) {
-        float& v = y[(int64_t) i[0] * ldy + (int64_t) i[1]];
-        // without a DoRA's factors (col) the expression the product had before them, so its rounding stays the same
-        const int64_t n = (int64_t) i[1];
-        const float s = (float) sycl::bit_cast<int32_t>(v) * sx[i[0]];
-        v = col != nullptr ? s * sw[n] * col[n] + (bias != nullptr ? bias[n] : 0.f)
-                           : s * sw[n] + (bias != nullptr ? bias[n] : 0.f);
-    });
-    finish(stream, e, "qi_i8_scale");
+void qi_swiglu_i8(const int32_t* gu, const DitOut& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream) {
+    kernels::rows_i8_of(qi_rows::I8FromSwiglu{gu, g.sx, g.sw, inter, g.bf != nullptr}, T, inter, q, s, stream);
 }
 
 void qi_rows_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* col, void* stream) {
@@ -526,40 +196,6 @@ void qi_rows_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* col
         y[(int64_t) i[0] * ldy + (int64_t) i[1]] *= col[(int64_t) i[1]];
     });
     finish(stream, e, "qi_rows_scale");
-}
-
-void qi_to_f16(const float* x, int64_t n, uint16_t* y16, void* stream) {
-    if (n <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        y16[i] = f16_from_f32(x[i]);
-    });
-    finish(stream, e, "qi_to_f16");
-}
-
-void qi_rms_norm16(const float* x, const float* w, int64_t rows, int64_t C, uint16_t* y16, void* stream) {
-    if (rows <= 0) return;
-    constexpr size_t local = 256;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
-            const auto r = static_cast<int64_t>(it.get_group_linear_id());
-            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-            const float* xr = x + r * C;
-            float s = 0.f;
-            for (int64_t c = lane; c < C; c += local) s += xr[c] * xr[c];
-            const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) /
-                                               (float) C + kEps);
-            for (int64_t c = lane; c < C; c += local) y16[r * C + c] = f16_from_f32(xr[c] * inv * w[c]);
-        });
-    finish(stream, e, "qi_rms_norm16");
-}
-
-void qi_gelu16(const float* x, int64_t n, uint16_t* y16, void* stream) {
-    if (n <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        const float v = x[i];
-        y16[i] = f16_from_f32(0.5f * v * (1.f + sycl::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v))));
-    });
-    finish(stream, e, "qi_gelu16");
 }
 
 void qi_silu(float* x, int64_t n, uint16_t* y16, void* stream) {
@@ -592,24 +228,6 @@ void qi_tokens_latent(const float* tokens, int64_t C, int64_t HW, float* latent,
     finish(stream, e, "qi_tokens_latent");
 }
 
-void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream) {
-    if (n <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { x[i] += a * v[i]; });
-    finish(stream, e, "qi_axpy");
-}
-
-void qi_repeat_kv16(const uint16_t* src, int64_t T, int64_t q_heads, int64_t kv_heads, int64_t head_dim, uint16_t* out,
-                    void* stream) {
-    if (T <= 0) return;
-    const int64_t group = q_heads / kv_heads, row = q_heads * head_dim, kvrow = kv_heads * head_dim;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * row)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / row, c = i - t * row, h = c / head_dim, d = c - h * head_dim;
-        out[i] = src[t * kvrow + (h / group) * head_dim + d];
-    });
-    finish(stream, e, "qi_repeat_kv16");
-}
-
 void qi_inpaint_blend(float* x, const float* z0, const float* noise, const float* m, float s, int64_t C, int64_t HW,
                       void* stream, bool tokens) {
     if (C * HW <= 0) return;
@@ -630,84 +248,469 @@ void qi_noise_mix(float* x, const float* z0, const float* noise, float s, int64_
     finish(stream, e, "qi_noise_mix");
 }
 
-void qi_bias_add(float* y, const float* b, int64_t T, int64_t N, void* stream) {
-    if (T <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
+namespace {
+// KT and K known (the VAEs' 3 x 3: its divisions by constants), else 0 and kt, k read at run time.  CH is the
+// channels one work item moves: 8 where they and the row stride are both a multiple of 8 (one read and one write of
+// 8 channels), 1 where they are not (a 3-channel picture's patch embedding: SAM 3, BiRefNet, Florence-2).
+template <int KT, int K, int CH>
+sycl::event im2col_launch(sycl::queue& q, const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t C, int kt_,
+                          int k_, int s, int pad, int dil, int64_t OH, int64_t OW, int64_t p0, int64_t rows,
+                          uint16_t* col16, int64_t ldx) {
+    const int64_t kt = KT > 0 ? KT : kt_, k = K > 0 ? K : k_, kk2 = k * k, taps = kt * kk2, nc = C / CH;
+    return q.parallel_for(sycl::range<1>((size_t) (rows * taps * nc)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        y[i] += b[i % N];
-    });
-    finish(stream, e, "qi_bias_add");
-}
-
-void qi_layer_norm16(const float* x, const float* w, const float* b, int64_t T, int64_t C, float eps, uint16_t* y16,
-                     void* stream) {
-    if (T <= 0) return;
-    constexpr size_t L = 256;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) T * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
-            const auto t = static_cast<int64_t>(it.get_group_linear_id());
-            const auto l = static_cast<int64_t>(it.get_local_linear_id());
-            const float* r = x + t * C;
-            float s = 0.f, s2 = 0.f;
-            for (int64_t c = l; c < C; c += (int64_t) L) {
-                s += r[c];
-                s2 += r[c] * r[c];
-            }
-            s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
-            s2 = sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>());
-            const float mean = s / (float) C;
-            const float inv = 1.f / sycl::sqrt(sycl::fmax(s2 / (float) C - mean * mean, 0.f) + eps);
-            for (int64_t c = l; c < C; c += (int64_t) L) y16[t * C + c] = f16_from_f32((r[c] - mean) * inv * w[c] + b[c]);
-        });
-    finish(stream, e, "qi_layer_norm16");
-}
-
-void qi_gelu_erf16(const float* x, int64_t n, uint16_t* y16, void* stream) {
-    if (n <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        const float v = x[i];
-        y16[i] = f16_from_f32(0.5f * v * (1.f + sycl::erf(v * 0.70710678118654752f)));
-    });
-    finish(stream, e, "qi_gelu_erf16");
-}
-
-void qi_vit_qkv_rope16(const float* qkv, const int32_t* yx, int64_t T, int64_t heads, int64_t hd, float theta,
-                       float q_scale, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream) {
-    if (T <= 0) return;
-    constexpr int64_t D = 128;
-    const int64_t C = heads * hd, half = hd / 2, quarter = hd / 4;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * heads * D)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / (heads * D), h = (i / D) % heads, d = i % D;
-        const int64_t o = t * heads * D + h * D + d;
-        if (d >= hd) {
-            q16[o] = k16[o] = v16[o] = 0;
-            return;
+        const int64_t rk = i / nc, r = rk / taps, tap = rk - r * taps, c = (i - rk * nc) * CH;
+        const int64_t pq = p0 + r, ox = pq % OW, oyt = pq / OW, oy = oyt % OH, t = oyt / OH;
+        const int64_t kk = tap % kk2, tt = t + (kt == 3 ? (tap / kk2 - 1) * dil : 0);
+        const int64_t y = oy * s + (kk / k) * dil - pad, x = ox * s + (kk % k) * dil - pad;
+        const bool inside = tt >= 0 && tt < T && y >= 0 && y < H && x >= 0 && x < W;
+        if constexpr (CH == 1) {
+            col16[rk * C + c] = inside ? in16[((tt * H + y) * W + x) * ldx + c] : (uint16_t) 0;
+        } else {
+            using V = sycl::vec<uint16_t, 8>;
+            V v(0);
+            if (inside) v = *reinterpret_cast<const V*>(in16 + ((tt * H + y) * W + x) * ldx + c);
+            *reinterpret_cast<V*>(col16 + rk * C + c) = v;
         }
-        const float* row = qkv + t * 3 * C + h * hd;
-        const int64_t j = d < half ? d : d - half;              // the pair's frequency index
-        const float pos = (float) (j < quarter ? yx[2 * t] : yx[2 * t + 1]);
-        const int64_t f = j < quarter ? j : j - quarter;
-        const float ang = pos * sycl::pow(theta, -2.0f * (float) f / (float) half);
-        const float c = sycl::cos(ang), s = sycl::sin(ang);
-        auto rot = [&](const float* r) {
-            return d < half ? r[d] * c - r[d + half] * s : r[d] * c + r[d - half] * s;
-        };
-        q16[o] = f16_from_f32(rot(row) * q_scale);
-        k16[o] = f16_from_f32(rot(row + C));
-        v16[o] = f16_from_f32(row[2 * C + d]);
     });
-    finish(stream, e, "qi_vit_qkv_rope16");
+}
+}  // namespace
+
+void qi_im2col16(const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t C, int kt, int k, int s, int pad,
+                 int64_t OH, int64_t OW, int64_t p0, int64_t rows, uint16_t* col16, void* stream, int64_t ldx,
+                 int dil) {
+    if (rows <= 0 || C <= 0 || k <= 0) return;
+    if (ldx == 0) ldx = C;
+    if (ldx < C || (kt != 1 && kt != 3) || dil < 1) throw std::invalid_argument("qi_im2col16: ldx, kt or dil");
+    sycl::queue& q = queue_for(stream);
+    // Eight channels at a time wherever a pixel's channels and its row stride both take the aligned vectors: the
+    // engine's own tensors and the aux nets' maps (their channels padded to 8), which is every unfold but a picture's
+    // 3-channel patch embedding (SAM 3, BiRefNet, Florence-2), left one value at a time as it was
+    const bool wide = C % 8 == 0 && ldx % 8 == 0;
+    const sycl::event e =
+        !wide   ? im2col_launch<0, 0, 1>(q, in16, T, H, W, C, kt, k, s, pad, dil, OH, OW, p0, rows, col16, ldx)
+        : k != 3 ? im2col_launch<0, 0, 8>(q, in16, T, H, W, C, kt, k, s, pad, dil, OH, OW, p0, rows, col16, ldx)
+        : kt == 1 ? im2col_launch<1, 3, 8>(q, in16, T, H, W, C, kt, k, s, pad, dil, OH, OW, p0, rows, col16, ldx)
+                  : im2col_launch<3, 3, 8>(q, in16, T, H, W, C, kt, k, s, pad, dil, OH, OW, p0, rows, col16, ldx);
+    finish(stream, e, "qi_im2col16");
 }
 
-void qi_unpad_heads16(const uint16_t* in16, int64_t T, int64_t heads, int64_t hd, uint16_t* out16, void* stream) {
-    if (T <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * heads * hd)), [=](sycl::id<1> id) {
+void product_store(const ProductStore& p, void* stream) {
+    if (p.rows <= 0 || p.cols <= 0) return;
+    const int64_t is = p.in_stride ? p.in_stride : p.cols, os = p.out_stride ? p.out_stride : p.cols;
+    const auto calculate = [=](float v, int64_t c, uint16_t residual) {
+        if (p.bias) v += p.bias[c];
+        else if (p.add_zero) v += 0.f;
+        v = image_activate(p.act, v, p.slope);
+        if (p.residual) v += p.bf ? kernels::f32_from_bf16(residual) : f32_from_f16(residual);
+        return v;
+    };
+    // Vector loads need every row and offset aligned, including the optional second destination.
+    const auto aligned = [](const void* a, uintptr_t n) { return !a || reinterpret_cast<uintptr_t>(a) % n == 0; };
+    const bool vec = p.cols % 8 == 0 && is % 8 == 0 && os % 8 == 0 && p.offset % 8 == 0 &&
+        (!p.out2 || p.from2 % 8 == 0) && aligned(p.in, 32) && aligned(p.in16, 16) &&
+        aligned(p.residual, 16) && aligned(p.out16, 16) && aligned(p.out2, 16) && aligned(p.out, 32);
+    // Contiguous FP16 rows need neither per-element conversion through integer bits nor generic stride handling.
+    // Synchronized warm calls, before -> this path: 2304x4096 GELU 124 -> 53 us (RTX 4070),
+    // 576x8192 GELU 43 -> 36 us (B70). Both are 8-value paths; the scalar path remains for unaligned rows.
+    if (vec && p.in16 && p.out16 && !p.out && !p.out2 && !p.residual && !p.bf &&
+        is == p.cols && os == p.cols && p.offset == 0) {
+        using V = sycl::vec<sycl::half, 8>;
+        const auto in = p.in16; const auto out = p.out16; const auto bias = p.bias;
+        const auto cols = p.cols; const auto act = p.act; const auto slope = p.slope;
+        const bool add_zero = p.add_zero;
+        const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t)(p.rows * cols / 8)), [=](sycl::id<1> id) {
+            const int64_t i = (int64_t)id[0], c = (i % (cols / 8)) * 8;
+            const V x = reinterpret_cast<const V*>(in)[i];
+            V y;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float v = (float)x[j];
+                if (bias) v += bias[c + j]; else if (add_zero) v += 0.f;
+                y[j] = sycl::half(image_activate(act, v, slope));
+            }
+            reinterpret_cast<V*>(out)[i] = y;
+        });
+        finish(stream, e, "product_store");
+        return;
+    }
+    sycl::event e;
+    if (vec) {
+        e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (p.rows * p.cols / 8)), [=](sycl::id<1> id) {
+            const int64_t k = (int64_t) id[0] * 8, r = k / p.cols, c = k % p.cols;
+            sycl::vec<float, 8> x;
+            if (p.in) x = *reinterpret_cast<const sycl::vec<float, 8>*>(p.in + r * is + c);
+            else {
+                auto h = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(p.in16 + r * is + c);
+                for (int j = 0; j < 8; ++j) x[j] = f32_from_f16(h[j]);
+            }
+            sycl::vec<uint16_t, 8> res(0), out;
+            if (p.residual) res = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(p.residual + k);
+            for (int j = 0; j < 8; ++j) {
+                const float v = calculate(x[j], c + j, res[j]);
+                if (p.out) x[j] = v;
+                if (p.out16 || p.out2) out[j] = p.bf ? kernels::bf16_from_f32(v) : f16_from_f32(v);
+            }
+            if (p.out) *reinterpret_cast<sycl::vec<float, 8>*>(p.out + r * os + p.offset + c) = x;
+            if (p.out16) *reinterpret_cast<sycl::vec<uint16_t, 8>*>(p.out16 + r * os + p.offset + c) = out;
+            if (p.out2 && c >= p.from2) *reinterpret_cast<sycl::vec<uint16_t, 8>*>(p.out2 + r * (p.cols - p.from2) + c - p.from2) = out;
+        });
+    } else {
+        e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (p.rows * p.cols)), [=](sycl::id<1> id) {
+            const int64_t k = (int64_t) id[0], r = k / p.cols, c = k % p.cols;
+            float v = p.in ? p.in[r * is + c] : f32_from_f16(p.in16[r * is + c]);
+            v = calculate(v, c, p.residual ? p.residual[k] : uint16_t{0});
+            if (p.out) p.out[r * os + p.offset + c] = v;
+            const uint16_t h = p.bf ? kernels::bf16_from_f32(v) : f16_from_f32(v);
+            if (p.out16) p.out16[r * os + p.offset + c] = h;
+            if (p.out2 && c >= p.from2) p.out2[r * (p.cols - p.from2) + c - p.from2] = h;
+        });
+    }
+    finish(stream, e, "product_store");
+}
+
+void qi_conv_store16(const float* y, int64_t T, int64_t O, int64_t ldy, const float* bias, ImageAct act, float slope,
+                     const uint16_t* res, uint16_t* dst, int64_t ld, int64_t off, void* stream, uint16_t* dst2,
+                     int64_t from2) {
+    ProductStore p;
+    p.in = y; p.rows = T; p.cols = O; p.in_stride = ldy; p.bias = bias; p.act = act; p.slope = slope;
+    p.residual = res; p.out16 = dst; p.out_stride = ld; p.offset = off; p.out2 = dst2; p.from2 = from2;
+    product_store(p, stream);
+}
+
+namespace {
+template <class T>
+void up2x16(const T* x, int64_t H, int64_t W, int64_t C, uint16_t* out16, void* stream) {
+    if (H * W * C <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (4 * H * W * C)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / (heads * hd), r = i % (heads * hd), h = r / hd, d = r % hd;
-        out16[i] = in16[(t * heads + h) * 128 + d];
+        const int64_t p = i / C, c = i - p * C, Y = p / (2 * W), X = p - Y * 2 * W;
+        const T v = x[((Y / 2) * W + X / 2) * C + c];
+        if constexpr (std::is_same_v<T, float>) out16[i] = f16_from_f32(v);
+        else out16[i] = v;
     });
-    finish(stream, e, "qi_unpad_heads16");
+    finish(stream, e, "qi_up2x16");
+}
+}  // namespace
+
+void qi_up2x16(const float* x, int64_t H, int64_t W, int64_t C, uint16_t* out16, void* stream) {
+    up2x16(x, H, W, C, out16, stream);
+}
+
+void qi_up2x16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, uint16_t* out16, void* stream) {
+    up2x16(x16, H, W, C, out16, stream);
+}
+
+namespace {
+// GroupNorm statistics: a work-group a chunk and group, with at most kGnMaxChunk chunks per reducer.
+constexpr int64_t kGnChunk = 256;      // positions a chunk
+constexpr int64_t kGnMaxChunk = 256;   // chunks a reducer's work-group
+
+// a GroupNorm's input: FP32, or 16-bit (FP16 or BF16 bits) activations
+struct GnIn {
+    const void* p;
+    int kind;   // 0 FP32, 1 FP16, 2 BF16
+    float operator[](int64_t i) const {
+        if (kind == 0) return static_cast<const float*>(p)[i];
+        const uint16_t h = static_cast<const uint16_t*>(p)[i];
+        return kind == 1 ? f32_from_f16(h) : kernels::f32_from_bf16(h);
+    }
+};
+
+void group_part(GnIn x, const float* mean, int64_t P, int64_t C, int64_t groups, bool sq, float* part, void* stream) {
+    if (P <= 0) return;
+    const int64_t cg = C / groups, B = (P + kGnChunk - 1) / kGnChunk;
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) (B * groups * 32)), sycl::range<1>(32)), [=](sycl::nd_item<1> it) {
+            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+            const auto blk = static_cast<int64_t>(it.get_group_linear_id());
+            const int64_t b = blk / groups, g = blk - b * groups;
+            const int64_t p1 = std::min<int64_t>(P, (b + 1) * kGnChunk);
+            const float m = sq ? mean[g] : 0.f;
+            float a = 0.f, comp = 0.f;
+            for (int64_t p = b * kGnChunk + lane; p < p1; p += 32) {
+                const int64_t r = p * C + g * cg;
+                for (int64_t c = 0; c < cg; ++c) {
+                    const float d = x[r + c] - m;
+                    const float y = (sq ? d * d : d) - comp, t = a + y;
+                    comp = (t - a) - y;
+                    a = t;
+                }
+            }
+            a = sycl::reduce_over_group(it.get_group(), a, sycl::plus<float>());
+            if (lane == 0) part[blk] = a;
+        });
+    (void) e;
+}
+
+void group_stats(const float* part, int64_t B, int64_t P, int64_t CG, int64_t groups, float eps, bool sq,
+                               float* stats, float* mid, void* stream) {
+    const int64_t G = (B + kGnMaxChunk - 1) / kGnMaxChunk;
+    if (G > 1) {
+        const auto e = queue_for(stream).parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) (G * groups * 32)), sycl::range<1>(32)),
+            [=](sycl::nd_item<1> it) {
+                const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+                const auto blk = static_cast<int64_t>(it.get_group_linear_id());
+                const int64_t gi = blk / groups, g = blk - gi * groups;
+                const int64_t b1 = std::min<int64_t>(B, (gi + 1) * kGnMaxChunk);
+                float a = 0.f, comp = 0.f;
+                for (int64_t b = gi * kGnMaxChunk + lane; b < b1; b += 32) {
+                    const float y = part[b * groups + g] - comp, t = a + y;
+                    comp = (t - a) - y;
+                    a = t;
+                }
+                a = sycl::reduce_over_group(it.get_group(), a, sycl::plus<float>());
+                if (lane == 0) mid[gi * groups + g] = a;
+            });
+        (void) e;
+        queue_for(stream).wait();   // the last level reads every group's entry
+    }
+    // one work-item a group, serial Kahan over the (at most kGnMaxChunk) entries of its slice, or over the B chunk
+    // sums themselves when they fit one reducer
+    const int64_t MG = G > 1 ? G : B;
+    const float* src = G > 1 ? mid : part;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) groups), [=](sycl::id<1> id) {
+        const auto g = static_cast<int64_t>(id[0]);
+        float a = 0.f, comp = 0.f;
+        for (int64_t i = 0; i < MG; ++i) {
+            const float y = src[i * groups + g] - comp, t = a + y;
+            comp = (t - a) - y;
+            a = t;
+        }
+        const float n = (float) P * (float) CG;   // FP32 here too (no device FP64): the sums are Kahan-folded
+        stats[g] = sq ? 1.0f / sycl::sqrt(a / n + eps) : a / n;   // and a 1e-7 share of a ratio is far under the
+    });                                                          // FP16 floor the convolutions set
+    (void) e;
+}
+// The group norm's statistics in one pass over x: chunks of kGnChunk pixels, a work-group a chunk whose lanes read
+// whole rows of channels (a lane one channel, R rows at a time: C R lanes), each lane its values' mean and squared
+// deviations, merged within each group (Chan's): part[(k groups + g) 3 + 0, 1, 2] = the count, the mean
+// and the squared deviations of chunk k's group g.  (A work-group a chunk and group, reading its C / 32 channels of
+// each pixel, and a second pass for the squares took MOSS-Image's VAE 64 ms of its 170 ms decode on the B70.)
+int64_t gn_chunks(int64_t HW) { return (HW + kGnChunk - 1) / kGnChunk; }
+int64_t gn_rows(int64_t C) { return sycl::max<int64_t>(1, 256 / C); }
+
+void gn_partial(GnIn x, int64_t HW, int64_t C, int64_t groups, float* part, void* s) {
+    const int64_t cg = C / groups, nk = gn_chunks(HW), R = gn_rows(C), local = C * R;
+    queue_for(s).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> ln(sycl::range<1>((size_t) local), h), lm(sycl::range<1>((size_t) local), h),
+            lq(sycl::range<1>((size_t) local), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (nk * local)), sycl::range<1>((size_t) local)),
+                       [=](sycl::nd_item<1> it) {
+            const auto k = static_cast<int64_t>(it.get_group_linear_id());
+            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+            const int64_t r = lane / C, c = lane - r * C, p0 = k * kGnChunk, p1 = sycl::min(p0 + kGnChunk, HW);
+            // sums about the lane's first value (no division a value; the shift keeps them accurate in FP32)
+            const float k0 = p0 + r < p1 ? x[(p0 + r) * C + c] : 0.f;
+            float n = 0.f, s1 = 0.f, s2 = 0.f;
+            for (int64_t p = p0 + r; p < p1; p += R) {
+                const float d = x[p * C + c] - k0;
+                n += 1.f;
+                s1 += d;
+                s2 += d * d;
+            }
+            ln[lane] = n;
+            lm[lane] = n > 0.f ? k0 + s1 / n : 0.f;
+            lq[lane] = n > 0.f ? s2 - s1 * s1 / n : 0.f;
+            sycl::group_barrier(it.get_group());
+            if (lane < groups) {
+                float N = 0.f, M = 0.f, Q = 0.f;
+                for (int64_t rr = 0; rr < R; ++rr)
+                    for (int64_t j = 0; j < cg; ++j) {
+                        const int64_t e = rr * C + lane * cg + j;
+                        const float nb = ln[e];
+                        if (nb == 0.f) continue;
+                        const float t = N + nb, d = lm[e] - M;
+                        M += d * nb / t;
+                        Q += lq[e] + d * d * N * nb / t;
+                        N = t;
+                    }
+                float* o = part + (k * groups + lane) * 3;
+                o[0] = N;
+                o[1] = M;
+                o[2] = Q;
+            }
+        });
+    });
+}
+
+// stats[2 g] = group g's mean over every pixel, stats[2 g + 1] = 1 / its std, gn_partial's chunks merged (Chan's): a
+// work-group a group, each lane a stride of the chunks, then the lanes in a tree
+void gn_stats(const float* part, int64_t HW, int64_t C, int64_t groups, float eps, float* mean, float* inv, void* s) {
+    (void) C;
+    constexpr int64_t local = 256;
+    const int64_t nk = gn_chunks(HW);
+    queue_for(s).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> ln(sycl::range<1>((size_t) local), h), lm(sycl::range<1>((size_t) local), h),
+            lq(sycl::range<1>((size_t) local), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (groups * local)), sycl::range<1>((size_t) local)),
+                       [=](sycl::nd_item<1> it) {
+            const auto g = static_cast<int64_t>(it.get_group_linear_id());
+            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+            const auto merge = [](float& N, float& M, float& Q, float nb, float mb, float qb) {
+                if (nb == 0.f) return;
+                const float t = N + nb, d = mb - M;
+                M += d * nb / t;
+                Q += qb + d * d * N * nb / t;
+                N = t;
+            };
+            float N = 0.f, M = 0.f, Q = 0.f;
+            for (int64_t k = lane; k < nk; k += local) {
+                const float* e = part + (k * groups + g) * 3;
+                merge(N, M, Q, e[0], e[1], e[2]);
+            }
+            ln[lane] = N;
+            lm[lane] = M;
+            lq[lane] = Q;
+            for (int64_t half = local / 2; half > 0; half /= 2) {
+                sycl::group_barrier(it.get_group());
+                if (lane < half) {
+                    merge(N, M, Q, ln[lane + half], lm[lane + half], lq[lane + half]);
+                    ln[lane] = N;
+                    lm[lane] = M;
+                    lq[lane] = Q;
+                }
+            }
+            if (lane == 0) {
+                mean[g] = M;
+                inv[g] = 1.f / sycl::sqrt(Q / N + eps);
+            }
+        });
+    });
+}
+
+}  // namespace
+
+int64_t qi_group_norm_ws_floats(int64_t P, int64_t groups) {
+    const int64_t B = (P + kGnChunk - 1) / kGnChunk, G = (B + kGnMaxChunk - 1) / kGnMaxChunk;
+    return 2 * groups + std::max((B + G) * groups, B * groups * 3);   // the two passes' sums, or the one's
+}
+
+namespace {
+
+void group_norm16(GnIn x, int64_t P, int64_t C, int64_t groups, const float* w, const float* b, float eps, ImageAct act, float* y, uint16_t* y16,
+                  float* ws, void* stream, const float* scale, const float* shift, uint16_t* lo16) {
+    if (P <= 0) return;
+    if (groups <= 0 || C <= 0 || C % groups != 0 || (!y && !y16)) throw std::invalid_argument("qi_group_norm16: C");
+    float* mean = ws, *inv = ws + groups, *part = ws + 2 * groups;
+    const int64_t B = (P + kGnChunk - 1) / kGnChunk, CG = C / groups;
+    // One pass where a pixel's channels fit a work-group's lanes (the VAEs' up to 1,024: the two passes took
+    // MOSS-Image's VAE 64 ms of its 170 ms decode on the B70), two (a mean, then the squares) past them (HunyuanImage
+    // 3.0's entry and exit, 4,096 channels)
+    static core::PerDevice<size_t> max_wg;
+    sycl::queue& q = queue_for(stream);
+    const size_t wg = max_wg.get(q.get_device(),
+                                 [&q] { return q.get_device().get_info<sycl::info::device::max_work_group_size>(); });
+    if ((size_t) (C * gn_rows(C)) <= wg) {
+        gn_partial(x, P, C, groups, part, stream);
+        gn_stats(part, P, C, groups, eps, mean, inv, stream);
+    } else {
+        float* mid = part + B * groups;
+        group_part(x, nullptr, P, C, groups, false, part, stream);
+        group_stats(part, B, P, CG, groups, eps, false, mean, mid, stream);
+        group_part(x, mean, P, C, groups, true, part, stream);
+        group_stats(part, B, P, CG, groups, eps, true, inv, mid, stream);
+    }
+    if (C % 8 != 0) {
+        const auto e = q.parallel_for(sycl::range<1>((size_t) (P * C)), [=](sycl::id<1> id) {
+            const int64_t i = static_cast<int64_t>(id[0]), c = i % C, g = c / CG;
+            float v = (x[i] - mean[g]) * inv[g];
+            if (w != nullptr) v = v * w[c] + b[c];
+            if (scale != nullptr) v = v * (1.f + scale[c]) + shift[c];
+            v = image_activate(act, v);
+            if (y != nullptr) y[i] = v;
+            const uint16_t h = f16_from_f32(v);
+            if (y16 != nullptr) y16[i] = h;
+            if (lo16 != nullptr) lo16[i] = f16_from_f32(v - f32_from_f16(h));
+        });
+        finish(stream, e, "qi_group_norm16");
+        return;
+    }
+    // 8 values a work-item, in one load and one store: a value each took 30 ms of MOSS-Image's decode on the B70
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (P * C / 8)), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]) * 8, c0 = i % C;
+        sycl::vec<float, 8> xv;
+        if (x.kind == 0) {
+            xv = *reinterpret_cast<const sycl::vec<float, 8>*>(static_cast<const float*>(x.p) + i);
+        } else {
+            const sycl::vec<uint16_t, 8> hv = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(
+                static_cast<const uint16_t*>(x.p) + i);
+            for (int j = 0; j < 8; ++j) xv[j] = x.kind == 1 ? f32_from_f16(hv[j]) : kernels::f32_from_bf16(hv[j]);
+        }
+        sycl::vec<uint16_t, 8> o, lo;
+        for (int j = 0; j < 8; ++j) {
+            const int64_t c = c0 + j, g = c / CG;
+            float v = (xv[j] - mean[g]) * inv[g];
+            if (w != nullptr) v = v * w[c] + b[c];
+            if (scale != nullptr) v = v * (1.f + scale[c]) + shift[c];
+            v = image_activate(act, v);
+            if (y != nullptr) y[i + j] = v;
+            o[j] = f16_from_f32(v);
+            lo[j] = f16_from_f32(v - f32_from_f16(o[j]));
+        }
+        if (y16 != nullptr) *reinterpret_cast<sycl::vec<uint16_t, 8>*>(y16 + i) = o;
+        if (lo16 != nullptr) *reinterpret_cast<sycl::vec<uint16_t, 8>*>(lo16 + i) = lo;
+    });
+    finish(stream, e, "qi_group_norm16");
+}
+
+}  // namespace
+
+void qi_group_norm16(const float* x, int64_t P, int64_t C, const float* w, const float* b, float eps, bool silu,
+                     uint16_t* y16, float* ws, void* stream, const float* scale, const float* shift, uint16_t* lo16, int64_t groups) {
+    group_norm16(GnIn{x, 0}, P, C, groups, w, b, eps, silu ? ImageAct::silu : ImageAct::none, nullptr, y16, ws, stream, scale, shift, lo16);
+}
+
+void qi_group_norm16(const uint16_t* x16, bool bf16, int64_t P, int64_t C, const float* w, const float* b, float eps,
+                     bool silu, uint16_t* y16, float* ws, void* stream, int64_t groups) {
+    group_norm16(GnIn{x16, bf16 ? 2 : 1}, P, C, groups, w, b, eps, silu ? ImageAct::silu : ImageAct::none, nullptr, y16, ws, stream, nullptr, nullptr, nullptr);
+}
+void image_group_norm(const float* x, const uint16_t* x16, int64_t P, int64_t C, int64_t groups, const float* w,
+                      const float* b, float eps, ImageAct act, float* y, uint16_t* y16, float* ws, void* stream) {
+    if ((x == nullptr) == (x16 == nullptr) || (w == nullptr) != (b == nullptr)) throw std::invalid_argument("image_group_norm: input or affine");
+    group_norm16(GnIn{x ? static_cast<const void*>(x) : static_cast<const void*>(x16), x ? 0 : 1}, P, C, groups,
+                 w, b, eps, act, y, y16, ws, stream, nullptr, nullptr, nullptr);
+}
+
+
+void qi_softmax16(const float* sc, int64_t rows, int64_t n, float scale, uint16_t* p16, void* stream, int64_t ld) {
+    if (rows <= 0) return;
+    if (ld == 0) ld = n;
+    sycl::queue& q = queue_for(stream);
+    // one pass's lanes over a row: the sub-group's own sums (no local memory, no barrier) where a row is short, a
+    // work-group's where it is long enough to need more lanes
+    auto row_softmax = [=](auto& grp, int64_t r, int64_t lane, int64_t lanes) {
+        const float* row = sc + r * ld;
+        float m = -INFINITY;
+        for (int64_t j = lane; j < n; j += lanes) m = sycl::fmax(m, row[j] * scale);
+        m = sycl::reduce_over_group(grp, m, sycl::maximum<float>());
+        float sum = 0.f;
+        for (int64_t j = lane; j < n; j += lanes) sum += sycl::exp(row[j] * scale - m);
+        const float inv = 1.f / sycl::reduce_over_group(grp, sum, sycl::plus<float>());
+        for (int64_t j = lane; j < ld; j += lanes)
+            p16[r * ld + j] = j < n ? f16_from_f32(sycl::exp(row[j] * scale - m) * inv) : (uint16_t) 0;
+    };
+    sycl::event e;
+    if (n <= 1024) {
+        constexpr int64_t SG = 32, ROWS = 8;
+        e = q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((rows + ROWS - 1) / ROWS * ROWS * SG)),
+                                             sycl::range<1>((size_t) (ROWS * SG))),
+                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            auto sg = it.get_sub_group();
+            const int64_t r = (int64_t) it.get_group_linear_id() * ROWS + (int64_t) sg.get_group_linear_id();
+            if (r >= rows) return;   // the whole sub-group
+            row_softmax(sg, r, (int64_t) sg.get_local_linear_id(), SG);
+        });
+    } else {
+        constexpr size_t local = 256;
+        e = q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)),
+                           [=](sycl::nd_item<1> it) {
+            auto g = it.get_group();
+            row_softmax(g, (int64_t) it.get_group_linear_id(), (int64_t) it.get_local_linear_id(), (int64_t) local);
+        });
+    }
+    finish(stream, e, "qi_softmax16");
 }
 
 }  // namespace strata::image

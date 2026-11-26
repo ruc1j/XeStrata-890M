@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/xe/iq_kernels.cpp - see include/strata/kernels/iq_kernels.hpp; the Xe port of Strata's src/kernels/cuda/iq_kernels.cu.
 //
@@ -32,20 +33,29 @@
 // SOFTWARE.
 //
 #include "strata/kernels/canon_math.hpp"
+#include "hadamard_device.hpp"
+#include "bih3.hpp"
+#include "strata/kernels/exact.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "xe_shuffle.hpp"
+#include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/matrix_report.hpp"
+#include "strata/kernels/nvfp4.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "strata/core/runtime.hpp"
+#include "amd_wmma.hpp"
 #include "cuda_intrinsics.hpp"
 #include "device_target.hpp"
 #include "iq_bits.hpp"
-#include "q8_1_finite.hpp"
 #include "q8_1_rows_item.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "sm70_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_iq_kernels
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL
@@ -56,7 +66,11 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -64,6 +78,7 @@
 #include <string>
 #include <tuple>
 #include <type_traits>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
@@ -144,6 +159,10 @@ template<> struct Split<42> {   // Q2_0
     static constexpr bool kParts = true;
     // the calls in a row that share one activation scale (their integer sums add before the scale)
     static constexpr int kGroup = 1;
+    // the fixed-point sums (seg_dot_canon_fx): K 1, the block's d, the activation scale a call reads
+    static constexpr int kFxLog2 = 0;
+    static float block_d(const void* blk) { return (float) static_cast<const block_q2_0*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int iqs) { return low_half(bq8_1[iqs].ds); }
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
         float c;
         int s;
@@ -187,6 +206,10 @@ template<> struct Split<16> {   // IQ2_XXS
     static constexpr bool kParts = true;
     // the calls in a row that share one activation scale (their integer sums add before the scale)
     static constexpr int kGroup = 8;
+    // the fixed-point sums (Split<18>'s): the 1/8, the block's d, the activation scale a call reads
+    static constexpr int kFxLog2 = -3;
+    static float block_d(const void* blk) { return (float) static_cast<const block_iq2_xxs*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int iqs) { return low_half(bq8_1[iqs / 2].ds); }
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
         float c;
         int s;
@@ -221,6 +244,11 @@ template<> struct Split<18> {   // IQ3_XXS
     static constexpr bool kParts = true;
     // the calls in a row that share one activation scale (their integer sums add before the scale)
     static constexpr int kGroup = 8;
+    // the fixed-point sums (canon_math.hpp's fx_*, seg_dot_canon_fx): log2 of the (2 ls + 1) / 4's 1/4, the block's d
+    // and the activation scale a call's parts read
+    static constexpr int kFxLog2 = -2;
+    static float block_d(const void* blk) { return (float) static_cast<const block_iq3_xxs*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int iqs) { return low_half(bq8_1[iqs / 2].ds); }
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
         float c;
         int s;
@@ -259,6 +287,10 @@ template<> struct Split<21> {   // IQ3_S
     static constexpr bool kParts = true;
     // the calls in a row that share one activation scale (their integer sums add before the scale)
     static constexpr int kGroup = 8;
+    // the fixed-point sums (Split<18>'s): K 1, the block's d, the activation scale a call reads
+    static constexpr int kFxLog2 = 0;
+    static float block_d(const void* blk) { return (float) static_cast<const block_iq3_s*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int iqs) { return low_half(bq8_1[iqs / 2].ds); }
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
         float c;
         int s;
@@ -298,6 +330,10 @@ template<> struct Split<17> {   // IQ2_XS
         return r;
     }
     static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) { parts_ls2(r, bq8_1, iqs, c, s); }
+    // the fixed-point sums (seg_dot_canon_fx): the 1/8, the block's d, the activation scale a call reads
+    static constexpr int kFxLog2 = -3;
+    static float block_d(const void* blk) { return (float) static_cast<const block_iq2_xs*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int iqs) { return low_half(bq8_1[iqs / 2].ds); }
     // the products' order an expert's row takes on every device and on the CPU (canon_math.hpp, seg_dot_multi)
     static constexpr bool kParts = true;
     // the calls in a row that share one activation scale (their integer sums add before the scale)
@@ -331,6 +367,10 @@ template<> struct Split<22> {   // IQ2_S
         return r;
     }
     static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) { parts_ls2(r, bq8_1, iqs, c, s); }
+    // the fixed-point sums (seg_dot_canon_fx): the 1/8, the block's d, the activation scale a call reads
+    static constexpr int kFxLog2 = -3;
+    static float block_d(const void* blk) { return (float) static_cast<const block_iq2_s*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int iqs) { return low_half(bq8_1[iqs / 2].ds); }
     // the products' order an expert's row takes on every device and on the CPU (canon_math.hpp, seg_dot_multi)
     static constexpr bool kParts = true;
     // the calls in a row that share one activation scale (their integer sums add before the scale)
@@ -432,6 +472,10 @@ template<> struct Split<20> {   // IQ4_NL
     // block's two calls have the same scale, so a call is a lane's own fma and no lanes exchange sums (the CPU's rows
     // add the 8 lanes as cheaply)
     static constexpr int kGroup = 1;
+    // the fixed-point sums (seg_dot_canon_fx; a down row: a scale for each 32): K 1, the block's d, its activation's
+    static constexpr int kFxLog2 = 0;
+    static float block_d(const void* blk) { return (float) static_cast<const block_iq4_nl*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int) { return low_half(bq8_1->ds); }
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
         float c;
         int s;
@@ -801,6 +845,39 @@ template<> struct Split<10> {
     }
 };
 template<> struct Split<11> : WholeDot<vec_dot_q3_K_q8_1> {};   // Q3_K
+// NVFP4 (Edge0's latent experts; nvfp4.hpp): a call is 32 values, two 16-value sub-blocks of one scale each, against
+// one q8_1 block (iqs 0 or 4: the block's first or second half; `bq8_1` the block's first q8_1 block).  A sub-block's
+// ints iqs0 and iqs0 + 1 hold its values 0-3 | 8-11 and 4-7 | 12-15 (low | high nibbles), which meet the q8_1
+// block's ints 4 i + {0, 2} and {1, 3}.  ggml-cuda's vec_dot_nvfp4_q8_1 through upstream's Split<40>: the weights
+// decoded once a call, the same sums in the same order.
+template<> struct Split<40> {
+    struct W { Int2 v0[2], v1[2]; float sc[2]; };
+    static W load(const void* vbq, int kbx, int iqs) {
+        const block_nvfp4* bq4 = (const block_nvfp4*) vbq + kbx;
+        W r{};
+        for (int i = 0; i < 2; ++i) {
+            const int iqs0 = iqs + 2 * i;
+            r.v0[i] = get_int_from_table_16(get_int_b4(bq4->qs, iqs0), kvalues_fp4);
+            r.v1[i] = get_int_from_table_16(get_int_b4(bq4->qs, iqs0 + 1), kvalues_fp4);
+            r.sc[i] = nvfp4::ue4m3_half(bq4->d[iqs0 >> 1]);
+        }
+        return r;
+    }
+    static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
+        const block_q8_1* bq8 = bq8_1 + (iqs >> 2);
+        const float d8 = low_half(bq8->ds);
+        float sum = 0.0f;
+        for (int i = 0; i < 2; ++i) {
+            const int* q8 = (const int*) bq8->qs + (ptrdiff_t) 4 * i;   // the sub-block's 16 activation values
+            int sumi = dp4a(r.v0[i].x, q8[0], 0);
+            sumi = dp4a(r.v0[i].y, q8[2], sumi);
+            sumi = dp4a(r.v1[i].x, q8[1], sumi);
+            sumi = dp4a(r.v1[i].y, q8[3], sumi);
+            sum += r.sc[i] * d8 * (float) sumi;
+        }
+        return sum;
+    }
+};
 
 // ---------------------------------------------------------------- the formats
 // bsz = bytes per block, qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
@@ -856,7 +933,7 @@ inline void tq_states4(const uint8_t* qs, int t0, uint32_t s[4]) {
         const int off3 = (TqInfo<TY>::NS - 4 - t0) * K, wb = off3 >> 4, r = off3 & 15;
         const int wi1 = wb + 1 >= nwords ? wb + 1 - nwords : wb + 1;
         const int wi2 = wb + 2 >= nwords ? wb + 2 - nwords : wb + 2;
-        uint64_t v = (uint64_t) qs16[wb] | ((uint64_t) qs16[wi1] << 16) | ((uint64_t) qs16[wi2] << 32);
+        uint64_t v = (uint64_t) qs16[wb] | ((uint64_t) qs16[wi1] << 16) | ((uint64_t) qs16[wi2] << 32);  // NOLINT(clang-analyzer-security.ArrayBound): wb + 1 >= nwords implies wb + 2 >= nwords, which the analyzer takes apart
         if constexpr (tq_window_words<TY>() > 3) {
             const int wi3 = wb + 3 >= nwords ? wb + 3 - nwords : wb + 3;
             v |= (uint64_t) qs16[wi3] << 48;
@@ -892,7 +969,7 @@ template<int TY> struct SplitTq {
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
         const int l = iqs / 4;
         const block_q8_1* b8 = bq8_1 + l / 2;
-        const int* q8 = (const int*) b8->qs + 4 * (l & 1);
+        const int* q8 = (const int*) b8->qs + (size_t) 4 * (l & 1);
         int sumi = 0;
         for (int i = 0; i < 4; ++i) sumi = dp4a(r.q[i], q8[i], sumi);
         return r.d * (low_half(b8->ds) * TQ_LUT_I8_SCALE) * (float) sumi;
@@ -940,6 +1017,7 @@ template<> struct Fmt<148> : FmtOf<148, (int) sizeof(block_tqp6), 128, 8, 4> {};
 template<> struct Fmt<149> : FmtOf<149, (int) sizeof(block_tqp7), 128, 8, 4> {};
 template<> struct Fmt<10> : FmtOf<10, (int) sizeof(block_q2_K), 256, QI2_K / 2, 2> {};   // two words a call
 template<> struct Fmt<11> : FmtOf<11, (int) sizeof(block_q3_K), 256, QI3_K / VDR_Q3_K, VDR_Q3_K> {};
+template<> struct Fmt<40> : FmtOf<40, (int) sizeof(block_nvfp4), 64, 2, 4> {};   // NVFP4: two calls of 32 values
 
 // A grid format's codebook, for a work-group's copy in local memory (the Volta experts below): its word, its length
 // and the global table.  N = 0: no codebook (IQ4_XS's 16 values stay where they are).
@@ -952,10 +1030,6 @@ template<> struct GridOf<22> { using T = uint64_t; static constexpr int N = 1024
 // CUDA's __shfl_xor butterfly, in the same order, so a row's sum does not depend on the backend's reduction tree.
 inline float warp_sum(const sycl::sub_group& sg, float v) {
     for (int o = 16; o > 0; o >>= 1) v += strata_shfl_xor(sg, v, o);
-    return v;
-}
-inline float warp_max(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(v, strata_shfl_xor(sg, v, o));
     return v;
 }
 
@@ -1062,12 +1136,117 @@ inline void seg_dot_canon(const sycl::sub_group& sg, const uint8_t* row, const b
     }
 }
 
+// A format with kFxLog2 (the gate/up's i-quants, IQ4_NL's down): seg_dot_canon's calls and integer butterflies, each
+// group's sum times its block's integer scale (canon_math.hpp's fx_scale) added in int64 and the lanes' sums by an
+// int64 butterfly - exact, so in any order: the CPU's rows (iq_avx2_rows.inl's row_dot_canon_fx) and the prompt's
+// products (iq_mmq.cpp's FX bodies) give the same bits.  The row's top: the largest exponent of its blocks' d's, read
+// by the segment's lanes, plus each activation's (the scale of each 256, in its first q8_1 block).
+template<class S, class = void> struct HasFx : std::false_type {};
+template<class S> struct HasFx<S, std::void_t<decltype(S::kFxLog2)>> : std::true_type {};
+
+// The row's weights' part of its top, canon_math.hpp's fx_row_top, read whole: every block's d by the segment's lanes
+// (the rare row with a d past its first block's span, fx_first_top's redo)
+template<int TY, int LPR>
+inline int fx_row_top(const sycl::sub_group& sg, const uint8_t* row, int nb, int seg_lane) {
+    using F = Fmt<TY>;
+    int top = canon::kFxNone;
+    for (int b = seg_lane; b < nb; b += LPR) top = sycl::max(top, canon::fx_exp(F::S::block_d(block_at<F>(row, b))));
+    for (int o = LPR / 2; o > 0; o >>= 1) top = sycl::max(top, sycl::permute_group_by_xor(sg, top, o));
+    return nb > 0 ? canon::fx_row_top(canon::fx_exp(F::S::block_d(block_at<F>(row, 0))), top) : top;
+}
+// The same where no block's d is past its first block's span (fx_row_top's usual case): the first block's d alone.
+// Its sums then flag a block past it (its exponent above the top), and the row is done again with fx_row_top.
+template<int TY>
+inline int fx_first_top(const uint8_t* row, int nb) {
+    using F = Fmt<TY>;
+    return nb > 0 ? canon::fx_exp(F::S::block_d(block_at<F>(row, 0))) + canon::kFxRowSpan : canon::kFxNone;
+}
+// an activation of nb_all of TY's blocks; S256: its scale is one for each 256 values (each 8th q8_1 block read), else
+// one for each 32
+template<int TY, int LPR, bool S256>
+inline int fx_act_top(const sycl::sub_group& sg, const block_q8_1* x, int nb_all, int seg_lane) {
+    constexpr int step = S256 ? 8 : 1;
+    const int n32 = nb_all * (Fmt<TY>::qk / 32);
+    int top = canon::kFxNone;
+    for (int b = seg_lane * step; b < n32; b += LPR * step)
+        top = sycl::max(top, canon::fx_exp(low_half(x[b].ds)));
+    for (int o = LPR / 2; o > 0; o >>= 1) top = sycl::max(top, sycl::permute_group_by_xor(sg, top, o));
+    return canon::fx_row_top(canon::fx_exp(low_half(x[0].ds)), top);   // the activation's part, as the weights'
+}
+// The activation's part where no scale is past its first block's span (fx_first_top's, for the activation)
+inline int fx_act_first_top(const block_q8_1* x) { return canon::fx_exp(low_half(x[0].ds)) + canon::kFxRowSpan; }
+
+template<int TY, int LPR, int NE, class G, bool S256>
+inline void seg_dot_canon_fx(const sycl::sub_group& sg, const uint8_t* row, const block_q8_1* const (&x)[NE], int n,
+                             int nb, int nb_all, int seg_lane, float (&out)[NE], const G* grid) {
+    using F = Fmt<TY>;
+    constexpr int KG = F::S::kGroup;
+    static_assert(LPR % KG == 0 && (KG & (KG - 1)) == 0, "a group's calls on neighbouring lanes of one segment");
+    int ta[NE];
+    for (int e = 0; e < NE; ++e) ta[e] = e < n ? fx_act_first_top(x[e]) : canon::kFxNone;
+    int top[NE];
+    int64_t s[NE];
+    // the sums at the weights' top topw and the activations' ta; `over`: a block's d or scale past them (the first
+    // blocks' spans: a redo with the whole tops)
+    const auto sums = [&](int topw, bool& over) {
+        for (int e = 0; e < NE; ++e) {
+            s[e] = 0;
+            top[e] = ta[e] + topw;
+        }
+        const int total = nb_all * F::ipb, mine = nb * F::ipb;
+        for (int k0 = 0; k0 < total; k0 += LPR) {
+            const int k = k0 + seg_lane;
+            const bool on = k < mine;
+            const int kk = on ? k : 0, kbx = kk / F::ipb, iqs = F::step * (kk % F::ipb);
+            const auto wd = [&] {
+                if constexpr (std::is_void_v<G>) return F::S::load(block_at<F>(row, kbx), 0, iqs);
+                else return F::S::load(block_at<F>(row, kbx), 0, iqs, grid);
+            }();
+            const canon::FxPart wp = canon::fx_part(wd.d);
+            over = over || (on && wp.e > topw);
+            const uint32_t xo32 = (uint32_t) kbx * (uint32_t) (F::qk / 32);   // in 32 bits (block_at)
+            const size_t xo = xo32;
+            for (int e = 0; e < NE; ++e)
+                if (e < n) {   // n is the whole sub-group's: the butterflies stay uniform
+                    float c = 0.0f;
+                    int t = 0;
+                    if (on) F::S::parts(wd, x[e] + xo, iqs, c, t);
+                    for (int o = KG / 2; o > 0; o >>= 1) t += sycl::permute_group_by_xor(sg, t, o);
+                    const canon::FxPart ap = canon::fx_part(F::S::act_d(x[e] + xo, iqs));
+                    over = over || (on && ap.e > ta[e]);
+                    if (on) s[e] += (int64_t) canon::fx_scale(ap, wp, top[e]) * t;
+                }
+        }
+    };
+    bool over = false;
+    sums(fx_first_top<TY>(row, nb), over);
+    if (sycl::any_of_group(sg, over)) {   // the whole sub-group again, each row at its whole tops
+        for (int e = 0; e < NE; ++e)
+            if (e < n) ta[e] = fx_act_top<TY, LPR, S256>(sg, x[e], nb_all, seg_lane);
+        bool again = false;
+        sums(fx_row_top<TY, LPR>(sg, row, nb, seg_lane), again);
+    }
+    for (int e = 0; e < NE; ++e) {
+        for (int o = LPR / 2; o >= KG; o >>= 1) s[e] += sycl::permute_group_by_xor(sg, s[e], o);
+        out[e] = canon::fx_value(s[e], top[e], F::S::kFxLog2);
+    }
+}
+
 // S256: the activation's scale is one for each 256 values (the gate/up rows' x, quantize_q8_1_rows); a down row's h
 // has one for each 32, where a format's calls of a block (kGroup > 1) do not share it: the plain loop
+// fx: the fixed-point sums (exact.hpp) for a format that has them, the same on every lane of the launch
+// XeStrata-890M: not on the APU rows, which are not the canonical ones (native_expert_canon_rows; STRATA_GPU_CANON=1
+// gives an integrated GPU the canonical rows, and with them these sums): the int64 body would set the VGPR budget of
+// every APU decode kernel even with XESTRATA_EXACT off
 template<int TY, int LPR, int NE, bool APU = false, class G = void, bool S256 = true>
 inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const block_q8_1* const (&x)[NE], int n,
-                          int nb, int nb_all, int seg_lane, float (&out)[NE], const G* grid = nullptr) {
+                          int nb, int nb_all, int seg_lane, float (&out)[NE], bool fx, const G* grid = nullptr) {
     using F = Fmt<TY>;
+    if constexpr (!APU && HasFx<typename F::S>::value && (S256 || group_of<typename F::S>() == 1))
+        if (fx) {
+            seg_dot_canon_fx<TY, LPR, NE, G, S256>(sg, row, x, n, nb, nb_all, seg_lane, out, grid);
+            return;
+        }
     if constexpr (!APU && HasParts<typename F::S>::value && (S256 || group_of<typename F::S>() == 1)) {
         seg_dot_canon<TY, LPR, NE, G>(sg, row, x, n, nb, nb_all, seg_lane, out, grid);
         return;
@@ -1283,7 +1462,7 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
 #pragma unroll
         for (int u = 0; u < U; ++u) {
             const int ku = k + u * LPR, kbx = ku / F::ipb, iqs = F::step * (ku % F::ipb);
-            const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+            const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));  // NOLINT(bugprone-misplaced-widening-cast): a 32-bit product on purpose, kbx < nb
             for (int e = 0; e < NE; ++e)
                 if (e < n) s[e] += F::S::apply(wd[u], x[e] + xo, iqs);
         }
@@ -1291,7 +1470,7 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
     for (; k < K; k += LPR) {
         const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
         const auto wd = load_at(k);
-        const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+        const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));  // NOLINT(bugprone-misplaced-widening-cast): a 32-bit product on purpose, kbx < nb
         for (int e = 0; e < NE; ++e)
             if (e < n) s[e] += F::S::apply(wd, x[e] + xo, iqs);
     }
@@ -1315,7 +1494,7 @@ inline void row_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
     for (int k = lane; k < nb * F::ipb; k += kWarp) {
         const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
         const auto wd = F::S::load(block_at<F>(row, kbx), 0, iqs);
-        const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+        const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));  // NOLINT(bugprone-misplaced-widening-cast): a 32-bit product on purpose, kbx < nb
         for (int c = 0; c < NC; ++c) s[c] += F::S::apply(wd, x + (size_t) c * xstride + xo, iqs);
     }
     for (int c = 0; c < NC; ++c) out[c] = warp_sum(sg, s[c]);
@@ -1325,7 +1504,7 @@ template<int TY, int NC>
 sycl::event launch_mmvq_n(sycl::queue& q, const uint8_t* w, size_t row_bytes, const block_q8_1* x, float* y, int n_in,
                           int n_out) {
     const size_t groups = (size_t) ((n_out + 3) / 4);
-    return q.parallel_for(sycl::nd_range<1>(groups * 4 * kWarp, 4 * kWarp),
+    return q.parallel_for(sycl::nd_range<1>(groups * 4 * kWarp, (size_t) 4 * kWarp),
                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int row = (int) it.get_group(0) * 4 + (int) sg.get_group_linear_id();
@@ -1340,7 +1519,7 @@ sycl::event launch_mmvq_n(sycl::queue& q, const uint8_t* w, size_t row_bytes, co
 }
 
 // up to 8 columns in one pass, the count exact (upstream 2715a752: 3, 5, 6 and 7 took two or three passes); 8 at a
-// time past 8 (the verify window takes up to 8 tokens)
+// time past 8 (a wide window's 9..16 rows: 9..16-column instances here took 2 MiB of VRAM from every run's start)
 template<int TY>
 sycl::event launch_mmvq(sycl::queue& q, const uint8_t* w, size_t row_bytes, const block_q8_1* x, float* y, int n_in,
                         int n_out, int ncols) {
@@ -1391,14 +1570,15 @@ constexpr int kEntriesPass = 4;
 // with no early return, so the segment shuffles see the whole sub-group.
 // `part`: -1 the gate and up rows, 0 the gate rows only, 1 the up rows only (a layer whose gate and up differ in type
 // takes one launch a type)
-template<int TG, int LPR, bool APU>
+template<int TG, int LPR, int NE = kEntriesPass, bool APU = false>
 sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                              const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
                              const block_q8_1* xq, NativeExpertLayout L, float* gate, float* up, int part = -1) {
+    const bool fx = exact_sums();   // the fixed-point sums (exact.hpp), the launch's lanes alike
     constexpr int RPW = kWarp / LPR;
     const int row_lo = part == 1 ? (int) L.n_ff : 0, row_hi = part == 0 ? (int) L.n_ff : (int) (2 * L.n_ff);
     const size_t xgroups = (size_t) ((row_hi - row_lo + (int64_t) GU_ROWS * RPW - 1) / ((int64_t) GU_ROWS * RPW));
-    return q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * GU_ROWS * kWarp}, {1, GU_ROWS * kWarp}),
+    return q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * GU_ROWS * kWarp}, {1, (size_t) GU_ROWS * kWarp}),
                           [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
@@ -1414,26 +1594,103 @@ sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned l
             const uint8_t* blob = global_blob(grp_ptr[g]);
             const uint8_t* wr = blob + (is_up && valid ? L.up_off + (size_t) r * L.up_row : (size_t) r * L.gu_row);
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
-            for (int e = e0; e < e1; e += kEntriesPass) {   // the row's blocks decoded once for kEntriesPass entries
-                const int n = sycl::min(kEntriesPass, e1 - e);
-                const block_q8_1* xs[kEntriesPass];
-                for (int j = 0; j < kEntriesPass; ++j) xs[j] = xq + (size_t) ent_tok[j < n ? e + j : e] * xb;
-                float s[kEntriesPass];
-                seg_dot_multi<TG, LPR, kEntriesPass, APU>(sg, wr, xs, n, nb, (int) (L.n_embd / Fmt<TG>::qk), seg_lane, s);
-                if (valid && seg_lane == 0)
-                    for (int j = 0; j < n; ++j) (is_up ? up : gate)[(size_t) (e + j) * L.n_ff + r] = s[j];
+            for (int e = e0; e < e1; e += NE) {   // the row's blocks decoded once for NE entries
+                const int n = sycl::min(NE, e1 - e);
+                const block_q8_1* xs[NE];
+                for (int j = 0; j < NE; ++j) xs[j] = xq + (size_t) ent_tok[j < n ? e + j : e] * xb;
+                float s[NE];
+                seg_dot_multi<TG, LPR, NE, APU>(sg, wr, xs, n, nb, (int) (L.n_embd / Fmt<TG>::qk), seg_lane, s, fx);
+                if (valid && seg_lane == 0) {
+                    const float ts = nvfp4::tail_scale(blob, L.tail_off, is_up ? 1 : 0);   // NVFP4's s_gate / s_up
+                    for (int j = 0; j < n; ++j)
+                        (is_up ? up : gate)[(size_t) (e + j) * L.n_ff + r] = L.tail_off ? s[j] * ts : s[j];
+                }
             }
         }
     });
 }
 
+// The latent A's gate/up LPR / entries-a-pass, chosen per device by timing at the window's init (the current
+// GU_LPR / kEntriesPass are candidates, so the choice never regresses).  XESTRATA_LATENT_A_LPR / _A_ENTRIES force.
+// The other forms are built only for the latent A's gate/up types (Q3_K: the Edge0 q3k packs), not for every
+// type: each form is one more kernel a type.  APU (XeStrata-890M): the APU rows' one form, gu_lpr<true>() lanes a row
+// and kEntriesPass entries, whatever the choice (their gate/up rows are not timed).
+template<int TG> constexpr bool latent_a_tuned() { return TG == 11 || TG == nvfp4::kType; }
+std::vector<std::pair<int, int>> latent_a_forms(int type) {
+    if (type == 11 || type == nvfp4::kType) return {{8, 4}, {8, 8}, {16, 4}, {16, 8}, {32, 4}, {32, 8}};
+    return {{GU_LPR, kEntriesPass}};
+}
+template<int TG, bool APU = false>
+sycl::event launch_native_gu_tuned(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
+                                   const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
+                                   const block_q8_1* xq, NativeExpertLayout L, float* gate, float* up, int part,
+                                   int lpr, int ne) {
+    if constexpr (APU) {
+        (void) lpr;
+        (void) ne;
+        return launch_native_gu<TG, gu_lpr<true>(), kEntriesPass, true>(q, cap_groups, grp_ptr, grp_start, n_groups,
+                                                                        ent_tok, xq, L, gate, up, part);
+    } else {
+#define EDGE_GU_CASE(LP, N) if (lpr == (LP) && ne == (N)) return launch_native_gu<TG, LP, N>(q, cap_groups, grp_ptr, grp_start, n_groups, ent_tok, xq, L, gate, up, part)
+    EDGE_GU_CASE(16, 2); EDGE_GU_CASE(16, 4);
+    if constexpr (latent_a_tuned<TG>()) {
+        EDGE_GU_CASE(8, 4); EDGE_GU_CASE(8, 8); EDGE_GU_CASE(16, 8); EDGE_GU_CASE(32, 4); EDGE_GU_CASE(32, 8);
+    }
+#undef EDGE_GU_CASE
+    return launch_native_gu<TG, GU_LPR, kEntriesPass>(q, cap_groups, grp_ptr, grp_start, n_groups, ent_tok, xq, L, gate, up, part);
+    }
+}
+
+// The latent A's gate/up form: LPR lanes a row and NE entries a pass, timed per device at the window's init.
+// The current GU_LPR / kEntriesPass are candidates, so the choice never regresses.  XESTRATA_LATENT_A_LPR /
+// XESTRATA_LATENT_A_ENTRIES force a value (0/absent: the timed choice).
+using LatentAKey = std::tuple<int, int64_t, int64_t>;
+core::TimedCache<sycl::device, LatentAKey, std::pair<int, int>> g_latent_a_choices;
+int latent_a_env(const char* name, const char* v) {
+    if (!v || !*v) return 0;
+    errno = 0;
+    char* end = nullptr;
+    const long n = std::strtol(v, &end, 10);
+    if (end != v) while (std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (end == v || *end || errno == ERANGE || n < INT_MIN || n > INT_MAX)
+        throw core::DeviceError(std::string("XESTRATA_") + name + ": expected an integer");
+    return static_cast<int>(n);
+}
+int latent_a_lpr_env() { static const int value = latent_a_env("LATENT_A_LPR", strata::env_get("LATENT_A_LPR")); return value; }
+int latent_a_ne_env() { static const int value = latent_a_env("LATENT_A_ENTRIES", strata::env_get("LATENT_A_ENTRIES")); return value; }
+std::pair<int, int> latent_a_choice(sycl::queue& q, const NativeExpertLayout& L) {
+    auto c = g_latent_a_choices.get(q.get_device(), LatentAKey{L.gu_type, L.n_embd, L.n_ff})
+                 .value_or(std::pair<int, int>{GU_LPR, kEntriesPass});
+    const int lpr = latent_a_lpr_env(), entries = latent_a_ne_env();
+    if (lpr > 0) c.first = lpr;
+    if (entries > 0) c.second = entries;
+    return c;
+}
+// The gate/up rows of type `ty` in their LPR / entries form: the decode's launch and the timing's take this one
+// dispatch, so the timing runs the kernel the decode runs.
+template<bool APU = false>
+void launch_gu_rows(sycl::queue& q, int ty, size_t cg, const unsigned long long* ptr, const int32_t* starts,
+                    const int32_t* count, const int32_t* toks, const block_q8_1* x, const NativeExpertLayout& L,
+                    float* gate, float* up, int part, int lpr, int ne) {
+#define EDGE_GU_TYPE(T) case T: launch_native_gu_tuned<T, APU>(q, cg, ptr, starts, count, toks, x, L, gate, up, part, lpr, ne); return
+    switch (ty) {
+        EDGE_GU_TYPE(16); EDGE_GU_TYPE(17); EDGE_GU_TYPE(18); EDGE_GU_TYPE(21); EDGE_GU_TYPE(22); EDGE_GU_TYPE(23);
+        EDGE_GU_TYPE(29); EDGE_GU_TYPE(19); EDGE_GU_TYPE(42); EDGE_GU_TYPE(12); EDGE_GU_TYPE(13); EDGE_GU_TYPE(8);
+        EDGE_GU_TYPE(6); EDGE_GU_TYPE(2); EDGE_GU_TYPE(3); EDGE_GU_TYPE(14); EDGE_GU_TYPE(10); EDGE_GU_TYPE(11);
+        EDGE_GU_TYPE(144); EDGE_GU_TYPE(145); EDGE_GU_TYPE(146); EDGE_GU_TYPE(147); EDGE_GU_TYPE(148); EDGE_GU_TYPE(149);
+        EDGE_GU_TYPE(40);
+        default: throw core::DeviceError("native_expert_grouped: gate/up type " + std::to_string(ty));
+    }
+#undef EDGE_GU_TYPE
+}
 template<int TD, int LPR, bool APU>
 sycl::event launch_native_down(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                const block_q8_1* hq, NativeExpertLayout L, float* out) {
+    const bool fx = exact_sums();   // the fixed-point sums (exact.hpp), the launch's lanes alike
     constexpr int RPW = kWarp / LPR;
     const size_t xgroups = (size_t) ((L.n_embd + (int64_t) 8 * RPW - 1) / ((int64_t) 8 * RPW));
-    return q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * 8 * kWarp}, {1, 8 * kWarp}),
+    return q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * 8 * kWarp}, {1, (size_t) 8 * kWarp}),
                           [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
@@ -1451,9 +1708,13 @@ sycl::event launch_native_down(sycl::queue& q, size_t cap_groups, const unsigned
                 const block_q8_1* xs[kEntriesPass];
                 for (int j = 0; j < kEntriesPass; ++j) xs[j] = hq + (size_t) (j < n ? e + j : e) * hb;
                 float s[kEntriesPass];
-                seg_dot_multi<TD, LPR, kEntriesPass, APU, void, false>(sg, wr, xs, n, nb, (int) (L.n_ff / Fmt<TD>::qk), seg_lane, s);
-                if (valid && seg_lane == 0)
-                    for (int j = 0; j < n; ++j) out[(size_t) ent_dst[e + j] * L.n_embd + r] = s[j];
+                seg_dot_multi<TD, LPR, kEntriesPass, APU, void, false>(sg, wr, xs, n, nb, (int) (L.n_ff / Fmt<TD>::qk),
+                                                                       seg_lane, s, fx);
+                if (valid && seg_lane == 0) {
+                    const float ts = nvfp4::tail_scale(blob, L.tail_off, 2);   // NVFP4's s_down
+                    for (int j = 0; j < n; ++j)
+                        out[(size_t) ent_dst[e + j] * L.n_embd + r] = L.tail_off ? s[j] * ts : s[j];
+                }
             }
         }
     });
@@ -1473,6 +1734,7 @@ template<int TG, int LPR, bool APU>
 sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
                                    const block_q8_1* xq, NativeExpertLayout L, block_q8_1* hq) {
+    const bool fx = exact_sums();   // the fixed-point sums (exact.hpp), the launch's lanes alike
     using GT = typename GridOf<TG>::T;
     constexpr int NG = GridOf<TG>::N, RPW = kWarp / LPR, WG = GU_ROWS * kWarp;
     static_assert(kM8Rows % (GU_ROWS * RPW) == 0, "whole passes");
@@ -1518,10 +1780,13 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
                     const int i = (p * GU_ROWS + warp) * RPW + lane / LPR;   // gate row r0 + i, or up row r0 + i - 32
                     const uint8_t* wr = blob + (i < 32 ? (size_t) 0 : L.up_off) + (size_t) (r0 + (i & 31)) * L.gu_row;
                     float s[kEntriesPass];
-                    if constexpr (NG > 0) seg_dot_multi<TG, LPR, kEntriesPass, APU>(sg, wr, xs, cn, nb, nb, seg_lane, s, grid);
-                    else seg_dot_multi<TG, LPR, kEntriesPass, APU>(sg, wr, xs, cn, nb, nb, seg_lane, s);
-                    if (seg_lane == 0)
-                        for (int j = 0; j < cn; ++j) res[j * kM8Rows + i] = s[j];
+                    if constexpr (NG > 0)
+                        seg_dot_multi<TG, LPR, kEntriesPass, APU>(sg, wr, xs, cn, nb, nb, seg_lane, s, fx, grid);
+                    else seg_dot_multi<TG, LPR, kEntriesPass, APU>(sg, wr, xs, cn, nb, nb, seg_lane, s, fx);
+                    if (seg_lane == 0) {
+                        const float ts = nvfp4::tail_scale(blob, L.tail_off, i < 32 ? 0 : 1);   // NVFP4's s_gate / s_up
+                        for (int j = 0; j < cn; ++j) res[j * kM8Rows + i] = L.tail_off ? s[j] * ts : s[j];
+                    }
                 }
                 sycl::group_barrier(it.get_group());
                 if (warp < cn) {   // native_expert_grouped's one-pass SwiGLU + q8_1 on entry c0 + warp's block
@@ -1529,14 +1794,8 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
                     // as native_expert_grouped's pass
                     float gv = res[warp * kM8Rows + lane], uv = res[warp * kM8Rows + 32 + lane];
                     swiglu_clamp(gv, uv, lim);
-                    const float xi = canon::silu_mul(gv, uv);
-                    const float amax = warp_max(sg, sycl::fabs(xi));
-                    const float sum = warp_sum(sg, xi);
-                    const float d = canon::q8_scale(amax);
-                    const int8_t qv = canon::q8_value(xi, canon::q8_inv(d));
-                    block_q8_1* y = hq + (size_t) (c0 + warp) * hb + it.get_group(1);
-                    y->qs[lane] = qv;
-                    if (lane == 0) y->ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+                    auto* y = reinterpret_cast<uint8_t*>(hq + (size_t) (c0 + warp) * hb + it.get_group(1));
+                    q8act::q8_1_block<q8act::Canon<32>>(sg, canon::silu_mul(gv, uv), y, lane);
                 }
             }
         });
@@ -1556,6 +1815,7 @@ template<int TD, int LPR, bool APU, bool WS = false>
 sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                    const block_q8_1* hq, NativeExpertLayout L, float* out) {
+    const bool fx = exact_sums();   // the fixed-point sums (exact.hpp), the launch's lanes alike
     constexpr int RPW = kWarp / LPR, WG = 8 * kWarp, kDownRows = down_rows<APU>();
     static_assert(kDownRows % (8 * RPW) == 0, "whole passes");
     static_assert(!(APU && WS), "the local copy of the rows is sized for kM8Rows");
@@ -1610,9 +1870,12 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
                     const uint8_t* wr = WS ? lw + (size_t) (valid ? r - rb : 0) * L.d_row
                                            : blob + L.down_off + (size_t) (valid ? r : 0) * L.d_row;
                     seg_dot_multi<TD, LPR, kEntriesPass, APU, void, false>(sg, wr, xs, cn, nb, (int) (L.n_ff / Fmt<TD>::qk),
-                                                                           seg_lane, s);
-                    if (valid && seg_lane == 0)
-                        for (int j = 0; j < cn; ++j) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = s[j];
+                                                                           seg_lane, s, fx);
+                    if (valid && seg_lane == 0) {
+                        const float ts = nvfp4::tail_scale(blob, L.tail_off, 2);   // NVFP4's s_down
+                        for (int j = 0; j < cn; ++j)
+                            out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = L.tail_off ? s[j] * ts : s[j];
+                    }
                 }
             }
         });
@@ -1625,7 +1888,7 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
 // STRATA_EXP_MODE=<another value> (0): the default kernels; upstream's modes 1-7 are gfx906's and not here.
 bool exp_mode8(sycl::queue& q) {
     static const int env = [] {
-        const char* v = std::getenv("STRATA_EXP_MODE");
+        const char* v = strata::env_get("EXP_MODE");
         return v != nullptr ? (int) std::strtol(v, nullptr, 10) : -1;
     }();
     (void) q;
@@ -1657,7 +1920,7 @@ size_t local_mem_bytes(sycl::queue& q) {
 // 72.6 / 53.5 us -> 42.3 / 38.6 us for IQ4_NL / Q2_0); there is no such GPU here.  Elsewhere the switch does nothing.
 bool down_ws_on(sycl::queue& q) {
     static const bool env = [] {
-        const char* v = std::getenv("STRATA_DOWN_WS");
+        const char* v = strata::env_get("DOWN_WS");
         return v != nullptr && v[0] == '1';
     }();
     if (!env) return false;
@@ -1674,19 +1937,8 @@ bool down_ws_on(sycl::queue& q) {
 // n is a multiple of 32, so every sub-group is either wholly in range or wholly out of it.  canon_math.hpp's scale (the
 // experts' activations: the CPU's rows of an expert quantize alike).
 sycl::event launch_quantize_q8_1_canon(sycl::queue& q, const float* x, block_q8_1* y, long long n) {
-    const size_t total = (size_t) ((n + 255) / 256) * 256;
-    return q.parallel_for(sycl::nd_range<1>(total, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
-        const long long i = (long long) it.get_global_linear_id();
-        if (i >= n) return;
-        const sycl::sub_group sg = it.get_sub_group();
-        const float xi = x[i];
-        const float amax = warp_max(sg, sycl::fabs(xi));
-        const float sum = warp_sum(sg, xi);
-        const float d = canon::q8_scale(amax);
-        const long long ib = i / 32, iqs = i % 32;
-        y[ib].qs[iqs] = canon::q8_value(xi, canon::q8_inv(d));
-        if (iqs == 0) y[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
-    });
+    return q8act::quantize<1, q8act::Canon<32>>(q, n / 32, 0, q8act::Flat{x},
+                                                q8act::Q8_1{reinterpret_cast<uint8_t*>(y)});
 }
 
 // ---------------------------------------------------------------- dequant (dequantize.cuh)
@@ -1700,7 +1952,7 @@ template<> inline sycl::half cvt<sycl::half>(float v) { return sycl::half(v); }
 template<int N, typename dst_t>
 inline void store(dst_t* y, const float* v) {
     sycl::vec<dst_t, N> o;
-    for (int j = 0; j < N; ++j) o[j] = cvt<dst_t>(v[j]);
+    for (int j = 0; j < N; ++j) o[j] = cvt<dst_t>(v[j]);  // NOLINT(clang-analyzer-core.CallAndMessage): every caller fills v[0 .. N)
     *reinterpret_cast<sycl::vec<dst_t, N>*>(y) = o;
 }
 
@@ -1719,10 +1971,10 @@ void dq_iq2_xxs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const uint8_t aux8 = (uint8_t) (q2[il / 2] >> (8 * (il % 2)));
     const uint64_t grid = iq2xxs_grid[aux8];   // whole, and the signs computed: as dq_iq3_xxs
     const uint32_t aux32 = q2[2] | ((uint32_t) q2[3] << 16);
-    const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.25f;
+    const float d = (float) x[ibs].d * (0.5f + (float) (aux32 >> 28)) * 0.25f;
     const uint32_t signs = ksigns_byte((uint8_t) ((aux32 >> 7 * il) & 127));
     float v[8];
-    for (int j = 0; j < 8; ++j) v[j] = d * (int) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
+    for (int j = 0; j < 8; ++j) v[j] = d * (float) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
     o.template put<8>(y, v);
 }
 template<typename Out>
@@ -1732,10 +1984,10 @@ void dq_iq2_xs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int y = (int) (32 * ib + 8 * il);
     const uint16_t* q2 = x[ibs].qs + 4 * ib;
     const uint64_t grid = iq2xs_grid[q2[il] & 511];   // whole, and the signs computed: as dq_iq3_xxs
-    const float d = (float) x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+    const float d = (float) x[ibs].d * (0.5f + (float) ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
     const uint32_t signs = ksigns_byte((uint8_t) (q2[il] >> 9));
     float v[8];
-    for (int j = 0; j < 8; ++j) v[j] = d * (int) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
+    for (int j = 0; j < 8; ++j) v[j] = d * (float) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
     o.template put<8>(y, v);
 }
 template<typename Out>
@@ -1744,10 +1996,10 @@ void dq_iq2_s(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int64_t il = tid % 4, ib = tid / 4;          // neighbours in one sub-block: contiguous writes
     const int y = (int) (32 * ib + 8 * il);
     const uint64_t grid = iq2s_grid[x[ibs].qs[4 * ib + il] | ((x[ibs].qh[ib] << (8 - 2 * il)) & 0x300)];   // whole
-    const float d = (float) x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+    const float d = (float) x[ibs].d * (0.5f + (float) ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
     const uint32_t signs = x[ibs].qs[QK_K / 8 + 4 * ib + il];
     float v[8];
-    for (int j = 0; j < 8; ++j) v[j] = d * (int) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
+    for (int j = 0; j < 8; ++j) v[j] = d * (float) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
     o.template put<8>(y, v);
 }
 template<typename Out>
@@ -1762,12 +2014,12 @@ void dq_iq3_xxs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const uint32_t grid1 = iq3xxs_grid[q3[2 * il + 0]];
     const uint32_t grid2 = iq3xxs_grid[q3[2 * il + 1]];
     const uint32_t aux32 = gas[0] | ((uint32_t) gas[1] << 16);
-    const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.5f;
+    const float d = (float) x[ibs].d * (0.5f + (float) (aux32 >> 28)) * 0.5f;
     const uint32_t signs = ksigns_byte((uint8_t) ((aux32 >> 7 * il) & 127));
     float v[8];
     for (int j = 0; j < 4; ++j) {
-        v[j + 0] = d * (int) byte_of(grid1, j) * (signs & (1u << j) ? -1.f : 1.f);
-        v[j + 4] = d * (int) byte_of(grid2, j) * (signs & (1u << (j + 4)) ? -1.f : 1.f);
+        v[j + 0] = d * (float) byte_of(grid1, j) * (signs & (1u << j) ? -1.f : 1.f);
+        v[j + 4] = d * (float) byte_of(grid2, j) * (signs & (1u << (j + 4)) ? -1.f : 1.f);
     }
     o.template put<8>(y, v);
 }
@@ -1779,12 +2031,12 @@ void dq_iq3_s(const void* vx, int64_t ibs, const Out& o, int tid) {
     const uint8_t* qs = x[ibs].qs + 8 * ib;
     const uint32_t grid1 = iq3s_grid[qs[2 * il + 0] | ((x[ibs].qh[ib] << (8 - 2 * il)) & 256)];   // whole words
     const uint32_t grid2 = iq3s_grid[qs[2 * il + 1] | ((x[ibs].qh[ib] << (7 - 2 * il)) & 256)];
-    const float d = (float) x[ibs].d * (1 + 2 * ((x[ibs].scales[ib / 2] >> 4 * (ib % 2)) & 0xf));
+    const float d = (float) x[ibs].d * (float) (1 + 2 * ((x[ibs].scales[ib / 2] >> 4 * (ib % 2)) & 0xf));
     const uint32_t signs = x[ibs].signs[4 * ib + il];
     float v[8];
     for (int j = 0; j < 4; ++j) {
-        v[j + 0] = d * (int) byte_of(grid1, j) * (signs & (1u << j) ? -1.f : 1.f);
-        v[j + 4] = d * (int) byte_of(grid2, j) * (signs & (1u << (j + 4)) ? -1.f : 1.f);
+        v[j + 0] = d * (float) byte_of(grid1, j) * (signs & (1u << j) ? -1.f : 1.f);
+        v[j + 4] = d * (float) byte_of(grid2, j) * (signs & (1u << (j + 4)) ? -1.f : 1.f);
     }
     o.template put<8>(y, v);
 }
@@ -1809,7 +2061,7 @@ void dq_iq1_m(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int y = (int) (32 * ib + 8 * il);
     const uint16_t* sc = (const uint16_t*) x[ibs].scales;
     const int64_t ib16 = 2 * ib + il / 2;
-    const float d = iq1m_scale(sc) * (2 * ((sc[ib16 / 4] >> 3 * (ib16 % 4)) & 0x7) + 1);
+    const float d = iq1m_scale(sc) * (float) (2 * ((sc[ib16 / 4] >> 3 * (ib16 % 4)) & 0x7) + 1);
     const float delta = x[ibs].qh[2 * ib + il / 2] & (0x08 << 4 * (il % 2)) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
     const uint32_t g = iq1s_grid_gpu[x[ibs].qs[4 * ib + il] | (((x[ibs].qh[2 * ib + il / 2] >> 4 * (il % 2)) & 7) << 8)];
     const uint32_t grid32[2] = {g & 0x0f0f0f0f, (g >> 4) & 0x0f0f0f0f};
@@ -1829,8 +2081,8 @@ void dq_iq4_nl(const void* vx, int64_t ibs, const Out& o, int tid) {
     const float d = (float) x[ib].d;
     float lo[4], hi[4];
     for (int j = 0; j < 4; ++j) {
-        lo[j] = d * (int8_t) byte_of((uint32_t) v.x, j);
-        hi[j] = d * (int8_t) byte_of((uint32_t) v.y, j);
+        lo[j] = d * (float) (int8_t) byte_of((uint32_t) v.x, j);
+        hi[j] = d * (float) (int8_t) byte_of((uint32_t) v.y, j);
     }
     o.template put<4>(y, lo);
     o.template put<4>(y + 16, hi);
@@ -1850,8 +2102,8 @@ void dq_q3_k(const void* vx, int64_t ibs, const Out& o, int tid) {
                           is < 8  ? (int8_t) ((x->scales[is - 0] & 0xF) | (((x->scales[is + 4] >> 2) & 3) << 4)) :
                           is < 12 ? (int8_t) ((x->scales[is - 8] >> 4) | (((x->scales[is + 0] >> 4) & 3) << 4)) :
                                     (int8_t) ((x->scales[is - 8] >> 4) | (((x->scales[is - 4] >> 6) & 3) << 4));
-        const float dl = (float) x->d * (us - 32);
-        const uint8_t* q = x->qs + 32 * n;
+        const float dl = (float) x->d * (float) (us - 32);
+        const uint8_t* q = x->qs + (size_t) 32 * n;
         const uint8_t* hm = x->hmask;
         float v[4];
         for (int l = l0; l < l0 + 4; ++l)
@@ -1877,12 +2129,12 @@ void dq_iq4_xs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const block_iq4_xs* x = (const block_iq4_xs*) vx + ibs;
     const int il = tid % 4, ib = tid / 4;              // neighbours in one sub-block, as dq_iq4_nl
     const int y = (int) (32 * ib + 4 * il);
-    const uint8_t* q4 = x->qs + 16 * ib + 4 * il;
-    const float d = (float) x->d * ((((x->scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x->scales_h >> 2 * ib) & 3) << 4)) - 32);
+    const uint8_t* q4 = x->qs + (size_t) 16 * ib + (size_t) 4 * il;
+    const float d = (float) x->d * (float) ((((x->scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x->scales_h >> 2 * ib) & 3) << 4)) - 32);
     float lo[4], hi[4];
     for (int j = 0; j < 4; ++j) {
-        lo[j] = d * kvalues_iq4nl[q4[j] & 0xf];
-        hi[j] = d * kvalues_iq4nl[q4[j] >> 4];
+        lo[j] = d * (float) kvalues_iq4nl[q4[j] & 0xf];
+        hi[j] = d * (float) kvalues_iq4nl[q4[j] >> 4];
     }
     o.template put<4>(y, lo);
     o.template put<4>(y + 16, hi);
@@ -2045,6 +2297,19 @@ void dq_q8_0(const void* vx, int64_t ibs, const Out& o, int tid) {
     o.template put<8>(32 * ib + 8 * il, v);
 }
 
+// NVFP4: a piece of 256 values is four blocks of 64; work-item tid takes block tid / 8's sub-block (tid / 2) % 4, its
+// 8 low nibbles (values 0-7) or its 8 high ones (values 8-15), one run of 8
+template<typename Out>
+void dq_nvfp4(const void* vx, int64_t ibs, const Out& o, int tid) {
+    const block_nvfp4* x = (const block_nvfp4*) vx + ibs * 4;
+    const int b = tid / 8, sb = (tid / 2) % 4, hi = tid % 2;
+    const float d = nvfp4::ue4m3_half(x[b].d[sb]);
+    const uint8_t* q = x[b].qs + (ptrdiff_t) 8 * sb;
+    float v[8];
+    for (int j = 0; j < 8; ++j) v[j] = d * (float) kvalues_fp4[hi ? q[j] >> 4 : q[j] & 0x0F];
+    o.template put<8>(64 * b + 16 * sb + 8 * hi, v);
+}
+
 // BF16 (the token embedding as the checkpoint ships it, tools/embd_bf16_pack.py; upstream c627d51): 8 values a
 // work-item, widened exactly
 template<typename Out>
@@ -2104,6 +2369,7 @@ inline void dq_dispatch(int ty, const void* vx, int64_t ibs, const Out& o, int t
         case 11: dq_q3_k(vx, ibs, o, tid); break;
         case 10: dq_q2_k(vx, ibs, o, tid); break;
         case 42: dq_q2_0(vx, ibs, o, tid); break;
+        case 40: dq_nvfp4(vx, ibs, o, tid); break;
         case 30: dq_bf16(vx, ibs, o, tid); break;   // the token embedding only (embed_type_supported)
         case 12: dq_q4_k(vx, ibs, o, tid); break;
         case 13: dq_q5_k(vx, ibs, o, tid); break;
@@ -2185,6 +2451,16 @@ inline void dq_one(const void* vx, int64_t ibs, const Out& o, int tid) {
 
 struct IqGemmPtrs { const uint8_t* p[kIqGemmGroup]; };
 
+// IqGemmKernel's TYPE for R1Q2 blobs (bih3_r1q2_gemm_grouped_f16): each expert's gate/up and down K, the layer's p2,
+// its widths and which product
+constexpr int kBih3Tile = 180;
+struct Bih3Tile {
+    uint8_t gk[kIqGemmGroup], dk[kIqGemmGroup];
+    float p2[3][4];
+    int n, ff;
+    bool down;
+};
+
 // 256 x 128 work-group tiles, K 128 at a time: one tile of rows takes an expert's 80-240 rows, so its weights are
 // dequantized once (128 x 256 tiles dequantized most experts' twice and were 10% slower)
 template<int TYPE>
@@ -2199,12 +2475,57 @@ struct IqGemmKernel {
     size_t row_bytes;
     int64_t inter, ldy, tiles_m, nN, N, K;
     sycl::local_accessor<sycl::half, 1> wt;     // [KC][LDN]: K by weight rows (B row-major)
+    Bih3Tile bt;                                // kBih3Tile only
+
+    // kBih3Tile: block k0 / 128 of the WN weight rows from n0, a work-item 4 neighbouring rows by 4 states (16 values),
+    // the values bih3_r1q2_dequant_f16 writes (its expression, the same rounding), stored as dequant()'s below
+    void dequant_bih3(int lid, int64_t ex, int64_t n0, int64_t k0) const {
+        const uint8_t* blob = W.p[ex];
+        const int n = bt.n, ff = bt.ff, gk = bt.gk[ex], dk = bt.dk[ex], b = (int) (k0 / 128);
+        const size_t grow = (size_t) (n / 128) * 4 * (size_t) gk, drow = (size_t) (ff / 128) * 4 * (size_t) dk;
+        const size_t up = grow * (size_t) ff, dn = 2 * up;
+        const size_t scale_off = (dn + drow * (size_t) n + 15) & ~(size_t) 15;
+        const size_t gu_scale = (size_t) ff * 2 + (size_t) (n / 128) * 2 + (size_t) ff * (size_t) ((n / 128 + 3) / 4);
+        const int width = bt.down ? ff : n, nb = width / 128, qbytes = (nb + 3) / 4, k = bt.down ? dk : gk;
+        const auto half_at = [](const uint8_t* p) {
+            return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+        };
+        for (int t = lid; t < (WN / 4) * 8; t += WG) {
+            const int r4 = t % (WN / 4) * 4, part = t / (WN / 4);   // states 4 part .. 4 part + 3
+            sycl::half v[4][16];
+            for (int q = 0; q < 4; ++q) {
+                // gate/up: weight row 2 r + m is matrix m's row r (iq_dequant_gu_f16's interleaving)
+                const int64_t nn = n0 + r4 + q;
+                const int m = bt.down ? 2 : (int) (nn & 1), r = (int) (bt.down ? nn : nn >> 1);
+                const uint8_t* bases = blob + scale_off + (size_t) m * gu_scale;
+                const uint8_t* cols = bases + (size_t) (bt.down ? n : ff) * 2;
+                const uint8_t qb = cols[(size_t) nb * 2 + (size_t) r * qbytes + b / 4];
+                const float scale = half_at(cols + (size_t) b * 2) * bt.p2[m][(qb >> (2 * (b % 4))) & 3] *
+                                    (1.f / 128.f) * half_at(bases + (size_t) r * 2);
+                const uint8_t* code = blob + (m == 1 ? up : m == 2 ? dn : 0) + (size_t) r * (bt.down ? drow : grow) +
+                                      (size_t) b * 4 * (size_t) k;
+                for (int s = 0; s < 4; ++s) {
+                    int num[4];
+                    xe::bih3_state_values(xe::bih3_state_w(code, k, 4 * part + s), num);
+                    for (int c = 0; c < 4; ++c) v[q][4 * s + c] = sycl::half((float) num[c] * scale);
+                }
+            }
+            for (int j = 0; j < 16; ++j)
+                *reinterpret_cast<sycl::vec<sycl::half, 4>*>(&wt[(size_t) (16 * part + j) * LDN + (size_t) r4]) =
+                    sycl::vec<sycl::half, 4>(v[0][j], v[1][j], v[2][j], v[3][j]);
+        }
+    }
 
     // Block k0 of K into the tile: a work-item dequantizes the same 8 values of 4 neighbouring weight rows and writes
     // them as 8 bytes a row of the tile, neighbouring work-items the next 4 rows.  B column-major took vector stores
     // of one weight row but loaded for the products at half the speed; row-major with 2-byte stores, one weight row
     // a work-item, dequantized at half the speed.
-    void dequant(int lid, const uint8_t* w, int64_t n0, int64_t k0) const {
+    void dequant(int lid, int64_t ex, int64_t n0, int64_t k0) const {
+        if constexpr (TYPE == kBih3Tile) dequant_bih3(lid, ex, n0, k0);
+        else dequant_blocks(lid, W.p[ex], n0, k0);
+    }
+
+    void dequant_blocks(int lid, const uint8_t* w, int64_t n0, int64_t k0) const {
         const int piece = (int) (k0 % 256);
         for (int t = lid; t < (WN / 4) * (KC / 8); t += WG) {
             const int r4 = t % (WN / 4) * 4, tt = t / (WN / 4);
@@ -2253,15 +2574,15 @@ struct IqGemmKernel {
     // let some work-items dequantize the next block while others still read the last; choosing the loads per tile
     // inside one loop ran several times slower.)
     template<bool WHOLE>
-    void loop(sycl::nd_item<1> it, const sycl::half* x, int64_t rows, int64_t m0, int nl, const uint8_t* w,
-              int64_t wn0,
+    void loop(sycl::nd_item<1> it, const sycl::half* x, int64_t rows, int64_t m0, int nl, int64_t ex, int64_t wn0,
               mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, GT_M, GT_N> (&c)[G_SGM][G_SGN]) const {
         const auto sg = it.get_sub_group();
         const int lid = (int) it.get_local_linear_id();
         for (int64_t k0 = 0; k0 < K; k0 += KC) {
-            dequant(lid, w, wn0, k0);
+            dequant(lid, ex, wn0, k0);
             sycl::group_barrier(it.get_group());
-            block<WHOLE>(sg, x, rows, m0, nl, k0, c);
+            // a sub-group past the expert's rows only dequantizes (block has no barrier)
+            if (WHOLE || m0 < rows) block<WHOLE>(sg, x, rows, m0, nl, k0, c);
             sycl::group_barrier(it.get_group());
         }
     }
@@ -2285,8 +2606,8 @@ struct IqGemmKernel {
         for (int i = 0; i < G_SGM; ++i)
             for (int j = 0; j < G_SGN; ++j) mx::joint_matrix_fill(sg, c[i][j], 0.0f);
         const sycl::half* x = X + row0 * K;
-        if (tm * WM + WM <= rows) loop<true>(it, x, rows, m0, nl, W.p[ex], wn0, c);
-        else loop<false>(it, x, rows, m0, nl, W.p[ex], wn0, c);
+        if (tm * WM + WM <= rows) loop<true>(it, x, rows, m0, nl, ex, wn0, c);
+        else loop<false>(it, x, rows, m0, nl, ex, wn0, c);
         if (m0 >= rows) return;
         const bool whole = m0 + G_MS <= rows;
         auto gy = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
@@ -2306,15 +2627,166 @@ struct IqGemmKernel {
 
 template<int TYPE>
 sycl::event launch_iq_gemm(sycl::queue& q, const sycl::half* X, const IqGemmPtrs& W, int64_t inter, float* Y,
-                           int64_t ldy, const int32_t* bounds, int G, int64_t max_rows, int64_t N, int64_t K) {
+                           int64_t ldy, const int32_t* bounds, int G, int64_t max_rows, int64_t N, int64_t K,
+                           const Bih3Tile& bt = {}) {
     using Kn = IqGemmKernel<TYPE>;
     const int64_t tiles_m = (max_rows + Kn::WM - 1) / Kn::WM, nN = N / Kn::WN;
-    const size_t row_bytes = iq_row_bytes(TYPE, K);
+    const size_t row_bytes = TYPE == kBih3Tile ? 0 : iq_row_bytes(TYPE, K);
     return q.submit([&](sycl::handler& h) {
         Kn k{X, W, Y, bounds, row_bytes, inter, ldy, tiles_m, nN, N, K,
-             sycl::local_accessor<sycl::half, 1>(sycl::range<1>((size_t) Kn::KC * Kn::LDN), h)};
+             sycl::local_accessor<sycl::half, 1>(sycl::range<1>((size_t) Kn::KC * Kn::LDN), h), bt};
         h.parallel_for(sycl::nd_range<1>((size_t) (G * tiles_m * nN) * Kn::WG, Kn::WG), k);
     });
+}
+
+// ---------------------------------------------------------------- iq_mmq_f16_grouped: RDNA3's and RDNA4's WMMA
+// iq_mmq_grouped's expert products in FP16 on the matrix instructions amd_wmma.hpp takes (16 x 16 x 16 tiles on 32
+// lanes, mma_gemm's shape on those GPUs), from the int8 products' own operands: a work-group of 2 x 4 sub-groups, each
+// SGM x 2 tiles, takes WM = 32 SGM rows of one expert by 128 of its weight rows; for each KC values of K it stages the
+// rows' int8 activations times their block's scale (iq_mmq_quantize's) as FP16, zero past the expert's last row, and
+// dequantizes the 128 x KC weights (the dequantizers above: the values iq_dequant_f16 writes) into local memory, B
+// column-major (a weight row's K values contiguous, as the instructions' B operand reads them), and its sub-groups
+// multiply them; row r's outputs go to dst row ids[r].  SGM by the most rows an expert has: an expert of 16 rows does
+// not pay a 128-row tile's products.  RX 9060 XT (2026-11-13), 16 experts' 1280 x 2560 IQ2_S gate/up, us an expert at
+// 64, 256 and 1024 rows: 23, 63 and 247 against the int8 products' 17, 63 and 238 (the weights from FP16 rows instead
+// of the int8 activations: 26, 59, 227); IQ4_XS's 21, 57, 220 against 20, 56, 214.  Where it pays is in the engine,
+// at a 32K prompt's 1000 rows an expert (iq_mmq.cpp's f16_first).
+struct ToNK {
+    sycl::half* row;   // the weight row in the tile
+    int piece;         // the offset of the tile's first value in the 256-value piece
+    template<int N> void put(int off, const float* v) const { store<N>(row + (off - piece), v); }
+};
+
+template<int TYPE, int SGM>
+struct IqWmmaKernel {
+    static constexpr int NSGM = 2, NSGN = 4, SGN = 2, T16 = 16, SG = 32, NSG = NSGM * NSGN, WG = NSG * SG;
+    static constexpr int WM = NSGM * SGM * T16, WN = NSGN * SGN * T16, KC = 64;
+    static constexpr int LD = KC + 8;          // a row's stride in the tile (16-byte rows, other banks)
+    static constexpr int LOCAL = (WM + WN) * LD;
+    const int8_t* x8;                          // the int8 rows, then their scales xs
+    const float* xs;
+    const uint8_t* w8;                         // expert e's weights at w8 + e expert_bytes, or wtab[e] + woff
+    const uint8_t* const* wtab;
+    size_t woff, expert_bytes;
+    const int32_t* ids;                        // the output row of each row (null: the row itself)
+    float* Y;
+    const int32_t* bounds;
+    size_t row_bytes;
+    int64_t ldy, tiles_m, nN, K;
+    sycl::local_accessor<sycl::half, 1> lm;    // [WM][LD] of X, then [WN][LD] of the weights
+
+    void operator()(sycl::nd_item<1> it) const {
+#if STRATA_AMD_WMMA
+        const int64_t g = (int64_t) it.get_group(0);
+        const int64_t ex = g / (tiles_m * nN), r = g % (tiles_m * nN), tm = r / nN, tn = r % nN;
+        const int64_t row0 = bounds[ex], rows = bounds[ex + 1] - row0;
+        const int64_t m0 = tm * WM, wn0 = tn * WN;
+        if (m0 >= rows) return;   // the whole work-group: the expert has fewer rows than the launch allows for
+        const auto sg = it.get_sub_group();
+        const int sgid = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int lid = (int) it.get_local_linear_id();
+        const int ms = sgid / NSGN * SGM * T16, ns = sgid % NSGN * SGN * T16;
+        const uint8_t* w = wtab != nullptr ? wtab[ex] + woff : w8 + (size_t) ex * expert_bytes;
+        sycl::half* al = &lm[0];
+        sycl::half* bl = &lm[(size_t) WM * LD];
+        xe::wmma::C c[SGM][SGN];
+        for (int i = 0; i < SGM; ++i)
+            for (int j = 0; j < SGN; ++j) xe::wmma::fill(sg, c[i][j], 0.0f);
+        for (int64_t k0 = 0; k0 < K; k0 += KC) {
+            sycl::group_barrier(it.get_group());   // the last step's tiles are read
+            for (int v = lid; v < WM * (KC / 8); v += WG) {
+                const int rr = v / (KC / 8), cc = v % (KC / 8) * 8;
+                const int64_t row = m0 + rr;
+                sycl::vec<sycl::half, 8> h(sycl::half(0.0f));
+                if (row < rows) {
+                    const auto q = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(x8 + (row0 + row) * K + k0 + cc);
+                    const float d = xs[(row0 + row) * (K / 32) + (k0 + cc) / 32];
+                    for (int j = 0; j < 8; ++j) h[j] = sycl::half(d * (float) q[j]);
+                }
+                *reinterpret_cast<sycl::vec<sycl::half, 8>*>(al + (ptrdiff_t) (rr * LD) + cc) = h;
+            }
+            const int piece = (int) (k0 % 256);
+            for (int t = lid; t < WN * (KC / 8); t += WG) {   // neighbouring work-items: the same 8 values of neighbouring rows
+                const int rr = t % WN, tt = t / WN;
+                dq_one<TYPE>(w + (size_t) (wn0 + rr) * row_bytes, k0 / 256, ToNK{bl + (ptrdiff_t) (rr * LD), piece}, piece / 8 + tt);
+            }
+            sycl::group_barrier(it.get_group());
+            for (int kk = 0; kk < KC; kk += T16) {
+                xe::wmma::A<sycl::half> a[SGM];
+                xe::wmma::Bc<sycl::half> b[SGN];
+                for (int i = 0; i < SGM; ++i) xe::wmma::load(sg, a[i], al + (ptrdiff_t) ((ms + i * T16) * LD) + kk, LD);
+                for (int j = 0; j < SGN; ++j) xe::wmma::load(sg, b[j], bl + (ptrdiff_t) ((ns + j * T16) * LD) + kk, LD);
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < SGN; ++j) xe::wmma::mad(sg, c[i][j], a[i], b[j], c[i][j]);
+            }
+        }
+        const int lo = lane & 15, hi = lane >> 4;
+        for (int i = 0; i < SGM; ++i)
+            for (int j = 0; j < SGN; ++j) {
+                const int64_t n = wn0 + ns + (int64_t) j * T16 + lo;
+                for (int e = 0; e < 8; ++e) {
+                    const int64_t row = m0 + ms + (int64_t) i * T16 + xe::wmma::row_of(hi, e);
+                    if (row >= rows) continue;
+                    const int64_t out = ids != nullptr ? ids[row0 + row] : row0 + row;
+                    Y[out * ldy + n] = c[i][j].v[e];
+                }
+            }
+#else
+        (void) it;
+#endif
+    }
+    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
+};
+
+template<int TYPE, int SGM>
+sycl::event launch_iq_wmma(sycl::queue& q, IqWmmaKernel<TYPE, SGM> k, int G, int64_t max_rows, int64_t N) {
+    using Kn = IqWmmaKernel<TYPE, SGM>;
+    k.tiles_m = (max_rows + Kn::WM - 1) / Kn::WM;
+    k.nN = N / Kn::WN;
+    k.row_bytes = iq_row_bytes(TYPE, k.K);
+    return q.submit([&](sycl::handler& h) {
+        k.lm = sycl::local_accessor<sycl::half, 1>(sycl::range<1>((size_t) Kn::LOCAL), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) (G * k.tiles_m * k.nN) * Kn::WG, Kn::WG), k);
+    });
+}
+
+// The launch's arguments; the tile's rows by the most rows an expert has: one 32-row tile up to 32 rows, 64 up to
+// 64, else 128 a work-group
+struct IqWmmaArgs {
+    const int8_t* x8 = nullptr;
+    const float* xs = nullptr;
+    const uint8_t* w8 = nullptr;
+    const uint8_t* const* wtab = nullptr;
+    size_t woff = 0, expert_bytes = 0;
+    const int32_t* ids = nullptr;
+    float* Y = nullptr;
+    const int32_t* bounds = nullptr;
+    int64_t ldy = 0, N = 0, K = 0;
+};
+template<int TYPE>
+sycl::event launch_iq_gemm_wmma(sycl::queue& q, const IqWmmaArgs& a, int G, int64_t max_rows) {
+    const auto kn = [&](auto sgm) {
+        constexpr int S = decltype(sgm)::value;
+        return IqWmmaKernel<TYPE, S>{a.x8, a.xs, a.w8, a.wtab, a.woff, a.expert_bytes, a.ids, a.Y, a.bounds, 0, a.ldy, 0, 0, a.K, {}};
+    };
+    if (max_rows <= 32) return launch_iq_wmma(q, kn(std::integral_constant<int, 1>{}), G, max_rows, a.N);
+    if (max_rows <= 64) return launch_iq_wmma(q, kn(std::integral_constant<int, 2>{}), G, max_rows, a.N);
+    return launch_iq_wmma(q, kn(std::integral_constant<int, 4>{}), G, max_rows, a.N);
+}
+
+sycl::event iq_wmma_by_type(int t, sycl::queue& q, const IqWmmaArgs& a, int G, int64_t max_rows) {
+    switch (t) {
+        case 16: return launch_iq_gemm_wmma<16>(q, a, G, max_rows);
+        case 17: return launch_iq_gemm_wmma<17>(q, a, G, max_rows);
+        case 18: return launch_iq_gemm_wmma<18>(q, a, G, max_rows);
+        case 19: return launch_iq_gemm_wmma<19>(q, a, G, max_rows);
+        case 20: return launch_iq_gemm_wmma<20>(q, a, G, max_rows);
+        case 21: return launch_iq_gemm_wmma<21>(q, a, G, max_rows);
+        case 22: return launch_iq_gemm_wmma<22>(q, a, G, max_rows);
+        case 23: return launch_iq_gemm_wmma<23>(q, a, G, max_rows);
+        case 29: return launch_iq_gemm_wmma<29>(q, a, G, max_rows);
+        default: return launch_iq_gemm_wmma<42>(q, a, G, max_rows);
+    }
 }
 
 // the formats iq_gemm_grouped_f16 dequantizes into its tile (dq_one); the K-quants and Q5_1 / Q8_0 take the fp16
@@ -2323,9 +2795,14 @@ bool in_iq_gemm(int t) {
     return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 ||
            is_tq(t);
 }
+// the formats IqWmmaKernel takes: their dequantizers' values for tids piece / 8 .. piece / 8 + 7 lie in the 64 values
+// from piece (a 32-value sub-block a 4 tids, Q2_0's 64-value block 8)
+bool in_iq_wmma(int t) {
+    return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42;
+}
 bool is_iq(int t) {
     return in_iq_gemm(t) || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 6 || t == 7 || t == 8 || t == 2 ||
-           t == 3;
+           t == 3 || t == nvfp4::kType;
 }
 
 void require(bool ok, const char* what) {
@@ -2351,6 +2828,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 10: return (size_t) (n / 256) * sizeof(block_q2_K);
         case 11: return (size_t) (n / 256) * sizeof(block_q3_K);
         case 42: return (size_t) (n / 64) * sizeof(block_q2_0);
+        case 40: return (size_t) (n / 64) * sizeof(block_nvfp4);
         case 12: return (size_t) (n / 256) * sizeof(block_q4_K);
         case 13: return (size_t) (n / 256) * sizeof(block_q5_K);
         case 7: return (size_t) (n / 32) * sizeof(block_q5_1);
@@ -2359,7 +2837,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 2: return (size_t) (n / 32) * sizeof(block_q4_0);
         case 3: return (size_t) (n / 32) * sizeof(block_q4_1);
         case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
-        case 30: return (size_t) n * 2;   // BF16: the token embedding (iq_embed_rows, iq_dequant_f32), BF16 experts
+        case 30: return (size_t) n * 2;   // BF16: the token embedding (embed_rows, iq_dequant_f32), BF16 experts
         case 144: return (size_t) (n / 128) * sizeof(block_tq2_t);
         case 145: return (size_t) (n / 128) * sizeof(block_tqk6);
         case 146: return (size_t) (n / 128) * sizeof(block_tqk7);
@@ -2391,7 +2869,7 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
         }), "quantize_q8_1_rows");
         return;
     }
-    sync_if_needed(stream, launch_quantize_q8_1_canon(queue_for(stream), x, Y, n), "quantize_q8_1_rows");
+    sync_if_needed(stream, launch_quantize_q8_1_canon(queue_for(stream), x, (block_q8_1*) y, n), "quantize_q8_1_rows");
 }
 
 namespace {
@@ -2422,15 +2900,7 @@ sycl::event launch_hadamard_rows(sycl::queue& q, const T* x, T* y, int64_t rows,
                 if (signs) v *= signs[col0 + i];
                 buf[i] = v;
             }
-            for (int len = 1; len < block; len <<= 1) {
-                sycl::group_barrier(it.get_group());
-                for (int p = lid; p < block / 2; p += n) {
-                    const int i = (p / len) * 2 * len + p % len;
-                    const float a = buf[i], c = buf[i + len];
-                    buf[i] = a + c;
-                    buf[i + len] = a - c;
-                }
-            }
+            xe::hadamard_block(&buf[0], block, lid, n, it.get_group());
             sycl::group_barrier(it.get_group());
             for (int i = lid; i < block; i += n) y[base + i] = (T) (buf[i] * scale);
         });
@@ -2467,6 +2937,736 @@ const float* hadamard_device_signs(const float* host, int width) {
         rt.finish(q);
     }
     return d;
+}
+
+void bih3_r1q2_mmvq(const Bih3R1q2Matrix& w, const void* x_q8_1, float* y, int ncols, void* stream) {
+    require(w.codes && w.rowbase && w.colscale && w.q && x_q8_1 && y && w.k >= 2 && w.k <= 14 &&
+            w.n_in > 0 && w.n_in % 128 == 0 && w.n_out > 0 && ncols > 0 &&
+            w.row_bytes >= (size_t) (w.n_in / 128) * 4 * (size_t) w.k, "bih3_r1q2_mmvq");
+    const auto* x = static_cast<const block_q8_1*>(x_q8_1);
+    const int nb = w.n_in / 128, qbytes = (nb + 3) / 4;
+    auto& queue = queue_for(stream);
+    auto event = queue.parallel_for(sycl::range<2>((size_t) ncols, (size_t) w.n_out), [=](sycl::id<2> id) {
+        const size_t col = id[0], row = id[1];
+        const auto half_at = [](const uint8_t* p) {
+            return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+        };
+        float sums[4] = {};
+        const uint8_t* codes = w.codes + row * w.row_bytes;
+        const uint8_t* qr = w.q + row * (size_t) qbytes;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* block = codes + (size_t) b * 4 * (size_t) w.k;
+            const float scale = half_at(w.colscale + (size_t) b * 2) * w.p2[(qr[b / 4] >> (2 * (b % 4))) & 3];
+            for (int q = 0; q < 4; ++q) {
+                int dot = 0;
+                const block_q8_1* xb = x + col * (size_t) (w.n_in / 32) + (size_t) b * 4 + q;
+                for (int j = 0; j < 8; ++j) {
+                    const auto planes = xe::bih3_planes(block, w.k, q * 8 + j);
+                    const int act = get_int_b4(xb->qs, j);
+                    dot = dp4a((int) planes.v[0], act, dot);
+                    dot = dp4a((int) planes.v[1], act, dot);
+                    dot = dp4a((int) planes.v[2], act, dot);
+                }
+                sums[q] = sycl::fma((float) (dot * 64), scale * low_half(xb->ds), sums[q]);
+            }
+        }
+        y[col * (size_t) w.n_out + row] = ((sums[0] + sums[1]) + (sums[2] + sums[3])) *
+                                           (1.f / 8192.f) * half_at(w.rowbase + row * 2);
+    });
+    sync_if_needed(stream, event, "bih3_r1q2_mmvq");
+}
+
+void bih3_r1q2_gather_mmq(const Bih3R1q2Matrix& w, void* dst, void* stream) {
+    require(w.codes && w.rowbase && w.colscale && w.q && dst && w.k >= 2 && w.k <= 14 &&
+            w.n_in > 0 && w.n_in % 128 == 0 && w.n_out > 0 &&
+            w.row_bytes >= (size_t) (w.n_in / 128) * 4 * (size_t) w.k, "bih3_r1q2_gather_mmq");
+    const int nb = w.n_in / 128, qbytes = (nb + 3) / 4, blocks = w.n_in / 32;
+    auto* out = static_cast<uint8_t*>(dst);
+    auto& queue = queue_for(stream);
+    auto event = queue.parallel_for(sycl::range<2>((size_t) w.n_out, (size_t) blocks), [=](sycl::id<2> id) {
+        const size_t row = id[0];
+        const int sb = (int) id[1], b = sb / 4;
+        const auto half_at = [](const uint8_t* p) {
+            return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+        };
+        const uint8_t* code = w.codes + row * w.row_bytes + (size_t) b * 4 * (size_t) w.k;
+        const uint8_t q = w.q[row * (size_t) qbytes + b / 4];
+        const float scale = half_at(w.rowbase + 2 * row) * half_at(w.colscale + 2 * (size_t) b) *
+                            w.p2[(q >> (2 * (b % 4))) & 3] * (1.f / 128.f);
+        for (int j = 0; j < 8; ++j) {
+            const auto planes = xe::bih3_planes(code, w.k, (sb % 4) * 8 + j);
+            for (int p = 0; p < 3; ++p) {
+                uint8_t* block = out + (row * (size_t) blocks * 3 + (size_t) sb * 3 + p) * 36;
+                reinterpret_cast<uint32_t*>(block)[j] = planes.v[p];
+                if (j == 0) *reinterpret_cast<float*>(block + 32) = scale;
+            }
+        }
+    });
+    sync_if_needed(stream, event, "bih3_r1q2_gather_mmq");
+}
+
+void bih3_r1q2_expand_mmq(const void* x_q8_1, void* dst, int n_in, int ncols, void* stream) {
+    require(x_q8_1 && dst && n_in > 0 && n_in % 128 == 0 && ncols > 0, "bih3_r1q2_expand_mmq");
+    const auto* x = static_cast<const block_q8_1*>(x_q8_1);
+    auto* values = static_cast<uint8_t*>(dst);
+    const int blocks = n_in / 32, out_blocks = 3 * blocks;
+    auto* scales = reinterpret_cast<float*>(values + (size_t) ncols * (size_t) n_in * 3);
+    auto& queue = queue_for(stream);
+    auto event = queue.parallel_for(sycl::range<2>((size_t) ncols, (size_t) blocks), [=](sycl::id<2> id) {
+        const size_t col = id[0], b = id[1];
+        const block_q8_1& in = x[col * (size_t) blocks + b];
+        for (int p = 0; p < 3; ++p) {
+            const size_t dst_block = col * (size_t) out_blocks + 3 * b + p;
+            for (int j = 0; j < 8; ++j) reinterpret_cast<uint32_t*>(values + dst_block * 32)[j] =
+                                               (uint32_t) get_int_b4(in.qs, j);
+            scales[dst_block] = low_half(in.ds);
+        }
+    });
+    sync_if_needed(stream, event, "bih3_r1q2_expand_mmq");
+}
+
+namespace {
+// One group's gathered weights and entry buffers. Each allocation starts on a 256-byte boundary for the matrix loads.
+struct Bih3GroupedScratch {
+    int32_t* bounds = nullptr;
+    int32_t* identity = nullptr;
+    int32_t* scatter = nullptr;
+    float* gu = nullptr;
+    float* h = nullptr;
+    block_q8_1* hq = nullptr;
+    uint8_t* xq = nullptr;
+    uint8_t* weights = nullptr;
+    size_t weight_bytes = 0, bytes = 0;
+};
+Bih3GroupedScratch bih3_scratch(void* ptr, int64_t cap, int64_t n, int64_t ff) {
+    Bih3GroupedScratch s;
+    auto* base = static_cast<uint8_t*>(ptr);
+    auto take = [&](size_t bytes) -> uint8_t* {
+        s.bytes = (s.bytes + 255) & ~(size_t) 255;
+        const size_t off = s.bytes;
+        s.bytes += bytes;
+        return base ? base + off : nullptr;
+    };
+    s.bounds = reinterpret_cast<int32_t*>(take(2 * sizeof(int32_t)));
+    s.identity = reinterpret_cast<int32_t*>(take((size_t) cap * sizeof(int32_t)));
+    s.scatter = reinterpret_cast<int32_t*>(take((size_t) cap * sizeof(int32_t)));
+    s.gu = reinterpret_cast<float*>(take((size_t) cap * (size_t) (2 * ff) * sizeof(float)));
+    s.h = reinterpret_cast<float*>(take((size_t) cap * (size_t) ff * sizeof(float)));
+    s.hq = reinterpret_cast<block_q8_1*>(take((size_t) cap * (size_t) (ff / 32) * sizeof(block_q8_1)));
+    s.xq = take(iq_mmq_act_bytes(cap, 3 * std::max(n, ff)));
+    s.weight_bytes = (size_t) (2 * ff) * (size_t) (3 * n / 32) * 36;
+    s.weights = take(s.weight_bytes);
+    s.bytes = (s.bytes + 255) & ~(size_t) 255;
+    return s;
+}
+
+// A projection's R1Q2 rows, read with the routed expert's K, to the common matrix kernel's three int8 planes.
+void bih3_gather_group(sycl::queue& q, Bih3R1q2Layer L, const unsigned long long* ptr, const int32_t* start,
+                       const int32_t* groups, const int32_t* dst, int group, bool down, uint8_t* gathered) {
+    const int rows = down ? L.n_embd : 2 * L.n_ff, width = down ? L.n_ff : L.n_embd;
+    const int blocks = width / 32;
+    q.parallel_for(sycl::range<2>((size_t) rows, (size_t) blocks), [=](sycl::id<2> id) {
+        if (group >= *groups || start[group] == start[group + 1]) return;
+        const int expert = L.route_ids[dst[start[group]]];
+        const int gk = L.k_pairs[(size_t) 2 * expert], dk = L.k_pairs[(size_t) 2 * expert + 1];
+        const uint8_t* blob = reinterpret_cast<const uint8_t*>(ptr[group]);
+        const int row = (int) id[0], sb = (int) id[1], b = sb / 4;
+        const int matrix = down ? 2 : row / L.n_ff, r = down ? row : row % L.n_ff;
+        const int k = down ? dk : gk, qblocks = width / 128, qbytes = (qblocks + 3) / 4;
+        const size_t grow = (size_t) (L.n_embd / 128) * 4 * (size_t) gk;
+        const size_t drow = (size_t) (L.n_ff / 128) * 4 * (size_t) dk;
+        const size_t up = grow * (size_t) L.n_ff, dn = 2 * up;
+        const size_t scale_off = (dn + drow * (size_t) L.n_embd + 15) & ~(size_t) 15;
+        const size_t gu_scale = (size_t) L.n_ff * 2 + (size_t) (L.n_embd / 128) * 2 +
+                                (size_t) L.n_ff * (size_t) ((L.n_embd / 128 + 3) / 4);
+        const int matrix_rows = down ? L.n_embd : L.n_ff;
+        const uint8_t* scales = blob + scale_off + (size_t) matrix * gu_scale;
+        const uint8_t* cols = scales + (size_t) matrix_rows * 2;
+        const uint8_t* qs = cols + (size_t) qblocks * 2 + (size_t) r * qbytes;
+        const uint8_t* code = blob + (matrix == 1 ? up : matrix == 2 ? dn : 0) +
+                              (size_t) r * (down ? drow : grow) + (size_t) b * 4 * (size_t) k;
+        const auto half_at = [](const uint8_t* p) {
+            return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+        };
+        const float scale = half_at(scales + 2 * (size_t) r) * half_at(cols + 2 * (size_t) b) *
+                            L.p2[matrix][(qs[b / 4] >> (2 * (b % 4))) & 3] * (1.f / 128.f);
+        for (int j = 0; j < 8; ++j) {
+            const auto planes = xe::bih3_planes(code, k, (sb % 4) * 8 + j);
+            for (int p = 0; p < 3; ++p) {
+                uint8_t* block = gathered + ((size_t) row * blocks * 3 + (size_t) sb * 3 + p) * 36;
+                reinterpret_cast<uint32_t*>(block)[j] = planes.v[p];
+                if (j == 0) *reinterpret_cast<float*>(block + 32) = scale;
+            }
+        }
+    });
+}
+}  // namespace
+
+// Direct row product for the small-device fallback. The expert's K and the blob address are device-side routing data.
+inline float bih3_grouped_row(Bih3R1q2Layer L, const uint8_t* blob, int expert, int matrix, int row,
+                              const block_q8_1* x) {
+    const int gk = L.k_pairs[(size_t) 2 * expert], dk = L.k_pairs[(size_t) 2 * expert + 1];
+    const int width = matrix == 2 ? L.n_ff : L.n_embd, rows = matrix == 2 ? L.n_embd : L.n_ff;
+    const int k = matrix == 2 ? dk : gk, nb = width / 128, qbytes = (nb + 3) / 4;
+    const size_t grow = (size_t) (L.n_embd / 128) * 4 * (size_t) gk;
+    const size_t drow = (size_t) (L.n_ff / 128) * 4 * (size_t) dk;
+    const size_t up = grow * (size_t) L.n_ff, dn = 2 * up;
+    const size_t scale_off = (dn + drow * (size_t) L.n_embd + 15) & ~(size_t) 15;
+    const size_t gu_scale = (size_t) L.n_ff * 2 + (size_t) (L.n_embd / 128) * 2 +
+                            (size_t) L.n_ff * (size_t) ((L.n_embd / 128 + 3) / 4);
+    const uint8_t* bases = blob + scale_off + (size_t) matrix * gu_scale;
+    const uint8_t* cols = bases + (size_t) rows * 2;
+    const uint8_t* qs = cols + (size_t) nb * 2 + (size_t) row * qbytes;
+    const uint8_t* codes = blob + (matrix == 1 ? up : matrix == 2 ? dn : 0) +
+                           (size_t) row * (matrix == 2 ? drow : grow);
+    const auto half_at = [](const uint8_t* p) {
+        return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+    };
+    float sums[4] = {};
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* code = codes + (size_t) b * 4 * (size_t) k;
+        const float scale = half_at(cols + (size_t) b * 2) * L.p2[matrix][(qs[b / 4] >> (2 * (b % 4))) & 3];
+        for (int q = 0; q < 4; ++q) {
+            const block_q8_1& xb = x[b * 4 + q];
+            int dot = 0;
+            for (int j = 0; j < 8; ++j) {
+                const auto planes = xe::bih3_planes(code, k, q * 8 + j);
+                const int act = get_int_b4(xb.qs, j);
+                for (int p = 0; p < 3; ++p) dot = dp4a((int) planes.v[p], act, dot);
+            }
+            sums[q] = sycl::fma((float) (dot * 64), scale * low_half(xb.ds), sums[q]);
+        }
+    }
+    return ((sums[0] + sums[1]) + (sums[2] + sums[3])) * (1.f / 8192.f) * half_at(bases + (size_t) row * 2);
+}
+
+void bih3_r1q2_grouped_scalar(const Bih3R1q2Layer& L, const unsigned long long* ptr, const int32_t* start,
+                              const int32_t* groups, const int32_t* dst, const int32_t* tok, int64_t cap_groups,
+                              int64_t cap, const void* x_q8_1, void* scratch, float* out, void* stream) {
+    if (cap_groups <= 0 || cap <= 0) return;
+    require(L.n_expert > 0 && L.k_pairs && L.route_ids && ptr && start && groups && dst && tok && x_q8_1 && scratch &&
+            out && bih3_r1q2_grouped_scratch_bytes(cap, L.n_embd, L.n_ff) > 0, "bih3_r1q2_grouped_scalar");
+    auto& q = queue_for(stream);
+    const Bih3GroupedScratch s = bih3_scratch(scratch, cap, L.n_embd, L.n_ff);
+    const auto* X = static_cast<const block_q8_1*>(x_q8_1);
+    const int n = L.n_embd, ff = L.n_ff;
+    const float lim = expert_swiglu_limit();
+    q.parallel_for(sycl::range<2>((size_t) cap, (size_t) (2 * ff)), [=](sycl::id<2> id) {
+        const int e = (int) id[0], row = (int) id[1];
+        int g = 0;
+        while (g < *groups && start[g + 1] <= e) ++g;
+        if (g >= *groups) return;
+        const int expert = L.route_ids[dst[e]], matrix = row / ff;
+        const auto* blob = reinterpret_cast<const uint8_t*>(ptr[g]);
+        s.gu[(size_t) e * 2 * ff + row] = bih3_grouped_row(L, blob, expert, matrix, row % ff,
+                                                           X + (size_t) tok[e] * (n / 32));
+    });
+    q.parallel_for(sycl::range<1>((size_t) cap * ff), [=](sycl::id<1> id) {
+        const size_t i = id[0], e = i / (size_t) ff, r = i % (size_t) ff;
+        if (*groups <= 0 || e >= (size_t) start[*groups]) { s.h[i] = 0.f; return; }
+        float gate = s.gu[e * 2 * ff + r], up = s.gu[e * 2 * ff + ff + r];
+        swiglu_clamp(gate, up, lim);
+        s.h[i] = canon::silu_mul(gate, up);
+    });
+    if (L.had_block > 0)
+        launch_hadamard_rows<float>(q, s.h, s.h, cap, ff, L.had_block, L.d_signs, "bih3_r1q2_grouped_scalar");
+    // One work-item a block: the shared q8 quantizer requires 256 work-items per group.
+    q.parallel_for(sycl::range<1>((size_t) cap * ff / 32), [=](sycl::id<1> id) {
+        const size_t b = id[0];
+        const float* x = s.h + b * 32;
+        float amax = 0.f;
+        for (int i = 0; i < 32; ++i) amax = sycl::fmax(amax, sycl::fabs(x[i]));
+        const float d = canon::q8_scale(amax), inv = canon::q8_inv(d);
+        auto* bytes = reinterpret_cast<uint8_t*>(s.hq + b);
+        *reinterpret_cast<sycl::half2*>(bytes) = sycl::half2(sycl::half(d), sycl::half(0.f));
+        auto* values = reinterpret_cast<int8_t*>(bytes + 4);
+        for (int i = 0; i < 32; ++i) values[i] = canon::q8_value(x[i], inv);
+    });
+    q.parallel_for(sycl::range<2>((size_t) cap, (size_t) n), [=](sycl::id<2> id) {
+        const int e = (int) id[0], row = (int) id[1];
+        int g = 0;
+        while (g < *groups && start[g + 1] <= e) ++g;
+        if (g >= *groups) return;
+        const int expert = L.route_ids[dst[e]];
+        const auto* blob = reinterpret_cast<const uint8_t*>(ptr[g]);
+        out[(size_t) dst[e] * n + row] = bih3_grouped_row(L, blob, expert, 2, row, s.hq + (size_t) e * (ff / 32));
+    });
+    if (!stream) q.wait_and_throw();
+}
+
+namespace {
+// Lanes a row and rows a work-group of the direct grouped products: the gate/up rows are 2560 values (80 blocks of 32)
+// and the down rows 640 (20), as the native experts' GU_LPR / DOWN_LPR.
+constexpr int kBih3GuLpr = 16, kBih3DownLpr = 2, kBih3Rows = 8;
+// a single group of up to this many entries goes straight from the blob, more are gathered for the matrix kernel
+constexpr int64_t kBih3DirectRows = 16;
+
+// The prompt's groups (bih3_r1q2_prompt_groups): groups gbase .. gend of a layer, group g the expert at ptr[g] (0:
+// computed elsewhere), its K in kp[g] (gate/up | down << 8), its entries start[g] .. start[g + 1], entry e's
+// activation row tok[e] and output row e, its scratch row e - rbase.
+struct Bih3PromptGroups {
+    const unsigned long long* ptr;
+    const int32_t *start, *kp, *tok;
+    int gbase, gend, rbase;
+};
+
+// A routed expert's row of R1Q2 codes against up to NE entries' q8_1 activations, straight from the blob: LPR lanes a
+// row, each lane a 32-value block at a time, its byte planes decoded once for the NE entries.  The entries' activations
+// are x's rows rows_of[e] (ints held, not pointers: NE 64-bit pointers took twice the registers on a SIMD32 sub-group,
+// and the prompt's 8 entries a pass ran 1.8x slower with them on the B70).  Rows not `valid` (past the matrix on some
+// lanes of the sub-group) add nothing but still take part in the segment's reduction.  matrix 0 gate, 1 up, 2 down;
+// k_gu / k_d the expert's K.  Returns, on every lane of the segment, the row's sums times 1/8192 and the row base.
+template<int LPR, int NE>
+inline void bih3_direct_row(const sycl::sub_group& sg, const Bih3R1q2Layer& L, const uint8_t* blob, int k_gu,
+                            int k_d, int matrix, int row, bool valid, const block_q8_1* x, const int (&rows_of)[NE],
+                            int n, int seg, float (&out)[NE]) {
+    const int width = matrix == 2 ? L.n_ff : L.n_embd, xb = width / 32;
+    const int rows = matrix == 2 ? L.n_embd : L.n_ff;
+    const int k = matrix == 2 ? k_d : k_gu, nb = width / 128, qbytes = (nb + 3) / 4;
+    const size_t grow = (size_t) (L.n_embd / 128) * 4 * (size_t) k_gu;
+    const size_t drow = (size_t) (L.n_ff / 128) * 4 * (size_t) k_d;
+    const size_t up = grow * (size_t) L.n_ff, dn = 2 * up;
+    const size_t scale_off = (dn + drow * (size_t) L.n_embd + 15) & ~(size_t) 15;
+    const size_t gu_scale = (size_t) L.n_ff * 2 + (size_t) (L.n_embd / 128) * 2 +
+                            (size_t) L.n_ff * (size_t) ((L.n_embd / 128 + 3) / 4);
+    const uint8_t* bases = blob + scale_off + (size_t) matrix * gu_scale;
+    const uint8_t* cols = bases + (size_t) rows * 2;
+    const uint8_t* qs = cols + (size_t) nb * 2 + (size_t) row * qbytes;
+    const uint8_t* codes = blob + (matrix == 1 ? up : matrix == 2 ? dn : 0) +
+                           (size_t) row * (matrix == 2 ? drow : grow);
+    const auto half_at = [](const uint8_t* p) {
+        return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+    };
+    float s[NE];
+    for (int j = 0; j < NE; ++j) s[j] = 0.f;
+    const int nsb = valid ? xb : 0;
+    for (int sb = seg; sb < nsb; sb += LPR) {
+        const int b = sb / 4, q = sb % 4;
+        const uint8_t* code = codes + (size_t) b * 4 * (size_t) k;
+        const float scale = half_at(cols + (size_t) b * 2) * L.p2[matrix][(qs[b / 4] >> (2 * (b % 4))) & 3];
+        xe::Bih3Planes planes[8];
+        xe::bih3_block_planes(code, k, q, planes);
+        for (int e = 0; e < NE; ++e)
+            if (e < n) {
+                const block_q8_1& xq = x[(size_t) ((uint32_t) rows_of[e] * (uint32_t) xb + (uint32_t) sb)];
+                int dot = 0;
+                for (int j = 0; j < 8; ++j) {
+                    const int act = get_int_b4(xq.qs, j);
+                    for (int p = 0; p < 3; ++p) dot = dp4a((int) planes[j].v[p], act, dot);
+                }
+                s[e] = sycl::fma((float) (dot * 64), scale * low_half(xq.ds), s[e]);
+            }
+    }
+    const float base = valid ? half_at(bases + (size_t) row * 2) * (1.f / 8192.f) : 0.f;
+    for (int e = 0; e < NE; ++e) {
+        float v = s[e];
+        for (int o = LPR / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+        out[e] = v * base;
+    }
+}
+
+// gate/up (matrix < 2: the 2 n_ff rows into gu) or down (the n_embd rows from hq into out), the grid's rows the groups
+template<int LPR, int NE, bool DOWN>
+void launch_bih3_prompt(sycl::queue& q, size_t grid, Bih3R1q2Layer L, Bih3PromptGroups G, const block_q8_1* x,
+                        float* y) {
+    constexpr int RPW = kWarp / LPR;
+    const int rows = DOWN ? L.n_embd : 2 * L.n_ff;
+    const size_t xgroups = (size_t) ((rows + kBih3Rows * RPW - 1) / (kBih3Rows * RPW));
+    q.parallel_for(sycl::nd_range<2>({grid, xgroups * kBih3Rows * kWarp}, {1, (size_t) kBih3Rows * kWarp}),
+                   [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int row0 = ((int) it.get_group(1) * kBih3Rows + warp) * RPW;
+        if (row0 >= rows) return;                                            // the whole sub-group
+        const int row = row0 + lane / LPR, seg = lane % LPR;
+        const bool valid = row < rows;
+        const int matrix = DOWN ? 2 : valid ? row / L.n_ff : 0, r = DOWN ? (valid ? row : 0) : valid ? row % L.n_ff : 0;
+        for (int g = G.gbase + (int) it.get_group(0); g < G.gend; g += (int) it.get_group_range(0)) {
+            const int e0 = G.start[g], e1 = G.start[g + 1];
+            if (e0 >= e1 || G.ptr[g] == 0) continue;
+            const int k_gu = G.kp[g] & 0xff, k_d = G.kp[g] >> 8;
+            const auto* blob = reinterpret_cast<const uint8_t*>(G.ptr[g]);
+            for (int e = e0; e < e1; e += NE) {
+                const int n = sycl::min(NE, e1 - e);
+                int rows_of[NE];
+                for (int j = 0; j < NE; ++j) rows_of[j] = DOWN ? (j < n ? e + j : e) - G.rbase : G.tok[j < n ? e + j : e];
+                float s[NE];
+                bih3_direct_row<LPR, NE>(sg, L, blob, k_gu, k_d, matrix, r, valid, x, rows_of, n, seg, s);
+                if (valid && seg == 0)
+                    for (int j = 0; j < n; ++j) {
+                        const size_t o = DOWN ? (size_t) (e + j) : (size_t) (e + j - G.rbase);
+                        y[o * (size_t) rows + (size_t) row] = s[j];
+                    }
+            }
+        }
+    });
+}
+
+// One pass over `grid` groups and the scratch rows [0, nrows): gate/up, SwiGLU, the Hadamard of h, q8_1, down.
+// A row of a group with no blob is left as it is in the scratch (nothing reads it).
+template<int NE>
+void bih3_prompt_pass(sycl::queue& q, const Bih3R1q2Layer& L, const Bih3PromptGroups& G, size_t grid, int64_t nrows,
+                      const void* x_q8_1, const Bih3GroupedScratch& s, float* out) {
+    const int ff = L.n_ff;
+    const float lim = expert_swiglu_limit();
+    launch_bih3_prompt<kBih3GuLpr, NE, false>(q, grid, L, G, static_cast<const block_q8_1*>(x_q8_1), s.gu);
+    q.parallel_for(sycl::range<1>((size_t) nrows * (size_t) ff), [=](sycl::id<1> id) {
+        const size_t i = id[0], e = i / (size_t) ff, r = i % (size_t) ff;
+        float gate = s.gu[e * (size_t) (2 * ff) + r], up = s.gu[e * (size_t) (2 * ff) + (size_t) ff + r];
+        swiglu_clamp(gate, up, lim);
+        s.h[i] = canon::silu_mul(gate, up);
+    });
+    if (L.had_block > 0)
+        launch_hadamard_rows<float>(q, s.h, s.h, nrows, ff, L.had_block, L.d_signs, "bih3_prompt_pass");
+    launch_quantize_q8_1_canon(q, s.h, s.hq, (long long) nrows * ff);
+    launch_bih3_prompt<kBih3DownLpr, NE, true>(q, grid, L, G, s.hq, out);
+}
+
+// gate/up: grid rows are the groups (a group's entries in passes of kEntriesPass), columns the 2 * n_ff rows
+template<int LPR>
+void launch_bih3_decode_gu(sycl::queue& q, size_t cap_groups, Bih3R1q2Layer L, const unsigned long long* ptr,
+                           const int32_t* start, const int32_t* groups, const int32_t* dst, const int32_t* tok,
+                           const block_q8_1* X, float* gu) {
+    constexpr int RPW = kWarp / LPR;
+    const int rows = 2 * L.n_ff;
+    const size_t xgroups = (size_t) ((rows + kBih3Rows * RPW - 1) / (kBih3Rows * RPW));
+    q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * kBih3Rows * kWarp}, {1, (size_t) kBih3Rows * kWarp}),
+                   [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int row0 = ((int) it.get_group(1) * kBih3Rows + warp) * RPW;
+        if (row0 >= rows) return;                                            // the whole sub-group
+        const int row = row0 + lane / LPR, seg = lane % LPR;
+        const bool valid = row < rows;
+        const int matrix = valid ? row / L.n_ff : 0, r = valid ? row % L.n_ff : 0;
+        for (int g = (int) it.get_group(0); g < *groups; g += (int) it.get_group_range(0)) {
+            const int e0 = start[g], e1 = start[g + 1];
+            if (e0 >= e1) continue;
+            const int expert = L.route_ids[dst[e0]];
+            const int k_gu = L.k_pairs[(size_t) 2 * expert], k_d = L.k_pairs[(size_t) 2 * expert + 1];
+            const auto* blob = reinterpret_cast<const uint8_t*>(ptr[g]);
+            for (int e = e0; e < e1; e += kEntriesPass) {
+                const int n = sycl::min(kEntriesPass, e1 - e);
+                int rows_of[kEntriesPass];
+                for (int j = 0; j < kEntriesPass; ++j) rows_of[j] = tok[j < n ? e + j : e];
+                float s[kEntriesPass];
+                bih3_direct_row<LPR, kEntriesPass>(sg, L, blob, k_gu, k_d, matrix, r, valid, X, rows_of, n, seg, s);
+                if (valid && seg == 0)
+                    for (int j = 0; j < n; ++j) gu[(size_t) (e + j) * (size_t) rows + (size_t) row] = s[j];
+            }
+        }
+    });
+}
+
+// down: the entries' q8_1 h rows to out[dst[e]]
+template<int LPR>
+void launch_bih3_decode_down(sycl::queue& q, size_t cap_groups, Bih3R1q2Layer L, const unsigned long long* ptr,
+                             const int32_t* start, const int32_t* groups, const int32_t* dst, const block_q8_1* hq,
+                             float* out) {
+    constexpr int RPW = kWarp / LPR;
+    const int rows = L.n_embd;
+    const size_t xgroups = (size_t) ((rows + kBih3Rows * RPW - 1) / (kBih3Rows * RPW));
+    q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * kBih3Rows * kWarp}, {1, (size_t) kBih3Rows * kWarp}),
+                   [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int row0 = ((int) it.get_group(1) * kBih3Rows + warp) * RPW;
+        if (row0 >= rows) return;
+        const int row = row0 + lane / LPR, seg = lane % LPR;
+        const bool valid = row < rows;
+        for (int g = (int) it.get_group(0); g < *groups; g += (int) it.get_group_range(0)) {
+            const int e0 = start[g], e1 = start[g + 1];
+            if (e0 >= e1) continue;
+            const int expert = L.route_ids[dst[e0]];
+            const int k_gu = L.k_pairs[(size_t) 2 * expert], k_d = L.k_pairs[(size_t) 2 * expert + 1];
+            const auto* blob = reinterpret_cast<const uint8_t*>(ptr[g]);
+            for (int e = e0; e < e1; e += kEntriesPass) {
+                const int n = sycl::min(kEntriesPass, e1 - e);
+                int rows_of[kEntriesPass];
+                for (int j = 0; j < kEntriesPass; ++j) rows_of[j] = j < n ? e + j : e;
+                float s[kEntriesPass];
+                bih3_direct_row<LPR, kEntriesPass>(sg, L, blob, k_gu, k_d, 2, valid ? row : 0, valid, hq, rows_of, n, seg, s);
+                if (valid && seg == 0)
+                    for (int j = 0; j < n; ++j) out[(size_t) dst[e + j] * (size_t) rows + (size_t) row] = s[j];
+            }
+        }
+    });
+}
+
+// The decode's grouped layer straight from the blobs: four launches a layer.  The gathered form below expands each
+// group's expert to three int8 planes (3.4 bytes a weight) and runs ~10 launches a group, which a verify window's
+// one or two entries a group cannot pay back: the B70's Sync-S decode spent 143 of its 173 ms a round there.
+void bih3_r1q2_grouped_direct(const Bih3R1q2Layer& L, const unsigned long long* ptr, const int32_t* start,
+                              const int32_t* groups, const int32_t* dst, const int32_t* tok, int64_t cap_groups,
+                              int64_t cap, const void* x_q8_1, void* scratch, float* out, sycl::queue& q) {
+    const Bih3GroupedScratch s = bih3_scratch(scratch, cap, L.n_embd, L.n_ff);
+    const int ff = L.n_ff;
+    const float lim = expert_swiglu_limit();
+    launch_bih3_decode_gu<kBih3GuLpr>(q, (size_t) cap_groups, L, ptr, start, groups, dst, tok,
+                                      static_cast<const block_q8_1*>(x_q8_1), s.gu);
+    q.parallel_for(sycl::range<1>((size_t) cap * (size_t) ff), [=](sycl::id<1> id) {
+        const size_t i = id[0], e = i / (size_t) ff, r = i % (size_t) ff;
+        if (*groups <= 0 || e >= (size_t) start[*groups]) { s.h[i] = 0.f; return; }
+        float gate = s.gu[e * (size_t) (2 * ff) + r], up = s.gu[e * (size_t) (2 * ff) + (size_t) ff + r];
+        swiglu_clamp(gate, up, lim);
+        s.h[i] = canon::silu_mul(gate, up);
+    });
+    if (L.had_block > 0)
+        launch_hadamard_rows<float>(q, s.h, s.h, cap, ff, L.had_block, L.d_signs, "bih3_r1q2_grouped_direct");
+    launch_quantize_q8_1_canon(q, s.h, s.hq, (long long) cap * ff);
+    launch_bih3_decode_down<kBih3DownLpr>(q, (size_t) cap_groups, L, ptr, start, groups, dst, s.hq, out);
+}
+}  // namespace
+
+size_t bih3_r1q2_grouped_scratch_bytes(int64_t cap, int64_t n, int64_t ff) {
+    if (cap <= 0 || n <= 0 || ff <= 0 || n % 128 || ff % 128) return 0;
+    return bih3_scratch(nullptr, cap, n, ff).bytes;
+}
+
+void bih3_r1q2_grouped(const Bih3R1q2Layer& L, const unsigned long long* ptr, const int32_t* start,
+                       const int32_t* groups, const int32_t* dst, const int32_t* tok, int64_t cap_groups,
+                       int64_t cap, const void* x_q8_1, void* scratch, float* out, void* stream) {
+    if (cap_groups <= 0 || cap <= 0) return;
+    require(L.n_expert > 0 && L.k_pairs && L.route_ids && ptr && start && groups && dst && tok && x_q8_1 && scratch &&
+            out && bih3_r1q2_grouped_scratch_bytes(cap, L.n_embd, L.n_ff) > 0, "bih3_r1q2_grouped");
+    auto& q = queue_for(stream);
+    if (!iq_mmq_usable(q) && !iq_mmq_dp4a_usable(q)) {
+        bih3_r1q2_grouped_scalar(L, ptr, start, groups, dst, tok, cap_groups, cap, x_q8_1, scratch, out, stream);
+        return;
+    }
+    // a verify window's groups (one a routed expert, a few entries each) or a prompt's expert with few rows: straight
+    // from the blobs; a prompt's expert with many rows: gathered to the matrix kernel
+    if (cap_groups > 1 || cap <= kBih3DirectRows) {
+        bih3_r1q2_grouped_direct(L, ptr, start, groups, dst, tok, cap_groups, cap, x_q8_1, scratch, out, q);
+        if (!stream) q.wait_and_throw();
+        return;
+    }
+    const Bih3GroupedScratch s = bih3_scratch(scratch, cap, L.n_embd, L.n_ff);
+    const auto* X = static_cast<const block_q8_1*>(x_q8_1);
+    const int n = L.n_embd, ff = L.n_ff;
+    const float lim = expert_swiglu_limit();
+    q.parallel_for(sycl::range<1>((size_t) cap), [=](sycl::id<1> i) { s.identity[i] = (int32_t) i[0]; });
+    for (int64_t g = 0; g < cap_groups; ++g) {
+        q.single_task([=] {
+            s.bounds[0] = 0;
+            s.bounds[1] = g < *groups ? start[g + 1] - start[g] : 0;
+        });
+        // Each group reads its own routed tokens into the shared matrix activation format.
+        q.parallel_for(sycl::range<2>((size_t) cap, (size_t) (n / 32)), [=](sycl::id<2> id) {
+            const size_t entry = id[0], block = id[1];
+            if (entry >= (size_t) s.bounds[1]) return;
+            const int e = start[g] + (int) entry, source = tok[e];
+            const block_q8_1& in = X[(size_t) source * (size_t) (n / 32) + block];
+            auto* scales = reinterpret_cast<float*>(s.xq + (size_t) cap * (size_t) (3 * n));
+            for (int p = 0; p < 3; ++p) {
+                const size_t dest = entry * (size_t) (3 * n / 32) + 3 * block + p;
+                for (int j = 0; j < 8; ++j) reinterpret_cast<uint32_t*>(s.xq + dest * 32)[j] =
+                                                   (uint32_t) get_int_b4(in.qs, j);
+                scales[dest] = low_half(in.ds);
+            }
+            if (block == 0) s.scatter[entry] = dst[e];
+        });
+        bih3_gather_group(q, L, ptr, start, groups, dst, (int) g, false, s.weights);
+        iq_mmq_grouped(q, kBih3Planes, s.weights, s.weight_bytes, (int64_t) 2 * ff, (int64_t) 3 * n, 1, s.xq, cap, s.bounds, cap,
+                       s.identity, s.gu, (int64_t) 2 * ff);
+        q.parallel_for(sycl::range<1>((size_t) cap * (size_t) ff), [=](sycl::id<1> id) {
+            const size_t i = id[0], entry = i / (size_t) ff, r = i % (size_t) ff;
+            if (entry >= (size_t) s.bounds[1]) { s.h[i] = 0.f; return; }
+            float gate = s.gu[entry * (size_t) (2 * ff) + r];
+            float up = s.gu[entry * (size_t) (2 * ff) + (size_t) ff + r];
+            swiglu_clamp(gate, up, lim);
+            s.h[i] = canon::silu_mul(gate, up);
+        });
+        if (L.had_block > 0)
+            launch_hadamard_rows<float>(q, s.h, s.h, cap, ff, L.had_block, L.d_signs, "bih3_r1q2_grouped");
+        launch_quantize_q8_1_canon(q, s.h, s.hq, (long long) cap * ff);
+        bih3_r1q2_expand_mmq(s.hq, s.xq, ff, (int) cap, stream);
+        bih3_gather_group(q, L, ptr, start, groups, dst, (int) g, true, s.weights);
+        iq_mmq_grouped(q, kBih3Planes, s.weights, s.weight_bytes, n, (int64_t) 3 * ff, 1, s.xq, cap, s.bounds, cap,
+                       s.scatter, out, n);
+    }
+    if (!stream) q.wait_and_throw();
+}
+
+size_t bih3_r1q2_prompt_scratch_bytes(int64_t cap, int64_t n, int64_t ff) {
+    const size_t grouped = bih3_r1q2_grouped_scratch_bytes(cap, n, ff);
+    return grouped ? ((grouped + 7) & ~(size_t) 7) + 24 + (size_t) cap * 8 : 0;
+}
+
+void bih3_r1q2_prompt(const Bih3R1q2Layer& layer, const uint8_t* blob, int gate_k, int down_k,
+                       const int32_t* token_rows, int64_t rows, int64_t cap, const void* x_q8_1,
+                       void* scratch, float* out, void* stream) {
+    require(blob && token_rows && scratch && rows > 0 && rows <= cap && gate_k >= 2 && gate_k <= 14 &&
+            down_k >= 2 && down_k <= 14 && bih3_r1q2_prompt_scratch_bytes(cap, layer.n_embd, layer.n_ff),
+            "bih3_r1q2_prompt");
+    auto& q = queue_for(stream);
+    auto* meta = static_cast<uint8_t*>(scratch) +
+                 ((bih3_r1q2_grouped_scratch_bytes(cap, layer.n_embd, layer.n_ff) + 7) & ~(size_t) 7);
+    auto* ptr = reinterpret_cast<unsigned long long*>(meta);
+    auto* start = reinterpret_cast<int32_t*>(meta + 8);
+    auto* groups = start + 2;
+    auto* k = reinterpret_cast<uint8_t*>(groups + 1);
+    auto* dst = reinterpret_cast<int32_t*>(meta + 24);
+    auto* route = dst + cap;
+    q.single_task([=] {
+        ptr[0] = (unsigned long long) blob;
+        start[0] = 0; start[1] = (int32_t) rows; *groups = 1;
+        k[0] = (uint8_t) gate_k; k[1] = (uint8_t) down_k;
+    });
+    q.parallel_for(sycl::range<1>((size_t) cap), [=](sycl::id<1> i) {
+        dst[i] = (int32_t) i[0]; route[i] = 0;
+    });
+    Bih3R1q2Layer one = layer;
+    one.n_expert = 1; one.k_pairs = k; one.route_ids = route;
+    bih3_r1q2_grouped(one, ptr, start, groups, dst, token_rows, 1, rows, x_q8_1,
+                      scratch, out, stream);
+}
+
+// Entries a pass over a row in the prompt's direct products: an expert's rows are many (a 3.5K prompt routes ~70 rows
+// to each of 512), and each pass decodes the row's states again.
+constexpr int kBih3PromptPass = 8;
+
+void bih3_r1q2_prompt_groups(const Bih3R1q2Layer& layer, const unsigned long long* ptr, const int32_t* start,
+                             const int32_t* k_pack, const int32_t* start_host, int n_groups, const int32_t* tok,
+                             const void* x_q8_1, void* scratch, int64_t cap, float* out, void* stream) {
+    require(ptr && start && k_pack && start_host && tok && x_q8_1 && scratch && out && cap > 0 && n_groups >= 0 &&
+            bih3_r1q2_prompt_scratch_bytes(cap, layer.n_embd, layer.n_ff), "bih3_r1q2_prompt_groups");
+    auto& q = queue_for(stream);
+    const Bih3GroupedScratch s = bih3_scratch(scratch, cap, layer.n_embd, layer.n_ff);
+    for (int g0 = 0; g0 < n_groups;) {   // whole groups whose rows fit the scratch's cap (a group's rows are <= cap)
+        int g1 = g0 + 1;
+        require(start_host[g1] - start_host[g0] <= cap, "bih3_r1q2_prompt_groups: a group's rows pass the cap");
+        while (g1 < n_groups && start_host[g1 + 1] - start_host[g0] <= cap) ++g1;
+        const Bih3PromptGroups G{ptr, start, k_pack, tok, g0, g1, start_host[g0]};
+        bih3_prompt_pass<kBih3PromptPass>(q, layer, G, (size_t) (g1 - g0), start_host[g1] - start_host[g0], x_q8_1, s,
+                                          out);
+        g0 = g1;
+    }
+    if (!stream) q.wait_and_throw();
+}
+
+void bih3_r1q2_dequant_f16(const Bih3R1q2Layer& L, const uint8_t* blob, int gate_k, int down_k, uint16_t* gu,
+                           uint16_t* d, void* stream) {
+    require(blob && gu && d && gate_k >= 2 && gate_k <= 14 && down_k >= 2 && down_k <= 14 && L.n_embd % 128 == 0 &&
+            L.n_ff % 128 == 0, "bih3_r1q2_dequant_f16");
+    const int n = L.n_embd, ff = L.n_ff;
+    const size_t grow = (size_t) (n / 128) * 4 * (size_t) gate_k, drow = (size_t) (ff / 128) * 4 * (size_t) down_k;
+    const size_t up = grow * (size_t) ff, dn = 2 * up;
+    const size_t scale_off = (dn + drow * (size_t) n + 15) & ~(size_t) 15;
+    const size_t gu_scale = (size_t) ff * 2 + (size_t) (n / 128) * 2 + (size_t) ff * (size_t) ((n / 128 + 3) / 4);
+    float p2[3][4];
+    std::memcpy(p2, L.p2, sizeof p2);
+    auto& queue = queue_for(stream);
+    // one work-item a state (4 values, 8 bytes written; a sub-group's lanes write one run), a launch for the gate and
+    // up rows and one for the down rows (a 2D range: no division a work-item)
+    sycl::event e;
+    for (const bool down : {false, true}) {
+        const int width = down ? ff : n, rows_out = down ? n : 2 * ff, k = down ? down_k : gate_k;
+        auto* out_h = reinterpret_cast<sycl::half*>(down ? d : gu);
+        e = queue.parallel_for(sycl::range<2>((size_t) rows_out, (size_t) (width / 4)), [=](sycl::id<2> id) {
+            const int row_all = (int) id[0], st = (int) id[1];
+            // the gate and up rows interleaved as iq_dequant_gu_f16 writes them: output row 2 r + m is matrix m's r
+            const int m = down ? 2 : row_all & 1, r = down ? row_all : row_all >> 1;
+            const int nb = width / 128, qbytes = (nb + 3) / 4, b = st / 32;
+            const uint8_t* bases = blob + scale_off + (size_t) m * gu_scale;
+            const uint8_t* cols = bases + (size_t) (down ? n : ff) * 2;
+            const uint8_t q = cols[(size_t) nb * 2 + (size_t) r * qbytes + b / 4];
+            const auto half_at = [](const uint8_t* p) {
+                return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+            };
+            // the decode's expression (bih3_grouped_row): the integer numerator / 128 x colscale x p2 x rowbase
+            const float scale = half_at(cols + (size_t) b * 2) * p2[m][(q >> (2 * (b % 4))) & 3] * (1.f / 128.f) *
+                                half_at(bases + (size_t) r * 2);
+            const uint8_t* code = blob + (m == 1 ? up : m == 2 ? dn : 0) + (size_t) r * (down ? drow : grow) +
+                                  (size_t) b * 4 * (size_t) k;
+            int num[4];
+            xe::bih3_state_values(xe::bih3_state_w(code, k, st % 32), num);
+            sycl::vec<sycl::half, 4> v;
+            for (int c = 0; c < 4; ++c) v[c] = sycl::half((float) num[c] * scale);
+            sycl::half* out = out_h + (size_t) row_all * (size_t) width + 4 * (size_t) st;
+            *reinterpret_cast<sycl::vec<sycl::half, 4>*>(out) = v;
+        });
+    }
+    sync_if_needed(stream, e, "bih3_r1q2_dequant_f16");
+}
+
+size_t bih3_r1q2_code_bytes(int64_t n_embd, int64_t n_ff) {
+    return (size_t) (2 * n_ff) * (size_t) (n_embd / 128) * 64 + (size_t) n_embd * (size_t) (n_ff / 128) * 64;
+}
+
+void bih3_r1q2_prompt_mmq(const Bih3R1q2Layer& L, int n, const unsigned long long* ptr, const int32_t* k_pack,
+                          const int32_t* bounds, int64_t max_rows, const int32_t* rows, const int32_t* tok, int64_t R,
+                          const void* x_q8_1, void* scratch, void* weights, float* out, void* stream) {
+    if (n <= 0 || R <= 0) return;
+    require(ptr && k_pack && bounds && rows && tok && x_q8_1 && scratch && weights && out && max_rows > 0 &&
+            bih3_r1q2_grouped_scratch_bytes(R, L.n_embd, L.n_ff), "bih3_r1q2_prompt_mmq");
+    auto& q = queue_for(stream);
+    const Bih3GroupedScratch s = bih3_scratch(scratch, R, L.n_embd, L.n_ff);
+    const int N = L.n_embd, ff = L.n_ff, nbg = N / 128, nbd = ff / 128;
+    const size_t gu_row = (size_t) nbg * 64, d_row = (size_t) nbd * 64;
+    const size_t gu_bytes = (size_t) (2 * ff) * gu_row, d_bytes = (size_t) N * d_row;
+    auto* wgu = static_cast<uint8_t*>(weights);
+    uint8_t* wd = wgu + (size_t) n * gu_bytes;
+    // the pass's experts' codes into kBih3Code rows: one 128-value block of a row an item
+    const size_t items = (size_t) (2 * ff) * (size_t) nbg + (size_t) N * (size_t) nbd;
+    const Bih3R1q2Layer lay = L;
+    q.parallel_for(sycl::range<2>((size_t) n, items), [=](sycl::id<2> id) {
+        const int e = (int) id[0];
+        const size_t i = id[1];
+        const bool down = i >= (size_t) (2 * ff) * (size_t) nbg;
+        const size_t j = down ? i - (size_t) (2 * ff) * (size_t) nbg : i;
+        const int nb = down ? nbd : nbg, row = (int) (j / (size_t) nb), b = (int) (j % (size_t) nb);
+        const int matrix = down ? 2 : row / ff, r = down ? row : row % ff;
+        const int gk = k_pack[e] & 0xff, dk = k_pack[e] >> 8, k = down ? dk : gk;
+        const auto* blob = reinterpret_cast<const uint8_t*>(ptr[e]);
+        const size_t grow = (size_t) nbg * 4 * (size_t) gk, drow = (size_t) nbd * 4 * (size_t) dk;
+        const size_t up = grow * (size_t) ff, dn = 2 * up;
+        const size_t scale_off = (dn + drow * (size_t) N + 15) & ~(size_t) 15;
+        const size_t gu_scale = (size_t) ff * 2 + (size_t) nbg * 2 + (size_t) ff * (size_t) ((nbg + 3) / 4);
+        const int rows_m = down ? N : ff, qbytes = (nb + 3) / 4;
+        const uint8_t* bases = blob + scale_off + (size_t) matrix * gu_scale;
+        const uint8_t* cols = bases + (size_t) rows_m * 2;
+        const uint8_t* qs = cols + (size_t) nb * 2 + (size_t) r * qbytes;
+        const auto* code = reinterpret_cast<const uint32_t*>(
+            blob + (matrix == 1 ? up : matrix == 2 ? dn : 0) + (size_t) r * (down ? drow : grow) + (size_t) b * 4 * k);
+        const auto half_at = [](const uint8_t* p) {
+            return (float) sycl::bit_cast<sycl::half>((uint16_t) (p[0] | ((uint16_t) p[1] << 8)));
+        };
+        auto* dst = reinterpret_cast<uint32_t*>(down ? wd + (size_t) e * d_bytes + (size_t) row * d_row + (size_t) b * 64
+                                                      : wgu + (size_t) e * gu_bytes + (size_t) row * gu_row + (size_t) b * 64);
+        for (int w = 0; w < k; ++w) dst[w] = code[w];
+        const float scale = half_at(bases + 2 * (size_t) r) * half_at(cols + 2 * (size_t) b) *
+                            lay.p2[matrix][(qs[b / 4] >> (2 * (b % 4))) & 3] * (1.f / 128.f);
+        dst[14] = sycl::bit_cast<uint32_t>(scale);
+        dst[15] = (uint32_t) k;
+    });
+    // the routed rows' activations, three times each (a plane each), in the pass's order
+    const auto* X = static_cast<const block_q8_1*>(x_q8_1);
+    q.parallel_for(sycl::range<2>((size_t) R, (size_t) (N / 32)), [=](sycl::id<2> id) {
+        const size_t c = id[0], block = id[1];
+        const block_q8_1& in = X[(size_t) tok[rows[c]] * (size_t) (N / 32) + block];
+        auto* scales = reinterpret_cast<float*>(s.xq + (size_t) R * (size_t) (3 * N));
+        for (int p = 0; p < 3; ++p) {
+            const size_t dest = c * (size_t) (3 * N / 32) + 3 * block + p;
+            for (int j = 0; j < 8; ++j) reinterpret_cast<uint32_t*>(s.xq + dest * 32)[j] = (uint32_t) get_int_b4(in.qs, j);
+            scales[dest] = low_half(in.ds);
+        }
+        if (block == 0) s.identity[c] = (int32_t) c;
+    });
+    iq_mmq_grouped(q, kBih3Code, wgu, gu_bytes, (int64_t) 2 * ff, (int64_t) 3 * N, n, s.xq, R, bounds, max_rows,
+                   s.identity, s.gu, (int64_t) 2 * ff);
+    const float lim = expert_swiglu_limit();
+    q.parallel_for(sycl::range<1>((size_t) R * (size_t) ff), [=](sycl::id<1> id) {
+        const size_t i = id[0], e = i / (size_t) ff, r = i % (size_t) ff;
+        float gate = s.gu[e * (size_t) (2 * ff) + r], up = s.gu[e * (size_t) (2 * ff) + (size_t) ff + r];
+        swiglu_clamp(gate, up, lim);
+        s.h[i] = canon::silu_mul(gate, up);
+    });
+    if (L.had_block > 0) launch_hadamard_rows<float>(q, s.h, s.h, R, ff, L.had_block, L.d_signs, "bih3_r1q2_prompt_mmq");
+    launch_quantize_q8_1_canon(q, s.h, s.hq, (long long) R * ff);
+    bih3_r1q2_expand_mmq(s.hq, s.xq, ff, (int) R, stream);
+    iq_mmq_grouped(q, kBih3Code, wd, d_bytes, N, (int64_t) 3 * ff, n, s.xq, R, bounds, max_rows, rows, out, N);
+    if (!stream) q.wait_and_throw();
 }
 
 void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
@@ -2506,7 +3706,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
     require(n % 256 == 0 && is_iq(t), "iq_dequant_f16");
-    sync_if_needed(stream, launch_dequant_flat<sycl::half>(queue_for(stream), t, src, n, (sycl::half*) dst),
+    sync_if_needed(stream, launch_dequant_flat<sycl::half>(queue_for(stream), t, src, n, reinterpret_cast<sycl::half*>(dst)),
                    "iq_dequant_f16");
 }
 
@@ -2515,24 +3715,48 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
     sync_if_needed(stream, launch_dequant_flat<float>(queue_for(stream), t, src, n, dst), "iq_dequant_f32");
 }
 
-void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd,
-                   float* out, void* stream) {
+void embed_rows(const EmbedTable& tb, const int32_t* ids, int64_t token, int64_t n_tok, float* out, void* stream) {
     if (n_tok <= 0) return;
-    require(n_embd % 256 == 0 && embed_type_supported(t), "iq_embed_rows");
-    const auto* tab = (const uint8_t*) table;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<2>({(size_t) n_tok, (size_t) (n_embd / 256) * 32}, {1, 32}), [=](sycl::nd_item<2> it) {
-            const int64_t tok = (int64_t) it.get_group(0), b = (int64_t) it.get_group(1);
-            const uint8_t* row = tab + (size_t) tokens[tok] * row_bytes;
-            dq_dispatch(t, row, b, ToGlobal<float>{out + (size_t) tok * n_embd + b * QK_K}, (int) it.get_local_id(1));
+    const int64_t n = tb.n_embd;
+    const auto* tab = (const uint8_t*) tb.rows;
+    const size_t rb = tb.row_bytes;
+    sycl::event e;
+    if (tb.type == EmbedTable::kPacked) {
+        const int bits = tb.code_bits, bias = tb.code_bias, ge = tb.group_elems;
+        require((bits == 2 || bits == 4 || bits == 8) && ge > 0 && n % ge == 0 && n % (8 / bits) == 0, "embed_rows");
+        const float *scales = tb.scales, *offsets = tb.offsets;
+        const uint64_t row_groups = (uint64_t) (n / ge);
+        e = queue_for(stream).parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n), [=](sycl::id<2> id) {
+            const int64_t t = (int64_t) id[0], i = (int64_t) id[1];
+            const uint64_t row = (uint64_t) (ids ? (int64_t) ids[t] : token);
+            const uint8_t* c = tab + row * rb;
+            const float* sc = scales + row * row_groups;
+            const float* of = offsets ? offsets + row * row_groups : nullptr;
+            const int per_byte = 8 / bits;
+            const unsigned mask = (1u << bits) - 1u;
+            const int code = (int) ((c[i / per_byte] >> ((i % per_byte) * bits)) & mask);
+            const int64_t group = i / ge;
+            // the product and the sum round separately: this library is built without contraction
+            const float product = (float) (code + bias) * sc[group];
+            out[(size_t) t * n + i] = product + (of ? of[group] : 0.0f);
         });
-    sync_if_needed(stream, e, "iq_embed_rows");
+    } else {
+        require(n % 256 == 0 && embed_type_supported(tb.type), "embed_rows");
+        const int ty = tb.type;
+        e = queue_for(stream).parallel_for(
+            sycl::nd_range<2>({(size_t) n_tok, (size_t) (n / 256) * 32}, {1, 32}), [=](sycl::nd_item<2> it) {
+                const int64_t t = (int64_t) it.get_group(0), b = (int64_t) it.get_group(1);
+                const uint8_t* row = tab + (size_t) (ids ? (int64_t) ids[t] : token) * rb;
+                dq_dispatch(ty, row, b, ToGlobal<float>{out + (size_t) t * n + b * QK_K}, (int) it.get_local_id(1));
+            });
+    }
+    sync_if_needed(stream, e, "embed_rows");
 }
 
 void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream) {
     require(n_embd % 256 == 0 && is_iq(t), "iq_dequant_gu_f16");
     const int64_t per_row = n_embd / 256;
-    auto* y = (sycl::half*) dst;
+    auto* y = reinterpret_cast<sycl::half*>(dst);
     const int64_t nsb = n_ff * per_row;   // superblocks per matrix, eight a work-group
     const auto e = queue_for(stream).parallel_for(
         sycl::nd_range<2>({2, (size_t) (nsb + 7) / 8 * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
@@ -2550,8 +3774,8 @@ void iq_dequant_expert_f16(int t, const void* gate, const void* up, int64_t n_ff
                            int dt, const void* down, uint16_t* d_dst, void* stream) {
     require(n_embd % 256 == 0 && is_iq(t) && is_iq(dt), "iq_dequant_expert_f16");
     const int64_t per_row = n_embd / 256;
-    auto* y = (sycl::half*) gu_dst;
-    auto* yd = (sycl::half*) d_dst;
+    auto* y = reinterpret_cast<sycl::half*>(gu_dst);
+    auto* yd = reinterpret_cast<sycl::half*>(d_dst);
     const int64_t nsb = n_ff * per_row;   // superblocks per matrix (the down matrix has as many), eight a work-group
     const auto e = queue_for(stream).parallel_for(
         sycl::nd_range<2>({3, (size_t) (nsb + 7) / 8 * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
@@ -2604,6 +3828,52 @@ void iq_gemm_grouped_f16(int t, const uint16_t* X, const void* const* W, int64_t
     sync_if_needed(stream, e, "iq_gemm_grouped_f16");
 }
 
+void bih3_r1q2_gemm_grouped_f16(const Bih3R1q2Layer& L, bool down, const uint16_t* X, const void* const* blob,
+                                const int32_t* k, float* Y, int64_t ldy, const int32_t* bounds, int G,
+                                int64_t max_rows, void* stream) {
+    if (G <= 0 || max_rows <= 0) return;
+    const int64_t N = down ? L.n_embd : 2 * L.n_ff, K = down ? L.n_ff : L.n_embd;
+    require(L.n_embd % 128 == 0 && L.n_ff % 128 == 0 && ldy >= N && G <= kIqGemmGroup, "bih3_r1q2_gemm_grouped_f16");
+    IqGemmPtrs w{};
+    Bih3Tile bt{};
+    for (int e = 0; e < G; ++e) {
+        w.p[e] = static_cast<const uint8_t*>(blob[e]);
+        const int gk = k[e] & 0xff, dk = k[e] >> 8;
+        require(gk >= 2 && gk <= 14 && dk >= 2 && dk <= 14, "bih3_r1q2_gemm_grouped_f16: K");
+        bt.gk[e] = (uint8_t) gk;
+        bt.dk[e] = (uint8_t) dk;
+    }
+    std::memcpy(bt.p2, L.p2, sizeof bt.p2);
+    bt.n = L.n_embd; bt.ff = L.n_ff; bt.down = down;
+    auto& q = queue_for(stream);
+    const sycl::event e = launch_iq_gemm<kBih3Tile>(q, reinterpret_cast<const sycl::half*>(X), w, down ? 0 : L.n_ff,
+                                                    Y, ldy, bounds, G, max_rows, N, K, bt);
+    sync_if_needed(stream, e, "bih3_r1q2_gemm_grouped_f16");
+}
+
+bool iq_mmq_f16_ok(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols) {
+    if (!in_iq_wmma(t) || w_rows % 128 != 0 || w_cols % 64 != 0 || no_xmx()) return false;
+    static core::PerDevice<bool> per_device;
+    return per_device.get(q.get_device(), [&q] {
+        const sycl::device d = q.get_device();
+        return has_form(d, MatrixForm::f16_from_int8) && d.get_info<sycl::info::device::local_mem_size>() >=
+                                                    (size_t) IqWmmaKernel<16, 4>::LOCAL * sizeof(sycl::half);
+    });
+}
+
+sycl::event iq_mmq_f16_grouped(sycl::queue& q, int t, const void* w, size_t expert_bytes, int64_t w_rows, int64_t w_cols,
+                               int n, const void* xq, int64_t total_rows, const int32_t* bounds, int64_t max_rows,
+                               const int32_t* ids, float* dst, int64_t ld_dst, const uint8_t* const* wtab, size_t woff) {
+    if (n <= 0 || max_rows <= 0) return {};
+    require(iq_mmq_f16_ok(q, t, w_rows, w_cols), "iq_mmq_f16_grouped");
+    IqWmmaArgs a;
+    a.x8 = static_cast<const int8_t*>(xq);
+    a.xs = reinterpret_cast<const float*>(a.x8 + total_rows * w_cols);
+    a.w8 = static_cast<const uint8_t*>(w); a.wtab = wtab; a.woff = woff; a.expert_bytes = expert_bytes; a.ids = ids;
+    a.Y = dst; a.bounds = bounds; a.ldy = ld_dst; a.N = w_rows; a.K = w_cols;
+    return iq_wmma_by_type(t, q, a, n, max_rows);
+}
+
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type) noexcept {
     if (up_type >= 0 && up_type != gu_type)   // a mixed layer: each of gate and up as a gate/up type of its own
         return up_type != 30 && gu_type != 30 && native_expert_supported(gu_type, d_type, n_embd, n_ff) &&
@@ -2614,13 +3884,16 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
         return gu_type == 30 && d_type == 30 && n_embd > 0 && n_ff > 0 && n_embd % 32 == 0 && n_ff % 32 == 0;
     const bool gu = in_iq_gemm(gu_type) ? gu_type != 20
                                         : gu_type == 12 || gu_type == 13 || gu_type == 14 || gu_type == 8 ||
-                                          gu_type == 6 || gu_type == 2 || gu_type == 3 || gu_type == 10 || gu_type == 11;
+                                          gu_type == 6 || gu_type == 2 || gu_type == 3 || gu_type == 10 || gu_type == 11 ||
+                                          gu_type == nvfp4::kType;
     const bool d = d_type == 20 || d_type == 23 || d_type == 42 || d_type == 6 || d_type == 7 || d_type == 8 ||
+                   d_type == nvfp4::kType ||
                    d_type == 2 || d_type == 3 || d_type == 14 || d_type == 10 || d_type == 11 || d_type == 12 ||
                    d_type == 13 || d_type == 16 || d_type == 17 || d_type == 18 || d_type == 21 || d_type == 22 ||
                    is_tq(d_type);
     const auto qk = [](int t) {
-        return t == 20 || t == 6 || t == 7 || t == 8 || t == 2 || t == 3 ? 32 : t == 42 ? 64 : is_tq(t) ? 128 : 256;
+        return t == 20 || t == 6 || t == 7 || t == 8 || t == 2 || t == 3 ? 32
+               : t == 42 || t == nvfp4::kType ? 64 : is_tq(t) ? 128 : 256;
     };
     return gu && d && n_embd > 0 && n_ff > 0 && n_embd % qk(gu_type) == 0 && n_ff % qk(d_type) == 0 &&
            n_embd % 256 == 0;   // the dequantizers write whole 256-value pieces of a gate/up row
@@ -2639,7 +3912,78 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     L.up_off = (size_t) n_ff * L.gu_row;
     L.down_off = L.up_off + (size_t) n_ff * L.up_row;
     L.bytes = L.down_off + (size_t) n_embd * L.d_row;
+    if (gu_type == nvfp4::kType || L.up_type == nvfp4::kType || d_type == nvfp4::kType) {   // as cpu::native_fmt
+        L.tail_off = L.bytes;
+        L.bytes += nvfp4::kTailBytes;
+    }
     return L;
+}
+
+void native_expert_latent_a_tune(const NativeExpertLayout& L, void* stream) {
+    if (latent_a_lpr_env() > 0 && latent_a_ne_env() > 0) return;   // both forced: nothing to time
+    auto& q = queue_for(stream);
+    const LatentAKey key{L.gu_type, L.n_embd, L.n_ff};
+    if (g_latent_a_choices.get(q.get_device(), key)) return;
+    const auto cands = latent_a_forms(L.gu_type);
+    if (cands.size() < 2) {
+        g_latent_a_choices.put(q.get_device(), key, cands[0]);
+        return;
+    }
+    // A decode window's hits: kEnt routes over kGrp experts, each its own blob read from memory.  A run takes the
+    // next set of blobs, and the sets together are twice the device's cache, so no run reads a blob from the cache
+    // a run before left it in (one blob for every group timed the cache, not the decode's memory reads).
+    constexpr int kGrp = 24, kEnt = 32;
+    const size_t cache = q.get_device().get_info<sycl::info::device::global_mem_cache_size>();
+    const size_t set_bytes = (size_t) kGrp * L.bytes;
+    const int sets = (int) std::min<size_t>(64, 2 * cache / set_bytes + 2);
+    std::vector<void*> allocated;
+    auto alloc = [&](size_t bytes) { void* p = sycl::malloc_device(bytes, q); if (!p) throw core::DeviceError("latent A timing allocation failed"); allocated.push_back(p); return p; };
+    try {
+        auto* blob = static_cast<uint8_t*>(alloc((size_t) sets * set_bytes));
+        auto* ptr = static_cast<unsigned long long*>(alloc((size_t) sets * kGrp * sizeof(unsigned long long)));
+        auto* starts = static_cast<int32_t*>(alloc((kGrp + 1) * sizeof(int32_t)));
+        auto* count = static_cast<int32_t*>(alloc(sizeof(int32_t)));
+        auto* toks = static_cast<int32_t*>(alloc(kEnt * sizeof(int32_t)));
+        auto* x = static_cast<block_q8_1*>(alloc((size_t) kEnt * (L.n_embd / 32) * sizeof(block_q8_1)));
+        auto* gate = static_cast<float*>(alloc((size_t) kEnt * L.n_ff * sizeof(float)));
+        auto* up = static_cast<float*>(alloc((size_t) kEnt * L.n_ff * sizeof(float)));
+        std::vector<unsigned long long> hp((size_t) sets * kGrp);
+        for (size_t b = 0; b < hp.size(); ++b) hp[b] = (unsigned long long) (uintptr_t) (blob + b * L.bytes);
+        std::vector<int32_t> hs(kGrp + 1), ht(kEnt);
+        for (int g = 0, e = 0; g <= kGrp; ++g) { hs[(size_t) g] = e; if (g < kGrp) e += g < kEnt - kGrp ? 2 : 1; }
+        for (int e = 0; e < kEnt; ++e) ht[(size_t) e] = e;
+        const int32_t hc = kGrp;
+        q.memset(blob, 0, (size_t) sets * set_bytes);
+        q.memset(x, 0, (size_t) kEnt * (L.n_embd / 32) * sizeof(block_q8_1));
+        q.memcpy(ptr, hp.data(), hp.size() * sizeof(unsigned long long));
+        q.memcpy(count, &hc, sizeof hc);
+        q.memcpy(toks, ht.data(), ht.size() * sizeof(int32_t));
+        q.memcpy(starts, hs.data(), hs.size() * sizeof(int32_t)).wait_and_throw();
+        int next = 0;
+        std::vector<core::TimedCandidate> tc;
+        tc.reserve(cands.size());
+        for (auto [lpr, ne] : cands)
+            tc.push_back({[&, lpr, ne] {
+                launch_gu_rows(q, L.gu_type, kGrp, ptr + (size_t) next * kGrp, starts, count, toks, x, L, gate, up, -1, lpr, ne);
+                next = (next + 1) % sets;
+                return true;
+            }});
+        const auto m = core::timed_choice(tc, [&] { q.wait_and_throw(); }, 5, 1.05, 0.3);
+        const auto best = m.pick >= 0 ? cands[(size_t) m.pick] : std::pair<int, int>{GU_LPR, kEntriesPass};
+        g_latent_a_choices.put(q.get_device(), key, best);
+        std::fprintf(stderr, "xestrata: latent A gate/up type %d width %lld: LPR %d, entries %d\n",
+                     L.gu_type, (long long) L.n_embd, best.first, best.second);
+        q.wait_and_throw();
+        for (void* p : allocated) sycl::free(p, q);
+    } catch (...) {
+        try {
+            q.wait();
+        } catch (const std::exception& w) {   // the timing's failure is said below; the queue is drained for the frees
+            std::fprintf(stderr, "xestrata: latent A timing: %s\n", w.what());
+        }
+        for (void* p : allocated) sycl::free(p, q);
+        g_latent_a_choices.put(q.get_device(), key, std::pair<int, int>{GU_LPR, kEntriesPass});
+    }
 }
 
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
@@ -2652,37 +3996,34 @@ template<bool APU>
 void expert_grouped_rows(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                          const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                          int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                         int64_t grid_groups, sycl::queue& q) {
+                         int64_t grid_groups, int mode8_override, sycl::queue& q) {
     const float lim = expert_swiglu_limit();
     // upstream 0bc1594: the gate/up and down grids take grid_groups rows of groups (each striding over the groups) and
-    // SwiGLU + q8_1 run as one pass over the call's own entries; STRATA_GROUPED_V1=1: a row per possible group and the
-    // two passes over every entry (A/B; the same bits)
-    static const bool v1 = [] {
-        const char* v = std::getenv("STRATA_GROUPED_V1");
-        return v != nullptr && v[0] == '1';
-    }();
+    // SwiGLU + q8_1 run as one pass over the call's own entries
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;
-    float* up = (float*) ((uint8_t*) scratch + fa);
-    float* h = (float*) ((uint8_t*) scratch + 2 * fa);
-    block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
+    float* up = reinterpret_cast<float*>((uint8_t*) scratch + fa);
+    float* h = reinterpret_cast<float*>((uint8_t*) scratch + 2 * fa);
+    block_q8_1* hq = reinterpret_cast<block_q8_1*>((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
-    const size_t cg = (size_t) (v1 || grid_groups <= 0 ? cap_groups : std::min(grid_groups, cap_groups));
+    const size_t cg = (size_t) (grid_groups <= 0 ? cap_groups : std::min(grid_groups, cap_groups));
     // upstream's expert mode 8 (launch_native_gu_fused): its gate/up for the grid formats and IQ4_XS, its down for
     // IQ4_NL and Q2_0, each where its local memory fits; never for a call whose grid strides over the groups (a verify
     // window's PCIe call), which upstream keeps on its default layout
     // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes, not
     // the fused gate/up that writes q8_1 itself)
     const bool had = L.had_block > 0;
-    const bool m8 = !(grid_groups > 0 && grid_groups < cap_groups) && !had && exp_mode8(q);
+    const bool m8 = !(grid_groups > 0 && grid_groups < cap_groups) && !had &&
+                    (mode8_override < 0 ? exp_mode8(q) : mode8_override != 0);
     const size_t xbytes = (size_t) kEntriesPass * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
     const size_t grid_bytes = L.gu_type == 22 ? sizeof(iq2s_grid) : L.gu_type == 16 ? sizeof(iq2xxs_grid)
                               : L.gu_type == 18 ? sizeof(iq3xxs_grid) : L.gu_type == 21 ? sizeof(iq3s_grid) : 0;
     const bool fused_gu = m8 && (L.up_type < 0 || L.up_type == L.gu_type) && (L.gu_type == 16 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
-                                 L.gu_type == 23 || L.gu_type == 29) &&
+                                 L.gu_type == 23 || L.gu_type == 29 || L.gu_type == nvfp4::kType) &&
                           grid_bytes + xbytes + (size_t) kEntriesPass * kM8Rows * sizeof(float) <= local_mem_bytes(q);
     const size_t hbytes = (size_t) kEntriesPass * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
-    const bool lds_down = m8 && (L.d_type == 20 || L.d_type == 42) && hbytes <= local_mem_bytes(q);
+    const bool lds_down = m8 && (L.d_type == 20 || L.d_type == 42 || L.d_type == nvfp4::kType) &&
+                          hbytes <= local_mem_bytes(q);
     const bool ws_down = lds_down && down_ws_on(q) && hbytes + (size_t) kM8Rows * L.d_row + 32 <= local_mem_bytes(q);
     if (fused_gu) {
         const size_t cgs = (size_t) cap_groups;
@@ -2692,38 +4033,15 @@ void expert_grouped_rows(const NativeExpertLayout& L, const unsigned long long* 
             case 21: launch_native_gu_fused<21, gu_lpr<APU>(), APU>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 22: launch_native_gu_fused<22, gu_lpr<APU>(), APU>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 29: launch_native_gu_fused<29, gu_lpr<APU>(), APU>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;   // XeStrata-890M
+            case 40: launch_native_gu_fused<40, gu_lpr<APU>(), APU>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             default: launch_native_gu_fused<23, gu_lpr<APU>(), APU>(q, cgs, grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
         }
     } else {
     // the gate and up rows in one launch, or one a type where they differ (native_mixed_gu's layers)
     auto gu_rows = [&](int ty, int part) {
-        switch (ty) {
-            case 16: launch_native_gu<16, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 17: launch_native_gu<17, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 18: launch_native_gu<18, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 21: launch_native_gu<21, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 22: launch_native_gu<22, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 23: launch_native_gu<23, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 29: launch_native_gu<29, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 19: launch_native_gu<19, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 42: launch_native_gu<42, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 12: launch_native_gu<12, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 13: launch_native_gu<13, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 8: launch_native_gu<8, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 6: launch_native_gu<6, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 2: launch_native_gu<2, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 3: launch_native_gu<3, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 14: launch_native_gu<14, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 10: launch_native_gu<10, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 11: launch_native_gu<11, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 144: launch_native_gu<144, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 145: launch_native_gu<145, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 146: launch_native_gu<146, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 147: launch_native_gu<147, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 148: launch_native_gu<148, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            case 149: launch_native_gu<149, gu_lpr<APU>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
-            default: throw core::DeviceError("native_expert_grouped: gate/up type " + std::to_string(ty));
-        }
+        // (the APU rows take their one form: launch_native_gu_tuned)
+        const auto a_form = latent_a_choice(q, L); const int a_lpr = a_form.first, a_ne = a_form.second;
+        launch_gu_rows<APU>(q, ty, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part, a_lpr, a_ne);
     };
     if (L.up_type >= 0 && L.up_type != L.gu_type) {
         gu_rows(L.gu_type, 0);
@@ -2732,13 +4050,13 @@ void expert_grouped_rows(const NativeExpertLayout& L, const unsigned long long* 
         gu_rows(L.gu_type, -1);
     }
     const long long nh = (long long) cap_entries * L.n_ff;
-    if (v1 || had) {
+    if (had) {
         q.parallel_for(sycl::range<1>((size_t) nh), [=](sycl::id<1> i) {
             float g = gate[i], u = up[i];
             swiglu_clamp(g, u, lim);
             h[i] = canon::silu_mul(g, u);
         });
-        if (had) launch_hadamard_rows<float>(q, h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, "native_expert_grouped");
+        launch_hadamard_rows<float>(q, h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, "native_expert_grouped");
         launch_quantize_q8_1_canon(q, h, hq, nh);
     } else {
         // SwiGLU into q8_1 in one pass over [grp_start[0], grp_start[n]): the product rounded to FP32 on its own, as
@@ -2755,14 +4073,8 @@ void expert_grouped_rows(const NativeExpertLayout& L, const unsigned long long* 
             // rows of the same expert are the same bits
             float g = gate[i], u = up[i];
             swiglu_clamp(g, u, lim);
-            const float xi = canon::silu_mul(g, u);
-            const float amax = warp_max(sg, sycl::fabs(xi));
-            const float sum = warp_sum(sg, xi);
-            const float d = canon::q8_scale(amax);
-            const int8_t qv = canon::q8_value(xi, canon::q8_inv(d));
-            const long long ib = i / 32, iqs = i % 32;
-            hq[ib].qs[iqs] = qv;
-            if (iqs == 0) hq[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+            q8act::q8_1_block<q8act::Canon<32>>(sg, canon::silu_mul(g, u), reinterpret_cast<uint8_t*>(hq + i / 32),
+                                                (int) (i % 32));
         });
     }
     }
@@ -2771,8 +4083,10 @@ void expert_grouped_rows(const NativeExpertLayout& L, const unsigned long long* 
         const size_t cgs = (size_t) cap_groups;
         if (ws_down) {   // (never with the APU rows: down_ws_on is a Pascal card's)
             if (L.d_type == 20) e = launch_native_down_lds<20, down_lpr<20>(), false, true>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            else if (L.d_type == 40) e = launch_native_down_lds<40, down_lpr<40>(), false, true>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
             else e = launch_native_down_lds<42, down_lpr<42>(), false, true>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         } else if (L.d_type == 20) e = launch_native_down_lds<20, down_lpr<20>(), APU>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else if (L.d_type == 40) e = launch_native_down_lds<40, down_lpr<40>(), APU>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         else e = launch_native_down_lds<42, down_lpr<42>(), APU>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     } else
     switch (L.d_type) {
@@ -2802,6 +4116,7 @@ void expert_grouped_rows(const NativeExpertLayout& L, const unsigned long long* 
         case 147: e = launch_native_down<147, down_lpr<147>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 148: e = launch_native_down<148, down_lpr<148>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 149: e = launch_native_down<149, down_lpr<149>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 40: e = launch_native_down<40, down_lpr<40>(), APU>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;   // NVFP4
         default: throw core::DeviceError("native_expert_grouped: down type " + std::to_string(L.d_type));
     }
     sync_if_needed(stream, e, "native_expert_grouped");
@@ -2811,15 +4126,15 @@ void expert_grouped_rows(const NativeExpertLayout& L, const unsigned long long* 
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups) {
+                           int64_t grid_groups, int mode8_override) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     auto& q = queue_for(stream);   // in order: the launches below follow one another
     if (apu_rows(q))
         expert_grouped_rows<true>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1,
-                                  scratch, out, stream, grid_groups, q);
+                                  scratch, out, stream, grid_groups, mode8_override, q);
     else
         expert_grouped_rows<false>(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1,
-                                   scratch, out, stream, grid_groups, q);
+                                   scratch, out, stream, grid_groups, mode8_override, q);
 }
 
 bool native_expert_canon_rows(void* stream) { return !apu_rows(queue_for(stream)); }

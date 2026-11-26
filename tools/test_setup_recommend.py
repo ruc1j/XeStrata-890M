@@ -1,0 +1,261 @@
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""Tests for setup.py's recommendations by quality and its lists' levels (the user's decisions of 2026-11-09): the
+size of each kind of family a PC of some RAM and VRAM is offered, the model a first install is offered, and the
+model, version and quantization that name a family.  Pure functions - no GPU, no downloads; the questions answered
+with their defaults.
+
+    python -m unittest tools.test_setup_recommend
+"""
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import setup  # noqa: E402
+
+
+def room(ram: float, vram: float | None) -> setup.Room:
+    """A PC of `ram` GB and one GPU of `vram` GB (None: no GPU)"""
+    return setup.room_of(ram, [] if vram is None else [{"vram_gb": vram, "integrated": False}])
+
+
+class SizeByQuality(unittest.TestCase):
+    def test_gsq_rco_is_iq3_s_where_it_runs_else_iq3_xxs(self):
+        self.assertEqual(setup.recommend_size("qwen", room(64, 16)), "IQ3_S")
+        self.assertEqual(setup.recommend_size("qwen", room(48, 8)), "IQ3_XXS")     # in the low-RAM mode
+        self.assertEqual(setup.recommend_size("sc117-swift", room(128, 24)), "IQ3_S")
+
+    def test_gsq_rco_without_iq3_xxs_running_takes_the_best_that_runs(self):
+        self.assertEqual(setup.recommend_size("qwen", room(48, 0)), "IQ2_XS")
+        self.assertEqual(setup.recommend_size("qwen", room(36, 4)), "Q2_0")        # none runs: the smallest
+
+    def test_a_ram_budget_size_needs_all_its_experts_in_ram(self):
+        # XeStrata-890M's catalog keeps the v3.1 sets (UD-Q2_0 ...) experimental, and an experimental
+        # size is never recommended: the smallest of the others
+        self.assertEqual(setup.recommend_size("unsloth", room(64, 16)), "UD-IQ4_XS")
+        self.assertEqual(setup.recommend_size("unsloth", room(128, 24)), "UD-IQ4_XS")   # never the experimental
+        self.assertEqual(setup.recommend_size("gyro", room(48, 8)), "Gyro-M")
+        self.assertEqual(setup.recommend_size("atomicchat", room(64, 0)), "AD-5.00bpw")  # the same experts, 8-bit table
+
+    def test_sync_does_not_change_other_families_entry_gate(self):
+        self.assertEqual(setup.minimum_setup_ram("sync"), 24)
+        self.assertEqual(setup.minimum_setup_ram("gyro"), 26)
+        self.assertEqual(setup.minimum_setup_ram(None), 26)
+
+    def test_sync_thresholds_and_recommendation(self):
+        cases = [(23, 16, "Sync-XS"), (24, 16, "Sync-XS"), (31.99, 16, "Sync-XS"),
+                 (32, 11.99, "Sync-XS"), (32, 12, "Sync-S"), (47.99, 11.99, "Sync-XS"),
+                 (48, 0, "Sync-M"), (48, 12, "Sync-M")]
+        for ram, vram, expected in cases:
+            with self.subTest(ram=ram, vram=vram):
+                self.assertEqual(setup.recommend_size("sync", room(ram, vram)), expected)
+        self.assertFalse(setup.size_fits("sync", "Sync-XS", room(23.99, 16)))
+        self.assertTrue(setup.size_fits("sync", "Sync-XS", room(24, 16)))
+        self.assertFalse(setup.size_fits("sync", "Sync-S", room(32, 11.99)))
+        self.assertTrue(setup.size_fits("sync", "Sync-S", room(48, 0)))
+        self.assertEqual(setup.recommend_family(FirstModel.fams, room(64, 32)), "sc117-swift")
+
+    def test_a_plain_moe_takes_the_best_that_ram_and_vram_hold_tested_or_not(self):
+        self.assertEqual(setup.recommend_size("ornith", room(36, 4)), "Q5_K_M")    # untested, as the user chose
+        self.assertEqual(setup.recommend_size("ornith", room(128, 24)), "Q8_0")    # never above Q8_0
+        self.assertEqual(setup.recommend_size("llmjp", room(128, 24)), "Q4_K_M")   # nor its BF16 weights
+        self.assertEqual(setup.recommend_size("qwen36-uncensored", room(36, 4)), "APEX-I-Quality")   # by its rank
+        self.assertEqual(setup.recommend_size("glm53", room(36, 4)), "UD-IQ1_S")   # none fits: the smallest
+
+    def test_a_dense_model_stops_at_q8_0(self):
+        self.assertEqual(setup.recommend_size("qwen35", room(64, 24)), "Q8_0")
+        self.assertEqual(setup.recommend_size("qwen35", room(64, 8)), "Q4_K_M")
+        self.assertEqual(setup.recommend_size("qwen35-0.8b", room(16, 8)), "Q8_0")
+
+    def test_on_the_cpu_the_familys_own_choice(self):
+        self.assertEqual(setup.recommend_size("qwen35-2b", room(16, None)), "UD-Q5_K_XL")
+
+    def test_one_quantizations_sizes(self):
+        gsq = [m for m in setup.family_sizes("ornith") if setup.size_quantizer("ornith", m) == "gsq-rco-pfeifferj"]
+        self.assertEqual(setup.recommend_size("ornith", room(36, 4), gsq), "GSQ-RCO-3.5BIT")
+
+
+# Signal-2's and SenseNova-Loop-9B (QSA)'s entries as their branches register them (signal-2-setup 4dcba88997,
+# sensenova-loop-qsa 966ff45a3e), for the steps of FIRST_CHOICE that name them
+OTHER_BRANCHES: dict[str, dict[str, Any]] = {
+    "MODELS": {"S": {"about": "Signal-2", "download_gb": 59.5, "ram_gb": 35.8, "arena_gb": 25.8,
+                     "families": ("signal2",), "file": "Signal-2-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1}},
+    "FAMILIES": {"signal2": {"title": "Signal-2-Flash-Next (Gyro)", "by": "", "about": "", "file": "", "tag": "",
+                             "name": "qwen3.8-flash-next-signal-2"},
+                 "sensenova-loop-qsa": {"title": "SenseNova-Loop-9B (QSA)", "by": "", "about": "", "tag": "",
+                                        "name": "sensenova-loop-9b-qsa", "max_context": 524288, "plain": True,
+                                        "dense": True, "kv_bytes": 57344,
+                                        "models": {"Q4_K_M": {"size": 5965458112, "about": ""},
+                                                   "Q8_0": {"size": 9945475776, "about": ""},
+                                                   "BF16": {"size": 18566736576, "about": ""},
+                                                   "Q5_K_M": {"size": 6815328960, "about": ""}}}},
+    "TIERS": {"signal2": ("qwen3.8-flash-next", "signal-2", "gyro"),
+              "sensenova-loop-qsa": ("sensenova-loop-9b", "original", "qsa")},
+}
+
+
+def with_other_branches():
+    """Signal-2 and SenseNova-Loop-9B (QSA) registered, as when their branches are in"""
+    return mock.patch.multiple(setup, **{name: {**getattr(setup, name), **add} for name, add in OTHER_BRANCHES.items()})
+
+
+def without_families(*names: str):
+    """FAMILIES and TIERS without `names`' entries, as in a tree whose branches never registered them"""
+    kept: dict[str, Any] = {t: {k: v for k, v in getattr(setup, t).items() if k not in names}
+                            for t in ("FAMILIES", "TIERS")}
+    return mock.patch.multiple(setup, **kept)
+
+
+class FirstModel(unittest.TestCase):
+    # edge0, like CUSTOM, is outside the recommendation ladder (--family edge0, setup_edge0; setup's list excludes it)
+    fams = [f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")]
+
+    def first(self, ram: float, vram: float | None, fams=None) -> tuple:
+        r = room(ram, vram)
+        f, size = setup.first_choice(fams or self.fams + list(OTHER_BRANCHES["FAMILIES"]), r)
+        return f, size or setup.recommend_size(f, r)
+
+    def test_the_first_this_pc_runs_in_the_users_order(self):
+        # the user's order of 2026-11-22: SC117's Swift 1.5 (IQ3_S, else IQ3_XXS, each where it runs with most of its
+        # experts on the GPUs), Signal-2 where the RAM holds its peak else Sync, then (2026-11-23 13:17) Inkling-2-Mini
+        # (QSA), SenseNova, Qwen3.5-2B.  Inkling's step takes a size whose experts all fit the card at 32K (the MODEL
+        # check's INKLING_CARD_GB, 2026-11-24): SQ-10 from 14.3 GiB, SQ-15 from 17.9, SQ-20 from 22.5
+        cases = [((123.2, 32), ("sc117-swift", "IQ3_S")),        # 128 GB of RAM, a 32 GB card
+                 ((123.2, 31.89), ("sc117-swift", "IQ3_S")),     # as an Arc Pro B70 reads
+                 ((123.2, 30), ("sc117-swift", "IQ3_XXS")),      # most of IQ3_XXS's experts on it, not of IQ3_S's
+                 ((123.2, 24), ("signal2", "S")),                # a 24 GB card: SC117 mostly on the CPU
+                 ((123.2, 12), ("signal2", "S")),
+                 ((93.0, 16), ("signal2", "S")),                 # 96 GB of RAM
+                 ((74.4, 16), ("signal2", "S")),
+                 ((74.3, 16), ("sync", "Sync-M")),
+                 ((62.7, 32), ("sc117-swift", "IQ3_S")),         # 64 GB of RAM, a 32 GB card
+                 ((62.7, 16), ("sync", "Sync-M")),
+                 ((32, 32), ("sc117-swift", "IQ3_S")),           # in the low-RAM mode
+                 ((52, 0), ("sync", "Sync-M")),
+                 ((32, 12), ("sync", "Sync-S")),
+                 ((24, 8), ("sync", "Sync-XS")),
+                 ((20, 24), ("inkling-qsa", "SQ-20")),
+                 ((20, 20), ("inkling-qsa", "SQ-15")),
+                 ((20, 16), ("inkling-qsa", "SQ-10")),
+                 ((20, 12), ("sensenova-loop-qsa", "Q5_K_M")),    # Inkling's experts would run from host memory
+                 ((16, 8), ("qwen35-2b", "Q8_0")),
+                 ((12, 8), ("qwen35-2b", "Q8_0")),
+                 ((2, 1), ("qwen35-2b", "Q4_K_M"))]               # nothing runs: the last choice
+        with with_other_branches():
+            for (ram, vram), expected in cases:
+                with self.subTest(ram=ram, vram=vram):
+                    self.assertEqual(self.first(ram, vram), expected)
+
+    def test_sensenova_where_inkling_does_not_run(self):
+        # the ladder's step after Inkling-2-Mini (QSA): where it is not offered, SenseNova, then Qwen3.5-2B
+        fams = [f for f in self.fams if f != "inkling-qsa"] + list(OTHER_BRANCHES["FAMILIES"])
+        with with_other_branches():
+            for (ram, vram), expected in [((20, 16), ("sensenova-loop-qsa", "Q8_0")),
+                                          ((20, 10), ("sensenova-loop-qsa", "Q5_K_M")),
+                                          ((20, 9), ("sensenova-loop-qsa", "Q4_K_M")),
+                                          ((20, 8), ("qwen35-2b", "Q8_0"))]:
+                with self.subTest(ram=ram, vram=vram):
+                    self.assertEqual(self.first(ram, vram, fams), expected)
+
+    def test_inkling_qsa_is_the_ladders_and_plain_inkling_is_not(self):
+        steps = [f for f, *_ in setup.FIRST_CHOICE]
+        self.assertEqual(steps.index("inkling-qsa"), steps.index("sync") + 1)
+        self.assertEqual(steps.index("sensenova-loop-qsa"), steps.index("inkling-qsa") + 1)
+        self.assertNotIn("inkling", steps)
+
+    def test_sc117_needs_most_of_its_experts_on_the_gpus(self):
+        self.assertTrue(setup.gpu_holds_most("IQ3_S", room(128, 31.16)))
+        self.assertFalse(setup.gpu_holds_most("IQ3_S", room(128, 31.14)))
+        self.assertTrue(setup.gpu_holds_most("IQ3_XXS", room(128, 27.46)))
+        self.assertFalse(setup.gpu_holds_most("IQ3_XXS", room(128, 27.44)))
+        # a second card adds its VRAM less 5 (room_of): two 16 GB cards hold 27 GB, not most of IQ3_XXS
+        two = setup.room_of(128, [{"vram_gb": 16.0, "integrated": False}] * 2)
+        self.assertFalse(setup.gpu_holds_most("IQ3_XXS", two))
+
+    def test_signal2_where_the_ram_is_plenty_else_sync(self):
+        # the step itself, SC117 aside: Signal-2's peak, 64.4 GiB, with LOW_RAM_HEADROOM_GB beside it
+        fams = [f for f in self.fams if f != "sc117-swift"] + list(OTHER_BRANCHES["FAMILIES"])
+        with with_other_branches():
+            self.assertEqual(self.first(123.2, 32, fams), ("signal2", "S"))    # 128 GB installed
+            self.assertEqual(self.first(92, 16, fams), ("signal2", "S"))       # 96 GB installed
+            self.assertEqual(self.first(74.4, 16, fams), ("signal2", "S"))
+            self.assertEqual(self.first(74.3, 16, fams), ("sync", "Sync-M"))
+            self.assertEqual(self.first(62.7, 16, fams), ("sync", "Sync-M"))   # 64 GB installed
+
+    def test_a_family_not_registered_is_passed_over(self):
+        # a tree without Signal-2's, Inkling's (QSA) and SenseNova's entries, whatever this one registers: SC117, Sync,
+        # Qwen3.5-2B
+        gone = ("signal2", "inkling-qsa", "sensenova-loop-qsa")
+        self.assertTrue(set(gone) <= {f for f, *_ in setup.FIRST_CHOICE})
+        with without_families(*gone):
+            fams = [f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")]
+            self.assertEqual(self.first(123.2, 32, fams), ("sc117-swift", "IQ3_S"))
+            self.assertEqual(self.first(123.2, 24, fams), ("sync", "Sync-M"))
+            self.assertEqual(self.first(48, 0, fams), ("sync", "Sync-M"))
+            self.assertEqual(self.first(20, 16, fams), ("qwen35-2b", "Q8_0"))
+
+    def test_without_a_gpu_the_2b(self):
+        self.assertEqual(setup.recommend_family(["qwen35-2b", "qwen35-0.8b"], room(32, None)), "qwen35-2b")
+        self.assertEqual(setup.recommend_family(self.fams, room(128, None)), "qwen35-2b")
+
+
+class FilesSize(unittest.TestCase):
+    def test_the_pinned_files(self):
+        sizes = {("sc117-swift", "IQ3_S"): 83.5, ("sc117-swift", "IQ3_XXS"): 75.8, ("sync", "Sync-XS"): 57.6,
+                 ("sync", "Sync-S"): 61.7, ("sync", "Sync-M"): 68.1, ("qwen35-2b", "UD-Q5_K_XL"): 1.5}
+        for (family, model), gb in sizes.items():
+            with self.subTest(family=family, model=model):
+                self.assertEqual(round(setup.files_gb(family, model), 1), gb)
+
+    def test_every_listed_size_has_its_files_size(self):
+        for f in (f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")):
+            for m in setup.family_sizes(f):
+                self.assertGreater(setup.files_gb(f, m), 0.5, f"{f} {m}")
+
+
+class Levels(unittest.TestCase):
+    def test_every_family_has_its_place(self):
+        self.assertEqual(set(setup.TIERS), {f for f in setup.FAMILIES if f not in (setup.CUSTOM, "edge0")})
+        self.assertEqual(len(set(setup.TIERS.values())), len(setup.TIERS))
+
+    def test_the_levels_name_the_family(self):
+        self.assertEqual(setup.tier_family("qwen3.8-flash-next", None, None), "qwen")
+        self.assertEqual(setup.tier_family("qwen3.8-flash-next", None, "gyro"), "gyro")
+        self.assertEqual(setup.tier_family("qwen3.8-flash-next", "huihui-ai", None), "huihui-unsloth")
+        self.assertEqual(setup.tier_family("qwen3.8-flash-next", "swift-sc117", None), "sc117-swift")
+        self.assertEqual(setup.tier_family("qwen3.8-flash-next", "coder", "gyro"), "gyro-coder")
+        self.assertEqual(setup.tier_family("ornith-1.5", None, "gsq-rco-pfeifferj"), "ornith")
+
+    def test_a_level_that_does_not_match_stops_with_the_choices(self):
+        with mock.patch.object(setup, "fail", side_effect=SystemExit) as fail:
+            with self.assertRaises(SystemExit):
+                setup.tier_family("qwen3.8-flash-next", "swift", "unsloth")
+        self.assertIn("gsq-rco", fail.call_args.args[1])
+
+    def test_the_questions_default_to_the_recommendation(self):
+        fams = [f for f in setup.FAMILIES if f != setup.CUSTOM]
+        r = room(36, 4)
+        with mock.patch.object(setup, "say"), \
+                mock.patch.object(setup, "ask", side_effect=lambda q, choices, default, yes: default) as ask:
+            family, quant = setup.ask_tiers(fams, setup.recommend_family(fams, r), r, None, True)
+        self.assertEqual((family, quant), ("sync", None))
+        self.assertEqual([c.args[0] for c in ask.call_args_list], ["Which model?", "Which version?",
+                                                                   "Which quantization?"])
+
+    def test_a_level_of_one_choice_is_not_asked(self):
+        r = room(64, 16)
+        with mock.patch.object(setup, "say"), \
+                mock.patch.object(setup, "ask", side_effect=lambda q, choices, default, yes: default) as ask:
+            family, quant = setup.ask_tiers(["llmjp"], "llmjp", r, None, True)
+        self.assertEqual((family, quant), ("llmjp", None))
+        ask.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

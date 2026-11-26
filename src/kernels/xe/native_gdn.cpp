@@ -14,7 +14,6 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_gdn
 #include "strata/kernels/device_arch_tag.hpp"
 
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -23,7 +22,6 @@
 namespace strata::kernels {
 namespace {
 
-std::atomic<bool> enabled{false};
 constexpr int S = 128;
 constexpr int WARP = 32;
 constexpr int COLS = 4;   // columns (sub-groups) per work-group
@@ -43,9 +41,6 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
 }
 
 }  // namespace
-
-void native_gdn_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_gdn_enabled() { return enabled.load(std::memory_order_relaxed); }
 
 void native_gdn_step(float* state, const float* q, const float* k, const float* v,
                      const float* gate, const float* beta, float* output,
@@ -101,76 +96,6 @@ void native_gdn_step(float* state, const float* q, const float* k, const float* 
             const int i = r * 32 + lane;
             state[(size_t(i) * h_v + head) * S + col] = s_shard[r];
         }
-    });
-}
-
-void native_gdn_step_rows(float* state, const float* h, int64_t h_stride, const float* gate, const float* beta,
-                          float* output, int64_t out_stride, int T, float* const* snaps, int n_snaps,
-                          const GdnShapes& shape, void* stream) {
-    constexpr int kMaxSnaps = kNativeGdnMaxSnaps;
-    if (!stream || shape.S != S || shape.h_k <= 0 || shape.h_v <= 0 || shape.h_v > 65535 || shape.h_v % shape.h_k != 0 ||
-        T < 1 || n_snaps < 0 || n_snaps > kMaxSnaps || n_snaps >= T)
-        throw std::invalid_argument("native GDN rows: S=128, divisible head counts, 1 <= T, n_snaps < T and <= 8");
-    struct Snaps { float* p[kMaxSnaps]; } sn{};
-    for (int i = 0; i < n_snaps; ++i) sn.p[i] = snaps[i];
-    auto& queue = core::Runtime::get().stream(stream);
-    const float scale = 1.0f / sycl::sqrt(float(S));
-    const int h_k = int(shape.h_k), h_v = int(shape.h_v);
-    // a work-group of WARP columns of one head, RG sub-groups each holding S / RG of the columns' state rows in
-    // registers: each row's load is WARP consecutive floats of the [i][head][col] layout; the two sums over the rows
-    // add the RG parts in a fixed order through local memory
-    constexpr int RG = 4, R = S / RG;
-    queue.submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> part(sycl::range<1>(size_t(RG) * WARP), cgh);
-        cgh.parallel_for(sycl::nd_range<2>({size_t(h_v), size_t(S / WARP) * RG * WARP}, {1, size_t(RG) * WARP}),
-                         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const int head = int(it.get_group(0));
-            const int lane = int(it.get_local_id(1)) % WARP, rg = int(it.get_local_id(1)) / WARP;
-            const int col = int(it.get_group(1)) * WARP + lane;
-            const int q_head = head % h_k;
-            const size_t row0 = size_t(rg) * R;
-            auto at = [&](int i) { return ((row0 + size_t(i)) * h_v + head) * S + col; };
-            float s[R];
-#pragma unroll
-            for (int i = 0; i < R; ++i) s[i] = state[at(i)];
-            for (int t = 0; t < T; ++t) {
-                const float* ht = h + t * h_stride;
-                const float* q = ht + int64_t(q_head) * S + row0;
-                const float* k = ht + int64_t(h_k + q_head) * S + row0;
-                const float v = ht[int64_t(2 * h_k + head) * S + col];
-                const float g_val = sycl::exp(gate[int64_t(t) * h_v + head]);
-                float kv = 0.0f;
-#pragma unroll
-                for (int i = 0; i < R; ++i) kv += s[i] * k[i];
-                part[rg * WARP + lane] = kv;
-                sycl::group_barrier(it.get_group());
-                kv = 0.0f;
-                for (int r = 0; r < RG; ++r) kv += part[r * WARP + lane];
-                const float delta = (v - g_val * kv) * beta[int64_t(t) * h_v + head];
-                float attn = 0.0f;
-#pragma unroll
-                for (int i = 0; i < R; ++i) {
-                    s[i] = g_val * s[i] + k[i] * delta;
-                    attn += s[i] * q[i];
-                }
-                sycl::group_barrier(it.get_group());
-                part[rg * WARP + lane] = attn;
-                sycl::group_barrier(it.get_group());
-                if (rg == 0) {
-                    attn = 0.0f;
-                    for (int r = 0; r < RG; ++r) attn += part[r * WARP + lane];
-                    output[t * out_stride + int64_t(head) * S + col] = attn * scale;
-                }
-                sycl::group_barrier(it.get_group());
-                if (t < n_snaps) {
-                    float* d = sn.p[t];
-#pragma unroll
-                    for (int i = 0; i < R; ++i) d[at(i)] = s[i];
-                }
-            }
-#pragma unroll
-            for (int i = 0; i < R; ++i) state[at(i)] = s[i];
-        });
     });
 }
 

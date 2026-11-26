@@ -8,9 +8,9 @@
 
 The folder (XeStrata-<version>-windows-x64/):
 
-    xestrata.exe, xestrata-cli.exe and their .NET libraries   the launchers (windows/launcher)
+    xestrata.exe, xestrata-cli.exe and their .NET libraries   the launchers (launcher)
     app/                  setup.py, serve/, tools/, data/ and gguf-py, read-only, with the PACKAGED record
-    app/engine/           the engine, its SYCL runtime (intel/llvm's), libjxl's cjxl.exe and BUILD.json
+    app/engine/           the engine, its SYCL runtime (intel/llvm's), libjxl's cjxl.exe and djxl.exe, and BUILD.json
     python/               Python's embeddable distribution with the packages setup and the server use
     NOTICE, COPYING, COPYING.LESSER, THIRD-PARTY-NOTICES.md, licenses/
 
@@ -29,17 +29,20 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+import engine_notices     # beside this script
+import launcher_notices
+
 # The SYCL runtime's DLLs a Windows engine loads (sycl-jit.dll, the runtime compiler, is not: 120 MB the engine does
 # not use).  ze_loader.dll comes with Intel's driver, nvcuda.dll and nvml.dll with NVIDIA's, amdhip64_7.dll with AMD's.
 SYCL_DLLS = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_adapter_cuda.dll", "ur_adapter_hip.dll",
              "ur_adapter_level_zero.dll", "ur_adapter_level_zero_v2.dll", "xptifw.dll")
-ENGINE_EXES = ("strata.exe", "strata-device.exe", "strata-image.exe", "strata-inkling-2-mini.exe",
-               "strata-vision-cpu.exe")
+ENGINE_EXES = ("xestrata-engine.exe", "xestrata-device.exe", "xestrata-image.exe", "xestrata-vision.exe",
+               "strata-inkling-2-mini.exe")
 # oneMath and its oneMKL backend (the engine's build folder's bin/), which loads oneMKL where the user installed it
 ONEMATH_DLLS = ("onemath.dll", "onemath_blas_mklgpu.dll", "onemath_blas_cublas.dll", "onemath_blas_rocblas.dll")
 # AMD GPUs' image attention: the engine's module that opens aotriton (on an AMD GPU only), aotriton's library (built
 # in the engine's build, liblzma linked in) and its kernels' images, which it finds beside it
-AOTRITON_DLLS = ("strata_sdpa_aotriton.dll", "aotriton_v2.dll")
+AOTRITON_DLLS = ("xestrata_sdpa_aotriton.dll", "aotriton_v2.dll")
 # Intel GPUs' image attention: oneDNN (built in the engine's build, onednn/bin/)
 ONEDNN_DLLS = ("dnnl.dll",)
 # what a Windows PC brings (the Visual C++ runtime, which xestrata.exe checks for) and what must never be carried
@@ -52,85 +55,35 @@ WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "p
           "jsonschema", "markupsafe", "certifi", "charset-normalizer", "charset_normalizer", "idna", "urllib3",
           "typing_extensions", "attrs", "jsonschema_specifications", "referencing", "rpds_py", "colorama", "pip")
 
+# The Windows engine's parts (engine_notices.py's PARTS.json names): what the 7z's engine is built with
+WIN_PARTS = {"onemath", "onemath_rocblas", "onemath_cublas", "onemkl", "cuda", "hip", "onednn", "aotriton",
+             "cudnn_frontend", "cutlass", "xgrammar", "zstd_dec"}
+# the parts of engine_notices.ROWS the 7z carries, as COMPONENTS' rows; those it does not carry (the contrib engine's
+# oneMKL and NVIDIA's libraries, where the user installed them) go to NOTICES.json only
+ENGINE_ROWS = engine_notices.rows_for(WIN_PARTS, linux=False)
+
 # name, version (a key of `versions`, or the text), license, source, license texts (paths relative to `roots`' keys, or
 # URLs), the files in the folder it covers (globs relative to its top)
 COMPONENTS = [
     ("XeStrata", "version", "LGPL-3.0-or-later (with MIT parts: NOTICE)", "https://github.com/ruc1j/XeStrata-890M",
-     [], ["xestrata.exe", "xestrata-cli.exe", "xestrata.dll", "xestrata-cli.dll", "Xestrata.Launcher.Core.dll",
-          *(f"app/engine/{e}" for e in ENGINE_EXES), f"app/engine/{AOTRITON_DLLS[0]}"]),
-    ("oneMath (XeStrata's fork)", "onemath", "Apache-2.0", "https://github.com/MistVVK/oneMath", ["onemath:LICENSE"],
-     [f"app/engine/{d}" for d in ONEMATH_DLLS]),
-    ("ROCm BLAS headers (rocBLAS, hipBLASLt and hipblas-common; compiled into onemath_blas_rocblas.dll)",
-     "ROCm 7.1 (Ubuntu 26.04's)", "MIT",
-     "https://github.com/ROCm/rocm-libraries", ["rocm:LICENSE-*.txt"], []),
-    ("intel/llvm (DPC++) SYCL runtime, with Unified Runtime, UMF and hwloc", "intel-llvm",
-     "Apache-2.0 WITH LLVM-exception; UMF Apache-2.0 WITH LLVM-exception; hwloc BSD-3-Clause; Level Zero loader "
-     "headers MIT; AMD's HIP headers MIT", "https://github.com/intel/llvm", ["sycl:licenses/*"],
-     [f"app/engine/{d}" for d in SYCL_DLLS]),
-    (".NET application host", "dotnet", "MIT", "https://github.com/dotnet/runtime",
-     ["https://raw.githubusercontent.com/dotnet/runtime/main/LICENSE.TXT",
-      "https://raw.githubusercontent.com/dotnet/runtime/main/THIRD-PARTY-NOTICES.TXT"], []),
-    ("Avalonia", "avalonia", "MIT", "https://github.com/AvaloniaUI/Avalonia",
-     ["https://raw.githubusercontent.com/AvaloniaUI/Avalonia/{avalonia}/licence.md"], ["Avalonia*.dll"]),
-    ("ANGLE (Avalonia's build)", "avalonia.angle.windows.natives", "BSD-3-Clause",
-     "https://github.com/AvaloniaUI/angle", ["nuget:avalonia.angle.windows.natives/LICENSE"], ["av_libglesv2.dll"]),
-    ("SkiaSharp and Skia", "skiasharp", "MIT; Skia BSD-3-Clause and others (its notices)",
-     "https://github.com/mono/SkiaSharp", ["nuget:skiasharp/LICENSE.txt",
-                                           "nuget:skiasharp.nativeassets.win32/THIRD-PARTY-NOTICES.txt"],
-     ["SkiaSharp.dll", "libSkiaSharp.dll"]),
-    ("HarfBuzzSharp and HarfBuzz", "harfbuzzsharp", "MIT; HarfBuzz MIT (its notices)",
-     "https://github.com/mono/SkiaSharp", ["nuget:harfbuzzsharp/LICENSE.txt",
-                                           "nuget:harfbuzzsharp.nativeassets.win32/THIRD-PARTY-NOTICES.txt"],
-     ["HarfBuzzSharp.dll", "libHarfBuzzSharp.dll"]),
-    ("FSharp.Core", "fsharp.core", "MIT", "https://github.com/dotnet/fsharp",
-     ["https://raw.githubusercontent.com/dotnet/fsharp/main/License.txt"],
-     ["FSharp.Core.dll", "*/FSharp.Core.resources.dll"]),
-    ("MicroCom.Runtime", "microcom.runtime", "MIT", "https://github.com/kekekeks/MicroCom",
-     ["https://raw.githubusercontent.com/kekekeks/MicroCom/master/LICENSE"], ["MicroCom.Runtime.dll"]),
-    ("Tmds.DBus.Protocol (Avalonia's Linux part, not used on Windows)", "tmds.dbus.protocol", "MIT",
-     "https://github.com/tmds/Tmds.DBus", ["https://raw.githubusercontent.com/tmds/Tmds.DBus/main/COPYING"],
-     ["Tmds.DBus.Protocol.dll"]),
+     [], [*launcher_notices.own_files("win-x64"), *(f"app/engine/{e}" for e in ENGINE_EXES),
+          f"app/engine/{AOTRITON_DLLS[0]}"]),
+    *((r["name"], r["version"], r["license"], r["source"], r["texts"],
+       r.get("win", []) + ([f"app/engine/{d}" for d in SYCL_DLLS] if r["version"] == "intel-llvm" else []))
+      for r in ENGINE_ROWS if r.get("bundled", True)),
+    *launcher_notices.components("win-x64"),       # the launchers' parts (shared with the xestrata-gui package)
     ("Python (embeddable distribution)", "python", "PSF-2.0 and the licenses its LICENSE.txt names",
      "https://www.python.org/", ["python:LICENSE.txt"], ["python/*.exe", "python/*.dll", "python/*.pyd"]),
-    ("gguf-py (llama.cpp)", "llama.cpp", "MIT", "https://github.com/ggml-org/llama.cpp", ["llama:LICENSE"], []),
-    ("Outfit (the web app's font)", "outfit", "OFL-1.1", "https://github.com/Outfitio/Outfit-Fonts",
-     ["src:third_party/main/outfit/OFL.txt"], []),
-    ("KaTeX (the web chat's math)", "0.19.0", "MIT", "https://katex.org/", ["src:third_party/main/katex/LICENSE"], []),
-    ("XGrammar (compiled into the engine: grammar-constrained decoding)", "0.2.8", "Apache-2.0",
-     "https://github.com/mlc-ai/xgrammar",
-     ["src:third_party/main/xgrammar/LICENSE", "src:third_party/main/xgrammar/NOTICE"], []),
-    ("picojson (in XGrammar, compiled into the engine)", "XGrammar 0.2.8's copy", "BSD-2-Clause",
-     "https://github.com/kazuho/picojson", ["src:third_party/main/picojson/LICENSE"], []),
-    ("DLPack (a header XGrammar reads)", "bbd2f4d", "Apache-2.0", "https://github.com/dmlc/dlpack",
-     ["src:third_party/main/dlpack/LICENSE"], []),
-    ("AOTriton (its library and kernels' images)", "0.14.2b", "MIT; the images can carry parts of aiter (MIT), "
-     "FlyDSL's kernels (Apache-2.0) and Triton (MIT)", "https://github.com/ROCm/aotriton",
-     ["src:third_party/main/aotriton/LICENSE", "src:third_party/main/aotriton/LICENSE.aiter",
-      "src:third_party/main/aotriton/LICENSE.FlyDSL", "src:third_party/main/aotriton/LICENSE.triton"],
-     ["app/engine/aotriton_v2.dll", "app/engine/aotriton.images/*"]),
-    ("liblzma of XZ Utils (linked into aotriton_v2.dll)", "5.8.1", "0BSD", "https://tukaani.org/xz/",
-     ["src:third_party/main/xz/COPYING.0BSD"], []),
-    ("oneDNN", "3.12", "Apache-2.0 (parts of it under other licenses, listed in THIRD-PARTY-PROGRAMS)",
-     "https://github.com/uxlfoundation/oneDNN",
-     ["src:third_party/main/oneDNN/LICENSE", "src:third_party/main/oneDNN/THIRD-PARTY-PROGRAMS"],
-     ["app/engine/dnnl.dll"]),
-    ("cuDNN Frontend (compiled into strata-image.exe)", "1.31.0", "Apache-2.0 (parts MIT)",
-     "https://github.com/NVIDIA/cudnn-frontend", ["src:third_party/main/cudnn-frontend/LICENSE.txt"], []),
-    ("stb_image (compiled into strata-image.exe)", "2.30", "MIT OR Unlicense", "https://github.com/nothings/stb",
-     ["src:third_party/main/stb/LICENSE"], []),
-    ("Zstandard's decoder (compiled into strata-inkling-2-mini.exe)", "1.5.6", "BSD-3-Clause",
-     "https://github.com/facebook/zstd", ["src:third_party/main/zstd-dec/LICENSE"], []),
-    ("libjxl's cjxl (statically linked with Highway, Brotli, skcms, libpng, zlib, libjpeg-turbo, giflib, libwebp and "
-     "sjpeg)", "jxl", "BSD-3-Clause; the libraries under their own licenses (Apache-2.0, BSD-3-Clause, MIT, zlib, IJG, "
-     "libpng)", "https://github.com/libjxl/libjxl", ["jxl:licenses/LICENSE.*"], ["app/engine/cjxl.exe"]),
-    ("quantscope", "quantscope", "MIT OR Apache-2.0", "https://github.com/1872183316/quantscope",
-     ["src:third_party/main/quantscope/LICENSE-MIT", "src:third_party/main/quantscope/LICENSE-APACHE"], []),
+    ("libjxl's cjxl and djxl (statically linked with Highway, Brotli, skcms, libpng, zlib, libjpeg-turbo, giflib, "
+     "libwebp and sjpeg)", "jxl", "BSD-3-Clause; the libraries under their own licenses (Apache-2.0, BSD-3-Clause, "
+     "MIT, zlib, IJG, libpng)", "https://github.com/libjxl/libjxl", ["jxl:licenses/LICENSE.*"],
+     ["app/engine/cjxl.exe", "app/engine/djxl.exe"]),
 ]
 
 # the program's files from the source tree (as cmake/packaging.cmake installs them on Linux)
 APP_FILES = ("setup.py", "chat.py", "requirements.txt")
 APP_DIRS = ("serve", "tools", "ref", "data", "third_party/main/outfit", "third_party/main/katex",
-            "third_party/main/quantscope")
+            "third_party/main/mermaid", "third_party/main/quantscope", "third_party/main/py3langid")
 APP_SKIP = ("__pycache__", "test_*", "mcp_fake_server.py", "lint", "vision", "package")
 
 
@@ -152,12 +105,7 @@ def fetch(url: str) -> bytes:
         return r.read()
 
 
-def nuget_version(nuget: Path, package: str) -> str:
-    versions = sorted((p.name for p in (nuget / package).iterdir() if p.is_dir()),
-                      key=lambda v: [int(x) if x.isdigit() else x for x in v.replace("-", ".").split(".")])
-    if not versions:
-        fail(f"no NuGet package {package} in {nuget}")
-    return versions[-1]
+nuget_version = launcher_notices.nuget_version
 
 
 def unbundle_runtime(site: Path) -> None:
@@ -225,7 +173,8 @@ def main() -> None:
         shutil.copy2(a.engine / "bin" / d, eng / d)
     for d in ONEDNN_DLLS:
         shutil.copy2(a.engine / "onednn" / "bin" / d, eng / d)
-    shutil.copy2(a.jxl / "bin" / "cjxl.exe", eng / "cjxl.exe")   # the images' JPEG XL (serve/images.py cjxl)
+    for x in ("cjxl.exe", "djxl.exe"):   # the images' JPEG XL out and in (serve/images.py cjxl, djxl)
+        shutil.copy2(a.jxl / "bin" / x, eng / x)
     aot = a.engine / "_deps" / "aotriton" / "aotriton"
     shutil.copy2(a.engine / AOTRITON_DLLS[0], eng / AOTRITON_DLLS[0])
     shutil.copy2(aot / "lib" / AOTRITON_DLLS[1], eng / AOTRITON_DLLS[1])
@@ -265,17 +214,16 @@ def main() -> None:
     lic = top / "licenses"
     lic.mkdir()
     versions = {"version": a.version, "dotnet": "10", "llama.cpp": "the commit setup.py pins",
-                "outfit": "third_party/main/outfit", "quantscope": "bfdf205",
+                "outfit": "third_party/main/outfit", "quantscope": "bfdf205", "py3langid": "0.4.0",
                 "python": a.python_zip.stem.split("-")[1],
-                "jxl": a.jxl.parent.name.removeprefix("jxl-")}   # windows.sh's jxl-<version>/x64-windows-static
+                "jxl": a.jxl.parent.name.removeprefix("jxl-"),   # windows.sh's jxl-<version>/x64-windows-static
+                "rocm": "ROCm 7.1 (Ubuntu 26.04's)"}             # tools/package/win_rocm.sh's
     sycl_rec = json.loads((a.sycl / "XESTRATA.json").read_text())
     versions["intel-llvm"] = f"{sycl_rec['tag']} ({sycl_rec['commit'][:12]}, with XeStrata's patches)"
     # the fork's tag the engine's build fetched (CMakeLists.txt pins it)
     m = re.search(r"tags/([\w.-]+)\.tar\.gz", (a.engine / "CMakeCache.txt").read_text())
     versions["onemath"] = m.group(1) if m else "the archive CMakeLists.txt pins"
-    for pkg in ("avalonia", "avalonia.angle.windows.natives", "skiasharp", "harfbuzzsharp", "fsharp.core",
-                "microcom.runtime", "tmds.dbus.protocol"):
-        versions[pkg] = nuget_version(a.nuget, pkg)
+    versions.update(launcher_notices.nuget_versions(a.nuget, "win-x64", a.launcher))
     roots = {"sycl": a.sycl, "python": py, "llama": a.llama, "src": a.src, "nuget": a.nuget, "rocm": a.rocm,
              "jxl": a.jxl, "onemath": a.engine / "_deps" / "strata_onemath-src"}
     rows = []
@@ -297,7 +245,7 @@ def main() -> None:
             base = roots[root]
             if root == "nuget":
                 pkg, rest = rel.split("/", 1)
-                base, rel = base / pkg / nuget_version(a.nuget, pkg), rest
+                base, rel = base / pkg / nuget_version(a.nuget, pkg, launcher_notices.published(a.launcher)), rest
             found = sorted(base.glob(rel))
             if not found:
                 fail(f"{name}: no license text {t}")
@@ -351,10 +299,21 @@ def main() -> None:
     for name, version, license_, source, kept in rows:
         lines.append(f"| {name} | {version} | {license_} | {source} | {', '.join(f'`{k}`' for k in kept)} |")
     (top / "THIRD-PARTY-NOTICES.md").write_text("\n".join(lines) + "\n")
+    # the same for the server's About > Licenses (engine_notices.py's form, the texts read in), with the parts the
+    # engine opens where the user installed them; not the Python packages, which the server reads where they are
+
+    def read(k: str) -> dict:
+        return {"name": Path(k).name, "text": (top / k).read_text(encoding="utf-8", errors="replace")}
+
+    notices = [engine_notices.entry({"name": name, "license": license_, "source": source}, version,
+                                    [read(k) for k in kept])
+               for name, version, license_, source, kept in rows[1:len(COMPONENTS)]]   # not XeStrata's own
+    notices += [engine_notices.entry(r, r["version"], []) for r in ENGINE_ROWS if not r.get("bundled", True)]
+    (eng / "NOTICES.json").write_text(json.dumps(notices, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
 
     archive = a.out / f"{top_name}.7z"
     archive.unlink(missing_ok=True)
-    subprocess.run(["7z", "a", "-t7z", "-mx=9", "-bd", str(archive), top_name], cwd=a.out, check=True,
+    subprocess.run(["7z", "a", "-t7z", "-mx=9", "-mmt=on", "-bd", str(archive), top_name], cwd=a.out, check=True,
                    stdout=subprocess.DEVNULL)
     say(f"{archive} ({archive.stat().st_size / 2**20:.0f} MiB)")
 

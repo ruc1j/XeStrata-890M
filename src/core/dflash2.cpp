@@ -1,28 +1,28 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// src/core/dflash2.cpp - the DFlash2 drafter on SYCL: upstream Strata's sycl/src/core/dflash2.cpp (its port of
-// src/core/dflash2.cpp) on XeStrata's runtime; see include/strata/core/dflash2.hpp for the differences from the CUDA
-// drafter.  The GPU goes through strata/core/gpu.hpp: the drafter's queue is an engine stream, its graphs are captured
-// with begin_capture / end_capture, and a failing call leaves its message in gpu::last_error().
+// src/core/dflash2.cpp - see include/strata/core/dflash2.hpp.  The drafter over XeStrata's GPU operations
+// (strata/core/gpu.hpp): one in-order stream, one graph per context-row count, the host stages the positions and the
+// rope tables (no device FP64).  The ring log rebuilds a resumed conversation's window from the logged activation
+// rows with the same kernels, so the rebuilt K/V bytes are those of the original update.
 #include "strata/core/dflash2.hpp"
 
-#include "strata/core/gpu.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/dflash2.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
-#include <fstream>
-#include <initializer_list>
+#include <set>
 #include <stdexcept>
 
 namespace strata::core {
@@ -31,44 +31,114 @@ namespace {
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
-constexpr int kMetaInts = 32;
-constexpr int kTableFloats = 16 * 128;   // 16 rows x [cos 64, sin 64]
-constexpr size_t kMetaBytes = (size_t) (kMetaInts + kTableFloats) * 4;
-
-/// A failing runtime call: its message after `what`.
-bool gpu_fail(std::string& err, const char* what) {
-    err = std::string("dflash2: ") + what + ": " + strata::gpu::last_error();
-    return false;
+// A number of the pack's index or of a setting, read whole: text that is not one fails, where atoi took the digits up
+// to the first other character, and 0 for none.
+bool read_int(const char* s, int64_t& v) {
+    char* end = nullptr;
+    errno = 0;
+    v = std::strtoll(s, &end, 10);
+    return end != s && *end == '\0' && errno == 0;
 }
 
-/// Ends the recording on `cs` (begun by capture): the graph when `ok`, else the recording is dropped.
-bool finish_capture(strata::gpu::Stream cs, bool ok, strata::gpu::Graph*& exec, std::string& err) {
-    if (!ok) { strata::gpu::abandon_capture(cs); return false; }
-    if (!strata::gpu::end_capture(cs, &exec)) return gpu_fail(err, "end capture");
+bool read_int(const char* s, int& v) {
+    int64_t w = 0;
+    if (!read_int(s, w) || w < INT_MIN || w > INT_MAX) return false;
+    v = (int) w;
     return true;
 }
 
-/// A device-to-host or host-to-device copy on the drafter's stream, waited for.
-bool copy_wait(strata::gpu::Stream cs, void* dst, const void* src, size_t bytes, std::string& err) {
-    if (!strata::gpu::copy_async(dst, src, bytes, cs)) return gpu_fail(err, "copy");
-    if (!strata::gpu::stream_sync(cs)) return gpu_fail(err, "wait");
+bool read_float(const char* s, float& v) {
+    char* end = nullptr;
+    errno = 0;
+    v = std::strtof(s, &end);
+    return end != s && *end == '\0' && errno == 0;
+}
+
+// The index's comma-separated list of tap layers ("3,11,19,"; a trailing comma is allowed).
+bool read_int_list(const char* s, std::vector<int>& out) {
+    out.clear();
+    for (const char* q = s; *q != '\0';) {
+        char* end = nullptr;
+        errno = 0;
+        const long long v = std::strtoll(q, &end, 10);
+        if (end == q || errno != 0 || v < INT_MIN || v > INT_MAX || (*end != ',' && *end != '\0')) return false;
+        out.push_back((int) v);
+        q = *end == ',' ? end + 1 : end;
+    }
+    return true;
+}
+
+// A tensor's line of the index: "t <name> <dtype> <rows> <cols> <offset> <bytes>".
+bool read_tensor_line(const std::string& line, char (&name)[256], char (&dtype)[64], int64_t (&v)[4]) {
+    char n[4][32];
+    if (std::sscanf(line.c_str(), "t %255s %63s %31s %31s %31s %31s", name, dtype, n[0], n[1], n[2], n[3]) != 6)
+        return false;
+    for (int k = 0; k < 4; ++k)
+        if (!read_int(n[k], v[k])) return false;
     return true;
 }
 
 }  // namespace
 
-Dflash2Drafter::~Dflash2Drafter() try {
+Dflash2Drafter::~Dflash2Drafter() { release(); }
+
+void Dflash2Drafter::release() {
     if (device_ < 0) return;
-    const OnDevice on_device(device_);
-    if (cs_) strata::gpu::stream_sync(cs_);
-    for (auto& e : exec_)
-        if (e) strata::gpu::graph_destroy(e);
-    strata::gpu::free(blob_); strata::gpu::free(slab_);   // every work buffer, the rings and the rebuild scratch live in the slab
-    strata::gpu::free(logits_); strata::gpu::free(dvocab_); strata::gpu::free(dhead_);
-    strata::gpu::free(h_logq_); strata::gpu::free(h_logd_);
-    strata::gpu::free(h_meta_); strata::gpu::free(h_out_);
-    if (cs_) strata::gpu::stream_destroy(cs_);
-} catch (...) {
+    {
+        const OnDevice on_device(device_);
+        if (cs_) strata::gpu::stream_sync(cs_);
+        for (auto& shape : exec_) for (auto& e : shape)
+            if (e) { strata::gpu::graph_destroy(e); e = nullptr; }
+        strata::gpu::free(blob_);
+        strata::gpu::free(slab_);
+        strata::gpu::free(logits_);
+        if (!dhead_shared_) {
+            // the subset's rows and ids are the DraftSubset's (it frees them); a raw bind's vocab is ours, a host
+            // bind's the engine's
+            if (dvocab_ && !subset_ && !vocab_borrowed_) strata::gpu::free(const_cast<int32_t*>(dvocab_));
+        }
+        subset_.reset();
+        strata::gpu::free(h_logq_);
+        strata::gpu::free(h_logd_);
+        strata::gpu::free(h_meta_);
+        strata::gpu::free(h_out_);
+        if (cs_) strata::gpu::stream_destroy(cs_);
+    }
+    device_ = -1;
+    cs_ = nullptr;
+    blob_ = slab_ = nullptr;
+    logits_ = nullptr;
+    h_logq_ = nullptr;
+    h_logd_ = nullptr;
+    h_meta_ = nullptr;
+    h_out_ = nullptr;
+    emb_mask_ = nullptr;
+    dvocab_ = nullptr;
+    head_w_ = nullptr;
+    vocab_borrowed_ = dhead_shared_ = bound_ = sel_q4_ = ctx_pending_ = false;
+    shared_ = SharedHead{};
+    embed_ = nullptr;
+    host_embed_ = nullptr;
+    head_fn_ = nullptr;
+    tensors_.clear();
+    tensors_.shrink_to_fit();
+    taps_.clear();
+    vram_ = 0;
+    graph_taps_ = nullptr;
+    have_ctx_ = 0;
+    ndraft_ = kDrafts;
+    block_rows_ = capacity_rows_ = kRows;
+    history_ = DraftRingHistory{};
+    pend_pos0_ = -1;
+    pend_n_ = 0;
+    log_on_ = true;
+}
+
+uint64_t Dflash2Drafter::ram_bytes() const {
+    if (device_ < 0) return 0;
+    uint64_t b = meta_bytes() + (uint64_t) N_ * 4 + 64 * sizeof(int32_t) + ring_log_bytes() + ring_stash_bytes();
+    if (h_logq_ != nullptr) b += (uint64_t) capacity_rows_ * N_ + (uint64_t) capacity_rows_ * (N_ / 32) * 4;
+    return b;
 }
 
 const Dflash2Drafter::Tensor& Dflash2Drafter::find(const std::string& name) const {
@@ -77,22 +147,90 @@ const Dflash2Drafter::Tensor& Dflash2Drafter::find(const std::string& name) cons
     throw std::runtime_error("dflash2: tensor " + name + " is missing from the pack");
 }
 
-bool Dflash2Drafter::load(const std::string& path, int device, std::string& err) try {
-    device_ = device;
-    const OnDevice on_device(device_);
-    std::ifstream f(path, std::ios::binary);   // (a stream, not fopen: closed on every return)
-    if (!f) { err = "dflash2: cannot open " + path; return false; }
+bool Dflash2Drafter::read_shape(const std::string& path, PackShape& shape, std::string& err) {
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> f(std::fopen(path.c_str(), "rb"), &std::fclose);
+    if (f == nullptr) { err = "dflash2: cannot open " + path; return false; }
     uint32_t hdr[3];
-    if (!f.read(reinterpret_cast<char*>(hdr), 12) || std::memcmp(hdr, "DF2P", 4) != 0 || hdr[1] != 1) { err = "dflash2: " + path + " is not a DF2P v1 pack"; return false; }
-    // The pack's own numbers (the index length, each tensor's offset and size) are checked against the file before they size an
-    // allocation or a copy: a pack that claims more than the file holds is refused here, not written past the device buffer.
-    f.seekg(0, std::ios::end);
-    const uint64_t file_bytes = (uint64_t) (int64_t) f.tellg();
-    f.seekg(12, std::ios::beg);
-    if (!f || (uint64_t) hdr[2] > file_bytes - 12) { err = "dflash2: the pack's index is cut short"; return false; }
+    if (std::fread(hdr, 4, 3, f.get()) != 3 || std::memcmp(hdr, "DF2P", 4) != 0 || hdr[1] != 1 || hdr[2] > (64u << 20)) {
+        err = "dflash2: " + path + " is not a DF2P v1 pack";
+        return false;
+    }
     std::string index(hdr[2], ' ');
-    if (!f.read(index.data(), hdr[2])) { err = "dflash2: the pack's index is cut short"; return false; }
-    const int64_t data_off = 12 + (int64_t) hdr[2];
+    if (std::fread(index.data(), 1, hdr[2], f.get()) != hdr[2]) { err = "dflash2: the pack's index is cut short"; return false; }
+    shape = PackShape{};
+    for (size_t i = 0; i < index.size();) {
+        const size_t j = index.find('\n', i);
+        if (j == std::string::npos) break;
+        const std::string line = index.substr(i, j - i);
+        i = j + 1;
+        char a[256], b[64], c[256];
+        int64_t v[4];
+        bool ok = true;
+        if (std::sscanf(line.c_str(), "cfg %63s %255s", b, c) == 2) {
+            const std::string key = b;
+            if (key == "hidden") ok = read_int(c, shape.hidden);
+            else if (key == "vocab") ok = read_int(c, shape.vocab);
+            else if (key == "taps") ok = read_int_list(c, shape.taps);
+        } else if (read_tensor_line(line, a, b, v)) {
+            shape.bytes = std::max<uint64_t>(shape.bytes, (uint64_t) v[2] + (uint64_t) v[3]);
+        } else if (line.starts_with("t ")) {
+            ok = false;
+        }
+        if (!ok) {
+            err = "dflash2: " + path + " has a bad line in its index: ";
+            err += line;
+            return false;
+        }
+    }
+    if (shape.taps.empty() || shape.hidden <= 0) { err = "dflash2: " + path + " has no taps in its index"; return false; }
+    return true;
+}
+
+void Dflash2Drafter::set_capacity_rows(int rows) {
+    if (device_ >= 0 || (rows != kRows && rows != kMaxRows))
+        throw std::invalid_argument("dflash2: capacity must be 8 or 16, set before load");
+    requested_capacity_rows_ = rows;
+}
+
+bool Dflash2Drafter::load(const std::string& path, int device, std::string& err) {
+    device_ = device;
+    capacity_rows_ = requested_capacity_rows_;
+    // a failure below must not leave what it took: the caller's drop releases only a loaded drafter, so return
+    // the pack's VRAM, the work buffers and the stream here on any error past this point
+    bool loaded = false;
+    struct OnFail {
+        Dflash2Drafter* d;
+        bool* ok;
+        ~OnFail() { if (!*ok) d->release(); }
+    } on_fail{this, &loaded};
+    const OnDevice on_device(device_);
+    std::unique_ptr<std::FILE, int (*)(std::FILE*)> f(std::fopen(path.c_str(), "rb"), &std::fclose);
+    if (f == nullptr) { err = "dflash2: cannot open " + path; return false; }
+    uint32_t hdr[3];
+    if (std::fread(hdr, 4, 3, f.get()) != 3 || std::memcmp(hdr, "DF2P", 4) != 0 || hdr[1] != 1) {
+        err = "dflash2: " + path + " is not a DF2P v1 pack";
+        return false;
+    }
+    // The pack's own numbers (the index length, each tensor's offset and size) are checked against the file before
+    // they size an allocation or a copy: a pack that claims more than the file holds is refused here, not written
+    // past the device buffer (#78).
+#if defined(_WIN32)
+    const bool sized = _fseeki64(f.get(), 0, SEEK_END) == 0;
+    const int64_t file_end = sized ? (int64_t) _ftelli64(f.get()) : -1;
+    const bool back = _fseeki64(f.get(), 12, SEEK_SET) == 0;
+#else
+    const bool sized = fseeko(f.get(), 0, SEEK_END) == 0;
+    const int64_t file_end = sized ? (int64_t) ftello(f.get()) : -1;
+    const bool back = fseeko(f.get(), 12, SEEK_SET) == 0;
+#endif
+    if (!sized || !back || file_end < 12 || (uint64_t) hdr[2] > (uint64_t) file_end - 12) {
+        err = "dflash2: the pack's index is cut short";
+        return false;
+    }
+    const uint64_t file_bytes = (uint64_t) file_end;
+    std::string index(hdr[2], ' ');
+    if (std::fread(index.data(), 1, hdr[2], f.get()) != hdr[2]) { err = "dflash2: the pack's index is cut short"; return false; }
+    const long data_off = 12 + (long) hdr[2];
     uint64_t total = 0;
     for (size_t i = 0; i < index.size();) {
         const size_t j = index.find('\n', i);
@@ -100,95 +238,123 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
         const std::string line = index.substr(i, j - i);
         i = j + 1;
         char a[256], b[64], c[256];
-        long long v1, v2, v3, v4;
+        int64_t v[4];
+        bool ok = true;
         if (std::sscanf(line.c_str(), "cfg %63s %255s", b, c) == 2) {
             const std::string key = b;
-            if (key == "hidden") N_ = std::atoi(c);
-            else if (key == "layers") L_ = std::atoi(c);
-            else if (key == "heads") NH_ = std::atoi(c);
-            else if (key == "kv_heads") NKV_ = std::atoi(c);
-            else if (key == "head_dim") HD_ = std::atoi(c);
-            else if (key == "inter") I_ = std::atoi(c);
-            else if (key == "window") window_ = std::atoi(c);
-            else if (key == "rope_theta") theta_ = (float) std::atof(c);
-            else if (key == "eps") eps_ = (float) std::atof(c);
-            else if (key == "conv_group") group_ = std::atoi(c);
-            else if (key == "rank") rank_ = std::atoi(c);
-            else if (key == "mask_token") mask_token_ = std::atoi(c);
-            else if (key == "vocab") vocab_ = std::atoll(c);
-            else if (key == "taps") {
-                taps_.clear();
-                for (const char* q = c; *q;) { taps_.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q == ',') ++q; }
-            }
-        } else if (std::sscanf(line.c_str(), "t %255s %63s %lld %lld %lld %lld", a, b, &v1, &v2, &v3, &v4) == 6) {
+            if (key == "hidden") ok = read_int(c, N_);
+            else if (key == "layers") ok = read_int(c, L_);
+            else if (key == "heads") ok = read_int(c, NH_);
+            else if (key == "kv_heads") ok = read_int(c, NKV_);
+            else if (key == "head_dim") ok = read_int(c, HD_);
+            else if (key == "inter") ok = read_int(c, I_);
+            else if (key == "window") ok = read_int(c, window_);
+            else if (key == "rope_theta") ok = read_float(c, theta_);
+            else if (key == "eps") ok = read_float(c, eps_);
+            else if (key == "conv_group") ok = read_int(c, group_);
+            else if (key == "rank") ok = read_int(c, rank_);
+            else if (key == "mask_token") ok = read_int(c, mask_token_);
+            else if (key == "vocab") ok = read_int(c, vocab_);
+            else if (key == "taps") ok = read_int_list(c, taps_);
+        } else if (read_tensor_line(line, a, b, v)) {
             const uint64_t data_bytes = file_bytes - (uint64_t) data_off;
-            if (v1 < 0 || v2 < 0 || v3 < 0 || v4 < 0 || (uint64_t) v3 > data_bytes || (uint64_t) v4 > data_bytes - (uint64_t) v3) {
+            if (v[0] < 0 || v[1] < 0 || v[2] < 0 || v[3] < 0 || (uint64_t) v[2] > data_bytes ||
+                (uint64_t) v[3] > data_bytes - (uint64_t) v[2]) {
                 err = "dflash2: tensor " + std::string(a) + " lies outside the pack (" + path + ")";
                 return false;
             }
             Tensor t;
-            t.name = a; t.dtype = b; t.rows = v1; t.cols = v2; t.off = (uint64_t) v3; t.bytes = (uint64_t) v4;
-            if (t.dtype == "q4_0" && (t.cols < 32 || t.cols % 32 != 0 || t.bytes % 18 != 0 || t.bytes / 18 % (uint64_t) (t.cols / 32) != 0 ||
-                                      t.bytes / 18 / (uint64_t) (t.cols / 32) != (uint64_t) t.rows)) {   // 18 bytes per 32 values
-                err = "dflash2: tensor " + t.name + " is not the size of a Q4_0 matrix of its shape (" + path + ")";
+            t.name = a; t.dtype = b; t.rows = v[0]; t.cols = v[1]; t.off = (uint64_t) v[2]; t.bytes = (uint64_t) v[3];
+            // a ggml block matrix's bytes follow from its shape (18 bytes per 32 values for Q4_0, 34 for Q8_0): the
+            // tiling kernels write rows x cols of it
+            const uint64_t block = t.dtype == "q4_0" ? 18 : t.dtype == "q8_0" ? 34 : 0;
+            if (block != 0 && (t.cols < 32 || t.cols % 32 != 0 || t.bytes % block != 0 ||
+                               t.bytes / block % (uint64_t) (t.cols / 32) != 0 ||
+                               t.bytes / block / (uint64_t) (t.cols / 32) != (uint64_t) t.rows)) {
+                err = "dflash2: tensor " + t.name + " is not the size of a " + (block == 18 ? "Q4_0" : "Q8_0") +
+                      " matrix of its shape (" + path + ")";
                 return false;
             }
             tensors_.push_back(t);
             total = std::max(total, t.off + t.bytes);
+        } else if (line.starts_with("t ")) {
+            ok = false;
+        }
+        if (!ok) {
+            err = "dflash2: " + path + " has a bad line in its index: ";
+            err += line;
+            return false;
         }
     }
-    // The layer count bounds the K/V rings (kring_ has 8), inter sizes the MLP buffers, conv_group splits the 2560 rows into at most 160
-    // groups (the dynamic conv rows are 640 wide: 2 convs x 2 taps x 160), and the taps are the main model's layers whose rows the
-    // 5 x 2560 tap buffers hold.
-    bool taps_ok = !taps_.empty() && taps_.size() <= 5;
-    for (const int t : taps_) taps_ok = taps_ok && t >= 0 && t < 1024;
-    if (tensors_.empty() || NH_ != 32 || NKV_ != 8 || HD_ != 128 || rank_ != 256 || N_ != 2560 || L_ < 1 || L_ > 8 || window_ < 1 ||
-        window_ + 16 > kRing || I_ < 1 || I_ % 32 != 0 || group_ < 1 || N_ % group_ != 0 || N_ / group_ > 160 || !taps_ok) {
-        err = "dflash2: the pack's shape is not the Flash-Next drafter this engine was written for";
+    // what the kernels take (kernels/dflash2.hpp): 32 query and 8 K/V heads of 128, a rank-256 selector, products of
+    // a multiple of 512 inputs, a hidden of at most 4096 (df2_conv_rms_quant), at most 8 layers (the rings), and the
+    // whole vocabulary in one top-k (4096 x kDf2TopBlocks).  The three drafters (Qwen3.8-Flash-Next 2560, GLM-5.3-Flash
+    // 4096, Qwen3.6-35B-A3B 2048) are all of this shape.
+    const char* bad = tensors_.empty() ? "no tensors"
+                    : NH_ != 32 || NKV_ != 8 || HD_ != 128 ? "not 32 query and 8 K/V heads of 128"
+                    : rank_ != 256 ? "a selector rank other than 256"
+                    : N_ < 512 || N_ > 4096 || N_ % 512 != 0 ? "a hidden size the kernels do not take"
+                    : I_ <= 0 || I_ % 512 != 0 ? "an FFN width the kernels do not take"
+                    : group_ != 16 ? "a conv group other than 16"
+                    : L_ < 1 || L_ > 8 ? "more layers than the rings take"
+                    : window_ < 1 || window_ + 16 > kRing ? "a window the ring does not take"
+                    : taps_.empty() || (taps_.size() * (size_t) N_) % 512 != 0 ? "no taps"
+                    : std::any_of(taps_.begin(), taps_.end(), [](int t) { return t < 0 || t >= 1024; }) ? "a tap layer outside the model"
+                    : vocab_ > (int64_t) 4096 * strata::kernels::kDf2TopBlocks ? "a vocabulary larger than the top-k takes"
+                    : nullptr;
+    if (bad != nullptr) {
+        err = std::string("dflash2: the pack's shape is not one this engine's kernels take: ") + bad;
         return false;
     }
-    if (cs_ == nullptr && (cs_ = strata::gpu::stream_create()) == nullptr) return gpu_fail(err, "stream");
-    blob_ = static_cast<uint8_t*>(strata::gpu::alloc_device(total));
-    if (blob_ == nullptr) { err = "dflash2: the pack does not fit in VRAM (" + std::to_string(total >> 20) + " MiB)"; return false; }
+    in_max_ = std::max({(int) taps_.size() * N_, I_, NH_ * HD_, N_});
+    if (cs_ == nullptr) cs_ = strata::gpu::stream_create();
+    if (cs_ == nullptr) { err = "dflash2: the drafter's stream"; return false; }
+    if (!strata::gpu::alloc_device(&blob_, total)) {
+        err = "dflash2: the pack does not fit in VRAM (" + std::to_string(total >> 20) + " MiB)";
+        return false;
+    }
     vram_ += total;
     uint64_t max_bytes = 0;
     for (const Tensor& t : tensors_) max_bytes = std::max(max_bytes, t.bytes);
     std::vector<uint8_t> stage(max_bytes);
-    uint8_t* tmp = static_cast<uint8_t*>(strata::gpu::alloc_device(max_bytes));
-    if (tmp == nullptr) { err = "dflash2: upload scratch"; return false; }
+    uint8_t* tmp = nullptr;
+    if (!strata::gpu::alloc_device(&tmp, max_bytes)) { err = "dflash2: upload scratch"; return false; }
     struct TmpFree { uint8_t* p; ~TmpFree() { strata::gpu::free(p); } } tmp_free{tmp};
     for (const Tensor& t : tensors_) {
-        f.seekg((std::streamoff) (data_off + (int64_t) t.off), std::ios::beg);
-        if (!f.read(reinterpret_cast<char*>(stage.data()), (std::streamsize) t.bytes)) { err = "dflash2: the pack is shorter than its index"; return false; }
-        if (t.dtype == "q4_0" && t.name.find("_codebook") != std::string::npos) {
-            // The pack with the selector as Q4_0 rows (tools/dflash2_pack.py --q4_0-selector; strata_control/drafting.py CONVERTED_NAME) is for engines that print
-            // "selector codebooks: Q4_0 rows" (CUDA, HIP, Metal). This build's select kernel reads bf16 rows only, so it says so instead of reading garbage; the app
-            // never hands it that pack (it looks for that text in the engine program and this file does not have it).
-            err = "dflash2: this build reads bf16 selector codebooks only; " + path + " has them as Q4_0 (use the pack without --q4_0-selector)";
-            return false;
-        }
-        if (t.dtype == "q4_0") {   // GGML Q4_0 blocks -> the tiled nibble plane at the tensor's offset, then the d plane (same total bytes)
-            if (!copy_wait(cs_, tmp, stage.data(), t.bytes, err)) return false;
-            kernels::df2_q4_tile(tmp, blob_ + t.off, blob_ + t.off + (uint64_t) t.rows * (uint64_t) t.cols / 2, (int) t.cols, t.rows * t.cols / 32, cs_);
-            if (!strata::gpu::stream_sync(cs_)) return gpu_fail(err, "tile");
+#if defined(_WIN32)
+        _fseeki64(f.get(), data_off + (long long) t.off, SEEK_SET);
+#else
+        fseeko(f.get(), data_off + (off_t) t.off, SEEK_SET);
+#endif
+        if (std::fread(stage.data(), 1, t.bytes, f.get()) != t.bytes) { err = "dflash2: the pack is shorter than its index"; return false; }
+        const bool codebook = t.name.find("_codebook") != std::string::npos;
+        if (t.dtype == "q4_0" && codebook) {
+            sel_q4_ = true;   // the converted pack: Q4_0 rows in block order, the select kernel dequantizes them
+            if (!strata::gpu::copy(blob_ + t.off, stage.data(), t.bytes)) { err = "dflash2: codebook upload"; return false; }
+        } else if (t.dtype == "q4_0") {   // ggml Q4_0 blocks -> the tiled nibble plane, then the d plane (same total bytes)
+            if (!strata::gpu::copy(tmp, stage.data(), t.bytes)) { err = "dflash2: weight upload"; return false; }
+            strata::kernels::df2_q4_tile(tmp, blob_ + t.off, blob_ + t.off + (uint64_t) t.rows * (uint64_t) t.cols / 2,
+                                         (int) t.cols, t.rows * t.cols / 32, cs_);
+            if (!strata::gpu::stream_sync(cs_)) { err = "dflash2: weight tiling"; return false; }
         } else if (t.dtype == "q8_0") {
-            err = "dflash2: this build runs the Q4_0 pack only (tools/dflash2_pack.py --q4_0); " + path + " holds Q8_0 matrices";
-            return false;
+            if (!strata::gpu::copy(tmp, stage.data(), t.bytes)) { err = "dflash2: weight upload"; return false; }
+            strata::kernels::df2_q8_tile(tmp, blob_ + t.off, blob_ + t.off + (uint64_t) t.rows * (uint64_t) t.cols,
+                                         (int) t.cols, t.rows * t.cols / 32, cs_);
+            if (!strata::gpu::stream_sync(cs_)) { err = "dflash2: weight tiling"; return false; }
         } else {
-            if (!copy_wait(cs_, blob_ + t.off, stage.data(), t.bytes, err)) return false;
+            if (!strata::gpu::copy(blob_ + t.off, stage.data(), t.bytes)) { err = "dflash2: tensor upload"; return false; }
         }
     }
-    if (const char* e = std::getenv("STRATA_DF2_TIMING"); e && e[0] == '1') timing_ = true;
-    return alloc(err);
-} catch (const std::exception& e) {
-    err = std::string("dflash2: ") + e.what();
-    return false;
+    std::fprintf(stderr, "xestrata dflash2: %s pack, %d layers, taps", sel_q4_ ? "Q4_0 + Q4_0 selector" : "Q4_0/Q8_0", L_);
+    for (int l : taps_) std::fprintf(stderr, " %d", l);
+    std::fprintf(stderr, ", window %d\n", window_);
+    loaded = alloc(err);
+    return loaded;
 }
 
-bool Dflash2Drafter::alloc(std::string& err) try {
-    // One device allocation for all of the drafter's work buffers, rings and the rebuild scratch: on the Arc A-series (i915) the host cost of every
-    // kernel launch grows with the number of live device allocations (12 us with none, 131 us with 300), and the eager prompt path launches a lot.
-    // A first pass adds the sizes up, the second hands out 256-byte aligned pieces.
+bool Dflash2Drafter::alloc(std::string& err) {
+    // One device allocation for the work buffers, the rings and the rebuild scratch: the host cost of a launch grows
+    // with the number of live device allocations (the Arc A-series measurement, upstream 903badd90).
     size_t slab_bytes = 0;
     uint8_t* slab = nullptr;
     auto dev = [&](auto** p, size_t n) {
@@ -198,601 +364,560 @@ bool Dflash2Drafter::alloc(std::string& err) try {
         if (slab != nullptr) *p = reinterpret_cast<T*>(slab + off);
         return true;
     };
-    const size_t B = kRows;
-    const size_t rb_cap = (size_t) kRing + kRows;
+    const size_t B = (size_t) capacity_rows_;
+    const size_t rb_cap = (size_t) kRing + capacity_rows_;
     auto carve = [&]() {
-        bool ok = dev(&d_meta_, (size_t) kMetaInts + kTableFloats) && dev(&d_out_, 64) && dev(&xq_, kernels::native_q8_1_bytes(N_, kRows) + 4096) &&
-              dev(&xqp_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&xqc_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * 8 + 64) &&
-              dev(&fcy_, B * N_) && dev(&kc_, B * NKV_ * HD_) && dev(&vc_, B * NKV_ * HD_) && dev(&h_, B * N_) && dev(&xn_, B * N_) &&
-              dev(&dyn_, B * 640) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
-              dev(&kblk_, B * NKV_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
-              dev(&part_, (size_t) kernels::kDf2PartChunks * 8 * 32 * 130) && dev(&fn_, B * N_) && dev(&topval_, kDrafts * 16) && dev(&toptok_, kDrafts * 16) &&
-              dev(&hsel_, kDrafts * rank_) && dev(&topscratch_, (size_t) kDrafts * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2) && dev(&tag_, (size_t) kRing);
-    for (int l = 0; ok && l < L_; ++l) ok = dev(&kring_[l], (size_t) kRing * NKV_ * HD_) && dev(&vring_[l], (size_t) kRing * NKV_ * HD_);
-        ok = ok && dev(&rb_q_, rb_cap * 2560) && dev(&rb_d_, rb_cap * 80) && dev(&rb_pos_, rb_cap);
+        bool ok = dev(&d_meta_, (size_t) meta_ints() + table_floats() + N_) && dev(&d_out_, 64) && dev(&emb_mask_, N_) &&
+              dev(&xq_, strata::kernels::native_q8_1_rows_bytes(N_, capacity_rows_) + 4096) &&
+              dev(&xqp_, (size_t) in_max_ * capacity_rows_ + 4096) && dev(&xdp_, (size_t) in_max_ / 32 * capacity_rows_ + 64) &&
+              dev(&xqc_, (size_t) in_max_ * capacity_rows_ + 4096) && dev(&xdc_, (size_t) in_max_ / 32 * capacity_rows_ + 64) &&
+              dev(&fcy_, B * N_) && dev(&kc_, B * NKV_ * HD_) && dev(&vc_, B * NKV_ * HD_) && dev(&h_, B * N_) &&
+              dev(&xn_, B * N_) && dev(&dyn_, B * (size_t) (N_ / 4)) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) &&
+              dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) && dev(&kblk_, B * NKV_ * HD_) && dev(&o_, B * N_) &&
+              dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
+              dev(&part_, (size_t) strata::kernels::kDf2PartChunks * 8 * capacity_rows_ * 4 * 130) && dev(&fn_, B * N_) &&
+              dev(&topval_, (size_t) (capacity_rows_ - 1) * 16) && dev(&toptok_, (size_t) (capacity_rows_ - 1) * 16) &&
+              dev(&hsel_, (size_t) (capacity_rows_ - 1) * rank_) &&
+              dev(&topscratch_, (size_t) (capacity_rows_ - 1) * strata::kernels::kDf2TopBlocks * strata::kernels::kDf2TopK * 2) &&
+              dev(&tag_, (size_t) kRing);
+        for (int l = 0; ok && l < L_; ++l)
+            ok = dev(&kring_[l], (size_t) kRing * NKV_ * HD_) && dev(&vring_[l], (size_t) kRing * NKV_ * HD_);
+        ok = ok && dev(&rb_q_, rb_cap * N_) && dev(&rb_d_, rb_cap * (N_ / 32)) && dev(&rb_pos_, rb_cap);
         return ok;
     };
     carve();
     const size_t slab_total = slab_bytes;
-    slab_ = static_cast<uint8_t*>(strata::gpu::alloc_device(slab_total));
-    if (slab_ == nullptr) { err = "dflash2: the drafter's buffers do not fit in VRAM"; return false; }
+    if (!strata::gpu::alloc_device(&slab_, slab_total)) { err = "dflash2: the drafter's buffers do not fit in VRAM"; return false; }
     slab = slab_;
     slab_bytes = 0;
-    const bool ok = carve();
+    carve();
     vram_ += slab_total;
-    rb_bytes_ = rb_cap * (2560 + 80 * sizeof(float) + sizeof(int32_t));
-    if (!ok) { err = "dflash2: the drafter's buffers do not fit in VRAM"; return false; }
-    h_meta_ = static_cast<int32_t*>(strata::gpu::alloc_host(kMetaBytes));   // pinned: the one copy before a round and the one after read them
-    h_out_ = static_cast<int32_t*>(strata::gpu::alloc_host(64 * 4));
-    if (h_meta_ == nullptr || h_out_ == nullptr) { err = "dflash2: host staging"; return false; }
-    std::memset(h_meta_, 0, kMetaBytes);
-    std::memset(h_out_, 0, 64 * 4);
-    rt_ctx_ = reinterpret_cast<float*>(d_meta_ + kMetaInts);
+    rt_ctx_ = reinterpret_cast<float*>(d_meta_ + meta_ints());
     rt_blk_ = rt_ctx_ + B * 128;
-    strata::gpu::memset_async(d_meta_, 0, kMetaBytes, cs_);
-    strata::gpu::memset_async(tag_, 0xff, (size_t) kRing * 8, cs_);   // -1: no slot holds a context row yet
-    for (int64_t& t : slot_pos_) t = -1;
-    if (const char* e = std::getenv("STRATA_DF2_RING_LOG"); e && e[0] == '0') log_on_ = false;
-    if (const char* e = std::getenv("STRATA_DF2_LOG_MIB"); e && e[0]) stash_budget_ = (uint64_t) std::max(0, std::atoi(e)) << 20;
+    history_.init((size_t) N_, 32, kRing, window_);
+    if (!strata::gpu::alloc_host(&h_meta_, meta_bytes() + (size_t) N_ * 4) || !strata::gpu::alloc_host(&h_out_, 64 * sizeof(int32_t))) {
+        err = "dflash2: host staging";
+        return false;
+    }
+    std::memset(h_meta_, 0, meta_bytes() + (size_t) N_ * 4);
+    std::memset(h_out_, 0, 64 * sizeof(int32_t));
+    if (!strata::gpu::memset_async(d_meta_, 0, meta_bytes() + (size_t) N_ * 4, cs_) ||
+        !strata::gpu::memset_async(tag_, 0xff, (size_t) kRing * 8, cs_)) {   // -1: no slot holds a context row yet
+        err = "dflash2: ring init";
+        return false;
+    }
+    if (const char* e = strata::env_get("DF2_RING_LOG"); e != nullptr && e[0] == '0') log_on_ = false;
+    int log_mib = 0;
+    if (const char* e = strata::env_get("DF2_LOG_MIB"); e != nullptr && read_int(e, log_mib))
+        stash_budget_ = (uint64_t) std::max(0, log_mib) << 20;
     if (log_on_) {
-        h_logq_ = static_cast<int8_t*>(strata::gpu::alloc_host((size_t) kRows * N_));
-        h_logd_ = static_cast<float*>(strata::gpu::alloc_host((size_t) kRows * (N_ / 32) * 4));
-        if (h_logq_ == nullptr || h_logd_ == nullptr) {
-            strata::gpu::free(h_logq_);
-            strata::gpu::free(h_logd_);
-            h_logq_ = nullptr; h_logd_ = nullptr; log_on_ = false;
-            std::fprintf(stderr, "strata dflash2: the ring log's staging does not fit in host memory: the log is off\n");
+        if (!strata::gpu::alloc_host(&h_logq_, (size_t) capacity_rows_ * N_) ||
+            !strata::gpu::alloc_host(&h_logd_, (size_t) capacity_rows_ * (N_ / 32) * 4)) {
+            strata::gpu::free(h_logq_); h_logq_ = nullptr;
+            strata::gpu::free(h_logd_); h_logd_ = nullptr;
+            log_on_ = false;
+            std::fprintf(stderr, "xestrata dflash2: the ring log's staging does not fit in host memory: the log is off\n");
         }
     }
-    strata::gpu::memset_async(xqp_, 0, (size_t) 5 * N_ * 8 + 4096, cs_);
-    strata::gpu::memset_async(xdp_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4, cs_);
-    strata::gpu::memset_async(xqc_, 0, (size_t) 5 * N_ * 8 + 4096, cs_);
-    strata::gpu::memset_async(xdc_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4, cs_);
-    for (int l = 0; l < L_; ++l) {
-        strata::gpu::memset_async(kring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4, cs_);
-        strata::gpu::memset_async(vring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4, cs_);
+    history_.configure(log_on_, stash_budget_);
+    if (!strata::gpu::memset_async(xqp_, 0, (size_t) in_max_ * capacity_rows_ + 4096, cs_) ||
+        !strata::gpu::memset_async(xdp_, 0, ((size_t) in_max_ / 32 * capacity_rows_ + 64) * 4, cs_) ||
+        !strata::gpu::memset_async(xqc_, 0, (size_t) in_max_ * capacity_rows_ + 4096, cs_) ||
+        !strata::gpu::memset_async(xdc_, 0, ((size_t) in_max_ / 32 * capacity_rows_ + 64) * 4, cs_)) {
+        err = "dflash2: activation init";
+        return false;
     }
-    if (!strata::gpu::stream_sync(cs_)) return gpu_fail(err, "buffers");
-    return true;
-} catch (const std::exception& e) {
-    err = std::string("dflash2: ") + e.what();
-    return false;
+    for (int l = 0; l < L_; ++l) {
+        if (!strata::gpu::memset_async(kring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4, cs_) ||
+            !strata::gpu::memset_async(vring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4, cs_)) {
+            err = "dflash2: ring init";
+            return false;
+        }
+    }
+    return strata::gpu::stream_sync(cs_);
 }
 
-bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err) try {
+uint64_t Dflash2Drafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, const std::string& vocab_file) const {
+    int64_t dv = DraftSubset::file_tokens(vocab_file);
+    if (dv <= 0 || dv > n_vocab) dv = n_vocab;
+    return (uint64_t) dv * head_row_bytes + (uint64_t) (requested_capacity_rows_ - 1) * (uint64_t) dv * 4 + (uint64_t) dv * 4;
+}
+
+bool Dflash2Drafter::bind_raw(EmbedFn embed, HeadFn head, int head_type, int64_t head_rows,
+                              const std::vector<int32_t>& vocab, std::string& err) {
     const OnDevice on_device(device_);
     embed_ = std::move(embed);
-    head_w_ = head_w;
+    head_fn_ = std::move(head);
     head_type_ = head_type;
     n_dvocab_ = head_rows;
     if (!vocab.empty()) {
         n_dvocab_ = (int64_t) vocab.size();
-        dvocab_ = static_cast<int32_t*>(strata::gpu::alloc_device(vocab.size() * 4));
-        if (dvocab_ == nullptr) { err = "dflash2: draft vocabulary"; return false; }
+        int32_t* dv = nullptr;
+        if (!strata::gpu::alloc_device(&dv, vocab.size() * 4)) { err = "dflash2: draft vocabulary"; return false; }
+        if (!strata::gpu::copy(dv, vocab.data(), vocab.size() * 4)) { strata::gpu::free(dv); err = "dflash2: draft vocabulary"; return false; }
+        dvocab_ = dv;
         vram_ += vocab.size() * 4;
-        if (!copy_wait(cs_, dvocab_, vocab.data(), vocab.size() * 4, err)) return false;
     }
-    if ((n_dvocab_ + kernels::kDf2TopBlocks - 1) / kernels::kDf2TopBlocks > 4096) { err = "dflash2: the head has too many rows for the top-k"; return false; }
-    if (!logits_) logits_ = static_cast<float*>(strata::gpu::alloc_device((size_t) kDrafts * (size_t) n_dvocab_ * 4));
-    if (logits_ == nullptr) { err = "dflash2: the draft logits do not fit"; return false; }
-    vram_ += (uint64_t) kDrafts * (uint64_t) n_dvocab_ * 4;
+    if ((n_dvocab_ + strata::kernels::kDf2TopBlocks - 1) / strata::kernels::kDf2TopBlocks > 4096) {
+        err = "dflash2: the head has too many rows for the top-k";
+        return false;
+    }
+    if (logits_ == nullptr && !strata::gpu::alloc_device(&logits_, (size_t) (capacity_rows_ - 1) * (size_t) n_dvocab_ * 4)) {
+        err = "dflash2: the draft logits do not fit";
+        return false;
+    }
+    vram_ += (uint64_t) (capacity_rows_ - 1) * (uint64_t) n_dvocab_ * 4;
     bound_ = true;
     return true;
-} catch (const std::exception& e) {
-    err = std::string("dflash2: ") + e.what();
-    return false;
 }
 
-bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err) try {
+bool Dflash2Drafter::bind_host(HostEmbedFn embed, HeadFn head, int64_t head_rows, const int32_t* vocab_dev,
+                               std::string& err) {
+    const OnDevice on_device(device_);
+    std::vector<float> mask((size_t) N_);
+    if (!embed(mask_token_, mask.data())) { err = "dflash2: the mask token is outside the model's embedding"; return false; }
+    if (!strata::gpu::copy(emb_mask_, mask.data(), mask.size() * 4)) { err = "dflash2: the mask row"; return false; }
+    host_embed_ = std::move(embed);
+    head_fn_ = std::move(head);
+    n_dvocab_ = head_rows;
+    dvocab_ = vocab_dev;
+    vocab_borrowed_ = vocab_dev != nullptr;
+    if ((n_dvocab_ + strata::kernels::kDf2TopBlocks - 1) / strata::kernels::kDf2TopBlocks > 4096) {
+        err = "dflash2: the head has too many rows for the top-k";
+        return false;
+    }
+    if (logits_ == nullptr && !strata::gpu::alloc_device(&logits_, (size_t) (capacity_rows_ - 1) * (size_t) n_dvocab_ * 4)) {
+        err = "dflash2: the draft logits do not fit";
+        return false;
+    }
+    vram_ += (uint64_t) (capacity_rows_ - 1) * (uint64_t) n_dvocab_ * 4;
+    bound_ = true;
+    return true;
+}
+
+bool Dflash2Drafter::bind(const WeightTable& wt, const ModelGeometry& g, const NativeHead* head,
+                          const std::string& vocab_file, std::string& err) {
     const OnDevice on_device(device_);
     if (head == nullptr || !head->loaded()) { err = "dflash2: the drafter needs the native head (--native)"; return false; }
-    const WeightRef* we = wt.find("token_embd.weight");
-    if (we == nullptr) { err = "dflash2: token_embd.weight is missing"; return false; }
-    EmbedFn embed = [we](const int32_t* tok, int n, float* out, strata::gpu::Stream cs) {
-        if (const NativeEmbed* ne = native_embed()) {
-            ne->gather_dev(tok, n, out, cs);
-        } else {
-            const auto* codes = (const uint8_t*) we->data;
-            const auto* scales = (const float*) (codes + we->codes_bytes);
-            const auto* offsets = we->has_offset ? (const float*) (codes + we->codes_bytes + we->scales_bytes) : nullptr;
-            kernels::embedding_gather_dev(codes, scales, offsets, tok, n, we->ne0, we->code_bits, we->code_bias, we->group_elems,
-                                          (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), out, cs);
-        }
-    };
-    std::vector<int32_t> vocab;
-    if (!vocab_file.empty()) {
-        if (std::FILE* vf = std::fopen(vocab_file.c_str(), "rb")) {
-            std::fseek(vf, 0, SEEK_END);
-            const long size = std::ftell(vf);
-            std::fseek(vf, 0, SEEK_SET);
-            if (size >= 4 && size % 4 == 0) {
-                vocab.resize((size_t) size / 4);
-                if (std::fread(vocab.data(), 4, vocab.size(), vf) != vocab.size()) vocab.clear();
-            }
-            std::fclose(vf);
-        }
-    }
-    const void* hw = head->weights();
     const int64_t row_bytes = (int64_t) head->row_bytes();
-    int64_t head_rows = row_bytes > 0 ? (int64_t) (head->weight_bytes() / (uint64_t) row_bytes) : 0;
-    if (!vocab.empty()) {
-        int32_t* dv = static_cast<int32_t*>(strata::gpu::alloc_device(vocab.size() * 4));
-        dhead_ = static_cast<uint8_t*>(strata::gpu::alloc_device((size_t) ((int64_t) vocab.size() * row_bytes)));
-        if (dv == nullptr || dhead_ == nullptr) {
-            strata::gpu::free(dv);
-            err = "dflash2: the draft vocabulary's head rows do not fit";
+    const int64_t head_rows = row_bytes > 0 ? (int64_t) (head->weight_bytes() / (uint64_t) row_bytes) : 0;
+    const WeightTable* wtp = &wt;
+    const ModelGeometry* gp = &g;
+    EmbedFn embed = [wtp, gp](const int32_t* tok, int n, float* out, void* s, std::string& e) {
+        return ::strata::core::embed_rows(*wtp, *gp, tok, 0, n, out, s, e);
+    };
+    HeadFn head_fn = [this](const uint8_t* rows, const uint8_t* xq, const float*, int n, float* y, void* s) {
+        strata::kernels::native_mmvq(head_type_, rows, xq, y, N_, (int) n_dvocab_, n, s);
+    };
+    if (shared_.rows != nullptr && shared_.n > 0) {   // the MTP drafter's gathered head: the same bytes, no second copy
+        head_w_ = shared_.rows;
+        dvocab_ = shared_.vocab_dev;
+        n_dvocab_ = shared_.n;
+        dhead_shared_ = true;
+        head_type_ = shared_.type;
+        embed_ = std::move(embed);
+        head_fn_ = std::move(head_fn);
+        if (logits_ == nullptr && !strata::gpu::alloc_device(&logits_, (size_t) (capacity_rows_ - 1) * (size_t) n_dvocab_ * 4)) {
+            err = "dflash2: the draft logits do not fit";
             return false;
         }
-        if (!copy_wait(cs_, dv, vocab.data(), vocab.size() * 4, err)) { strata::gpu::free(dv); return false; }
-        kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), dhead_, cs_);
-        const bool gathered = strata::gpu::stream_sync(cs_);
-        strata::gpu::free(dv);
-        if (!gathered) return gpu_fail(err, "the draft head's rows");
-        vram_ += (uint64_t) ((int64_t) vocab.size() * row_bytes);
-        hw = dhead_;
-        head_rows = (int64_t) vocab.size();
+        vram_ += (uint64_t) (capacity_rows_ - 1) * (uint64_t) n_dvocab_ * 4;
+        bound_ = true;
+        std::fprintf(stderr, "xestrata dflash2: %lld-token draft head shared with the MTP, drafter %.0f MiB of VRAM\n",
+                     (long long) n_dvocab_, (double) vram_ / 1048576.0);
+        return true;
     }
-    if (!bind_raw(embed, hw, head->type(), head_rows, vocab, err)) return false;
-    std::fprintf(stderr, "strata dflash2: %lld-token draft head (%.1f MiB), drafter %.0f MiB of VRAM (Q4_0 weights)\n", (long long) n_dvocab_,
-                 (double) (n_dvocab_ * row_bytes) / 1048576.0, (double) vram_ / 1048576.0);
+    if (DraftSubset::file_tokens(vocab_file) > 0) {
+        auto sub = std::make_shared<DraftSubset>();
+        if (!sub->load(vocab_file, head_rows, head->weights(), head->row_bytes(), cs_, "xestrata dflash2", err))
+            return false;
+        if (sub->size() > 0) {
+            subset_ = sub;
+            head_w_ = sub->rows();
+            vram_ += sub->bytes();
+        }
+    }
+    if (head_w_ == nullptr) head_w_ = static_cast<const uint8_t*>(head->weights());
+    if (!bind_raw(std::move(embed), std::move(head_fn), head->type(), subset_ ? subset_->size() : head_rows, {}, err))
+        return false;
+    if (subset_) dvocab_ = subset_->ids_device();   // the subset's own device ids (it owns them)
+    std::fprintf(stderr, "xestrata dflash2: %lld-token draft head (%.1f MiB), drafter %.0f MiB of VRAM\n",
+                 (long long) n_dvocab_, (double) ((int64_t) n_dvocab_ * row_bytes) / 1048576.0, (double) vram_ / 1048576.0);
     return true;
-} catch (const std::exception& e) {
-    err = std::string("dflash2: ") + e.what();
-    return false;
 }
 
-void Dflash2Drafter::gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, const uint8_t* xq, const float* xd) {
-    kernels::Df2Mat mats[3];
-    int n = 0, n_in = 0;
-    auto o = outs.begin();
-    for (const char* name : names) {
-        const Tensor& t = find(name);
-        mats[n] = kernels::Df2Mat{blob_ + t.off, *o++, (int) t.rows, t.dtype == "q4_0"};
-        if (n == 0) n_in = (int) t.cols;
-        ++n;
+bool Dflash2Drafter::gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols,
+                          const uint8_t* xq, const float* xd, std::string& err) {
+    try {
+        strata::kernels::Df2Mat mats[3];
+        int n = 0, n_in = 0;
+        auto o = outs.begin();
+        for (const char* name : names) {
+            const Tensor& t = find(name);
+            mats[n] = strata::kernels::Df2Mat{blob_ + t.off, *o++, (int) t.rows, t.dtype == "q4_0"};
+            if (n == 0) n_in = (int) t.cols;
+            ++n;
+        }
+        strata::kernels::df2_gemm(mats, n, xq, xd, n_in, ncols, cs_);
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("dflash2: ") + e.what();
+        return false;
     }
-    kernels::df2_gemm(mats, n, xq, xd, n_in, ncols, cs_);
 }
 
-void Dflash2Drafter::stage(int n_ctx, int64_t pos0, int block_n, int64_t block_s, int32_t anchor) {
-    for (int i = 0; i < 8; ++i) {
+void Dflash2Drafter::stage(int n_ctx, int64_t pos0, int64_t block_s, int32_t anchor, bool block) {
+    for (int i = 0; i < capacity_rows_; ++i) {
         h_meta_[i] = (int32_t) (pos0 + std::min(i, std::max(n_ctx, 1) - 1));
-        h_meta_[8 + i] = (int32_t) (block_s + i);
+        h_meta_[block_pos_offset() + i] = (int32_t) (block_s + i);
+        h_meta_[token_offset() + i] = i == 0 ? anchor : mask_token_;
     }
     h_meta_[16] = anchor;
     h_meta_[17] = (int32_t) block_s;
-    h_meta_[18] = epoch_;
-    h_meta_[24] = anchor;
-    for (int i = 1; i < 8; ++i) h_meta_[24 + i] = mask_token_;
-    (void) block_n;
-    kernels::df2_rope_table_cpu(h_meta_, 16, theta_, reinterpret_cast<float*>(h_meta_ + kMetaInts));
-    strata::gpu::copy_async(d_meta_, h_meta_, kMetaBytes, cs_);
+    h_meta_[18] = history_.epoch();
+    float* tables = reinterpret_cast<float*>(h_meta_ + meta_ints());
+    strata::kernels::df2_rope_table_cpu(h_meta_, capacity_rows_, theta_, tables);
+    strata::kernels::df2_rope_table_cpu(h_meta_ + block_pos_offset(), capacity_rows_, theta_, tables + (ptrdiff_t) capacity_rows_ * 128);
+    size_t bytes = meta_bytes();
+    if (host_embed_ && block) {   // bind_host: the anchor's row behind the tables, in the same copy
+        float* row = reinterpret_cast<float*>(h_meta_ + meta_ints()) + table_floats();
+        if (!host_embed_(anchor, row)) std::memset(row, 0, (size_t) N_ * 4);   // an id outside the table: a poor draft, never a wrong token
+        bytes += (size_t) N_ * 4;
+    }
+    strata::gpu::copy_async(d_meta_, h_meta_, bytes, cs_, "dflash2 meta");
 }
 
 bool Dflash2Drafter::record_context(const float* taps, int n, std::string& err) {
-    using namespace kernels;
+    using namespace strata::kernels;
     try {
         const int tap_n = (int) taps_.size() * N_;
         df2_quant_rows(taps, tap_n, n, xqc_, xdc_, cs_);
-        gemm({"fc.weight"}, {fcy_}, n, xqc_, xdc_);
+        if (!gemm({"fc.weight"}, {fcy_}, n, xqc_, xdc_, err)) return false;
         df2_rms_quant(fcy_, f32("hidden_norm.weight"), nullptr, n, N_, eps_, xqc_, xdc_, cs_);
+        return record_kv(n, xqc_, xdc_, d_meta_ + 0, err);
     } catch (const std::exception& e) {
-        err = e.what();
+        err = std::string("dflash2: ") + e.what();
         return false;
     }
-    return record_kv(n, xqc_, xdc_, d_meta_ + 0, err);
 }
 
-// The part of a context update after the activations are quantized: per layer the keys and values (projection, k-norm, rope, ring write).  Also what a ring
-// rebuild runs over logged rows: `xq` / `xd` are then the log's codes and scales, `pos` the rows' positions (device), rt_ctx_ their rope table.
+// The part of a context update after the activations are quantized: per layer the keys and values (projection,
+// k-norm, rope, ring write).  Also what a ring rebuild runs over logged rows.
 bool Dflash2Drafter::record_kv(int n, const uint8_t* xq, const float* xd, const int32_t* pos, std::string& err) {
-    using namespace kernels;
+    using namespace strata::kernels;
     try {
         for (int l = 0; l < L_; ++l) {
             const std::string p = "layers." + std::to_string(l) + ".";
             const std::string kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
-            gemm({kp.c_str(), vp.c_str()}, {kc_, vc_}, n, xq, xd);
-            df2_kv_ring(kc_, vc_, f32(p + "self_attn.k_norm.weight"), pos, rt_ctx_, kring_[l], vring_[l], kRing, n, NKV_, eps_, cs_, tag_, d_meta_ + 18);
+            if (!gemm({kp.c_str(), vp.c_str()}, {kc_, vc_}, n, xq, xd, err)) return false;
+            df2_kv_ring(kc_, vc_, f32(p + "self_attn.k_norm.weight"), pos, rt_ctx_, kring_[l], vring_[l], kRing, n, NKV_,
+                        eps_, cs_, tag_, d_meta_ + 18);
         }
+        return true;
     } catch (const std::exception& e) {
-        err = e.what();
+        err = std::string("dflash2: ") + e.what();
         return false;
     }
-    return true;
 }
 
 bool Dflash2Drafter::record_block(std::string& err) {
-    using namespace kernels;
+    using namespace strata::kernels;
     try {
-        const int B = kRows;
-        embed_(d_meta_ + 24, B, h_, cs_);
-        df2_rms_quant(h_, f32("layers.0.input_layernorm.weight"), xn_, B, N_, eps_, xqp_, xdp_, cs_);
-        for (int l = 0; l < L_; ++l) {
-            const std::string p = "layers." + std::to_string(l) + ".";
-            const float* base_a = f32(p + "attention_conv.base_kernel");
-            const float* base_m = f32(p + "mlp_conv.base_kernel");
-            const std::string akp = p + "attention_conv.kernel_projection.weight", mkp = p + "mlp_conv.kernel_projection.weight";
-            const std::string qp = p + "self_attn.q_proj.weight", kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
-            const std::string gp = p + "mlp.gate_proj.weight", up = p + "mlp.up_proj.weight";
-            const std::string op = p + "self_attn.o_proj.weight";
-            const std::string dp = p + "mlp.down_proj.weight";
-            gemm({akp.c_str()}, {dyn_}, B, xqp_, xdp_);
-            df2_conv_quant(xn_, dyn_, 640, base_a, B, N_, group_, xqp_, xdp_, cs_);
-            gemm({qp.c_str(), kp.c_str(), vp.c_str()}, {q_, k_, v_}, B, xqp_, xdp_);
-            df2_norm_rope_qk(q_, k_, f32(p + "self_attn.q_norm.weight"), f32(p + "self_attn.k_norm.weight"), rt_blk_, qn_, kblk_, B, NH_, NKV_, eps_, cs_);
-            df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs_, tag_, d_meta_ + 18);
-            gemm({op.c_str()}, {o_}, B, xqp_, xdp_);
-            df2_conv_rms_quant(o_, dyn_ + 320, 640, base_a + 2 * N_, h_, f32(p + "post_attention_layernorm.weight"), xn_, B, N_, group_, eps_, xqp_, xdp_, cs_);
-            gemm({mkp.c_str()}, {dyn_}, B, xqp_, xdp_);
-            df2_conv_quant(xn_, dyn_, 640, base_m, B, N_, group_, xqp_, xdp_, cs_);
-            gemm({gp.c_str(), up.c_str()}, {gate_, up_}, B, xqp_, xdp_);
-            df2_swiglu_quant(gate_, up_, B, I_, xqp_, xdp_, cs_);
-            gemm({dp.c_str()}, {mlp_}, B, xqp_, xdp_);
-            // the next layer's input norm, or after the last layer the final norm (-> fn_, the rows the head and the selector read)
-            const std::string next_gamma = l + 1 < L_ ? "layers." + std::to_string(l + 1) + ".input_layernorm.weight" : std::string("norm.weight");
-            df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, B, N_, group_, eps_, xqp_, xdp_, cs_);
-        }
-        native_quantize_q8_1(fn_ + N_, xq_, N_, ndraft_, cs_);   // rows 1..ndraft, the head's format
-        df2_quant_rows(fn_ + N_, N_, ndraft_, xqp_, xdp_, cs_);   // and the selector projection's
-        gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, xqp_, xdp_);
-        native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, ndraft_, cs_);
-        df2_topk(logits_, (int) n_dvocab_, dvocab_, ndraft_, topscratch_, topval_, toptok_, cs_);
-        df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
-                   reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, ndraft_, d_meta_ + 16, d_out_,
-                   reinterpret_cast<float*>(d_out_) + 16, cs_);
+    const int B = block_rows_;
+    const int drafts = std::min(ndraft_, B - 1);
+    const int dyn_w = N_ / 4;   // a row's two convolutions' kernels: [prepare, finish] x [2 taps] x N / 16 groups
+    if (!embed_rows(err)) return false;
+    df2_rms_quant(h_, f32("layers.0.input_layernorm.weight"), xn_, B, N_, eps_, xqp_, xdp_, cs_);
+    for (int l = 0; l < L_; ++l) {
+        const std::string p = "layers." + std::to_string(l) + ".";
+        const float* base_a = f32(p + "attention_conv.base_kernel");
+        const float* base_m = f32(p + "mlp_conv.base_kernel");
+        const std::string akp = p + "attention_conv.kernel_projection.weight", mkp = p + "mlp_conv.kernel_projection.weight";
+        const std::string qp = p + "self_attn.q_proj.weight", kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
+        const std::string gp = p + "mlp.gate_proj.weight", up = p + "mlp.up_proj.weight";
+        const std::string op = p + "self_attn.o_proj.weight";
+        const std::string dp = p + "mlp.down_proj.weight";
+        if (!gemm({akp.c_str()}, {dyn_}, B, xqp_, xdp_, err)) return false;
+        df2_conv_quant(xn_, dyn_, dyn_w, base_a, B, N_, group_, xqp_, xdp_, cs_);
+        if (!gemm({qp.c_str(), kp.c_str(), vp.c_str()}, {q_, k_, v_}, B, xqp_, xdp_, err)) return false;
+        df2_norm_rope_qk(q_, k_, f32(p + "self_attn.q_norm.weight"), f32(p + "self_attn.k_norm.weight"), rt_blk_, qn_,
+                         kblk_, B, NH_, NKV_, eps_, cs_);
+        df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs_, tag_,
+                      d_meta_ + 18, B);
+        if (!gemm({op.c_str()}, {o_}, B, xqp_, xdp_, err)) return false;
+        df2_conv_rms_quant(o_, dyn_ + dyn_w / 2, dyn_w, base_a + (ptrdiff_t) 2 * N_, h_, f32(p + "post_attention_layernorm.weight"), xn_,
+                           B, N_, group_, eps_, xqp_, xdp_, cs_);
+        if (!gemm({mkp.c_str()}, {dyn_}, B, xqp_, xdp_, err)) return false;
+        df2_conv_quant(xn_, dyn_, dyn_w, base_m, B, N_, group_, xqp_, xdp_, cs_);
+        if (!gemm({gp.c_str(), up.c_str()}, {gate_, up_}, B, xqp_, xdp_, err)) return false;
+        df2_swiglu_quant(gate_, up_, B, I_, xqp_, xdp_, cs_);
+        if (!gemm({dp.c_str()}, {mlp_}, B, xqp_, xdp_, err)) return false;
+        const std::string next_gamma = l + 1 < L_ ? "layers." + std::to_string(l + 1) + ".input_layernorm.weight"
+                                                  : std::string("norm.weight");
+        df2_conv_rms_quant(mlp_, dyn_ + dyn_w / 2, dyn_w, base_m + (ptrdiff_t) 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, B, N_,
+                           group_, eps_, xqp_, xdp_, cs_);
+    }
+    native_quantize_q8_1_rows(fn_ + N_, xq_, N_, drafts, cs_);   // rows 1..ndraft, the head's format (fp32: fn_ + N_)
+    df2_quant_rows(fn_ + N_, N_, drafts, xqp_, xdp_, cs_);   // and the selector projection's
+    if (!gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, drafts, xqp_, xdp_, err)) return false;
+    for (int r = 0; r < drafts; r += 8)
+        head_fn_(head_w_, xq_ + strata::kernels::native_q8_1_rows_bytes(N_, r), fn_ + (size_t) (r + 1) * N_,
+                 std::min(8, drafts - r), logits_ + (size_t) r * n_dvocab_, cs_);
+    df2_topk(logits_, (int) n_dvocab_, dvocab_, drafts, topscratch_, topval_, toptok_, cs_);
+    df2_select(hsel_, topval_, toptok_,
+               reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
+               reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_,
+               drafts, d_meta_ + 16, d_out_, reinterpret_cast<float*>(d_out_) + 16, cs_, sel_q4_);
+    return true;
     } catch (const std::exception& e) {
-        err = e.what();
+        err = std::string("dflash2: ") + e.what();
         return false;
     }
+}
+
+bool Dflash2Drafter::embed_rows(std::string& err) {
+    if (embed_) return embed_(d_meta_ + token_offset(), block_rows_, h_, cs_, err);
+    const float* anchor = reinterpret_cast<const float*>(d_meta_ + meta_ints()) + table_floats();
+    strata::kernels::df2_embed_rows(anchor, emb_mask_, h_, N_, block_rows_, cs_);
     return true;
 }
 
 bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
-    if (exec_[n]) return true;
-    if (!strata::gpu::begin_capture(cs_)) return gpu_fail(err, "begin capture");
+    auto& graph = exec_[block_rows_ == kRows ? 0 : 1][n];
+    if (graph) return true;
+    if (!strata::gpu::begin_capture(cs_)) { err = "dflash2: begin capture"; return false; }
     bool ok = record_context(taps, n, err);
     if (ok) ok = record_block(err);
-    return finish_capture(cs_, ok, exec_[n], err);
+    if (!ok) { strata::gpu::abandon_capture(cs_); return false; }
+    if (!strata::gpu::end_capture(cs_, &graph)) { err = "dflash2: end capture"; return false; }
+    return true;
 }
 
 void Dflash2Drafter::set_max_drafts(int n) {
-    n = std::max(1, std::min(n, (int) kDrafts));
+    n = std::max(1, std::min(n, capacity_rows_ - 1));
     if (n == ndraft_) return;
     const OnDevice on_device(device_);
     if (cs_) strata::gpu::stream_sync(cs_);
-    for (auto& e : exec_)
+    for (auto& shape : exec_) for (auto& e : shape)
         if (e) { strata::gpu::graph_destroy(e); e = nullptr; }
     graph_taps_ = nullptr;
     ndraft_ = n;
+    if (ndraft_ < kMaxDrafts) block_rows_ = kRows;
 }
 
-bool Dflash2Drafter::prepare(const float* taps, std::string& err) try {
+void Dflash2Drafter::set_block_rows(int rows) {
+    if (rows != kRows && rows != kMaxRows) throw std::invalid_argument("dflash2: block rows must be 8 or 16");
+    if (rows == kMaxRows && (capacity_rows_ < kMaxRows || ndraft_ < kMaxDrafts)) throw std::invalid_argument("dflash2: 16 rows need 15 drafts enabled");
+    block_rows_ = rows;
+}
+
+bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
     if (!bound_) { err = "dflash2: not bound"; return false; }
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
-    for (int n = 1; n <= kRows; ++n)
-        if (!capture(n, taps, err)) return false;
-    if (!strata::gpu::stream_sync(cs_)) return gpu_fail(err, "prepare");
+    // Graph recording cannot time a candidate.  Warm the Q4 shapes with zero activations before capturing so the
+    // measured choice also reaches every captured window.  The scratch is private to this drafter and is overwritten
+    // by the first real window.  One tensor per shape is enough; the choice is per device and shape.
+    const char* pair = strata::env_get("DF2_GEMM_PAIR16");
+    if (!pair || !*pair || std::strcmp(pair, "auto") == 0) {
+        if (!strata::gpu::memset_async(xqc_, 0, (size_t) 5 * N_ * kRows, cs_) ||
+            !strata::gpu::memset_async(xdc_, 0, (size_t) 5 * N_ / 32 * kRows * sizeof(float), cs_)) {
+            err = "dflash2: GEMM timing activation init";
+            return false;
+        }
+        std::set<std::pair<int64_t, int64_t>> shapes;
+        try {
+            for (const Tensor& t : tensors_) {
+                if (t.dtype != "q4_0" || !t.name.ends_with(".weight") || t.rows <= 0 || t.rows > I_ ||
+                    t.cols <= 0 || t.cols > (int64_t) 5 * N_ || t.rows % 16 || t.cols % 512 ||
+                    !shapes.emplace(t.rows, t.cols).second) continue;
+                strata::kernels::Df2Mat mat{blob_ + t.off, gate_, (int) t.rows, true};
+                for (int n = 1; n <= kRows; ++n)
+                    strata::kernels::df2_gemm(&mat, 1, xqc_, xdc_, (int) t.cols, n, cs_);
+            }
+        } catch (const std::exception& e) {
+            err = std::string("dflash2: GEMM timing: ") + e.what();
+            return false;
+        }
+    }
+    const int saved_rows = block_rows_;
+    const int max_context_rows = ndraft_ > kDrafts ? kMaxRows : kRows;
+    for (int rows : {kRows, kMaxRows}) {
+        if (rows == kMaxRows && ndraft_ <= kDrafts) break;
+        block_rows_ = rows;
+        for (int n = 1; n <= max_context_rows; ++n) {
+            if (!capture(n, taps, err)) { block_rows_ = saved_rows; return false; }
+        }
+    }
+    block_rows_ = saved_rows;
+    if (!strata::gpu::stream_sync(cs_)) { err = "dflash2: prepare"; return false; }
     graph_taps_ = taps;
     ms_capture = ms_since(t0);
     return true;
-} catch (const std::exception& e) {
-    err = std::string("dflash2: ") + e.what();
-    return false;
 }
 
-// ---- ring log -----------------------------------------------------------------------------------------------------------------------------------------
-// The ring holds the last 2064 positions of the lineage it was filled for.  Resuming a prompt below the highest position written (a repeated or rewound prefix,
-// a parked conversation brought back) leaves the part of the first draft's window [n - 2047, resume) either overwritten by the later positions (the slots are
-// position % 2064) or never written for this lineage.  The K/V rows are a function of the quantized hidden rows (codes and block scales after hidden_norm) alone,
-// so those rows are logged as the updates make them (2.9 KB a position), per lineage, and a rebuild runs record_kv over them: the same kernels on the same bytes,
-// so the rebuilt K/V rows are bitwise those of the original update.  (Port of the CUDA drafter's ring log, DF2-NV's f-0291-df2-ring.)
-bool Dflash2Drafter::Lineage::logged(int64_t pos) const {
-    const size_t c = (size_t) (pos / kLogChunk);
-    return pos >= 0 && c < chunks.size() && chunks[c] && chunks[c]->ok[(size_t) (pos % kLogChunk)] != 0;
-}
-
-uint64_t Dflash2Drafter::Lineage::bytes() const {
-    uint64_t b = (uint64_t) hist.capacity() * 4;
-    for (const auto& c : chunks)
-        if (c) b += c->q.size() + c->d.size() * 4 + c->ok.size();
-    return b;
-}
-
-Dflash2Drafter::LogChunk& Dflash2Drafter::Lineage::writable(size_t chunk) {
-    if (chunks.size() <= chunk) chunks.resize(chunk + 1);
-    if (!chunks[chunk]) {
-        auto c = std::make_shared<LogChunk>();
-        c->q.assign((size_t) kLogChunk * 2560, 0);
-        c->d.assign((size_t) kLogChunk * 80, 0.0f);
-        c->ok.assign((size_t) kLogChunk, 0);
-        chunks[chunk] = std::move(c);
-    } else if (chunks[chunk].use_count() > 1) {
-        chunks[chunk] = std::make_shared<LogChunk>(*chunks[chunk]);   // copy on write: a stashed copy keeps the old rows
-    }
-    return *chunks[chunk];
-}
-
-void Dflash2Drafter::Lineage::truncate(int64_t keep) {
-    keep = std::max<int64_t>(0, keep);
-    const size_t c0 = (size_t) (keep / kLogChunk);
-    for (size_t c = c0 + 1; c < chunks.size(); ++c) chunks[c].reset();
-    if (chunks.size() > c0 + 1) chunks.resize(c0 + 1);
-    if (c0 < chunks.size() && chunks[c0]) {
-        if (keep % kLogChunk == 0) {
-            chunks[c0].reset();
-        } else {
-            LogChunk& ch = writable(c0);
-            for (int i = (int) (keep % kLogChunk); i < kLogChunk; ++i) ch.ok[(size_t) i] = 0;
-        }
-    }
-}
-
-uint64_t Dflash2Drafter::ring_log_bytes() const { return cur_.bytes(); }
-uint64_t Dflash2Drafter::ring_stash_bytes() const {
-    uint64_t b = 0;
-    for (const Lineage& l : stash_) b += l.bytes();
-    return b;
-}
+// ---- ring log --------------------------------------------------------------------------------------------
+uint64_t Dflash2Drafter::ring_log_bytes() const { return history_.log_bytes(); }
+uint64_t Dflash2Drafter::ring_stash_bytes() const { return history_.stash_bytes(); }
 
 void Dflash2Drafter::reset() {
     have_ctx_ = 0;
-    cur_ = Lineage{};
-    stash_.clear();
-    invalidate_ring();
-}
-
-void Dflash2Drafter::invalidate_ring() {
-    ++epoch_;
-    ring_hi_ = 0;
-    for (int64_t& t : slot_pos_) t = -1;
-}
-
-void Dflash2Drafter::stash_push(Lineage&& l) {
-    if (!log_on_ || stash_budget_ == 0 || l.hist.size() < 128 || l.chunks.empty()) return;
-    stash_.push_back(std::move(l));
-    ++ring_stats.stash_stores;
-    uint64_t total = ring_stash_bytes();
-    while (!stash_.empty() && total > stash_budget_) {
-        total -= std::min(total, stash_.front().bytes());
-        stash_.pop_front();
-        ++ring_stats.stash_evictions;
-    }
+    history_.reset();
 }
 
 void Dflash2Drafter::log_stage(int64_t pos0, int n) {
     if (!log_on_) return;
     pend_pos0_ = pos0;
     pend_n_ = n;
-    for (int i = 0; i < n; ++i) slot_pos_[(size_t) ((pos0 + i) % kRing)] = ((int64_t) epoch_ << 32) | (pos0 + i);
+    history_.mark_slots(pos0, n);
 }
 
-// The update's quantized rows are still in xqc_ / xdc_ when its queue has run (nothing writes them afterwards): copy them to the host behind the update.
+// Copy the exact quantized rows behind the update, on the same stream.
 void Dflash2Drafter::log_fetch(int n) {
     if (!log_on_ || pend_pos0_ < 0) return;
-    strata::gpu::copy_async(h_logq_, xqc_, (size_t) n * N_, cs_);
-    strata::gpu::copy_async(h_logd_, xdc_, (size_t) n * (N_ / 32) * 4, cs_);
+    strata::gpu::copy_async(h_logq_, xqc_, (size_t) n * N_, cs_, "dflash2 ring log");
+    strata::gpu::copy_async(h_logd_, xdc_, (size_t) n * (N_ / 32) * 4, cs_, "dflash2 ring log");
 }
 
 void Dflash2Drafter::log_flush() {
     if (!log_on_ || pend_pos0_ < 0) return;
-    for (int i = 0; i < pend_n_; ++i) {
-        const int64_t pos = pend_pos0_ + i;
-        LogChunk& ch = cur_.writable((size_t) (pos / kLogChunk));
-        const size_t r = (size_t) (pos % kLogChunk);
-        std::memcpy(&ch.q[r * 2560], h_logq_ + (size_t) i * 2560, 2560);
-        std::memcpy(&ch.d[r * 80], h_logd_ + (size_t) i * 80, 80 * sizeof(float));
-        ch.ok[r] = 1;
-    }
+    history_.store(pend_pos0_, pend_n_, h_logq_, h_logd_);
     pend_pos0_ = -1;
 }
 
-bool Dflash2Drafter::rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* missing, std::string& err) try {
-    *rebuilt = 0;
-    *missing = 0;
-    std::vector<int32_t> pos;
-    for (int64_t p = lo; p < hi; ++p) {
-        if (slot_pos_[(size_t) (p % kRing)] == (((int64_t) epoch_ << 32) | p)) continue;   // the ring already holds this row
-        if (cur_.logged(p)) pos.push_back((int32_t) p);
-        else {
-            if (++*missing <= 8 && std::getenv("STRATA_DF2_RING_STATS") != nullptr) std::fprintf(stderr, "strata dflash2 ring: position %lld was never logged (hist %zu)\n", (long long) p, cur_.hist.size());
-        }
-    }
-    if (pos.empty()) return true;
+bool Dflash2Drafter::replay(const int32_t* positions, const int8_t* q, const float* scales, int rows, int32_t epoch,
+                            std::string& err) {
     const OnDevice on_device(device_);
-    const size_t rows = pos.size();   // a window is at most 2048 rows
-    std::vector<int8_t> q(rows * 2560);
-    std::vector<float> d(rows * 80);
-    std::vector<float> tab(rows * 128);   // the rope tables of the rows, two floats [64] each, computed on the host (no device FP64)
-    for (size_t i = 0; i < rows; ++i) {
-        const int64_t p = pos[i];
-        const LogChunk& ch = *cur_.chunks[(size_t) (p / kLogChunk)];
-        const size_t r = (size_t) (p % kLogChunk);
-        std::memcpy(&q[i * 2560], &ch.q[r * 2560], 2560);
-        std::memcpy(&d[i * 80], &ch.d[r * 80], 80 * sizeof(float));
+    std::vector<float> table((size_t) rows * 128);
+    strata::kernels::df2_rope_table_cpu(positions, rows, theta_, table.data());
+    h_meta_[18] = epoch;
+    if (!strata::gpu::copy_async(d_meta_, h_meta_, (size_t) meta_ints() * 4, cs_, "dflash2 rebuild") ||
+        !strata::gpu::copy_async(rb_q_, q, (size_t) rows * N_, cs_, "dflash2 rebuild") ||
+        !strata::gpu::copy_async(rb_d_, scales, (size_t) rows * (N_ / 32) * 4, cs_, "dflash2 rebuild") ||
+        !strata::gpu::copy_async(rb_pos_, positions, (size_t) rows * sizeof(int32_t), cs_, "dflash2 rebuild") ||
+        !strata::gpu::copy_async(rt_ctx_, table.data(), table.size() * sizeof(float), cs_, "dflash2 rebuild")) {
+        strata::gpu::stream_sync(cs_);   // earlier copies can still reference these host buffers
+        err = "dflash2: ring rebuild upload";
+        return false;
     }
-    for (size_t r0 = 0; r0 < rows; r0 += kRows)
-        kernels::df2_rope_table_cpu(pos.data() + r0, (int) std::min<size_t>(kRows, rows - r0), theta_, tab.data() + r0 * 128);
-    h_meta_[18] = epoch_;
-    bool ok = strata::gpu::copy_async(d_meta_, h_meta_, kMetaInts * 4, cs_) && strata::gpu::copy_async(rb_q_, q.data(), q.size(), cs_) &&
-              strata::gpu::copy_async(rb_d_, d.data(), d.size() * sizeof(float), cs_) &&
-              strata::gpu::copy_async(rb_pos_, pos.data(), rows * sizeof(int32_t), cs_);
-    if (!ok) return gpu_fail(err, "ring rebuild: upload");
-    for (size_t r0 = 0; ok && r0 < rows; r0 += kRows) {
-        const int m = (int) std::min<size_t>(kRows, rows - r0);
-        // this batch's table before its kernels (an in-order stream)
-        ok = strata::gpu::copy_async(rt_ctx_, tab.data() + r0 * 128, (size_t) m * 128 * 4, cs_) || gpu_fail(err, "ring rebuild: table");
-        ok = ok && record_kv(m, rb_q_ + r0 * 2560, rb_d_ + r0 * 80, rb_pos_ + r0, err);
-    }
-    const bool synced = strata::gpu::stream_sync(cs_);   // (the host vectors die with this scope)
-    if (!ok) return false;
-    if (!synced) return gpu_fail(err, "ring rebuild");
-    for (int32_t p : pos) slot_pos_[(size_t) (p % kRing)] = ((int64_t) epoch_ << 32) | p;
-    *rebuilt = (int64_t) rows;
-    return true;
-} catch (const std::exception& e) {
-    err = std::string("dflash2: ring rebuild: ") + e.what();
-    return false;
+    const bool ok = record_kv(rows, rb_q_, rb_d_, rb_pos_, err);
+    if (!strata::gpu::stream_sync(cs_)) { err = "dflash2: ring rebuild"; return false; }
+    return ok;
 }
 
 bool Dflash2Drafter::begin_request(const int32_t* ids, int64_t n, int64_t resume, bool* cold) {
-    resume = std::max<int64_t>(0, std::min(resume, n));
-    if (cold) *cold = false;
-    ++ring_stats.requests;
-    last_rebuilt = last_missing = 0;
-    last_ms = 0;
-    last_swapped = false;
     std::string err;
-    const Clock::time_point t0 = Clock::now();
-    auto lcp_of = [&](const std::vector<int32_t>& h) {
-        int64_t l = 0;
-        const int64_t lim = std::min<int64_t>((int64_t) h.size(), resume);
-        while (l < lim && h[(size_t) l] == ids[l]) ++l;
-        return l;
-    };
-    if (!log_on_) {   // the pre-log rule: a history that does not cover the resumed prefix starts the ring over
-        const int64_t lcp = lcp_of(cur_.hist);
-        const bool stale = ring_hi_ > lcp && lcp < resume;
-        if (stale) { ++epoch_; ring_hi_ = 0; }
-        if (cold) *cold = stale;
-        cur_.hist.assign(ids, ids + resume);
-        return true;
-    }
-    bool covered = lcp_of(cur_.hist) >= resume;
-    bool swapped = false;
-    if (!covered) {   // a parked lineage may be the one this request resumes
-        for (size_t i = stash_.size(); i-- > 0;) {
-            if (lcp_of(stash_[i].hist) < resume) continue;
-            Lineage got = std::move(stash_[i]);
-            stash_.erase(stash_.begin() + (std::ptrdiff_t) i);
-            stash_push(std::move(cur_));
-            cur_ = std::move(got);
-            invalidate_ring();
-            covered = swapped = true;
-            ++ring_stats.stash_hits;
-            break;
-        }
-    }
-    if (!covered) {   // another conversation: the live lineage is parked, this one starts empty
-        stash_push(std::move(cur_));
-        cur_ = Lineage{};
-        invalidate_ring();
-        ++ring_stats.cold_starts;
-    } else if ((int64_t) cur_.hist.size() >= resume + 128) {
-        // the rows past `resume` are about to be rewritten (a rewound or branching request): keep the old branch as it is, sharing the log's chunks
-        Lineage copy;
-        copy.hist = cur_.hist;
-        copy.chunks = cur_.chunks;
-        stash_push(std::move(copy));
-    }
-    if ((int64_t) cur_.hist.size() > resume) { cur_.hist.resize((size_t) resume); cur_.truncate(resume); }
-    if (!covered) cur_.hist.assign(ids, ids + resume);
-    // the window the first draft reads, below `resume` (the prompt's own taps cover [resume, n)): every slot that does not hold its row is rebuilt from the log
-    int64_t rebuilt = 0, missing = 0;
-    const int64_t lo = std::max<int64_t>(0, n - (window_ - 1)), hi = resume;
-    if (hi > lo) {
-        if (!rebuild(lo, hi, &rebuilt, &missing, err)) {
-            std::fprintf(stderr, "strata dflash2: %s: the ring starts over for this request\n", err.c_str());
-            invalidate_ring();
-            missing = hi - lo;
-            rebuilt = 0;
-        }
-    }
-    static const bool verbose = std::getenv("STRATA_DF2_RING_STATS") != nullptr;
-    if (verbose)
-        std::fprintf(stderr, "strata dflash2 ring: request %lld resume %lld of %lld: live log %.1f MiB (%lld positions), parked %zu lineages %.1f MiB, rebuilt %lld rows (missing %lld) in %.2f ms%s\n",
-                     (long long) ring_stats.requests, (long long) resume, (long long) n, (double) cur_.bytes() / 1048576.0, (long long) cur_.hist.size(), stash_.size(),
-                     (double) ring_stash_bytes() / 1048576.0, (long long) rebuilt, (long long) missing, ms_since(t0), swapped ? " (swapped in)" : "");
-    ring_stats.rows_rebuilt += rebuilt;
-    ring_stats.rows_missing += missing;
-    if (rebuilt > 0) ++ring_stats.rebuilds;
-    const double ms = ms_since(t0);
-    if (rebuilt > 0) ring_stats.ms_rebuild += ms;
-    if (swapped) ring_stats.ms_swap += ms;
-    if (cold) *cold = missing > 0;
-    last_rebuilt = rebuilt;
-    last_missing = missing;
-    last_ms = ms;
-    last_swapped = swapped;
-    return true;
+    const auto replay_rows = [this](const int32_t* pos, const int8_t* q, const float* scales, int rows, int32_t epoch,
+                                    std::string& e) { return replay(pos, q, scales, rows, epoch, e); };
+    const bool ok = history_.begin_request(ids, n, resume, replay_rows, cold, err);
+    ring_stats = history_.stats;
+    last_rebuilt = history_.last_rebuilt; last_missing = history_.last_missing;
+    last_ms = history_.last_ms; last_swapped = history_.last_swapped;
+    if (!err.empty()) std::fprintf(stderr, "xestrata dflash2: %s: the ring starts over for this request\n", err.c_str());
+    if (log_on_ && strata::env_get("DF2_RING_STATS") != nullptr)
+        std::fprintf(stderr, "xestrata dflash2 ring: request %lld resume %lld of %lld: live log %.1f MiB (%lld positions), "
+                             "parked %zu lineages %.1f MiB, rebuilt %lld rows (missing %lld) in %.2f ms%s\n",
+                     (long long) ring_stats.requests, (long long) std::max<int64_t>(0, std::min(resume, n)), (long long) n,
+                     (double) history_.log_bytes() / 1048576.0, (long long) history_.history_size(), history_.stash_size(),
+                     (double) history_.stash_bytes() / 1048576.0, (long long) last_rebuilt, (long long) last_missing,
+                     last_ms, last_swapped ? " (swapped in)" : "");
+    return ok;
 }
 
-void Dflash2Drafter::note_rows(const int32_t* toks, int64_t n, int64_t pos0) {
-    if (pos0 < 0) return;
-    if ((int64_t) cur_.hist.size() > pos0) { cur_.hist.resize((size_t) pos0); if (log_on_) cur_.truncate(pos0); }
-    if ((int64_t) cur_.hist.size() < pos0) return;   // a gap: the history stops being a prefix, so it stays where it is (the next begin_request starts over)
-    cur_.hist.insert(cur_.hist.end(), toks, toks + n);
-}
+void Dflash2Drafter::note_rows(const int32_t* toks, int64_t n, int64_t pos0) { history_.note_rows(toks, n, pos0); }
 
-bool Dflash2Drafter::debug_ring(std::vector<float>& kv, std::vector<int64_t>& tags, std::string& err) try {
+bool Dflash2Drafter::debug_ring(std::vector<float>& kv, std::vector<int64_t>& tags, std::string& err) {
     const OnDevice on_device(device_);
     const size_t per = (size_t) kRing * NKV_ * HD_;
     kv.resize((size_t) L_ * 2 * per);
     tags.resize((size_t) kRing);
-    if (!strata::gpu::stream_sync(cs_)) return gpu_fail(err, "debug ring");
+    if (!strata::gpu::stream_sync(cs_)) { err = "dflash2: debug ring"; return false; }
     for (int l = 0; l < L_; ++l) {
-        strata::gpu::copy_async(kv.data() + ((size_t) l * 2) * per, kring_[l], per * 4, cs_);
-        strata::gpu::copy_async(kv.data() + ((size_t) l * 2 + 1) * per, vring_[l], per * 4, cs_);
+        if (!strata::gpu::copy(kv.data() + ((size_t) l * 2) * per, kring_[l], per * 4) ||
+            !strata::gpu::copy(kv.data() + ((size_t) l * 2 + 1) * per, vring_[l], per * 4)) {
+            err = "dflash2: debug ring";
+            return false;
+        }
     }
-    strata::gpu::copy_async(tags.data(), tag_, (size_t) kRing * 8, cs_);
-    if (!strata::gpu::stream_sync(cs_)) return gpu_fail(err, "debug ring");
+    if (!strata::gpu::copy(tags.data(), tag_, (size_t) kRing * 8)) { err = "dflash2: debug ring"; return false; }
     return true;
-} catch (const std::exception& e) {
-    err = std::string("dflash2: debug ring: ") + e.what();
-    return false;
 }
 
-bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::string& err) try {
+bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
+    if (ctx_pending_ && !context_wait(err)) return false;
     const int tap_n = (int) taps_.size() * N_;
+    const Clock::time_point t0 = Clock::now();
     for (int64_t r0 = 0; r0 < n; r0 += kRows) {
         const int m = (int) std::min<int64_t>(kRows, n - r0);
-        stage(m, pos0 + r0, 0, pos0 + r0 + m, 0);
+        stage(m, pos0 + r0, pos0 + r0 + m, 0, false);
         log_stage(pos0 + r0, m);
         if (!record_context(taps + (size_t) r0 * (size_t) tap_n, m, err)) return false;
         log_fetch(m);
-        if (!strata::gpu::stream_sync(cs_)) return gpu_fail(err, "context");
+        if (!strata::gpu::stream_sync(cs_)) { err = "dflash2: context"; return false; }
         log_flush();
     }
     have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
-    ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n);
+    history_.mark_end(pos0 + n);
+    ms_ctx += ms_since(t0);
     return true;
-} catch (const std::exception& e) {
-    err = std::string("dflash2: ") + e.what();
-    return false;
 }
 
-bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err) try {
-    if (!bound_) { err = "dflash2: not bound"; return false; }
-    if (n_new < 1 || n_new > kRows) { err = "dflash2: draft rows out of range"; return false; }
+bool Dflash2Drafter::context_async(const float* taps, int64_t n, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
+    if (n < 1 || n > capacity_rows_) { err = "dflash2: context_async rows exceed capacity"; return false; }
+    if (ctx_pending_ && !context_wait(err)) return false;
+    stage((int) n, pos0, pos0 + n, 0, false);
+    log_stage(pos0, (int) n);
+    if (!record_context(taps, (int) n, err)) return false;
+    log_fetch((int) n);
+    ctx_pending_ = true;
+    have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
+    history_.mark_end(pos0 + n);
+    return true;
+}
+
+bool Dflash2Drafter::context_wait(std::string& err) {
+    if (!ctx_pending_) return true;
+    const OnDevice on_device(device_);
+    if (!strata::gpu::stream_sync(cs_)) { err = "dflash2: context wait"; return false; }
+    log_flush();
+    ctx_pending_ = false;
+    return true;
+}
+
+bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs,
+                           std::string& err) {
+    if (!bound_) { err = "dflash2: not bound"; return false; }
+    if (n_new < 1 || n_new > capacity_rows_) { err = "dflash2: draft rows out of range"; return false; }
+    const OnDevice on_device(device_);
+    if (ctx_pending_ && !context_wait(err)) return false;
     const Clock::time_point t0 = Clock::now();
     if (graph_taps_ != nullptr && graph_taps_ != taps) { err = "dflash2: the taps buffer moved after capture"; return false; }
-    if (!exec_[n_new]) {
+    auto& graph = exec_[block_rows_ == kRows ? 0 : 1][n_new];
+    if (!graph) {
         if (!capture(n_new, taps, err)) return false;
         graph_taps_ = taps;
     }
     const int64_t s = pos0 + n_new;
-    stage(n_new, pos0, kRows, s, anchor);
+    stage(n_new, pos0, s, anchor);
     log_stage(pos0, n_new);
-    if (!strata::gpu::graph_launch(exec_[n_new], cs_)) return gpu_fail(err, "round");
-    strata::gpu::copy_async(h_out_, d_out_, 64 * 4, cs_);
+    if (!strata::gpu::graph_launch(graph, cs_)) { err = "dflash2: graph launch"; return false; }
+    if (!strata::gpu::copy_async(h_out_, d_out_, 64 * sizeof(int32_t), cs_, "dflash2 picks")) { err = "dflash2: picks"; return false; }
     log_fetch(n_new);
-    if (!strata::gpu::stream_sync(cs_)) return gpu_fail(err, "round");
+    if (!strata::gpu::stream_sync(cs_)) { err = "dflash2: draft"; return false; }
     log_flush();
-    for (int i = 0; i < kDrafts; ++i) {
+    for (int i = 0; i < block_rows_ - 1; ++i) {
         const bool made = i < ndraft_;
         drafts[i] = made ? h_out_[i] : 0;
         if (probs) probs[i] = made ? reinterpret_cast<const float*>(h_out_)[16 + i] : 0.0f;
     }
     have_ctx_ = std::max<int64_t>(have_ctx_, s);
-    ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n_new);
+    history_.mark_end(pos0 + n_new);
     ms_draft += ms_since(t0);
     ++rounds;
+    if (block_rows_ == kRows) ++rounds_short; else ++rounds_wide;
     return true;
-} catch (const std::exception& e) {
-    err = std::string("dflash2 draft: ") + e.what();
-    return false;
 }
 
 }  // namespace strata::core

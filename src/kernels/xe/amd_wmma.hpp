@@ -10,6 +10,8 @@
 // GFX11: a lane all 16 K values (lanes 16-31 repeat 0-15), the accumulator's rows 2 e + l / 16.
 #pragma once
 
+#include "strata/kernels/matrix_report.hpp"
+
 #include <sycl/sycl.hpp>
 
 #include <cstddef>
@@ -24,14 +26,13 @@
 
 namespace strata::kernels::xe {
 
-/// Whether the device is an RDNA3 or RDNA4 GPU (GFX11, GFX12), whose WMMA these kernels take: the architecture as SYCL
-/// reports it (its values carry the version: 0x0200000000110000 is gfx1100).
-inline bool amd_wmma(const sycl::device& d) {
-    namespace syclex = sycl::ext::oneapi::experimental;
-    if (d.get_backend() != sycl::backend::ext_oneapi_hip) return false;
-    const auto a = static_cast<uint64_t>(d.get_info<syclex::info::device::architecture>());
-    return a >= static_cast<uint64_t>(syclex::architecture::amd_gpu_gfx1100) && a < 0x0200000000130000ull;
-}
+/// Whether the device has the WMMA instructions these kernels take (wmma_gfx, matrix_report.hpp).  Inside the kernels'
+/// own choices only (layouts, shapes): a path asks has_form(d, MatrixForm::wmma).
+inline bool amd_wmma(const sycl::device& d) { return wmma_gfx(d) != 0; }
+
+/// Whether the device's WMMA takes its operands in GFX12's layout, not GFX11's (and its products take tile layouts of
+/// their own, mma_gemm.cpp).
+inline bool amd_wmma_gfx12(const sycl::device& d) { return wmma_gfx(d) == 12; }
 
 // The ports from Strata-rdna3 (nicejunjie/Strata-rdna3) that XeStrata-890M takes as opt-in switches have their bodies
 // only in gfx1150's (the Radeon 890M's) device code, and run only where the device reports that architecture: the
@@ -123,6 +124,19 @@ inline void mad(sycl::sub_group, C& d, const A<E>& a, const B& b, const C& c) {
         d.v = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a.v, b.v, c.v);
 #endif
     }
+}
+
+// int8 (iq_mmq.cpp's products, the image engine's int8 attention): a lane's KN of A's row or B's column as bytes in
+// 32-bit words, the accumulator's eight int32 elements in the FP32 one's places
+using s8f = int __attribute__((ext_vector_type(KN / 4)));
+using iv8 = int __attribute__((ext_vector_type(8)));
+/// A . B + c, both operands signed int8
+inline iv8 mad_s8(const s8f& a, const s8f& b, const iv8& c) {
+#if defined(__GFX12__)
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
+#else
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+#endif
 }
 
 // row-major: the accumulator's element (i, j) to p + i * ld + j

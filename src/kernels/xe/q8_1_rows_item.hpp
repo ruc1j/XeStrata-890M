@@ -7,8 +7,8 @@
 // writes the experts' image beside the plan.
 #pragma once
 
-#include "q8_1_finite.hpp"
 #include "strata/kernels/canon_math.hpp"
+#include "strata/kernels/q8_act.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -35,7 +35,7 @@ inline void q8_1_rows_item(const sycl::sub_group& sg, long long j, long long n8,
     const long long ib = j / 4, o = 8 * (j % 4);
     uint8_t* const block = y + ib * 36;
     for (int q = 0; q < 8; ++q) reinterpret_cast<int8_t*>(block + 4)[o + q] = canon::q8_value(v[q], id);
-    if (o == 0) *reinterpret_cast<sycl::half2*>(block) = sycl::half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+    if (o == 0) *reinterpret_cast<sycl::half2*>(block) = sycl::half2(sycl::half(d), sycl::half(q8act::finite(sum)));
 }
 
 }  // namespace strata::kernels

@@ -71,6 +71,8 @@ class EveryFileIsPinned(unittest.TestCase):
         for fam_name, fam in {**setup.FAMILIES, **setup.PLAIN_FAMILIES}.items():
             if fam.get("ready"):                       # ready-made packs: pinned file by file (ready_files)
                 continue
+            if fam.get("edge0") or fam_name == "sync":  # upstream's pre-built packs: pinned file by file
+                continue                               # (EDGE0_MODELS, serve/sync_models.py; test_setup_sync)
             for model in (setup.MODELS if fam_name in setup.FAMILIES else fam["models"]):
                 if fam_name in setup.FAMILIES and \
                         fam_name not in setup.MODELS[model].get("families", ("qwen", "swift")):
@@ -86,7 +88,7 @@ class EveryFileIsPinned(unittest.TestCase):
 
     def test_the_picture_reader_of_every_family(self):
         for name, fam in {**setup.FAMILIES, **setup.PLAIN_FAMILIES}.items():
-            if "mmproj_hf" not in fam:                 # a family without a picture reader (XeStrata's plain families)
+            if not fam.get("mmproj_hf"):               # a family without a picture reader (the plain families, Edge0)
                 continue
             with self.subTest(family=name):
                 self.pinned(fam["mmproj_hf"] + fam["mmproj"])
@@ -233,6 +235,9 @@ class InstalledModelsNeedNoNetwork(unittest.TestCase):
         def urlopen(req, timeout=None):
             raise urllib.error.URLError("no route to host")
 
+        # the failed host is remembered for the rest of the process (serve/download.py): forget it, or every later
+        # test that downloads from huggingface.co stops at once
+        self.addCleanup(setup.download_core.forget_dead_hosts)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
                 mock.patch.object(setup.time, "sleep", lambda s: None), \
                 mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface"}):
@@ -240,11 +245,19 @@ class InstalledModelsNeedNoNetwork(unittest.TestCase):
                 quiet(setup.download, pinned_url("Q2_0/x.gguf"), Path(d) / "x.gguf")
 
     def test_the_runtime_has_no_model_host_in_it(self):
-        """serve, the monitor and the API reach no model host: the names are in setup.py and the install tools only."""
+        """serve, the monitor and the API reach no model host for a text model: the names are in setup.py, the install
+        tools and upstream XeStrata's download modules below only."""
         hosts = re.compile(r"huggingface\.co|hf-mirror|HF_ENDPOINT|modelscope|hf_hub_download", re.I)
+        # upstream's serve fetches what is not a text model, by pinned names or a link the user gives:
+        downloads = {
+            "download.py",     # the download core setup and the modules below share (the Hugging Face endpoint)
+            "image_aux.py",    # the image tools' auxiliary weights, the first time a tool needs one
+            "loras.py",        # an image LoRA from a Hugging Face link the user gives
+            "model_terms.py",  # the models' license texts at their pinned commits, and their cards' links
+        }
         found = []
         for p in (ROOT / "serve").rglob("*.py"):
-            if "test" in p.name:
+            if "test" in p.name or (p.parent == ROOT / "serve" and p.name in downloads):
                 continue
             text = p.read_text(encoding="utf-8", errors="replace")
             if hosts.search(text):

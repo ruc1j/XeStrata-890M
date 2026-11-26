@@ -33,8 +33,25 @@ struct SamplerParams {
     // (-inf) before penalties and filters.  Grammar-constrained decoding (src/core/grammar.cpp): row t's allowed tokens
     // after the window's tokens 0..t
     const uint32_t* allowed = nullptr;
-    bool gumbel = false;         // STRATA_SPEC_GUMBEL=1: Gumbel-max pick keyed by (seed, counter, token id) - see sampler.cpp
+    // Gumbel-max pick: argmax_i z_i + G_i, G_i a Gumbel noise hashed from (seed, counter, token id), over the top
+    // kGumbelK of the surviving list (sampler.cpp).  XESTRATA_SPEC_GUMBEL (auto|0|1) and gumbel_active() decide.
+    bool gumbel = false;
 };
+
+// The most candidates a Gumbel draw is made for (YASAKANI's Q35_SMP_K, q35.hpp): a tail beyond them would rarely
+// win a draw, and the list is cut before the draws so their cost stays small whatever top_k the request asked for.
+inline constexpr int kGumbelK = 20;
+
+// XESTRATA_SPEC_GUMBEL: auto (unset or "auto"), 0, 1.  Unset is off on an integrated GPU on the HIP backend
+// (XeStrata-890M's default; "auto" asks for the arms there).  Auto: for a request that samples, the serve loop learns
+// both arms (Gumbel off and on) by the tokens per ms the request decoded at - spec/drafter_policy.hpp's two-arm
+// learner - and sets the arm the request runs (set_gumbel_auto).  The Gumbel arm samples only the top kGumbelK survivors;
+// the other arm samples all survivors, so their distributions can differ.  XESTRATA_EXACT=1 fixes it off (a run whose answers must
+// repeat); 0 and 1 force it off and on.
+enum class GumbelMode { kAuto, kOff, kOn };
+GumbelMode gumbel_mode();
+void set_gumbel_auto(bool on);   // the arm for the request now decoding (auto mode only)
+bool gumbel_active();            // what the sampler consults: the mode, and in auto the arm last set
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
 //
@@ -55,6 +72,11 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
 // t holds a NaN or an infinity, else 0; n_blocks 1..32.  The same picks and the same flags as the two launches.
 void sample_tokens_nonfinite(const float* logits, int n_tokens, int n_vocab, const SamplerParams& p, int* out,
                              uint32_t* flags, int n_blocks, void* stream);
+
+// One parameter record per row, on the device. A negative penalty_last_n leaves that row's output unchanged.
+// Each record's counter and allowed pointer belong to that row (not row zero of a window).
+void sample_token_rows(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                       const SamplerParams* params, int* out, void* stream);
 
 // ---- COUPLED DRAFT SAMPLING (include/strata/core/coupled_draft.hpp, STRATA_SPEC_COUPLED=1).  Device pointers
 // throughout; every per-request / per-round value comes from device memory, so the calls can be captured.
@@ -134,5 +156,40 @@ inline void penalty_rows(const int32_t* tail, int64_t n_tail, const int32_t* win
         }
     }
 }
+
+// The penalty-history rows of a BATCH window, on the host: row t of the window fed `tokens[t]` to slot `rows[t]`,
+// and its row of `out` (S rows of `h` slots) is the last `h` tokens of that slot's reply tail (`tails[slot]` with
+// `n_tails[slot]` tokens: what the slot's session consumed since the reply began, the fed-back head not yet in it)
+// followed by the tokens this window's rows of the same slot fed up to and including row t, most recent LAST, -1 in
+// the unused front slots.  A slot may hold several rows (--batch-mtp's drafts).  This is exactly what `penalty_rows`
+// gives a solo window, slot by slot, so a request's picks are the ones it would have made alone.
+inline void slot_penalty_rows(const int* rows, const int32_t* tokens, int S, const int32_t* const* tails,
+                              const int64_t* n_tails, int h, int32_t* out) {
+    for (int t = 0; t < S; ++t) {
+        int32_t* row = out + (size_t) t * (size_t) h;
+        const int slot = rows[t];
+        const int32_t* tail = tails != nullptr ? tails[slot] : nullptr;
+        const int64_t n_tail = tail != nullptr ? n_tails[slot] : 0;
+        int64_t in_window = 0;                                     // this window's rows of the slot, up to t
+        for (int u = 0; u <= t; ++u) in_window += rows[u] == slot;
+        const int64_t avail = n_tail + in_window;
+        const int take = (int) std::min<int64_t>(h, avail);
+        std::fill(row, row + (h - take), -1);
+        for (int j = 0; j < take; ++j) {
+            const int64_t i = avail - take + j;                     // index into (the tail, the slot's window tokens)
+            if (i < n_tail) { row[h - take + j] = tail[i]; continue; }
+            int64_t k = i - n_tail, seen = 0;
+            for (int u = 0; u <= t; ++u)
+                if (rows[u] == slot) {
+                    if (seen == k) { row[h - take + j] = tokens[u]; break; }
+                    ++seen;
+                }
+        }
+    }
+}
+
+// The widest penalty window a history row keeps, the engine's own cap (serve's kPenaltyWindowCap in generate.cpp):
+// a longer penalty_last_n is counted over the last this many tokens.
+constexpr int kPenaltyWindowCap = 4096;
 
 }  // namespace strata::kernels

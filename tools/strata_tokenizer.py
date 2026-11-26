@@ -114,6 +114,14 @@ O200K_PATTERN = (
     r"|\s+"
 )
 
+# `gpt2` (Florence-2's BART tokenizer: RoBERTa's, GPT-2's vocabulary): Hugging Face's ByteLevel pre-tokenizer with
+# its regex on (`use_regex`, the default; tokenizers' `byte_level.rs`, GPT-2's encoder.py), `add_prefix_space` off.
+GPT2_PATTERN = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+
+# `inkling2` (Inkling-2-Mini, Thinking Machines): o200k's split as its `tokenizer.json` writes it (Unsloth's GGUF names
+# it `inkling2`), with `model.ignore_merges` set.
+INKLING2_PATTERN = O200K_PATTERN                 # the same Split rule as `o200k`
+
 # The GGUF's `tokenizer.ggml.pre` -> (pattern, ignore_merges, where the pattern was transcribed from).  A `pre` not
 # listed is refused: tokenizing it with another type's pattern gives plausible tokens the model was not trained on.
 PRE_TYPES = {
@@ -123,6 +131,8 @@ PRE_TYPES = {
     "glm5": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
     HUNYUANIMAGE3_PRE: (QWEN2_PATTERN, True, "tencent/HunyuanImage-3.0*'s tokenizer.json, 2026-10-24"),
     "o200k": (O200K_PATTERN, True, "Inkling-2-Mini's tokenizer.json (the o200k Split rule), upstream Strata c6f6427d9"),
+    "gpt2": (GPT2_PATTERN, False, "Hugging Face tokenizers' ByteLevel pre-tokenizer (byte_level.rs), GPT-2's"),
+    "inkling2": (INKLING2_PATTERN, True, "strata-engine/Inkling-2-Mini-Strata's tokenizer.json (04996a1e), 2026-11-23"),
 }
 
 def pre_tokenizer_kind(pre) -> str | None:
@@ -277,9 +287,9 @@ class Tokenizer:
         if not isinstance(vocab, dict):
             raise ValueError("%s: no model.vocab (a BPE tokenizer.json is expected)" % f)
         added = j.get("added_tokens") or []
-        n = len(vocab) + len(added)
-        for a in added:
-            n = max(n, int(a["id"]) + 1)
+        # the ids the vocabulary and the added tokens use (an added token may already be in the vocabulary, as
+        # RoBERTa's <s> and </s> are)
+        n = max([int(i) + 1 for i in vocab.values()] + [int(a["id"]) + 1 for a in added] + [0])
         tokens = [""] * n
         for t, i in vocab.items():
             tokens[int(i)] = t
@@ -292,7 +302,13 @@ class Tokenizer:
             types[i] = 3 if a.get("special") else 1
         raw_merges = model.get("merges") or []
         merges = [m if isinstance(m, str) else " ".join(m) for m in raw_merges]
-        pre = cls._hf_pre(cls._hf_regex(j.get("pre_tokenizer")), bool(model.get("ignore_merges")))
+        pt = j.get("pre_tokenizer") or {}
+        if pt.get("type") == "ByteLevel":   # GPT-2's own regex inside the byte layer (Florence-2's, RoBERTa's)
+            if pt.get("add_prefix_space") or pt.get("use_regex") is False or model.get("ignore_merges"):
+                raise ValueError("%s: a ByteLevel pre-tokenizer with a prefix space or without its regex" % f)
+            pre = "gpt2"
+        else:
+            pre = cls._hf_pre(cls._hf_regex(pt), bool(model.get("ignore_merges")))
         if model.get("dropout") not in (None, 0, 0.0):
             raise ValueError("%s: a BPE dropout of %r is not supported" % (f, model["dropout"]))
         if model.get("continuing_subword_prefix") or model.get("end_of_word_suffix"):
@@ -304,7 +320,8 @@ class Tokenizer:
     @classmethod
     def from_dir(cls, path):
         """The tokenizer `extract` wrote into a pack's `tokenizer/` folder, with the `pre` it declared (an export
-        older than the field is Qwen3.8's, `qwen35`); a Unigram one (`model` t5: llm-jp-4.1) is strata_unigram's."""
+        older than the field is Qwen3.8's, `qwen35`); a Unigram one (`model` t5: llm-jp-4.1) is strata_unigram's, a
+        PLaMo one (`model` plamo3: PLaMo 3 Translate) strata_plamo's."""
         path = pathlib.Path(path)
         cfg_file = path / "tokenizer.json"
         cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
@@ -312,6 +329,10 @@ class Tokenizer:
             sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
             from strata_unigram import UnigramTokenizer
             return UnigramTokenizer.from_dir(path, cfg)
+        if cfg.get("model") in ("plamo2", "plamo3"):
+            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+            from strata_plamo import PlamoTokenizer
+            return PlamoTokenizer.from_dir(path, cfg)
         vocab = json.loads((path / "vocab.json").read_text(encoding="utf-8"))
         tokens = [""] * len(vocab)
         for t, i in vocab.items():
@@ -498,6 +519,79 @@ class Tokenizer:
         return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
 
 
+# ------------------------------------------------------------------ CLIP's BPE (SAM 3's words)
+class ClipTokenizer:
+    """CLIP's tokenizer as its Hugging Face `tokenizer.json` describes it (openai/clip-vit-large-patch14's; SAM 3's
+    text tower reads the same vocabulary): the text NFC-normalized, its whitespace runs one space, lowercased; split
+    by CLIP's regex (contractions, letter runs, single digits, other runs), each piece through the byte layer and a
+    BPE whose words end in `</w>`, a piece the merges cannot spell the unknown token; <|startoftext|> first and
+    <|endoftext|> last, the content cut so the whole fits `max_len`."""
+
+    PATTERN = r"'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+"
+    GPT2 = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+
+    def __init__(self, vocab: dict[str, int], merges: list[str], bos: int, eos: int, unk: int):
+        self.vocab = vocab
+        self.ranks = {tuple(m.split(" ")): i for i, m in enumerate(merges) if m and not m.startswith("#version")}
+        self.bos, self.eos, self.unk = bos, eos, unk
+        self.byte = bytes_to_unicode()
+        self.pat = regex.compile(self.PATTERN)
+        self.gpt2 = regex.compile(self.GPT2)
+        self.cache: dict[str, list[int]] = {}
+
+    @classmethod
+    def from_hf(cls, path) -> "ClipTokenizer":
+        f = pathlib.Path(path)
+        if f.is_dir():
+            f = f / "tokenizer.json"
+        j = json.loads(f.read_text(encoding="utf-8"))
+        model = j.get("model") or {}
+        if model.get("type") != "BPE" or model.get("end_of_word_suffix") != "</w>":
+            raise ValueError("%s: not CLIP's BPE (end_of_word_suffix </w>)" % f)
+        added = {a["content"]: int(a["id"]) for a in j.get("added_tokens") or []}
+        vocab = {t: int(i) for t, i in model["vocab"].items()}
+        merges = [m if isinstance(m, str) else " ".join(m) for m in model.get("merges") or []]
+        unk = vocab.get(model.get("unk_token") or "<|endoftext|>", added.get("<|endoftext|>", 0))
+        return cls(vocab, merges, added["<|startoftext|>"], added["<|endoftext|>"], unk)
+
+    def _bpe(self, piece: str) -> list[int]:
+        hit = self.cache.get(piece)
+        if hit is not None:
+            return hit
+        word = list(piece[:-1]) + [piece[-1] + "</w>"]
+        while len(word) > 1:
+            best, at = None, -1
+            for i in range(len(word) - 1):
+                r = self.ranks.get((word[i], word[i + 1]))
+                if r is not None and (best is None or r < best):
+                    best, at = r, i
+            if best is None:
+                break
+            a, b = word[at], word[at + 1]
+            out, i = [], 0
+            while i < len(word):
+                if i < len(word) - 1 and word[i] == a and word[i + 1] == b:
+                    out.append(a + b)
+                    i += 2
+                else:
+                    out.append(word[i])
+                    i += 1
+            word = out
+        ids = [self.vocab.get(w, self.unk) for w in word]
+        if len(self.cache) < 4096:
+            self.cache[piece] = ids
+        return ids
+
+    def encode(self, text: str, max_len: int = 32) -> list[int]:
+        import unicodedata
+        t = regex.sub(r"\s+", " ", unicodedata.normalize("NFC", text)).lower()
+        ids: list[int] = []
+        for piece in self.pat.findall(t):
+            for sub in self.gpt2.findall(piece):
+                ids.extend(self._bpe("".join(self.byte[b] for b in sub.encode("utf-8"))))
+        return [self.bos] + ids[:max(0, max_len - 2)] + [self.eos]
+
+
 # ------------------------------------------------------------------ incremental prompts (#567)
 def common_prefix_len(a: str, b: str) -> int:
     """Length of the longest common prefix, by slices (C speed) rather than a loop over characters."""
@@ -620,7 +714,21 @@ def extract(gguf_path, out_dir) -> dict:
         if tpl:
             (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
         return cfg
-    tk = Tokenizer.from_gguf(gguf_path)
+    if md.get("tokenizer.ggml.model") in ("plamo2", "plamo3"):   # PLaMo 3 Translate
+        from strata_plamo import PlamoTokenizer
+        cfg = PlamoTokenizer.from_gguf(gguf_path).write_dir(out)
+        (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+        tpl = md.get("tokenizer.chat_template")
+        if tpl:
+            (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
+        return cfg
+    return write_bpe(Tokenizer.from_gguf(gguf_path), out, md.get("tokenizer.chat_template"))
+
+
+def write_bpe(tk: Tokenizer, out: pathlib.Path, tpl: str | None) -> dict:
+    """A byte-level BPE tokenizer into `out` (a pack's `tokenizer/`), with the model's chat template where it has one
+    (fine-tunes change it: Swift 1.5 differs from Qwen3.8-Flash-Next's)."""
+    out.mkdir(parents=True, exist_ok=True)
     cfg = {
         "model": "gpt2",
         "pre": tk.pre,
@@ -639,10 +747,6 @@ def extract(gguf_path, out_dir) -> dict:
                                               sorted(tk.ranks.items(), key=lambda kv: kv[1])), encoding="utf-8")
     (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
     (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    # the model's own chat template: fine-tunes change it (Swift 1.5 differs from Qwen3.8-Flash-Next's)
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from gguf_reader import GGUFFile
-    tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
     if tpl:
         (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
     return cfg
@@ -651,20 +755,31 @@ def extract(gguf_path, out_dir) -> dict:
 def main() -> int:
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gguf", required=True)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--gguf")
+    src.add_argument("--tokenizer-json", help="Hugging Face's tokenizer.json (a model without a GGUF: Inkling-2-Mini's "
+                                              ".strata), with --chat-template")
+    ap.add_argument("--chat-template", help="the chat template beside --tokenizer-json")
     ap.add_argument("--out", required=True)
     ap.add_argument("--check", action="store_true", help="round-trip a corpus and report")
     args = ap.parse_args()
-    cfg = extract(args.gguf, args.out)
+    if args.tokenizer_json:
+        tpl = pathlib.Path(args.chat_template).read_text(encoding="utf-8") if args.chat_template else None
+        cfg = write_bpe(Tokenizer.from_hf(args.tokenizer_json), pathlib.Path(args.out) / "tokenizer", tpl)
+    else:
+        cfg = extract(args.gguf, args.out)
     if cfg["model"] == "t5":
         print("tokenizer/: Unigram, vocab %d, specials %s" % (cfg["vocab_size"], cfg["special_ids"]))
         if args.check:   # the round trip is byte-level BPE's property: Unigram normalizes its input
             print("--check: a Unigram tokenizer has no exact round trip (its input is normalized)")
         return 0
+    if cfg["model"] in ("plamo2", "plamo3"):
+        print("tokenizer/: PLaMo (%s), vocab %d, specials %s" % (cfg["model"], cfg["vocab_size"], cfg["special_ids"]))
+        return 0
     print("tokenizer/: vocab %d, merges %d, pre %s, specials %s"
           % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"], cfg["special_ids"]))
     if args.check:
-        tk = Tokenizer.from_gguf(args.gguf)
+        tk = Tokenizer.from_hf(args.tokenizer_json) if args.tokenizer_json else Tokenizer.from_gguf(args.gguf)
         corpus = ["", "Hello, world!", "  leading and trailing  ", "a\n\n\nb",
                   "def f(x):\n\treturn x  # comment\n", "\u4f60\u597d\uff0c\u4e16\u754c",
                   "\u0645\u0631\u062d\u0628\u0627",

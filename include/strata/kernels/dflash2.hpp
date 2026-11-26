@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
-// include/strata/kernels/dflash2.hpp - the small kernels of the DFlash2 drafter (core/dflash2.hpp) for Qwen3.8-Flash-Next.
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// include/strata/kernels/dflash2.hpp - the kernels of the DFlash2 drafter (core/dflash2.hpp), for every engine.
 //
-// The drafter's matrices run through the engine's multi-column MMVQ (native_q8_0_mmvq); what is here is everything between
-// them: the grouped dynamic 2-tap convolution, the per-head RMS norm + rotary rotation, the windowed non-causal attention over a
-// K/V ring, the top-16 selection over the head's logits and the selector's left-to-right walk.  All launches are asynchronous on
-// the given stream, allocate nothing and are graph-capturable.  Layouts are row-major f32 unless noted.
+// The drafter's matrices run as tiled Q4_0 / Q8_0 through df2_gemm on planar int8 activations; what is here is
+// everything between them: the grouped dynamic 2-tap convolution, the per-head RMS norm + rotary rotation, the
+// windowed non-causal attention over a K/V ring, the top-16 over the head's logits, the selector's left-to-right
+// walk, and the verify window's / prompt's tap (the layer's completed output, the mean of the hyper-connection
+// streams).  All launches are asynchronous on the given stream (null: the runtime's compute queue), allocate
+// nothing and are graph-capturable.  Layouts are row-major f32 unless noted.  No device FP64: the rope tables are
+// computed on the host (df2_rope_table_cpu) - a device FP64 kernel slows every later kernel on an Arc Alchemist.
 #pragma once
 
 #include <cstddef>
@@ -17,99 +21,112 @@ constexpr int kDf2Rows = 8;            ///< block rows (the anchor + 7 masks) an
 constexpr int kDf2Kv = 8;              ///< K/V heads
 constexpr int kDf2Gqa = 4;             ///< query heads per K/V head
 constexpr int kDf2Hd = 128;            ///< head dim
-constexpr int kDf2Chunk = 128;         ///< keys per attention block
-constexpr int kDf2MaxChunks = 17;      ///< ceil((2047 context keys + 8 block keys) / kDf2Chunk)
-constexpr int kDf2PartChunks = 33;     ///< SYCL: the attention partials hold up to 33 chunks of 64 keys (part: kDf2PartChunks x 8 x 32 x 130 floats)
+constexpr int kDf2Chunk = 64;          ///< keys per attention work-group
+constexpr int kDf2PartChunks = 33;     ///< the attention partials hold ceil((2047 + 8) / 64) chunks
 constexpr int kDf2TopK = 16;
 constexpr int kDf2TopBlocks = 64;      ///< partial top-k blocks per row (a block holds at most 4096 logits)
 
-/// out[b][c] = sum_{o < 2, b - o >= 0} (base[o][c] + dyn[b * dyn_stride + o * groups + c / group]) * x[(b - o) * H + c]  (+ resid[b][c] when
-/// resid != null; out may equal resid).  x is [rows][H]; base is [2][H]; `dyn` points at this convolution's [2][groups] slice of row 0.
-void df2_conv(const float* x, const float* dyn, int dyn_stride, const float* base, const float* resid, float* out, int rows, int H,
-              int group, void* stream);
+/// out[b][c] = sum_{o < 2, b - o >= 0} (base[o][c] + dyn[b * dyn_stride + o * groups + c / group]) * x[(b - o) * H + c]
+/// (+ resid[b][c] when resid != null; out may equal resid).  x is [rows][H]; base is [2][H]; `dyn` points at this
+/// convolution's [2][groups] slice of row 0.
+void df2_conv(const float* x, const float* dyn, int dyn_stride, const float* base, const float* resid, float* out,
+              int rows, int H, int group, void* stream);
 
-/// table[r][0][i], table[r][1][i] = cos, sin of pos[r] * theta^(-2 i / 128) for i < 64 (the angle reduced in double first, so a large
-/// position keeps its precision under fast math).  table: [rows][2][64].
-void df2_rope_table(const int32_t* pos, int rows, float theta, float* table, void* stream);
-
-/// Per (row, head): out = rope(rmsnorm(in) * gamma).  `in` rows are `in_stride` floats apart (heads * 128 contiguous per row).  The
-/// rotation is the neox/rotate_half one over the whole head dim with row r's entry of `rope_table` (null: the norm only).  The result of row r goes to
-/// out + slot(r) * heads * 128 with slot(r) = (slot_mod > 0 ? pos[r] % slot_mod : r).  `rope` false: the norm only.
-void df2_norm_rope(const float* in, int in_stride, const float* gamma, const int32_t* pos, const float* rope_table, float* out, int slot_mod,
-                   int rows, int heads, float eps, void* stream);
-
-/// out[slot(r)][c] = in[r][c], slot as above (the value half of the ring write).
-void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod, int rows, int cols, void* stream);
-
-/// Attention of the block's 8 query rows (q: [8][32][128], already normed and rotated) over the context ring (kring, vring:
-/// head-major [8][ring_slots][128]) and the block's own keys (kblk, vblk: [8][8][128]).  Row i at position s + i sees context position j when
-/// s + i - j < window (j in [max(0, s - window + 1), s - 1], slot j % ring_slots) and every block key.  `s` is read from *anchor_pos
-/// on the device.  Partials in `part` ([kDf2MaxChunks][8][32][130] floats) are combined and the 8 output rows (4096 wide) written planar-quantized to xq / xd.
-void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
-                   int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag = nullptr, const int32_t* epoch = nullptr);
-
-/// The Q8 GEMM the drafter's matrices run on.  A weight matrix is TILED (see the layout note in dflash2.cu; df2_q8_tile makes it from GGUF Q8_0 blocks):
-/// the int8 plane at `w` (n_out * n_in bytes) then the fp16 scale plane.  Activations are planar (df2_quant_rows and the fused quantizers below):
-/// xq is int8 [col][n_in] (8 columns of n_in bytes), xd float [col][n_in / 32].  Up to 3 matrices that share the input run in one launch; y (matrix i)
-/// is [ncols][n_out].  n_in a multiple of 512, n_out of 16, ncols 1..8 (the other columns of xq are read and dropped).
-/// Bench only: pick a GEMM kernel variant (0 = the default).
-/// df2_rope_table with the inverse frequencies computed once (df2_rope_inv: the same double-precision pow per i), so a round pays no pow: the same table, bitwise.
-void df2_rope_inv(float theta, double* inv, void* stream);
-void df2_rope_table_inv(const int32_t* pos, int rows, const double* inv, float* table, void* stream);
-/// The same table computed on the host (double precision, bitwise the CUDA kernel up to sincosf): table [rows][2][64].  The SYCL port uses this one: a kernel with FP64 operations on an Arc Alchemist (IGC DP emulation) slows every later kernel of the process by 2x or more, so the drafter has no device FP64.
+/// table[r][0][i], table[r][1][i] = cos, sin of pos[r] * theta^(-2 i / 128) for i < 64, the angle reduced in double
+/// first so a large position keeps its precision.  Host: table [rows][2][64].  Bitwise the device table up to sincosf.
 void df2_rope_table_cpu(const int32_t* pos, int rows, float theta, float* table);
-void df2_gemm_variant(int v);
-/// Bench only: attention variants (bit 0 skips Q K^T, bit 1 skips P V).
+
+/// The block's q (q_heads x 128) and k (k_heads x 128) per row: RMS norm and rope with the table of the block's
+/// positions -> qo, ko (row-major [row][head][128]).
+void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const float* gk, const float* table, float* qo,
+                      float* ko, int rows, int q_heads, int k_heads, float eps, void* stream);
+
+/// The context update's ring write: K (norm + rope) and V of `rows` rows into the head-major rings ([head][slot][128])
+/// at slot pos[r] % slots.  With `tag` (int64 per slot) the slot is stamped (*epoch << 32 | pos); the attention (same
+/// tag / epoch) ignores a slot whose stamp is not the position it expects.
+void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table,
+                 float* kring, float* vring, int slots, int rows, int heads, float eps, void* stream,
+                 int64_t* tag = nullptr, const int32_t* epoch = nullptr);
+
+/// Attention of the block's `rows` query rows (8 or 16; q [rows][32][128]) over the context ring and the block's
+/// own keys (kblk, vblk [rows][8][128]). Each row sees the whole block and the ring within `window` positions.
+/// Partials are [kDf2PartChunks][8][rows * 4][130]. The output is planar quantized [rows][4096].
+void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
+                   const int32_t* anchor_pos, int ring_slots, int window, float* part, void* xq, float* xd,
+                   void* stream, const int64_t* tag = nullptr, const int32_t* epoch = nullptr, int rows = 8);
+/// The same attention, returning eight FP32 rows [8][4096] instead of quantizing them. The output can feed
+/// a weight format with its own activation quantizer. The rings, block keys and partials have the same layout.
+void df2_attention_f32(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
+                       const int32_t* anchor_pos, int ring_slots, int window, float* part, float* out, void* stream,
+                       const int64_t* tag = nullptr, const int32_t* epoch = nullptr);
+/// The attention's form for 8 rows (16 rows take the 8-query-group form): 0 the default (XESTRATA_DF2_ATTN, else 4 on
+/// an integrated GPU on the HIP backend, elsewhere XESTRATA_DF2_ATTN_256: auto, timed on the first window), 1 the
+/// 8-query-group form, 2 the 256-work-item form (bitwise 1), 3 RDNA's matrix instructions with FP16 operands (a
+/// device without them takes the default), 4 the 256-work-item form on 2 x 2 register tiles, 5 the CUDA file's
+/// 128-work-item form on 4 x 4 tiles.  The tests set it, the engine leaves 0; XESTRATA_DF2_ATTN takes the same numbers.
 void df2_attention_variant(int v);
-/// Bench only (SYCL): keys per attention work-group, 64 or 128 (0 = the default).
-void df2_attention_chunk(int ck);
-/// q4: the weights are the Q4_0 nibble plane (n_out * n_in / 2 bytes, see gemm4_kernel in dflash2.cu) then the fp16 scale plane (df2_q4_tile); all matrices of a launch share the format.
+/// Bench only: the GEMM's form for Q4_0 matrices (0 = the default; XESTRATA_DF2_GEMM4 takes the same ids).  10 .. 43
+/// are the fused kernels with the CUDA file's ids (every matrix of a launch in one kernel, W warps a block and R rows
+/// a warp; 40 .. 43 need sub-groups of 16).  The default is 28 / 17 on an integrated GPU on the HIP backend, one
+/// launch a matrix elsewhere (df2_gemm).
+void df2_gemm_variant(int v);
+
+/// The drafter's GEMM: up to 3 tiled weight matrices that share the input, times the planar activations.  A matrix
+/// is TILED (df2_q4_tile / df2_q8_tile make it from ggml blocks): the int8 / nibble plane then the fp16 scale plane.
+/// Activations: xq int8 [col][n_in], xd float [col][n_in / 32].  y (matrix i) is [ncols][n_out].  n_in a multiple of
+/// 512, n_out of 16, ncols 1..16 (above 8 is split into two launches).
 struct Df2Mat { const void* w; float* y; int n_out; bool q4 = false; };
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream);
-/// Planar quantization of rows x[ncols][K].
+
+/// Planar quantization of rows x[ncols][K]: per 32-value block d = amax / 127, q = round(x / d).
 void df2_quant_rows(const float* x, int K, int ncols, void* xq, float* xd, void* stream);
 /// RMS norm (weights gamma) of `rows` rows of N, written to xn (optional) and quantized.
-void df2_rms_quant(const float* h, const float* gamma, float* xn, int rows, int N, float eps, void* xq, float* xd, void* stream);
+void df2_rms_quant(const float* h, const float* gamma, float* xn, int rows, int N, float eps, void* xq, float* xd,
+                   void* stream);
 /// df2_conv without residual, then quantized.
-void df2_conv_quant(const float* x, const float* dyn, int dyn_stride, const float* base, int rows, int H, int group, void* xq, float* xd, void* stream);
+void df2_conv_quant(const float* x, const float* dyn, int dyn_stride, const float* base, int rows, int H, int group,
+                    void* xq, float* xd, void* stream);
 /// silu(gate) * up of `rows` rows of I, quantized.
 void df2_swiglu_quant(const float* gate, const float* up, int rows, int I, void* xq, float* xd, void* stream);
-/// GGUF Q8_0 blocks (34 bytes) of a matrix with rows of n_in -> the tiled qs plane and the tiled d plane (count = rows * n_in / 32 blocks).
+/// h += conv(x) (the finish convolution with the residual), then the RMS norm of the new h (weights gamma) -> xn
+/// (optional) and the planar quantization.  rows <= 8, H <= 4096 (H a multiple of 32).
+void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h,
+                        const float* gamma, float* xn, int rows, int H, int group, float eps, void* xq, float* xd,
+                        void* stream);
+
+/// ggml Q8_0 blocks (34 bytes) of a matrix with rows of n_in -> the tiled int8 plane and the tiled fp16 scale plane
+/// (count = rows * n_in / 32 blocks).
 void df2_q8_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t count, void* stream);
-/// ggml Q4_0 blocks (18 bytes) of a matrix with rows of n_in -> the tiled nibble plane (n_out * n_in / 2 bytes) and the tiled d plane (Df2Mat::q4).
+/// ggml Q4_0 blocks (18 bytes) -> the tiled nibble plane (n_out * n_in / 2 bytes) and the tiled fp16 scale plane.
 void df2_q4_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t count, void* stream);
 
-/// h += conv(x) (the finish convolution with the residual), then the RMS norm of the new h (weights gamma) -> xn (optional) and the planar quantization.
-/// rows <= 8, H <= 3072 (H a multiple of 32).
-void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h, const float* gamma, float* xn, int rows, int H, int group,
-                        float eps, void* xq, float* xd, void* stream);
-/// The block's q (q_heads x 128) and k (k_heads x 128) per row: RMS norm and rope with the table of the block's positions -> qo, ko (row-major).
-void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const float* gk, const float* table, float* qo, float* ko, int rows, int q_heads, int k_heads,
-                      float eps, void* stream);
-/// The context update's write: K (norm + rope) and V of `rows` rows into the head-major rings at slot pos[r] % slots.  With `tag` (int64 per slot) the slot is
-/// stamped (*epoch << 32 | pos) and the attention (same tag / epoch) ignores a slot whose stamp is not the position it expects.
-void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, float* kring, float* vring, int slots, int rows,
-                 int heads, float eps, void* stream, int64_t* tag = nullptr, const int32_t* epoch = nullptr);
-
-/// Top-16 per row of logits [rows][n] (value-descending; ties to the lower index).  idx_map (optional) maps a column to a token id.
-/// scratch: rows * kDf2TopBlocks * 16 * 2 words.  Outputs val[rows][16] and tok[rows][16].  n <= 4096 * kDf2TopBlocks.
-void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint32_t* scratch, float* val, int32_t* tok, void* stream);
+/// Top-16 per row of logits [rows][n] (value-descending; ties to the lower index).  idx_map (optional) maps a column
+/// to a token id.  scratch: rows * kDf2TopBlocks * 16 * 2 words.  Outputs val[rows][16] and tok[rows][16].
+/// n <= 4096 * kDf2TopBlocks.
+void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint32_t* scratch, float* val, int32_t* tok,
+              void* stream);
 
 /// The candidate selector's walk: for row i = 0..rows-1 the 16 candidates' scores are unary[i][j] + dot(succ[tok[i][j]],
-/// pred[prev] * hp[i]) over `rank` values (codebooks are bf16 rows of `rank`), the pick is the argmax, prev = the pick.  Writes
-/// out_tok[i] and out_prob[i] (the softmax probability of the pick among the 16).  `prev0` is read from *anchor_tok on the device.
-/// `cb_q4`: the codebooks are ggml Q4_0 rows in block order (rank / 32 blocks of 18 bytes a row: fp16 d, 16 bytes, value i in the low nibble of byte i,
-/// value i + 16 in the high nibble; NOT tiled like the matrices), dequantized to fp32 ((q - 8) * d) before the same dot; default: bf16 rows.
-void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false);
+/// pred[prev] * hp[i]) over `rank` values, the pick is the argmax, prev = the pick.  Writes out_tok[i] and out_prob[i]
+/// (the softmax probability of the pick among the 16).  `prev0` is read from *anchor_tok on the device.  The codebooks
+/// are bf16 rows of `rank`, or with `cb_q4` ggml Q4_0 rows in block order (rank / 32 blocks of 18 bytes a row, NOT
+/// tiled like the matrices), dequantized to fp32 ((q - 8) * d) before the same dot.
+void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb,
+                int rank, int rows, const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream,
+                bool cb_q4 = false);
 
-/// The verify window's tap: out[r][d] = mean over the hc streams c of (R[r][c][d] + bo[r][d] * 2 * sigmoid(inject[r][c] / hc)) - the layer output with
-/// its pending FFN write (gr_write) applied, averaged over the streams.  R rows are `R_stride` floats apart, bo rows `bo_stride`, inject rows
-/// `inj_stride`, out rows `out_stride`.
-void df2_tap_gr(const float* R, int64_t R_stride, const float* bo, int64_t bo_stride, const float* inject, int64_t inj_stride, float* out, int64_t out_stride,
-                int rows, int64_t n_embd, int hc, void* stream);
+/// The block's input rows from two embedding rows (a host-embedded target, the plain engine's): h[0] = anchor,
+/// h[1..rows-1] = mask, each of N floats.
+void df2_embed_rows(const float* anchor, const float* mask, float* h, int N, int rows, void* stream);
 
-/// out[r][:n_embd] = the mean of the hc streams of row r of R ([rows][hc][n_embd]) written to out + r * out_stride (a tap slot).
+/// The verify window's tap: out[r][d] = mean over the hc streams c of (R[r][c][d] + bo[r][d] * 2 * sigmoid(inject[r][c]
+/// / hc)) - the layer output with its pending FFN write applied, averaged over the streams.  R rows are R_stride floats
+/// apart, bo rows bo_stride, inject rows inj_stride, out rows out_stride.
+void df2_tap_gr(const float* R, int64_t R_stride, const float* bo, int64_t bo_stride, const float* inject,
+                int64_t inj_stride, float* out, int64_t out_stride, int rows, int64_t n_embd, int hc, void* stream);
+
+/// out[r][:n_embd] = the mean of the hc streams of row r of R ([rows][hc][n_embd]) written to out + r * out_stride
+/// (a tap slot; the prompt path, whose GR write has already landed).
 void df2_tap_rows(const float* R, float* out, int64_t out_stride, int64_t n_embd, int hc, int rows, void* stream);
 
 }  // namespace strata::kernels

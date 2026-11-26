@@ -18,6 +18,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/platform/env.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -55,22 +56,42 @@ struct PrefillStats {
 void set_cpu_share(double share);
 /// The share in use: STRATA_PREFILL_CPU_SHARE's, else set_cpu_share's; -1 measured.
 double cpu_share_setting();
+/// The link rule's verdict (share_rules::link_rule) for the card the prompt path runs on: chunks up to `limit` tokens are
+/// staged and share (0: the plain 3,072), experts of up to `nt` tokens may go to the CPU (0: the pool's MAXT).  Before
+/// bytes_needed and init (the staged walk's buffers follow the limit).
+void set_cpu_share_rule(int64_t limit, int nt);
 
 /// The prompt chunks --prefill auto picks from, the largest first, for both engines (generate.cpp's plan_lend and
 /// PlainModel's): every chunk streams again each expert it routes to, so fewer chunks stream fewer experts.  32768 and
 /// 16384 after upstream ae652b2: on the B70 a 26,292-token IQ3_S prompt read at 1,080 tok/s in 8192-token chunks
-/// (50,356 experts streamed), 1,303 in 16384 and 1,545 in one chunk (17,728), the same logits.
-inline constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
-/// The largest of kAutoChunks that `take(chunk)` accepts (0: none), at most STRATA_PREFILL_AUTO_MAX (32768 unset) and,
-/// past 8192, none above `max_context`.
-template <class Take>
-int64_t auto_chunk(int64_t max_context, Take&& take) {
-    static const int64_t auto_max = [] {
-        const char* v = std::getenv("STRATA_PREFILL_AUTO_MAX");
-        return v ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) 32768;
+/// (50,356 experts streamed), 1,303 in 16384 and 1,545 in one chunk (17,728), the same logits.  49152 and 40960 (the
+/// RDNA3 fork's 8192 grid) only for a prompt they read in one chunk (one_chunk_cap): on the B70, IQ3_XXS, a 48K prompt
+/// read in 17.7 s in one 48128-token chunk against 18.7 s in 32768 + the rest, the same answer, but a 57K one in 22.2 s
+/// in 49152 + 7848 against 21.8 s in 32768 + 24231 (2026-11-15).  A 16 GB card (RX 9060 XT) cannot lend them at 48K and
+/// keeps 16384; above 49152 the R buffer (~40 KB a token) passes 2 GiB.
+inline constexpr int64_t kAutoChunks[] = {49152, 40960, 32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+/// The largest auto chunk a prompt longer than one chunk is read in (the chunks above it pay only in one chunk).
+inline constexpr int64_t kAutoSplitMax = 32768;
+/// The ceiling of --prefill auto: STRATA_PREFILL_AUTO_MAX, else the largest of kAutoChunks.
+inline int64_t auto_max() {
+    static const int64_t m = [] {
+        const char* v = strata::env_get("PREFILL_AUTO_MAX");
+        return v ? (int64_t) std::strtoll(v, nullptr, 10) : kAutoChunks[0];
     }();
+    return m;
+}
+/// The chunk a prompt of `tokens` is read in when the auto chunk is `chunk`: the prompt's own size (rounded up to 256)
+/// when it fits in one, else at most kAutoSplitMax.
+inline int64_t one_chunk_cap(int64_t chunk, int64_t tokens) {
+    const int64_t whole = std::max<int64_t>(256, (tokens + 255) / 256 * 256);
+    return whole <= chunk ? whole : std::min(chunk, kAutoSplitMax);
+}
+/// The largest of kAutoChunks that `take(chunk)` accepts (0: none), at most `cap` and, past 8192, none above
+/// `max_context`.
+template <class Take>
+int64_t auto_chunk(int64_t max_context, Take&& take, int64_t cap = auto_max()) {
     for (const int64_t c : kAutoChunks) {
-        if (c > auto_max || (c > 8192 && c > max_context)) continue;
+        if (c > cap || (c > 8192 && c > max_context)) continue;
         if (take(c)) return c;
     }
     return 0;
@@ -78,7 +99,7 @@ int64_t auto_chunk(int64_t max_context, Take&& take) {
 /// The percent of the expert tier's slots a prompt chunk's buffers may borrow (a lent slot's expert is streamed during
 /// the prompt and refilled after it): STRATA_PREFILL_LEND_PCT, else `fallback` (the engine's own, measured).
 inline int64_t lend_pct(int64_t fallback) {
-    const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
+    const char* v = strata::env_get("PREFILL_LEND_PCT");
     return v ? (int64_t) std::strtol(v, nullptr, 10) : fallback;
 }
 
@@ -141,8 +162,13 @@ public:
     /// to a share of the experts it would stream (`auto`: measured, where both sides end together); their rows go to
     /// the tail of the experts' outputs (upstream 978d3558).  Not bit-identical to the GPU's rows (the CPU's own
     /// activation format).  Unset (default) or null: every expert on the GPU.  Only for a pool no other thread runs
-    /// meanwhile (no batch slots).  Set before `init`.
+    /// meanwhile (no batch slots, or XESTRATA_PREFILL_CPU_SHARE_BATCH=1's gate: set_share_blocked).  Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
+
+    /// XESTRATA_PREFILL_CPU_SHARE_BATCH=1 (batch slots beside the pool): set before each read - true while a slot
+    /// decodes (its windows use the pool), so no chunk of that read takes the share; false lets the read's chunks take
+    /// it.  One flag for the process (a layer split hands it on): the pool is one.
+    static void set_share_blocked(bool blocked);
 
     /// A helper GPU's expert cache (RemoteExperts: --expert-cache-device1, or --layer-split auto's helper).  A chunk
     /// below the streamed-walk size hands it the experts this GPU does not hold and it does, routed by at most
@@ -214,11 +240,24 @@ public:
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
 
     const PrefillStats& stats() const { return stats_; }
+    void set_stats(const PrefillStats& stats) { stats_ = stats; }
 
     /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
     /// K/V from them.  The prefill stream is synchronized before the call.
     std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
+
+    /// The DFlash2 drafter's prompt taps: the completed output (the mean of the hyper-connection streams) of these
+    /// layers, for the rows at or after `first_pos`, gathered into a staging of `cap_rows` rows and reported through
+    /// on_taps after each chunk (the prefill stream synchronized).  Set before init; empty allocates nothing.
+    void set_taps(const std::vector<int>& layers, int64_t first_pos, int64_t cap_rows) {
+        tap_layers_ = layers; tap_first_ = first_pos; tap_cap_ = cap_rows;
+    }
+    std::function<bool(const float* taps, int64_t rows, int64_t pos0, std::string& err)> on_taps;
+    /// After init: the staging for `cap_rows` rows (the start's measurement reads short prompts with a small one and
+    /// takes the window's 2048 rows only when DFlash2 stays), or the taps off and their staging freed.
+    bool set_tap_rows(int64_t cap_rows, std::string& err);
+    void taps_off();
 
     /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state
     /// is still at that chunk's end (its stream synchronized; the last stage calls it just before `on_chunk`).  An
@@ -226,18 +265,10 @@ public:
     /// mid-prompt checkpoint takes each stage's part.  Runs on that stage's thread, with its device current.
     std::function<bool(int64_t done, std::string& err)> on_stage_chunk;
 
-    /// DFlash2 prompt taps (upstream Strata's SYCL prefill; single stage): before `run`, ask for the completed output
-    /// of each layer in `layers` (zero-based; the mean of the hc streams) for the rows at positions >= first_pos (the
-    /// drafter looks back one window).  The staging of cap_rows x layers x n_embd floats is allocated at the first
-    /// chunk, or by `reserve_taps` before (so the expert cache is sized around it).  After each chunk that has such
-    /// rows, on_taps(taps [rows][layers][n_embd] device, rows, first position, err) runs with the stream synchronized.
-    /// clear_taps frees the staging.
-    void set_taps(const std::vector<int>& layers, int64_t first_pos, int64_t cap_rows) {
-        tap_layers_ = layers; tap_first_ = first_pos; tap_cap_ = cap_rows;
-    }
+    /// DFlash2 prompt taps, set_taps' staging made before init instead (so the expert cache is sized around it):
+    /// cap_rows x layers x n_embd floats.  clear_taps is taps_off.
     void clear_taps();
     bool reserve_taps(const std::vector<int>& layers, int64_t cap_rows, int64_t n_embd, std::string& err);
-    std::function<bool(const float* taps, int64_t rows, int64_t pos0, std::string& err)> on_taps;
 
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
@@ -291,9 +322,10 @@ private:
     std::future<bool> lm_next_run_;   ///< a layer split: the next stage's run of the last super-chunk handed on
     std::string lm_next_err_;
     int64_t stage_lb_ = 0, stage_le_ = -1;
-    std::vector<int> tap_layers_;       ///< DFlash2 taps (set_taps)
-    int64_t tap_first_ = 0, tap_cap_ = 0;
-    float* tap_dev_ = nullptr;          ///< the taps' staging [cap_rows][layers][n_embd]
+    std::vector<int> tap_layers_, tap_local_, tap_slot_;   ///< set_taps: the drafter's tap layers (this stage's share)
+    int64_t tap_first_ = 0, tap_cap_ = 0, tap_n_ = 0;
+    int64_t tap_alloc_ = 0;          ///< the rows tap_dev_ holds (set_taps asks for tap_cap_; a chunk writes at most this)
+    float* tap_dev_ = nullptr;       ///< [tap_cap_][ntap][n_embd] staging (null: no taps)
     PrefillLink* next_ = nullptr;       ///< set_stage: the next stage, through this link only
     InProcessPrefill local_next_;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
@@ -302,6 +334,9 @@ private:
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
+    bool latent_experts(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err);   // the latent MoE arm (Edge0)
+    bool latent_mmq_d(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err);   // latent: D, U's tables
+    bool latent_mmq_u(int64_t l, int64_t T, int64_t K, Impl& m, std::string& err);   // latent: U into Dm
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
 };

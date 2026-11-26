@@ -32,7 +32,18 @@ path = ["serve/web/sprite.svg"]
 SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors"]
 SPDX-License-Identifier = "MIT"
 
-# XeStrata's own files without a comment of their own: the expert profiles of the other models
+# XeStrata's own files without a comment of their own: the settings register (tools/settings_register.py writes it),
+# and the expert profiles of the other models
+[[annotations]]
+path = ["data/dflash2/NOTICE.md", "data/dflash2/NOTICE-GLM-5.3-Flash.md", "data/dflash2/NOTICE-Qwen3.6-35B-A3B.md"]
+SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
+SPDX-License-Identifier = "LGPL-3.0-or-later"
+
+[[annotations]]
+path = ["data/settings-register.json"]
+SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
+SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
+
 [[annotations]]
 path = ["data/expert-profile-glm53.bin", "data/expert-profile-gyro-coder.bin", "data/expert-profile-llmjp.bin",
         "data/expert-profile-ornith.bin", "data/expert-profile-qwen36.bin"]
@@ -52,7 +63,9 @@ SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 Mis
 SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 [[annotations]]
-path = ["data/quant_quality/long/set.ids.json", "cmake/BUILD.json.in", "tools/lint/package.json", ".claude/skills/**/SKILL.md", ".claude/skills/**/references/*.md"]
+path = ["data/quant_quality/long/set.ids.json", "cmake/BUILD.json.in", "tools/lint/package.json", ".claude/skills/**/SKILL.md",
+        ".claude/skills/**/references/*.md", "serve/skills/**/SKILL.md",
+        "launcher/Core/locales/*.json", "launcher/Tests/describe.json", "launcher/*/packages.lock.json"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
@@ -78,6 +91,16 @@ SPDX-FileCopyrightText = "NVIDIA CORPORATION & AFFILIATES"
 SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
+path = ["third_party/main/cutlass/LICENSE.txt"]
+SPDX-FileCopyrightText = "NVIDIA CORPORATION & AFFILIATES"
+SPDX-License-Identifier = "BSD-3-Clause"
+
+[[annotations]]
+path = ["third_party/main/comfy-kitchen/LICENSE", "third_party/main/comfy-kitchen/NOTICE"]
+SPDX-FileCopyrightText = "2025 Comfy Org"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
 path = ["third_party/main/aotriton/LICENSE"]
 SPDX-FileCopyrightText = "Advanced Micro Devices, Inc."
 SPDX-License-Identifier = "MIT"
@@ -90,6 +113,11 @@ SPDX-License-Identifier = "MIT"
 [[annotations]]
 path = ["third_party/main/aotriton/LICENSE.FlyDSL"]
 SPDX-FileCopyrightText = "2025 FlyDSL Project Contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["third_party/main/oneDNN/patches/*.patch"]
+SPDX-FileCopyrightText = "Intel Corporation and the oneDNN contributors"
 SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
@@ -132,11 +160,24 @@ path = ["third_party/main/outfit/**"]
 SPDX-FileCopyrightText = "2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)"
 SPDX-License-Identifier = "OFL-1.1"
 
-# KaTeX 0.19.0 (the web app's math rendering; PROVENANCE.json is upstream Strata's record, above)
+# KaTeX 0.19.1 (the web app's math rendering; PROVENANCE.json is upstream Strata's record, above)
 [[annotations]]
 path = ["third_party/main/katex/LICENSE", "third_party/main/katex/dist/**"]
 SPDX-FileCopyrightText = "2013-2020 Khan Academy and other contributors"
 SPDX-License-Identifier = "MIT"
+
+# mermaid's script bundles the packages BUNDLED.md lists, each under its own license (elkjs taken under EPL-2.0,
+# DOMPurify under Apache-2.0)
+[[annotations]]
+path = ["third_party/main/mermaid/**"]
+SPDX-FileCopyrightText = ["2014-2022 Knut Sveidqvist", "2017 Kiel University and others",
+                         "the authors of the packages third_party/main/mermaid/BUNDLED.md lists"]
+SPDX-License-Identifier = "MIT AND ISC AND BSD-3-Clause AND Apache-2.0 AND EPL-2.0"
+
+[[annotations]]
+path = ["third_party/main/containers-common/**"]
+SPDX-FileCopyrightText = ["The containers/common authors", "2026 MistVVK and the XeStrata contributors"]
+SPDX-License-Identifier = "Apache-2.0"
 
 # non-free: material made from or copied from the Qwen3.8-Flash-Next model (the READMEs carry their own header)
 [[annotations]]
@@ -158,3 +199,8 @@ SPDX-License-Identifier = "BSD-2-Clause"
 path = ["third_party/main/dlpack/LICENSE"]
 SPDX-FileCopyrightText = "The DLPack contributors"
 SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["third_party/main/py3langid/**"]
+SPDX-FileCopyrightText = ["2011 Marco Lui", "2021 Adrien Barbaresi"]
+SPDX-License-Identifier = "BSD-3-Clause"

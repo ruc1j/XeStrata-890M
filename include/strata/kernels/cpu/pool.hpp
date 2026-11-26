@@ -37,6 +37,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <chrono>
 #include <condition_variable>
@@ -116,12 +117,23 @@ struct ThreadAffinity {
 #if defined(_WIN32)
     std::vector<unsigned long> cpu_sets;   ///< the thread's selected CPU Sets; empty: the process defaults
 #else
-    unsigned long mask = 0;                ///< CPUs 0..63
+    std::vector<int> cpus;                 ///< every CPU in the calling thread's previous mask
 #endif
     bool valid = false;
 };
 ThreadAffinity pin_current_thread(int core);
 void restore_thread_affinity(const ThreadAffinity& previous);
+
+/// Hold the host on its reserved core for a forward, restoring its former placement on return.
+class ScopedThreadPin {
+public:
+    explicit ScopedThreadPin(int cpu) { if (cpu >= 0) previous_ = pin_current_thread(cpu); }
+    ~ScopedThreadPin() { restore_thread_affinity(previous_); }
+    ScopedThreadPin(const ScopedThreadPin&) = delete;
+    ScopedThreadPin& operator=(const ScopedThreadPin&) = delete;
+private:
+    ThreadAffinity previous_;
+};
 
 class ExpertPool {
 public:
@@ -143,7 +155,9 @@ public:
     /// the cores below it: a layer split's stages each with workers of their own).
     /// `tasks`: the row tasks of each batched expert phase (--pool-tasks), 0 = three per participating thread; a
     /// count is capped by the phase's rows.
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int first_core = 0, int tasks = 0);
+    /// `generic` makes a pool for independent pieces; n_workers then includes the calling thread (0: auto).
+    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int first_core = 0, int tasks = 0,
+                        bool generic = false);
     static constexpr int kMaxTasks = 4096;
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
@@ -162,6 +176,14 @@ public:
     /// The start-up line about where the workers and the host run ("CPU workers on logical processors 2,4,...,30 (15
     /// workers, one per physical core; host on 0)"); "" without workers.
     std::string placement_line() const;
+    int size() const { return n_ + (host_works_ ? 1 : 0); }
+    /// Run independent pieces on the same pool, the caller included.
+    void run(int n, const std::function<void(int)>& fn);
+    /// `n` independent items, `fn(i)` each: in pieces of `chunk` items on the pool (run) when there are at least
+    /// `min_items` of them and the pool has workers, else in line on the caller.  Each item writes only its own
+    /// output, so the bits are the same either way (upstream 431a26db1's run_range: the CPU prompt share's activations
+    /// quantized by the pool, host grouping 81 -> 7 ms on an RTX 5090).  XESTRATA_POOL_ITEMS=0: always in line.
+    void run_items(int n, int chunk, int min_items, const std::function<void(int)>& fn);
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
@@ -286,8 +308,11 @@ private:
     std::vector<std::thread> threads_;
     std::vector<int> worker_cpus_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
-    // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
+    // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts (7 = run(n, fn), 8 = the
+    // one-batch native layer call of XESTRATA_POOL_DEP)
     int mode_ = 0;
+    const std::function<void(int)>* fn_ = nullptr;
+    int fn_offset_ = 0;
     int parts_a_ = 1, parts_b_ = 1;
     struct SplitBuf {
         alignas(64) float ff[FF];
@@ -307,6 +332,23 @@ private:
     const NativeFmt* nfmt_ = nullptr;
     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
     std::vector<SplitBufMulti> split_multi_;
+    // XESTRATA_POOL_DEP (on unless "0"; upstream edef565b, 902ea232): a native layer call as ONE batch (mode 8) instead
+    // of two phases with a barrier between them.  The batch's tasks are the experts' gate/up row ranges (expert-major),
+    // then the experts' down row ranges.  A down task waits only for its own expert's gate/up tasks (counted in
+    // gu_left), and the first thread that gets there quantizes that expert's intermediate (once: quant 0 -> 1 -> 2), so
+    // the threads that finish the gate/up rows early start on the experts that are ready instead of waiting for the
+    // slowest task of the phase, and the host does not quantize between the phases.  Every row is computed by the same
+    // kernel from the same bytes: the outputs are the two-phase batch's bits.  Every gate/up task has a lower index than
+    // every down task, a claim hands the indices out in order, and a gate/up task waits for nothing, so a waiting down
+    // task always waits for a task that is running: no deadlock.
+    struct alignas(64) DepExpert {
+        std::atomic<int32_t> gu_left{0};
+        std::atomic<int32_t> quant{0};
+    };
+    std::unique_ptr<DepExpert[]> dep_;   // kMaxSplitMulti
+    bool dep_on_ = true;                 // XESTRATA_POOL_DEP, read once in the constructor
+    int dep_nb_ = 0, dep_k_gu_ = 1, dep_k_dn_ = 1;   // the current batch: experts, gate/up and down tasks per expert
+    void dep_task(int i);
 };
 
 }  // namespace strata::kernels::cpu

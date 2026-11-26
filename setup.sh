@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-# Strata for Linux: the first run installs everything and starts the model; later runs just start it.
-# Needs the Intel GPU driver (xe) and Intel oneAPI (DPC++, oneMKL). Python (with venv) is installed through
-# apt/dnf/pacman if it is missing (asks for sudo).
-# NixOS (or STRATA_UV=1) with uv installed: uv makes the project venv; every other Linux uses the standard venv.
+# XeStrata for Linux: the first run installs everything and starts the model; later runs just start it.
+# Python (with venv) is installed through apt/dnf/pacman if it is missing (asks for sudo); setup.py then checks the
+# GPU makers' drivers and runtimes and says how to install what is missing.
+# NixOS (or XESTRATA_UV=1) with uv installed: uv makes the project venv; every other Linux uses the standard venv.
 cd "$(dirname "$0")" || exit 1
 # Python 3.10+ that can make a venv WITH pip: Debian/Ubuntu ship `venv` without `ensurepip` (that is the separate
 # python3-venv package), and a venv made without it has no pip
@@ -13,8 +13,9 @@ ok_py() { "$1" -c 'import sys, venv, ensurepip; sys.exit(0 if sys.version_info >
 # --help and --check only report, with any Python 3.10+ (they need nothing beyond the standard library): they make no
 # .venv and install nothing (a user ran --help to look, on a work machine, and apt installed Python's packages)
 for arg in "$@"; do
-  case $arg in
-    -h|--help|--check)
+  case $1:$arg in
+    chat:*|images:*) ;;                # their own --help, once the venv is there
+    *:-h|*:--help|*:--check)
       for c in .venv/bin/python python3 python; do
         if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null
         then
@@ -30,10 +31,11 @@ if [ -x .venv/bin/python ] && ! .venv/bin/python -m pip --version >/dev/null 2>&
   rm -rf .venv
 fi
 if [ ! -x .venv/bin/python ]; then
-  # uv's own Python only on NixOS (its Python cannot load pip wheels' libraries), or when asked: STRATA_UV=1.
+  # uv's own Python only on NixOS (its Python cannot load pip wheels' libraries), or when asked: XESTRATA_UV=1
+  # (or upstream's STRATA_UV=1).
   # Everywhere else the standard venv stays the default (#662: a silent toolchain change was not wanted).
   UV=""
-  if [ "${STRATA_UV:-}" = "1" ] || grep -qi '^ID=nixos' /etc/os-release 2>/dev/null; then
+  if [ "${XESTRATA_UV:-${STRATA_UV:-}}" = "1" ] || grep -qi '^ID=nixos' /etc/os-release 2>/dev/null; then
     UV="$(command -v uv 2>/dev/null || true)"
   fi
   PY=""
@@ -71,4 +73,11 @@ if [ ! -x .venv/bin/python ]; then
     $PY -m venv .venv || { rm -rf .venv; echo "could not create .venv: sudo apt install python3-venv"; exit 1; }
   fi
 fi
+# the same subcommands as the packages' xestrata and xestrata-cli.exe: the terminal chat, image models for an install,
+# the launcher's window (built with the .NET 10 SDK, which nothing else here needs)
+case $1 in
+  chat) shift; exec .venv/bin/python chat.py "$@" ;;
+  gui) shift; exec .venv/bin/python setup.py --gui "$@" ;;
+  images) shift; exec .venv/bin/python tools/image/install.py "$@" ;;
+esac
 exec .venv/bin/python setup.py "$@"

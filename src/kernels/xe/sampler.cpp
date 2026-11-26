@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 the YASAKANI authors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT AND Apache-2.0
 // src/kernels/xe/sampler.cpp - the Xe port of Strata's src/kernels/cuda/sampler.cu: the sampler chain in llama.cpp's order
 // (penalties -> top_k -> top_p -> min_p -> temperature -> pick), one work-group of 1024 per token over the
 // vocabulary.  See the CUDA source for the order, the tie rule and the cost notes.
@@ -11,12 +12,15 @@
 #include "xe_shuffle.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/coupled_draft.hpp"
+#include "strata/kernels/exact.hpp"
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/spec_proposal.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_sampler
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
@@ -57,26 +61,36 @@ inline float philox_uniform(uint64_t seed, uint64_t counter) {
     return (float) (c0 >> 8) * (1.0f / 16777216.0f);   // 24 bits: uniform in [0,1), never 1.0
 }
 
-// GUMBEL-MAX COUPLING (STRATA_SPEC_GUMBEL=1, upstream 6381df34, from llama.cpp-lab's --spec-coupled).  The pick is
-// argmax_i p_i / E_i with E_i = -log(u_i) ~ Exp(1) and u_i a hash of (seed, counter, TOKEN ID) - exactly equivalent
-// to argmax(log p_i + Gumbel_i), so it is an exact sample of p.  Unlike the inverse-CDF pick over a probability-sorted
-// list, the noise a token gets does not depend on which other tokens survived the cut, so a drafter whose candidate
-// set differs from the target's still agrees with it on the tokens they share.  The MTP drafter keys on the draft's
-// token id (via sub_to_id), the target on its row's token id.  D float (a GPU without FP64): u from the hash's top 24
-// bits, still in (0, 1).
-template <typename D>
-inline D gumbel_exp(uint64_t seed, uint64_t counter, uint32_t token) {
-    uint64_t z = seed ^ (counter * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) token * 0xD1B54A32D192ED03ull);
+// GUMBEL-MAX COUPLING (XESTRATA_SPEC_GUMBEL=auto|0|1; unset is auto, but off on an integrated GPU on the HIP backend,
+// gumbel_mode; upstream 6381df34, from llama.cpp-lab's --spec-coupled; the
+// hash and the top-k cut are YASAKANI's smp_hash.cuh `kh_gumbel` and q35_sample.cu's version-3 pick).  The pick is
+// argmax_i z_i + G_i with G_i a Gumbel noise hashed from (seed, counter, TOKEN ID) and z_i the temperature-scaled
+// logit - exactly argmax(log p_i + Gumbel_i), an exact sample of p.  Unlike the inverse-CDF pick over a
+// probability-sorted list, the noise a token gets does not depend on which other tokens survived the cut, so a
+// drafter whose candidate set differs from the target's still agrees with it on the tokens they share.  The MTP
+// drafter keys on the draft's token id (via sub_to_id), the target on its row's token id.
+//
+// Only the first kGumbelK (20) entries of the surviving list take a draw: the list comes in descending order, so
+// they are its most likely tokens, and the tail's mass is the part a draw almost never reaches.  A draw is one
+// 64-bit mix and two logs - and only the work-item that writes the row's answer makes it (the argument is the same
+// for every work-item, and computing it 256 or 1024 times is what made this cost more than it saved on the B70).
+// D float (a GPU without FP64): u from the hash's top 23 bits, still in (0, 1).
+inline uint64_t kh_mix(uint64_t z) {
     z += 0x9E3779B97F4A7C15ull;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    z ^= z >> 31;
+    return z ^ (z >> 31);
+}
+
+template <typename D>
+inline D gumbel_noise(uint64_t seed, uint64_t counter, uint32_t token) {
+    const uint64_t h = kh_mix(kh_mix(kh_mix(seed) ^ counter) ^ ((uint64_t) token * 0xD6E8FEB86659FD93ull));
     if constexpr (sizeof(D) == 8) {
-        const D u = ((D) (z >> 11) + 0.5) * (1.0 / 9007199254740992.0);   // (0, 1), never 0 or 1
-        return -sycl::log(u);
+        const D u = ((D) (h >> 12) + 0.5) * (1.0 / 4503599627370496.0);   // (0, 1), never 0 or 1
+        return -sycl::log(-sycl::log(u));
     } else {
-        const D u = ((D) (uint32_t) (z >> 40) + 0.5f) * (1.0f / 16777216.0f);
-        return -sycl::log(u);
+        const D u = ((D) (uint32_t) (h >> 41) + 0.5f) * (1.0f / 8388608.0f);
+        return -sycl::log(-sycl::log(u));
     }
 }
 
@@ -180,11 +194,13 @@ inline void block_argmax(const sycl::nd_item<1>& it, int n_vocab, float* sv, int
     }
 }
 
-// top_p, min_p, temperature and one Philox draw over a row's top_k list (ids, logits in the selection order),
-// computed redundantly by every work-item
+// top_p, min_p, temperature and the pick over a row's top_k list (ids, logits in the selection order).  The inverse-CDF
+// pick is computed redundantly by every work-item; the Gumbel pick is drawn by the row's first warp, one candidate a
+// lane, and the warp's (value, index) argmax gives the row's pick (see below).
 template <typename D>
 inline int pick_from_list(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& pp, int t,
-                          float* probability = nullptr, const int32_t* sub_to_id = nullptr) {
+                          const sycl::sub_group& sg, int tid, float* probability = nullptr,
+                          const int32_t* sub_to_id = nullptr) {
     const float inv_t = pp.temperature > 0.0f ? 1.0f / pp.temperature : 0.0f;
     int n_keep = k;
     float mx = sel_logit[0];
@@ -206,20 +222,34 @@ inline int pick_from_list(const int* sel_ids, const float* sel_logit, int k, con
         for (int i = 0; i < n_keep; ++i)
             if (sel_logit[i] < thresh) { n_keep = i; break; }
     }
+    // a Gumbel pick draws over the top kGumbelK of the survivors only (the list is descending, so its first entries
+    // are the most likely); every other pick walks the whole surviving list
+    const int nb = pp.gumbel && n_keep > kGumbelK ? kGumbelK : n_keep;
     auto scaled = [&](int i) { return sel_logit[i] * inv_t; };
     float smx = scaled(0);
-    for (int i = 1; i < n_keep; ++i) smx = sycl::fmax(smx, scaled(i));
+    for (int i = 1; i < nb; ++i) smx = sycl::fmax(smx, scaled(i));
     D sum = 0;
-    for (int i = 0; i < n_keep; ++i) sum += sycl::exp((D) scaled(i) - (D) smx);
-    int selected = n_keep - 1;
+    if (!pp.gumbel || probability != nullptr)   // a Gumbel pick only needs the sums of the exp for `probability`
+        for (int i = 0; i < nb; ++i) sum += sycl::exp((D) scaled(i) - (D) smx);
+    int selected = nb - 1;
     int pick = sel_ids[selected];
     if (pp.gumbel) {
-        D best = -1;
-        for (int i = 0; i < n_keep; ++i) {
-            const int id = sub_to_id != nullptr ? sub_to_id[sel_ids[i]] : sel_ids[i];
-            const D r = sycl::exp((D) scaled(i) - (D) smx) / sum / gumbel_exp<D>(pp.seed, pp.counter + (uint64_t) t, (uint32_t) id);
-            if (r > best) { best = r; pick = sel_ids[i]; selected = i; }
+        // the row's first warp draws: lane i takes candidate i (one 64-bit mix and two logs a lane, in parallel), and
+        // the warp's (value, index) argmax gives the pick; the other warps' work-items have nothing to draw
+        if (tid >= WARP) return pick;
+        D best = -std::numeric_limits<D>::infinity();
+        int bi = nb;
+        if (tid < nb) {
+            const int id = sub_to_id != nullptr ? sub_to_id[sel_ids[tid]] : sel_ids[tid];
+            best = (D) scaled(tid) - (D) smx + gumbel_noise<D>(pp.seed, pp.counter + (uint64_t) t, (uint32_t) id);
+            bi = tid;
         }
+        for (int off = WARP / 2; off > 0; off >>= 1) {   // the same total order as argmax_step: larger value, then lower index
+            const D ov = strata_shfl_xor(sg, best, off);
+            const int oi = strata_shfl_xor(sg, bi, off);
+            if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+        }
+        if (tid == 0 && bi < nb) { pick = sel_ids[bi]; selected = bi; }
     } else {
         const float u = philox_uniform(pp.seed, pp.counter + (uint64_t) t);
         D cum = 0;
@@ -241,7 +271,8 @@ namespace {
 template <int THREADS, typename D, bool NF = false>
 sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int n_vocab, const int* history,
                           int history_len, SamplerParams pp, bool greedy, size_t words, int* out,
-                          uint32_t* nf = nullptr, int nf_blocks = 0) {
+                          const SamplerParams* rows = nullptr, bool gumbel = false, uint32_t* nf = nullptr,
+                          int nf_blocks = 0) {
     // NF: the row in nf_blocks slices of per_block logits, a flag each (logits_nonfinite_rows' layout)
     const int per_block = NF ? (n_vocab + nf_blocks - 1) / nf_blocks : n_vocab;
     return q.submit([&](sycl::handler& h) {
@@ -254,11 +285,16 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const int t = (int) it.get_group(0);
             const int tid = (int) it.get_local_id(0);
+            const sycl::sub_group sg = it.get_sub_group();
+            SamplerParams row = rows ? rows[t] : pp;
+            if (rows && row.penalty_last_n < 0) return;
+            row.gumbel = row.gumbel || gumbel;
+            const int draw_row = rows ? 0 : t;
             const float* l = logits + (size_t) t * n_vocab;
             unsigned* b = &bits[0];
-            const Window w = load_window<THREADS>(it, history, history_len, pp.penalty_last_n, n_vocab, t, b);
+            const Window w = load_window<THREADS>(it, history, history_len, row.penalty_last_n, n_vocab, t, b);
 
-            if (greedy) {
+            if (rows ? (row.greedy || row.temperature <= 0.0f) : greedy) {
                 float wv;
                 int wi;
                 // NF: the slices in which this item met a non-finite logit, a bit each.  The item's values go up, so
@@ -273,7 +309,7 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                         while (v >= blk_end) { ++blk; blk_end += per_block; }
                         bad |= (uint32_t) ((sycl::bit_cast<uint32_t>(l[v]) & 0x7f800000u) == 0x7f800000u) << blk;
                     }
-                    s = apply_penalties(biased(pp, l, v, t, n_vocab), hit_count(w, b, v), pp);
+                    s = apply_penalties(biased(row, l, v, draw_row, n_vocab), hit_count(w, b, v), row);
                     return true;
                 }, wv, wi);
                 if constexpr (NF) {
@@ -285,7 +321,7 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                 return;
             }
 
-            int k = (pp.top_k > 0 && pp.top_k < KMAX) ? pp.top_k : KMAX;
+            int k = (row.top_k > 0 && row.top_k < KMAX) ? row.top_k : KMAX;
             if (k > n_vocab) k = n_vocab;
 
             // top_k: k rounds of a block argmax over the not-yet-taken
@@ -294,14 +330,14 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                 int wi;
                 block_argmax<THREADS>(it, n_vocab, &sv[0], &si[0], [&](int v, float& s) {
                     for (int j = 0; j < i; ++j) if (sel_ids[j] == v) return false;
-                    s = apply_penalties(biased(pp, l, v, t, n_vocab), hit_count(w, b, v), pp);
+                    s = apply_penalties(biased(row, l, v, draw_row, n_vocab), hit_count(w, b, v), row);
                     return true;
                 }, wv, wi);
                 if (tid == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
                 sycl::group_barrier(it.get_group());
             }
 
-            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], k, pp, t);
+            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], k, row, draw_row, sg, tid, nullptr, nullptr);
             if (tid == 0) out[t] = pick;
         });
     });
@@ -425,6 +461,7 @@ sycl::event split_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParam
         h.parallel_for(sycl::nd_range<2>({(size_t) n_tokens, (size_t) SPLIT_T}, {1, (size_t) SPLIT_T}),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const int t = (int) it.get_group(0), tid = (int) it.get_local_id(1);
+            const sycl::sub_group sg = it.get_sub_group();
             for (int c = tid; c < m; c += SPLIT_T) {
                 const int id = li[(size_t) t * m + c];
                 // an empty entry is never a candidate (the stage-1 sentinel)
@@ -449,7 +486,7 @@ sycl::event split_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParam
             keep = sycl::min(keep, n_vocab);
             if (step_rec) chain.counter = core::coupled_draft_counter(step_rec[0]);
             float prob = 0;
-            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], keep, chain, t, &prob, sub_to_id);
+            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], keep, chain, t, sg, tid, &prob, sub_to_id);
             if (tid == 0) {
                 const int id = sub_to_id ? sub_to_id[pick] : pick;
                 out[t] = id;
@@ -539,10 +576,24 @@ sycl::event spec_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParams
                 }
                 sycl::group_barrier(it.get_group());
             }
-            if (tid != 0) return;
             SamplerParams chain = device_params ? *device_params : pp;
             int keep = device_params ? ((chain.top_k > 0 && chain.top_k < KMAX) ? chain.top_k : KMAX) : k;
             keep = sycl::min(keep, n_vocab);
+            if constexpr (!DRAFT) {
+                // no draft on this row: the exact-match sampler's own draw.  Every work-item comes here: the Gumbel pick
+                // is drawn by the row's first warp (pick_from_list), and the first work-item writes the token.  (An
+                // explicit mu candidate without a draft is the error token below.)
+                const int d = t < n_tokens - 1 ? dtok[t] : -1;
+                const auto kind = core::proposal::rowkind(t, n_tokens, n_q);
+                const bool null_tail = AUG && kind == core::proposal::RowKind::NullTail;
+                const bool mu_offer = AUG && kind == core::proposal::RowKind::MuOffer;
+                if (d < 0 && !null_tail && !mu_offer) {
+                    const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], keep, chain, t, it.get_sub_group(), tid);
+                    if (tid == 0) out[t] = pick;
+                    return;
+                }
+            }
+            if (tid != 0) return;
             if constexpr (DRAFT) {
                 const int n = chain_probs<D>(&sel_logit[0], keep, chain, &ex[0]);
                 const float u = philox_uniform(chain.seed, core::coupled_draft_counter(step_rec[0]) | core::kSpecCtrDraft);
@@ -580,10 +631,6 @@ sycl::event spec_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParams
                         out[t] = core::proposal::kProposalSamplerErrorToken;
                         return;
                     }
-                }
-                if (d < 0 && !null_tail) {   // no draft on this row: the exact-match sampler's own draw
-                    out[t] = pick_from_list<D>(&sel_ids[0], &sel_logit[0], keep, chain, t);
-                    return;
                 }
                 const uint64_t pos = chain.counter + (uint64_t) t;
                 const int n = chain_probs<D>(&sel_logit[0], keep, chain, &ex[0]);
@@ -664,14 +711,36 @@ void* split_scratch(sycl::queue& q, size_t bytes) {
     return sc.p;
 }
 
-bool gumbel_env() {
-    static const bool on = [] {
-        const char* e = std::getenv("STRATA_SPEC_GUMBEL");
-        return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
-    }();
-    return on;
-}
+std::atomic<bool> g_gumbel_arm{false};   // the auto arm for the request now decoding
+
 }  // namespace
+
+GumbelMode gumbel_mode() {
+    static const GumbelMode m = [] {
+        const char* e = strata::env_get("SPEC_GUMBEL");
+        if (e == nullptr || e[0] == '\0') {
+            // XeStrata-890M: an integrated GPU on the HIP backend keeps the fork's default, off (its sampled requests
+            // draw as before); "auto" asks for the arm there
+            const sycl::device& d = core::Runtime::get().device();
+            if (d.get_backend() == sycl::backend::ext_oneapi_hip && core::integrated_gpu(d)) return GumbelMode::kOff;
+            return GumbelMode::kAuto;
+        }
+        if (std::strcmp(e, "auto") == 0) return GumbelMode::kAuto;
+        return std::strcmp(e, "0") == 0 ? GumbelMode::kOff : GumbelMode::kOn;
+    }();
+    return m;
+}
+
+void set_gumbel_auto(bool on) { g_gumbel_arm.store(on, std::memory_order_relaxed); }
+
+bool gumbel_active() {
+    switch (gumbel_mode()) {
+        case GumbelMode::kOn: return true;
+        case GumbelMode::kOff: return false;
+        case GumbelMode::kAuto: break;
+    }
+    return !exact_sums() && g_gumbel_arm.load(std::memory_order_relaxed);
+}
 
 void sample_tokens_nonfinite(const float* logits, int n_tokens, int n_vocab, const SamplerParams& p, int* out,
                              uint32_t* flags, int n_blocks, void* stream) {
@@ -683,16 +752,16 @@ void sample_tokens_nonfinite(const float* logits, int n_tokens, int n_vocab, con
                                    : xe::work_group_upto_1024<SampleKernelFloat>(q);
     if (wg < n_blocks) throw core::DeviceError("sample_tokens_nonfinite: the work-group is smaller than the slices");
     // (the greedy branch sums nothing: one kernel for every device, in sample_tokens' work-group)
-    const auto e = wg == 1024  ? sample_launch<1024, float, true>(q, logits, n_tokens, n_vocab, nullptr, 0, p, true, 1, out, flags, n_blocks)
-                   : wg == 512 ? sample_launch<512, float, true>(q, logits, n_tokens, n_vocab, nullptr, 0, p, true, 1, out, flags, n_blocks)
-                               : sample_launch<256, float, true>(q, logits, n_tokens, n_vocab, nullptr, 0, p, true, 1, out, flags, n_blocks);
+    const auto e = wg == 1024  ? sample_launch<1024, float, true>(q, logits, n_tokens, n_vocab, nullptr, 0, p, true, 1, out, nullptr, false, flags, n_blocks)
+                   : wg == 512 ? sample_launch<512, float, true>(q, logits, n_tokens, n_vocab, nullptr, 0, p, true, 1, out, nullptr, false, flags, n_blocks)
+                               : sample_launch<256, float, true>(q, logits, n_tokens, n_vocab, nullptr, 0, p, true, 1, out, nullptr, false, flags, n_blocks);
     if (!stream) core::Runtime::get().wait(e, "sample_tokens_nonfinite");
 }
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p_in, int* out, void* stream) {
     SamplerParams p = p_in;
-    p.gumbel = p_in.gumbel || gumbel_env();   // the target's pick; greedy rows never read it
+    p.gumbel = p_in.gumbel || gumbel_active();   // the target's pick; greedy rows never read it
     if (n_tokens <= 0 || n_vocab <= 0) return;
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0))
         throw core::DeviceError("sample_tokens: penalty_last_n " + std::to_string(p.penalty_last_n) +
@@ -710,7 +779,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                       : (wg == 1024 ? sample_launch<1024, float> : wg == 512 ? sample_launch<512, float>
                                                                       : sample_launch<256, float>);
     // the sampled path split over the GPU; STRATA_OLD_SAMPLER=1: the one-group kernel (A/B and reference)
-    static const bool old_sampler = [] { const char* v = std::getenv("STRATA_OLD_SAMPLER"); return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0; }();   // =0: not the old one (upstream's tests set it so)
+    static const bool old_sampler = [] { const char* v = strata::env_get("OLD_SAMPLER"); return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0; }();   // =0: not the old one (upstream's tests set it so)
     int k = (pp.top_k > 0 && pp.top_k < KMAX) ? pp.top_k : KMAX;
     if (k > n_vocab) k = n_vocab;
     const int nb = (n_vocab + SPLIT_BL - 1) / SPLIT_BL;
@@ -726,8 +795,26 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
             return;
         }
     }
-    const auto e = launch(q, logits, n_tokens, n_vocab, history, history_len, pp, greedy, words, out, nullptr, 0);
+    const auto e = launch(q, logits, n_tokens, n_vocab, history, history_len, pp, greedy, words, out, nullptr, false, nullptr, 0);
     if (!stream) core::Runtime::get().wait(e, "sample_tokens");
+}
+
+
+void sample_token_rows(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                       const SamplerParams* params, int* out, void* stream) {
+    if (n_tokens <= 0 || n_vocab <= 0) return;
+    auto& q = core::Runtime::get().stream(stream);
+    const size_t words = history && history_len > 0 ? (size_t) ((n_vocab + 31) / 32) : 1;
+    const int wg = xe::has_fp64(q) ? xe::work_group_upto_1024<SampleKernelDouble>(q)
+                                   : xe::work_group_upto_1024<SampleKernelFloat>(q);
+    auto launch = xe::has_fp64(q)
+                      ? (wg == 1024 ? sample_launch<1024, double> : wg == 512 ? sample_launch<512, double>
+                                                                       : sample_launch<256, double>)
+                      : (wg == 1024 ? sample_launch<1024, float> : wg == 512 ? sample_launch<512, float>
+                                                                      : sample_launch<256, float>);
+    const auto e = launch(q, logits, n_tokens, n_vocab, history, history_len, SamplerParams{}, false, words, out,
+                          params, gumbel_active(), nullptr, 0);
+    if (!stream) core::Runtime::get().wait(e, "sample_token_rows");
 }
 
 
@@ -741,10 +828,10 @@ size_t coupled_draft_scratch_bytes(int nv) {
 void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapped_hist, SamplerParams* params,
                          int32_t* ring, int cap, void* stream) {
     auto& q = core::Runtime::get().stream(stream);
-    const bool gumbel = gumbel_env();
+    // `gumbel` comes in mapped_params too: the serve loop writes the request's arm there (set_draft_sampling) and the
+    // stage runs inside the round's captured graph, so it must not bake in a value read when the graph was captured
     q.single_task([=] {
         *params = *mapped_params;
-        params->gumbel = gumbel;
     });
     q.parallel_for(sycl::range<1>((size_t) cap), [=](sycl::id<1> i) {
         ring[i] = mapped_hist[i];
@@ -828,10 +915,10 @@ static bool sample_tokens_spec_impl(const float* logits, int n_tokens, int n_voc
             (n_tokens > 1 && dtok == nullptr)) return refuse("the rows, the q rows or the drafts do not fit together");
     }
     SamplerParams p = p_in;
-    p.gumbel = p_in.gumbel || gumbel_env();   // the last row's plain draw, as sample_tokens
+    p.gumbel = p_in.gumbel || gumbel_active();   // the last row's plain draw, as sample_tokens
     if (n_tokens <= 0 || n_vocab <= 0 || p.greedy || p.temperature <= 0.0f) return refuse("greedy or a temperature of 0");
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) return refuse("a penalty window without history");
-    static const bool old_sampler = [] { const char* v = std::getenv("STRATA_OLD_SAMPLER"); return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0; }();   // =0: not the old one (upstream's tests set it so)
+    static const bool old_sampler = [] { const char* v = strata::env_get("OLD_SAMPLER"); return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0; }();   // =0: not the old one (upstream's tests set it so)
     int k = (p.top_k > 0 && p.top_k < KMAX) ? p.top_k : KMAX;
     if (k > n_vocab) k = n_vocab;
     const int nb = (n_vocab + SPLIT_BL - 1) / SPLIT_BL;

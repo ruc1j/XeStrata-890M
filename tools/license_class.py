@@ -7,12 +7,16 @@ A file is upstream's when upstream Strata's integrated tag (v + STRATA_UPSTREAM_
 has it at the same path, has a file of the same content elsewhere (a rename), or the file names Strata's copyright and
 upstream had it at that path before the tag (the content it last had there); not when it has none of upstream's
 lines (apart from blank and short ones): XeStrata wrote it anew.  Apart from the SPDX header lines XeStrata adds, the
-same content as upstream's is unchanged, any other is mixed:
+same content as upstream's is unchanged, any other is mixed.  XeStrata keeps the layout upstream left in 0.2.16
+(`src/` became `engine/src/`, `serve/` `terminal/serve/` ...): at a tag with `engine/CMakeLists.txt` a path is looked
+up where the MOVES of the tag's tools/layout/move_0216.py put it.
+
 
   unchanged  upstream's copyright holders only, upstream's license (MIT, or the SPDX identifier upstream's file has)
   mixed      those holders and XeStrata's, LGPL-3.0-or-later AND MIT
-  own        a file that is not upstream's: XeStrata's copyright, LGPL-3.0-or-later; AND MIT when it also names
-             another permissive project's copyright (code transcribed from ggml, for example)
+  own        a file that is not upstream's: XeStrata's copyright, LGPL-3.0-or-later; AND that project's license when
+             it also names another permissive project's copyright (code transcribed from ggml: MIT; from vLLM-Omni:
+             Apache-2.0)
 
 A file without a header of its own is checked against the last REUSE.toml annotation that covers it.  --fix rewrites
 the headers that differ (only the holder and identifier lines); REUSE.toml and a file without a header are reported
@@ -34,7 +38,18 @@ STRATA = "2026 Niko1221 and the Strata contributors"
 # copyright holders whose code is under a permissive license XeStrata's files may carry (AGENTS.md, Licenses);
 # all of them MIT (Expat)
 PERMISSIVE = ("Niko1221 and the Strata contributors", "The ggml authors", "Debian's rocm-llvm packaging",
-              "Peasant Smith and the Project Maya contributors")
+              "Peasant Smith and the Project Maya contributors", "hiruhiru2005", "Sahand Ahmadian", "Jonseed",
+              "ZhengPeng",
+              "Ostris, LLC", "Gwangbin Bae", "SenseTime X-Lab")
+# the same for the projects under another permissive license: a copyright holder's words -> its license
+PERMISSIVE_OTHER = {"contributors to the vLLM-Omni project": "Apache-2.0", "The HuggingFace Inc. team": "Apache-2.0",
+                    "SageAttention team": "Apache-2.0", "(comfy-kitchen)": "Apache-2.0",
+                    "the comfyui_controlnet_aux contributors": "Apache-2.0",
+                    "the ComfyUI-SeedVR2_VideoUpscaler contributors": "Apache-2.0",
+                    "the YASAKANI authors": "Apache-2.0",
+                    "Edge0": "Apache-2.0", "OpenMMLab": "Apache-2.0", "SenseTime X-Lab": "Apache-2.0",
+                    "Secret Labs AB": "MIT-CMU", "Fredrik Lundh and contributors": "MIT-CMU",
+                    "Jeffrey A. Clark and contributors": "MIT-CMU"}
 OWN = "LGPL-3.0-or-later"
 MIXED = "LGPL-3.0-or-later AND MIT"
 # the files the classes do not cover: other projects' folders, license texts, the notices
@@ -83,9 +98,20 @@ def holders_and_id(data: bytes) -> tuple[list[str], str | None]:
     return hs, ident
 
 
+def load_moves(spec: str) -> list[tuple[str, str]]:
+    """The (old, new) pairs of upstream's layout move: the block of the move script from `LANGS = ` to `REMOVE = `,
+    run with no builtins (it only builds lists)."""
+    src = git("show", spec).decode()
+    ns: dict = {"__builtins__": {}}
+    exec(src[src.index("\nLANGS = "):src.index("\nREMOVE = ")], ns)
+    return ns["MOVES"]
+
+
 class Upstream:
     def __init__(self, tag: str):
         self.tag = tag
+        new = subprocess.run(["git", "cat-file", "-e", f"{tag}:engine/CMakeLists.txt"], capture_output=True)
+        self.moves = load_moves(f"{tag}:tools/layout/move_0216.py") if new.returncode == 0 else []
         tree = git("ls-tree", "-r", "-z", tag).split(b"\0")
         self.blob = {}
         for e in tree:
@@ -110,21 +136,29 @@ class Upstream:
             pos = nl + 1 + size + 1
         return res
 
+    def moved(self, path: str) -> str:
+        """XeStrata's path as the tag has it: through the longest matching prefix of the layout move."""
+        best = max((m for m in self.moves if path == m[0] or path.startswith(m[0] + "/")), key=lambda m: len(m[0]),
+                   default=None)
+        return best[1] + path[len(best[0]):] if best else path
+
     def base(self, path: str, data: bytes) -> bytes | None:
         """upstream's content of the file, or None when the file is not upstream's."""
-        if path in self.blob:
-            return self.data[self.blob[path]]
+        at = self.moved(path)
+        if at in self.blob:
+            return self.data[self.blob[at]]
         p = self.by_hash.get(hashlib.sha256(strip(data)).hexdigest())
         if p:
             return self.data[self.blob[p]]
         if STRATA not in holders_and_id(data)[0]:
             return None
         # deleted upstream before the tag: the content of the last commit that had it
-        last = git("log", "-1", "--format=%H", self.tag, "--", path).decode().strip()
+        last = git("log", "-1", "--format=%H", self.tag, "--", *{at, path}).decode().strip()
         for rev in (last, last + "^") if last else ():
-            r = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True)
-            if r.returncode == 0:
-                return r.stdout
+            for q in dict.fromkeys((at, path)):
+                r = subprocess.run(["git", "show", f"{rev}:{q}"], capture_output=True)
+                if r.returncode == 0:
+                    return r.stdout
         return b""  # Strata's copyright, no upstream file to compare: mixed
 
 
@@ -144,12 +178,16 @@ def expected(path: str, data: bytes, hs: list[str], up: Upstream) -> tuple[str, 
         base = None  # written anew at upstream's path (AGENTS.md)
     if base is None:
         perm = [h for h in hs if h != XE and any(k in h for k in PERMISSIVE)]
-        return ("own", hs if XE in hs else hs + [XE], MIXED if perm else OWN)
+        other = sorted({lic for h in hs for k, lic in PERMISSIVE_OTHER.items() if k in h})
+        ident = " AND ".join([OWN] + (["MIT"] if perm else []) + other)
+        return ("own", hs if XE in hs else hs + [XE], ident)
     bhs, bid = holders_and_id(base)
     others = [h for h in hs if h != XE] or bhs or [STRATA]
     if base and strip(data) == strip(base):
         return ("unchanged", others, bid or "MIT")
-    return ("mixed", others + [XE], MIXED)
+    # a mixed file keeps the license of every project it names (YASAKANI's and Edge0's Apache-2.0 beside Strata's MIT)
+    other = sorted({lic for h in hs for k, lic in PERMISSIVE_OTHER.items() if k in h})
+    return ("mixed", others + [XE], " AND ".join([MIXED] + other))
 
 
 def reuse_rules() -> list[tuple[re.Pattern[str], list[str], str]]:

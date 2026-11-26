@@ -185,6 +185,55 @@ Qwen3.8-Flash-Next の decode の 1 窓を段ごとに測り、段ごとに速�
 - エキスパートの prefill を FP16 にほどいて積む形: 890M のモデルの量子化形式には専用のコードブックが要り、780M では差がありませんでした。
 - decode の細かいカーネルの切り替え: 890M の decode は帯域で決まり、見込みが小さいと判断しました。
 
+## 上流の XeStrata の取り込み（2026-11-25 の main まで）
+
+上流の XeStrata（MistVVK/XeStrata）の main を、xe0.2.8-1 の次から 2026-11-25 の aadd4f9fe（xe0.2.20-1 の 25 件先）まで merge しました（2026-11-27）。
+5,327 コミットのうち、Strata の取り込みではない上流自身のものは 1,411 件です。
+上流は Strata を 0.2.20 まで取り込んでいて、この fork は 0.2.22 まで自分で移してあります。同じ変更が両側にある所は fork の形を残し、上流がその上に足した直しを移しました。
+衝突したのは 189 ファイルの 1,111 か所です。
+
+入ったものは次のとおりです。
+
+- 名前: 実行ファイルは `xestrata-engine`、`xestrata-image`、`xestrata-device` になりました（serve の `--engine strata` は引き続き使えます）。環境変数は `XESTRATA_<名前>` で、エンジンは `XESTRATA_<名前>`、`STRATA_<名前>` の順に読みます。ログの接頭辞は `xestrata` です。この fork が足したスイッチは、これまでどおり `STRATA_<名前>` で読めます。`strata-inkling-2-mini` は元の名前のままです。
+- エンジンの構造: verify の窓の MoE を 1 つにまとめた `MoeWindow`、prompt の注意の形を選ぶ `flash_attn`、Qwen3.8 と密なモデルが共有する読み方（QSA、GDN、PLE、BF16 の積、埋め込み）、環境変数の読み取り `strata::env_get`、行列の命令の形の報告（`has_form`）。
+- decode: 返答の途中のチェックポイント（`--reply-checkpoint-every`、既定は 512 トークンごと）、GPU を失ったことの検出（verify と MTP の待ちが event を読み、20 秒で打ち切ります）、16 行までの窓（`--wide-window`。MTP の窓は 8 行のままです）、起動時に MTP、DFlash2、下書きなしを測って選ぶ `--draft auto`（DFlash2 の pack が要ります）、統合 GPU が全エキスパートを持つときにモデルのファイルのページキャッシュを返すこと（`XESTRATA_UMA_DROP_PAGES=0` で残します）。
+- prefill とカーネル: 密な積を形ごとに自前のカーネルとライブラリーで比べて選ぶこと、RDNA の WMMA のタイルの形、エキスパートの int8 の積の本体（K の塊のループをなくしてレジスターの退避を減らしたもの）、エキスパートの積の FP16 の形（`XESTRATA_IQ_MMQ_F16`）、MoE のモデルの密な射影の W8A8（`XESTRATA_LLM_W8A8=1`、opt-in）、上流の GDN の塊の走査（opt-in）、aotriton 0.15b の注意と comfy-kitchen の int8 の積のモジュール（AMD の GPU でだけ開きます）。
+- ほかのモデル: Inkling-2-Mini をエンジンの中で動かす経路（`src/inkling2`。この fork の `strata-inkling-2-mini` と並んで入ります）、画像の Qwen-Image-2.1、MOSS-Image の編集、Anima、ControlNet の前処理、LoRA の学習、RealESRGAN と SeedVR2 の拡大、SAM 3、BiRefNet、Florence-2、動画（ffmpeg を呼びます）。
+- serve と web ページ: 起動のたびに決める `auto` の設定（`serve/autotune.py`）、画像のモデルと同じ GPU で文のエンジンを降ろすときの共有の arena、答えにほかの言語の文字を出さない `script_guard`、会話の保存、モニターの GPU の役割のタブ。web ページは上流のものになり、チャットの一覧、編集、数式が既定で入ります。
+- setup: `--drafting auto|mtp|dflash2|off`、AMD の ROCm の確認（ライブラリーの名前で見ます）、画像と翻訳のモデルの質問、設定の一覧（`data/settings-register.json`、`tools/settings_register.py` が作ります）。
+- intel/llvm: `tools/intel_llvm_build.py` は v7.2.1 を指し、パッチは 31 本です。HIP の仮想メモリー、hostcall を要らなくする AMDGPU の修正、モジュールの読み込みでのメモリー不足の報告が加わりました。この fork の `hip-reqd-work-group-size` は 33 番に移しました。エンジンは実行時に GPU へ仮想メモリーの対応を尋ねるので、v7.2.0 で作った intel/llvm のままでもビルドでき、これまでどおり動きます。
+
+fork の形を残したものは次のとおりです。HIP の統合 GPU であることは、デバイスの報告から決めます。
+
+- 推測デコード: 費用の規則（`SPEC_COST`）は HIP の統合 GPU ですべての深さで入ります。上流の `auto`（6K から）は入れていません。DFlash2 は opt-in のままで、HIP の統合 GPU では fork の注意（`XESTRATA_DF2_ATTN=4`）、融合した Q4_0 の積、`--draft-conf 0.6` を使います。setup は統合 GPU では `--drafting mtp` を既定にします。
+- verify の窓: 統合 GPU での横の分岐、top-10 を plan の起動に入れる形、GDN の段階分けと後回しの commit、`STRATA_VERIFY_ECAP`、`STRATA_EXPERT_KEEP` と `STRATA_EXPERT_SER`。これらは `MoeWindow` の上に載せました。
+- decode のカーネル: 注意の per-cell の形と GEMV の行の配置の計測は、HIP の統合 GPU では行いません（`STRATA_QSA_PERCELL=1`、`STRATA_MMVQ_TUNE` で試せます）。`STRATA_QSA_CU_SLOTS` は opt-in のままです。`GPU_MAX_HW_QUEUES=2` は統合 GPU には設定しません。Gumbel の標本化の腕は、統合 GPU では `XESTRATA_SPEC_GUMBEL=auto` のときだけ使います。
+- prefill: `DEQUANT_SIDE`（上流は消しました）、prompt の注意の `PA_FAST`（fork の `qsa_prompt_attn.cpp`）、GDN の WMMA の再帰（`GDN_CHUNKED`。上流の同じ名前の走査は `=1` のときだけで、WMMA の経路が動かない所に限ります）、`STRATA_GDN_TC`（opt-in）、`PF_DM16`、`HC_UPMIX`、KVA の identity だけの形、起動時に rocBLAS と自前のカーネルを比べる試し、塊 2048 と layer-major の off。
+- CPU: WAITPKG のない CPU では pool の待ちはこれまでどおり spin で、MWAITX は `POOL_UMWAIT=1` のときです。IQ の gather は CPUID で決めます。
+- serve と setup: エンジンの nice は 0 のまま（`XESTRATA_ENGINE_NICE=auto` で上流の +5）、`--vram-elastic` は統合 GPU では opt-in のまま、道具呼び出しの解析器は Strata 0.2.22 の形、統合 GPU の設定（`uma_host_cache`、`kfd_integrated`、`--mmap-experts`、`STRATA_CACHE_HOST=1`）と最初の提案（IQ3_XXS か Q2_0）、Unsloth の一覧。
+- README とこの fork の文書、`container/`（Fedora 44 と Fedora の ROCm。`XESTRATA_ROCM=10.1` で AMD の ROCm）、CI。
+
+既定が変わったものは次のとおりです。
+
+- CPU の pool は、down の仕事が自分のエキスパートの gate と up だけを待つ形になりました（`XESTRATA_POOL_DEP=0` で 2 段の形）。答えのビットは同じです。
+- AVX-512 のある CPU では、IQ4_XS の gate と up を 512 ビットの行で読みます（`XESTRATA_IQ512_IQ4XS=0` で切れます）。
+- setup が入れる画像の読み手は、エンジンの `xestrata-vision` になりました。この fork の mtmd の読み手（`tools/vision`）はソースからビルドできます。
+
+890M に合わせて直したものは次のとおりです。
+
+- エキスパートと密な射影の int8 の積（`iq_mmq.cpp`）: 上流は、行の少ない積で K を 2 つに分けて別々の work-group に渡す経路を足しました。その判定と書き出しが RDNA の本体に入ったことで、累算器がレジスターに載らずスタックに置かれ、密な射影の 128 行のタイルが 890M で 2 倍近く遅くなっていました（`iq_mmq_parity --dense`、IQ3_S の 10240 x 2560、2,048 行で 14.8 ms が 27.3 ms。prefill は 3,426 トークンで 340 tok/s が 275 tok/s）。K を分ける経路は 64 行までの積にしか使われないので、それより大きいタイルの本体からは外し、小さいタイルでは累算器のループを展開するよう指定し、書き出しの行き先を 1 回だけ調べる形にしました。gfx1150 では本体の写しを 1 つにしています（上流の 2 つの写しでは、IQ3_XXS の 64 行以上の積が 12% 遅くなりました）。直したあとは、密な積が 12.9 ms 対 13.2 ms（IQ4_XS、2,048 行）、エキスパートの積は merge 前と 1% 以内です。
+- MTP の下書きの待ち: 上流は、GPU を失ったことを知るために起動のたびに event を記録します。HIP の統合 GPU では、待ちが 200 ms を超えたときにだけ記録します。1 段は数 ms で終わるので、そこまで待った時点で止まっていると見てよく、失われたキューは遅れた記録も断ります。
+- 上流の DFlash2 の注意のカーネル（256 work-item の形）の不具合: 文脈の鍵が塊の数より少ないとき、鍵のない塊が番兵を一部しか書かず、和に残りの値が混ざっていました（`dflash2_attention_parity` の短い文脈の 3 例が inf）。番兵をサブグループごとに全部書くようにしました。
+
+確かめたこと: free と contrib-llvm のビルド、CTest（どちらのモードも 259 件が通ります）、serve の Python の試験（1,904 本、28 本は skip）、tools の試験（736 本、29 本は skip）、`reuse lint` と `tools/license_class.py`、Python、Markdown、CSS の lint で merge が新しく足した指摘がないこと。
+
+890M での merge 前（5e04b832c）との比較は次のとおりです（IQ2_XS、`--spec 4`、どれも merge 前、merge 後の順）。
+
+- decode: 6 チャットの greedy の答えは 4 周とも同じでした。速さは 3 周の平均で 42.72 対 42.65 tok/s です。
+- prefill: 3,426 トークンで 340.5 対 340.4 tok/s、14,210 トークンで 335.0 対 335.3 tok/s です。
+- 長い prompt のあとの答え: 14,210 トークンの prompt では、要約の文面が 27 文字目から変わりました。どちらの文面も毎回同じに出ます。最初の 3 層は 1 ビットも違わず、最初の注意の層で 511 行のうち数行に 1e-4 程度の差が出て、後ろの層で経路の選択が変わります。
+- 普段の設定に近い形（IQ3_XXS、`--spec 6`、文脈 262,144）: 6 チャットの答えは 3 周とも同じで、decode は 3 周の平均で 33.74 対 33.95 tok/s です。3,426 トークンの prefill は、どちらも 274〜309 tok/s の間で回ごとに動きました。
+
 ## 上流の XeStrata の取り込み（xe0.2.8-1 まで）
 
 上流の XeStrata（MistVVK/XeStrata）の main を、xe0.2.2-1 の次から 2026-10-30 の 721afe51f（xe0.2.8-1）まで merge しました（2026-11-02）。
@@ -604,6 +653,45 @@ upstream の 0.2 は app と Terminal と Control の層を加えた版で、エ
 確かめたのは、free のビルドと、変えた C++ の試験（spec_start、draft_policy、suffix_drafter、pool_plan、pool_cores、conversation_memory、batch_telemetry）、serve と tools の Python の試験、画像の読み取り（strata-vision）の CPU のビルドです。
 contrib-llvm のビルド、Windows のクロスビルド、ほかの GPU は unverified です。
 
+## Strata 0.2.20 の取り込み
+
+upstream の Strata v0.2.8 から v0.2.20（`a34979fc94f3d126b9bb8210f4ad311345688b52`）までの変更を取り込みました。
+
+- DFlash2 の下書きと MTP を起動時に測って選びます。会話のキャッシュと長い文脈の処理、setup と serve も更新しました。
+- XeStrata は Edge0 の latent MoE と NVFP4・MXFP4、VRAM の小さいカードで重みを流す道、画像 LoRA の層ごとの重みを足しました。D/U の量子化形式は利用できる枠から選びます。
+- serve: ツール呼び出しの閉じタグ・コードの囲み・名前空間と Anthropic のツール検索を扱います。要求の停止やエラー後の処理、画像の読み手が使えない場合の CPU への切り替えも直しました。
+- setup と道具: ダウンロードの範囲の検査を再試行し、固定したファイルをハッシュで確かめます。パックの保存先の空き容量を調べ、GGUF の整数テンソルも読みます。
+- エンジン: 会話のキャッシュの退避で空いた RAM を返し、エキスパートの共有領域と PLE の固定を直しました。バッチのサンプリング、下書きの窓と長い文脈にも対応を足しました。
+- XeStrata の共通部品にはトレリス符号の K/V、固定小数点の積、層ごとの VRAM 予算と流す道を加えました。DeltaNet の塊の走査は `XESTRATA_GDN_CHUNKED=1` で選べます。
+- upstream のアプリ・ターミナル・Mac・Metal は、XeStrata の対象でないため移していません。upstream の CUDA と HIP の専用カーネルは、共通の SYCL の部品を使うためそのまま移していません。
+
+Edge0-120B-NVFP4 の prefill / decode（tok/s）です。小さい構成は VRAM の上限を設定しています。「前」は一時領域の修正前の測定です。RX の 8192 MiB 相当は枠を前後で揃えた serve の測定、ほかは CLI です。
+条件が合うときは、CLI では下書きの頭を decode の直前に用意し、それまでの領域を prompt の一時領域に使います。serve では prefill の間だけ頭の物理領域を外して戻し、prompt の塊を大きくします。
+
+| GPU | 構成 | 1K: D/U・prefill / decode | 32K: D/U・prefill / decode |
+| --- | --- | --- | --- |
+| B70 | 常駐 | Q8_0・944.66 / 54.97 | Q8_0・1525.93 / 56.85（前） |
+| B70 | 9700 MiB | Q4_0・593.93 / 31.94 | Q4_0・641.76 / 27.51 |
+| B70 | 7700 MiB | Q4_0・618.95 / 15.36（前） | Q4_0・608.19 / 15.92（前） |
+| RTX 4070 | 常駐 | Q4_0・239.26 / 46.36 | Q4_0・1181.88 / 46.93（前） |
+| RTX 4070 | 8192 MiB | Q4_0・215.98 / 35.21 | Q4_0・219.31 / 20.86 |
+| RTX 4070 | 6144 MiB | Q4_0・200.77 / 6.48（前） | Q4_0・119.46 / 6.88（前） |
+| RX 9060 XT | 常駐 | Q8_0・520.39 / 38.39（前） | Q8_0・914.24 / 42.56（前） |
+| RX 9060 XT | 8192 MiB 相当 | Q4_0・432.5 / 29.1 | Q4_0・436.6 / 26.7 |
+| RX 9060 XT | 6144 MiB 相当 | Q4_0・186.00 / 18.74（前） | Q4_0・182.43 / 19.38（前） |
+
+常駐の Q8_0 と小さい構成の Q4_0 は D/U の形式が違うので、答えも違います。
+
+B70 の整数積の尺度を最近接に丸める修正で、答えの md5 が次のように変わりました。KL は答えが分かれるまでの行の平均 / 最大です。
+
+| モデル・文脈 | 前 → 後（md5 先頭） | KL 平均 / 最大 | 比較した行 |
+| --- | --- | --- | --- |
+| Ornith-1.5 1K | bb6bcf6a → 0d11bf5f | 0.00274 / 0.00813 | 10 |
+| Ornith-1.5 32K | 05bae7b1 → 2d2230e0 | 0.0362 / 0.0708 | 3 |
+| Qwen3.6-35B-A3B 1K | d10297b3 → 098361d3 | 0.0645 / 0.0645 | 1 |
+| Qwen3.6-35B-A3B 32K | da7576c6 → 57c0f759 | 0.00827 / 0.0729 | 25 |
+| llm-jp-4.1-32b-a3b-thinking 1K | ab799775 → 42eb1b00 | 0.00473 / 0.00965 | 7 |
+
 ## Strata 0.2.8 の取り込み
 
 upstream の Strata 0.2.7 から 0.2.8（`870aedd9`）までの変更を Xe に移しています。
@@ -611,11 +699,10 @@ upstream の Strata 0.2.7 から 0.2.8（`870aedd9`）までの変更を Xe に�
 
 移したものは次のとおりです。
 
-- route prior（`STRATA_ROUTE_PRIOR`）を既定で入れない。0.2.7 ではキャッシュに載る枠が 20% 未満の GPU 1 枚で自分で 1.5 にしていましたが、upstream が長いエージェントの作業で同じ文を繰り返し結果も落ちるとして既定を戻したので、XeStrata も opt-in に戻しました（`STRATA_ROUTE_PRIOR=1.5` で入る）。キャッシュの小さい GPU では decode が前の版より遅くなります。context 262144 の通常使用では RTX 4070 で 2〜3 割、RX 9060 XT（キャッシュは 16%）で 1〜2 割です。
+- route prior（`XESTRATA_ROUTE_PRIOR`）を既定で入れない。0.2.7 ではキャッシュに載る枠が 20% 未満の GPU 1 枚で自分で 1.5 にしていましたが、upstream が長いエージェントの作業で同じ文を繰り返し結果も落ちるとして既定を戻したので、XeStrata も opt-in に戻しました（`XESTRATA_ROUTE_PRIOR=1.5` で入る）。キャッシュの小さい GPU では decode が前の版より遅くなります。context 262144 の通常使用では RTX 4070 で 2〜3 割、RX 9060 XT（キャッシュは 16%）で 1〜2 割です。キャッシュの小さい GPU では、route prior より文章を崩しにくい `XESTRATA_ROUTE_TAIL_SKIP=4`（opt-in、[詳しい説明](DETAILS.ja.md)）で、通常使用の出力が順位 7 より 13〜42% 速くなります。
 - serve のツール呼び出し: 壊れた引数、余分な思考の閉じタグ、`</function>` の抜けで呼び出しを失わない。呼び出しを丸ごと引く値や同じ引数名が続く値を、値の一部として読む。この直し（`tool_call_recovery`）を既定で入れ、`"tool_call_recovery": false` で切る。
 - 会話のキャッシュ: バッチの空いた枠の退避で、本体の写しと共有の根のチェックポイントを消さない。
-- エンジン: エキスパートの領域に要る RAM を最大 20 秒待ってから読み込む。PLE の表を RAM に固定する方針（`STRATA_PLE_AUTO_RAM=1`）で、その固定が会話のキャッシュの余地を奪うときは固定を返す。AVX-512 のない CPU で止まるときは、原因が CPU でなく `native_experts.txt` のないパックだと言う。
-- 層の分割: Xe2 の GPU ちょうど 2 枚では `--pipeline-windows 2` を既定にする（upstream と同じ。`--pipeline-windows 0` で切れる、[MULTIGPU](MULTIGPU.ja.md)）。
+- エンジン: エキスパートの領域に要る RAM を最大 20 秒待ってから読み込む。PLE の表を RAM に固定する方針（`XESTRATA_PLE_AUTO_RAM=1`）で、その固定が会話のキャッシュの余地を奪うときは固定を返す。AVX-512 のない CPU で止まるときは、原因が CPU でなく `native_experts.txt` のないパックだと言う。
 - setup: 使わない APU に大きな BIOS の割り当てがあるときは、OS が失う RAM と直し方を言う。
 
 upstream v0.2.8 と 3 社の GPU で比べました（IQ3_XXS の generate の 1K と 32K、serve の 32K、通常使用）。
@@ -639,14 +726,15 @@ upstream の Strata 0.2.6 から 0.2.7（`5e8a4cca`）までの変更を Xe に�
 移したものは次のとおりです。
 
 - 会話のキャッシュ: 残しておいた K/V を、それを読んだ会話にしか使わない。空いたバッチの枠が decode した会話を、受け入れで上書きする前に退避する。チェックポイントの写しがメモリ不足のときは、そのチェックポイントを飛ばして要求を続ける。
-- `--serve` で GPU とのリンクが 12 GB/s に満たないときは、会話のキャッシュの写しを裏のスレッドと VRAM の段に移す（`STRATA_CKPT_ASYNC`・`STRATA_CKPT_GATHER`・`STRATA_PARK_ASYNC`。upstream では opt-in）。RTX 4070（6.4 GB/s）では続きの要求の待ちが 226 → 201 ms になり、B70（28 GB/s）では遅くなるので入れません。
-- route prior: `STRATA_ROUTE_PRIOR=1.5` で入る（opt-in、答えが変わる）。upstream は 0.2.7 で 13 GiB 以下の NVIDIA のカードの既定にし、XeStrata もキャッシュに載る枠が 20% 未満の GPU 1 枚で自分で入れていましたが、長いエージェントの作業で同じ文を繰り返し、結果も落ちるため、0.2.8 で upstream とともに既定から外しました。serve の decode は RTX 4070（15%）で 6〜77%、VRAM を 12 GiB に絞った B70（11%）で 15〜80% 速く、RX 9060 XT（25%）では 2〜18% 遅くなります。
+- `--serve` で GPU とのリンクが 12 GB/s に満たないときは、会話のキャッシュの写しを裏のスレッドと VRAM の段に移す（`XESTRATA_CKPT_ASYNC`・`XESTRATA_CKPT_GATHER`・`XESTRATA_PARK_ASYNC`。upstream では opt-in）。RTX 4070（6.4 GB/s）では続きの要求の待ちが 226 → 201 ms になり、B70（28 GB/s）では遅くなるので入れません。
+- route prior: `XESTRATA_ROUTE_PRIOR=1.5` で入る（opt-in、答えが変わる）。upstream は 0.2.7 で 13 GiB 以下の NVIDIA のカードの既定にし、XeStrata もキャッシュに載る枠が 20% 未満の GPU 1 枚で自分で入れていましたが、長いエージェントの作業で同じ文を繰り返し、結果も落ちるため、0.2.8 で upstream とともに既定から外しました。serve の decode は RTX 4070（15%）で 6〜77%、VRAM を 12 GiB に絞った B70（11%）で 15〜80% 速く、RX 9060 XT（25%）では 2〜18% 遅くなります。
 - serve: OpenAI の `logprobs`・`top_logprobs`・`allowed_token_ids`、`/v1/responses` の timings と `max_output_tokens` の 0・−1、IPv6 で待ち受ける、ツールの結果を呼び出しの順に並べる、宣言のない名前の呼び出しを名指しする、Codex の名前空間の綴り、構造化出力の LaTeX の回復（opt-in）、画像のエンコーダーが起きないときの 503、MCP のツールの回数の上限で最後に 1 回答える、MCP のツールの画像（opt-in）、split serving（prefill と decode を別の GPU で、opt-in）。
 - Web ページ: 会話の履歴の作り直し（保存・編集と巻き戻し・枝分かれ・答えている間の送信）、9 言語の訳（既定はブラウザーの言語）、KaTeX の数式（opt-in、`third_party/main/katex/`）、svg・html のプレビュー、読み込み・解放のボタン、広い画面、待ち行列の Timeout の印。
 - setup と道具: `--rope-scale` の検査、ダウンロードの長さが取れないときの公開の大きさ、ワーカー数と画像のエンコーダーのスレッドの上限、calibrate で途中で死んだ候補だけを外す、`gguf_reader.py` の読みの上限、Maxwell 以前の NVIDIA の GPU に使えない理由を言う。
-- エンジンの修正: PLE の読みの失敗の後に止まらない、prefill の領域が取れないときに部分ごとに確保しに行かない、`--adapt-decay` の範囲、`STRATA_TRACE` の時刻、decode の時間の行の内訳。
-- opt-in のまま移したもの（XeStrata の 3 社の GPU で速くならなかったもの）: PLE の表を RAM に置く判定（`STRATA_PLE_AUTO_RAM=1`。B70 では 32K が完走しなくなった）、swiglu と q8 の量子化の融合（`STRATA_SWIGLU_QUANT=1`）、layer-major の prefill（`STRATA_PREFILL_LAYER_MAJOR=1`）、DeltaNet の再帰を行列ユニットで（`STRATA_GDN_TC=1`、答えが変わる）、KVA（`STRATA_KVA=1`、答えが変わる、[KVA](KVA.ja.md)）、`STRATA_EMBED_VRAM`・`STRATA_PLE_COMPACT`・`STRATA_PLE_COPY_STREAM`・`STRATA_DEQUANT_SIDE`、流れ作業のバッチの組の `STRATA_PIPED_MTP`・`STRATA_PIPE_ADAPT_EVERY`、`STRATA_RAM_ADAPT` の改良、GP100 の `STRATA_DOWN_WS`。
-- 2 枚の NVIDIA の `--batch` は、流れ作業の組に戻しました（直列の組は `STRATA_BATCH_GROUPS_NV_SERIAL=1`）。
+- エンジンの修正: PLE の読みの失敗の後に止まらない、prefill の領域が取れないときに部分ごとに確保しに行かない、`--adapt-decay` の範囲、`XESTRATA_TRACE` の時刻、decode の時間の行の内訳。
+- opt-in のまま移したもの（XeStrata の 3 社の GPU で速くならなかったもの）: PLE の表を RAM に置く判定（`XESTRATA_PLE_AUTO_RAM=1`。B70 では 32K が完走しなくなった）、layer-major の prefill（`XESTRATA_PREFILL_LAYER_MAJOR=1`）、KVA（`XESTRATA_KVA=1`、答えが変わる、[KVA](KVA.ja.md)）、流れ作業のバッチの組の `XESTRATA_PIPED_MTP`・`XESTRATA_PIPE_ADAPT_EVERY`、`XESTRATA_RAM_ADAPT` の改良、GP100 の `XESTRATA_DOWN_WS`。
+- 起動時の短い測りで選ぶもの（`0`・`1` で固定できる）: PLE の行の上げ方（`XESTRATA_PLE_COMPACT`・`XESTRATA_PLE_COPY_STREAM`。最初の起動で 512 トークンの塊を 2 通りの上げ方で測り、3% 以上速い方を選びます）。
+- 2 枚の NVIDIA の `--batch` は、流れ作業の組に戻しました（直列の組は `XESTRATA_BATCH_GROUPS_NV_SERIAL=1`）。
 
 upstream v0.2.7 と 3 社の GPU で比べました（B70 は全部の型の generate と IQ3_XXS の serve・通常使用、RTX 4070 も同じ、RX 9060 XT は IQ3_XXS と Gyro-M）。
 IQ3_XXS の generate では、B70 は upstream の `sycl/` 版より prefill が 1.8〜3.0 倍、decode が 36〜64% 速いです。ほかの型の 32K では prefill が 1.6〜1.9 倍、decode が 25% から 3.2 倍まで速いです（UD-Q4_K_XL の prefill は、ファイルがページキャッシュに載っていない起動直後の回で測れていません）。
@@ -655,9 +743,9 @@ serve の prompt は B70 で 1.8〜2.9 倍、RTX 4070 で 1.17〜1.73 倍、RX 9
 
 移していないのは、DeepSeek V4.1-Flash への対応、アプリとターミナル、Docker、Mac、upstream の `sycl/`、
 gfx12 の decode の取りこぼしの分け方の既定（`--pcie-frac 0.15`。RX 9060 XT で prompt が 4〜30% 遅く、XeStrata はリンクを測って分けます）、
-推測の確からしさの門（`STRATA_SPEC_PROB`。前提の確率的な受理を 0.1.40 で取らなかったため）、
+推測の確からしさの門（`XESTRATA_SPEC_PROB`。前提の確率的な受理を 0.1.40 で取らなかったため）、
 CUDA の機種別の表と融合カーネル（sm_80・sm_89 の MMVQ-IL の表、hyper-connection の広い読み、prompt の融合した IQ のエキスパート）、
-GP100 の weight-stationary の MMQ と 4 ビットのエキスパートの形式（試験的で大きい）、hipBLASLt と `STRATA_SH_STREAM` の項目です。
+GP100 の weight-stationary の MMQ と 4 ビットのエキスパートの形式（試験的で大きい）、hipBLASLt と `XESTRATA_SH_STREAM` の項目です。
 
 ## Strata 0.2.6 の取り込み
 
@@ -669,14 +757,14 @@ upstream の Strata 0.2.2 から 0.2.6（`4b9e05a2`）までの変更を Xe に�
 - serve: `--conversation-cache-mib` を省くと、会話のキャッシュの大きさを RAM の空きから決める（Qwen3.8-Flash-Next と PlainModel の両方）。メッセージのないチャットの要求は 400 にする。1 トークンの返答には decode の速さを出さない。ツール呼び出しの別名と包みの境目を upstream に合わせ、閉じていない囲みのツール呼び出しも読む。ツールが返した画像では、止めてある画像のエンコーダーを起こす。画像のトークン数の上限に既定を持たせ、超えたものを断る。
 - Web ページ: 書き換えた API キーを、ブラウザーの保存が断られてもすぐ使う。狭い画面で長い語・広い表・モデルの設定の行を画面の内に収める。
 - setup: `--kv fp16` を受ける。入れたパッケージの記録に、書いた OS を残す。ビルドの道具は virtualenv のものを先に使い、古い cmake は無いものとする。2 分データが来ないダウンロードは、割合と次の一手を添えてそう言う。
-- 推測デコード: `--spec-window auto` に、費用を見る窓の改良（文脈の長さごとの費用の表、外れた回を薄めて数える、1〜2 個先まで見て下書きを続けるか決める）を `STRATA_SPEC_COST=1` で opt-in に。PlainModel の推測デコードも同じ部品を使います。既定にしないのは、B70 と RTX 4070 の 1K の decode で 1.4〜4.7% 遅いためです（32K では 1.3〜3.2% 速い）。
+- 推測デコード: `--spec-window auto` に、費用を見る窓の改良（文脈の長さごとの費用の表、外れた回を薄めて数える、1〜2 個先まで見て下書きを続けるか決める）を `XESTRATA_SPEC_COST` で選べるように。PlainModel の推測デコードも同じ部品を使います。1K では今の規則より狭い窓を選んで B70 で 2.7% 遅く、4K 以上では B70 と RTX 4070 のどちらでも今の規則と同じ窓を選びました（Qwen3.8 と Qwen3.6、2026-11-13。0.2.6 では 32K で 1.3〜3.2% 速かった）。既定（auto）は 6K 未満の文脈では切ります（`=1` で常に、`=0` で常に切る）。
 
 この取り込みの間に XeStrata の側で変えたもの:
 
 - Qwen3.8-Flash-Next と PlainModel（GLM・Ornith・llm-jp・Qwen3.6）で同じ働きの部分を、両方が呼ぶ部品にまとめました: オプションの解析、DONE 行、エキスパートの層の入れ替えの規則とプロファイルからの埋め方、`--adapt-every` を省いたときの間隔の自動の判定、PCIe の分担の測り方、`--prefill auto` の塊の選び方、prompt で CPU に回すエキスパートの候補、MTP の語彙の部分集合のドラフトヘッド。llm-jp-4.1 は入れ替えの間隔を自動で縮めません（縮めると遅くなるため）。PlainModel が VRAM の枠から選ぶ prompt の塊は、4096 より大きくするときだけ使います。
-- PlainModel にも、`--vram-elastic`、`--low-ram on|mmap`、`--kv int8`（GLM を除く）、`--prefill-cpu-share`、`STRATA_RAM_ADAPT`、`--adapt-min-gain`、`STRATA_FETCH_THREADS`、`--spec-window` を通しました。GLM-5.3-Flash は DSA の潜在を RAM に置き、空いた VRAM をエキスパートに回します（`--kv-ram`、既定 on）。
+- PlainModel にも、`--vram-elastic`、`--low-ram on|mmap`、`--kv int8`（GLM を除く）、`--prefill-cpu-share`、`XESTRATA_RAM_ADAPT`、`--adapt-min-gain`、`XESTRATA_FETCH_THREADS`、`--spec-window` を通しました。GLM-5.3-Flash は DSA の潜在を RAM に置き、空いた VRAM をエキスパートに回します（`--kv-ram`、既定 on）。
 - MTP の下書きのヘッドを、その GPU で速ければ 2 ビットの粗い積と上位 16 個の選び直しにします（Qwen3.8-Flash-Next と PlainModel の両方）。
-- SSD から読むエキスパートを順位で飛ばす `STRATA_DISK_SKIP_FROM`（opt-in、Project Maya の #109 から）。
+- SSD から読むエキスパートを順位で飛ばす `XESTRATA_DISK_SKIP_FROM`（opt-in、Project Maya の #109 から）。
 - 画像の層を流すときの写しを、スロットごとのリレーと複数スレッドの memcpy にしました。
 - MTP の 2 ビットの下書きのヘッドで、文脈が 49152 トークン以上のときは、粗い値は候補の 16 個を選ぶだけにし、下書きの確率は選び直した 16 個から取ります（残りの約 10 万語の粗い値の誤差が確率を下げ、長い文脈で下書きが早く止まっていました: RTX 4070 の 64K の serve の最初のターンが 56.5 → 71.7 tok/s）。短い文脈では今までどおりです（残りを確率 0 にすると確率が高く出すぎ、RX 9060 XT の 32K で 5% 遅くなりました）。
 - serve: 会話のキャッシュを RAM の空きから決める既定では、チャットの次のターンのたびに今の会話を RAM に退避していました（クライアントが前の返事の考えを履歴から外して送るので、切り替えとして扱われていた）。同じ会話の次のターンでは退避せず、別の会話に切り替えるときだけ退避します（Qwen3.8-Flash-Next と PlainModel の両方。B70 で 1 ターンあたり 80〜140 ms、RX 9060 XT で 120〜370 ms の待ちがなくなりました）。
@@ -701,7 +789,7 @@ upstream の Strata 0.2.1.1 から 0.2.2（`011c9e60`）までの変更を Xe �
 移したものは次のとおりです。
 
 - CPU のプール: ワーカーの置き場所を起動時に言い、`--pool-cores`（実験的）で置き場所を指定できる。エンジンのスレッドに名前を付ける。serve は設定の `pool_cores` をエンジンに渡す。
-- 推測デコード: 開始の規則を `spec_loop_runs` にまとめ、`STRATA_SPEC_WATCH` で止まりを見張る。
+- 推測デコード: 開始の規則を `spec_loop_runs` にまとめ、`XESTRATA_SPEC_WATCH` で止まりを見張る。
 - serve: prefill の短い残りの窓で logits が非有限になったら、次の要求は prompt 全体をまとめて読む。エンジンを起動できないときは、接続を切らずに理由つきの 503 を返す。`"api_key": "none"` と `--no-api-key` でキーなしを選べる。
 - serve: Anthropic の usage で、次の要求のために残したトークンを `cache_creation_input_tokens` として返す。llama.cpp の `thinking_budget_tokens` も思考の上限として読む。1 トークンずれた囲みのツールの呼び出しを読み、宣言していないツールの呼び出しは文として返す。done の行の速さはエンジンの decode の時間から取る。
 - setup: SHA-256 が合わないダウンロードは消さずに違う部分だけ取り直し、大きなファイルの確かめにも進み具合を出す。`--gguf-dir` の利用者のファイルは消さない。空き容量は入り切らないときだけ止める。ごみ箱の中のフォルダーを前のインストールとして覚えない。
@@ -732,14 +820,14 @@ upstream の Strata 0.2.0-beta から 0.2.1.1（`9ae93f7b`）までの変更を 
 - ダウンロード: 既定 16 本の接続、1 つの要求で隣の 4 片、長さを返さない HEAD には 0-0 を聞く。MTP の取得は切れやすい回線でも続き、setup が止まれば止まる。
 - setup: 新しい `--data-dir` はモデルのファイルを勝手に動かさず、前の置き場所も見つけ続ける（`--move-data`、`--set-default-data-dir`）。
 - serve: エンジンが signal 9 で終わった理由に、有限の RLIMIT_RTTIME（rtkit のない PipeWire）を挙げる。
-- Windows: `strata.exe`・`strata-image.exe`・`strata-device.exe` に UTF-8 のマニフェストを付け、ANSI でない文字のパスを通す。
+- Windows: `xestrata-engine.exe`・`xestrata-image.exe`・`xestrata-device.exe` に UTF-8 のマニフェストを付け、ANSI でない文字のパスを通す。
 - `--batch`: 2 枚の NVIDIA の GPU の層の分割では、既定のグループを 1 つの直列にする（upstream の計測で +12〜18%）。
 
 RX 9060 XT で upstream v0.2.1.1 と比べました（IQ3_XXS の generate）。prefill が 2.1〜2.7 倍、decode が 3〜7% 速いです。
 upstream のエンジンの変更は、ほかの GPU の計測の経路（1 枚の GPU、エキスパートを RAM に置く）に効かないので、B70 と RTX 4070 は 0.2.0-beta の比べを使っています。
 
 移していないのは、アプリとターミナル、Docker の配布、Mac、upstream の `sycl/`、HIP の内蔵 GPU と hipBLASLt の表と GPU のキューの開き方（RX 9060 XT の XeStrata の prompt は起動ごとに 1.5% の幅に収まっていて、upstream の直した 2 つの速さに分かれる現象は出ていません）、
-experts.bin の pack の I/O の先読みとファイルの段（その土台が XeStrata にありません）、Intel の GPU の画像の読み手（XeStrata は Vulkan の読み手を持ちます）です。
+experts.bin の pack の I/O の先読みとファイルの段（その土台が XeStrata にありません）、Intel の GPU の画像の読み手（XeStrata は自前の視覚エンコーダーで読みます）です。
 
 ## Strata 0.2.0-beta の取り込み
 
@@ -752,12 +840,13 @@ upstream の Strata 0.1.45 から 0.2.0-beta（`3d1fb480`）までの変更を X
 - setup: ダウンロードするモデルのファイルを大きさと SHA-256 で固定する。大きなファイルは複数の接続でダウンロードする。ビルドの道具（cmake・ninja）は実行時の requirements から分ける。SSD でも RAM に余裕があれば `--ple-io ram` を付ける。画像を読めるモデルでは画像を既定で入にする。
 - serve: 文脈に収まらない `max_tokens` は、400 にせず残りの余地まで縮める（`--no-fit-max-tokens` で以前のように断る）。
 - CPU のプールの既定のワーカーを、32 本とコンテナの CPU の割り当てまでにする。cgroup の RAM の判定では、きれいなページキャッシュを回収できるものに数える。
-- 適応の段で入れ替えたエキスパートは、既定で 2 つ目の窓から使う（`STRATA_ADAPT_LAG=2`、RTX 4070 で decode +8.6%）。
-- 画像の読み手（strata-vision）は、文章のモデルの語彙とヘッダーだけを読む（Gyro の型のファイルでも開ける）。
+- 適応の段で入れ替えたエキスパートは、既定で 2 つ目の窓から使う（`XESTRATA_ADAPT_LAG`、RTX 4070 で decode +8.6%）。
+  `auto`（既定）は、入れ替えのコピーを待つ窓がある最初の数窓で「次の窓が待つ」と「既定の窓数」を交互に回し、トークン当たりの時間が 3% 以上短い方を選ぶ（`0` は次の窓が待つ、`2` 以上はその窓数）。
+- 画像の読み手（xestrata-vision）は、文章のモデルの語彙とヘッダーだけを読む（Gyro の型のファイルでも開ける）。
 
 この取り込みの間に XeStrata の側で直したもの:
 
-- VRAM のエキスパートの入れ替えの位置で窓を切るのは、CPU と GPU で丸めが違う層があるモデルだけにする（`STRATA_ADAPT_CUT=0|1`）。Qwen3.8 の 4 つのファイルはすべての層が CPU と GPU で同じビットになるので、窓を切らない。同じ文で decode は RTX 4070 で 59.3 → 61.3、B70 で 80.5 → 86.9 tok/s。
+- VRAM のエキスパートの入れ替えの位置で窓を切るのは、CPU と GPU で丸めが違う層があるモデルだけにする（`XESTRATA_ADAPT_CUT`。`auto` が既定で形式の規則、`0` と `1` で固定）。Qwen3.8 の 4 つのファイルはすべての層が CPU と GPU で同じビットになるので、窓を切らない。同じ文で decode は RTX 4070 で 59.3 → 61.3、B70 で 80.5 → 86.9 tok/s。
 
 upstream v0.2.0-beta と 3 社の GPU で比べました（generate は 5 つのモデルファイル、serve、通常使用、画像の生成）。
 IQ3_XXS の generate では、B70 は upstream の `sycl/` 版より prefill が 1.7〜3.0 倍、decode が 18〜38% 速いです。
@@ -782,8 +871,9 @@ upstream の Strata 0.1.44.1 から 0.1.45（`477ac13c`）までの変更を Xe 
 - 会話のキャッシュ: 新しい会話が別の会話の途中のチェックポイントで始まるときは借りる（#1164）、少ししか伸びていない会話は置き直さない（`--conversation-cache-park-gain`）、チェックポイントを会話の終わりから間を空けて残す（`--prompt-cache-spread`）。
 - RAM 常駐の形: 予算に余りがあれば、prompt の経路が借りる枠のエキスパートも RAM に置く（#1683）。
 - `--layer-split auto`: 2 枚で小さな段ができたら置き場所の広さの割合で選び直す（#2644）。
-- serve: 思考の上限（`max_tokens` と Anthropic の `budget_tokens`）、sampling のない要求にモデルカードの値、プロンプトを最後に共有した前置きからトークン化する（#1852）、次のターンを会話のチェックポイントを持つスロットへ送る（#2518）、短い prompt を先に受け入れる（`STRATA_ADMIT_SHORT_FIRST`、opt-in）、パーサーの修正。
-- opt-in のまま移したもの: `STRATA_EXCHANGE_ROTATE`、`STRATA_RAM_ADAPT`、`STRATA_SPLIT_UNIFORM`。
+- serve: 思考の上限（`max_tokens` と Anthropic の `budget_tokens`）、sampling のない要求にモデルカードの値、プロンプトを最後に共有した前置きからトークン化する（#1852）、次のターンを会話のチェックポイントを持つスロットへ送る（#2518）、短い prompt を先に受け入れる（`XESTRATA_ADMIT_SHORT_FIRST`、opt-in）、パーサーの修正。
+- opt-in のまま移したもの: `XESTRATA_RAM_ADAPT`。
+- `XESTRATA_EXCHANGE_ROTATE` は、層ごとにエキスパートの大きさが違う pack で、予備のぶんの RAM（IQ3_XXS・`--adapt-swaps 80` で 1.20 GiB）の余裕があるときに自動で入ります（`0`・`1` で固定）。
 
 この取り込みの間に XeStrata の側で直したものは次のとおりです。
 
@@ -799,7 +889,7 @@ B70 は upstream の `sycl/` 版より prefill が 1.6〜2.5 倍、decode が 15
 取り込みの前の XeStrata と同じ文で比べると、decode は B70 と RTX 4070 で同じ速さ、prefill は B70 の 1K が 35% 速くなりました。
 
 移していないのは、upstream の `sycl/`、バッチの改善（8 を超えるスロットの層の分割、スロットの GPU 間のコピー、受け入れの opt-in、行をまとめた起動）、Turing（sm_75）の速さの経路、
-`--prefill-pipe`（B70 + RTX 4070 では小さなチャンクで prefill が 38.6% 遅い）、`STRATA_SPLIT_OVERLAP`（XeStrata の段の受け渡しは GPU どうしで同じメモリの語を見られない）、
+`--prefill-pipe`（B70 + RTX 4070 では小さなチャンクで prefill が 38.6% 遅い）、`XESTRATA_SPLIT_OVERLAP`（XeStrata の段の受け渡しは GPU どうしで同じメモリの語を見られない）、
 計測のない CUDA の opt-in の経路、upstream の試験の道具と記録です。
 
 ## Strata 0.1.44.1 の取り込み
@@ -812,16 +902,17 @@ upstream の Strata 0.1.43.1 から 0.1.44.1（`296b59d2`）までの変更を X
 - Qwen3.6-35B-A3B（Unsloth の MTP の層付きの UD-Q4_K_XL・UD-Q6_K_XL・Q8_0）を、Ornith-1.5 と同じ plain の経路で読む。
   upstream は Qwen3.6 に CUDA 専用のエンジンを作りましたが、XeStrata では F32 の GDN の alpha・beta と MTP の層の BF16 の router を読めるようにしました。
   llama.cpp と答えを比べ、3 社の GPU で動かしています。prompt の直後に、その prompt が多く使ったエキスパートで VRAM の層を一度に埋める（upstream の q36 の考え方）ので、decode が 20〜40% 速くなりました（Ornith と llm-jp にも効きます）。
-- 画像の生成（Qwen-Image-2.1-Turbo、`POST /v1/images/generations`）。upstream の stable-diffusion.cpp の代わりに、XeStrata 自身の SYCL の画像のエンジン `strata-image` で作ります（DiT・VAE・文の読み手、行列ユニットの注意。サーバーの中で常駐し、VRAM に入らない層は流し込む）。
-- Unsloth のファイル: K-quant のエキスパートの重みをグループの呼び出しで 1 回だけ展開する（KqSplit、同じビットの答え。B70 の UD-Q4_K_XL の decode +7%）。setup は UD-Q5_K_XL・UD-Q6_K_XL・Q8_0 も選べます（experimental）。
-- 確定のグラフで GDN と QSA の層をまとめて 1 回の起動にする（`STRATA_COMMIT_BATCH`、既定でオン）。
+- 画像の生成（Qwen-Image-2.1-Turbo、`POST /v1/images/generations`）。upstream の stable-diffusion.cpp の代わりに、XeStrata 自身の SYCL の画像のエンジン `xestrata-image` で作ります（DiT・VAE・文の読み手、行列ユニットの注意。サーバーの中で常駐し、VRAM に入らない層は流し込む）。
+- Unsloth のファイル: K-quant のエキスパートの重みを、グループの呼び出しで 1 回だけ展開する（KqSplit、同じビットの答え。B70 の UD-Q4_K_XL の decode +7%）。setup は UD-Q5_K_XL・UD-Q6_K_XL・Q8_0 も選べます（experimental）。
+- 確定のグラフで GDN と QSA の層をまとめて 1 回の起動にする（`XESTRATA_COMMIT_BATCH`、既定でオン）。
 - 層の分割の自動の配置（近い同点では窮屈なカードに余裕を残す、遅いリンクの重みは 4 倍の差から）、起動時の VRAM の空きの確認を後ろのカードにも。
 - prompt の塊を 16384 にするのは、RAM が貸し出しを賄えるときだけ。arena の MADV_HUGEPAGE は、空いている 2 MiB のブロックが半分に満たないときは頼まない（#2126）。
 - serve: 長い読みが短い要求に次の塊で譲る（#656）、opencode の `<env>` を最初のユーザーの発言へ移す（`"env_to_user"`、opt-in）、画像があるときだけ画像のエンコーダーを動かす（`"elastic"`、opt-in）、
   GPU のランタイムの立ち上げで止まったエンジンの起動し直し、落ちたエンジンの終わり方の表示、Responses API の `reasoning_effort`、会話のキャッシュの画像の照合（#2228）、stdin の読み手の終了の競合。
 - 量子化の品質の物差し（`tools/quant_quality.py`、`tools/quant_formats.py`）。
-- `STRATA_HC_Q8`（ハイパーコネクションの down/up を Q8_0 で読む、BF16 の pack では読み込み時に Q8_0 にする）: 読み込み時に両方の形を測って速い方を使い、Q8_0 なら GPU 1 枚のときは BF16 の写しを VRAM から外します。AMD では次の射影のための q8_1 も読みの中で書きます（B70 で decode +3.5%。答えが変わる近似）。
-- opt-in のまま移したもの: `STRATA_MTP_PRIO`・`STRATA_COPY_PRIO`、`STRATA_POOL_UMWAIT`、`STRATA_PCIE_MIN1`、arena の `--adapt-async 1`、`STRATA_DENSE_F32`。
+- `XESTRATA_HC_Q8`（ハイパーコネクションの down/up を Q8_0 で読む、BF16 の pack では読み込み時に Q8_0 にする）: 読み込み時に両方の形を測って速い方を使い、Q8_0 なら GPU 1 枚のときは BF16 の写しを VRAM から外します。AMD では次の射影のための q8_1 も読みの中で書きます（B70 で decode +3.5%。答えが変わる近似）。
+- opt-in のまま移したもの: `XESTRATA_COPY_PRIO`（自動は 0。1 で `--pcie-mode dma` のコピーの stream を高優先にする）、`XESTRATA_DENSE_F32`。
+- 起動時の短い測りで選ぶもの（`0`・`1` で固定できる）: CPU プールの待ち方（`XESTRATA_POOL_UMWAIT`。CPU の WAITPKG を確かめ、公開から起きるまでの時間をスピンと UMWAIT で測ります）と、PCIe の分担の下限（`XESTRATA_PCIE_MIN1`。分担を固定したときに 1〜2 個の外れが 0 に丸まらないよう、CPU・PCIe・GPU の 1 個あたりの時間を測って決めます）。
 
 この取り込みの間に XeStrata の側で直したものは次のとおりです。
 
@@ -851,11 +942,11 @@ upstream の Strata 0.1.43 から 0.1.43.1（`a0116b27`）までの変更を、W
 - PLE: 直接読みが遅いと測れても mmap には切り替えず警告だけにする（`STRATA_PLE_AUTO_MMAP=1` で 0.1.42 の切り替え）。
   `--ple-io mmap` の prompt の読みは次の 4096 行を先に読ませる（upstream #2040・#1984・#1971）。
 - 見張り: 10 秒以内に動いたファイルの層は I/O の猶予を保つ。会話の退避は 1 MiB ずつ写して見張りに止められないようにし、
-  停止の報告に MTP の下書きの待ちを名前で出す（upstream #2049・#2065）。`STRATA_TRACE=2` は起動の印ごとにデバイスを待つ。
+  停止の報告に MTP の下書きの待ちを名前で出す（upstream #2049・#2065）。`XESTRATA_TRACE=2` は起動の印ごとにデバイスを待つ。
 - serve: BGEN の枠を断られたら別の枠を試す（#1994）、before_load のフックの失敗に 503 と Retry-After を返し `/unload?wait=1` を受ける（#1997）、
   文中の `</tool_call>` を文として扱う（#2026）、`<tool_call>` の中の Markdown の囲みの呼び出しを読む（#2037）、
   画像の準備中に去ったクライアントの準備を止める（#1999）。
-- 層の分割と `--batch` では既定の組を `--batch-mtp` に譲らない（#2038、`STRATA_BATCH_MTP_SERIAL=1` で前の形）。
+- 層の分割と `--batch` では、既定の組を `--batch-mtp` に譲らない（#2038、`XESTRATA_BATCH_MTP_SERIAL` の `auto`（既定）は流れ作業、`1` で前の形）。
 - setup の `--calibrate` は `--model`・`--family` のモデルを調整する（#2036）。ベンチマークはエンジンが使う GPU だけを報告し（#1985・#2062）、
   ベンチマークが起動するサーバーは `--expert-profile-save` なしで動く（#2088）。
 
@@ -863,8 +954,8 @@ upstream の Strata 0.1.43 から 0.1.43.1（`a0116b27`）までの変更を、W
 
 - prefill: FP16 と int8 のエキスパートの行と組を同じ場所に置き、両方の経路を持つモデルで塊が縮まないようにする。
   RTX 4070 の UD-Q4_K_XL の 32K で 460 → 617 tok/s（upstream は 620）。
-- 小さい VRAM の prefill: hyper-connection の行を注意と MoE の作業領域の中に置き（`STRATA_PREFILL_HC_IN_REGION=0` で元の置き方）、
-  FP16 のエキスパートの入力の行を down の出力の行の上半分に置く（`STRATA_PREFILL_XS_IN_DM=0`）。
+- 小さい VRAM の prefill: hyper-connection の行を注意と MoE の作業領域の中に置き（`XESTRATA_PREFILL_HC_IN_REGION=0` で元の置き方）、
+  FP16 のエキスパートの入力の行を down の出力の行の上半分に置く（`XESTRATA_PREFILL_XS_IN_DM=0`）。
   RTX 4070 を 8 GB に絞った IQ3_XXS の 64K で 291 → 428 tok/s。
 - `--spec` でエキスパートキャッシュが 0 枠のときは、prompt を読む前に止める。
   setup は、KV キャッシュとエキスパートキャッシュが VRAM にも RAM にも入らない文脈の長さを警告し、入る `--context` か `--kv q4_0` を示す。
@@ -874,7 +965,7 @@ RTX 4070 は IQ3_XXS の decode が 1K〜262K で 11〜20% 速く、prefill は�
 RX 9060 XT は prefill が 2.1〜3.1 倍、decode が 5〜12% 速くなりました。
 8 GB のカード（VRAM の残りを 8 GB にして両方を動かす）でも、prefill は RTX 4070 の 64K で 270 対 194 tok/s、RX 9060 XT の 32K で 713 対 306 tok/s です。
 
-移していないのは、Windows の実装、upstream の `sycl/`、`STRATA_ADAPT_OVERLAP` とその callback のスレッドの調整（XeStrata にない機能）、
+移していないのは、Windows の実装、upstream の `sycl/`、`XESTRATA_ADAPT_OVERLAP` とその callback のスレッドの調整（XeStrata にない機能）、
 適応の段のコピーの着地を host の関数でなく stream の順番どおりのコピーで知らせる変更（XeStrata で host の関数でフラグを立てるのは `--pcie-mode dma` のときだけで、既定の経路は使わない）、
 塊を小さくすると貸す枠が増える場合の扱い（#2090。XeStrata のリングは塊について単調）、upstream の試験の道具と記録（`bench/results`）です。
 
@@ -885,16 +976,16 @@ upstream の Strata 0.1.42 から 0.1.43（`7695859a`）までの変更を、Win
 
 移したものの主なものは次のとおりです。
 
-- logits が NaN や無限大になった窓を見張り、その要求を終えて使い回す状態を捨てる仕組み（upstream #879、既定。`STRATA_NAN_GUARD=0` で切る）。
-- prefill: K/V のホストの写しを 1 レーン 4 バイトで書く（`STRATA_KV_WIDE_HOST=0` で以前の形。B70 の 64K で 1,974 → 2,399 tok/s）、
-  エキスパートのコピーを GPU のコピー専用のエンジンで流す（Level Zero、`STRATA_COPY_ENGINE=0`）、
-  1 つのエキスパートの gate/up と down を 1 回の起動で逆量子化する（`STRATA_PF_DQ_FUSED=0`。B70 の UD-Q4_K_XL の 32K で +9%）、
+- logits が NaN や無限大になった窓を見張り、その要求を終えて使い回す状態を捨てる仕組み（upstream #879、既定。`XESTRATA_NAN_GUARD=0` で切る）。
+- prefill: K/V のホストの写しを 1 レーン 4 バイトで書く（`XESTRATA_KV_WIDE_HOST=0` で以前の形。B70 の 64K で 1,974 → 2,399 tok/s）、
+  エキスパートのコピーを GPU のコピー専用のエンジンで流す（Level Zero、`XESTRATA_COPY_ENGINE=0`）、
+  1 つのエキスパートの gate/up と down を 1 回の起動で逆量子化する（`XESTRATA_PF_DQ_FUSED=0`。B70 の UD-Q4_K_XL の 32K で +9%）、
   塊の step 記録とトークン id を page-lock したバッファから送る（upstream #1712）。
-- decode: エキスパートの足し込みを複数行の combine に畳む（`STRATA_FUSE_HITS=0`）、Q3_K の GEMV の展開をブロックごとに 1 回にする、
+- decode: エキスパートの足し込みを複数行の combine に畳む（`XESTRATA_FUSE_HITS=0`）、Q3_K の GEMV の展開をブロックごとに 1 回にする、
   route-resident の入れ替えを 1 トークン 1 sub-group にする（opt-in の機能の中、B70 で +3.9%）。
-- serve の tail skip を、エキスパートの 90% 以上が VRAM にあるときは既定で切る（upstream #1884、`STRATA_TAIL_SKIP_MAX_CACHED`）。
+- serve の tail skip を、エキスパートの 90% 以上が VRAM にあるときは既定で切る（upstream #1884、`XESTRATA_TAIL_SKIP_MAX_CACHED`）。
 - serve の報告（単独の経路とバッチの枠を移った要求の時間とトークン数、`timings.prompt_n`。upstream #1869・#1870）、
-  `STRATA_DROP_CACHE_ON_EXIT`、RAM が足りないときのファイルキャッシュの案内、`STRATA_TRACE` の VRAM の残り。
+  `XESTRATA_DROP_CACHE_ON_EXIT`、RAM が足りないときのファイルキャッシュの案内、`XESTRATA_TRACE` の VRAM の残り。
 - upstream のベンチマークのモード（`strata_bench.py`）を、そのままの測り方で動かす `xestrata --setup --bench-original-compat`（[BENCH](BENCH.ja.md)）。
 
 この取り込みの間に XeStrata の側で直したものは次のとおりです。
@@ -911,7 +1002,7 @@ RTX 4070 の serve の続きの待ちは 222 ms と 253 ms で、upstream の 24
 
 移していないのは、Windows の実装、upstream の `sycl/`、HIP と CUDA の専用のカーネルの調整表と試せる機器のない GPU のための経路（Pascal の行の表、gfx12 の prompt の融合 int8 のエキスパート、gfx12 の decode の HC norm とフラグ待ちの畳み込み、HIP の層分割の既定）、
 upstream が `sycl/` 向けに作った混ぜたエキスパートのプロファイル（generate の 32K の decode が B70 で −2.0%、RTX 4070 で +6.2%、RX 9060 XT で −5.3%）、
-XeStrata で効く所のないもの（`STRATA_ADAPT_OVERLAP`、PcieAuto の割合、GEMM の operand の段取りを省く変更、貸した枠を DMA で埋め直す変更）、upstream の記録（`bench/results`）です。
+XeStrata で効く所のないもの（`XESTRATA_ADAPT_OVERLAP`、PcieAuto の割合、GEMM の operand の段取りを省く変更、貸した枠を DMA で埋め直す変更）、upstream の記録（`bench/results`）です。
 
 ## Strata 0.1.42 の取り込み
 
@@ -924,7 +1015,7 @@ upstream の Strata 0.1.40.2 から 0.1.42（`61b3fb5d`）までの変更（0.1.
 - 検証の窓で VRAM にあるエキスパートに寄せる `STRATA_ROUTE_RESIDENT`（opt-in）と `STRATA_ROUTE_PRIOR`（opt-in）。どちらも答えが変わる。
 - prefill の CPU 分担の拡張（ページ固定でない RAM のエキスパートも渡す）と、全エキスパートが VRAM にあるときやメモリが足りないときに既定で使わない規則。
 - `--aux-cpus`（opt-in）、PLE の `--ple-io direct` が遅いときの mmap への切り替え、stager の RAM 向けの読み方、埋め込みのバッファの使い回し。
-- メモリの見張り（cgroup の上限と `--memory-limit-mib`）、会話キャッシュの `--conversation-cache-min-tokens`、`--session-save-reclaim`、`logit_bias`、`strata --version`。
+- メモリの見張り（cgroup の上限と `--memory-limit-mib`）、会話キャッシュの `--conversation-cache-min-tokens`、`--session-save-reclaim`、`logit_bias`、`xestrata-engine --version`。
 - serve の変更（Prometheus の形のメトリクス、Monitor の会話キャッシュのカード、AMD の GPU の読み取り、サンプリングの欄の扱い、道具の一覧の順など）と、setup の変更（設定の書き方、`--gguf-dir`、回転ディスク、画面を出すカードの VRAM の予約、ハイブリッド CPU のワーカー数など）。
 
 upstream v0.1.42 と 3 社の GPU で比べました（generate は 5 つのモデルファイル、serve、通常使用）。
@@ -933,12 +1024,12 @@ RX 9060 XT の decode は同じ条件でも回ごとに 3 割ほど変わり（u
 
 最終の比較の途中で見つけて、XeStrata の側で直したものは次のとおりです。
 
-- RAM に置いたエキスパートの写しのページ固定が 1 回の確保で断られたら（B70 の Level Zero は 30 GiB まで）、エキスパートの境目で分けて確保する（`STRATA_PIN_PARTS=0` で前の形）。B70 の UD-Q4_K_XL の 32K で prefill +17%、decode +14%。
+- RAM に置いたエキスパートの写しのページ固定が 1 回の確保で断られたら（B70 の Level Zero は 30 GiB まで）、エキスパートの境目で分けて確保する（`XESTRATA_PIN_PARTS=0` で前の形）。B70 の UD-Q4_K_XL の 32K で prefill +17%、decode +14%。
 - 外れたエキスパートの CPU と PCIe への分け方の測定をそろえる（[外れたエキスパートの CPU と PCIe への分け方](#外れたエキスパートの-cpu-と-pcie-への分け方)）。
 - serve の短い読み込みで、窓とまとめ読みの実測を読み始めの位置と一緒に覚え、近い位置の実測だけで選ぶ。試しのまとめ読みは 16K までの位置でだけ行う。RTX 4070 の 64K で、4 ターン目の続きが 505 ms から 304 ms に。
 
-速くするための経路は B70・RTX 4070・RX 9060 XT のどれかで速くなり、ほかで遅くならないものを移しました。
-CPU 分担の auto の判定（upstream f2a3b946）は B70 と RTX 4070 の 1K で遅くなったので opt-in（`STRATA_PREFILL_CPU_GATE=1`）に、Q8_0 の逆量子化の 4 分け（upstream e910e410）はどちらでも速くならなかったので外しました。
+速くするための経路は、B70・RTX 4070・RX 9060 XT のどれかで速くなり、ほかで遅くならないものを移しました。
+CPU 分担の auto の判定（upstream f2a3b946）は B70 と RTX 4070 の 1K で遅く（−1.3%・−4.4%）、plain の Ornith 32K でも差が無かった（−0.1%）ので消しました。Q8_0 の逆量子化の 4 分け（upstream e910e410）はどちらでも速くならなかったので外しました。
 移していないのは、Windows の実装、upstream の `sycl/`（同じ B70 で速さを比べる相手）、HIP と CUDA の専用のカーネルの調整表、試せる機器のない GPU のための経路の一部（RDNA2 特有のもの）、複数 GPU の変更（別の作業でまとめて移します）です。
 
 ## Strata 0.1.40 の取り込み
@@ -956,10 +1047,10 @@ NVIDIA の GPU では contrib-llvm のビルドで同じカーネルが動きま
   upstream の測定では、BF16 の表と比べた行ごとの平均誤差は Q8_0 0.53%、FP8 2.64%、Q5_1 3.78%、Q5_0 4.25%、IQ4_NL 7.60%、Q4_0 8.55% です。
 - ネイティブのエキスパートの Q4_0、Q4_1、Q5_0、Q6_K の gate/up の GPU カーネル。CPU のエキスパートの AVX-2 の i-quant と Q2_0 のカーネル。
 - 検証の窓と prefill の経路で起動の数を減らすカーネルの融合（#783 ほか）。
-- `STRATA_PREFILL_CPU_SHARE=auto`（既定）: 短いチャンクで、ほとんど選ばれないエキスパートを空いている CPU のプールで計算します。
+- `XESTRATA_PREFILL_CPU_SHARE`（既定は `auto` でプロンプトごとに測ります。0 ですべて GPU）: 短いチャンクで、ほとんど選ばれないエキスパートを空いている CPU のプールで計算します。
 - `--kv-grow`: K/V は要求が届いたセルの分だけ VRAM を取り、残りをエキスパートのキャッシュが使います。
   デバイスの仮想メモリの対応づけの粒度が 2 MiB 以上なら既定で有効です（RTX 4070 は有効、B70 は 64 KiB で無効）。
-- `--adapt-async`（常駐モードの既定）、`--batch-mtp`（`--batch` と `--mtp` のときの既定）、`--pipeline-windows`（Xe2 の GPU 2 枚の分割では既定、ほかは opt-in、[MULTIGPU](MULTIGPU.ja.md)）、`--lookup-chain`（opt-in。HIP の統合 GPU では 2026-11-16 から 2 が既定、[890M の decode の見直し](#890m-の-decode-の見直し)）。
+- `--adapt-async`（常駐モードの既定）、`--batch-mtp`（`--batch` と `--mtp` のときの既定）、`--pipeline-windows`（opt-in、[MULTIGPU](MULTIGPU.ja.md)）、`--lookup-chain`（opt-in。HIP の統合 GPU では 2026-11-16 から 2 が既定、[890M の decode の見直し](#890m-の-decode-の見直し)）。
 - setup の追加（`--inspect`、`--source modelscope`、200K の文脈など）とサーバーの変更。
 
 速くするための経路は B70 か RTX 4070 で速くなり、もう一方で遅くならないものを移しました。
@@ -997,14 +1088,13 @@ CUDA、HIP、Windows の実装は移していません。複数の GPU の実装
 
 | 経路 | B70 での結果 |
 | --- | --- |
-| prefill の量子化したエキスパートの積（`STRATA_PREFILL_MMQ`） | 既定の XMX の FP16 の経路の 0.34 倍 |
-| 融合 MoE（`STRATA_PF_FUSED`） | 既定の経路の 0.25 倍 |
-| GDN の key-head の共有（`STRATA_GDN_KEYHEAD`） | 既定の経路の 0.54 倍 |
-| hyper-connection の分割読み出し（`STRATA_GR_V3`） | decode が約 18% 遅い |
+| prefill の量子化したエキスパートの積（`XESTRATA_PREFILL_MMQ`） | 既定の XMX の FP16 の経路の 0.34 倍 |
+| 融合 MoE（`XESTRATA_PF_FUSED`） | 既定の経路の 0.25 倍 |
+| GDN の key-head の共有（`XESTRATA_GDN_KEYHEAD`） | 既定の経路の 0.54 倍 |
+| hyper-connection の分割読み出し（`XESTRATA_GR_V3`） | decode が約 18% 遅い |
 | CPU のプールの P コアと E コアの配置（`--pool-affinity`） | decode が 1〜4% 遅い |
-| K-quant の AVX2 の多トークンの積（`STRATA_KQ256`） | 差はばらつきの範囲 |
 | AVX2 の IQ カーネルのソフトウェアのプリフェッチ | 差はばらつきの範囲 |
-| ファイルの層のルーティングによる先読み（`STRATA_LOOKAHEAD`） | decode が約 2% 遅い |
+| ファイルの層のルーティングによる先読み（`XESTRATA_LOOKAHEAD`） | decode が約 2% 遅い |
 
 量子化した積と融合 MoE は XMX を使わずに decode と同じ DP4a の内積で計算します。
 そのため、XMX のある GPU では既定の経路に勝てません。
@@ -1030,7 +1120,7 @@ nonfree のビルドの 4 トークンの窓は Intel のランタイムの中�
   メーカー名やデバイス ID では選ばず、報告される能力で選びます。
   32 幅のサブグループ、FP16、デバイスとホストの USM が必要です。
   実行ファイルがその GPU 向けのコードを持たないとき（`STRATA_CUDA_ARCHS` なしのビルドと NVIDIA の GPU など）も断ります。
-  `STRATA_GPU_PCI`（setup が書きます）は GPU を PCI アドレスで指定します。
+  `XESTRATA_GPU_PCI`（setup が書きます）は GPU を PCI アドレスで指定します。
   これがなければ、単体の GPU を CPU 内蔵のグラフィックス（Level Zero の integrated フラグ。他のバックエンドの GPU は単体とみなします）より先に選び、
   その中ではメモリの多いもの、同じならば計算ユニットの多いものを選びます（計算ユニットの大きさはメーカーで違うためです）。
   CPU への代替の経路はありません。
@@ -1049,23 +1139,25 @@ nonfree のビルドの 4 トークンの窓は Intel のランタイムの中�
   ローダーが中身を詰める前に `prepare_for_device_copy` でデバイスへのコピー用に登録し、マッピングや登録に失敗したら例外を投げます。
   ホストの USM は使いません。
   Level Zero は `max_mem_alloc_size`（B70 で 32.5 GB）を超える 1 つの USM の確保を断り、Coder 以外のどのモデルのアリーナもそれより大きいためです。
-  登録はデバイスの最大の確保量を超えない、層の始まりで切れる断片に分けます。
-  UHD 770（4 GiB）はそれより大きい登録をエラーなしで受け付け、間違ったバイトをコピーしました。
-  `registered_bytes` は容量全体、`locked_bytes` は明示的に `mlock` したバイト数（0）です。
-  `mlock` も hugetlbfs のプールも使わず、透過的なヒュージページで支えます。
-  B70 での測定では、memlock の上限が 8 MiB のまま、47.46 GiB のアリーナを登録でき、`VmLck` は 0 でした。
-- デバイスの能力に合わせる: カーネルはデバイスの報告に従います。
+  登録は、デバイスの最大の確保量を超えない、層の始まりで切れる断片に分けます。
+  UHD 770（4 GiB）は、それより大きい登録をエラーなしで受け付け、間違ったバイトをコピーしました。
+  `registered_bytes` は容量全体です。hugetlbfs のプールは使わず、透過的なヒュージページで支えます。
+  登録に memlock の上限は要りません（B70 で、上限 8 MiB のまま 47.46 GiB のアリーナを登録できました）。
+  Level Zero の登録（xe や i915 の userptr）はページを固定せずに追いかけるので、メモリの compaction がページを 1 つ動かすと、ドライバーは次のコピーで登録全体を GPU に写し直します（#42）。
+  そのため詰め終えたアリーナは、`vm.compact_unevictable_allowed` が 0 なら `mlock` し（`locked_bytes`）、そうでなければ io_uring の固定バッファで固定します。
+  共有のアリーナ（memfd）は固定しても動かされるので、`mlock` と `vm.compact_unevictable_allowed=0` でだけ守れます。どちらも memlock の上限がアリーナの分要ります。
+- **デバイスの能力に合わせる**: カーネルはデバイスの報告に従います。
   1024 個のワークアイテムのワークグループは、それを受け付けるデバイスでだけ使います（UHD 770 は 512 まで）。
   FP64 はそれを持つデバイスでだけ使い、持たないデバイス（UHD 770 と Arc の A シリーズ）では FP32 で足し合わせます。
 - 検証の窓での待ち合わせ: 検証の窓（verify window）の GPU は、ホストのメモリのフラグを回し読みして CPU のエキスパートを待ちます。
   これには、動いているカーネルからホストの書き込みが見える必要があります。
   検証器は起動時にそれを確かめ（`doorbell_visible`）、見えない GPU（UHD 770）では待つカーネルを使わず、ホストが区切りを順に起動します。
   結果は同じで、遅くなります。
-  `STRATA_VERIFY_SEGMENTED=1` と `0` で、どちらかに固定できます。
+  `XESTRATA_VERIFY_SEGMENTED=1` と `0` で、どちらかに固定できます。
   検証器の層のエキスパートがすべて VRAM にある窓は、エキスパートの割り当てを GPU が自分で決める別のグラフで動かし、ホストを待ちません（upstream cfd3b72。区切りも要りません）。
   B70 の Coder IQ1_M では 28.0 から 28.5 tok/s になり、logits は同じでした。
-  `STRATA_VERIFY_RESIDENT_GRAPH=0` で使わないようにできます。
-- 寿命: コピー元、コピー先、読み手は、最後の使い手が終わるまで生かしておきます。
+  `XESTRATA_VERIFY_RESIDENT_GRAPH=0` で使わないようにできます。
+- **寿命**: コピー元、コピー先、読み手は、最後の使い手が終わるまで生かしておきます。
   コピーの完了イベントだけでは、カーネルがまだコピー先を読んでいる間の再利用は許されません。
   アリーナを壊すときは、USM を解放したり登録を解いたりする前に、持っているキューをすべて空にします。
   USM のポインターは確保したコンテキストで使い、その依存はアプリケーションが管理します
@@ -1084,7 +1176,7 @@ parity のテストは埋め込みとスケールの小さな記録と再生の�
 
 ### 要素ごとの計算
 
-Xe のライブラリは `embedding_gather`、`gdn_gate`、`scale_inplace`、`f32_to_f16_bulk`、`silu_inplace`、`rms_norm_weighted` を提供します。
+Xe のライブラリは、埋め込みの行の取り出し `embed_rows`（`iq_kernels.hpp`）、`scale_inplace`、`f32_to_f16_bulk` を提供します。
 `elementwise.hpp` のほかの宣言は移植しておらず、ライブラリにはありません。
 これらのカーネルと parity の参照は高速な数学関数と積和の融合（contraction）を切ってコンパイルします。
 
@@ -1161,7 +1253,6 @@ decode のカーネルの確認では `rope_parity`、`router_top10_parity`、`b
 | Swift 1.5 IQ2_XS | 動く | 7（0.151） | 推測なし = suffix。MTP は異なる |
 | Swift 1.5 IQ3_XXS | 動く | 62（0.058、3 候補） | 異なる（キャッシュの大きさも実行ごとに違った） |
 | Swift 1.5 Q2_0 | 動く（注） | 25（0.273） | 推測なし = suffix。MTP は異なる |
-| OrcaRouter IQ3_XXS（互換の手順） | **動かしていない**: リポジトリが gated で、ダウンロードに Hugging Face のログインが要る | — | — |
 
 注: Swift 1.5 Q2_0 は、層 13 のエキスパートのテンソルが 2 つのシャードにまたがります。
 pack の索引はテンソルごとにシャードを記録します。
@@ -1181,11 +1272,11 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
   SwiGLU と int8 のスケールは足し算・掛け算・fma だけで作り、gate と up の活性は 256 個に 1 つのスケールで量子化し、スケールを共有する部分の整数の和を先に足してから、GPU のレーンと同じ順に fma で足します。
   窓の中身、PCIe の分担、入れ替えでエキスパートが CPU と GPU を行き来しても、答えは変わりません。
   K-quant や BF16 のエキスパート（Unsloth のファイル、Ornith、llm-jp）は対象外です。
-  `STRATA_CANON=0` で CPU を以前のカーネルに戻します（比べるため。GPU は戻らないので、CPU と GPU の結果は一致しなくなります）。
+  `XESTRATA_CANON=0` で CPU を以前のカーネルに戻します（比べるため。GPU は戻らないので、CPU と GPU の結果は一致しなくなります）。
 - Qwen IQ3_XXS では、キャッシュが同じでも、suffix の実行と推測なしの実行が分かれていました。
   CPU の複数トークン用のエキスパートのカーネル（i-quant の gate と up、IQ4_NL の down）を 2 トークンから使い、1 トークンでは ggml の内積を使っていたため、トークンの行が 1 つのときと窓の中のときで足す順が違ったためです。
   2026-10-16 からは、CPU はこれらと Q4_K・Q5_K・Q6_K を 1 トークンから複数トークン用のカーネルで計算し、Q2_K・Q3_K・Q8_0 はどのトークン数でも ggml の内積で計算します。トークンの行は 1 つのときも窓の中でも同じになり、キャッシュが同じなら推測の方式によらずロジットがビット単位で同じになります（複数トークンの窓の GPU 側は、もともと差を生んでいません）。
-  `STRATA_IQ_MT_MIN=N` で、以前のように N トークンから複数トークン用のカーネルを使います（比べるため）。
+  `XESTRATA_IQ_MT_MIN=N` で、以前のように N トークンから複数トークン用のカーネルを使います（比べるため）。
 - AVX-512 の CPU では i-quant の格子の引きを 1 つの gather 命令で行えます（upstream 0.2.5 の移植）。読む語は同じなので、結果はスカラーの引きとビット単位で同じです。
   既定でオンになるのは、CPUID が AVX-VNNI と hybrid を報告する CPU の P コアだけで（`cpu_gather_fast`。ベンダー名やモデル番号では決めません）、Zen 4・Zen 5 では gather がマイクロコードで遅いので既定でオフです。`STRATA_IQ_GATHER=1` / `0` でどちらにも固定できます。
   gather がオンの AVX-512 の CPU では、IQ3_XXS と IQ3_S のエキスパートの 1 トークンの gate と up を、ggml の 1 トークンの内積とビット単位で同じ exact rows（`iq512x_rows`）で計算します。最初に使うときに ggml と照合し、合わなければ使いません。`STRATA_NO_IQ512X1=1` でオフにできます。
@@ -1199,6 +1290,28 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
 代わりに setup のウォームアップが、起動したときに空いていた VRAM から 32 MiB 引いた値を実行の設定に書きます（`--vram-free-mib`）。エンジンは起動時にそれより多く空いていても数えないので、空きが少し多い起動でも同じキャッシュになります（B70 で起動ごとに 20 MiB ほど揺れ、スロットが 15 個動いていました）。空きがそれより少ない起動では、キャッシュは小さくなります。
 同じ出力が要るとき（機械や設定をまたいだ比較も）は、`--expert-cache N` で固定します。
 
+密な行列積の道も起動ごとに変わります。
+プロンプトと検証の窓の密な行列積は、形（種類・行数の級・N・K）ごとに XeStrata のカーネルと oneMath の時間を起動時に測り、XeStrata のカーネルが 5% 以上速いときだけそちらを使います。
+ライブラリの速さは実行ごとに 2 倍ほど動くことがあり（RX 9060 XT の 4096 x 320 x 10240 の BF16: rocBLAS 13.1〜25.5 TFLOPS、XeStrata のカーネル 16.8〜21.3）、選びが XeStrata とライブラリの間で動くと最後の数ビットが変わります（同じ実行物・同じ設定で 64K の greedy が 18 トークン目で分かれた）。
+ライブラリの速い/遅いの 2 つの状態はビットを変えません（`XESTRATA_BLAS=1` の 2 回は最初の 48 窓まで同じハッシュ）。
+
+検証の窓の大きさも起動ごとに変わります。
+`--spec-window auto` は大きさごとに測ったラウンドの時間（実時間）から窓の大きさを選び、`--suffix-draft` は繰り返しの位置で窓を `--spec` より広げます。
+窓の大きさが違うと同じ位置の行でも計算の形が変わり、最後の数ビットが変わります（XeStrata のカーネルだけでも、3 トークンの窓と 4 トークンの窓で同じ位置の argmax が違った）。
+
+同じ答えが要る実行（機械や設定をまたいだ比較、md5 の見張り）は、次の 3 つで固定します（RX 9060 XT、64K）。
+
+- `XESTRATA_NO_BLAS=1`: 密な行列積をすべて XeStrata のカーネルで計算する（ライブラリを測らない）。
+- `--spec-window min-p --spec-min-p 0`: 窓をいつも `--spec` の大きさにする（測った時間を読まない）。
+- `--suffix-draft 0`: サフィックスの下書きで窓を広げない。
+
+この 3 つで 64K の A/A は 5 回とも同じ答えになりました（2026-11-14）。
+prefill は 890〜906 トークン/秒・decode は 34.2〜34.9 トークン/秒（既定は 962〜977・37.5〜40.7）で、prefill が 6〜7%、decode が 8〜10% 遅いので、既定は速さのため測って選ぶ道のままです。
+
+短いプロンプト（CPU がエキスパートを分担する塊）では、CPU が受け持つ割合を塊ごとに測るので、その揺れでも答えが変わります（CPU と GPU でエキスパートの行の丸めが違うため）。
+`XESTRATA_EXACT=1` は、エキスパートの行を CPU でも GPU でも同じ固定小数点の整数の和で計算し、割合が動いても答えを変えません（Strix Halo の Qwen3.8 IQ3_XXS、1K の greedy が 5 回とも同じ。既定では 5 回で 4 通り）。
+1K の prefill が 7%、decode が 3% ほど遅くなるので、既定ではありません。
+
 ### 出力ヘッドの VRAM の確保が断られる
 
 起動時に、出力ヘッドを GPU に上げる確保が断られることがあります。
@@ -1208,11 +1321,11 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
 
 ### 小さい GPU での VRAM の予約
 
-小さい GPU では（upstream #496）、既定の 700 MiB の予約のせいで、prefill の経路に 256 トークンの塊を貸すだけのスロットがキャッシュに残らないことがあります。
-そのときエンジンはそれだけ残るところまで予約を下げます。
+既定の予約は機器のメモリの 32 分の 1 で、700 MiB から 768 MiB の間です（plain のエンジンと同じ式、core::vram_room。16 GiB のカードでは下限の 700 MiB、24 GiB 以上では 768 MiB）。小さい GPU では（upstream #496）、その 700 MiB のせいで、prefill の経路に 256 トークンの塊を貸すだけのスロットがキャッシュに残らないことがあります。
+そのときエンジンは、それだけ残るところまで予約を下げます。
 下限は 300 MiB で、`--vram-reserve-mib` で指定した予約より下げることはありません。
 それでも足りなければ起動を止め、何 MiB 足りないか、何を減らせば空くかを示します。
-`STRATA_VRAM_LIMIT_MIB` で確かめました。
+`XESTRATA_VRAM_LIMIT_MIB` で確かめました。
 4,608 MiB（IQ2_XS、32K、MTP）では予約が 482 MiB になり、必要な 368 スロットが残りました。
 4,096 MiB では 330 MiB 足りずに止まりました。
 
@@ -1234,11 +1347,11 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
   CPU だけの場合より 10% 以上早く終わる見積もりのときだけ PCIe に回します。
 - decode の実測で詰め直す: 起動時の CPU の時間は 1 トークンずつ測るので、decode の窓のプールの呼び出しはそれより遅くなることがあります（RX 9060 XT で 1.27〜1.29 倍、ホストが忙しいときは 3.5 倍）。
   decode の呼び出しの実時間を、分け方が見込んだ時間と比べ、15% を超えてずれていれば CPU の時間をその比で直します（CPU に計算のあった呼び出しの 512 回、さらに 1,024 回、2,048 回の後、3 回まで。upstream の PcieAuto が割合を詰めるのと同じ考え方）。
-  RX 9060 XT の IQ3_XXS で decode が 1K 50.3 → 52.2、64K 48.5 → 51.3、262K 42.5 → 44.7 tok/s になり、起動時の時間が実測と合う B70 と RTX 4070 では動きません。`STRATA_PCIE_SPLIT_REFINE=0` で起動時の時間のままにします。
-- 領域: Level Zero では、デバイスへのコピー用に登録したエキスパートの領域を GPU のカーネルが読めません。
-  分け方が PCIe に回すときだけ、領域を層ごとにホスト USM へ移します（IQ3_XXS の 40 GB で約 7.5 秒）。`STRATA_ARENA_HOST_USM=1` は最初からホスト USM にします。
+  RX 9060 XT の IQ3_XXS で decode が 1K 50.3 → 52.2、64K 48.5 → 51.3、262K 42.5 → 44.7 tok/s になり、起動時の時間が実測と合う B70 と RTX 4070 では動きません。`XESTRATA_PCIE_SPLIT_REFINE=0` で起動時の時間のままにします。
+- **領域**: Level Zero では、デバイスへのコピー用に登録したエキスパートの領域を GPU のカーネルが読めません。
+  分け方が PCIe に回すときだけ、領域を層ごとにホスト USM へ移します（IQ3_XXS の 40 GB で約 7.5 秒）。`XESTRATA_ARENA_HOST_USM` は 16 MiB を両方の置き場から GPU へ写して比べ、ホスト USM が 2% 以上速いときだけ最初からホスト USM にします（同じなら、OS がページを取り返せる写像のまま。`0`・`1` で固定）。
 - **READY の前の待ち**: エンジンは READY と言う前に、カーネルがホストのページを動かし終えるまで待ちます（`/proc/vmstat` の `pgmigrate_success` が 2 秒続けて毎秒 10,000 ページ未満、最大 30 秒。Linux だけ）。
-  読み込みの直後のメモリの詰め直しは登録した領域のページも動かしうるので、それを最初の要求より前に済ませます。`STRATA_SETTLE_S` で最大の秒数を変え、0 で待ちません。
+  読み込みの直後のメモリの詰め直しは登録した領域のページも動かしうるので、それを最初の要求より前に済ませます。`XESTRATA_SETTLE_S` で最大の秒数を変え、0 で待ちません。
 - **割合のまま**: `--pcie-frac`（`--calibrate` が保存した値を含む）を渡したとき、層の分割、`--pcie-mode dma` と `direct`、測れなかったときは、以前の割合を使います。
 
 RTX 4070（PCIe 4.0 x4）では外れを全部 CPU に回し、IQ3_XXS 32K で 49.9 → 57〜58.6 tok/s、UD-Q4_K_XL 32K で 22.0 → 25.7 tok/s です。
@@ -1246,18 +1359,21 @@ B70 も全部 CPU（以前と同じ）で、RX 9060 XT は PCIe に回す数が 
 
 ## 画像
 
-画像は setup で選んだときだけ使えます（既定はオフ）。
-選ぶと、画像のエンコーダー（`tools/vision`。llama.cpp の mtmd とモデルの mmproj）は既定で GPU で動きます（`./setup.sh --vision yes` または `gpu`）。
+画像は、setup で選んだときだけ使えます（既定はオフ）。
+選ぶと、画像のエンコーダーは既定で GPU で動きます（`./setup.sh --vision yes` または `gpu`）。
+エンコーダーは XeStrata 自身の視覚エンコーダー（画像エンジンと共通の `src/core/vision.cpp`。モデルの mmproj の Qwen3-VL の ViT と merger）で、エンジンと一緒にビルドされる 1 つの実行ファイル（`xestrata-vision`）が、GPU（`--gpu`）でも CPU でも動かします。
 GPU で動かせないときは CPU のエンコーダーに切り替わり、`--vision cpu` では CPU のエンコーダーだけを使います。
-CPU のエンコーダーは確かめた画像を 2 つの形の格子で llama.cpp と同じに読みます。
+CPU のエンコーダーは、重みを読み込むときに int8 にし、活性は行ごとに量子化して、XeStrata の CPU の int8 の積（AVX2・AVX-VNNI・AVX-512 VNNI を CPU の報告で選ぶ）で計算します。
+どちらのエンコーダーも、画像を llama.cpp の mtmd と同じ格子（大きさの規則と黒の余白）にします。
 動くモデルはすべて画像でも確かめました。
 2 つの形の格子、1 つの要求に 2 枚の画像、同じ画像をもう一度送ってそのキャッシュを使う会話です。
 
-GPU のエンコーダーは Vulkan のビルド（ggml-vulkan、`-DSTRATA_VISION_VULKAN=ON`）です。
-GPU を PCI アドレスで選びます（`strata-vision --gpu-pci`、設定の `vision.gpu_pci`）。
-Vulkan では、最初の GPU が CPU 内蔵のグラフィックスやほかの GPU のこともあるためです。
-Intel の GPU のドライバーは自由ソフトウェアの Mesa です。
-CPU のエンコーダー（8 スレッド）より 7〜9 倍速く、埋め込みは CPU のエンコーダーと 2.4〜3.1%（相対 L2）違い、毎回ビット単位で同じになります。
+GPU を PCI アドレスで選びます（`xestrata-vision --gpu --gpu-pci`、設定の `vision.gpu_pci`）。
+最初の GPU が CPU 内蔵のグラフィックスやほかの GPU のこともあるためです。
+GPU のエンコーダーは CPU のエンコーダー（8 スレッド）より 20 倍ほど速く（1,024 トークンの絵で RX 9060 XT が 0.2〜0.3 秒、Ryzen 7 5700X が 5.3 秒）、埋め込みは毎回ビット単位で同じになります。
+CPU のエンコーダーは、以前の CPU のエンコーダー（llama.cpp の mtmd）の約 2 倍速く（同じ 5700X・8 スレッドで 1 枚 5.3 秒 対 mtmd 10.2〜11.2 秒）、300 トークンの絵で 1.1 秒です。埋め込みは mtmd のものと画像のトークンごとのコサインが平均 0.9964 です。
+正答は 300 トークンで 18/36、1,024 トークンで 28/36 です（BF16 では 19/36・26/36）。
+環境変数 `XESTRATA_VISION_CPU_I8=0` を置くと、CPU のエンコーダーは積を BF16（重みも、活性は FP32 のまま）にし、mtmd とのコサインは平均 0.9998 に上がりますが、約 2 倍遅くなります（同じ 5700X で 300 トークン 2.5 秒・1,024 トークン 9.4 秒）。
 （contrib-icpx のモードにあった SYCL のビルド（ggml-sycl、oneMKL）は、そのモードと一緒に 2026-10-15 に廃止しました。）
 
 server はどちらかが準備できるまで、エンコーダーを次の順に起動します。
@@ -1298,7 +1414,7 @@ GPU の q8_1 の活性化の約束と、CPU の活性化（上の型のエキス
 
 | テストと資産 | 状態と限界 |
 | --- | --- |
-| `strata-device --selftest`、`elementwise_parity` | 移植済み。B70 で通る。デバイスの自己診断は確保、境界、容量を確かめ、数値の読み戻しは確かめない |
+| `xestrata-device --selftest`、`elementwise_parity` | 移植済み。B70 で通る。デバイスの自己診断は確保、境界、容量を確かめ、数値の読み戻しは確かめない |
 | `gguf_reader_test`、`suffix_drafter_test`、`controller_test`、`draft_policy_test`、`conv_cache_test` | 今のツールチェーンで通る。エンジン全体の結合を示すものではない |
 | `s_gemv_parity`、`s_gemv_q8k_parity` | 移植済み。CTest に登録。B70 で通る。`--bench` は `s_gemv_split`、`s2_gemv_quads`、`s2_gemv_fast` も素朴なカーネルと比べる |
 | `dequant_s2_parity`、`s2_gemv_parity`、`s2_gemv_q8_parity` | 移植済み。CTest に登録。B70 で通る |
@@ -1325,6 +1441,6 @@ XeStrata はそのまま使っていて、Xe での調整は一部しか済ん�
 | `src/program/generate.cpp` | ネイティブの pack で、キャッシュにないエキスパートを PCIe で運ぶ割合 0.55（正準形は 0.2）。リンクの速さ（256 MiB の転送 4 回の最良）/ 20 GB/s で縮める | 新しい開発機で測ると、0.15 で 2〜4% 速く、それより大きい割合はどれも遅かった。0.55 はこの測定に支持されない |
 | `tools/calibrate.py` | 基準は Ryzen 5 7600 と RTX 5070。PCIe の割合の候補 0、0.2、0.35、0.55、0.75、推測の下限 0.3、0.5、0.7、ワーカー数の候補。交互の確認で 3% を超えて速いときだけ採用 | 候補と基準は upstream のまま |
 | `setup.py` | `--spec 4`、`--spec-min-p 0.5`、`--expert-cache auto`、`--prefill auto` | `--prefill auto` は 32768 トークンの塊まで選ぶように変えた。既定のリングで収まらない塊は、リングを 96 スロットにして選ぶ（upstream #583。B70 を 8 GB に絞った IQ3_S で、8K と 32K のプロンプトが 1.5〜2 倍）。それでも収まらなければ、int8 の積の組の作業領域（GU・H・Hq）を塊全体でなく 1 組の行数で確保して選び直す（RTX 4070 の IQ3_XXS 32K で塊が 8192 → 16384、prefill 1,194 → 2,058 tok/s。組の形で丸めが変わるので答えは上限なしの実行と少し違いうる）。窓の大きさは `--spec-min-p` の下限でなく、測った窓の時間と補正した確率から 1 ms あたりの出力で決める（`--spec-window auto`、[DETAILS](DETAILS.ja.md#この-pc-に合わせて調整する--calibrate)）。ほかは upstream のまま |
-| `src/program/generate.cpp` | VRAM の予約 700 MiB（小さい GPU では 300 まで）、prefill の経路のスロットの借り方と塊の選び方、4 ラウンドごとのキャッシュの入れ替え（最大 96 個） | upstream のまま |
+| `src/program/generate.cpp` | VRAM の予約（機器のメモリの 32 分の 1、700〜768 MiB。小さい GPU では 300 まで）、prefill の経路のスロットの借り方と塊の選び方、4 ラウンドごとのキャッシュの入れ替え（最大 96 個） | 予約の大きさを機器の報告から決めるようにした（upstream は 700 MiB 固定）。ほかは upstream のまま |
 | `src/program/generate.cpp` と CPU のプール | 物理コア数に基づくワーカー数とホストのワーカー、キャッシュのヒットの通知、グラフとドアベルの段取り | ワーカー数は新しい開発機で測り、7〜19 で速さが変わらなかったので既定のまま |
-| `src/kernels/cpu/iq_avx512.cpp` | ソフトウェアのプリフェッチの距離と、AVX-512 向けの調整 | 開発機は AVX-512 を持たないので測っていない |
+| `src/kernels/cpu/iq_avx512.cpp` | ソフトウェアのプリフェッチの距離と、AVX-512 向けの調整。IQ4_XS の gate/up の 512-bit の行（upstream 55dc17697、既定で使う。`XESTRATA_IQ512_IQ4XS=0` で切る） | 開発機は AVX-512 を持たないので測っていない。IQ4_XS の行は llvm-mca の見積りで 256 値の塊あたり 1 トークン 35.3 サイクル（ggml の内積 31.8、−11%）、2 トークン 41.0（63.6 に対して +35%）、4 トークン 54.3（127.2 に対して +57%） |

@@ -2,15 +2,14 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/kernels/elementwise.hpp"
-#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/f16_gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_elementwise
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <algorithm>
-#include <limits>
 
 namespace strata::kernels {
 
@@ -29,37 +28,6 @@ void sync_if_needed(void* stream, const sycl::event& event) {
 }
 }  // namespace
 
-void embedding_gather(const uint8_t* codes, const float* scales, const float* offsets,
-                      int64_t n, int code_bits, int code_bias, int group_elems,
-                      float* out, void* stream) {
-    if (n <= 0) return;
-    if ((code_bits != 2 && code_bits != 4 && code_bits != 8) || group_elems <= 0)
-        throw core::DeviceError("invalid packed embedding geometry");
-    const auto event = queue_for(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> index) {
-        const int64_t i = index[0];
-        const int per_byte = 8 / code_bits;
-        const unsigned mask = (1u << code_bits) - 1u;
-        const int code = (codes[i / per_byte] >> ((i % per_byte) * code_bits)) & mask;
-        const float product = static_cast<float>(code + code_bias) * scales[i / group_elems];
-        // This translation unit disables contraction to preserve the packed-row format's rounding.
-        out[i] = product + (offsets ? offsets[i / group_elems] : 0.0f);
-    });
-    sync_if_needed(stream, event);
-}
-
-void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* gate,
-              int64_t n_tokens, int64_t h_v, void* stream) {
-    if (n_tokens <= 0) return;
-    if (h_v <= 0 || n_tokens > std::numeric_limits<int64_t>::max() / h_v)
-        throw core::DeviceError("invalid gate dimensions");
-    const auto event = queue_for(stream).parallel_for(sycl::range<1>(n_tokens * h_v), [=](sycl::id<1> index) {
-        const int64_t i = index[0], h = i % h_v;
-        const float x = alpha[i] + dt[h];
-        gate[i] = (x > 20.0f ? x : sycl::log1p(sycl::exp(x))) * ssm_a[h];
-    });
-    sync_if_needed(stream, event);
-}
-
 void scale_inplace(float* x, int64_t n, float s, void* stream) {
     if (n <= 0) return;
     const auto event = queue_for(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { x[i] *= s; });
@@ -69,55 +37,16 @@ void scale_inplace(float* x, int64_t n, float s, void* stream) {
 void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     const auto event = queue_for(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-        y[i] = f16_from_f32(x[i]);
+        y[i] = f16_gpu::f16_from_f32(x[i]);
     });
     sync_if_needed(stream, event);
 }
 
-void silu_inplace(float* x, int64_t n, void* stream) {
+void add_inplace(float* dst, const float* src, int64_t n, void* stream, float a) {
     if (n <= 0) return;
-    const auto event = queue_for(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-        // The negative branch avoids overflow; FP32 is checked against the existing double oracle.
-        const float v = x[i];
-        const float e = sycl::exp(-sycl::fabs(v));
-        x[i] = v >= 0.0f ? v / (1.0f + e) : (v * e) / (1.0f + e);
-    });
-    sync_if_needed(stream, event);
-}
-
-void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream) {
-    if (rows <= 0) return;
-    if (cols <= 0 || rows > std::numeric_limits<int64_t>::max() / cols)
-        throw core::DeviceError("invalid RMS dimensions");
-    constexpr size_t local = 128;
-    const auto event = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(rows * local), sycl::range<1>(local)), [=](sycl::nd_item<1> item) {
-            const int64_t row = item.get_group_linear_id(), lane = item.get_local_linear_id();
-            float sum = 0.0f;
-            for (int64_t col = lane; col < cols; col += local) {
-                const float v = x[row * cols + col];
-                sum += v * v;
-            }
-            sum = sycl::reduce_over_group(item.get_group(), sum, sycl::plus<float>());
-            const float inv = 1.0f / sycl::sqrt(sum / static_cast<float>(cols) + eps);
-            for (int64_t col = lane; col < cols; col += local) {
-                const int64_t i = row * cols + col;
-                x[i] = (w ? x[i] * w[col] : x[i]) * inv;
-            }
-        });
-    sync_if_needed(stream, event);
-}
-void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
-    if (n <= 0) return;
-    const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { dst[i] += src[i]; });
-    sync_if_needed(stream, event);
-}
-
-void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
-    if (n <= 0) return;
-    const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        y[i] = bf16_from_f32(x[i]);
-    });
+    // a src is exact for a = 1, so the residual's plain sum keeps its bits
+    const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) n),
+                                                      [=](sycl::id<1> i) { dst[i] += a * src[i]; });
     sync_if_needed(stream, event);
 }
 
@@ -233,6 +162,13 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
             sycl::atomic_fence(sycl::memory_order::acq_rel, sycl::memory_scope::system);
             bump_host(d_seq);
         }
+    });
+}
+
+void mapped_flag_store(uint32_t* flag, uint32_t value, void* stream) {
+    queue_for(stream).single_task([=] {
+        sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+        reinterpret_cast<volatile uint32_t*>(flag)[0] = value;
     });
 }
 

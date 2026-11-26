@@ -5,7 +5,7 @@
 // include/strata/kernels/rope_scaling.hpp - rope scaling: extending the context past the trained one.
 //
 // WHAT IT IS.  The artifact's RoPE is trained over `orig_ctx` positions (the artifact ships no
-// `rope.scaling` keys, so this is a pure runtime feature).  Scaling re-uses positions past that by
+// `rope.scaling` keys, so this is a pure runtime feature).  Scaling reuses positions past that by
 // rescaling the rotation angles.  Three types, the llama.cpp set:
 //
 //   none    freq_scale 1, no correction                      - today's behaviour, exactly
@@ -28,7 +28,7 @@
 //   - the TABLE path (the default decode path, the indexer's pooled key) never changes its kernels:
 //     scaling is baked into the cos/sin contents by `build_rope_table`, which the parity test checks
 //     bit-exactly against a float64 reference;
-//   - the ANALYTIC paths (`--native-rope`, the native indexer, prefill) get the resolved constants
+//   - the ANALYTIC paths (`native_rope_apply`, the native indexer, prefill) get the resolved constants
 //     as kernel arguments.
 //
 // **PROCESS CONSTANTS, SET ONCE BEFORE CAPTURE.**  A captured graph bakes kernel ARGUMENTS at capture
@@ -173,6 +173,25 @@ inline void rope_scaled_angle(float theta_extrap, float freq_scale, float corr_l
 }
 
 #if defined(SYCL_LANGUAGE_VERSION)
+/// The rotary table used by an FP32 indexer trained against a BF16 backbone: build and blend inverse frequencies
+/// before multiplying by position, as the training table does. The caller rounds the resulting coefficients to BF16.
+inline void rope_bf16_table_cs(float pos, int pair, int n_rot, float base, bool scaled,
+                               const RopeKernelArgs& a, float& c, float& s) {
+    const float denom = sycl::pow(base, float(2 * pair) / float(n_rot));
+    const float extrap = 1.0f / denom;
+    float inv = extrap, amplitude = 1.0f;
+    if (scaled) {
+        const float interp = 1.0f / (denom / a.freq_scale);
+        const float ramp = rope_yarn_ramp(a.corr_low, a.corr_high, pair) * a.ext_factor;
+        inv = interp * (1.0f - ramp) + extrap * ramp;
+        amplitude = a.attn_factor;
+        if (a.ext_factor != 0.0f) amplitude *= 1.0f + 0.1f * sycl::log(1.0f / a.freq_scale);
+    }
+    const float angle = pos * inv;
+    c = sycl::cos(angle) * amplitude;
+    s = sycl::sin(angle) * amplitude;
+}
+
 /// cos and sin of a pair's trained angle `theta`: as the unscaled kernels take them (sycl::cos / sycl::sin) when
 /// `scaled` is false, else through rope_scaled_angle with the process's constants.  `scaled` is the same for every
 /// work-item of a launch.

@@ -62,7 +62,7 @@ if __name__ == "__main__":
 '''
 
 FAKE_SERVER = r'''
-import json, os, signal, sys, time
+import json, os, signal, socketserver, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 a = sys.argv
@@ -116,9 +116,15 @@ class H(BaseHTTPRequestHandler):
                           "timings": {"predicted_per_second": 61.5, "prompt_per_second": 400.0}})
         else:
             self.js(404, {})
-httpd = ThreadingHTTPServer(("127.0.0.1", port), H)
+class Srv(ThreadingHTTPServer):
+    # http.server's server_bind asks socket.getfqdn("127.0.0.1") for a name nothing here uses; on a slow runner a fresh
+    # process waited longer for that answer than the tests wait for the server
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+httpd = Srv(("127.0.0.1", port), H)
 def term(*_):
-    print("[strata] stopped (fake)", flush=True)
+    print("[xestrata] stopped (fake)", flush=True)
     os._exit(0)
 signal.signal(signal.SIGTERM, term)
 print(f"ready: http://127.0.0.1:{port}/v1", flush=True)
@@ -160,6 +166,9 @@ class FakeRoot(unittest.TestCase):
         (self.root / "serve" / "server.py").write_text(FAKE_SERVER)
         self.env_backup = {k: os.environ.get(k) for k in ("XDG_CONFIG_HOME",)}
         os.environ["XDG_CONFIG_HOME"] = str(base / "config")
+        # the default port every status looks at: a free one, so a real server on 8095 is not taken for the tests'
+        self.default_port = M.DEFAULT_PORT
+        M.DEFAULT_PORT = free_port()
         self.strata = M.Strata(self.root)
         self.strata.python_override = sys.executable
         self.strata.health_timeout = 1.0
@@ -186,6 +195,7 @@ class FakeRoot(unittest.TestCase):
                 p.wait(5)
             except subprocess.TimeoutExpired:
                 pass
+        M.DEFAULT_PORT = self.default_port
         for k, v in self.env_backup.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -332,7 +342,7 @@ class Validation(FakeRoot):
         self.write_config("q2_0", log=str(Path(self.tmp.name).parent / "elsewhere.log"))
         res, err = self.call("strata_logs", {"source": "engine", "model": "q2_0"})
         self.assertTrue(err)
-        self.assertIn("outside the Strata folder", res["error"])
+        self.assertIn("outside the XeStrata folder", res["error"])
         self.write_config("q2_0")
         res, err = self.call("strata_logs", {"source": "engine"})
         self.assertFalse(err)
@@ -410,7 +420,7 @@ class StartStop(FakeRoot):
         self.write_config("q2_0", port=port, delay=1.5)
         res, err = self.call("strata_start", {"wait_seconds": 30})
         self.assertFalse(err, res)
-        self.assertIn("Strata is running", res["summary"])
+        self.assertIn("XeStrata is running", res["summary"])
         pid = res["server"]["pid"]
 
         st, _ = self.call("strata_status", {"hardware": False})
@@ -445,7 +455,7 @@ class StartStop(FakeRoot):
         st, _ = self.call("strata_status", {"hardware": False})
         self.assertEqual(st["running"], [])
         res, _ = self.call("strata_stop", {})
-        self.assertEqual(res["summary"], "Strata is not running")
+        self.assertEqual(res["summary"], "XeStrata is not running")
 
     def test_start_reports_a_crash(self):
         self.write_config("q2_0", port=free_port(), crash=True)
@@ -498,7 +508,7 @@ class StartStop(FakeRoot):
         self.strata.save_state("server", {"pid": other.pid, "ident": "linux:1",
                                           "port": free_port(), "model": "q2_0"})
         res, _ = self.call("strata_stop", {})
-        self.assertEqual(res["summary"], "Strata is not running")
+        self.assertEqual(res["summary"], "XeStrata is not running")
         self.assertFalse(M.proc_terminate(other.pid, "linux:1"))
         time.sleep(0.3)
         self.assertIsNone(other.poll())
@@ -532,7 +542,7 @@ class Helpers(unittest.TestCase):
     def test_progress_from_setup_output(self):
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / "setup.log"
-            f.write_text("=== Step 4: the Strata engine ===\n  [ok] engine\n=== Step 5: downloading X ===\n"
+            f.write_text("=== Step 4: the XeStrata engine ===\n  [ok] engine\n=== Step 5: downloading X ===\n"
                          "\r  a.gguf:   1.00 / 50.00 GB (2%)   \r  a.gguf:  25.00 / 50.00 GB (50%)   \n")
             p = M.install_progress(M.read_tail(f, 50))
         self.assertEqual(p["step"], "5/7: downloading X")
@@ -575,6 +585,11 @@ class Helpers(unittest.TestCase):
         self.assertEqual((by["UD-Q4_K_XL"]["experimental"], by["UD-Q4_K_XL"]["images"]), (True, True))   # #967
         self.assertFalse(by["UD-IQ4_XS"]["on_this_pc"].startswith("experimental"))
         self.assertTrue(by["UD-Q4_K_XL"]["on_this_pc"].startswith("experimental"))
+        self.assertEqual(by["UD-IQ4_XS"]["on_this_pc"], "fits")             # 63.7 GB of RAM, all of its experts
+        # a 32 GB card with 31 GB of RAM: 51 GB of weights beside 63 GB of memory - it runs, slower (upstream a16f3fe39)
+        fam = next(f for f in s.model_table({"ram_gb": 31.0, "gpus": [{"vram_gb": 32.0, "usable": True}]})
+                   if f["family"] == "unsloth")
+        self.assertEqual({x["model"]: x["on_this_pc"] for x in fam["sizes"]}["UD-IQ4_XS"], "may run slower")
 
     def test_recommendation_follows_ram(self):
         s = M.Strata(HERE.parent)
@@ -594,5 +609,49 @@ class Helpers(unittest.TestCase):
         self.assertTrue(any("own graphics" in n for n in r["notes"]))
 
 
+class ProcIdentity(unittest.TestCase):
+    """upstream 7ea172159: an ended process is not "running", not even while nobody has reaped it yet (a zombie) - on
+    Windows, where the test must not be os.kill(pid, 0) (that ends the process), and on Linux (/proc's state)."""
+
+    def test_an_ended_child_is_not_running_before_it_is_reaped(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            end = time.time() + 10
+            while M.proc_identity(child.pid) is not None and time.time() < end:
+                time.sleep(0.05)                        # it has ended; wait() is what reaps it
+            self.assertIsNone(M.proc_identity(child.pid))
+            self.assertFalse(M.proc_alive(child.pid, "linux:0"))
+        finally:
+            child.wait()
+
+    def test_a_running_child_is_running_and_its_token_is_its_own(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            ident = M.proc_identity(child.pid)
+            self.assertIsNotNone(ident)
+            self.assertTrue(M.proc_alive(child.pid, ident))
+            self.assertFalse(M.proc_alive(child.pid, ident + "x"))
+        finally:
+            child.kill()
+            child.wait()
+        self.assertIsNone(M.proc_identity(child.pid))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class EngineComponent(FakeRoot):
+    """台帳 0619: component: の engine はパスが無くてもインストール済みなら missing にしない。"""
+
+    def test_a_component_engine_is_not_a_missing_file(self):
+        cfg = self.root / "xestrata-two.json"
+        cfg.write_text(json.dumps({"exe": "component:strata-engine", "args": [], "port": 8095}), encoding="utf-8")
+        desc = self.strata.describe_config(cfg)
+        self.assertEqual(desc["missing_files"], ["component:strata-engine"])
+        self.assertFalse(desc["ready"])
+        (self.root / "bin").mkdir()
+        (self.root / "bin" / "strata-engine").write_text("", encoding="utf-8")
+        desc = self.strata.describe_config(cfg)
+        self.assertEqual(desc["missing_files"], [])
+        self.assertTrue(desc["ready"])

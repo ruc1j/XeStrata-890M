@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #pragma once
 // --adapt-decay: the factor the adaptive tier's usage counts are multiplied by after each adaptation (#1284).
 // Inside 0..1 it forgets old routing; above 1 the counts grow without end (inf after a few hundred adaptations) and the
@@ -17,7 +18,7 @@ constexpr float kAdaptDecayDefault = 0.7f;
 inline float adapt_decay_checked(double v, std::FILE* log = stderr) {
     if (std::isfinite(v) && v >= 0.0 && v <= 1.0) return (float) v;
     if (log != nullptr)
-        std::fprintf(log, "strata: --adapt-decay %g is not between 0 and 1; using %g (counts above 1 grow without end and the swap gains turn NaN)\n",
+        std::fprintf(log, "xestrata: --adapt-decay %g is not between 0 and 1; using %g (counts above 1 grow without end and the swap gains turn NaN)\n",
                      v, (double) kAdaptDecayDefault);
     return kAdaptDecayDefault;
 }

@@ -30,8 +30,9 @@
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/mf_vae.hpp"
 #include "strata/image/pipeline.hpp"
-#include "strata/image/qi_text.hpp"
-#include "strata/image/qi_vision.hpp"
+#include "strata/core/vision.hpp"
+#include "strata/image/text_encoder.hpp"
+#include "strata/image/w8_choice.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -42,10 +43,12 @@ namespace strata::image {
 
 /// Mage-Flow's static-shift schedule (shift s) of n steps: sigma = s t / (1 + (s - 1) t) for t from 1 down to 1 / n,
 /// and the terminal 0 (the reference's FlowMatchEulerDiscreteScheduler, shift 6).
-std::vector<float> mage_sigmas(int n, float shift = 6.0f);
 
 class MfPipeline : public ImagePipeline {
 public:
+    bool takes_loras() const override { return true; }
+    bool takes_guidance() const override { return true; }
+
     /// Reads the parts' files for their sizes; the parts go on the GPU with the first request.  `q8`: the DiT's blocks
     /// as Q8_0 (1), FP16 (0) or by the budget (-1, the default).  `edit_dit` and `vision` (the mmproj): edits (none
     /// without them); `keep`: the DiT not in use kept in RAM.
@@ -53,9 +56,7 @@ public:
               int q8 = -1, const std::string& edit_dit = "", const std::string& vision = "", bool keep = true);
 
     void set_budget(uint64_t bytes) override;
-    uint64_t budget() const override { return budget_ > 0 ? budget_ : auto_budget_; }
     void release(bool all = false) override;
-    void fit(uint64_t reserve) override;
     uint64_t held() const override;
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
                 const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
@@ -81,25 +82,25 @@ private:
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_, edit_path_, vision_path_;
     int q8_ = -1;
-    /// --dit-q8 auto with both forms in the budget: the 8-bit form is the faster on this GPU (MfDit::time_forms: 1 yes,
-    /// 0 no, -1 not yet), timed at w8_rows_ image rows (again for an image of more than twice as many)
-    mutable int w8_faster_ = -1;
-    mutable int64_t w8_rows_ = 0;
+    W8Choice w8_;   // --dit-q8 auto with both forms in the budget: the faster here (MfDit::time_forms)
     bool keep_ = true, edit_active_ = false;
     bool base_encoder_ = false;   // the VAE's file has the encoder a base image takes (img2img, a mask)
-    std::unique_ptr<QiText> te_;
+    /// The text encoder's states of a prompt (its pictures' rows among the tokens), the engine's stream's work done
+    /// first (the encoder runs on its own); a failure throws.
+    std::vector<float> text(const std::vector<int32_t>& ids, const std::vector<TextEncoder::Picture>& pictures);
+    std::unique_ptr<TextEncoder> te_;
     std::unique_ptr<MfDit> dit_, edit_dit_;
     // the closed DiTs' blocks in 8 bits (release(true)), for their next open
     std::vector<std::vector<uint8_t>> dit_host_, edit_host_;
-    std::unique_ptr<QiVision> vision_;        // the edits' vision encoder, while the budget has room for it
-    std::unique_ptr<QiVision> vision_size_;
+    std::unique_ptr<core::Vision> vision_;        // the edits' vision encoder, while the budget has room for it
+    std::unique_ptr<core::Vision> vision_size_;
     std::unique_ptr<MfVae> vae_;
-    std::unique_ptr<QiText> te_size_;
+    std::unique_ptr<TextEncoder> te_size_;
     std::unique_ptr<MfDit> dit_size_, dit16_size_;   // the DiT's sizes as Q8_0 and as FP16
     std::unique_ptr<MfVae> vae_size_;
-    uint64_t budget_ = 0, auto_budget_ = 0, dit_set_ = 0, te_set_ = 0;
-    int64_t mlp_set_ = -1;
-    std::vector<int32_t> last_ids_, last_neg_ids_;
+    uint64_t te_set_ = 0;
+    uint64_t te_want_ = 0;   // the encoder's layers the plan left room for, set where it encodes (te_layers)
+    void te_layers();
     std::vector<float> last_states_, last_neg_states_;
 };
 

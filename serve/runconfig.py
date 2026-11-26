@@ -9,6 +9,11 @@ trusted_origins, allowed_hosts), the MCP servers and before_load (which run prog
 here - is kept as it is: a change touches only the keys it names (as setup run again keeps the user's keys, #629).
 The earlier file is kept as xestrata-<model>.json.bak.  The server reads the config when it starts, so a change is
 used from the next start on.
+
+A few keys can also be set for every model, in the user's settings (settings.json beside the configs,
+serve/places.py): GLOBAL lists them.  A model's config overrides the settings key by key (effective), so a model can
+turn off or change what the others use.  The settings file is setup's as well (the data folder, the installs): a
+change rewrites only the keys it names.
 """
 from __future__ import annotations
 
@@ -16,7 +21,10 @@ import json
 import math
 import os
 import shutil
+import urllib.parse
 from pathlib import Path
+
+from serve import option_values, sampling, settings
 
 # (key, kind, help).  kind: "bool", "int>=0", "num>=0", ("enum", values), "names", or ("sampling", check) for a key
 # of the "sampling" block, ("arg", flag) for an engine option kept in "args".
@@ -28,23 +36,48 @@ EDITABLE = [
     ("sampling.top_k", ("sampling", "1..64"), "Default top_k for requests that send none (1-64)"),
     ("sampling.min_p", ("sampling", "0<=x<=1"), "Default min_p for requests that send none"),
     ("reasoning_budget_tokens", "int>=0", "Cap the thinking of every request at this many tokens (0 or empty: no cap)"),
-    ("fit_max_tokens", "bool", "Shorten a max_tokens that does not fit the context (on by default); off: answer 400 "
-                               "like llama.cpp"),
+    ("fit_max_tokens", "bool",
+     "Shorten a max_tokens that does not fit the context (on by default); off: answer 400 like llama.cpp"),
     ("anthropic_thinking", ("enum", ["model", "on_request"]),
      "Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)"),
     ("effort_position", ("enum", ["start", "end"]),
      "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)"),
+    ("script_guard", ("enum", [option_values.GUARD_OFF, *option_values.GUARD_LANGS]),
+     "Keep other languages' characters out of the answers of requests that name none: ja, en "
+     "(English and the like: no CJKV), ko, zh-cn or zh-tw; off: as the model writes"),
     ("aliases", "names", "Other model names the server lists and answers to (comma-separated)"),
     ("idle_unload_s", "num>=0", "Unload the model after this many seconds without requests (0 or empty: never)"),
     ("lazy_load", "bool", "Start without loading the model; the first request loads it (text only)"),
     ("engine_silence_s", "num>=0",
      "End a request when the engine says nothing for this long (default 300 s, 0 = wait)"),
-    ("api_monitor", "bool", "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
+    ("api_monitor", "bool",
+     "Keep the last 100 requests' prompts and answers in memory for /api-monitor (on by default; false turns it off)"),
+    ("debug_chat_log", "bool",
+     "Debug chat log: write every chat request's prompt, tool rounds, answer and pictures, and the web page's chats, "
+     "to the state folder's debug-chat-log/ (off by default)"),
+    ("debug_chat_log_mib", "num>=0",
+     "Debug chat log: the most MiB its folder keeps; the oldest go first (default 1024)"),
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", ("arg", "--vram-reserve-mib"),
-     "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
+     ("VRAM in MiB the engine leaves free for other programs (engine default: a 32nd of the card's memory, "
+      "between 700 and 768 MiB)")),
+    ("search_engine", ("enum", list(option_values.SEARCH_ENGINES)),
+     "Web search: searxng (the server at search_url), deepseek (DeepSeek's search API, billed per search) or "
+     "tinyfish (TinyFish's search API, free up to a daily allowance)"),
+    ("search_url", "url",
+     "Web search: the address of a SearXNG-compatible search server (http://127.0.0.1:8888); empty in a model's "
+     "config: no search for that model"),
+    ("deepseek_api_key", "secret",
+     "Web search with DeepSeek: its API key (write-only: never shown; the queries go to DeepSeek)"),
+    ("tinyfish_api_key", "secret",
+     "Web search with TinyFish: its API key (write-only: never shown; the queries and the pages found go to "
+     "TinyFish)"),
 ]
 SPEC = {k: kind for k, kind, _ in EDITABLE}
+# the keys settings.json may hold for every model
+GLOBAL = ("search_engine", "search_url", "deepseek_api_key", "tinyfish_api_key", "script_guard", "debug_chat_log",
+          "debug_chat_log_mib")
+GLOBAL_ONLY = ("deepseek_api_key", "tinyfish_api_key")   # ... and the ones only it holds (secrets: one place)
 
 
 def _arg(cfg: dict, flag: str):
@@ -66,21 +99,39 @@ def value_of(cfg: dict, key: str):
     return cfg.get(key)
 
 
-def view(cfg: dict, path: str | Path) -> dict:
-    """GET /config: the editable keys with their values (None: not set, the default applies)."""
+def effective(cfg: dict, settings: dict, key: str):
+    """The value a GLOBAL key has for this model: the config's when it has the key (an empty one included), else the
+    settings'."""
+    return cfg[key] if key in cfg else settings.get(key)
+
+
+def view(cfg: dict, path: str | Path, settings: dict | None = None, settings_path: str | Path | None = None) -> dict:
+    """GET /config: the editable keys with their values (None: not set, the default applies).  A GLOBAL key also
+    gives the settings' value and the one in effect, with where it comes from ("model", "global" or None)."""
+    settings = settings or {}
     out = []
     for key, kind, help_ in EDITABLE:
         k = kind[0] if isinstance(kind, tuple) else kind
-        out.append({"key": key, "value": value_of(cfg, key), "help": help_,
-                    "kind": "number" if k in ("sampling", "arg", "int>=0", "num>=0") else k,
-                    **({"choices": kind[1]} if k == "enum" else {})})
+        row = {"key": key, "value": value_of(cfg, key), "help": help_,
+               "kind": "number" if k in ("sampling", "arg", "int>=0", "num>=0") else k,
+               **({"choices": kind[1]} if k == "enum" else {}), "scopes": ["model"]}
+        if k == "secret":                                # its value never leaves the server: only whether it is set
+            row.update({"value": None, "scopes": ["global"], "global": None, "set": bool(settings.get(key))})
+        elif key in GLOBAL:
+            row.update({"scopes": ["global", "model"], "global": settings.get(key),
+                        "effective": effective(cfg, settings, key),
+                        "from": "model" if key in cfg else "global" if settings.get(key) is not None else None})
+        out.append(row)
     return {"file": Path(path).name, "keys": out,
-            "note": "Saved to the run config; used from the next start of the model."}
+            **({"global_file": str(settings_path)} if settings_path is not None else {}),
+            "note": "Saved to the run config (or the settings, for every model); used from the next start of the "
+                    "model."}
 
 
 def _number(key, v, whole=False, lo=0.0, hi=None, lo_open=False):
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or (whole and v != int(v)) or \
-            (v <= lo if lo_open else v < lo) or (hi is not None and v > hi):   # isfinite: json reads Infinity and NaN
+    # isfinite: json reads Infinity and NaN
+    if (isinstance(v, float) and not math.isfinite(v)) or \
+            not sampling.number(v, whole=whole, lo=lo, hi=hi, lo_open=lo_open):
         rng = f"{'more than' if lo_open else 'at least'} {lo:g}" + (f" and at most {hi:g}" if hi is not None else "")
         raise ValueError(f"{key}: expected a {'whole ' if whole else ''}number, {rng}, not {v!r}")
     return int(v) if whole else v
@@ -94,6 +145,18 @@ def check(key: str, v, cfg: dict):
         return None
     kind = SPEC[key]
     k = kind[0] if isinstance(kind, tuple) else kind
+    if k == "secret":
+        if not isinstance(v, str) or not 8 <= len(v.strip()) <= 512 or any(c.isspace() for c in v.strip()):
+            raise ValueError(f"{key}: expected an API key (one word, no spaces)")   # never the value itself
+        return v.strip()
+    if k == "url":
+        if not isinstance(v, str) or len(v) > 2048:
+            raise ValueError(f"{key}: expected an http or https address, not {v!r}")
+        v = v.strip()
+        u = urllib.parse.urlsplit(v)
+        if v and (u.scheme not in ("http", "https") or not u.hostname):
+            raise ValueError(f"{key}: expected an http or https address (http://127.0.0.1:8888), not {v!r}")
+        return v.rstrip("/")
     if k == "bool":
         if not isinstance(v, bool):
             raise ValueError(f"{key}: expected true or false, not {v!r}")
@@ -126,12 +189,21 @@ def check(key: str, v, cfg: dict):
     return _number(key, v, whole=True, lo=1, hi=64)
 
 
-def apply(cfg: dict, changes: dict) -> tuple[dict, list[str]]:
-    """The config with `changes` ({key: value or None}) made, and the keys that changed.  Every value is checked
-    first, so a request with one bad value changes nothing (ValueError)."""
+def apply(cfg: dict, changes: dict, scope: str = "model") -> tuple[dict, list[str]]:
+    """The config (or with scope "global", the settings) with `changes` ({key: value or None}) made, and the keys
+    that changed.  Every value is checked first, so a request with one bad value changes nothing (ValueError)."""
     if not isinstance(changes, dict) or not changes:
         raise ValueError('send {"set": {"<key>": <value or null>, ...}}')
+    if scope not in ("model", "global"):
+        raise ValueError(f'scope: expected "model" or "global", not {scope!r}')
+    if scope == "global" and any(k not in GLOBAL for k in changes):
+        raise ValueError(f"only {', '.join(GLOBAL)} can be set for every model")
+    if scope == "model" and any(k in GLOBAL_ONLY for k in changes):
+        raise ValueError(f"{', '.join(k for k in changes if k in GLOBAL_ONLY)} is set for every model only "
+                         '(scope "global")')
     checked = {k: check(k, v, cfg) for k, v in changes.items()}
+    if scope == "global":                              # empty there is the same as unset (only a model's config can
+        checked = {k: None if v == "" else v for k, v in checked.items()}   # turn a key off for itself)
     new = json.loads(json.dumps(cfg))                  # a deep copy: the caller's dict is left alone
     changed = []
     for key, v in checked.items():
@@ -181,6 +253,14 @@ def save(path: str | Path, cfg: dict) -> Path:
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
     return bak
+
+
+def save_settings(path: str | Path, data: dict) -> None:
+    settings.save(path, data)
+
+
+def load_settings(path: str | Path) -> dict:
+    return settings.load(path)
 
 
 def load(path: str | Path) -> dict:

@@ -62,6 +62,16 @@ class MtpDrafter {
 public:
     MtpDrafter() = default;
     ~MtpDrafter();
+    /// Everything given back (VRAM, the host staging, the streams and graphs): the engine's start measured that no
+    /// drafter or DFlash2 decodes faster.  The drafter is as a new one after this (unloaded).
+    void release();
+    /// The layer's weights, its draft head (unless `keep_head`: DFlash2 reads the same gathered rows), its buffers,
+    /// graphs and host staging given back, its K/V kept: a parked or saved conversation carries the draft layer's
+    /// K/V (conversation_snapshot_*, conversation_kv_*), so the engine keeps that part when the start's measurement
+    /// chose DFlash2 or no drafter.  Nothing drafts or reads a prompt with it after this; kv_state() and kv_restore()
+    /// still work.
+    void release_weights(bool keep_head);
+    bool loaded() const { return dense_ != nullptr; }
     MtpDrafter(const MtpDrafter&) = delete;
     MtpDrafter& operator=(const MtpDrafter&) = delete;
 
@@ -74,6 +84,7 @@ public:
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    int max_drafts() const { return max_drafts_; }
     int max_t() const { return max_t_; }
     /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
     /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
@@ -83,6 +94,28 @@ public:
     static bool top2_env();
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     uint64_t vram_bytes() const { return vram_; }
+    /// The 512 routed experts moved from VRAM to pinned host memory, which the drafter's kernels read in place (the
+    /// few a draft routes to): a card the expert cache would otherwise leave short (generate's cache sizing).  Fails,
+    /// leaving them where they are, where this GPU's kernels cannot read host memory or none can be pinned.  The slot
+    /// drafters that share them follow with share_experts.
+    bool experts_to_host(std::string& err);
+    bool experts_on_host() const { return experts_host_; }
+    /// The draft head's token subset is read from `name` beside the layer in place of draft_vocab.bin (before bind):
+    /// the English subset setup puts there, a card the expert cache would otherwise leave short.  False (nothing
+    /// changed) where the file is not there or holds no fewer tokens.
+    bool use_vocab_file(const std::string& name);
+    const std::string& vocab_file() const { return vocab_file_; }
+    void share_experts(const MtpDrafter& owner) { experts_ = owner.experts_; experts_host_ = owner.experts_host_; }
+    /// DF-05: the gathered draft-head rows and vocabulary (this drafter keeps owning them), for the DFlash2 drafter
+    /// to share when they are the same bytes (the same head and vocabulary file).  rows null: the whole head.
+    struct SharedHead { const uint8_t* rows; const int32_t* vocab_dev; int64_t n; int type; };
+    SharedHead shared_head() const;
+    void set_parkable_head(bool on) { parkable_head_ = on; }
+    bool head_can_park() const { return subset_ && subset_->can_park(); }
+    uint64_t parkable_head_bytes() const { return subset_ ? subset_->bytes() : 0; }
+    bool park_head(std::string& err, bool* returned = nullptr) { return subset_ && subset_->park(err, returned); }
+    bool restore_head(std::string& err) { return subset_ && subset_->restore(err); }
+
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
@@ -93,7 +126,7 @@ public:
     uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
-              const MtpDrafter* shared = nullptr);
+              const MtpDrafter* shared = nullptr, bool prompt_only = false);
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
     /// the token at position cell+1).  Runs in batches of up to max_t rows.
@@ -163,6 +196,12 @@ public:
     /// `n_early`: an event after each of the first `n_early` outputs (chain_outputs_ready).
     bool chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force, int n_out,
                       int n_early, std::string& err);
+    /// More outputs of the last chain, up to `n_out` in all: its next steps queued behind the ones already launched (a
+    /// step is a graph of its own and every step's cell was staged by chain_launch), each with its event.  The chain
+    /// may still be running or have ended; nothing else may have run on the drafter since.  Needs the chain launched
+    /// with n_early == n_out.  The pipelined decode (XESTRATA_PIPELINE_LAZY_CHAIN) asks for a step only once the
+    /// outputs before it say it can be used.
+    bool chain_extend(int n_out, std::string& err);
     /// 1: every output is in chain_tok()/chain_prob(); 0: still running; -1: an error.
     int chain_poll(std::string& err);
     /// How many of the chain's first outputs (up to `n_early`; all of them once the chain is done) have landed in
@@ -250,6 +289,7 @@ private:
     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
     strata::gpu::Event* ev_chain_ = nullptr;
     strata::gpu::Event* ev_step_[8] = {};               ///< after each of the first n_early outputs
+    strata::gpu::Event* ev_draft_ = nullptr;            ///< draft(): after each launch, read by its wait (#78)
     int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
     int32_t chain_tok_[8] = {};
     float chain_prob_[8] = {};
@@ -273,7 +313,9 @@ private:
     // a slot drafter borrows the immutable weights and the draft head; each still owns its state and scratch
     bool owns_weights_ = true;
     bool owns_draft_head_ = true;
+    bool parkable_head_ = false;
     uint8_t* experts_ = nullptr;
+    bool experts_host_ = false;   ///< experts_ is pinned host memory (experts_to_host)
     void* state_arena_ = nullptr;
     QsaState st_;
     void* arena_ = nullptr;
@@ -294,6 +336,7 @@ private:
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;
+    std::string vocab_file_ = "draft_vocab.bin";
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
     float* probs_ = nullptr;
@@ -316,7 +359,6 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float* sh_scratch_ = nullptr;
-    uint16_t* x_bf16_ = nullptr;
     float* head_logits_ = nullptr;
     float* dummy_inj_ = nullptr;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;

@@ -41,36 +41,101 @@ public:
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              bool half_sums = false, bool accumulate = false);
 
+    /// `batch` products of the same shape at strides (elements): Y + b sy (row stride ldy, 0: N) = (X + b sx) [T][K] .
+    /// (W + b sw)^T [N][K], FP16 in, FP32 out; one call of oneMath's strided batch where it has one for the GPU, else
+    /// one product each.
+    void f16_batch(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t batch,
+                   int64_t sx, int64_t sw, int64_t sy, int64_t ldy = 0);
+    /// A strided batch of FP16 products with either operand transposed, through oneMath only (false, nothing done,
+    /// where its backend does not take the GPU's FP16 products: the caller transposes and takes f16_batch).
+    /// Y + b sy [T][N] (row stride ldy) = op(X) . op(W) (+ beta Y), op(X) [T][K]: X [T][K] (row stride ldx), or with
+    /// x_t X [K][T] (row stride ldx) read transposed; op(W) [K][N]: W [N][K] read transposed as f16 reads it
+    /// (w_nk), or W [K][N] as it is (row stride ldw).  A training step's attention reads P^T dO, dS^T Q and dS K so,
+    /// without writing the transposed maps.
+    bool f16_batch_ex(bool x_t, bool w_nk, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
+                      int64_t K, int64_t batch, int64_t sx, int64_t sw, int64_t sy, int64_t ldx, int64_t ldw,
+                      int64_t ldy, float beta);
+    /// Whether f16_batch_ex takes this stream's GPU (oneMath's backend for it has FP16 products), so a caller can
+    /// leave the transposed operands unmade.
+    bool f16_batch_ex_ok() const;
     /// The experts' groups (FP16), one product each through oneMath: rows bounds[e] .. bounds[e + 1] (host values) of
     /// X and Y (row stride N) by W + e * w_stride, e < G.  False when oneMath does not take FP16 products on `stream`'s
     /// GPU: the caller runs kernels::xmx_gemm_grouped then.
     static bool f16_groups(const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y, const int32_t* bounds,
                            int G, int64_t N, int64_t K, void* stream);
 
-    /// Whether `stream`'s GPU takes i8: oneMath's backend for it has int8 products (asked of it once, by a trial).
+    /// Whether `stream`'s GPU takes i8: oneMath's backend for it has int8 products (asked of it once, by a trial), or
+    /// oneDNN takes the GPU (kernels::i8_gemm_s32: Intel's GPUs, the free mode's int8 products).
     static bool i8_usable(void* stream);
-    /// Y[T, N] (int32, row stride ldy) = X[T, K] . W[N, K]^T, both int8 row-major, int32 sums, through oneMath; only
-    /// where i8_usable says yes.
+    /// Y[T, N] (int32, row stride ldy) = X[T, K] . W[N, K]^T, both int8 row-major, int32 sums, through oneMath, else
+    /// oneDNN; only where i8_usable says yes.
     static void i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                    void* stream);
+    /// The int8 products' one entry (W8A8: X [T, K] and W [N, K] int8 row-major, sx[t] and sw[n] their row scales):
+    /// with `bf16_out`, Y [T, N] (BF16, row stride ldy, 0: N) = (X . W^T) sx[t] sw[n] + bias[n] (null: none) through the GPU
+    /// maker's fused kernel (kernels::i8_gemm_bf16), where it takes the shape and is the faster on the GPU (timed once
+    /// a GPU against the library's sums; XESTRATA_W8_FUSED=0 or 1 fixes it): true.  Otherwise the int32
+    /// sums X . W^T into Y (row stride ldy) through i8, for the reader to scale (sx, sw and bias unread): false.  Only
+    /// where i8_usable or kernels::i8_gemm_ok says yes.
+    static bool w8a8(const int8_t* X, const float* sx, const int8_t* W, const float* sw, const float* bias, void* Y,
+                     int64_t T, int64_t N, int64_t K, int64_t ldy, bool bf16_out, void* stream);
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16; `half_sums` as
     /// f16's.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, bool half_sums = false);
+    /// The LLMs' dense prompt products (Qwen3.8-Flash-Next's native_proj, the plain engine's proj): native, or the
+    /// W8A8 form (native_w8a8) where the model is dense and the GPU took it in a timing of three representative
+    /// shapes once (llm_w8a8 in gemm.cpp; XESTRATA_LLM_W8A8=0 or 1 fixes it, =1 a MoE model too) and the shape is a
+    /// wide product of many rows (T >= 1024, N >= 1024, K a multiple of kernels::kI8Rotate).  `dense`: the model
+    /// has no experts (its structure, not its name).  An approximation: the answers change (checked by KL against
+    /// the floor of the same binary's runs).  A DiT's products never come here: they take f16 / bf16 / w8a8 directly.
+    void native_llm(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N,
+                    int64_t K, bool dense, int64_t ldy = 0, bool half_sums = false);
+    /// native with FP16 sums into FP16 rows Y16 (row stride ldy), not widened into FP32: the reader takes them as they
+    /// are (prefill::add_h, swiglu_pair_h), a pass over the sums fewer.  Where half_ok says no, the FP32 product
+    /// narrowed into Y16 (the same rows, a pass more).
+    void native_half(const uint16_t* X, int ggml_type, const void* W_blocks, uint16_t* Y16, int64_t T, int64_t N,
+                     int64_t K, int64_t ldy = 0);
+    /// Whether `stream`'s GPU takes native_half (oneMath's half GEMM).
+    static bool half_ok(void* stream);
+    /// The products' warm-up, shared by the models: native() once a shape (type, N x K, ldy) a GPU in the process -
+    /// a library's first product of a shape loads its kernels for it (rocBLAS on the RX 9060 XT: 0.5 s for the
+    /// first product, 0.9 s more for the first of 32 rows) - on X's rows of zeros into a buffer the caller
+    /// overwrites.  A shape already warm on this Gemm's GPU is skipped: native_warm says whether it ran, native_cold
+    /// whether it would.
+    bool native_cold(int ggml_type, int64_t N, int64_t K, int64_t ldy = 0) const;
+    bool native_warm(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                     int64_t ldy = 0);
 
+    /// Whether the LLMs' dense prompt products take the W8A8 form on this GPU: a dense model's choice timed once
+    /// (the comment at llm_w8a8 in gemm.cpp), XESTRATA_LLM_W8A8=0 or 1 fixing it (=1 without the timing, a MoE
+    /// model too).  `dense`: the model has no experts; a MoE model's default takes neither the timing nor the int8
+    /// library's load.  Called at startup (after settle) so the timing's cost and the library it loads land before
+    /// the first prompt, not in it; native_llm calls it too (a GPU the startup did not measure, a layer split's
+    /// second one).
+    static bool llm_w8a8(void* stream, bool dense);
+    /// The fewest rows native_llm takes the W8A8 form at (the comment there): a model whose prompt chunks are
+    /// shorter never takes it.
+    static constexpr int64_t kLlmW8a8Rows = 1024;
     /// Loads the products' library ahead of the first prompt (oneMath's backend for the current GPU), on a thread of
     /// its own: call once for each GPU at startup.
     static void prepare();
     /// Waits for prepare's trial on the current GPU (the library and its first kernels loaded).
     static void settle();
+    /// Waits for every GPU's trial still running: before the process ends, so no trial is still loading its library
+    /// while the exit handlers take the GPU runtime down (main's guard; a run that ended in an error before its first
+    /// prompt crashed or hung there on the RX 9060 XT, 2026-11-08).
+    static void finish();
     /// The path the products take on the current GPU, for the startup report: "oneMath", or the own kernels'
     /// (kernels::gemm_path).
     static const char* path();
+    /// Training logs each distinct product shape and the path it actually takes.
+    static void trace_training();
 
     /// Caller-owned buffer only: the scratch moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems);
 
-    /// STRATA_DEQUANT_SIDE=1 (gemm_dequant_side): a second dequant scratch of scratch_elems() elements, caller-owned
+    /// XESTRATA_DEQUANT_SIDE (gemm_dequant_side): a second dequant scratch of scratch_elems() elements, caller-owned
     /// like the first.  native() then dequantizes on a side stream into the two in turn, so a weight's dequant runs
     /// while the kernels queued ahead of its product do; events order every write and read of each scratch, so the
     /// products are the serial form's, bit for bit.  nullptr: the serial form.  Called after init_external and after
@@ -82,6 +147,13 @@ public:
     void* stream() const { return stream_; }
 
 private:
+    template<class F> void with_f16(int ggml_type, const void* W_blocks, int64_t N, int64_t K, F prod);
+    /// native_llm's W8A8 form: the weight's GGUF blocks to int8 rows and a scale a row (kernels::rows_i8_blocks
+    /// where it takes their type, else dequant_f16 into the scratch and kernels::rows_i8), X's rows likewise, the
+    /// int32 product (w8a8, the reader takes FP32) and the scales back (kernels::i8_scale).  The int8 scratch is
+    /// grown on demand (as bf16_through_f16's), beside the prompt region's budget.
+    void native_w8a8(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N,
+                     int64_t K, int64_t ldy);
     bool bf16_through_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
 
     void* stream_ = nullptr;
@@ -91,7 +163,13 @@ private:
     uint16_t* tc_w_ = nullptr;   // bf16_through_f16's FP16 images of W and of a slice of X, grown on demand
     uint16_t* tc_x_ = nullptr;
     int64_t tc_w_elems_ = 0, tc_x_elems_ = 0;
-    // STRATA_DEQUANT_SIDE (set_dequant_side): the second scratch, the side stream and, per scratch, "the dequant
+    // native_w8a8's int8 scratch: X's rows and their scales, W's rows and their scales, grown on demand
+    int8_t* w8_x_ = nullptr;
+    float* w8_sx_ = nullptr;
+    int8_t* w8_w_ = nullptr;
+    float* w8_sw_ = nullptr;
+    int64_t w8_x_elems_ = 0, w8_sx_elems_ = 0, w8_w_elems_ = 0, w8_sw_elems_ = 0;
+    // XESTRATA_DEQUANT_SIDE (set_dequant_side): the second scratch, the side stream and, per scratch, "the dequant
     // landed" (recorded on the side stream) and "the product read it" (recorded on the compute stream); side_cur_ is
     // the scratch the next native() dequantizes into (0: scratch_, 1: side_scratch_)
     uint16_t* side_scratch_ = nullptr;
@@ -101,8 +179,9 @@ private:
     int side_cur_ = 0;
 };
 
-/// STRATA_DEQUANT_SIDE=1: the prompt path's dense-weight dequant on a side stream with a second GEMM scratch
-/// (Gemm::set_dequant_side; the prompt path takes the scratch from its region when this is on).  Off by default.
+/// XESTRATA_DEQUANT_SIDE=1: the prompt path's dense-weight dequant on a side stream with a second GEMM scratch
+/// (Gemm::set_dequant_side; the prompt path takes the scratch from its region when this is on).  On by default on an
+/// integrated GPU on the HIP backend, off elsewhere; =0 turns it off.
 bool gemm_dequant_side();
 
 }  // namespace strata::prefill

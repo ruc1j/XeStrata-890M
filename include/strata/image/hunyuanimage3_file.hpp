@@ -3,14 +3,14 @@
 // include/strata/image/hunyuanimage3_file.hpp - HunyuanImage 3.0's weights as its safetensors files hold them: the quantized
 // matrices and the routed experts' banks, read in place.
 //
-// The files come from ComfyUI's ecosystem (HunyuanImage-3.0-*-ComfyUI), in two quantized forms, and the form is in
-// each quantized tensor's `comfy_quant` JSON:
+// The files are single checkpoints (PedroMarinhoDev's HunyuanImage-3.0-*-ComfyUI), in two quantized forms, and the form
+// is in each quantized tensor's `comfy_quant` JSON:
 //
 //   * `int8_tensorwise` with `convrot` (81.9 GB, the original's weights at 8 bits): `weight` I8 [E][N][K] and
 //     `weight_scale` F32 [E][N][1], one scale a row; K's groups of `convrot_groupsize` (256) were rotated when the
 //     file was made (W_rot = W @ H^T a group), so the *activations* are rotated alike before the product:
 //     x W^T = (x H) (W H)^T for H orthogonal.  THE ROTATION IS NOT SYLVESTER'S: it is the **regular** Hadamard,
-//     kron(H4, H4, H4, H4) with H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]] / 2, which XeStrata's qi_rows_i8
+//     kron(H4, H4, H4, H4) with H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]] / 2, which XeStrata's kernels::rows_i8
 //     does not use (that one is (-1)^popcount(r & c) / sqrt(b)); the two disagree, and rotating with the wrong one
 //     gives plausible-looking noise (cos 0.05, measured 2026-10-23).  h5/H4 is symmetric, so H^T = H.
 //   * `asym_w4a8_int8` (46.9 GB, the default): `weight` I8 [E][N][K/2] (two 4-bit codes a byte),
@@ -27,7 +27,7 @@
 // and how it streams the banks it cannot hold, is hunyuanimage3_dit's.
 #pragma once
 
-#include "strata/image/mapped_file.hpp"
+#include "strata/platform/mapped_file.hpp"
 #include "strata/image/safetensors.hpp"
 
 #include <cstdint>
@@ -63,8 +63,8 @@ struct HunyuanImage3Matrix {
 };
 
 /// Whether a DiT file is laid out as a HunyuanImage 3.0 model: its header says so (`format`), or a matrix carries a
-/// `comfy_quant` (ComfyUI's quantized save), or it holds the model's own pieces (`model.wte.weight` beside
-/// `patch_embed.model.0.weight`).  The header alone is read (no mapping), so strata-image can pick its pipeline:
+/// `comfy_quant` (a quantized save's description of its form), or it holds the model's own pieces (`model.wte.weight`
+/// beside `patch_embed.model.0.weight`).  The header alone is read (no mapping), so strata-image can pick its pipeline:
 /// a HunyuanImage save and a Mage-Flow save share the `.safetensors` extension.  False on a file that is not a
 /// safetensors one (a GGUF) or whose header cannot be read.
 bool hunyuanimage3_is_dit_file(const std::string& path);
@@ -121,7 +121,7 @@ public:
 private:
     std::string path_;
     std::unique_ptr<SafeTensors> st_;
-    std::unique_ptr<MappedFile> file_;
+    std::unique_ptr<platform::MappedFile> file_;
     std::string err_;
 
     static bool low_first_default_;

@@ -21,8 +21,8 @@
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/mf_vae.hpp"
 #include "strata/image/qi_image_io.hpp"
-#include "strata/image/qi_vision.hpp"
-#include "strata/image/qi_text.hpp"
+#include "strata/core/vision.hpp"
+#include "strata/image/text_encoder.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -95,18 +95,18 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 // the text encoder: each prompt of the run (ids.npy, ids_lens.npy) encoded alone, its rows after the 34 of the
 // system turn against txt.npy
 int text(const std::string& gguf, const std::string& dir, const std::string& mmproj = "") {
-    constexpr int32_t kImagePad = 151655;
     const int64_t kDrop = mmproj.empty() ? 34 : 64;   // the system turn: generation's, an edit's
     void* s = strata::core::Runtime::get().create_stream();
-    strata::image::QiText te;
+    strata::image::TextEncoder te;
     std::string err;
-    if (!te.open(gguf, s, err)) throw std::runtime_error(err);
+    if (!te.open(gguf, 16384, err)) throw std::runtime_error(err);
+    const int32_t kImagePad = te.image_pad();   // the <|image_pad|> token, from the vocabulary
     te.set_final_norm(true);
     te.set_flat_positions(true);
     // an edit's images (as the processor took them: their sides the grid's 16-pixel patches) through the vision encoder
-    std::vector<strata::image::QiVisionOut> vouts;
+    std::vector<strata::core::VisionOut> vouts;
     if (!mmproj.empty()) {
-        strata::image::QiVision vis;
+        strata::core::Vision vis;
         if (!vis.open(mmproj, s, err)) throw std::runtime_error(err);
         for (int j = 0;; ++j) {
             const std::string f = dir + "/vl" + std::to_string(j) + ".png";
@@ -149,23 +149,24 @@ int text(const std::string& gguf, const std::string& dir, const std::string& mmp
     for (int64_t len : lens) {
         std::vector<int32_t> p(ids.begin() + (long) off, ids.begin() + (long) (off + len));
         off += (size_t) len;
-        std::vector<strata::image::QiText::Image> ims;   // the prompt's runs of image pads, image by image
+        std::vector<strata::image::TextEncoder::Picture> ims;   // the prompt's runs of image pads, image by image
         for (size_t i = 0, k = 0; i < p.size(); ++i) {
             if (p[i] != kImagePad || (i > 0 && p[i - 1] == kImagePad)) continue;
             if (k >= vouts.size()) throw std::runtime_error("image pads beyond the images (pass the mmproj)");
             const auto& v = vouts[k++];
-            strata::image::QiText::Image im;
+            strata::image::TextEncoder::Picture im;
             im.index = (int64_t) i;
-            im.rows = v.rows;
-            im.grid_h = v.grid_h;
-            im.grid_w = v.grid_w;
-            im.main = v.main.data();
+            im.nx = v.grid_w;
+            im.ny = v.grid_h;
+            im.rows = v.main.data();
             for (const auto& d : v.deepstack) im.deepstack.push_back(d.data());
             ims.push_back(im);
         }
-        te.encode(p, ims);   // warm
+        strata::gpu::stream_sync(s);   // the vision encoder's work first (the text encoder runs on its own stream)
+        te.encode(p, err, ims);   // warm
         const auto t0 = std::chrono::steady_clock::now();
-        const auto h = te.encode(p, ims);
+        const auto h = te.encode(p, err, ims);
+        if (h.empty()) throw std::runtime_error(err);
         std::printf("encode %lld tokens: %.1f ms\n", (long long) len, 1e3 * seconds_since(t0));
         got.insert(got.end(), h.begin() + kDrop * C, h.end());
     }
@@ -236,6 +237,10 @@ int vae(const std::string& path, const std::string& dir, const std::string& out_
         const auto got = fetch(rgb, img.size());
         compare("image", got.data(), img.data(), img.size());
         psnr(got, img);
+        if (!out_path.empty()) {   // the whole's decode beside the tiled one's
+            std::ofstream o(out_path + ".whole", std::ios::binary);
+            o.write(reinterpret_cast<const char*>(got.data()), (std::streamsize) (got.size() * 4));
+        }
         // in tiles: decode within a quarter of the whole's scratch (rgba 0 .. 1, back to -1 .. 1 for the PSNR)
         const uint64_t limit = v.scratch_bytes(h, w) / 4;
         float* rgba = nullptr;
@@ -462,7 +467,7 @@ int main(int argc, char** argv) {
                      "dit DIT.safetensors GOLDEN_DIR [q8|bf16 [VAE.safetensors OUT.f32]]\n", argv[0]);
         return 2;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-mf-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-mf-probe: %s\n", e.what());
         return 1;
     }
 }

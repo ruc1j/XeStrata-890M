@@ -26,6 +26,11 @@ from unittest import mock
 import serve.server as server
 
 
+def plain_popen(what, args, **kw):                 # the real process, without the lifeline's anchor and watcher
+    kw.pop("role", None)
+    return subprocess.Popen(args, **kw)
+
+
 class ReadyPipe(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -49,16 +54,18 @@ class ReadyPipe(unittest.TestCase):
         v = server.Vision.__new__(server.Vision)
         v.spawn = ([sys.executable, "-u", str(script)], None, None)
         v.dir = Path(self.tmp.name)
-        v.cache = {}
-        v.stopped, v.proc, v.dead = True, None, None
+        v.stopped, v.proc, v.dead, v.cache = True, None, None, {}
+        v.fallback = v.fallback_why = v.cpu_note = v.cpu_spawn = v.cpu_label = None
+        v.gpu_spawn, v.on_cpu, v.elastic, v.label = v.spawn, False, False, "the GPU encoder"
         return v
 
     def start(self, v):
         """v._start() with the process kept for cleanup; (the error or None, the text it printed, seconds taken)."""
         out, error, t0 = io.StringIO(), None, time.monotonic()
+        real = plain_popen
 
         def keep(what, args, **kw):
-            p = subprocess.Popen(args, **kw)
+            p = real(what, args, **kw)
             self.procs.append(p)
             return p
 

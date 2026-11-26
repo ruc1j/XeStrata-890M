@@ -109,7 +109,7 @@ inline std::string gpu_pause_stall_line(int64_t now, int64_t at_request, int64_t
 /// Upstream's owner-approved wording (11-11): kept word for word.
 inline std::string gpu_pause_request_line(int64_t at_start, int64_t at_end) {
     if (at_start < 0 || at_end < at_start || at_end - at_start < kGpuPauseReportMs) return "";
-    return "strata serve: the graphics driver paused the GPU for " + std::to_string(at_end - at_start) +
+    return "xestrata serve: the graphics driver paused the GPU for " + std::to_string(at_end - at_start) +
            " ms during this request while Linux moved memory the GPU uses; the request was slower by up to that much";
 }
 
@@ -119,7 +119,7 @@ inline std::string gpu_pause_request_line(int64_t at_start, int64_t at_end) {
 /// "during this request" and no "slower" clause (nothing was running); kept word for word.
 inline std::string gpu_pause_between_line(int64_t idle_from, int64_t at_begin) {
     if (idle_from < 0 || at_begin < idle_from || at_begin - idle_from < kGpuPauseReportMs) return "";
-    return "strata serve: the graphics driver paused the GPU for " + std::to_string(at_begin - idle_from) +
+    return "xestrata serve: the graphics driver paused the GPU for " + std::to_string(at_begin - idle_from) +
            " ms between requests while Linux moved memory the GPU uses";
 }
 

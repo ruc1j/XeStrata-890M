@@ -39,7 +39,7 @@ ROOT = C.ROOT
 REFS = ROOT / "data" / "bench-ref"
 TIERS = ("64k", "32k", "1k")          # the upstream merges' IQ3_XXS tiers (the longest first), as this config holds
 # --bench-verbose's extra run per tier: the engine's per-stage timings (kept out of the measured runs)
-STATS_ENV = {"STRATA_PREFILL_TIMING": "1", "STRATA_DECODE_TIMING": "1"}
+STATS_ENV = {"XESTRATA_PREFILL_TIMING": "1", "XESTRATA_DECODE_TIMING": "1"}
 GPU_LABEL = "PC"                      # the record's GPU name (the merges name their machines' GPUs)
 
 
@@ -125,7 +125,7 @@ def engine_lines(text: str) -> list[str]:
             if "session is up" in line:
                 out.append(line)
             break
-        if line.startswith(("strata", "INFO ")) or line.startswith(" " * 8):
+        if line.startswith(("xestrata", "strata", "INFO ")) or line.startswith(" " * 8):   # upstream's engine too
             out.append(line.rstrip())
     return out
 
@@ -134,20 +134,32 @@ def engine_lines(text: str) -> list[str]:
 def busy_engines() -> list[str]:
     """Strata engines or servers running now (any user's), which would share the GPU with the measurements."""
     found = []
-    for p in Path("/proc").iterdir():
-        if not p.name.isdigit() or int(p.name) == os.getpid():
-            continue
-        try:
-            argv = (p / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        words = [w.decode("utf-8", "replace") for w in argv if w]
-        if not words:
+    for pid, words in command_lines():
+        if pid == os.getpid() or not words:
             continue
         exe = os.path.basename(words[0])
-        if (exe.startswith("strata") and "--serve" in words) or any(w.endswith("serve/server.py") for w in words):
-            found.append(f"{p.name} {' '.join(words[:3])}")
+        engine = exe.startswith(("xestrata", "strata"))   # XeStrata's or upstream's
+        if (engine and "--serve" in words) or \
+                any(w.replace("\\", "/").endswith("serve/server.py") for w in words):
+            found.append(f"{pid} {' '.join(words[:3])}")
     return found
+
+
+def command_lines() -> list[tuple[int, list[str]]]:
+    """Every process's id and command line: /proc on Linux, psutil on Windows (#48)."""
+    if C.WIN:
+        import psutil
+        return [(q.info["pid"], q.info["cmdline"] or []) for q in psutil.process_iter(["pid", "cmdline"])]
+    out = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            argv = (d / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        out.append((int(d.name), [w.decode("utf-8", "replace") for w in argv if w]))
+    return out
 
 
 # ------------------------------------------------------------------------------------------------ the machine
@@ -217,6 +229,17 @@ CPU_ISA = ("avx2", "fma", "f16c", "avx_vnni", "avx512f", "avx512bw", "avx512vl",
 
 
 def cpu_facts() -> dict:
+    if sys.platform == "win32":  # #48: no /proc; the name from the registry, the ISA not read (the engine's log has it)
+        import psutil
+        import winreg
+        name: str | None
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+                name = str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).strip()
+        except OSError:
+            name = platform.processor() or None
+        return {"name": name, "isa": [], "threads": os.cpu_count(), "cores": psutil.cpu_count(logical=False),
+                "hybrid": None, "numa_nodes": None, "sockets": None}
     txt = read("/proc/cpuinfo", "") or ""
     flags = set((grab(r"^flags\s*:\s*(.*)$", txt, str) or "").split())
     cores = {(m[0], m[1]) for m in re.findall(r"^physical id\s*:\s*(\d+)\s*$[\s\S]*?^core id\s*:\s*(\d+)", txt, re.M)}
@@ -229,7 +252,9 @@ def cpu_facts() -> dict:
 
 
 def storage_of(path: Path) -> dict:
-    """The kind of disk a folder is on (NVMe, SATA SSD, HDD) and its model, from sysfs."""
+    """The kind of disk a folder is on (NVMe, SATA SSD, HDD) and its model, from sysfs (Linux only: none on Windows)."""
+    if C.WIN:
+        return {}
     try:
         st = os.stat(path)
         dev = Path(f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}").resolve()
@@ -259,9 +284,16 @@ def environment(cfg: dict, gpus: list[dict], data: Path) -> dict:
         build = json.loads((exe.parent / "BUILD.json").read_text())
     except (OSError, ValueError):
         build = {}
-    os_name = grab(r'^PRETTY_NAME="?([^"\n]*)', read("/etc/os-release", "") or "", str)
+    if C.WIN:
+        import psutil
+        os_name = f"Windows {platform.release()} ({platform.version()})"
+        ram = psutil.virtual_memory().total
+    else:
+        os_name = grab(r'^PRETTY_NAME="?([^"\n]*)', read("/etc/os-release", "") or "", str)
+        ram = int(grab(r"^MemTotal:\s+(\d+)", read("/proc/meminfo", "") or "", int) or 0) * 1024
     env = {k: v for k, v in {**os.environ, **{str(k): str(v) for k, v in (cfg.get("env") or {}).items()}}.items()
-           if k.startswith(("STRATA_", "ONEAPI_", "SYCL_", "UR_", "ZE_", "CUDA_", "HIP_", "ROCR_", "HSA_"))}
+           if k.startswith(("XESTRATA_", "STRATA_",   # and upstream's names
+                            "ONEAPI_", "SYCL_", "UR_", "ZE_", "CUDA_", "HIP_", "ROCR_", "HSA_"))}
     args = cfg.get("args", [])
     return {
         "xestrata": {k: build.get(k) for k in BUILD_KEYS if k in build},
@@ -269,8 +301,9 @@ def environment(cfg: dict, gpus: list[dict], data: Path) -> dict:
                                         "gfx", "uma_gb") if k in g} for g in gpus],
         "drivers": drivers({g.get("vendor") for g in gpus}),
         "cpu": cpu_facts(),
-        "ram_gib": round(int(grab(r"^MemTotal:\s+(\d+)", read("/proc/meminfo", "") or "", int) or 0) / 2**20, 1),
+        "ram_gib": round(ram / 2**30, 1),
         "os": os_name,
+        "system": platform.system(),
         "data_disk": storage_of(data),
         "model": {"name": cfg.get("model_name"), "context": context_of(args), "kv": arg_of(args, "--kv"),
                   "images": "--vision" in args, "parallel": cfg.get("parallel"),
@@ -285,8 +318,8 @@ def model_files(args: list[str]) -> list[str]:
 
 
 def hw_bench(exe: str, env: dict, cwd: str | None, args: list[str], log: Path) -> dict:
-    """The engine's measurement of this machine (strata --hw-bench): the RAM's read bandwidth with the expert pool's
-    threads and with one, the copies over PCIe each way, the SSD under the model.  `HW key value` lines."""
+    """The engine's measurement of this machine (xestrata-engine --hw-bench): the RAM's read bandwidth with the expert
+    pool's threads and with one, the copies over PCIe each way, the SSD under the model.  `HW key value` lines."""
     cmd = [exe, "--hw-bench", *model_files(args)]
     try:
         r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=300)
@@ -307,12 +340,13 @@ def hw_bench(exe: str, env: dict, cwd: str | None, args: list[str], log: Path) -
 # the paths the kernels are measured on: the one the engine takes here, then the device without its matrix engines,
 # and without their BF16 combinations (the switches AGENTS.md checks a small card with)
 KERNEL_VARIANTS: tuple[tuple[str, dict[str, str]], ...] = (
-    ("default", {}), ("no-xmx", {"STRATA_NO_XMX": "1"}), ("no-bf16-mma", {"STRATA_NO_BF16_MMA": "1"}))
+    ("default", {}), ("no-xmx", {"XESTRATA_NO_XMX": "1"}), ("no-bf16-mma", {"XESTRATA_NO_BF16_MMA": "1"}))
 
 
 def kernel_bench(exe: str, env: dict, cwd: str | None, pack: str | None, log: Path) -> list[dict]:
-    """The prompt path's products on synthetic data of the model's shapes (strata --kernel-bench, `KB <kernel> <path>
-    <shape> <us>` lines), once on each of KERNEL_VARIANTS; "default" is the path the engine takes on this device."""
+    """The prompt path's products on synthetic data of the model's shapes (xestrata-engine --kernel-bench, `KB <kernel>
+    <path> <shape> <us>` lines), once on each of KERNEL_VARIANTS; "default" is the path the engine takes on this
+    device."""
     rows: list[dict] = []
     with open(log, "w", encoding="utf-8") as f:
         for variant, extra in KERNEL_VARIANTS:
@@ -337,7 +371,7 @@ class Sampler:
 
     def __init__(self, gpu_pci: str | None):
         from serve.telemetry import Telemetry
-        self.t = Telemetry(gpu_pci=gpu_pci)
+        self.t = Telemetry(gpus=[{"pci": gpu_pci, "roles": ["text"]}])
         self.tag: str | None = None
         self.rows: dict[str, list] = {}
         self.stop = False
@@ -450,8 +484,11 @@ def summary_md(rec: dict) -> str:
                m["xestrata"].get("license"),
                f"{comp.get('id') or ''} {str(comp.get('version') or '').split(' build based')[0]}".strip()) if x)
            + ")",
-           f"- GPU: {gpu}", f"- CPU: {m['cpu']['name']} ({', '.join(m['cpu']['isa'])}), RAM {m['ram_gib']} GiB",
-           f"- OS: {m['os']}, Linux {m['drivers']['kernel']}; data folder on {m['data_disk'].get('kind') or '?'}",
+           f"- GPU: {gpu}",
+           f"- CPU: {m['cpu']['name']}" + (f" ({', '.join(m['cpu']['isa'])})" if m['cpu']['isa'] else "") +
+           f", RAM {m['ram_gib']} GiB",
+           f"- OS: {m['os']}, {m.get('system', 'Linux')} {m['drivers']['kernel']}; data folder on "
+           f"{m['data_disk'].get('kind') or '?'}",
            f"- Model: {m['model']['name']}, context {m['model']['context']}, KV {m['model']['kv']}"]
     hw = rec.get("hw") or {}
     if "ram_read_gb_s" in hw:
@@ -561,12 +598,19 @@ def xe_license(cfg: dict) -> str:
 
 
 def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, original: str | None = None,
-        say: Callable = print, rounds: int = C.ROUNDS, temperature: float = C.TEMPERATURE) -> Path:
-    """Measure; write records/bench-<time>/ and return its summary.md."""
+        say: Callable = print, rounds: int = C.ROUNDS, temperature: float = C.TEMPERATURE,
+        cards: list[str] | None = None) -> Path:
+    """Measure; write records/bench-<time>/ and return its summary.md.  `cards`: the GPUs' PCI addresses to run on
+    instead of the config's, the first one first (setup's --gpu / --gpus for this bench only; #49)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    if cards:
+        cfg = {k: v for k, v in cfg.items() if k not in ("gpu", "split_pci")}
+        cfg["gpu_pci"] = cards[0]
+        if len(cards) > 1:
+            cfg["split_pci"] = cards[1:]
     busy = busy_engines()
     if busy:
-        raise BenchError("a Strata engine or server is running and would share the GPU with the measurements; stop "
+        raise BenchError("an XeStrata engine or server is running and would share the GPU with the measurements; stop "
                          "it first (" + "; ".join(busy[:3]) + ")")
     out = data / "records" / f"bench-{time.strftime('%Y%m%d-%H%M%S')}"
     extra_dir = out / "verbose"
@@ -675,7 +719,9 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
         rec["verbose"]["kernels"] = kernel_bench(xe.cmd[0], xe.env, xe.cwd, arg_of(cfg["args"], "--pack"),
                                                  extra_dir / "kernel-bench.txt")
         rec["verbose"]["fingerprint"] = {t: [r.get("output_sha256_64") for r in runs] for t, runs in gen.items()}
-        ref = REFS / f"{cfg.get('model_name')}.csv"
+        # the model's reference, also one kept under a name it had before (its aliases)
+        ref = next((REFS / f"{x}.csv" for x in [cfg.get("model_name"), *(cfg.get("aliases") or [])]
+                    if (REFS / f"{x}.csv").exists()), REFS / f"{cfg.get('model_name')}.csv")
         if ref.exists() and not split:
             say("  The answer against the development machine's (top-1 agreement) ...")
             log = extra_dir / "reference-1k.txt"

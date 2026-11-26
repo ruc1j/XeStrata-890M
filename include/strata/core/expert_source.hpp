@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstddef>
 #include <condition_variable>
@@ -52,6 +53,7 @@ struct ExpertLayout;
 namespace strata::core {
 
 class RemoteExperts;
+class LatentDense;
 struct LoadStats;
 
 namespace detail {
@@ -106,6 +108,16 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/me
 /// from the files through the page cache); `why` gets the numbers either way, for the log.
 bool resident_pin_fits(uint64_t copy, uint64_t in_place, uint64_t headroom, uint64_t available, std::string& why);
 
+/// The RAM the user asked XeStrata to leave free for other programs (setup's --ram-reserve-gib): the engine's
+/// --ram-reserve-mib (set_ram_reserve_bytes), else STRATA_RAM_RESERVE_MIB, which the server gives the image engine;
+/// 0 when none was asked.
+uint64_t ram_reserve_bytes();
+void set_ram_reserve_bytes(uint64_t bytes);
+
+/// A headroom kept free beside a RAM copy or cache, raised to the RAM reserve: the copy (an engine's experts, the
+/// image engine's streamed layers) takes less, so the reserve stays free.
+inline uint64_t ram_headroom(uint64_t headroom) { return std::max(headroom, ram_reserve_bytes()); }
+
 /// #4051 (upstream 07d5ecfac): wait for the RAM an arena needs to come back.  An engine that was still exiting (or a
 /// program that was ending) holds memory a few seconds longer than its process; loading into that shortfall sent a 60 GiB
 /// host into reclaim for good.  Calls `sample(available)` (false: the RAM cannot be read; the wait ends) every `step_s`
@@ -117,9 +129,10 @@ bool wait_for_ram(uint64_t need, double max_wait_s, double step_s, double note_s
                   const std::function<void(double, uint64_t)>& progress, double& waited, uint64_t& available);
 
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
-/// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.
+/// `blob_sizes` has one entry per (layer, expert), in that order.  Kept CPU-only so selection and byte
+/// accounting can be tested without initializing a GPU.
 bool make_cache_complement_plan(
-    int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+    int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& blob_sizes,
     const std::vector<std::pair<int32_t, int32_t>>& primary_gpu_pairs,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs,
     std::vector<uint64_t>& offsets, uint64_t& bytes, std::string& err);
@@ -147,7 +160,7 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 /// over; a stage's walk stops at the first pair that does not fit `cap_bytes` and the NEXT stage's walk still runs
 /// (the pairs past the cap keep the mapped-file fallback they had).  Returns the pairs added, or -1 - leaving the
 /// plan untouched - when a pair is outside the geometry or a region repeats one (upstream aea9dc3e).
-int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& blob_sizes,
                                   std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t cap_bytes,
                                   const std::vector<std::vector<std::pair<int32_t, int32_t>>>& regions,
                                   std::string& err);
@@ -218,11 +231,14 @@ public:
     /// Whether every blob device_alias names is registered on engine device `device` (register_on), which a CUDA or
     /// HIP GPU's kernels then read in place (gpu::kernels_read_host).
     virtual bool registered_on(int device) const { (void) device; return false; }
+    /// A layer split's later GPU copies from the arena for as long as the engine runs: its registration (register_on)
+    /// is kept, and where that GPU is of another runtime the arena stays out of host USM (PinnedArena::to_host_usm)
+    virtual void hold_registration(int device) { (void) device; }
     /// Disk sessions: the files this source read its experts from, as (role, path), resolved by the loader itself
     /// - the pack's experts.bin, or every GGUF tensor native_experts.txt named, per layer and role
     /// ("expert blk.L.ffn_up").  Filled by open(); empty before.
     const std::vector<std::pair<std::string, std::string>>& model_inputs() const { return inputs_; }
-    /// The blob's bytes into `dst` (blob_bytes(layer) of them).  Safe from several threads for a source whose
+    /// The blob's bytes into `dst` (blob_bytes(layer, expert) of them).  Safe from several threads for a source whose
     /// `transient` can be true.
     virtual bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst);
     /// Asks the OS for these pairs' bytes ahead of the `blob` calls that read them.  False (nothing asked) by default.
@@ -322,7 +338,7 @@ struct GpuPlanSink {
     int64_t cap = 0;
     void (*publish)(void* ctx) = nullptr;
     /// Starts the DMA copies of `n` host blobs (pinned) into staging slots 0..n-1 and signals the GPU when they land.
-    void (*fetch)(void* ctx, const uint8_t* const* src, int n, size_t bytes) = nullptr;
+    void (*fetch)(void* ctx, const uint8_t* const* src, int n, const size_t* bytes, size_t stride) = nullptr;
     void* ctx = nullptr;
     /// Plan v0.3 P6: how a PCIe group reaches the GPU.  0 = the copy engine stages it (DMA, `fetch`); 1 = the grouped
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
@@ -441,6 +457,21 @@ struct ExpertDispatch {
 
     std::vector<strata::kernels::cpu::ExpertJob> jobs;
     strata::kernels::cpu::ActQ act;
+
+    // ---- the latent MoE (Edge0): the CPU share runs the A-blob experts on the host over the D stage's rows
+    // (the window computed D on the GPU and published them through the doorbell), then either hands its q8_1
+    // rows of h to the GPU's U (lat_u_gpu, the mapped out buffer holds them) or computes U itself.
+    bool latent = false;
+    int64_t lat_H = 0, lat_ELL = 0, lat_I = 0;
+    int lat_G = 8, lat_E = 0;
+    int lat_fmt = 8;                 ///< the D/U pack's format (8 Q8_0 / 4 Q4_0)
+    bool lat_u_gpu = true;           ///< XESTRATA_LATENT_U_GPU: the CPU share's U on the GPU
+    const int32_t* lat_labels = nullptr;   ///< [layers * E] group labels, host
+    const float* lat_xl = nullptr;         ///< mapped: the D stage's f32 rows (row t*G + g)
+    const uint32_t* lat_xlseq = nullptr;   ///< mapped: the D stage's doorbell (layer + 1)
+    const uint8_t* lat_act0 = nullptr;     ///< mapped: the D rows as Q8_0, GPU-made (nullptr: host quantizes)
+    int64_t lat_tb = 0;                    ///< the group's first token in the window (the D rows are the window's)
+    const strata::core::LatentDense* lat_dense = nullptr;   ///< the D/U file, mapped (the CPU U reads it)
     /// Plan v0.3 P6 verify window: one quantized activation per token, the multi-token jobs, and the expert ->
     /// job map (reset after every layer).
     std::vector<strata::kernels::cpu::ActQ> act_multi;
@@ -528,12 +559,54 @@ struct PcieSplitTimes {
 /// native format; `layer` < 0 picks the first such layer and gets it.  False, with `why`, when no layer has enough such
 /// experts or the pack is not native.
 bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, double& c, int64_t& layer, std::string& why);
+/// The CPU side before anything is loaded (--layer-split auto prices a placement's misses by it): the time `c` (ms)
+/// one more expert takes `pool`, timed as measure_cpu_expert_ms times it, on 64 stand-ins of `layer`'s experts - their
+/// formats and sizes (each expert's own in a mixed pack), arbitrary bytes - and their mean size `bytes`.  False, with
+/// `why`, when the pack is not native.
+bool measure_cpu_expert_ms_unloaded(strata::kernels::cpu::ExpertPool& pool, int64_t layer, double& c, double& bytes,
+                                    std::string& why);
+/// The CPU side on ONE expert, for a decision a start may spend about 100 ms on where measure_cpu_expert_ms takes
+/// about half a second: the same call, 32 rounds after 30 ms of calls, the median.  False, with `why`, as above.
+bool measure_cpu_expert_one_ms(ExpertDispatch& d, int64_t n_layers, double& c, int64_t& layer, std::string& why);
+/// STRATA_PCIE_MIN1: whether the PCIe lane's floor under a FIXED share pays (one of two misses over PCIe).  Decided
+/// once at the start (setup_pcie_split, pcie_min1_worth) when the share is fixed and the switch is auto; forced 0/1 by
+/// the environment.  False where the split is measured (that split has its own floor) and before the probe ran.
+bool pcie_min1_on();
+/// The probe behind it: the CPU's one expert, one and two experts over PCIe, and the GPU's compute of one, from one
+/// layer; the rule is pcie_split_m's for two misses and no hits.  False, with `why`, when a side cannot be timed.
+bool pcie_min1_worth(ExpertDispatch& d, int64_t n_layers, std::string& why);
 /// Of `f` missed experts of a group with `h` VRAM hits: the number read over PCIe.  The GPU computes its hits, then
 /// (`overlap`: beside them) fetches the `m` and computes them; the CPU computes the other `f - m`; both at their times
 /// beside each other when both work.  The `m` that makes the later side earliest, taken only when that is at least 10%
 /// earlier than the CPU taking all `f` (the times are measured alone and on few experts: a split by a thin margin
 /// lost on the B70 with the VRAM of a small card); else 0.
 int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h);
+/// The prompt's CPU share measured on its own layers: the CPU's ms per expert and the GPU's per streamed expert of the
+/// layers that shared, each a running mean (weight 0.25 of the newest), and the share g / (c + g) they give, in
+/// [0.05, 0.9] (0.5 before any reading).
+struct CpuShareMeter {
+    double c_ms = 0.0, g_ms = 0.0, share = 0.5;
+    void add(double cpu_ms, int64_t n_cpu, double gpu_ms, int64_t n_gpu) {
+        if (n_cpu <= 0 || n_gpu <= 0) return;
+        constexpr double a = 0.25;
+        const double c = cpu_ms / (double) n_cpu, g = gpu_ms / (double) n_gpu;
+        c_ms = c_ms > 0 ? c_ms + a * (c - c_ms) : c;
+        g_ms = g_ms > 0 ? g_ms + a * (g - g_ms) : g;
+        share = std::clamp(g_ms / (c_ms + g_ms), 0.05, 0.9);
+    }
+};
+
+/// How many of a prompt chunk's layer's `missed` experts the CPU takes (both engines' rule): `fixed` of them where it is
+/// >= 0 (--prefill-cpu-share), else the share `meter` measured on the prompt's layers, else what the decode's split
+/// times (`split`, after Project Maya's CPU lane) leave the CPU beside `hits` VRAM hits, else none.
+inline int64_t cpu_share_count(int64_t missed, int64_t hits, double fixed, const CpuShareMeter* meter,
+                               const PcieSplitTimes* split) {
+    if (missed <= 0) return 0;
+    if (fixed >= 0.0) return std::llround(fixed * (double) missed);
+    if (meter != nullptr) return std::llround(meter->share * (double) missed);
+    if (split != nullptr) return missed - pcie_split_m(*split, true, (int) missed, (int) hits);
+    return 0;
+}
 /// All of `t`, measured once at start on the window's own kernels: the CPU's side (measure_cpu_expert_ms), the GPU
 /// computing experts from its memory, the PCIe fetch of experts in RAM, and the CPU's and the link's sides beside each
 /// other from the rate the memory serves.  False, with `why`, when a side cannot be timed (too few experts in RAM).
@@ -548,11 +621,18 @@ bool setup_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, bo
 /// 64K prompt the reading came out up to 3x low on the RX 9060 XT's machine).
 void read_memory_rate_before(const ExpertDispatch& d, int64_t n_layers);
 
-/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 (tail_skip_default.hpp).
+/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 (tail_skip_default.hpp); "auto": 0 until the
+/// serve start-up sets rank 7 where its rule allows (tail_skip_auto).
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
+/// STRATA_ROUTE_TAIL_SKIP=auto: the serve start-up's rule picks the rank (7, or off with every expert in VRAM, 90% or
+/// more cached, or --batch slots)
+bool tail_skip_auto();
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic = strata::kernels::cpu::NativeArithmetic::Default);
+/// The routing counts expert_pool_dispatch_multi keeps for layer d.layers (d.usage, or d.route_rec by window), for a
+/// window whose experts ran without the pool (every one in VRAM: MoeWindow::resident_plan).
+void expert_pool_count(ExpertDispatch& d, const int32_t* ids, int64_t n_tok, int64_t k);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about
@@ -839,6 +919,14 @@ public:
     }
     /// The page cache's room (see the gate) over the experts' bytes; 0 when unknown.
     double cache_room_ratio() const;
+    /// Upstream 3220dbc0e0, a5104df5bf: a GPU that shares the system RAM (integrated_gpu: its "VRAM" is the RAM) and
+    /// holds every expert in its cache reads nothing from the files again, and the pages the start read from them are
+    /// a second copy of the cache's bytes.  Gives them back, expert by expert: madvise(MADV_DONTNEED) on the blob's
+    /// whole pages in this source's mappings, then posix_fadvise(DONTNEED) on the same file range (clean pages, no
+    /// root needed; a page shared with a neighbouring blob stays).  `keep(layer, expert)` true keeps that expert's
+    /// pages (the experts of the slots the prompt path borrows: their refill reads them again).  The mappings stay; a
+    /// later read faults the bytes in from the file.  Returns the bytes released (0: nothing, or not Linux).
+    uint64_t drop_cached_pages(const std::function<bool(int64_t, int64_t)>& keep);
 
 private:
     /// The RAM copy's blob of residency index `index` (through the rotation's ownership table when it is on), or null
@@ -850,7 +938,7 @@ private:
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
-    void publish_stage(size_t v, int64_t layer, bool ok, double us);
+    void publish_stage(size_t v, int64_t layer, int64_t expert, bool ok, double us);
     struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);
@@ -966,6 +1054,8 @@ private:
         const ComplementChunk* c = chunk_of(chunks, offset);
         return c->host + (size_t) (offset - c->start);
     }
+    /// A free span for a RAM replacement, counting the outgoing expert as free. kNoComplement means no fit.
+    uint64_t replacement_offset(size_t outgoing, uint64_t bytes) const;
     uint8_t* complement_at(uint64_t offset) const {
         return complement_chunks_.empty() ? (uint8_t*) complement_host_ + (size_t) offset
                                           : chunk_at(complement_chunks_, offset);
@@ -988,7 +1078,7 @@ private:
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
     std::vector<int> layer_dev_;              ///< layer_devices: each layer's engine device (empty: one runtime)
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
-    struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
+    struct Exchange { size_t in, out; int64_t q; uint64_t bytes, at; };
     std::vector<Exchange> staged_;
     uint8_t* xstage_ = nullptr;               ///< exchange buffers, `xstage_cap_ x xstage_blob_`
     std::vector<std::pair<int, std::vector<void*>>> stage_reg_;   ///< register_on: a device, its registrations
@@ -1022,6 +1112,7 @@ class ArenaExpertSource : public ExpertSource {
 public:
     bool register_on(int device, std::string& err) override;
     bool registered_on(int device) const override;
+    void hold_registration(int device) override;
     ArenaExpertSource() = default;
     ~ArenaExpertSource() override;
     ArenaExpertSource(const ArenaExpertSource&) = delete;
@@ -1034,6 +1125,13 @@ public:
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's shard 1.
     void set_gguf(const std::string& shard1) { gguf_ = shard1; }
     void close();
+    /// Before an unload that must leave RAM free (the server's ARENA DROP): marks the coldest experts of a shared
+    /// arena dropped, at least `want_bytes` of them - those `ranked` (a profile, hottest first) does not hold, then
+    /// its last ones - so the next engine on it reads only those again.  `ranges`: their (offset, bytes) in the
+    /// shared file, adjacent ones joined, which the server punches out once this engine has ended; `dropped`: their
+    /// bytes.  False (and `err`) without a shared arena.
+    bool drop_cold(uint64_t want_bytes, const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                   std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t& dropped, std::string& err);
 
     bool mapped() const { return base_ != nullptr; }
     /// STRATA_ARENA_MMAP: the arena is a file mapped read-only, its experts read from the drive as they are used
@@ -1087,13 +1185,27 @@ private:
     std::string gguf_;
 };
 
+/// The engines' `ARENA DROP <mib> <file>` (server.py's arena_drop, before it unloads the engine to make room in RAM):
+/// `arena`'s coldest experts (by `ranked`, hottest first) of at least <mib> marked dropped (drop_cold), their ranges in
+/// the shared file written to <file> as "offset bytes" lines -> `answer`, "ARENA dropped_mib=N ranges=N".  False (and
+/// `err`) for a malformed line or an arena that cannot.
+bool arena_drop_command(ArenaExpertSource& arena, const std::string& line,
+                        const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& answer, std::string& err);
+
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
 /// The routed experts of a GGUF model read in place (no pack, no experts.bin) as the process-wide expert layout: per
 /// MoE layer i (the model's block moe_blocks[i]), the gate / up / down types, the blob, and the tensors' files and
 /// offsets in the shards of `gguf`'s model (any of its shards).  Gate and up are [n_embd, n_ff, n_expert], down
 /// [n_ff, n_embd, n_expert].  A FileExpertSource reads it with set_gguf(`gguf`) and no experts.bin.
+/// `folded_ok`: take Hadamard-folded experts (prism.hadamard) too, whose layout a check reads (--check-model) though
+/// only a pack can run them.
 bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>& moe_blocks, int64_t n_expert,
-                             int64_t n_embd, int64_t n_ff, std::string& err);
+                             int64_t n_embd, int64_t n_ff, std::string& err, bool folded_ok = false);
+/// What keeps the process-wide expert layout's layers off the GPU, a line a layer (empty: nothing): types
+/// native_expert_supported has no kernels for, or (`mixed_gu` false: Qwen3.8's experts, which take one gate/up type)
+/// a gate and up of different types.  Both engines check it at startup, before anything is allocated (upstream
+/// efeffd8): an unsupported type would only fail inside the first window.  --check-model reports it.
+std::vector<std::string> native_layer_problems(bool mixed_gu);
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst,
                           const strata::kernels::cpu::ExpertLayout& lay, int threads);
 

@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/moss_text_probe.cpp - strata-image-moss-text-probe: MOSS-Image's text encoder (MossText) against the
+// src/image/moss_text_probe.cpp - strata-image-moss-text-probe: MOSS-Image's text encoder (TextEncoder) against the
 // reference pipeline's states of the same prompts (diffusers' MOSS-Image pipeline, its ids-NAME.npy and te-NAME.npy:
 // int32 token ids and float32 [tokens][4096] states after the final norm).
 //
@@ -11,7 +11,7 @@
 // difference, and the encoder's time; and the load's.  MOSS_LAYER_BUDGET_MIB: the blocks' VRAM (the rest streamed).
 
 #include "strata/core/runtime.hpp"
-#include "strata/image/moss_text.hpp"
+#include "strata/image/text_encoder.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -58,15 +58,15 @@ int main(int argc, char** argv) {
     const bool files = argc >= 2 && std::strcmp(argv[1], "--states") == 0;
     const int a0 = files ? 2 : 1;   // the GGUF (or the states' folder), then REF_DIR
     if (argc < a0 + 2) {
-        std::fprintf(stderr, "usage: strata-image-moss-text-probe QWEN3.5-9B.gguf REF_DIR [NAME...]\n"
-                             "       strata-image-moss-text-probe --states DIR REF_DIR [NAME...]\n");
+        std::fprintf(stderr, "usage: xestrata-image-moss-text-probe QWEN3.5-9B.gguf REF_DIR [NAME...]\n"
+                             "       xestrata-image-moss-text-probe --states DIR REF_DIR [NAME...]\n");
         return 2;
     }
     std::vector<std::string> names;
     for (int i = a0 + 2; i < argc; ++i) names.emplace_back(argv[i]);
     if (names.empty()) names = {"short", "text", "layout", "negative"};
     try {
-        strata::image::MossText te;
+        strata::image::TextEncoder te;
         std::string err;
         if (!files) {
             strata::core::Runtime::get();
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
             const uint64_t budget = b != nullptr && *b != '\0' ? std::strtoull(b, nullptr, 10) << 20 : UINT64_MAX;
             const auto t0 = std::chrono::steady_clock::now();
             if (!te.open(argv[a0], 4096, err, budget)) {
-                std::fprintf(stderr, "strata-image-moss-text-probe: %s\n", err.c_str());
+                std::fprintf(stderr, "xestrata-image-moss-text-probe: %s\n", err.c_str());
                 return 1;
             }
             std::printf("open %.0f ms, blocks %.2f GB, %d resident, %.2f GB of VRAM\n",
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
             if (files) {
                 std::string p = argv[a0];
                 p.append("/").append(n).append(".ste");
-                if (!strata::image::MossText::read_states(p, got, rows, width, err)) got.clear();
+                if (!strata::image::TextEncoder::read_states(p, got, rows, width, err)) got.clear();
             } else {
                 got = te.encode(ids, err);
                 width = te.hidden();
@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
         }
         return bad == 0 ? 0 : 1;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-moss-text-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-moss-text-probe: %s\n", e.what());
         return 1;
     }
 }

@@ -65,7 +65,7 @@ def _num(v, default=0):
 
 def render(m: dict, lat: dict) -> str:
     """The text for one scrape.  `m` is Service.metrics(), `lat` Latencies.snapshot()."""
-    model = str((m.get("engine") or {}).get("model") or "strata").replace("\\", "\\\\").replace('"', '\\"')
+    model = str((m.get("engine") or {}).get("model") or "xestrata").replace("\\", "\\\\").replace('"', '\\"')
     lab = f'model_name="{model}"'
     live, totals = m.get("live") or {}, m.get("totals") or {}
     out = []
@@ -95,7 +95,7 @@ def render(m: dict, lat: dict) -> str:
            _num(totals.get("drafts_offered")))
     metric("vllm:spec_decode_num_accepted_tokens_total", "counter", "MTP draft tokens accepted.",
            _num(totals.get("drafts_accepted")))
-    metric("vllm:num_preemptions_total", "counter", "Preempted requests (Strata does not preempt).", 0)
+    metric("vllm:num_preemptions_total", "counter", "Preempted requests (XeStrata does not preempt).", 0)
     for name, key, help_ in (("vllm:time_to_first_token_seconds", "ttft", "Time to the first token."),
                              ("vllm:inter_token_latency_seconds", "itl", "Time between two tokens."),
                              ("vllm:e2e_request_latency_seconds", "e2e", "A request from start to end.")):
@@ -157,13 +157,19 @@ def strata(m: dict, out: list, lab: str):
                              ("gpu_temp_celsius", "temp", "GPU temperature (hardware.gpu_temp)."),
                              ("gpu_power_watts", "power", "GPU power draw (hardware.gpu_power).")):
         for g in gpus:                                   # a family's samples together, one per card
-            metric(name, "gauge", help_, g.get(key), f',gpu="{g.get("index")}"')
+            role = "+".join(g.get("roles") or ())        # what the card does: text, image, helper (gpu_roles)
+            metric(name, "gauge", help_, g.get(key), f',gpu="{g.get("index")}"' + (f',role="{role}"' if role else ""))
     guard = m.get("loop_guard") or {}
     for key, help_ in (("detected", "Loops the loop guard saw in answers (loop_guard.detected)."),
                        ("penalised", "Loops broken with a short repetition penalty (loop_guard.penalised)."),
                        ("thinking_closed", "Loops in the thinking that closed it (loop_guard.thinking_closed)."),
                        ("stopped", "Answers the loop guard ended, a loop that came back (loop_guard.stopped).")):
         metric(f"loop_guard_{key}_total", "counter", help_, guard.get(key))
+    sguard = m.get("script_guard") or {}
+    for key, help_ in (("requests", "Requests the script guard applied to (script_guard.requests)."),
+                       ("rewinds", "Banned characters spelt in byte tokens and written again (script_guard.rewinds)."),
+                       ("passed", "Banned characters let through (script_guard.passed).")):
+        metric(f"script_guard_{key}_total", "counter", help_, sguard.get(key))
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
     metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
     metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))

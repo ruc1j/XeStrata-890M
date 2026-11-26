@@ -11,6 +11,8 @@
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
+#include "strata/image/gpu_buf.hpp"
+
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -25,60 +27,27 @@ namespace {
 
 using strata::kernels::f16_from_f32;
 
-sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
-
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) n * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (HunyuanImage 3.0 SigLIP2): GPU memory: ") +
-                                 gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
-
-// qkv [P][3 C] (FP32: q, k, v side by side) -> q16 [H][P][Dp], k16 [H][np][Dp], vt16 [H][Dp][np] in FP16, the
-// head_dim D padded to Dp and the n real keys to np with zeros (the products' shapes)
-void heads_split(const float* qkv, int64_t P, int64_t n, int64_t np, int64_t C, int64_t H, int64_t D, int64_t Dp,
-                 uint16_t* q16, uint16_t* k16, uint16_t* vt16, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (H * P * Dp)), [=](sycl::id<1> id) {
+// qkv [P][3 C] (FP32: q, k, v side by side; the three biases are read here, qkv is read nowhere else) -> the
+// shared attention's rows q16, k16, v16 [P][H][128] in FP16, the head's D channels and the rest zero.  q carries
+// sqrt(128 / D): qi_attention divides by sqrt(128) over the 128-wide head, and the model wants 1 / sqrt(D) (the
+// same trick qi_vision's reader uses).  k's and v's rows past n are zero: the padded patches attend only to the
+// real keys (the pixel mask), and the keys past `n` are read in whole chunks of 64.
+void heads_to_shared(const float* qkv, const float* bq, const float* bk, const float* bv, int64_t P, int64_t n,
+                     int64_t C, int64_t H, int64_t D, float q_scale, uint16_t* q16, uint16_t* k16, uint16_t* v16,
+                     void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (H * P * 128)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        const int64_t d = i % Dp, p = (i / Dp) % P, h = i / (Dp * P);
-        q16[i] = d < D ? f16_from_f32(qkv[p * 3 * C + h * D + d]) : (uint16_t) 0;
+        const int64_t d = i % 128, h = (i / 128) % H, p = i / (128 * H);
+        q16[i] = d < D ? f16_from_f32((qkv[p * 3 * C + h * D + d] + bq[h * D + d]) * q_scale) : (uint16_t) 0;
     });
-    q_of(s).parallel_for(sycl::range<1>((size_t) (H * np * Dp)), [=](sycl::id<1> id) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (2 * H * P * 128)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        const int64_t d = i % Dp, j = (i / Dp) % np, h = i / (Dp * np);
-        const bool real = d < D && j < n;
-        k16[i] = real ? f16_from_f32(qkv[j * 3 * C + C + h * D + d]) : (uint16_t) 0;
-        vt16[(h * Dp + d) * np + j] = real ? f16_from_f32(qkv[j * 3 * C + 2 * C + h * D + d]) : (uint16_t) 0;
-    });
-}
-
-// p16[r][j] = FP16(softmax(scale * sc[r][0 .. n))) for j < n, 0 past it (the padded keys), rows of stride ld
-void softmax_ld16(const float* sc, int64_t rows, int64_t n, int64_t ld, float scale, uint16_t* p16, void* s) {
-    constexpr size_t local = 256;
-    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)),
-                         [=](sycl::nd_item<1> it) {
-        const auto r = static_cast<int64_t>(it.get_group_linear_id());
-        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-        const float* row = sc + r * ld;
-        float m = -INFINITY;
-        for (int64_t j = lane; j < n; j += (int64_t) local) m = sycl::fmax(m, row[j] * scale);
-        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
-        float sum = 0.f;
-        for (int64_t j = lane; j < n; j += (int64_t) local) sum += sycl::exp(row[j] * scale - m);
-        const float inv = 1.f / sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
-        for (int64_t j = lane; j < ld; j += (int64_t) local)
-            p16[r * ld + j] = j < n ? f16_from_f32(sycl::exp(row[j] * scale - m) * inv) : (uint16_t) 0;
-    });
-}
-
-// a16[p][h D + d] = FP16(o32[h][p][d]) for d < D: the heads' outputs side by side, the padding dropped
-void heads_merge16(const float* o32, int64_t H, int64_t P, int64_t D, int64_t Dp, uint16_t* a16, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (H * P * D)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t d = i % D, p = (i / D) % P, h = i / (D * P);
-        a16[p * H * D + h * D + d] = f16_from_f32(o32[(h * P + p) * Dp + d]);
+        const bool side = i >= H * P * 128;   // the values, after the keys
+        const auto j = side ? i - H * P * 128 : i;
+        const int64_t d = j % 128, h = (j / 128) % H, p = j / (128 * H);
+        const float* row = qkv + p * 3 * C + (side ? 2 * C : C);
+        const float* b = side ? bv : bk;
+        (side ? v16 : k16)[j] = p < n && d < D ? f16_from_f32(row[h * D + d] + b[h * D + d]) : (uint16_t) 0;
     });
 }
 
@@ -101,7 +70,7 @@ const float* HunyuanImage3Vision::vec(SafeTensors& st, const std::string& name, 
     weight_bytes_ += (uint64_t) t->elements() * 4;
     if (dry_) return nullptr;
     const auto v = st.f32(name);
-    float* d = alloc<float>(weights_, (int64_t) v.size());
+    float* d = alloc<float>(weights_, (int64_t) v.size(), "image engine (HunyuanImage 3.0 SigLIP2)");
     gpu::copy(d, v.data(), v.size() * 4);
     return d;
 }
@@ -128,7 +97,7 @@ HunyuanImage3Vision::Lin HunyuanImage3Vision::lin(SafeTensors& st, const std::st
         const auto w = st.f32(name + ".weight");
         std::vector<uint16_t> h(w.size());
         for (size_t i = 0; i < w.size(); ++i) h[i] = f16_from_f32(w[i]);
-        uint16_t* d = alloc<uint16_t>(weights_, (int64_t) h.size());
+        uint16_t* d = alloc<uint16_t>(weights_, (int64_t) h.size(), "image engine (HunyuanImage 3.0 SigLIP2)");
         gpu::copy(d, h.data(), h.size() * 2);
         l.w = d;
     }
@@ -215,42 +184,37 @@ bool HunyuanImage3Vision::open(const std::string& vision, const std::string& dit
 }
 
 uint64_t HunyuanImage3Vision::scratch_bytes() const {
-    const int64_t P = kMaxPatches, C = hidden_, Dp = kHeadPad, np = kMaxPatches, H = kHeads;
+    const int64_t P = kMaxPatches, C = hidden_, Dp = kHeadPad, H = kHeads;
     uint64_t b = 0;
     b += (uint64_t) P * patch_.in * 2;                      // patches16
     b += (uint64_t) P * C * 2 * 1;                          // a16
-    b += (uint64_t) H * P * Dp * 2 * 2;                     // q16, o32 (as 2 x FP16 bytes of FP32 below)
-    b += (uint64_t) H * np * Dp * 2 * 2;                    // k16, vt16
-    b += (uint64_t) P * np * (4 + 2);                       // scores, p16
+    b += (uint64_t) 4 * P * H * Dp * 2;                     // q16, k16, v16, out16 (the shared attention's rows)
     b += (uint64_t) P * inter_ * (4 + 2);                   // mlp32, mlp16
     b += (uint64_t) P * al0_.out * (4 + 2);                 // al32, al16
     b += (uint64_t) P * out_ * 4;                           // out32
     b += (uint64_t) P * C * 4 * 4;                          // x32, tmp32, pos32 and qkv32's extra
     b += (uint64_t) P * 3 * C * 4;                          // qkv32
-    b += (uint64_t) H * P * Dp * 4;                         // o32
     return b;
 }
 
 void HunyuanImage3Vision::grow() {
     if (x32_ != nullptr) return;
-    const int64_t P = kMaxPatches, C = hidden_, Dp = kHeadPad, np = kMaxPatches, H = kHeads;
-    patches16_ = alloc<uint16_t>(scratch_, P * patch_.in);
-    a16_ = alloc<uint16_t>(scratch_, P * C);
-    q16_ = alloc<uint16_t>(scratch_, H * P * Dp);
-    k16_ = alloc<uint16_t>(scratch_, H * np * Dp);
-    vt16_ = alloc<uint16_t>(scratch_, H * Dp * np);
-    p16_ = alloc<uint16_t>(scratch_, P * np);
-    mlp16_ = alloc<uint16_t>(scratch_, P * inter_);
-    al16_ = alloc<uint16_t>(scratch_, P * al0_.out);
-    x32_ = alloc<float>(scratch_, P * C);
-    qkv32_ = alloc<float>(scratch_, P * 3 * C);
-    scores_ = alloc<float>(scratch_, P * np);
-    o32_ = alloc<float>(scratch_, H * P * Dp);
-    tmp32_ = alloc<float>(scratch_, P * C);
-    mlp32_ = alloc<float>(scratch_, P * inter_);
-    al32_ = alloc<float>(scratch_, P * al0_.out);
-    out32_ = alloc<float>(scratch_, P * out_);
-    pos32_ = alloc<float>(scratch_, P * C);
+    const int64_t P = kMaxPatches, C = hidden_, Dp = kHeadPad, H = kHeads;
+    patches16_ = alloc<uint16_t>(scratch_, P * patch_.in, "image engine (HunyuanImage 3.0 SigLIP2)");
+    a16_ = alloc<uint16_t>(scratch_, P * C, "image engine (HunyuanImage 3.0 SigLIP2)");
+    q16_ = alloc<uint16_t>(scratch_, P * H * Dp, "image engine (HunyuanImage 3.0 SigLIP2)");
+    k16_ = alloc<uint16_t>(scratch_, P * H * Dp, "image engine (HunyuanImage 3.0 SigLIP2)");
+    v16_ = alloc<uint16_t>(scratch_, P * H * Dp, "image engine (HunyuanImage 3.0 SigLIP2)");
+    out16_ = alloc<uint16_t>(scratch_, P * H * Dp, "image engine (HunyuanImage 3.0 SigLIP2)");
+    mlp16_ = alloc<uint16_t>(scratch_, P * inter_, "image engine (HunyuanImage 3.0 SigLIP2)");
+    al16_ = alloc<uint16_t>(scratch_, P * al0_.out, "image engine (HunyuanImage 3.0 SigLIP2)");
+    x32_ = alloc<float>(scratch_, P * C, "image engine (HunyuanImage 3.0 SigLIP2)");
+    qkv32_ = alloc<float>(scratch_, P * 3 * C, "image engine (HunyuanImage 3.0 SigLIP2)");
+    tmp32_ = alloc<float>(scratch_, P * C, "image engine (HunyuanImage 3.0 SigLIP2)");
+    mlp32_ = alloc<float>(scratch_, P * inter_, "image engine (HunyuanImage 3.0 SigLIP2)");
+    al32_ = alloc<float>(scratch_, P * al0_.out, "image engine (HunyuanImage 3.0 SigLIP2)");
+    out32_ = alloc<float>(scratch_, P * out_, "image engine (HunyuanImage 3.0 SigLIP2)");
+    pos32_ = alloc<float>(scratch_, P * C, "image engine (HunyuanImage 3.0 SigLIP2)");
     held_bytes_ = scratch_bytes();
 }
 
@@ -258,40 +222,24 @@ void HunyuanImage3Vision::drop_scratch() {
     if (s_ != nullptr) gpu::stream_sync(s_);
     for (void* p : scratch_) gpu::free(p);
     scratch_.clear();
-    patches16_ = a16_ = q16_ = k16_ = vt16_ = p16_ = mlp16_ = al16_ = nullptr;
-    x32_ = qkv32_ = scores_ = o32_ = tmp32_ = mlp32_ = al32_ = out32_ = pos32_ = nullptr;
+    patches16_ = a16_ = q16_ = k16_ = v16_ = out16_ = mlp16_ = al16_ = nullptr;
+    x32_ = qkv32_ = tmp32_ = mlp32_ = al32_ = out32_ = pos32_ = nullptr;
     pos_ph_ = pos_pw_ = 0;
     held_bytes_ = 0;
 }
 
-// one layer's attention over the P padded rows: every row's query against the n real keys (the pixel mask), the
-// softmax FP32 at 1 / sqrt(head_dim), the heads' outputs merged into a16_ for the out projection
+// one layer's attention over the P rows through the shared attention (qi_attention_cross, the reader qi_vision
+// takes): every row's query against the n real keys (the pixel mask), the heads padded to 128, the outputs
+// unpadded into a16_ for the out projection
 void HunyuanImage3Vision::attention(const Layer& l, int64_t n) {
-    const int64_t P = kMaxPatches, C = hidden_, H = kHeads, D = C / H, Dp = kHeadPad;
-    const int64_t np = (n + kKeyRound - 1) / kKeyRound * kKeyRound;
+    const int64_t P = kMaxPatches, C = hidden_, H = kHeads, D = C / H;
     gemm_.f16(a16_, l.q.w, qkv32_, P, C, C, 3 * C);
     gemm_.f16(a16_, l.k.w, qkv32_ + C, P, C, C, 3 * C);
     gemm_.f16(a16_, l.v.w, qkv32_ + 2 * C, P, C, C, 3 * C);
-    // the biases, rows of stride 3 C: hunyuanimage3_bias_add32 takes contiguous rows, so the three go in as one
-    // row of 3 C with the biases laid side by side on the device once (pos32_'s tail is free here: it holds P x C)
-    // - simpler: three strided adds through the kernel over [P][C] views at the right offsets
-    for (int64_t which = 0; which < 3; ++which) {
-        const Lin& w = which == 0 ? l.q : which == 1 ? l.k : l.v;
-        float* y = qkv32_ + which * C;
-        const float* b = w.b;
-        q_of(s_).parallel_for(sycl::range<1>((size_t) (P * C)), [=](sycl::id<1> id) {
-            const auto i = static_cast<int64_t>(id[0]);
-            y[(i / C) * 3 * C + i % C] += b[i % C];
-        });
-    }
-    heads_split(qkv32_, P, n, np, C, H, D, Dp, q16_, k16_, vt16_, s_);
-    const float scale = 1.0f / std::sqrt((float) D);
-    for (int64_t h = 0; h < H; ++h) {
-        gemm_.f16(q16_ + h * P * Dp, k16_ + h * np * Dp, scores_, P, np, Dp);
-        softmax_ld16(scores_, P, n, np, scale, p16_, s_);
-        gemm_.f16(p16_, vt16_ + h * Dp * np, o32_ + h * P * Dp, P, Dp, np);
-    }
-    heads_merge16(o32_, H, P, D, Dp, a16_, s_);
+    const float q_scale = std::sqrt(128.f / (float) D);
+    heads_to_shared(qkv32_, l.q.b, l.k.b, l.v.b, P, n, C, H, D, q_scale, q16_, k16_, v16_, s_);
+    qi_attention_cross(q16_, k16_, v16_, P, n, H, kHeadPad, out16_, s_);
+    qi_unpad_heads16(out16_, P, H, D, a16_, s_);
     gemm_.f16(a16_, l.o.w, tmp32_, P, C, C);
     hunyuanimage3_bias_add32(tmp32_, l.o.b, P, C, s_);
     hunyuanimage3_add(x32_, tmp32_, P * C, s_);

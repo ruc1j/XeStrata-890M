@@ -235,7 +235,7 @@ class Structured(unittest.TestCase):
         fmt = {"type": "json_schema", "json_schema": {"name": "local", "schema": schema}}
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt)[0], 200)
 
-    def test_malformed_formats_and_tools_are_rejected_before_loading(self):
+    def test_malformed_formats_are_rejected_before_loading(self):
         formats = ([], {"type": "unsupported"},
                    {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}},
                    {"type": "json_schema",
@@ -244,7 +244,6 @@ class Structured(unittest.TestCase):
             for fmt in formats:
                 with self.subTest(fmt=fmt):
                     self.assertEqual(self.chat(response_format=fmt)[0], 400)
-            self.assertEqual(self.chat(strata_mcp=True)[0], 400)
             self.assertEqual(self.request("/v1/chat/completions", [])[0], 400)
             load.assert_not_called()
 
@@ -279,6 +278,24 @@ class Structured(unittest.TestCase):
     def test_a_final_answer_with_tools_that_breaks_the_schema_fails(self):
         code, reply = self.chat('{"title":"Only a title"}', tools=EXEC)
         self.assertEqual((code, reply["error"]["code"]), (502, "structured_output_failed"))
+
+    def test_tools_with_a_schema(self):
+        # #60: the schema is the final answer's - a turn that calls a tool goes out as it is, the answer is checked
+        tool = {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}
+        call = "<tool_call>\n<function=search>\n<parameter=q>\nphotobooth\n</parameter>\n</function>\n</tool_call>"
+        code, reply = self.chat(call, tools=[tool])
+        self.assertEqual(code, 200, reply)
+        self.assertEqual(reply["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(reply["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "search")
+        _, raw = self.chat(call, tools=[tool], stream=True)
+        self.assertIn('"tool_calls"', raw)
+        self.assertNotIn('"structured_output_failed"', raw)
+        code, reply = self.chat(json.dumps(STORY), tools=[tool])
+        self.assertEqual(code, 200, reply)
+        self.assertEqual(json.loads(reply["choices"][0]["message"]["content"]), STORY)
+        code, reply = self.chat("## Film Plan - Photobooth", tools=[tool])
+        self.assertEqual(code, 502)
+        self.assertEqual(reply["error"]["code"], "structured_output_failed")
 
     def test_without_jsonschema_an_object_is_still_required(self):
         # without jsonschema a strict request (strict: true, a strict tool) is refused, as its reply could not be

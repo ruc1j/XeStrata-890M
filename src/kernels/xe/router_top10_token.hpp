@@ -25,15 +25,16 @@ inline void better(float& bv, int& bi, float ov, int oi) {
     if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
 }
 
-// One token's top-10 by one sub-group (the pinned kernel's 32 x 8 block has only its first warp active), NPL = n_expert
-// / 32 values a lane: `ids2` and `weights2`, when given, get the same values (the doorbell's mapped copies, written here
-// instead of copied after)
+// One token's top k (k <= 32) by one sub-group (the pinned kernel's 32 x 8 block has only its first warp active), NPL
+// values a lane, the experts past n_expert (<= NPL x 32) never picked: `ids2` and `weights2`, when given, get the same
+// values (the doorbell's mapped copies, written here instead of copied after)
 template <int NPL>
 inline void top10_token(const sycl::sub_group& sg, const float* logits, int32_t* ids, float* weights, int32_t* ids2,
-                        float* weights2) {
+                        float* weights2, int n_expert = NPL * 32, int k = 10) {
         const int lane = (int) sg.get_local_linear_id();
+        const bool full = n_expert == NPL * 32;
         float values[NPL];
-        for (int i = 0; i < NPL; ++i) values[i] = logits[lane + i * 32];
+        for (int i = 0; i < NPL; ++i) values[i] = full || lane + i * 32 < n_expert ? logits[lane + i * 32] : -INFINITY;
         float maximum = -INFINITY;
         for (int i = 0; i < NPL; ++i) maximum = sycl::max(maximum, values[i]);
         for (unsigned mask = 16; mask; mask >>= 1u) maximum = sycl::fmax(maximum, strata_shfl_xor(sg, maximum, mask));
@@ -47,18 +48,23 @@ inline void top10_token(const sycl::sub_group& sg, const float* logits, int32_t*
         for (int i = 0; i < NPL; ++i) {
             values[i] *= reciprocal;
             if (sycl::isnan(values[i])) values[i] = -FLT_MAX;
+            if (!full && lane + i * 32 >= n_expert) values[i] = -INFINITY;
         }
+        // The rows already picked are a bit mask, not -INFINITY stored back into `values`: IGC 2.38.2 drops every store
+        // of this kernel when it stores at a run-time index into the private array the butterfly just read (#45, Arc
+        // Pro B70: the routing table kept its old contents).  The picks, their order and the ties are the same.
+        uint32_t picked = 0;
         float selected = 0.0f, selected_sum = 0.0f;
-        for (int rank = 0; rank < 10; ++rank) {
-            float best = values[0];
+        for (int rank = 0; rank < k; ++rank) {
+            float best = -INFINITY;
             int expert = lane;
-            for (int i = 1; i < NPL; ++i) {
-                if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+            for (int i = 0; i < NPL; ++i) {
+                if (((picked >> i) & 1u) == 0 && values[i] > best) { best = values[i]; expert = lane + i * 32; }
             }
             for (unsigned mask = 16; mask; mask >>= 1u)
                 better(best, expert, strata_shfl_xor(sg, best, mask), strata_shfl_xor(sg, expert, mask));
-            if (expert % 32 == lane) {   // (expert is never negative)
-                values[expert / 32] = -INFINITY;
+            if ((expert & 31) == lane) {
+                picked |= 1u << (expert / 32);
                 ids[rank] = expert;
                 if (ids2 != nullptr) ids2[rank] = expert;
                 // Deliberately accumulate by WINNING EXPERT lane, not output rank.
@@ -70,7 +76,7 @@ inline void top10_token(const sycl::sub_group& sg, const float* logits, int32_t*
         for (unsigned mask = 16; mask; mask >>= 1u) selected_sum += strata_shfl_xor(sg, selected_sum, mask);
         selected_sum = sycl::max(selected_sum, 6.103515625e-5f);
         const float inverse_selected_sum = 1.0f / selected_sum;
-        if (lane < 10) {
+        if (lane < k) {
             weights[lane] = selected * inverse_selected_sum;
             if (weights2 != nullptr) weights2[lane] = selected * inverse_selected_sum;
         }

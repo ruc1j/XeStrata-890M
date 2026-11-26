@@ -12,12 +12,18 @@
 
 #include "strata/image/hunyuanimage3_vae.hpp"
 
+#include "qi_conv.hpp"
+#include "vae_attention.hpp"
+
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/hunyuanimage3_kernels.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/elementwise.hpp"
+
+#include "strata/image/gpu_buf.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -37,23 +43,6 @@ using strata::kernels::f16_from_f32;
 
 constexpr int64_t kGroups = 32;             // every GroupNorm here: nn.GroupNorm(32, C, eps = 1e-6, affine)
 constexpr float kEps = 1e-6f;
-constexpr int64_t kColBytes = 256ll << 20;  // the unfolded neighbourhoods a product at most (QiVae's bound)
-
-sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
-
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) n * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (HunyuanImage 3.0 VAE): GPU memory: ") + gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
-
-void release(std::vector<void*>& owned, void* p) {
-    if (p == nullptr) return;
-    owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
-    gpu::free(p);
-}
 
 // z [C][HW] (the DiT's latent, model space, FP32) -> the decoder's input: in16 [HW][C] = FP16(z[c][p] / sf) for
 // the convolutions and x32 [HW][C] = the same value in FP32 for conv_in's repeat_interleave shortcut.  The
@@ -81,79 +70,10 @@ void rep_add(float* x, const float* tok, int64_t HW, int64_t O, int64_t I, void*
     });
 }
 
-// col16[r][tap * C + c] = in16[(t + dt, y + dy, x + dx)][c] (0 outside the tensor), output pixel p0 + r with its
-// linear (t, y, x) index, taps in (dt, dy, dx) order matching the weight packing below.  kt 3: the three time
-// taps with symmetric zero padding; kt 1: the CENTER tap only - a T = 1 tensor's other taps multiply padding
-// that is zero, which VAE.md measured as exactly 0.0 on the whole image path (and the loader keeps 1 / 3 of the
-// weights, 340 M of the 510 M numbers those twelve convolutions hold).  C a multiple of 8 (the vec8 unfold).
-void im2col3d(const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t C, int64_t kt, int64_t p0,
-              int64_t rows, uint16_t* col16, void* s) {
-    const int64_t C8 = C / 8, taps = kt * 9;
-    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * taps * C8)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c8 = (i % C8) * 8, rk = i / C8, r = rk / taps, tap = rk - r * taps;
-        const int64_t p = p0 + r, x = p % W, y = (p / W) % H, t = p / (W * H);
-        const int64_t dt = kt == 3 ? tap / 9 - 1 : 0, dy = (tap % 9) / 3 - 1, dx = tap % 3 - 1;
-        const int64_t tt = t + dt, yy = y + dy, xx = x + dx;
-        using V = sycl::vec<uint16_t, 8>;
-        V v(0);
-        if (tt >= 0 && tt < T && yy >= 0 && yy < H && xx >= 0 && xx < W)
-            v = *reinterpret_cast<const V*>(in16 + ((tt * H + yy) * W + xx) * C + c8);
-        *reinterpret_cast<V*>(col16 + (r * taps + tap) * C + c8) = v;
-    });
-}
-
-// y [rows][O] += b[i % O] (contiguous)
-void bias_add(float* y, const float* b, int64_t rows, int64_t O, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * O)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        y[i] += b[i % O];
-    });
-}
-
-// the same for a matrix written into wider rows: y [rows][ldy] at columns 0 .. O += b
-void bias_add_ld(float* y, const float* b, int64_t rows, int64_t O, int64_t ldy, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * O)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i % O;
-        y[(i / O) * ldy + c] += b[c];
-    });
-}
-
-// The group norm's statistics are the kernels' (hunyuanimage3_group_part and -stats): deterministic as the golden's
+// The group norm's statistics are qi_group_norm16's: deterministic as the golden's
 // comparisons need one.  The workspace they take is sized for the most positions one GroupNorm here can span.
 constexpr int64_t kMaxGnPositions = (int64_t) 256 * 256 * 256;   // 16.7 M positions
 constexpr int64_t kWsFloats = 2 * kGroups + (kMaxGnPositions / 256 + kMaxGnPositions / 256 / 256) * kGroups;
-
-// qkv [P][3 C] (FP32) -> q16, k16 [P][C] and vt16 [C][P] in FP16 (QiVae's split, the same single-head form:
-// all C in one head, V transposed for the products' W[N][K] layout)
-void split_qkv16(const float* qkv, int64_t P, int64_t C, uint16_t* q16, uint16_t* k16, uint16_t* vt16, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (P * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t p = i / C, c = i - p * C;
-        q16[i] = f16_from_f32(qkv[p * 3 * C + c]);
-        k16[i] = f16_from_f32(qkv[p * 3 * C + C + c]);
-        vt16[c * P + p] = f16_from_f32(qkv[p * 3 * C + 2 * C + c]);
-    });
-}
-
-// p16[r][j] = FP16(softmax(scale * sc[r][:])) over the row, FP32 statistics (a work-group a row)
-void softmax16(const float* sc, int64_t rows, int64_t n, float scale, uint16_t* p16, void* s) {
-    constexpr size_t local = 256;
-    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)),
-                         [=](sycl::nd_item<1> it) {
-        const auto r = static_cast<int64_t>(it.get_group_linear_id());
-        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-        const float* row = sc + r * n;
-        float m = -INFINITY;
-        for (int64_t j = lane; j < n; j += local) m = sycl::fmax(m, row[j] * scale);
-        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
-        float sum = 0.f;
-        for (int64_t j = lane; j < n; j += local) sum += sycl::exp(row[j] * scale - m);
-        const float inv = 1.f / sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
-        for (int64_t j = lane; j < n; j += local) p16[r * n + j] = f16_from_f32(sycl::exp(row[j] * scale - m) * inv);
-    });
-}
 
 // The UpsampleDCAE's split: out [(f r1 + i1, h 2 + i2, w 2 + i3)][c] = conv[(f, h, w)][m C + c] +
 // x[(f, h, w)][(m C + c) / rep] with m = (i1 2 + i2) 2 + i3 - einops "b (r1 r2 r3 c) f h w -> b c (f r1)
@@ -278,7 +198,7 @@ HunyuanImage3Vae::Conv HunyuanImage3Vae::conv_w(SafeTensors& st, const std::stri
                 h[(size_t) (o * K + tap * c.in + i)] =
                     kernels::f16_from_f32(w[((size_t) (o * in_file + i) * 3 + dt) * 9 + dy * 3 + dx]);
             }
-    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (HunyuanImage 3.0 VAE)");
     gpu::copy(d, h.data(), h.size() * 2);
     c.w = d;
     weight_bytes_ += h.size() * 2;
@@ -303,7 +223,7 @@ HunyuanImage3Vae::Conv HunyuanImage3Vae::point_w(SafeTensors& st, const std::str
     const auto w = st.f32(name + ".weight");
     std::vector<uint16_t> h((size_t) (c.out * c.in));
     for (size_t j = 0; j < h.size(); ++j) h[j] = kernels::f16_from_f32(w[j]);
-    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (HunyuanImage 3.0 VAE)");
     gpu::copy(d, h.data(), h.size() * 2);
     c.w = d;
     weight_bytes_ += h.size() * 2;
@@ -320,7 +240,7 @@ const float* HunyuanImage3Vae::vec(SafeTensors& st, const std::string& name) {
         return nullptr;
     }
     const auto v = st.f32(name);
-    float* d = alloc<float>(allocs_, (int64_t) v.size());
+    float* d = alloc<float>(allocs_, (int64_t) v.size(), "image engine (HunyuanImage 3.0 VAE)");
     gpu::copy(d, v.data(), v.size() * 4);
     weight_bytes_ += v.size() * 4;
     return d;
@@ -420,25 +340,25 @@ bool HunyuanImage3Vae::open_encoder(const std::string& path, std::string& err) {
 void HunyuanImage3Vae::grow(int64_t elems32, int64_t elems16, int64_t col16, int64_t scores) {
     if (elems32 > cap32_) {
         for (float** p : {&t0_, &t1_, &tmp32_}) release(allocs_, *p);
-        for (float** p : {&t0_, &t1_, &tmp32_}) *p = alloc<float>(allocs_, elems32);
+        for (float** p : {&t0_, &t1_, &tmp32_}) *p = alloc<float>(allocs_, elems32, "image engine (HunyuanImage 3.0 VAE)");
         cap32_ = elems32;
     }
     if (elems16 > cap16_) {
         release(allocs_, a16_);
-        a16_ = alloc<uint16_t>(allocs_, elems16);
+        a16_ = alloc<uint16_t>(allocs_, elems16, "image engine (HunyuanImage 3.0 VAE)");
         cap16_ = elems16;
     }
     if (col16 > col_cap_) {
         release(allocs_, col16_);
-        col16_ = alloc<uint16_t>(allocs_, col16);
+        col16_ = alloc<uint16_t>(allocs_, col16, "image engine (HunyuanImage 3.0 VAE)");
         col_cap_ = col16;
     }
     if (scores > score_cap_) {
         release(allocs_, scores_);
-        scores_ = alloc<float>(allocs_, scores);
+        scores_ = alloc<float>(allocs_, scores, "image engine (HunyuanImage 3.0 VAE)");
         score_cap_ = scores;
     }
-    if (gn_ws_ == nullptr) gn_ws_ = alloc<float>(allocs_, kWsFloats);
+    if (gn_ws_ == nullptr) gn_ws_ = alloc<float>(allocs_, kWsFloats, "image engine (HunyuanImage 3.0 VAE)");
     held_bytes_ = (uint64_t) cap32_ * 4 * 3 + (uint64_t) cap16_ * 2 + (uint64_t) col_cap_ * 2 +
                   (uint64_t) score_cap_ * 4 + (uint64_t) kWsFloats * 4;
 }
@@ -446,33 +366,32 @@ void HunyuanImage3Vae::grow(int64_t elems32, int64_t elems16, int64_t col16, int
 // out [P][c.out] (FP32) = c(in16 [P][c.in]) + bias, the pixels the linear (t, y, x) index; kt 0 products
 // straight, kt 1 / 3 through the unfold's bands
 void HunyuanImage3Vae::conv(const Conv& c, const uint16_t* in16, int64_t T, int64_t H, int64_t W, float* out) {
-    const int64_t P = T * H * W;
-    if (c.kt == 0) {
-        gemm_.f16(in16, c.w, out, P, c.out, c.in);
-    } else {
-        const int64_t K = c.kt * 9 * c.in, rows = std::max<int64_t>(1, col_cap_ / K);
-        for (int64_t p0 = 0; p0 < P; p0 += rows) {
-            const int64_t n = std::min(rows, P - p0);
-            im2col3d(in16, T, H, W, c.in, c.kt, p0, n, col16_, s_);
-            gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K);
-        }
+    const int64_t frames = c.kt == 1 ? T : 1;
+    const int64_t times = c.kt == 1 ? 1 : T;
+    const int k = c.kt == 0 ? 1 : 3, kt = c.kt == 0 ? 1 : (int) c.kt, pad = k / 2;
+    const int64_t P = times * H * W, K = (int64_t) kt * k * k * c.in;
+    sycl::queue& q = core::Runtime::get().stream(s_);
+    for (int64_t t = 0; t < frames; ++t) {
+        const uint16_t* x = in16 + t * H * W * c.in;
+        float* y = out + t * H * W * c.out;
+        conv::Request r{x, H, W, c.in, c.w, c.out, k, 1, pad, pad, pad, pad};
+        r.temporal = kt;
+        r.bias = c.b;
+        r.out = y;
+        conv::drive(q, r, P, K, col_cap_, k == 1,
+            [&](int64_t p0, int64_t n) { qi_im2col16(x, times, H, W, c.in, kt, k, 1, pad, H, W, p0, n, col16_, s_); },
+            [&](int64_t p0, int64_t n, bool point) {
+                gemm_.f16(point ? x : col16_, c.w, y + p0 * c.out, n, c.out, point ? c.in : K);
+            },
+            [&] { qi_bias_add(y, c.b, P, c.out, s_); });
     }
-    bias_add(out, c.b, P, c.out, s_);
 }
 
 // one GroupNorm(32, eps 1e-6) over P pixels of C channels and the swish after it (when `silu`), FP16 out
 void HunyuanImage3Vae::groupnorm(const float* x, const float* g, const float* b, int64_t P, int64_t C, bool silu,
                                  uint16_t* y16, const std::string& tag) {
-    float* mean = gn_ws_, *inv = gn_ws_ + kGroups, *part = gn_ws_ + 2 * kGroups;
-    const int64_t B = (P + 255) / 256;   // the kernels' chunk of positions
-    float* mid = part + B * kGroups;
-    hunyuanimage3_group_part(x, nullptr, P, C, false, part, s_);
-    hunyuanimage3_group_stats(part, B, P, C / kGroups, kEps, false, mean, mid, s_);
-    if (!tag.empty()) dump_stage(0, tag + "_stats", gn_ws_, 2 * kGroups);
-    hunyuanimage3_group_part(x, mean, P, C, true, part, s_);
-    hunyuanimage3_group_stats(part, B, P, C / kGroups, kEps, true, inv, mid, s_);
-    if (!tag.empty()) dump_stage(0, tag + "_stats2", gn_ws_, 2 * kGroups);
-    hunyuanimage3_group_apply16(x, mean, inv, g, b, nullptr, nullptr, P, C, silu, y16, s_);
+    qi_group_norm16(x, P, C, g, b, kEps, silu, y16, gn_ws_, s_);
+    if (!tag.empty()) dump_stage(0, tag + "_stats2", gn_ws_, 2 * kGroups);   // the means, then the inverse deviations
 }
 
 // GN -> swish -> conv1 -> GN -> swish -> conv2 -> + x.  The channels are equal in and out in every block of
@@ -502,24 +421,27 @@ void HunyuanImage3Vae::attention(float* x, int64_t P, int64_t C, const std::stri
 
 void HunyuanImage3Vae::attention_w(const float* g, const float* b, const Conv& aq, const Conv& ak, const Conv& av,
                                    const Conv& aproj, float* x, int64_t P, int64_t C, const std::string& tag) {
-    groupnorm(x, g, b, P, C, false, a16_, tag);
     float* qkv = tmp32_;
-    gemm_.f16(a16_, aq.w, qkv, P, C, C, 3 * C);
-    gemm_.f16(a16_, ak.w, qkv + C, P, C, C, 3 * C);
-    gemm_.f16(a16_, av.w, qkv + 2 * C, P, C, C, 3 * C);
-    bias_add_ld(qkv, aq.b, P, C, 3 * C, s_);
-    bias_add_ld(qkv + C, ak.b, P, C, 3 * C, s_);
-    bias_add_ld(qkv + 2 * C, av.b, P, C, 3 * C, s_);
-    uint16_t *q16 = a16_ + P * C, *k16 = a16_ + 2 * P * C, *vt16 = a16_ + 3 * P * C;
-    split_qkv16(qkv, P, C, q16, k16, vt16, s_);
-    gemm_.f16(q16, k16, scores_, P, P, C);
-    uint16_t* p16 = col16_;
-    softmax16(scores_, P, P, 1.0f / std::sqrt((float) C), p16, s_);
-    gemm_.f16(p16, vt16, tmp32_, P, C, P);   // O = P . V (V^T's rows are V's columns)
-    qi_to_f16(tmp32_, P * C, a16_, s_);
-    gemm_.f16(a16_, aproj.w, tmp32_, P, C, C);
-    bias_add(tmp32_, aproj.b, P, C, s_);
-    hunyuanimage3_add(x, tmp32_, P * C, s_);
+    vae_mid::Attention mid{1, P, C, P};
+    mid.x = x; mid.weight = g; mid.bias = b; mid.normalized = a16_; mid.norm_workspace = gn_ws_;
+    mid.qkv = qkv;
+    mid.q = a16_ + P * C; mid.k = a16_ + 2 * P * C; mid.vt = a16_ + 3 * P * C;
+    mid.p = col16_; mid.scores = scores_; mid.out = tmp32_;
+    vae_mid::run(mid, gemm_, s_,
+        [&] {
+            if (!tag.empty()) dump_stage(0, tag + "_stats2", gn_ws_, 2 * kGroups);
+            gemm_.f16(a16_, aq.w, qkv, P, C, C, 3 * C);
+            gemm_.f16(a16_, ak.w, qkv + C, P, C, C, 3 * C);
+            gemm_.f16(a16_, av.w, qkv + 2 * C, P, C, C, 3 * C);
+            qi_bias_add(qkv, aq.b, P, C, s_, nullptr, 3 * C);
+            qi_bias_add(qkv + C, ak.b, P, C, s_, nullptr, 3 * C);
+            qi_bias_add(qkv + 2 * C, av.b, P, C, s_, nullptr, 3 * C);
+        },
+        [&] {
+            gemm_.f16(a16_, aproj.w, tmp32_, P, C, C);
+            qi_bias_add(tmp32_, aproj.b, P, C, s_);
+            hunyuanimage3_add(x, tmp32_, P * C, s_);
+        });
 }
 
 // The DCAE downsample: the conv (its input's T decides the time taps), then the fold and the averaged shortcut in
@@ -527,7 +449,7 @@ void HunyuanImage3Vae::attention_w(const float* g, const float* b, const Conv& a
 void HunyuanImage3Vae::downsample(const Down& d, const float* x, int64_t T, int64_t H, int64_t W, int64_t C,
                                   float* y) {
     const int64_t P = T * H * W;
-    qi_to_f16(x, P * C, a16_, s_);
+    kernels::f32_to_f16_bulk(x, a16_, P * C, s_);
     conv(d.down, a16_, T, H, W, tmp32_);
     const int64_t r1 = d.temporal ? 2 : 1, factor = 4 * r1;
     dcae_fold_down(tmp32_, x, T, H, W, d.down.out, C, r1, factor * C / d.out, y, s_);
@@ -538,7 +460,8 @@ void HunyuanImage3Vae::downsample(const Down& d, const float* x, int64_t T, int6
 void HunyuanImage3Vae::upsample(const Up& u, const float* x, int64_t T, int64_t H, int64_t W, int64_t C,
                                 float* y) {
     const int64_t P = T * H * W;
-    qi_to_f16(x, P * C, a16_, s_);   // the conv reads the block's output FP16, as the reference's conv3d does
+    // the conv reads the block's output FP16, as the reference's conv3d does
+    kernels::f32_to_f16_bulk(x, a16_, P * C, s_);
     conv(u.up, a16_, T, H, W, tmp32_);
     const int64_t r1 = u.temporal ? 2 : 1;
     dcae_split(tmp32_, x, T, H, W, C, u.up.out / (4 * r1), r1, y, s_);
@@ -584,7 +507,7 @@ void HunyuanImage3Vae::decode(const float* z, int64_t h, int64_t w, float* rgb, 
     // the widest stage in elements: the head's grid T = 4, 16 h x 16 w of 128 channels = 131072 HW (the same
     // count at every DCAE upsample's conv output); the attention is the T = 1 grid: P = HW positions, C = 1024.
     const int64_t big32 = 131072 * HW, p_attn = HW;
-    grow(big32, big32, std::max(kColBytes / 2, p_attn * p_attn), p_attn * p_attn);
+    grow(big32, big32, std::max(conv::col_values(q_of(s_)), p_attn * p_attn), p_attn * p_attn);
     latent_tokens(z, (float) kScalingFactor, cin_.in, HW, a16_, t0_, s_);   // t0_ the FP32 tokens [HW][32]
     dump_stage(0, "tokens", t0_, HW * cin_.in);
     conv(cin_, a16_, 1, h, w, t1_);
@@ -637,7 +560,7 @@ void HunyuanImage3Vae::encode(const float* rgb, int64_t H, int64_t W, float* z, 
     // the widest stage: conv_in's four frames of 128 channels over the image = 512 HW (the decoder's widest is
     // the same count at that latent); the attention is the T = 1 grid of h x w positions
     const int64_t big32 = 512 * HW, p_attn = hw;
-    grow(big32, big32, std::max(kColBytes / 2, p_attn * p_attn), p_attn * p_attn);
+    grow(big32, big32, std::max(conv::col_values(q_of(s_)), p_attn * p_attn), p_attn * p_attn);
     int64_t T = 4;
     rgb_frames16(rgb, HW, T, ecin_.in, a16_, s_);
     conv(ecin_, a16_, T, H, W, t0_);
@@ -812,7 +735,7 @@ uint64_t HunyuanImage3Vae::encode_scratch_bytes(int64_t H, int64_t W) const {
 }
 
 uint64_t HunyuanImage3Vae::scratch_bytes(int64_t h, int64_t w) const {
-    const int64_t HW = h * w, big32 = 131072 * HW, col = std::max(kColBytes / 2, HW * HW);
+    const int64_t HW = h * w, big32 = 131072 * HW, col = std::max(conv::col_values(q_of(s_)), HW * HW);
     return (uint64_t) big32 * 4 * 3 + (uint64_t) big32 * 2 + (uint64_t) col * 2 + (uint64_t) HW * HW * 4 +
            (uint64_t) kWsFloats * 4;
 }

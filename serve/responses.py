@@ -39,6 +39,7 @@ from urllib.parse import unquote
 from serve.frontend import (Event, _late_system_to_user, _parts_of, cut_arguments, declared_parameters, effort_kwargs,
                             file_item)
 from serve.structured import jsonschema_modules
+from serve import search as search_api
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -332,8 +333,8 @@ def input_messages(req: dict, keep_image=None) -> list[dict]:
                     url = keep_image(data) if keep_image is not None else None
                 except ValueError as e:
                     raise ResponsesError(f"an image_generation_call's result: {e}", param + ".result") from None
-                text = (f"The image is made and the user sees it: {url}. To change it, call edit_image (its image: "
-                        f"{url}).") if url else "The image is made and the user sees it."
+                text = (f"The image is made and the user sees it: {url}. This step is done." if url else
+                        "The image is made and the user sees it.")
             prompt = item.get("revised_prompt")
             target = open_turn if open_turn is not None and not thinking else turn()
             target.setdefault("tool_calls", []).append({"function": {
@@ -936,6 +937,7 @@ class Assembler:
         self.prompt_tokens = prompt_tokens
         self.seq = 0
         self.item: Any = None                        # the open output item
+        self.hosted: dict[Any, dict] = {}             # hosted tool calls still open: call id -> output item
         self.json_text: list[str] = []               # structured output: the answer, held until it is checked
         self.called = False                          # a tool call was made: this turn is not the final answer
         r = req.get("reasoning")
@@ -944,6 +946,7 @@ class Assembler:
         # separate summary), with the reasoning_summary_* events
         self.summary = reasoning.get("summary") in ("auto", "concise", "detailed")
         self.spell = None                            # text -> its tokens' logprobs entries (include asks for them)
+        self.sources: list[dict] = []                # the web search's results (serve/search.py): url_citation
         self.response = {
             "id": new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
             "background": False, "error": None, "incomplete_details": None,
@@ -1000,12 +1003,27 @@ class Assembler:
 
     def close(self, status=None) -> list[dict]:
         item, self.item = self.item, None
+        out = self._close_item(item, status)
+        for cid, held in list(self.hosted.items()):
+            if held is item:
+                del self.hosted[cid]
+        return out
+
+    def _close_item(self, item, status=None) -> list[dict]:
+        """Close one item, whether or not it is the last one opened: several hosted calls can run side by side."""
         if item is None:
             return []
         at, out = self.response["output"].index(item), []
         item["status"] = status or ("incomplete" if item["type"] in CALL_ITEMS else "completed")
         if item["type"] == "message":
             part = item["content"][0]
+            for c in search_api.cited(part["text"], self.sources):   # an address the answer writes: its citation
+                note = {"type": "url_citation", "start_index": c["start"], "end_index": c["end"], "url": c["url"],
+                        "title": c["title"]}
+                part["annotations"].append(note)
+                out.append(self.event("response.output_text.annotation.added", item_id=item["id"], output_index=at,
+                                      content_index=0, annotation_index=len(part["annotations"]) - 1,
+                                      annotation=note))
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,
                                text=part["text"], logprobs=part["logprobs"]),
                     self.event("response.content_part.done", item_id=item["id"], output_index=at, content_index=0,
@@ -1141,37 +1159,94 @@ class Assembler:
             item["namespace"] = namespace
         return item
 
+    def _hosted(self, x: dict, kind: str) -> dict | None:
+        item = self.hosted.get(x.get("id"))
+        return item if item is not None and item["type"] == kind else None
+
     def image_call(self, x: dict, image_b64) -> list[dict]:
         """An image tool's activity (run_with_mcp's "mcp" events: call, result) as an image_generation_call item, as
-        OpenAI's hosted image_generation tool shows one: its result the PNG in base64 (`image_b64(url)`)."""
+        OpenAI's hosted image_generation tool shows one: its result the PNG in base64 (`image_b64(url)`).  Calls can
+        run side by side, so the events of a result go to the item of its own call id (the last opened is not always
+        the one that ended)."""
         out: list[dict] = []
         if x.get("event") == "call":
-            out += self.close()
+            if self.item is not None and self.item["type"] not in ("image_generation_call", "web_search_call"):
+                out += self.close()
             raw = x.get("arguments")
             args: dict = raw if isinstance(raw, dict) else {}
-            item = {"id": new_id("ig"), "type": "image_generation_call", "status": "in_progress", "result": None,
+            item: dict = {"id": new_id("ig"), "type": "image_generation_call", "status": "in_progress", "result": None,
                     "revised_prompt": args.get("prompt")}
             out += self._open(item)
+            at = self.index
+            if x.get("id") is not None:
+                self.hosted[x["id"]] = item
             out.append(self.event("response.image_generation_call.in_progress", item_id=item["id"],
-                                  output_index=self.index))
+                                  output_index=at))
             out.append(self.event("response.image_generation_call.generating", item_id=item["id"],
-                                  output_index=self.index))
-        elif x.get("event") == "partial" and self.item is not None and self.item["type"] == "image_generation_call":
-            out.append(self.event("response.image_generation_call.partial_image", item_id=self.item["id"],
-                                  output_index=self.index, partial_image_index=x.get("index", 0),
-                                  partial_image_b64=x.get("b64")))
-        elif x.get("event") == "result" and self.item is not None and self.item["type"] == "image_generation_call":
+                                  output_index=at))
+        elif x.get("event") == "partial":
+            found = self._hosted(x, "image_generation_call")
+            if found is None:
+                return out
+            item = found
+            out.append(self.event("response.image_generation_call.partial_image", item_id=item["id"],
+                                  output_index=self.response["output"].index(item),
+                                  partial_image_index=x.get("index", 0), partial_image_b64=x.get("b64")))
+        elif x.get("event") == "result":
+            found = self._hosted(x, "image_generation_call")
+            if found is None:
+                return out
+            item = found
             urls = x.get("images") or []
-            self.item["result"] = image_b64(urls[0]) if urls else None
+            item["result"] = image_b64(urls[0]) if urls else None
             # what OpenAI's item says of the image: its size, quality, background, format and the prompt used
-            self.item.update(x.get("image") or {})
-            if x.get("ok") and self.item["result"]:
-                out.append(self.event("response.image_generation_call.completed", item_id=self.item["id"],
-                                      output_index=self.index))
-                out += self.close("completed")
+            item.update(x.get("image") or {})
+            at = self.response["output"].index(item)
+            if x.get("ok") and item["result"]:
+                out.append(self.event("response.image_generation_call.completed", item_id=item["id"],
+                                      output_index=at))
+                status = "completed"
             else:
-                self.item["error"] = x.get("text")
-                out += self.close("failed")
+                item["error"] = x.get("text")
+                status = "failed"
+            out += self.close(status) if self.item is item else self._close_item(item, status)
+            self.hosted.pop(x.get("id"), None)
+        return out
+
+    def search_call(self, x: dict) -> list[dict]:
+        """A web search tool's activity (run_with_mcp's "mcp" events: call, result) as a web_search_call item, as
+        OpenAI's hosted web_search tool shows one: the action is a search (its query and the sources found) or, for
+        fetch_page, an open_page."""
+        out: list[dict] = []
+        if x.get("event") == "call":
+            if self.item is not None and self.item["type"] not in ("image_generation_call", "web_search_call"):
+                out += self.close()
+            # like any other tool: the words written before the search are not the structured answer, and the words
+            # after it are not checked against the format (this turn called a tool)
+            out += self._call_started()
+            raw = x.get("arguments")
+            args: dict = raw if isinstance(raw, dict) else {}
+            action = ({"type": "open_page", "url": args.get("url")} if x.get("name") == "fetch_page"
+                      else {"type": "search", "query": args.get("query")})
+            item: dict = {"id": new_id("ws"), "type": "web_search_call", "status": "in_progress", "action": action}
+            out += self._open(item)
+            at = self.index
+            if x.get("id") is not None:
+                self.hosted[x["id"]] = item
+            out.append(self.event("response.web_search_call.in_progress", item_id=item["id"], output_index=at))
+            out.append(self.event("response.web_search_call.searching", item_id=item["id"], output_index=at))
+        elif x.get("event") == "result":
+            found = self._hosted(x, "web_search_call")
+            if found is None:
+                return out
+            item = found
+            if item["action"]["type"] == "search":
+                item["action"]["sources"] = [{"type": "url", "url": s["url"]} for s in x.get("sources") or []]
+            out.append(self.event("response.web_search_call.completed", item_id=item["id"],
+                                  output_index=self.response["output"].index(item)))
+            status = "completed" if x.get("ok") else "failed"
+            out += self.close(status) if self.item is item else self._close_item(item, status)
+            self.hosted.pop(x.get("id"), None)
         return out
 
     def finish(self, done: dict, validate=None) -> list[dict]:

@@ -3,21 +3,25 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/expert_tier.hpp - the rules of the expert tiers that Qwen3.8-Flash-Next's engine
 // (generate.cpp) and the other models' (PlainModel) share: which experts an adaptive round swaps into the VRAM tier,
-// which ones STRATA_RAM_ADAPT moves into the RAM copy, and the copies back into the RAM copy's exchange buffers.
-// When a round runs, how many swaps it may take and how its copies are issued stay with each engine: those were
-// measured apart (plain_model.hpp's adapt_mib_per_token, generate.cpp's adapt_lag and --adapt-async).
+// which ones STRATA_RAM_ADAPT moves into the RAM copy, the copies back into the RAM copy's exchange buffers, and the
+// bound of a round's copies (--adapt-mib-per-token).  When a round runs and how its copies are issued stay with each
+// engine: those were measured apart (generate.cpp's adapt_lag and --adapt-async).
 #pragma once
 
+#include "strata/core/auto_pick.hpp"
+#include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -78,6 +82,16 @@ inline std::vector<TierSwap> choose_swaps(const float* usage, const int32_t* res
                         [](int64_t, int32_t) { return false; });
 }
 
+/// --adapt-mib-per-token: the swaps a round may take, `cap` (--adapt-swaps) at most and, with `mib_per_token` > 0, at
+/// most that many MiB of copies, at the largest expert's size, for each of the `tokens` read since the last round (at
+/// least one swap).  The copies share the RAM's bandwidth with the missed experts the CPU and PCIe read.
+inline int64_t adapt_swap_budget(int64_t cap, int64_t mib_per_token, int64_t tokens) {
+    const uint64_t blob = kernels::cpu::expert_layout().max_blob;
+    if (mib_per_token <= 0 || blob == 0) return cap;
+    const uint64_t n = ((uint64_t) mib_per_token << 20) * (uint64_t) std::max<int64_t>(tokens, 0) / blob;
+    return std::min<int64_t>(cap, std::max<int64_t>((int64_t) n, 1));
+}
+
 /// STRATA_RAM_ADAPT's rule (upstream d7298883, 2b13a4493): the RAM copy is chosen once, at start, so an expert it does
 /// not hold is read from the file every time the conversation routes to it.  In each layer up to 4 of the experts the
 /// windows route to most (a decayed count of 2 or more) of those neither in VRAM nor in the RAM copy take the RAM places
@@ -126,6 +140,40 @@ inline void ram_adapt_round(const float* usage, const int32_t* res, int64_t laye
     }
 }
 
+/// The plain engine's floor for the room no plan counts (core::vram_room): under STRATA_VRAM_LIMIT_MIB=4096 on
+/// the RX 9060 XT the peak stayed below the card with 128 MiB kept free - llm-jp Q4_K_M, Ornith Q4_K_M and
+/// GSQ-RCO 3bit, 2026-10-12 - where the 768 MiB of before left 700 MiB of the card unused.
+inline constexpr uint64_t kTierRoomLeast = 192ull << 20;
+
+/// What a verify window takes beside a VRAM tier, counted apart from it: its rows (`max_t` tokens of `k` routed
+/// experts, three FP32 rows of `n_embd` each), sixteen experts in staging and 64 MiB.
+inline uint64_t tier_window_bytes(int64_t max_t, int64_t k, int64_t n_embd, uint64_t max_blob) {
+    return (uint64_t) max_t * (uint64_t) k * (uint64_t) n_embd * 4 * 3 + 16 * max_blob + (64ull << 20);
+}
+
+/// A VRAM tier's room, for every engine that fills one from the free memory (PlainModel's rule).  Of `free_b` (counted_free's) on a device of `total_b`: less `window_b` and less the reserve -
+/// what is allocated after the tier (the products' libraries, the graphs) and the driver's margin, --vram-reserve-mib
+/// (`reserve_mib` >= 0) or the room of the device's memory (core::vram_room, its floor kTierRoomLeast, its 768 MiB
+/// ceiling past 24 GiB).  `per_layer_b`: one expert of every layer the tier holds; `max_slots`: --expert-cache N over
+/// the `layers` (< 0: what fits).
+struct TierRoom {
+    uint64_t reserve = 0;   ///< what stays free beside the tier and the window
+    uint64_t room = 0;      ///< the tier's bytes at most
+    int64_t q = 0;          ///< the experts a layer takes when the layers take alike (`n_expert` at most)
+    uint64_t bytes = 0;     ///< per_layer_b * q: the budget plan_profile_fill shares out
+};
+inline TierRoom plan_tier_room(uint64_t free_b, uint64_t total_b, uint64_t window_b, int64_t reserve_mib,
+                               int64_t max_slots, uint64_t per_layer_b, int64_t layers, int64_t n_expert) {
+    TierRoom t;
+    t.reserve = reserve_mib >= 0 ? (uint64_t) reserve_mib << 20 : vram_room(total_b, /*parts*/ 1, kTierRoomLeast);
+    t.room = free_b > window_b + t.reserve ? free_b - window_b - t.reserve : 0;
+    t.q = per_layer_b > 0 ? (int64_t) (t.room / per_layer_b) : 0;
+    t.q = std::min<int64_t>(t.q, n_expert);
+    if (max_slots >= 0) t.q = std::min<int64_t>(t.q, max_slots / std::max<int64_t>(layers, 1));
+    t.bytes = per_layer_b * (uint64_t) t.q;
+    return t;
+}
+
 /// How many slots of a tier of `budget` bytes each layer takes, from its profile (`prior`, (layer, expert) pairs in
 /// rank order): Qwen3.8-Flash-Next's fill (generate.cpp), the pairs in their order over all the layers while the bytes
 /// last (`bytes(l)` a layer's expert, `local(l)` the layers this tier holds), then the rest of the bytes the layers in
@@ -163,19 +211,50 @@ ProfileFill<Pairs> plan_profile_fill(const Pairs& prior, int64_t layers, int64_t
     return f;
 }
 
+/// The slots each layer of a tier of `room` takes, and the experts that take them at the start.  With a profile
+/// (`prior` not null): plan_profile_fill's, over room.bytes.  Without one: room.q in each layer the tier holds, and
+/// each of those layers' first experts, the layers in turn.
+template <class Pairs, class Bytes, class Local>
+ProfileFill<Pairs> plan_tier_fill(const Pairs* prior, int64_t layers, int64_t n_expert, const TierRoom& room,
+                                  Bytes bytes, Local local, bool alike) {
+    if (prior != nullptr) return plan_profile_fill(*prior, layers, n_expert, room.bytes, bytes, local, alike);
+    ProfileFill<Pairs> f;
+    f.quota.assign((size_t) layers, 0);
+    for (int64_t l = 0; l < layers; ++l)
+        if (local(l)) f.quota[(size_t) l] = room.q;
+    for (int64_t e = 0; e < room.q; ++e)
+        for (int64_t l = 0; l < layers; ++l)
+            if (local(l)) f.fill.emplace_back((int32_t) l, (int32_t) e);
+    return f;
+}
+
+/// How many of a tier's slots, in the order ExpertCache::open_sized lays them (each from a 256-byte boundary), fit
+/// `limit` bytes: the free memory is read again just before the tier is opened, and what was allocated since the plan
+/// comes off the last slots.
+inline size_t tier_slots_within(const std::vector<int64_t>& slot_bytes, uint64_t limit) {
+    uint64_t need = 0;
+    size_t n = 0;
+    for (; n < slot_bytes.size(); ++n) {
+        need += ((uint64_t) slot_bytes[n] + 255) / 256 * 256;
+        if (need > limit) break;
+    }
+    return n;
+}
+
 /// #463 without the stall (upstream d69424c9, #764): a verify window takes the adaptive tier's previous swaps only once
 /// they are this many windows old, and then waits for their copies (which have landed by then).  The window that first
 /// computes a swapped-in expert on the GPU depends only on the window count, as with #463's wait, so the answers are as
 /// reproducible.  Default 2 (upstream 2725c23f7 on sm_86 and sm_60; on XeStrata's GPUs the RTX 4070's decode 59.1 ->
 /// 64.2 tok/s, IQ2_XS, and the B70's equal, IQ3_XXS 1K and 32K within 0.7%, 2026-10-20); STRATA_ADAPT_LAG=1 is #463's
 /// (the very next window waits for the copies).  Both engines' (generate.cpp, PlainModel); `windows` the engine's
-/// default, STRATA_ADAPT_LAG over it.
+/// default, STRATA_ADAPT_LAG over it.  `auto` (the default) lets the first windows where a swap is waiting choose
+/// between the engine's default and 1 (auto_pick.hpp), on a pack whose layers round alike on the CPU and the GPU.
 inline int adapt_lag(int windows = 2) {
-    static const int v = [] {
-        const char* e = std::getenv("STRATA_ADAPT_LAG");
-        return e ? std::max(1, (int) std::strtol(e, nullptr, 10)) : 0;
-    }();
-    return v > 0 ? v : windows;
+    const int forced = adapt_lag_forced();
+    if (forced > 0) return forced;
+    const int chosen = adapt_lag_chosen();
+    if (chosen > 0) return chosen;
+    return adapt_lag_forming() == 1 ? 1 : windows;   // the trial: the next window waits, and its cost is measured
 }
 
 /// The adaptive tier's period when --adapt-every is not given, for both engines (generate.cpp, PlainModel): chosen once,
@@ -212,7 +291,7 @@ inline int64_t auto_adapt_period(double share, int64_t period, bool from_files, 
 /// STRATA_USAGE_SEED=0: the counts start from nothing.
 inline void seed_usage(std::vector<float>& usage, const std::vector<int64_t>& routed, int64_t routed_k,
                        std::vector<int64_t>& seen, int64_t n_expert, int64_t period, double decay) {
-    static const bool on = [] { const char* v = std::getenv("STRATA_USAGE_SEED"); return v == nullptr || *v != '0'; }();
+    static const bool on = [] { const char* v = strata::env_get("USAGE_SEED"); return v == nullptr || *v != '0'; }();
     if (!on || usage.empty() || routed.empty() || routed_k <= 0 || usage.size() != routed.size() || n_expert <= 0 ||
         period <= 0)
         return;
@@ -245,27 +324,81 @@ void add_route_rows(std::vector<float>& usage, const std::vector<int32_t>& rec, 
     }
 }
 
-/// A prompt chunk's layer, for the CPU's share of the experts the GPU does not hold: `missed` the routed experts not in
-/// VRAM, `cand` (rows, expert) those the CPU may take, fewest rows first - at most MAXT rows (one multi-token job) and a
-/// blob the CPU reads where it lies, page-locked or not assembled into a short-lived buffer (the CPU's jobs keep their
-/// pointers while the GPU's groups stage the rest; upstream 92bce20e).  How many of them the CPU takes is each engine's
-/// (a share of `missed`).  `in_vram(e)`, `skip(e)`: an expert another part computes (a helper GPU's).
+// auto tunes the staged walk; 0 keeps streaming and 1 forces the CPU jobs.
+inline int cpu_share_staged_3k_mode() {
+    static const int mode = [] {
+        const char* v = strata::env_get("PREFILL_STAGED_3K");
+        if (!v || std::strcmp(v, "auto") == 0) return -1;
+        return *v == '1' ? 1 : 0;
+    }();
+    return mode;
+}
+inline bool cpu_share_batched(int64_t rows, bool qualified = false) {
+    const int mode = cpu_share_staged_3k_mode();
+    return (mode == 1 || (mode < 0 && qualified)) && rows >= 2048 && rows <= 3072;
+}
+
+// Compare adjacent layers after warm-up. Require two ratios to beat the unshared layer by 10%, so a
+// near-tie keeps the earlier path. One instance belongs to one model/device.
+struct PromptShareChoice {
+    int attempts = 0, samples = 0, ratios = 0, last_arm = -1;
+    int64_t last_layer = -1;
+    double last_cost = 0, values[2] = {};
+    bool selected = false;
+    bool decided() const { return ratios >= 2; }
+    bool next() { return decided() ? selected : (attempts++ & 1) != 0; }
+    void add(bool arm, int64_t layer, int64_t missed, double ms, const char* who) {
+        if (decided() || missed <= 0 || ms <= 0) return;
+        const double cost = ms / (double) missed;
+        if (++samples > 1 && last_arm >= 0 && last_arm != (int) arm && layer > last_layer) {
+            values[ratios++] = arm ? cost / last_cost : last_cost / cost;
+            if (decided()) {
+                const double slower = std::max(values[0], values[1]);
+                selected = slower < 0.90;
+                std::fprintf(stderr, "xestrata: CPU prompt share auto (%s): slower shared/unshared %.3f, %s\n",
+                             who, slower, selected ? "share" : "do not share");
+            }
+        }
+        last_arm = (int) arm; last_layer = layer; last_cost = cost;
+    }
+};
+
+/// A prompt chunk's layer: missed experts and those the CPU can read, fewest rows first. max_rows bounds an
+/// expert's rows; the default is one multi-token job. The blob must stay at its address during the jobs.
 struct CpuShareCandidates {
     int64_t missed = 0;
     std::vector<std::pair<int32_t, int32_t>> cand;
 };
 template <class InVram, class Skip>
 CpuShareCandidates cpu_share_candidates(const int32_t* counts, int64_t n_expert, int64_t layer, const ExpertSource& src,
-                                        InVram in_vram, Skip skip) {
+                                        InVram in_vram, Skip skip, int64_t max_rows = kernels::cpu::MAXT) {
     CpuShareCandidates r;
     for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
         const int32_t c = counts[e];
         if (c == 0 || in_vram(e) || skip(e)) continue;
         ++r.missed;
-        if (c <= kernels::cpu::MAXT && (src.pinned(layer, e) || !src.transient(layer, e))) r.cand.emplace_back(c, e);
+        if (c <= max_rows && (src.pinned(layer, e) || !src.transient(layer, e))) r.cand.emplace_back(c, e);
     }
     std::sort(r.cand.begin(), r.cand.end());
     return r;
+}
+
+/// Of `cand` (cpu_share_candidates, fewest rows first), the first `want` the CPU can take: `blob(e)` non-null (the
+/// expert's bytes where the CPU reads them), their rows `row_cap` at most together; `take(e, rows, blob)` for each.
+/// The experts taken.
+template <class Blob, class Take>
+int64_t cpu_share_take(const std::vector<std::pair<int32_t, int32_t>>& cand, int64_t want, int64_t row_cap, Blob blob,
+                       Take take) {
+    int64_t n = 0, rows = 0;
+    for (const auto& [c, e] : cand) {
+        if (n >= want || rows + c > row_cap) break;
+        const uint8_t* b = blob(e);
+        if (b == nullptr) continue;   // an expert without a blob stays on the GPU
+        take(e, c, b);
+        rows += c;
+        ++n;
+    }
+    return n;
 }
 
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
@@ -289,6 +422,16 @@ struct SwapHome {
 template <class Swap, class Locate>
 bool resident_stage_swaps(FileExpertSource& src, const std::vector<int32_t>& host_res, int64_t n_expert,
                           std::vector<Swap>& swaps, Locate locate) {
+    const auto& layout = kernels::cpu::expert_layout();
+    if (layout.mixed()) {
+        swaps.erase(std::remove_if(swaps.begin(), swaps.end(), [&](const Swap& s) {
+            if (s.out < 0) return false;
+            const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
+            if (slot < 0) return true;
+            const auto* cache = locate(s.layer).cache;
+            return layout.blob_bytes(s.layer, s.in) > cache->slot_capacity(slot);
+        }), swaps.end());
+    }
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
@@ -307,7 +450,7 @@ bool resident_stage_swaps(FileExpertSource& src, const std::vector<int32_t>& hos
         const SwapHome home = locate(s.layer);
         const OnDevice on(home.dev);
         if (gpu::copy_async(src.exchange_buffer(q, s.layer), home.cache->device_slot(slot),
-                            (size_t) kernels::cpu::expert_layout().blob_bytes(s.layer), home.stream) != true)
+                            (size_t) layout.blob_bytes(s.layer, s.out), home.stream) != true)
             return false;
         if (std::find_if(used.begin(), used.end(), [&](const SwapHome& h) { return h.stream == home.stream; }) == used.end())
             used.push_back(home);
@@ -319,8 +462,13 @@ bool resident_stage_swaps(FileExpertSource& src, const std::vector<int32_t>& hos
             const OnDevice on(h.dev);
             if (gpu::stream_sync(h.stream) != true) return false;
         }
-        for (const Staged& x : staged)
-            if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
+        for (const Staged& x : staged) {
+            if (src.stage_exchange(x.layer, x.in, x.out, x.q)) continue;
+            if (!layout.mixed()) return false;
+            kept.erase(std::remove_if(kept.begin(), kept.end(), [&](const Swap& s) {
+                return s.layer == x.layer && s.in == x.in && s.out == x.out;
+            }), kept.end());
+        }
     }
     swaps.swap(kept);
     return true;

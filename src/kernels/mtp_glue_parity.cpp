@@ -148,7 +148,6 @@ void read_case(int T, bool q8, std::mt19937& rng, void* s) {
 
 int main() try {
     std::mt19937 rng(52);  // NOLINT(bugprone-random-generator-seed): reproducible rows.
-    k::gr_set_native_mmvf(true);
     void* s = strata::gpu::stream_create();
     if (s == nullptr) { std::printf("mtp_glue_parity: no stream: %s\n", strata::gpu::last_error()); return 1; }
     for (int rows = 1; rows <= 8; ++rows) norm_case(N, rows, 0, N, rng, s);     // the embedding's norm

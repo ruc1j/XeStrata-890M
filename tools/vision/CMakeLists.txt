@@ -12,7 +12,9 @@
 #         -DLLAMA_DIR=third_party/main/llama.cpp -DSTRATA_VISION_VULKAN=ON
 #
 # Two picture readers in the program (--tower own|mtmd|auto, upstream's own-stack phase 3): Strata's own Qwen tower on the CPU (own/, no ggml) and llama.cpp's
-# mtmd.  `auto` (the default) takes ours in the CPU build and keeps mtmd in the Vulkan build (the GPU reader); see strata_vision.cpp.
+# mtmd.  `auto` (the default) takes ours in the CPU build and keeps mtmd in the Vulkan build (the GPU reader); see strata_vision_mtmd.cpp.
+# (tools/vision/strata_vision.cpp is upstream XeStrata's reader on the engine's own vision encoder, xestrata-vision, which
+# the top CMakeLists.txt builds with the engine; this folder's build is the separate one with llama.cpp.)
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
 if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
@@ -51,7 +53,7 @@ add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
 # our own Qwen vision tower on the CPU (own-stack phase 3): tools/vision/own, no ggml or llama.cpp inside
 add_subdirectory(own)
 
-add_executable(strata-vision strata_vision.cpp)
+add_executable(strata-vision strata_vision_mtmd.cpp)
 target_link_libraries(strata-vision PRIVATE mtmd llama strata_vit_own)
 target_compile_features(strata-vision PRIVATE cxx_std_17)
 set_target_properties(strata-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

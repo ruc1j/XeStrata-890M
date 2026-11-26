@@ -7,11 +7,12 @@
 Many interleaved streaming clients, each with its own random canary in its prompt and the model asked to repeat it.
 Some clients disconnect at random points (before the first byte, during the prompt read, after a few chunks).  Every
 text a client receives (content and reasoning) is searched for canaries: any canary that is not the client's own is a
-cross-delivery.  Run against any OpenAI-compatible Strata server; the server must be one you started (check the
+cross-delivery.  Run against any OpenAI-compatible XeStrata server; the server must be one you started (check the
 listener first on a shared box).
 
-    python tools/stream_ownership_probe.py --url http://127.0.0.1:8080 --clients 6 --rounds 20 --seed 1 \\
-        --out result.json
+
+    python tools/stream_ownership_probe.py --url http://127.0.0.1:8080 --clients 6 --rounds 20 \
+        --seed 1 --out result.json
 
 Exit code 0: no cross-delivery.  1: at least one.  2: the run itself failed (no server, no completed client).
 Nothing here sends anything but chat requests; it never reads another client's connection.
@@ -46,8 +47,7 @@ def prompt_for(canary: str, filler_words: int, rnd: random.Random) -> str:
             "separated by single spaces, and write nothing else.")
 
 
-# every canary this run has issued: a canary-looking string the model made up is not a cross-delivery
-USED: set = set()
+USED: set = set()          # every canary this run issued: one the model made up is not a cross-delivery
 
 
 class Result:

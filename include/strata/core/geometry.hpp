@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/geometry.hpp - the model's geometry: one struct for the shape a model file declares and
 // the shape the kernels are compiled for.
 //
@@ -76,6 +77,8 @@ struct ModelGeometry {
 // takes any header; cmake/strata_geometry.cmake writes geometry_selected.hpp into the build tree for either).  With
 // neither option the build uses Flash-Next's header and adds no compile flag.  A kernel that fixes a dimension at
 // compile time asserts it against `kCompiledGeometry`; geometry_checks.hpp holds the constraints every shape must meet.
+// The device-dependent sizes (tiles, chunks, work-groups) are not here: they stay what the device's report picks at run
+// time.
 #if __has_include("strata/core/geometry_selected.hpp")
 #include "strata/core/geometry_selected.hpp"
 #else

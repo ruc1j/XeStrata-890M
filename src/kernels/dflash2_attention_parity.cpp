@@ -1,18 +1,20 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/dflash2_attention_parity.cpp - the DFlash2 drafter's attention kernels against a float64 reference (GPU,
-// synthetic, no model): the default kernel (STRATA_DF2_ATTN=2, FP32) and the one on RDNA's matrix instructions
-// (STRATA_DF2_ATTN=3, FP16 operands).
+// synthetic, no model): the FP32 kernels (STRATA_DF2_ATTN=1, the 8-query-group form; 2, upstream's 256-work-item
+// form; 4, the same on 2 x 2 register tiles, the default on an integrated GPU on the HIP backend such as the 890M; 5,
+// the 128-work-item form on 4 x 4 tiles) and the one on RDNA's matrix instructions (STRATA_DF2_ATTN=3, FP16 operands).
 //
 // The kernels leave partials (a running maximum, a sum and 128 output sums for each chunk of keys, K/V head and query);
 // the test combines them as the merge kernel does and compares the 32 queries x 8 K/V heads x 128 outputs with
 //     out = softmax(Q K^T / sqrt(128)) V
-// computed in float64 over the keys each row may see.  The error is measured against the output's RMS: the FP32 kernel
-// must stay within 1e-4 of it and the FP16 one within 1e-2 (FP16's 2^-11 a factor, through the scores' exponentials);
-// the worst use of each bound is printed.  Cases: a full window, a short context, no context, a window that masks the
+// computed in float64 over the keys each row may see.  The error is measured against the output's RMS: the FP32
+// kernels must stay within 1e-4 of it and the FP16 one within 1e-2 (FP16's 2^-11 a factor, through the scores'
+// exponentials); the worst use of each bound is printed.  Cases: a full window, a short context, no context, a window that masks the
 // oldest keys of the later rows, and ring slots a tag marks as stale.  A negative control - one key moved in the
 // reference only - must fail the FP16 bound.
-// Usage: dflash2_attention_parity   (exit 0: all pass; 77: this device has no such instructions, only the FP32 kernel ran)
+// Usage: dflash2_attention_parity   (exit 0: all pass; 77: this device has no such instructions, only the FP32 kernels
+// ran)
 #include "strata/kernels/dflash2.hpp"
 
 #include "parity_device.hpp"
@@ -171,7 +173,7 @@ int main() {
         float* d_xd = dev.alloc<float>((size_t) ROWS * 32 * HD / 32);
         const std::vector<double> want = reference(c, q, kring, vring, kblk, vblk, tag, epoch);
         std::vector<float> part(PART);
-        for (int variant : {2, 3}) {
+        for (int variant : {1, 2, 4, 5, 3}) {
             if (variant == 3 && !wmma) continue;
             std::fill(part.begin(), part.end(), std::numeric_limits<float>::quiet_NaN());
             par::copy_in(d_part, part.data(), part.size());
@@ -201,7 +203,7 @@ int main() {
         return 1;
     }
     if (!wmma) {
-        std::printf("dflash2_attention_parity: the FP32 kernel passes; this device has no WMMA, STRATA_DF2_ATTN=3 did not run\n");
+        std::printf("dflash2_attention_parity: the FP32 kernels pass; this device has no WMMA, STRATA_DF2_ATTN=3 did not run\n");
         return 77;
     }
     std::printf("dflash2_attention_parity: ALL PASS\n");

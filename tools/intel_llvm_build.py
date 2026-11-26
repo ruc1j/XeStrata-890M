@@ -24,6 +24,7 @@ minutes on 24 threads (a Ryzen AI 9 HX 370).
 
 Prints the toolchain's folder on its last line.  setup.py runs it for --intel-llvm-build."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -44,7 +45,10 @@ OUT, BUILD, INSTALL, RECORD = BASE, BASE / "build", BASE / "install", BASE / "in
 REPO = "https://github.com/intel/llvm.git"
 # The release this script builds: one with the Arc Pro B70 in the runtime's matrix table (v7.0.0 or later).  Raised by
 # a change to this line, not by following the newest release, so a run does not start a build by itself.
-TAG = "v7.2.0"
+TAG = "v7.2.1"
+# Releases intel/llvm has raised its version to without a tag yet, at the commit taken: v7.2.1 is sycl-rel-7_2's head
+# of 2026-11-13 (its version raised by 5fd7ee455; untagged and unreleased on 2026-11-24).
+UNTAGGED = {"v7.2.1": "ea269d5f7189ab7ade0ada0706d973c5f5ee5f65"}
 
 # ROCm's device libraries (ocml, ockl and the others; the University of Illinois/NCSA license), which the AMD code
 # links: built with the toolchain, into install/amdgcn/bitcode, since a clang reads bitcode of its own LLVM or older
@@ -59,7 +63,7 @@ DEVICE_LIBS_SRC = BASE / "rocm-device-libs"
 
 # Fixes the release lacks (its sycl branch too, on 2026-10-05): third_party/main/intel-llvm/patches/NN-<id>.patch,
 # applied in order to the clone before the configuration (under intel/llvm's license, Apache-2.0 with LLVM
-# exceptions).  A finished install records the ids it was built with.
+# exceptions).  A finished install records the ids and full-file hashes it was built with.
 PATCHES = sorted((ROOT / "third_party" / "main" / "intel-llvm" / "patches").glob("[0-9][0-9]-*.patch"))
 
 
@@ -67,31 +71,31 @@ def patch_id(patch: Path) -> str:
     return patch.stem.split("-", 1)[1]
 
 
-def patched_files() -> list:
-    """The files the patches change, as paths in the clone: the ones the release has (a file a patch adds, such as
-    hip-group-shuffle's, is not in HEAD and is removed by added_files() before the patches are applied again)."""
-    files = set()
+def patch_fingerprints() -> list[dict[str, str]]:
+    """Names, order and contents identify the patches in a finished toolchain."""
+    return [{"name": p.name, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in PATCHES]
+
+
+def patched_files() -> tuple[list, list]:
+    """The files the patches change and the files they add, as paths in the clone."""
+    files, added, cur = set(), set(), ""
     for patch in PATCHES:
         for line in patch.read_text().splitlines():
             if line.startswith("diff --git a/"):
-                files.add(line.split()[2][2:])
+                cur = line.split()[2][2:]
+                files.add(cur)
+            elif line.startswith("new file mode") and cur:
+                added.add(cur)
+    return sorted(files - added), sorted(added)
 
-    def in_head(f: str) -> bool:
-        r = subprocess.run(["git", "-C", str(SRC), "cat-file", "-e", "HEAD:" + f], capture_output=True)
-        return r.returncode == 0
-    return sorted(f for f in files if in_head(f))
 
-
-def added_files() -> list:
-    """The files the patches add (their "--- /dev/null" entries), as paths in the clone."""
-    files, path = set(), None
-    for patch in PATCHES:
-        for line in patch.read_text().splitlines():
-            if line.startswith("diff --git a/"):
-                path = line.split()[2][2:]
-            elif line.startswith("--- /dev/null") and path is not None:
-                files.add(path)
-    return sorted(files)
+def restore_release() -> None:
+    """The files the patches change back to the release, and the files they add removed (git knows no such path to
+    check out, and a patch does not apply over its own file)."""
+    changed, added = patched_files()
+    run(["git", "-C", SRC, "checkout", "--", *changed])
+    for f in added:
+        (SRC / f).unlink(missing_ok=True)
 
 
 def set_out(out: Path) -> None:
@@ -152,14 +156,21 @@ PREREQUISITES = {
                "how": "sudo apt install "},
     "fedora": {"git": "git", "cmake": "cmake", "ninja": "ninja-build", "g++": "gcc-c++", "ld.lld": "lld",
                "hwloc": "hwloc-devel",
-               "zstd": "libzstd-devel", "opencl": "opencl-headers", "cuda": "cuda-toolkit-13-4",
+               "zstd": "libzstd-devel", "opencl": "opencl-headers", "cuda": "cuda-toolkit-13-5",
+               # (NVIDIA's CUDA repository, which Fedora's own do not carry the toolkit of: setup.py's NVIDIA_REPO.
+               # It is fedora44's, which Fedora 45 uses as well - NVIDIA has no repository of its own yet; change the
+               # URL when it publishes one, developer.download.nvidia.com/compute/cuda/repos/.  The toolkit's name
+               # says the CUDA version: 13.4 on Fedora 44 as the packages build with, 13.5 on 45)
+               "cuda_repo": "sudo dnf config-manager addrepo \\\n"
+                            "    --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/"
+                            "x86_64/cuda-fedora44.repo",
                "how": "sudo dnf install "},
     "arch": {"git": "git", "cmake": "cmake", "ninja": "ninja", "g++": "base-devel", "ld.lld": "lld",
              "hwloc": "hwloc",
              "zstd": "zstd", "opencl": "opencl-headers", "cuda": "cuda", "how": "sudo pacman -S --needed "},
 }
 # where CMake's find_library looks, per distribution
-LIB_DIRS = ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib", "/usr/local/lib")
+LIB_DIRS = ("/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64", "/usr/lib", "/usr/local/lib")
 
 
 def static_zstd() -> bool:
@@ -179,7 +190,7 @@ def missing_prerequisites() -> list:
         need.append(p["hwloc"])
     # intel/llvm's SYCL tools (sycl-ls, which the build installs) include CL/cl.h through sycl/detail/cl.h, and their
     # target gets no include for the OpenCL headers the configuration fetches (those belong to the runtime's own
-    # objects): Arch's clang does not bring the header in, Ubuntu's and Fedora's builds have it
+    # objects), and no distribution's compiler brings the header in (a fresh Fedora lacks it as Arch does)
     if not Path("/usr/include/CL/cl.h").exists():
         need.append(p["opencl"])
     # the SYCL runtime reads zstd-compressed device images (oneMKL's, which oneMath calls in the contrib modes); without
@@ -239,12 +250,13 @@ def rocm_dirs() -> tuple | None:
 def target_options(contrib: bool) -> list:
     """configure.py's options for the GPU targets besides Intel's: HIP where ROCm is installed (free software, in both
     modes), and CUDA for the contrib toolchain."""
-    opts = []
+    opts: list = []
     if contrib:
         if shutil.which("nvcc") is None and not Path("/usr/local/cuda/include/cuda.h").exists():
             p = PREREQUISITES[distro_family()]
             fail("the CUDA target needs NVIDIA's CUDA toolkit (not free software)",
-                 "install it: " + p["how"] + p["cuda"] +
+                 "install it:\n" + (f"  {p['cuda_repo']}\n" if "cuda_repo" in p else "") +
+                 "  " + p["how"] + p["cuda"] +
                  (" (Ubuntu: multiverse; Debian: non-free)" if distro_family() == "ubuntu" else ""))
         opts.append("--cuda")
     rocm = rocm_dirs()
@@ -305,10 +317,8 @@ def build_device_libs(jobs: int) -> bool:
 
 
 def fix_sources() -> None:
-    # the patched files back to the release (the files the patches add removed), then every patch in order
-    run(["git", "-C", SRC, "checkout", "--", *patched_files()])
-    for f in added_files():
-        (SRC / f).unlink(missing_ok=True)
+    # the patched files back to the release, then every patch in order
+    restore_release()
     for patch in PATCHES:
         r = subprocess.run(["git", "-C", str(SRC), "apply", str(patch)], capture_output=True, text=True)
         if r.returncode != 0:
@@ -318,22 +328,24 @@ def fix_sources() -> None:
 
 
 def prepare_source(tag: str) -> None:
-    """The clone at `tag`, with the patches."""
+    """The clone at `tag` (an untagged release at its commit, UNTAGGED), with the patches."""
     BASE.mkdir(parents=True, exist_ok=True)
     OUT.mkdir(parents=True, exist_ok=True)
-    if (SRC / ".git").exists():
-        have = subprocess.run(["git", "-C", str(SRC), "describe", "--tags", "--exact-match"], capture_output=True,
-                              text=True).stdout.strip()
-        if have != tag:
-            run(["git", "-C", SRC, "fetch", "--depth", "1", "origin", "tag", tag])
-            # every file the earlier tag's patches changed back to the release first (that set can differ from this
-            # tag's: a patch dropped since still has its file changed in the clone), and the files they added removed
+    ref = UNTAGGED.get(tag, tag)
+    if not (SRC / ".git").exists():
+        run(["git", "init", "-q", SRC])
+        run(["git", "-C", SRC, "remote", "add", "origin", REPO])
+    have = [subprocess.run(["git", "-C", str(SRC), *cmd], capture_output=True, text=True).stdout.strip()
+            for cmd in (["rev-parse", "HEAD"], ["describe", "--tags", "--exact-match"])]
+    if ref not in have:
+        run(["git", "-C", SRC, "fetch", "--depth", "1", "origin", *([] if tag in UNTAGGED else ["tag"]), ref])
+        # every file the earlier release's patches changed back to the release first (that set can differ from this
+        # release's: a patch dropped since still has its file changed in the clone), and the files they added removed
+        if have[0] != "HEAD":
             run(["git", "-C", SRC, "checkout", "--", "."])
-            for f in added_files():
+            for f in patched_files()[1]:
                 (SRC / f).unlink(missing_ok=True)
-            run(["git", "-C", SRC, "checkout", "--detach", tag])
-    else:
-        run(["git", "clone", "--depth", "1", "--branch", tag, REPO, SRC])
+        run(["git", "-C", SRC, "checkout", "--detach", ref])
     fix_sources()
 
 
@@ -379,7 +391,7 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     jobs = jobs or os.cpu_count() or 4
     started = time.time()
     run([sys.executable, SRC / "buildbot" / "compile.py", "-o", BUILD, "-j", str(jobs)])
-    # the tools a --windows build runs that the toolchain does not install (libclc's)
+    # the tools a --windows build runs that the toolchain does not install (libdevice's)
     for tool in HOST_TOOLS_EXTRA:
         if (BUILD / "bin" / tool).exists():
             shutil.copy2(BUILD / "bin" / tool, INSTALL / "bin" / tool)
@@ -387,7 +399,8 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     gpus = probe(INSTALL)
     backends = sorted(p.name.split("_adapter_")[1].split(".")[0] for p in (INSTALL / "lib").glob("libur_adapter_*.so"))
-    RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [patch_id(p) for p in PATCHES], "zstd": True,
+    RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [patch_id(p) for p in PATCHES],
+                                  "patches": patch_fingerprints(), "zstd": True,
                                   "built": time.strftime("%Y-%m-%d %H:%M"),
                                   "minutes": round((time.time() - started) / 60), "backends": backends,
                                   "device_libs": device_libs,
@@ -402,11 +415,11 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
 # it does not install), so no compiler is built for Windows or for this machine: only the parts a Windows engine links
 # and runs with (no Debug libraries, no clang.exe).
 WIN_OUT = ROOT / ".tools" / "intel-llvm-win"
-# the tools libdevice and libclc take from LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR; the toolchain installs all but
-# HOST_TOOLS_EXTRA, which build() copies from its build tree
+# the tools libdevice takes from LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR; the toolchain installs all but HOST_TOOLS_EXTRA,
+# which build() copies from its build tree
 HOST_TOOLS = ("clang", "llvm-ar", "append-file", "clang-offload-bundler", "llvm-offload-binary", "file-table-tform",
               "llvm-foreach", "llvm-spirv", "sycl-post-link", "llvm-link")
-HOST_TOOLS_EXTRA = ("llvm-as", "opt", "libclc-remangler")
+HOST_TOOLS_EXTRA = ("opt",)
 # NVIDIA's Windows CUDA headers and import libraries (cuda.lib, nvml.lib) the CUDA adapter links: the toolkit's
 # redistributable archives (not free software; downloaded, never bundled), of the version the contrib packages build
 # for, which every newer driver runs
@@ -422,16 +435,27 @@ echo "#$ TOP={root}"
 echo "#$ INCLUDES=\"-I{root}/include\""
 echo "#$ LIBRARIES=\"-L{root}/lib/x64\""
 """
+# AMD's HIP for the Windows HIP adapter (AMD GPUs): the HIP headers of this machine's ROCm (free software; AMD's
+# Windows SDK carries the same) and an import library of the HIP 7 runtime AMD's Windows driver puts into System32
+# (Adrenalin 26.5.1 and later ship only it, in place of amdhip64_6.dll), made with llvm-dlltool from the names the
+# Linux runtime of the same major version exports
+WIN_HIP_DLL = "amdhip64_7.dll"
+# zstd for the Windows SYCL runtime (BSD-3-Clause; dual-licensed with GPL-2.0, taken under the BSD license), linked into
+# sycl9.dll: oneMKL's SYCL DLLs carry zstd-compressed device images, which a runtime without it refuses as they
+# register them in their DllMain - mkl_sycl_blas.6.dll then does not load (WinError 1114, XeStrata #59)
+WIN_ZSTD = "1.5.7"
+WIN_ZSTD_SHA256 = "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
+WIN_ZSTD_URL = f"https://github.com/facebook/zstd/releases/download/v{WIN_ZSTD}/zstd-{WIN_ZSTD}.tar.gz"
 # what a Windows engine's SYCL runtime is: the headers and the device libraries, installed by their components, and
-# the DLLs and import libraries, copied (their components install the Debug ones too, which are not built)
-WIN_COMPONENTS = ("sycl-headers", "sycl-headers-extras", "OpenCL-Headers", "ur_headers", "libsycldevice",
-                  "libspirv-builtins")
-WIN_FILES = ("bin/sycl9.dll", "bin/ur_loader.dll", "bin/ur_win_proxy_loader.dll",
+# the DLLs and import libraries, copied (their components install the Debug ones too, which are not built); the UR
+# loader and the OpenCL adapter are linked into sycl9.dll since v7.2.0 (UR_STATIC_LOADER, UR_STATIC_ADAPTER_OPENCL)
+WIN_COMPONENTS = ("sycl-headers", "sycl-headers-extras", "OpenCL-Headers", "ur_headers", "libsycldevice")
+WIN_FILES = ("bin/sycl9.dll", "bin/ur_win_proxy_loader.dll",
              "bin/ur_adapter_cuda.dll", "bin/ur_adapter_level_zero.dll", "bin/ur_adapter_level_zero_v2.dll",
-             "bin/ur_adapter_opencl.dll", "bin/xptifw.dll", "lib/sycl9.lib", "lib/sycl.lib",
-             "lib/sycl-devicelib-host.lib", "lib/ur_loader.lib", "lib/xpti.lib", "lib/xptifw.lib")
-WIN_TARGETS = ("sycl9.dll", "ur_loader", "ur_win_proxy_loader", "ur_adapter_cuda", "ur_adapter_level_zero",
-               "ur_adapter_level_zero_v2", "ur_adapter_opencl", "xptifw", "libsycldevice", "libspirv-builtins")
+             "bin/xptifw.dll", "lib/sycl9.lib", "lib/sycl.lib",
+             "lib/sycl-devicelib-host.lib", "lib/xpti.lib", "lib/xptifw.lib")
+WIN_TARGETS = ("sycl9.dll", "ur_win_proxy_loader", "ur_adapter_cuda", "ur_adapter_level_zero",
+               "ur_adapter_level_zero_v2", "xptifw", "libsycldevice")
 # Windows names the build asks for in another case than the SDK's files (Linux's file names are case-sensitive)
 WIN_CASE_HEADERS = {"Libloaderapi.h": "um/libloaderapi.h"}
 WIN_CASE_LIBS = {"Shlwapi.lib": "um/x86_64/shlwapi.lib"}
@@ -469,6 +493,63 @@ def fetch_win_cuda(dest: Path) -> Path:
     return dest
 
 
+def win_hip(dest: Path) -> Path | None:
+    """A HIP tree for the Windows HIP adapter in `dest` (include/ and lib/amdhip64.lib), or None when this machine has
+    no ROCm HIP of WIN_HIP_DLL's major version."""
+    rocm = rocm_dirs()
+    major = WIN_HIP_DLL.removesuffix(".dll").rsplit("_", 1)[1]
+    if rocm is None or not (rocm[1] / f"libamdhip64.so.{major}").exists():
+        return None
+    so = rocm[1] / f"libamdhip64.so.{major}"
+    # the headers' license (MIT), for the Windows package's notices: the adapter carries their inline code
+    lic = [*Path("/usr/share/doc/libamdhip64-dev").glob("copyright"),
+           *Path("/usr/share/licenses").glob("rocm-hip*/LICENSE*"), *(rocm[0] / "share" / "doc").glob("hip*/LICENSE*")]
+    if not lic:
+        fail("ROCm's HIP headers are here, but not their license text", "install ROCm's HIP development package whole")
+    inc = dest / "include"
+    shutil.rmtree(dest, ignore_errors=True)
+    for name in ("hip", "hsa"):
+        if (rocm[0] / "include" / name).is_dir():
+            shutil.copytree(rocm[0] / "include" / name, inc / name, symlinks=True)   # hsa/hsa: a link to itself
+    out = subprocess.run(["nm", "-D", "--defined-only", "--format=posix", str(so)], capture_output=True, text=True,
+                         check=True).stdout
+    # the C functions, without their symbol versions (hipMalloc@@hip_4.2); the Itanium-mangled C++ ones have other
+    # names in the Windows DLL
+    names = sorted({f.split()[0].split("@")[0] for f in out.splitlines()
+                    if len(f.split()) > 1 and f.split()[1] in ("T", "W") and not f.startswith("_Z")})
+    (dest / "lib").mkdir(parents=True)
+    shutil.copy2(lic[0], dest / "LICENSE-hip.txt")
+    (dest / "amdhip64.def").write_text(f"LIBRARY {WIN_HIP_DLL}\nEXPORTS\n" + "".join(f"  {n}\n" for n in names))
+    run([llvm_bin_with("llvm-dlltool"), "-m", "i386:x86-64", "-d", dest / "amdhip64.def", "-l",
+         dest / "lib" / "amdhip64.lib"])
+    return dest
+
+
+def win_zstd(dest: Path, toolchain: Path) -> Path:
+    """zstd's static library for Windows in `dest` (include/zstd.h, lib/zstd_static.lib, LICENSE), cross-built with
+    the cross build's `toolchain`, WIN_ZSTD's release checked against its SHA-256."""
+    if (dest / "lib" / "zstd_static.lib").exists() and (dest / "include" / "zstd.h").exists():
+        return dest
+    tar = OUT / f"zstd-{WIN_ZSTD}.tar.gz"
+    run(["curl", "-fsSL", "-o", tar, WIN_ZSTD_URL])
+    if hashlib.sha256(tar.read_bytes()).hexdigest() != WIN_ZSTD_SHA256:
+        fail(f"zstd {WIN_ZSTD}'s release does not have the SHA-256 this script expects", f"look at {WIN_ZSTD_URL}")
+    src, build = OUT / f"zstd-{WIN_ZSTD}", OUT / "zstd-build"
+    shutil.rmtree(src, ignore_errors=True)
+    shutil.rmtree(build, ignore_errors=True)
+    run(["tar", "-xzf", tar, "-C", OUT])
+    run(["cmake", "-G", "Ninja", "-S", src / "build" / "cmake", "-B", build, f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
+         "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_INSTALL_PREFIX={dest}", "-DZSTD_BUILD_SHARED=OFF",
+         "-DZSTD_BUILD_STATIC=ON", "-DZSTD_BUILD_PROGRAMS=OFF", "-DZSTD_BUILD_TESTS=OFF", "-DZSTD_LEGACY_SUPPORT=OFF"])
+    run(["cmake", "--build", build])
+    run(["cmake", "--install", build])
+    shutil.copy2(src / "LICENSE", dest / "LICENSE")
+    shutil.rmtree(src)
+    shutil.rmtree(build)
+    tar.unlink()
+    return dest
+
+
 def win_toolchain(xwin: Path, host_bin: Path) -> Path:
     """The CMake toolchain of the cross build: the host toolchain's clang-cl and lld-link, xwin's CRT and SDK."""
     case_inc, case_lib = OUT / "case" / "include", OUT / "case" / "lib"
@@ -482,8 +563,10 @@ def win_toolchain(xwin: Path, host_bin: Path) -> Path:
     libs = [xwin / "crt" / "lib" / "x86_64", *(xwin / "sdk" / "lib" / s / "x86_64" for s in ("um", "ucrt")), case_lib]
     flags = " ".join(["--target=x86_64-pc-windows-msvc", "-Wno-unused-command-line-argument",
                       *(f"/imsvc{d}" for d in inc)])
-    # intel/llvm installs lld only where it builds the AMD target (ROCm installed): else the distribution's
-    linker = host_bin / "lld-link" if (host_bin / "lld-link").exists() else llvm_bin_with("lld-link")
+    # the distribution's lld-link, which merges the DLLs' manifests itself (with libxml2); intel/llvm's, which it
+    # installs where it builds the AMD target, looks for Windows' mt.exe for them and stopped sycl9.dll's link
+    dist = [d for d in sorted(Path("/usr/lib").glob("llvm-*/bin/lld-link")) if d.exists()]
+    linker = llvm_bin_with("lld-link") if dist else host_bin / "lld-link"
     tc = OUT / "toolchain.cmake"
     tc.write_text(f"""set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_VERSION 10.0)
@@ -514,6 +597,9 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
     if rec.get("tag") != tag or "cuda" not in rec.get("backends", []):
         fail(f"--windows runs the tools of the contrib toolchain of {tag} on this machine, which is not built",
              f"build it first: tools/intel_llvm_build.py --contrib --tag {tag}")
+    if rec.get("patches") != patch_fingerprints():
+        fail("the contrib toolchain was built with different patches",
+             "build it again: tools/intel_llvm_build.py --contrib --rebuild")
     lacking = [t for t in (*HOST_TOOLS, *HOST_TOOLS_EXTRA) if not (host / "bin" / t).exists()]
     if lacking:
         fail(f"the contrib toolchain lacks {', '.join(lacking)} (built before --windows needed them)",
@@ -522,19 +608,28 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
         fail(f"no MSVC CRT and Windows SDK in {xwin}", "xwin's splat: docs/DEVTOOLS.md#windows-cross-build, or --xwin")
     prepare_source(tag)
     cuda = fetch_win_cuda(OUT / "cuda")
+    hip = win_hip(OUT / "hip") if "hip" in rec.get("backends", []) else None
+    if hip is None:
+        say(f"note: no ROCm HIP for {WIN_HIP_DLL} here, or a contrib toolchain without the HIP target: the Windows "
+            "runtime without AMD GPUs")
     hb = host / "bin"
     # the device libraries: the host compiler for Windows, with the CRT's and the SDK's headers after its own
     devflags = " ".join(["-nostdlibinc", *(f"-idirafter {d}" for d in (
         xwin / "crt" / "include", *(xwin / "sdk" / "include" / s for s in ("ucrt", "um", "shared"))))])
     s = SRC
     projects = "sycl;llvm-spirv;opencl;xpti;xptifw;libdevice"
+    toolchain = win_toolchain(xwin, hb)
+    zstd = win_zstd(OUT / "zstd", toolchain)
     options = [
-        f"-DCMAKE_TOOLCHAIN_FILE={win_toolchain(xwin, hb)}", "-DCMAKE_BUILD_TYPE=Release",
+        f"-DCMAKE_TOOLCHAIN_FILE={toolchain}", "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_INSTALL_PREFIX={INSTALL}", "-DLLVM_ENABLE_ASSERTIONS=OFF",
-        "-DLLVM_TARGETS_TO_BUILD=X86;SPIRV;NVPTX", "-DLLVM_HOST_TRIPLE=x86_64-pc-windows-msvc",
+        f"-DLLVM_TARGETS_TO_BUILD=X86;SPIRV;NVPTX{';AMDGPU' if hip else ''}",
+        "-DLLVM_HOST_TRIPLE=x86_64-pc-windows-msvc",
         # BLAKE3's MASM files: LLVM's ml (llvm-ml) does not assemble them; the C versions are taken
         "-DLLVM_DISABLE_ASSEMBLY_FILES=ON",
-        f"-DLLVM_EXTERNAL_PROJECTS={projects}", f"-DLLVM_ENABLE_PROJECTS=clang;{projects};libclc",
+        # no libclc: its libspirv for a Windows host (libspirv.l32.*, the Windows long) is the contrib toolchain's,
+        # which builds every variant of each device target (LLVM runtimes since v7.2.0)
+        f"-DLLVM_EXTERNAL_PROJECTS={projects}", f"-DLLVM_ENABLE_PROJECTS=clang;{projects}",
         f"-DLLVM_EXTERNAL_SYCL_SOURCE_DIR={s / 'sycl'}", f"-DLLVM_EXTERNAL_LLVM_SPIRV_SOURCE_DIR={s / 'llvm-spirv'}",
         f"-DLLVM_EXTERNAL_XPTI_SOURCE_DIR={s / 'xpti'}", f"-DXPTI_SOURCE_DIR={s / 'xpti'}",
         f"-DLLVM_EXTERNAL_XPTIFW_SOURCE_DIR={s / 'xptifw'}", f"-DLLVM_EXTERNAL_LIBDEVICE_SOURCE_DIR={s / 'libdevice'}",
@@ -542,15 +637,15 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
         "-DLLVM_BUILD_TOOLS=ON", "-DSYCL_ENABLE_WERROR=OFF", "-DSYCL_INCLUDE_TESTS=OFF", "-DLLVM_ENABLE_DOXYGEN=OFF",
         "-DLLVM_ENABLE_SPHINX=OFF", "-DBUILD_SHARED_LIBS=OFF", "-DSYCL_ENABLE_XPTI_TRACING=ON",
         "-DLLVM_ENABLE_LLD=OFF", "-DLLVM_SPIRV_ENABLE_LIBSPIRV_DIS=OFF", "-DXPTI_ENABLE_WERROR=OFF",
-        "-DSYCL_ENABLE_BACKENDS=level_zero;level_zero_v2;cuda;opencl",
+        f"-DSYCL_ENABLE_BACKENDS=level_zero;level_zero_v2;cuda;opencl{';hip' if hip else ''}",
         # no sycl-jit (the runtime compiler, kernel_compiler's), which the engine does not use: it would build most of
         # LLVM's code generation and clang for Windows
         "-DSYCL_ENABLE_EXTENSION_JIT=OFF",
-        # (v7.2.0 has no LIBCLC_TARGETS_TO_BUILD: libclc follows the backends; the Windows build is unverified with it)
         "-DSYCL_ENABLE_MAJOR_RELEASE_PREVIEW_LIB=OFF",
-        "-DLIBCLC_GENERATE_REMANGLED_VARIANTS=ON", "-DLIBCLC_NATIVECPU_HOST_TARGET=OFF",
         "-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON", f"-DCUDAToolkit_ROOT={cuda}", "-DLLVM_ENABLE_DIA_SDK=OFF",
-        "-DLLVM_ENABLE_ZSTD=OFF",
+        "-DLLVM_ENABLE_ZSTD=FORCE_ON", "-DLLVM_USE_STATIC_ZSTD=ON", f"-Dzstd_INCLUDE_DIR={zstd / 'include'}",
+        f"-Dzstd_LIBRARY={zstd / 'lib' / 'zstd_static.lib'}",
+        f"-Dzstd_STATIC_LIBRARY={zstd / 'lib' / 'zstd_static.lib'}",
         # the device libraries' tools, this machine's (patch build-libdevice-custom-tools); each also by its own
         # variable, else LLVM's get_host_tool_path sets its *_target in the cache to a build of it for this machine
         f"-DLIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR={hb}", f"-DSYCL_LIBDEVICE_CXX_FLAGS={devflags}",
@@ -559,32 +654,45 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
         # it PYTHON_EXECUTABLE (empty unless given) over its own
         f"-DPYTHON_EXECUTABLE={sys.executable}", "-DCROSS_TOOLCHAIN_FLAGS_NATIVE=-DSYCL_ENABLE_EXTENSION_JIT=OFF",
     ]
+    if hip:
+        options += ["-DUR_HIP_PLATFORM=AMD", f"-DUR_HIP_ROCM_DIR={hip}", f"-DUR_HIP_INCLUDE_DIR={hip / 'include'}",
+                    f"-DUR_HIP_HSA_INCLUDE_DIRS={hip / 'include'}", f"-DUR_HIP_LIB_DIR={hip / 'lib'}"]
     # llvm-rc preprocesses the resource scripts with the clang it finds on PATH: the host toolchain's
     env = dict(os.environ, PATH=f"{hb}{os.pathsep}{os.environ.get('PATH', '')}")
     started = time.time()
-    if not (BUILD / "build.ninja").exists():
-        run(["cmake", "-G", "Ninja", "-S", s / "llvm", "-B", BUILD, *options], env=env)
-    run(["cmake", "--build", BUILD, "--target", *WIN_TARGETS, "--", "-j", str(jobs or os.cpu_count() or 4)], env=env)
+    # configured every time, so a kept build tree takes the options a change of this script gives (zstd)
+    run(["cmake", "-G", "Ninja", "-S", s / "llvm", "-B", BUILD, *options], env=env)
+    targets = [*WIN_TARGETS, *(["ur_adapter_hip"] if hip else [])]
+    run(["cmake", "--build", BUILD, "--target", *targets, "--", "-j", str(jobs or os.cpu_count() or 4)], env=env)
     shutil.rmtree(INSTALL, ignore_errors=True)
     for component in WIN_COMPONENTS:
         run(["cmake", "--install", BUILD, "--component", component])
-    for rel in WIN_FILES:
+    for rel in (*WIN_FILES, *(["bin/ur_adapter_hip.dll"] if hip else [])):
         (INSTALL / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(BUILD / rel, INSTALL / rel)
     shutil.copytree(s / "xpti" / "include" / "xpti", INSTALL / "include" / "xpti", dirs_exist_ok=True)
+    # Level Zero's headers (MIT, the loader's the build fetched), for the engine's calls into the loader the SYCL
+    # runtime loads (the copy engine's queue, the device's status: src/core/device.cpp); no component installs them
+    shutil.copytree(BUILD / "_deps" / "level-zero-loader-src" / "include" / "level_zero",
+                    INSTALL / "include" / "level_zero", dirs_exist_ok=True)
     # the license texts of what the DLLs carry: intel/llvm's, and those of the projects its build fetched (UMF and the
     # hwloc it links statically, Level Zero's loader and headers, emhash, parallel-hashmap, OpenCL's headers and ICD
     # loader, vc-intrinsics), for the Windows package's notices
     lic = INSTALL / "licenses"
     lic.mkdir(parents=True, exist_ok=True)
     shutil.copy2(s / "llvm" / "LICENSE.TXT", lic / "intel-llvm.txt")
+    shutil.copy2(zstd / "LICENSE", lic / "zstd-LICENSE")
+    if hip:
+        shutil.copy2(hip / "LICENSE-hip.txt", lic / "hip-headers.txt")
     for dep in sorted((BUILD / "_deps").glob("*-src")):
         for f in sorted(dep.iterdir()):
             if f.is_file() and f.name.upper().startswith(("LICENSE", "COPYING", "NOTICE")):
                 shutil.copy2(f, lic / f"{dep.name[:-4]}-{f.name}")
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [patch_id(p) for p in PATCHES],
-                                  "target": "x86_64-pc-windows-msvc", "cuda": WIN_CUDA,
+                                  "patches": patch_fingerprints(), "target": "x86_64-pc-windows-msvc",
+                                  "cuda": WIN_CUDA, "zstd": WIN_ZSTD,
+                                  "hip": WIN_HIP_DLL if hip else None,
                                   "built": time.strftime("%Y-%m-%d %H:%M"),
                                   "minutes": round((time.time() - started) / 60)}, indent=1))
     if not keep_build:
@@ -615,7 +723,9 @@ def main() -> None:
     if a.windows:
         set_out(WIN_OUT)
         have = json.loads(RECORD.read_text()) if RECORD.exists() else {}
-        if a.rebuild or have.get("tag") != a.tag or have.get("fixes") != [patch_id(p) for p in PATCHES]:
+        # an install from before zstd and Level Zero's headers were in it is built again
+        if a.rebuild or have.get("tag") != a.tag or have.get("patches") != patch_fingerprints() or \
+                have.get("zstd") != WIN_ZSTD or not (INSTALL / "include" / "level_zero" / "ze_api.h").exists():
             say(f"building intel/llvm {a.tag}'s SYCL runtime for Windows in {OUT} ...")
             build_windows(a.tag, a.xwin.resolve(), a.keep_build, a.jobs)
         else:
@@ -627,13 +737,10 @@ def main() -> None:
     have = finished()
     if have and not a.rebuild:
         if have.get("tag") == a.tag:
-            # the CUDA fixes ask only the contrib toolchain to be built again, the HIP ones only a toolchain with HIP
-            # or one that would have it now (ROCm installed since); the fixes to the build itself (build-) none
+            # A changed name, order or byte of any patch, including its description, changes the build input.
+            # Old records have no hashes, so they ask for one rebuild too.
             hip = "hip" in have.get("backends", []) or rocm_dirs() is not None
-            missing = [patch_id(p) for p in PATCHES if patch_id(p) not in have.get("fixes", [])
-                       and not patch_id(p).startswith("build-")
-                       and (a.contrib or not patch_id(p).startswith("cuda-"))
-                       and (hip or not patch_id(p).startswith("hip-"))]
+            missing = [] if have.get("patches") == patch_fingerprints() else ["the current patches"]
             # an AMD GPU's code needs the HIP target, which the build gets only when ROCm's HIP is there while it is
             # built: a record whose backends have none was built before ROCm was installed (and its deploy may be
             # incomplete, as an interrupted one leaves the record of the build before it)

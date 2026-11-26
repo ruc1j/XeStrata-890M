@@ -27,7 +27,6 @@
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/glm5.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
@@ -159,8 +158,9 @@ bool PlainModel::load_gblock(const GgufModel& m, int64_t l, GBlock& b, std::stri
 bool PlainModel::load_glm5(std::string& err) {
     const ModelSpec& s = spec_;
     glm_ = true;
-    if (opt_.kv_int8) {   // its MLA latent and indexer caches have no int8 kernels yet
-        err = "plain model: --kv int8 is not available for GLM-5.3-Flash yet";
+    // its MLA latent and indexer caches have no such kernels yet
+    if (opt_.kv_int8 || opt_.kv_q4 != 0 || opt_.kv_tcq != 0) {
+        err = "plain model: --kv int8, q4_0, k8v4, tcq4 and tcq5 are not available for GLM-5.3-Flash yet";
         return false;
     }
     // the shapes the kernels are written for (glm5.hpp: four streams, KDA heads of 128, the MLA's 512-wide latent and
@@ -177,6 +177,11 @@ bool PlainModel::load_glm5(std::string& err) {
     model_mtp_ = opt_.spec >= 2 && s.n_nextn == 1 &&
                  model_->find("blk." + std::to_string(s.n_layer) + ".nextn.eh_proj.weight") != nullptr;
     has_mtp_ = model_mtp_ && last();
+    // its decode windows keep their graphs, as the other MoE models' (load_qwen): a window answers the CPU's rings
+    // between its graph segments, which the straight form does not.  Timed against it on the one-row windows, a
+    // one-row window ran straight, its experts' ids were garbage and the GPU faulted on them (B70, UD-IQ3_XXS:
+    // --draft off stopped at its first token, the MTP's windows at a one-row window after 63 or 127 tokens)
+    step_form_.fix(0);
     opt_.max_cells = (opt_.max_cells + s.idx_kpool - 1) / s.idx_kpool * s.idx_kpool;
     cs_ = strata::gpu::stream_create();
     if (cs_ == nullptr) { err = "plain model: stream create failed"; return false; }
@@ -194,19 +199,7 @@ bool PlainModel::load_glm5(std::string& err) {
     }
 
     const GgufModel& m = *model_;
-    {   // the embedding stays in the mapping: a token's row is dequantized on the host
-        size_t at = 0;
-        const TensorInfo* t = m.find("token_embd.weight", &at);
-        if (t == nullptr || t->shape.size() != 2 || t->shape[0] != (uint64_t) s.n_embd || !m.in_bounds(*t, at)) {
-            err = "plain model: token_embd.weight is missing or of another width";
-            return false;
-        }
-        emb_type_ = (int) t->type;
-        n_vocab_ = (int64_t) t->shape[1];
-        emb_row_ = k::cpu::native_row_bytes(emb_type_, s.n_embd);
-        if (emb_row_ == 0) { err = "plain model: token_embd.weight's type has no host dequantizer"; return false; }
-        emb_ = m.shard(at).tensor_data(*t);
-    }
+    if (!load_embedding(err)) return false;
     if (last()) {   // the head: the last stage's
         if (!upload(m, "output.weight", head_, err) ||
             !upload_f32(m, "output_norm.weight", (uint64_t) s.n_embd, out_norm_, err))
@@ -225,8 +218,10 @@ bool PlainModel::load_glm5(std::string& err) {
         if (l >= lb_ && l < le_ && !load_gblock(m, l, b, err)) return false;
     }
     if (n_dsa == 0) { err = "plain model: the model has no DSA block"; return false; }
+    if (!setup_taps(err)) return false;   // DFlash2's (GLM-5.3-Flash's drafter reads the four streams' mean)
     if (has_mtp_) {   // a DSA block of its own caches, after the trunk's
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
+        mtp_allocs_[0] = allocs_.size();   // the layer's own weights (release_mtp)
         gmtp_.kda = false;
         gmtp_.idx = n_dsa++;
         if (!load_gblock(m, s.n_layer, gmtp_, err, true) || !upload(m, p + "eh_proj.weight", mtp_eh_, err) ||
@@ -239,8 +234,10 @@ bool PlainModel::load_glm5(std::string& err) {
             err = "plain model: the MTP layer's eh_proj has another shape or type";
             return false;
         }
+        mtp_allocs_[1] = allocs_.size();
     }
 
+    if (!tune_uploaded(err)) return false;
     // per-sequence state: per KDA block its recurrence and its three convolutions' last 3 inputs; per DSA block the
     // indexer's key | gate rows, its pooled keys and the MLA latent (FP16), one row a cell
     const int64_t H = s.n_head, S = s.kda_head_dim, C = H * S, KVR = s.kv_lora_rank, ID = s.idx_key_length;
@@ -269,20 +266,26 @@ bool PlainModel::load_glm5(std::string& err) {
         gdn_conv_[(size_t) i] = cv;
     }
     // the KDA states after a window's rows but its last, for going back to the last accepted draft (every stage's)
-    if (model_mtp_) {
-        opt_.spec = std::min({opt_.spec, opt_.max_t, k::kGlm5MaxSnaps + 1});
-        n_snap_ = opt_.spec - 1;
+    if (model_mtp_ || opt_.draft_windows > 0) {   // (--draft dflash2: its windows' copies)
+        if (model_mtp_) opt_.spec = std::min({opt_.spec, opt_.max_t, k::kGlm5MaxSnaps + 1});
+        n_mtp_ = model_mtp_ ? opt_.spec - 1 : 0;
+        // those past the MTP layer's are the drafter's (load_qwen's rule: set_window_drafts may free them)
+        n_snap_load_ = n_mtp_;
+        n_snap_ = std::max(n_mtp_, std::min({opt_.draft_windows, opt_.max_t - 1, k::kGlm5MaxSnaps}));
         gdn_snap_.assign(gdn_state_.size(), {});
         conv_snap_.assign(gdn_state_.size(), {});
         for (size_t g = 0; g < gdn_state_.size(); ++g)
             for (int t = 0; t < n_snap_ && gdn_state_[g] != nullptr; ++t) {
                 float *st = nullptr, *cv = nullptr;
                 if (!strata::gpu::alloc_device(&st, state_bytes_) || !strata::gpu::alloc_device(&cv, conv_bytes_)) {
+                    strata::gpu::free(st);
                     err = "plain model: no VRAM for the KDA states' copies (--spec)";
                     return false;
                 }
-                allocs_.push_back(st);
-                allocs_.push_back(cv);
+                if (t < n_snap_load_) {
+                    allocs_.push_back(st);
+                    allocs_.push_back(cv);
+                }
                 gdn_snap_[g].push_back(st);
                 conv_snap_[g].push_back(cv);
             }
@@ -325,7 +328,7 @@ bool PlainModel::load_glm5(std::string& err) {
         }
         allocs_.push_back(g_lat_gather_);
         allocs_.push_back(g_lat_stage_);
-        std::fprintf(stderr, "strata plain: --kv-ram: the DSA latent cells in RAM (%.1f MiB), %.1f MiB of VRAM for them\n",
+        std::fprintf(stderr, "xestrata plain: --kv-ram: the DSA latent cells in RAM (%.1f MiB), %.1f MiB of VRAM for them\n",
                      (double) (n_dsa * cells * KVR * 2) / 1048576.0,
                      (double) ((opt_.max_t * g_gather_stride_ + cells) * KVR * 2) / 1048576.0);
     }
@@ -391,7 +394,7 @@ bool PlainModel::load_glm5(std::string& err) {
     mexec_.assign((size_t) opt_.max_t + 1, nullptr);
     msegs_.assign((size_t) opt_.max_t + 1, {});
     if (root_ == this)
-        std::fprintf(stderr, "strata plain: GLM-5.3-Flash, %lld KDA and %lld DSA blocks, %lld cells; the prompt in chunks "
+        std::fprintf(stderr, "xestrata plain: GLM-5.3-Flash, %lld KDA and %lld DSA blocks, %lld cells; the prompt in chunks "
                              "of %lld%s\n", (long long) n_kda, (long long) (has_mtp_ ? n_dsa - 1 : n_dsa),
                      (long long) cells, (long long) opt_.prompt_chunk, model_mtp_ ? "; the MTP layer drafts" : "");
     return true;
@@ -490,6 +493,7 @@ bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring
         ffn_out = moe_out_;
     }
     k::glm5_hc_post(ffn_out, g_hs_, g_post_, g_comb_, g_hs_, N, T, cs);
+    tap_rows(l, g_hs_, kHC, T, 0, true, cs);   // DFlash2's taps: the mean of the four streams (sglang's capture)
     return true;
 }
 
@@ -557,8 +561,7 @@ bool PlainModel::record_moe(const GBlock& b, int64_t ml, int T, uint32_t& ring, 
     k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
     const float scale = s.expert_weights_scale > 0 ? (float) s.expert_weights_scale : 1.0f;
     k::glm5_router_sigmoid(rlog_, b.router_b, T, (int) E, (int) K, s.expert_weights_norm, scale, ids_, w_, cs);
-    ++ring;
-    win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
+    moe_ring(ml, T, ring, nullptr, cs);
     {   // the shared expert while the host serves: gate / up from hn_'s q8_1, the clamp, down
         const int FW = b.ffn_gate.n_out;
         if (b.ffn_gate.type != b.ffn_up.type ||
@@ -570,17 +573,8 @@ bool PlainModel::record_moe(const GBlock& b, int64_t ml, int T, uint32_t& ring, 
         k::glm5_swiglu_clamp(g_ffg_, g_ffu_, g_ffg_, (int64_t) T * FW, b.clamp, cs);
         gproj(b.ffn_down, g_ffg_, shared_, T, false, cs);
     }
-    if (win_.segmented()) {   // a graph ends where the host must answer the ring
-        strata::gpu::Graph* g = nullptr;
-        if (!strata::gpu::end_capture(cs, &g)) {
-            err = std::string("plain model: segment capture: ") + strata::gpu::last_error();
-            return false;
-        }
-        segs.push_back(g);
-        if (!strata::gpu::begin_capture(cs)) { err = "plain model: begin capture failed"; return false; }
-    }
-    if (!win_.experts(ml, ring, 0, 0, T, cs, err)) return false;
-    k::native_moe_combine_multi(win_.parts(), w_, shared_, moe_out_, N, K, T, cs);
+    if (!moe_experts(ml, T, ring, segs, cs, err)) return false;
+    win_.combine(0, 0, T, w_, shared_, moe_out_, nullptr, cs);
     return true;
 }
 

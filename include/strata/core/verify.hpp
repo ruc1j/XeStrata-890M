@@ -28,8 +28,10 @@
 
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/core/moe_window.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include "strata/core/gpu.hpp"
 
@@ -46,8 +48,7 @@ namespace strata::core {
 class NativeHead;
 
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
-using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                             int64_t layer);
+using PoolMultiFn = MoePoolFn;
 
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
@@ -85,12 +86,17 @@ public:
     virtual bool wait_commit(std::string& err) = 0;
     virtual void set_sampling(const strata::kernels::SamplerParams& sp) = 0;
     virtual void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) = 0;
+    /// A slot's reply tail for its penalty window and its own logit bias (same process: the pointer is copied).
+    virtual void set_slot_history(int slot, const int32_t* tail, int64_t n) = 0;
+    virtual bool set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err) = 0;
     virtual void set_head_sampling(bool on) = 0;
     virtual bool set_logit_bias(const std::vector<float>& bias, std::string& err) = 0;
     virtual bool set_stop_ids(const std::vector<int32_t>& ids, std::string& err) = 0;
     /// The grammar's allowed tokens for the next window's T rows (host bitmask rows), uploaded on the last stage's
     /// device; null clears them.
     virtual bool set_allowed(const uint32_t* rows, int T, std::string& err) = 0;
+    /// STRATA_ROUTE_PRIOR on or off for the next windows on every stage (off: the router's exact routing).
+    virtual bool set_route_prior(bool on, std::string& err) = 0;
     /// Same process: the penalty rows the last stage's head reads, a buffer the engine fills before every window.
     virtual void set_history(const int32_t* history, int history_len) = 0;
     /// Same process: the drafter's q rows for the next window (Verifier::set_spec_q).
@@ -126,10 +132,13 @@ public:
     bool wait_commit(std::string& err) override;
     void set_sampling(const strata::kernels::SamplerParams& sp) override;
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) override;
+    void set_slot_history(int slot, const int32_t* tail, int64_t n) override;
+    bool set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err) override;
     void set_head_sampling(bool on) override;
     bool set_logit_bias(const std::vector<float>& bias, std::string& err) override;
     bool set_stop_ids(const std::vector<int32_t>& ids, std::string& err) override;
     bool set_allowed(const uint32_t* rows, int T, std::string& err) override;
+    bool set_route_prior(bool on, std::string& err) override;
     void set_history(const int32_t* history, int history_len) override;
     void set_spec_q(const int32_t* q, int n_q) override;
     void set_spec_proposal(const int32_t* q, int n_q) override;
@@ -162,7 +171,7 @@ public:
     /// measurement (about 1 s on an RTX 4070) is not in its time to the first token.  Throws on a device error.
     static void tune_device(const ModelGeometry& g, void* stream);
 
-    /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
+    /// `max_t` <= kVerifyNarrowT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
 
@@ -171,6 +180,8 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Whether the last run() captured its window's graph: that round's time is mostly the capture's, not the window's
     bool captured_last() const { return captured_last_; }
+    size_t captured_graph_bytes() const { return graph_bytes_max_; }
+    size_t device_arena_bytes() const { return arena_bytes_; }
     /// Whether a window of T tokens can run without running the card out of memory: its graph is captured already,
     /// or the VRAM free leaves room to capture it (half as much again as the most a capture has taken, and 64 MiB)
     bool window_fits(int T) const;
@@ -196,13 +207,16 @@ public:
     // (n_vocab + 31) / 32 words from the host, copied before every window to the final stage's device.  Null clears
     // them; set, the head samples outside the captured graph as for a logit_bias.
     bool set_allowed(const uint32_t* rows, int T, std::string& err);
+    // STRATA_ROUTE_PRIOR for the next windows (a request's route_prior=0|1): off is the router's exact routing.  The kernel
+    // reads lambda from the device, so the captured windows stay as they are.  A no-op without STRATA_ROUTE_PRIOR.
+    bool set_route_prior(bool on, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
     /// int32 slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused
     /// front slots -1 (the kernel reads only the tail window).  Row t follows the window's drafts 1..t - staging
     /// row 0 alone (before 0.1.19) left the drafted rows with unwritten histories.  Null disables the penalties
     /// entirely - the neutral run's sampling call is byte-for-byte what it was.  The engine re-uploads the rows
-    /// before every window; the buffer must hold kVerifyMaxT rows and stay alive across the request.
+    /// before every window; the buffer must hold kVerifyNarrowT rows and stay alive across the request.
     void set_history(const int32_t* history, int history_len) {
         hist_d_ = history;
         hist_len_ = history_len;
@@ -273,8 +287,18 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
-    /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyMaxT, the default).  STRATA_PIPED_MTP's groups write
-    /// their slots' token and proposal rows at hbase = group * rows-per-group, past kVerifyMaxT with enough slots.
+    /// The DFlash2 drafter's taps: the completed output (the mean of the hyper-connection streams) of these layers,
+    /// gathered for every window row into tap_dev() ([T][ntap][n_embd]).  Only the layers this stage runs below the
+    /// last are kept.  Set before init; empty (the default) allocates nothing and records nothing.
+    void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
+    /// The taps off after init (the start's measurement released DFlash2): the window graphs, captured with the tap
+    /// kernels, are dropped and captured again without them on their next use.
+    void taps_off();
+    const float* tap_dev() const { return tap_dev_; }
+    int n_taps() const { return (int) tap_layers_.size(); }
+
+    /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyNarrowT, the default).  STRATA_PIPED_MTP's groups write
+    /// their slots' token and proposal rows at hbase = group * rows-per-group, past kVerifyNarrowT with enough slots.
     void set_handoff_rows(int rows) { handoff_rows_ = rows; }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.  Everything goes through a StageLink (an InProcessStage here).
@@ -389,12 +413,9 @@ public:
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU).  0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
-    /// DFlash2 taps (upstream Strata's SYCL verifier): before init(), the zero-based layers whose completed output the
-    /// drafter reads.  Each window then leaves tap_dev() = [max_t][n_taps][n_embd] floats (the mean of the hc streams
-    /// after the layer's FFN write), valid until the next window.  Single-stage only; a batch window writes none.
-    void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
-    const float* tap_dev() const { return tap_dev_; }
-    bool tapping() const { return tap_on_; }
+    /// XeStrata-890M: the DFlash2 taps (set_taps) are recorded here and this verifier holds every layer, so the drafter
+    /// reads them all from tap_dev() (a stage of a layer split keeps only its share).  A batch window writes none.
+    bool tapping() const { return !tap_layers_.empty() && g_ != nullptr && lb_ == 0 && le_ == g_->n_layers; }
 
     // ---- The stages of a layer split as a PIPELINE (upstream PR #559, --batch-groups).  A batch window over the slot
     // GROUP [base, base + S) is launched on ONE stage with its commit right behind it on the stage's queue (a batch
@@ -431,13 +452,32 @@ public:
                            const int64_t* pos, std::string& err);
     bool batch_commit_rows_submit(const int* rows, int S, int hbase, std::string& err);
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
-    /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
-    /// its row is drawn again with Philox(seed, position), as a solo window draws it.  Greedy by default.  Set on
-    /// the first stage of a layer split, it reaches the last (which draws).
+    /// A slot's sampling (temperature / top_p / top_k / min_p / seed, and with set_slot_history and
+    /// set_slot_logit_bias its penalties and bias): its row is drawn again with Philox(seed, position), as a solo
+    /// window draws it.  Greedy by default.  Set on the first stage of a layer split, it reaches the last (which
+    /// draws).
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
-        if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
+        if (slot >= 0 && slot < (int) slot_sp_.size()) {
+            slot_sp_[(size_t) slot] = sp;
+            // a slot's own bias array stays its row's (set_slot_logit_bias; the request's sp carries no pointer)
+            slot_sp_[(size_t) slot].logit_bias =
+                slot < (int) slot_bias_dev_.size() ? slot_bias_dev_[(size_t) slot] : nullptr;
+        }
         if (next_) next_->set_slot_sampling(slot, sp);
     }
+    /// A slot's reply tail for its penalty window: the `n` tokens its session consumed since the reply began (the
+    /// last penalty_last_n of them are counted), the fed-back head not in it yet.  Set before every batch window
+    /// that holds the slot while it has a penalty; reaches the last stage, which draws the rows.
+    void set_slot_history(int slot, const int32_t* tail, int64_t n) {
+        if (slot >= 0 && slot < (int) slot_tail_.size()) {
+            if (n > 0) slot_tail_[(size_t) slot].assign(tail, tail + n);
+            else slot_tail_[(size_t) slot].clear();
+        }
+        if (next_) next_->set_slot_history(slot, tail, n);
+    }
+    /// A slot's logit bias (n_vocab floats, empty = none), added before its row's penalties and filters as a solo
+    /// request's is.  Reaches the last stage.
+    bool set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err);
 
     /// Row `t` of the last window's head logits (the distribution token t of the window came from: before sampling,
     /// temperature and penalties) into `host` (vocab() floats); false when there is none.  OpenAI's logprobs.
@@ -473,7 +513,13 @@ public:
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
-    GpuPlanSink* plan_sink() { return &sink_; }
+    GpuPlanSink* plan_sink() { return win_.sink(); }
+    /// The latent MoE (Edge0): the window's mapped D rows, their doorbell and their Q8_0 image, for the pool's
+    /// CPU share (ExpertDispatch's lat_* fields); null when the pack is not a latent one.
+    const float* latent_xl_mapped() const { return win_.latent_xl_mapped(); }
+    const uint32_t* latent_xlseq() const { return win_.latent_xlseq(); }
+    const uint8_t* latent_act0_mapped() const { return win_.latent_act0_mapped(); }
+    bool latent() const { return win_.latent(); }
     /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
     /// of the other (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }
@@ -481,7 +527,7 @@ public:
     /// beside the CPU; best when the CPU is compute-bound, the i-quants), 1 = the grouped kernel reads the mapped
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
-    void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
+    void set_pcie_mode(int mode) { win_.sink()->pcie_mode = mode; }
     /// Whether the window reads the PCIe share beside its VRAM hits (STRATA_FETCH_BRANCH), for the split's estimate.
     bool fetch_branch() const { return fetch_branch_; }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
@@ -515,32 +561,28 @@ private:
     float* logit_bias_device_ = nullptr;
     std::vector<int32_t> stop_ids_host_;      ///< set_stop_ids
     int32_t* stop_ids_device_ = nullptr;
-    uint32_t* allowed_device_ = nullptr;   ///< kVerifyMaxT rows of the grammar's mask (set_allowed)
+    uint32_t* allowed_device_ = nullptr;   ///< kVerifyNarrowT rows of the grammar's mask (set_allowed)
     bool allowed_on_ = false;
+    float* rp_lambda_d_ = nullptr;          ///< STRATA_ROUTE_PRIOR's lambda on the device (0: off; set_route_prior)
+    bool rp_on_ = true;
+    unsigned long long* rp_stats_ = nullptr;   ///< STRATA_ROUTE_PRIOR: this GPU's counters
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT: this GPU's counters (nullptr: none)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
-    uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
-    unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     // Every expert of the verifier's layers resident (hits.h_res): the window runs as one graph that plans each
     // layer's experts on the device and never asks the host - no doorbell, flag waits, PCIe or CPU share (upstream
     // cfd3b72's zero-doorbell graph).  STRATA_VERIFY_RESIDENT_GRAPH=0: off.
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
-    bool tap_on_ = false;                  ///< DFlash2 taps (set_taps) are recorded into the windows
-    std::vector<int> tap_req_;             ///< set_taps
-    std::vector<int> tap_layers_;          ///< the tapped layer ids (zero-based, completed outputs)
-    std::vector<int> tap_slot_;            ///< layer -> slot in tap_layers_, or -1
-    float* tap_dev_ = nullptr;             ///< [max_t][n_taps][n_embd]
-    int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
+    int brow_[strata::kernels::kWindowMaxT] = {};   ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
     /// key: batch_key(rows, S, hand-off base) - the whole row layout (--batch-mtp repeats a slot over its rows)
     std::map<std::vector<int>, strata::gpu::Graph*> exec_bm_, commit_bm_;
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU, with a graph limit)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph; N: LRU-evict beyond N layouts
-    int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    int last_rows_[strata::kernels::kWindowMaxT] = {};   ///< the slots of the last batch window's rows
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
         std::vector<int> k;
         k.reserve((size_t) S + 1);
@@ -551,17 +593,27 @@ private:
     int row_base_ = 0;                     ///< a batch window's first hand-off row (its slot group's base)
     // batch_launch / batch_poll
     bool b_running_ = false;
+    /// Recorded behind a batch window's graphs: batch_poll reads the device's loss from it, as service() reads ev_done_
+    /// (issue #78: stream_status cannot report a banned queue)
+    strata::gpu::Event* ev_batch_ = nullptr;
+    bool mark_batch(std::string& err);
     int64_t b_k_ = 0, b_steps_ = 0;
     std::chrono::steady_clock::time_point b_last_;
-    int32_t b_out_[8] = {};
+    int32_t b_out_[strata::kernels::kWindowMaxT] = {};
     /// The host's half of a batch window: the checks, the graphs, the rows' staging (run_slot_rows, batch_launch).
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
     std::vector<strata::kernels::SamplerParams> slot_sp_;
+    std::vector<float*> slot_bias_dev_;              ///< per slot: its logit bias on the device (null: none)
+    std::vector<std::vector<int32_t>> slot_tail_;    ///< per slot: its reply tail for the penalty window
+    int32_t* slot_hist_d_ = nullptr;                 ///< the current batch window's penalty-history rows (device)
+    strata::kernels::SamplerParams* slot_params_d_ = nullptr;
+    size_t slot_params_cap_ = 0;
+    size_t slot_hist_cap_ = 0;                       ///< ... and how many int32 fit (grows to the widest window)
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
-    int64_t last_pos_b_[8] = {};
+    int64_t last_pos_b_[strata::kernels::kWindowMaxT] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
     // STRATA_PIPED_MTP (init_deferred_commit): the saved rows, laid out as the window scratch (global layer index) with
@@ -577,11 +629,14 @@ private:
     bool sample_rows(int S, std::string& err);
     bool res_graph_ = false;
     bool recording_res_ = false;
-    strata::gpu::Graph* exec_res_[9] = {};
+    strata::gpu::Graph* exec_res_[strata::kernels::kWindowMaxT + 1] = {};
     bool all_resident() const;
     bool capture_res(int T, std::string& err);
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
-    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyMaxT)
+    std::vector<int> tap_req_, tap_layers_;   ///< set_taps: the DFlash2 drafter's tap layers (this stage's share)
+    std::vector<int> tap_slot_;          ///< layer -> its tap index (-1: not tapped)
+    float* tap_dev_ = nullptr;           ///< [max_t][ntap][n_embd], the window's taps (null: none)
+    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyNarrowT)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
     StageLink* next_ = nullptr;          ///< set_next: the next stage, through this link only
@@ -611,8 +666,8 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
-    double prof_t_sum_[9][2][kProfPer] = {};   // the same per window size T (1..8), for profile_by_t_report
-    int64_t prof_t_win_[9] = {};
+    double prof_t_sum_[strata::kernels::kWindowMaxT + 1][2][kProfPer] = {};   // the same per window size T, for
+    int64_t prof_t_win_[strata::kernels::kWindowMaxT + 1] = {};               // profile_by_t_report
     bool rs_on_ = false;                      // STRATA_ROUTE_STATS (upstream d276adf2)
     unsigned long long* rs_dev_ = nullptr;    // [9 T][n_layers][8 rows]: experts of row r that no earlier row of the window routed to
     int64_t rs_win_[9] = {};
@@ -625,7 +680,7 @@ private:
     int max_t_ = 0;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[8] = {};
+    int32_t last_tokens_[strata::kernels::kWindowMaxT] = {};
     int64_t n_vocab_ = 0;
     strata::gpu::Stream cs_ = nullptr;
     strata::gpu::Stream df_side_[2] = {};   ///< STRATA_DF_BRANCH: the mixer's side branches of the window graph
@@ -633,7 +688,7 @@ private:
     bool df_branch_res_ = false;            ///< the same choice for the all-resident window graph (see init)
     strata::gpu::Stream fetch_side_ = nullptr;   ///< STRATA_FETCH_BRANCH: the PCIe share's fetch beside the VRAM hits
     bool fetch_branch_ = false;
-    strata::gpu::Graph* exec_[9] = {};
+    strata::gpu::Graph* exec_[strata::kernels::kWindowMaxT + 1] = {};
     bool captured_last_ = false;
     size_t graph_bytes_max_ = 0;   ///< the most VRAM a window's capture and first run have taken
     size_t graph_free0_ = 0;       ///< the VRAM free before the capture of the window run() is running, else 0
@@ -650,12 +705,8 @@ private:
     bool gdn_pend_ = false;      ///< rows stashed that no window has run yet
     bool defer_ok();             ///< decides defer_graphs_ once
     bool flush_gdn(std::string& err);
-    // A device whose running kernels do not see the host's writes (doorbell_visible: the UHD 770) runs a window as
-    // segments the host launches one after another, cut before each layer group's experts; no kernel waits on a
-    // flag.  STRATA_VERIFY_SEGMENTED=1 / 0 forces it either way.
-    bool segmented_ = false;
     bool no_window_eviction_ = false;   ///< capture_all wants every size at once: it must not free one to capture another (#3702)
-    std::vector<strata::gpu::Graph*> segs_[9];
+    std::vector<strata::gpu::Graph*> segs_[strata::kernels::kWindowMaxT + 1];
     std::vector<strata::gpu::Graph*>* seg_out_ = nullptr;   // the segments of the window being captured
 
     // mapped staging (host pointer, device alias)
@@ -665,13 +716,11 @@ private:
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
-    uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
+    uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyNarrowT * kNonfiniteBlocks flags
     int nf_row_ = -1;                     ///< nonfinite_row()
     int64_t nf_pos_ = -1;                 ///< nonfinite_pos()
     uint32_t nf_mask_ = 0;                ///< nonfinite_in(): bit t = row t
     void note_nonfinite(int T, const int64_t* pos_b);   ///< the window's flags (+ STRATA_NAN_INJECT) -> nf_row_
-    float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
-    int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     int32_t* h_route_ = nullptr; int32_t* m_route_ = nullptr;   // n_layers * T * k: each layer's ids (add_routing)
     bool route_rec_ = false;
     // STRATA_ROUTE_DUMP / STRATA_ROUTE_REPLAY (verify.cpp's RouteTrace): the routed weights beside h_route_'s ids, the
@@ -682,34 +731,18 @@ private:
     bool rt_dump_ = false, rt_replay_ = false;
     int rt_req_ = -1;
     int64_t rt_pos0_ = INT64_MAX;
-    float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
-    uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
-    uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
-    uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
-    uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     strata::gpu::Event* commit_done_ = nullptr;   // recorded after an async commit (set_commit_async)
     bool commit_pending_ = false;
-    strata::gpu::Stream copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
-    struct FlagSet { uint32_t* flag; uint32_t value; };
-    FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
-    static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
-    static void raise_flag(uint32_t* flag, uint32_t value);
-    /// Flag B for `want`, behind every copy queued on copy_ (an empty plan must not overtake an earlier layer's DMA;
-    /// upstream 40849df0a, PR #5096)
-    void raise_flag_b_ordered(uint32_t want);
-    bool copy_used_ = false;                                      // copies queued on copy_ since it was last drained
-    int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
-    int64_t plan_i32_ = 0;                                        // int32 words in the plan block
-    GpuPlanSink sink_;
-    uint32_t cur_layer_ = 0;
-    static void publish_plan(void* ctx);
-    void set_plan_slot(int grp);
+    // the routed experts' protocol with the host: the mapped doorbell, ids, weights, CPU rows, flags and plans, the
+    // copy engine's stream, the experts' device rows (moe_window.hpp, the plain engine's too).  A device whose running
+    // kernels do not see the host's writes runs a window as segments the host launches (win_.segmented()).
+    MoeWindow win_;
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
-    int groups_[9] = {};
-    float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
+    int groups_[strata::kernels::kWindowMaxT + 1] = {};
 
     // device
     void* arena_ = nullptr;
+    size_t arena_bytes_ = 0;
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
@@ -720,25 +753,16 @@ private:
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer
     int32_t* sel_ = nullptr;
-    float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
-    int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
-    int32_t* plan_ = nullptr;                                     // device copy of the plan block
-    uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
-    static constexpr int64_t kStagingBlobs = 16;
-    static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
-    uint8_t* hit_xq_ = nullptr;
-    uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
+    float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr;
+    int32_t* ids_ = nullptr;
     float* nat_xr_ = nullptr;     // APR: the Hadamard-rotated expert input (the shared expert and the CPU keep xm); nullptr
                                   // without a folded gate/up
     const float* had_sx_ = nullptr;   // APR: this device's sign vectors of the expert input (n_embd) and of h (n_ff)
     const float* had_sh_ = nullptr;
-    float* hit_xs_ = nullptr;
-    void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     int32_t* one_ = nullptr;
     float* ple_key_ = nullptr;   ///< the window rows' PLE key and value projections (ple_batch)
     float* ple_val_ = nullptr;   ///< device 1: a one-token window's n_keep (it commits itself)
-    uint16_t* sh_bf16_ = nullptr;
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;

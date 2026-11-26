@@ -7,6 +7,7 @@ message).  Three deaths within ten minutes stop the restarts, and the 503 says w
 log is.  CPU only, no engine: Service.ensure_loaded runs on a stand-in whose engine dies each time it is started."""
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -40,7 +41,8 @@ class DyingEngine:
 
 def service(engine):
     svc = types.SimpleNamespace(engine=engine, before_load=None, min_free_vram_mib=0, restore_after_load=None,
-                                vision=None, vram_reserve=None, loaded=lambda: False, _vision_down=lambda: False)
+                                vision=None, images=None, vram_reserve=None, loaded=lambda: False,
+                                _vision_down=lambda: False, status_lock=threading.Lock(), status={})
     for name in ("FATAL_GPU_MAX", "FATAL_GPU_WINDOW_S", "CRASH_LOOP_MAX", "CRASH_LOOP_WINDOW_S"):
         setattr(svc, name, getattr(S.Service, name))
     for name in ("_note_fatal_gpu_exit", "_note_crash_loop", "_engine_last_words", "_crash_loop_text",

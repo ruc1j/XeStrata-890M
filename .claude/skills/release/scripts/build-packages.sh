@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # .claude/skills/release/scripts/build-packages.sh - a release's packages: one set of the deb and rpm variants (and in
-# the contrib set the Windows 7z) built from TAG one after another (tools/package/build.sh, a clean container each),
+# the contrib set the Windows 7z and the window's xestrata-gui deb and rpm, one for every variant) built from TAG one after another (tools/package/build.sh, a clean container each),
 # gathered into build/release/TAG/ with SHA256SUMS over every package there (the other set's included).
 #
-#   .claude/skills/release/scripts/build-packages.sh TAG contrib   # ubuntu26.04 cuda13.1, cuda12.4; fedora44 cuda13.4;
-#                                                                  # windows cuda12.4
-#   .claude/skills/release/scripts/build-packages.sh TAG free      # ubuntu26.04 free; fedora44 free
+#   .claude/skills/release/scripts/build-packages.sh TAG contrib   # ubuntu26.04 cuda13.1, cuda12.4; fedora44 cuda13.4,
+#                                                                  # fedora45 cuda13.5; windows cuda12.4; ubuntu26.04 gui,
+#                                                                  # fedora44 gui, fedora45 gui
+#   .claude/skills/release/scripts/build-packages.sh TAG free      # ubuntu26.04 free; fedora44 free, fedora45 free
 #
 # Run from the repository root.  The contrib set takes about two hours, the free one about an hour.  It
 # writes its own PID to build/release/TAG/build-SET.pid (wait on that PID, not on a pattern: pgrep -f matches the
@@ -20,12 +21,15 @@ usage() { echo "usage: $0 TAG contrib|free" >&2; exit 2; }
 tag=$1
 set_=$2
 case $set_ in
-  contrib) variants="ubuntu26.04 cuda13.1|ubuntu26.04 cuda12.4|fedora44 cuda13.4|windows cuda12.4" ;;
-  free) variants="ubuntu26.04 free|fedora44 free" ;;
+  contrib) variants="ubuntu26.04 cuda13.1|ubuntu26.04 cuda12.4|fedora44 cuda13.4|fedora45 cuda13.5|windows cuda12.4|ubuntu26.04 gui|fedora44 gui|fedora45 gui" ;;
+  free) variants="ubuntu26.04 free|fedora44 free|fedora45 free" ;;
   *) usage ;;
 esac
 cd "$(git rev-parse --show-toplevel)" || exit 1
 git rev-parse --verify -q "$tag^{commit}" >/dev/null || { echo "no tag $tag" >&2; exit 1; }
+# The host's persistent ccache is shared by every build; pass it to every variant (build.sh mounts it directly).
+: "${XESTRATA_PKG_CCACHE_DIR:?set XESTRATA_PKG_CCACHE_DIR to the persistent host ccache folder}"
+export XESTRATA_PKG_CCACHE_DIR
 out=build/release/$tag
 mkdir -p "$out/logs"
 summary=$out/summary-$set_.txt
@@ -41,6 +45,7 @@ for t; do
   set -- $t
   n=$1-$2
   start=$(date +%s)
+  # a release's packages use the same keyed reuse as any build: build tools and intel/llvm kept per distribution and toolchain (tools/package/reuse.sh)
   if ! tools/package/build.sh "$1" "$2" "$tag" > "$out/logs/$n.log" 2>&1; then
     echo "$n FAILED after $(( ($(date +%s) - start) / 60 )) min (logs/$n.log)" >> "$summary"
     echo FAILED >> "$summary"

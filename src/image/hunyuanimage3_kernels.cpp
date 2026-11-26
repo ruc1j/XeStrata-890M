@@ -7,10 +7,15 @@
 // `gpu` and `gpulayer`), and tile/local-memory versions come once the values agree.
 
 #include "strata/image/hunyuanimage3_kernels.hpp"
+#include "strata/image/qi_kernels.hpp"
+
+#include "dit_rows.hpp"
 
 #include "strata/core/runtime.hpp"
-#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/qk_norm_rope.hpp"
+#include "strata/kernels/rows_cols.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -23,22 +28,9 @@ namespace strata::image {
 namespace hunyuanimage3_detail {
 
 using strata::kernels::f16_from_f32;
-using strata::kernels::f32_from_bf16;
 using strata::kernels::f32_from_f16;
 
 sycl::queue& queue_for(void* stream) { return core::Runtime::get().stream(stream); }
-
-// The GroupNorm(32) statistics (hunyuanimage3_group_part and -stats): a work-group a chunk of kGnChunk positions and
-// one of the 32 groups, the chunk sums reduced over at most kGnMaxChunk of them a work-group.  The VAE's 32 groups
-// and the entry and exit's are the same reduction; only eps differs.
-constexpr int64_t kGnGroups = 32;      // every GroupNorm here: nn.GroupNorm(32, C)
-constexpr int64_t kGnChunk = 256;      // positions a chunk
-constexpr int64_t kGnMaxChunk = 256;   // chunks a reducer's work-group
-
-// The router: the lanes a dot product is split over, each summing every kRouterLanes-th term (FP32 throughout, the
-// reference's own type, and no FP64, which not every GPU has), and the most experts a token takes.
-constexpr size_t kRouterLanes = 32;
-constexpr int64_t kRouterMaxTopk = 32;
 
 void finish(void* stream, const sycl::event& e, const char* what) {
     if (!stream) core::Runtime::get().wait(e, what);
@@ -55,112 +47,25 @@ float e4m3(uint8_t b) {
     return s ? -v : v;
 }
 
-// One group of 256 values times the normalized regular Hadamard: four butterflies on the group's base-4 digits
-// (strides 64, 16, 4, 1), H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]], by a work-group of 256 on the values in
-// local memory, the work-item `lid` writing value `lid` (each sum in the order a single work-item's loop had them,
-// so the bits are the same).  Returns the value.
-float hadamard256_lane(float* t, int lid, const sycl::nd_item<1>& it) {
-    constexpr int h4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
-    float scale = 1.0f;
-    for (int n = 256; n > 1; n /= 4) scale *= 0.5f;
-    for (int stride = 64; stride >= 1; stride /= 4) {
-        const int i = (lid / stride) % 4, first = lid - i * stride;
-        sycl::group_barrier(it.get_group());
-        float sum = 0.f;
-        for (int j = 0; j < 4; ++j) sum += (float) h4[i][j] * t[first + j * stride];
-        sycl::group_barrier(it.get_group());
-        t[lid] = sum;
-    }
-    return t[lid] * scale;
-}
-
 }  // namespace hunyuanimage3_detail
 
 using hunyuanimage3_detail::e4m3;
 using hunyuanimage3_detail::f16_from_f32;
-using hunyuanimage3_detail::f32_from_bf16;
 using hunyuanimage3_detail::f32_from_f16;
 using hunyuanimage3_detail::finish;
-using hunyuanimage3_detail::hadamard256_lane;
-using hunyuanimage3_detail::kGnChunk;
-using hunyuanimage3_detail::kGnGroups;
-using hunyuanimage3_detail::kGnMaxChunk;
-using hunyuanimage3_detail::kRouterLanes;
-using hunyuanimage3_detail::kRouterMaxTopk;
 using hunyuanimage3_detail::queue_for;
 
-void hunyuanimage3_rms_norm16(const float* x, const float* w, int64_t rows, int64_t C, float eps, uint16_t* y16,
-                    void* stream) {
-    if (rows <= 0) return;
-    constexpr size_t local = 256;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
-            const auto r = static_cast<int64_t>(it.get_group_linear_id());
-            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-            const float* xr = x + r * C;
-            float s = 0.f;
-            for (int64_t c = lane; c < C; c += (int64_t) local) s += xr[c] * xr[c];
-            const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) /
-                                               (float) C + eps);
-            uint16_t* yr = y16 + r * C;
-            for (int64_t c = lane; c < C; c += (int64_t) local) yr[c] = f16_from_f32(xr[c] * inv * w[c]);
-        });
-    finish(stream, e, "hunyuanimage3_rms_norm16");
-}
-
-void hunyuanimage3_rms_norm32(const float* x, const float* w, int64_t rows, int64_t C, float eps, float* y32, void* stream) {
-    if (rows <= 0) return;
-    constexpr size_t local = 256;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
-            const auto r = static_cast<int64_t>(it.get_group_linear_id());
-            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-            const float* xr = x + r * C;
-            float s = 0.f;
-            for (int64_t c = lane; c < C; c += (int64_t) local) s += xr[c] * xr[c];
-            const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) /
-                                               (float) C + eps);
-            float* yr = y32 + r * C;
-            for (int64_t c = lane; c < C; c += (int64_t) local) yr[c] = xr[c] * inv * w[c];
-        });
-    finish(stream, e, "hunyuanimage3_rms_norm32");
-}
-
+// the rotation is the image engine's regular one (dit_rows::regular_rotate16, int8_convrot's basis as well)
 void hunyuanimage3_rotate16_from32(const float* x32, int64_t rows, int64_t K, int64_t block, uint16_t* out16, void* stream) {
     if (rows <= 0 || block <= 1) return;
     if (block != 256) throw std::runtime_error("hunyuanimage3_rotate16_from32: only the 256-wide group is implemented");
-    const int64_t groups = rows * (K / 256);
-    // a work-group a group of 256 (hadamard256_lane): one value a work-item
-    const auto e = queue_for(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> t(sycl::range<1>(256), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) groups * 256, 256), [=](sycl::nd_item<1> it) {
-            const int64_t g = (int64_t) it.get_group(0);
-            const int lid = (int) it.get_local_id(0);
-            const int64_t at = (g / (K / 256)) * K + (g % (K / 256)) * 256 + lid;
-            float* tp = t.get_multi_ptr<sycl::access::decorated::no>().get();
-            tp[lid] = x32[at];
-            out16[at] = f16_from_f32(hadamard256_lane(tp, lid, it));   // the one rounding, after the spread
-        });
-    });
-    finish(stream, e, "hunyuanimage3_rotate16_from32");
+    finish(stream, dit_rows::regular_rotate16(x32, rows, K, out16, stream), "hunyuanimage3_rotate16_from32");
 }
 
 void hunyuanimage3_rotate16(const uint16_t* x16, int64_t rows, int64_t K, int64_t block, uint16_t* out16, void* stream) {
     if (rows <= 0 || block <= 1) return;
     if (block != 256) throw std::runtime_error("hunyuanimage3_rotate16: only the 256-wide group is implemented");
-    const int64_t groups = rows * (K / 256);
-    const auto e = queue_for(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> t(sycl::range<1>(256), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) groups * 256, 256), [=](sycl::nd_item<1> it) {
-            const int64_t g = (int64_t) it.get_group(0);
-            const int lid = (int) it.get_local_id(0);
-            const int64_t at = (g / (K / 256)) * K + (g % (K / 256)) * 256 + lid;
-            float* tp = t.get_multi_ptr<sycl::access::decorated::no>().get();
-            tp[lid] = f32_from_f16(x16[at]);
-            out16[at] = f16_from_f32(hadamard256_lane(tp, lid, it));
-        });
-    });
-    finish(stream, e, "hunyuanimage3_rotate16");
+    finish(stream, dit_rows::regular_rotate16(x16, rows, K, out16, stream), "hunyuanimage3_rotate16");
 }
 
 void hunyuanimage3_w4a8_dequant16(const int8_t* codes, const uint8_t* s_rel, const float* s_channel, const float* codebook,
@@ -174,9 +79,7 @@ void hunyuanimage3_w4a8_dequant16(const int8_t* codes, const uint8_t* s_rel, con
                                  std::to_string(group));
     // a work-item a group: its scale read and decoded once for the group's values
     const int64_t groups = K / group;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::range<2>((size_t) rows, (size_t) groups), [=](sycl::id<2> i) {
-            const int64_t r = (int64_t) i[0], g = (int64_t) i[1];
+    const auto e = kernels::for_rows_cols(queue_for(stream), rows, groups, [=](int64_t r, int64_t g) {
             const float sg = e4m3(s_rel[r * groups + g]);
             const float sc = s_channel[r];
             const uint8_t* const src = reinterpret_cast<const uint8_t*>(codes) + r * (K / 2) + g * (group / 2);
@@ -197,9 +100,7 @@ void hunyuanimage3_int8_dequant16(const int8_t* w, const float* row_scale, int64
     if (r1 <= r0) return;
     (void) N;
     const int64_t rows = r1 - r0;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::range<2>((size_t) rows, (size_t) K), [=](sycl::id<2> i) {
-            const int64_t r = (int64_t) i[0], c = (int64_t) i[1];
+    const auto e = kernels::for_rows_cols(queue_for(stream), rows, K, [=](int64_t r, int64_t c) {
             out16[r * K + c] = f16_from_f32((float) w[r * K + c] * row_scale[r]);
         });
     finish(stream, e, "hunyuanimage3_int8_dequant16");
@@ -209,8 +110,7 @@ void hunyuanimage3_rope_angles(const int32_t* pos_y, const int32_t* pos_x, int64
                      float* ang, void* stream) {
     if (T <= 0) return;
     const int64_t half = head_dim / 2;
-    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) T, (size_t) half), [=](sycl::id<2> i) {
-        const int64_t t = (int64_t) i[0], j = (int64_t) i[1];
+    const auto e = kernels::for_rows_cols(queue_for(stream), T, half, [=](int64_t t, int64_t j) {
         // FP32 as the reference's `1.0 / (base ** (arange(0, n, 2).float() / n))` (and no FP64, which not every
         // GPU has)
         const float pos = (float) ((j % 2) ? pos_x[t] : pos_y[t]);
@@ -224,63 +124,28 @@ void hunyuanimage3_qk_rope_norm16(const float* qkv, const float* wq, const float
                         uint16_t* k16, uint16_t* v16, void* stream) {
     if (T <= 0) return;
     const int64_t groups = q_heads / kv_heads;      // the reference's num_key_value_groups
-    const int64_t row = q_heads + 2 * kv_heads;     // one token's (q head | k head | v head) jobs
-    constexpr size_t local = 128;                   // one work-group a (token, head): head_dim 128 channels
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) T * row * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
-            const int64_t job = (int64_t) it.get_group_linear_id();
-            const int64_t t = job / row, which = job % row;
-            const int64_t lane = (int64_t) it.get_local_linear_id();
-            // the file's order: [kv head][q head of that group, then k, then v][head_dim]
-            int64_t src = 0;
-            const float* w = nullptr;
-            uint16_t* dst = nullptr;
-            int64_t dst_head = 0;
-            if (which < q_heads) {
-                const int64_t kv = which / groups, g = which % groups;
-                src = (t * kv_heads + kv) * (groups + 2) + g;
-                w = wq;
-                dst = q16;
-                dst_head = which;
-            } else if (which < q_heads + kv_heads) {
-                const int64_t kv = which - q_heads;
-                src = (t * kv_heads + kv) * (groups + 2) + groups;
-                w = wk;
-                dst = k16;
-                dst_head = kv * groups;   // written to each of the q heads this KV head serves, below
-            } else {
-                const int64_t kv = which - q_heads - kv_heads;
-                src = (t * kv_heads + kv) * (groups + 2) + groups + 1;
-                dst = v16;
-                dst_head = kv * groups;
-            }
-            const float* x = qkv + src * head_dim;
-            if (which >= q_heads + kv_heads) {            // v: only the repeat
-                for (int64_t r = 0; r < groups; ++r) dst[((t * q_heads) + dst_head + r) * head_dim + lane] =
-                    f16_from_f32(x[lane]);
-                return;
-            }
-            float s = 0.f;
-            for (int64_t c = lane; c < head_dim; c += (int64_t) local) s += x[c] * x[c];
-            const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) /
-                                               (float) head_dim + eps);
-            // The rope before the norm, as the reference does.  The rotation is orthogonal on each pair, so the
-            // head's sum of squares - the norm's denominator - is the same before and after it: reading it off
-            // `x` is the same number, to rounding.
-            const int64_t half = head_dim / 2;
-            const int64_t j = lane < half ? lane : lane - half;                // the pair's low column
-            const float a = x[lane], partner = x[lane < half ? lane + half : j];
-            // (the partner is the OTHER half of the pair: for the upper column that is `x[j]`, not `x[j + half]`, which
-            // is the column itself - written the second way, this kernel turned every head's upper 64 columns into
-            // a*(cos + sin) and cost the layer 6% of q, 63% of k: `probe stages`, B70 and the CPU golden, 2026-10-24)
-            const float c0 = sycl::cos(ang[t * (head_dim / 2) + j]), s0 = sycl::sin(ang[t * (head_dim / 2) + j]);
-            // rotate_half, the SAME angle for both halves, then the norm (the reference's order)
-            const float rot = lane < half ? a * c0 - partner * s0 : a * c0 + partner * s0;
-            const float val = rot * inv * w[lane];
-            const int64_t reps = which < q_heads ? 1 : groups;   // q has its own head; k serves `groups`
-            for (int64_t r = 0; r < reps; ++r)
-                dst[((t * q_heads) + dst_head + r) * head_dim + lane] = f16_from_f32(val);
-        });
+    // the file's order: [kv head][q head of that group, then k, then v][head_dim]
+    struct In {
+        const float* qkv;
+        int64_t kv_heads, groups, hd;
+        auto head(int which, int64_t t, int64_t h) const {
+            const int64_t kv = which == 0 ? h / groups : h;
+            const int64_t slot = which == 0 ? h % groups : which == 1 ? groups : groups + 1;
+            const float* p = qkv + ((t * kv_heads + kv) * (groups + 2) + slot) * hd;
+            return [p](int64_t d) { return p[d]; };
+        }
+    };
+    // rotate_half with the SAME angle for both halves, then the norm (the reference's order): the rotation is
+    // orthogonal on each pair, so the head's sum of squares - the norm's denominator - is the same before and after
+    // it.  k and v written to each of the q heads their KV head serves.
+    kernels::qk::Shape sh{T, q_heads, kv_heads, head_dim};
+    sh.wq = wq;
+    sh.wk = wk;
+    sh.eps = eps;
+    sh.rope_first = true;
+    const auto e = kernels::qk::qk_norm_rope(queue_for(stream), sh, In{qkv, kv_heads, groups, head_dim},
+                                             kernels::qk::Angles{ang, head_dim / 2},
+                                             kernels::qk::Rows16{q16, k16, v16, q_heads, q_heads, head_dim, groups});
     finish(stream, e, "hunyuanimage3_qk_rope_norm16");
 }
 
@@ -288,7 +153,7 @@ void hunyuanimage3_swiglu16_rotated(const float* gu, int64_t T, int64_t inter, u
     if (T <= 0) return;
     if (inter % 256 != 0) throw std::runtime_error("hunyuanimage3_swiglu16_rotated: the intermediate is not in 256 groups");
     const int64_t groups = T * (inter / 256);
-    // a work-group a group of 256 (hadamard256_lane): one value a work-item
+    // a work-group a group of 256 (dit_rows::regular256): one value a work-item
     const auto e = queue_for(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> v(sycl::range<1>(256), h);
         h.parallel_for(sycl::nd_range<1>((size_t) groups * 256, 256), [=](sycl::nd_item<1> it) {
@@ -298,52 +163,13 @@ void hunyuanimage3_swiglu16_rotated(const float* gu, int64_t T, int64_t inter, u
             const float gate = gu[t * 2 * inter + off], up = gu[t * 2 * inter + inter + off];
             float* vp = v.get_multi_ptr<sycl::access::decorated::no>().get();
             vp[lid] = gate * (up / (1.f + sycl::exp(-up)));     // x1 * silu(x2), the SECOND half silu'd
-            out16[t * inter + off] = f16_from_f32(hadamard256_lane(vp, lid, it));
+            out16[t * inter + off] = f16_from_f32(dit_rows::regular256(vp, lid, it.get_group()));
         });
     });
     finish(stream, e, "hunyuanimage3_swiglu16_rotated");
 }
 
-void hunyuanimage3_gather16(const uint16_t* x16, const int32_t* rows, int64_t n_rows, int64_t K, uint16_t* out16,
-                  void* stream) {
-    if (n_rows <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) n_rows, (size_t) K), [=](sycl::id<2> i) {
-        const int64_t r = (int64_t) i[0], c = (int64_t) i[1];
-        out16[r * K + c] = x16[(int64_t) rows[r] * K + c];
-    });
-    finish(stream, e, "hunyuanimage3_gather16");
-}
-
-void hunyuanimage3_scatter_scale_add(float* x, const float* y, const float* w, const int32_t* rows, int64_t n_rows,
-                           int64_t C, void* stream) {
-    if (n_rows <= 0) return;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::range<2>((size_t) n_rows, (size_t) C), [=](sycl::id<2> i) {
-            const int64_t r = (int64_t) i[0], c = (int64_t) i[1];
-            sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device> target(
-                x[(int64_t) rows[r] * C + c]);
-            target += w[r] * y[r * C + c];
-        });
-    finish(stream, e, "hunyuanimage3_scatter_scale_add");
-}
-
-void hunyuanimage3_add(float* x, const float* v, int64_t n, void* stream) {
-    if (n <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        x[i[0]] += v[i[0]];
-    });
-    finish(stream, e, "hunyuanimage3_add");
-}
-
-void hunyuanimage3_embed_bf16_16(const uint16_t* table_bf16, const int32_t* ids, int64_t rows, int64_t C, uint16_t* out16,
-                       void* stream) {
-    if (rows <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) rows, (size_t) C), [=](sycl::id<2> i) {
-        const int64_t r = (int64_t) i[0], c = (int64_t) i[1];
-        out16[r * C + c] = f16_from_f32(f32_from_bf16(table_bf16[(int64_t) ids[r] * C + c]));
-    });
-    finish(stream, e, "hunyuanimage3_embed_bf16_16");
-}
+void hunyuanimage3_add(float* x, const float* v, int64_t n, void* stream) { kernels::add_inplace(x, v, n, stream); }
 
 void hunyuanimage3_copy16(const uint16_t* src16, uint16_t* dst16, int64_t n, void* stream) {
     if (n <= 0) return;
@@ -351,57 +177,6 @@ void hunyuanimage3_copy16(const uint16_t* src16, uint16_t* dst16, int64_t n, voi
         dst16[i[0]] = src16[i[0]];
     });
     finish(stream, e, "hunyuanimage3_copy16");
-}
-
-void hunyuanimage3_router_logits(const float* x32, const float* w, int64_t T, int64_t C, int64_t E, float* logits,
-                       void* stream) {
-    if (T <= 0) return;
-    // a work-group a (token, expert): its lanes read neighbouring columns, each sums every L-th term, and the
-    // group adds the lanes' sums
-    constexpr size_t L = kRouterLanes;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<2>(sycl::range<2>((size_t) T, (size_t) E * L), sycl::range<2>(1, L)), [=](sycl::nd_item<2> it) {
-            const int64_t t = (int64_t) it.get_global_id(0), ex = (int64_t) it.get_group(1);
-            const int64_t lane = (int64_t) it.get_local_id(1);
-            const float* xr = x32 + t * C;
-            const float* wr = w + ex * C;
-            float part = 0.f;
-            for (int64_t c = lane; c < C; c += (int64_t) L) part += xr[c] * wr[c];
-            const float sum = sycl::reduce_over_group(it.get_group(), part, sycl::plus<float>());
-            if (lane == 0) logits[t * E + ex] = sum;
-        });
-    finish(stream, e, "hunyuanimage3_router_logits");
-}
-
-void hunyuanimage3_router_topk(const float* logits, int64_t T, int64_t E, int64_t K, int32_t* idx, float* wt,
-                               void* stream) {
-    if (T <= 0) return;
-    if (K <= 0 || K > kRouterMaxTopk || K > E)
-        throw std::runtime_error("hunyuanimage3_router_topk: " + std::to_string(K) + " of " + std::to_string(E) +
-                                 " experts");
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) T), [=](sycl::id<1> id) {
-        const int64_t t = (int64_t) id[0];
-        const float* lg = logits + t * E;
-        int32_t pick[kRouterMaxTopk];
-        for (int64_t j = 0; j < K; ++j) {
-            int32_t best = -1;
-            for (int64_t ex = 0; ex < E; ++ex) {
-                bool taken = false;
-                for (int64_t i = 0; i < j; ++i) taken = taken || pick[i] == (int32_t) ex;
-                if (!taken && (best < 0 || lg[ex] > lg[best])) best = (int32_t) ex;   // the lower expert on a tie
-            }
-            pick[j] = best;
-        }
-        // softmax over the K picked (norm_topk_prob: the full softmax's denominator cancels), from the largest
-        const float m = lg[pick[0]];
-        float s = 0.f;
-        for (int64_t j = 0; j < K; ++j) s += sycl::exp(lg[pick[j]] - m);
-        for (int64_t j = 0; j < K; ++j) {
-            idx[t * K + j] = pick[j];
-            wt[t * K + j] = sycl::exp(lg[pick[j]] - m) / s;
-        }
-    });
-    finish(stream, e, "hunyuanimage3_router_topk");
 }
 
 void hunyuanimage3_route_lists(const int32_t* idx, const float* wt, int64_t T, int64_t K, int64_t E, int32_t* bounds,
@@ -453,127 +228,16 @@ void hunyuanimage3_to16(const float* x, int64_t n, uint16_t* y16, void* stream, 
 
 void hunyuanimage3_im2col16(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, int64_t rows,
                             uint16_t* col16, void* stream) {
-    if (rows <= 0) return;
-    if (C % 8 != 0) throw std::runtime_error("hunyuanimage3_im2col16: C is not a multiple of 8");
-    const int64_t C8 = C / 8;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (rows * 9 * C8)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c8 = (i % C8) * 8, rk = i / C8, r = rk / 9, tap = rk - r * 9;
-        const int64_t p = p0 + r, x = p % W, y = p / W;
-        const int64_t yy = y + tap / 3 - 1, xx = x + tap % 3 - 1;
-        using V = sycl::vec<uint16_t, 8>;
-        V v(0);
-        if (yy >= 0 && yy < H && xx >= 0 && xx < W)
-            v = *reinterpret_cast<const V*>(in16 + (yy * W + xx) * C + c8);
-        *reinterpret_cast<V*>(col16 + (r * 9 + tap) * C + c8) = v;
-    });
-    finish(stream, e, "hunyuanimage3_im2col16");
+    qi_im2col16(in16, 1, H, W, C, 1, 3, 1, 1, H, W, p0, rows, col16, stream);
 }
 
 void hunyuanimage3_bias_add32(float* y, const float* b, int64_t rows, int64_t N, void* stream) {
-    if (rows <= 0 || N <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (rows * N)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        y[i] += b[i % N];
-    });
-    finish(stream, e, "hunyuanimage3_bias_add32");
-}
-
-int64_t hunyuanimage3_group_ws_floats(int64_t P) {
-    const int64_t B = (P + kGnChunk - 1) / kGnChunk, G = (B + kGnMaxChunk - 1) / kGnMaxChunk;
-    return 2 * kGnGroups + (B + G) * kGnGroups;
-}
-
-void hunyuanimage3_group_part(const float* x, const float* mean, int64_t P, int64_t C, bool sq, float* part,
-                              void* stream) {
-    if (P <= 0) return;
-    const int64_t cg = C / kGnGroups, B = (P + kGnChunk - 1) / kGnChunk;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (B * kGnGroups * 32)), sycl::range<1>(32)), [=](sycl::nd_item<1> it) {
-            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-            const auto blk = static_cast<int64_t>(it.get_group_linear_id());
-            const int64_t b = blk / kGnGroups, g = blk - b * kGnGroups;
-            const int64_t p1 = std::min<int64_t>(P, (b + 1) * kGnChunk);
-            const float m = sq ? mean[g] : 0.f;
-            float a = 0.f, comp = 0.f;
-            for (int64_t p = b * kGnChunk + lane; p < p1; p += 32) {
-                const float* r = x + p * C + g * cg;
-                for (int64_t c = 0; c < cg; ++c) {
-                    const float d = r[c] - m;
-                    const float y = (sq ? d * d : d) - comp, t = a + y;
-                    comp = (t - a) - y;
-                    a = t;
-                }
-            }
-            a = sycl::reduce_over_group(it.get_group(), a, sycl::plus<float>());
-            if (lane == 0) part[blk] = a;
-        });
-    finish(stream, e, "hunyuanimage3_group_part");
-}
-
-void hunyuanimage3_group_stats(const float* part, int64_t B, int64_t P, int64_t CG, float eps, bool sq,
-                               float* stats, float* mid, void* stream) {
-    const int64_t G = (B + kGnMaxChunk - 1) / kGnMaxChunk;
-    if (G > 1) {
-        const auto e = queue_for(stream).parallel_for(
-            sycl::nd_range<1>(sycl::range<1>((size_t) (G * kGnGroups * 32)), sycl::range<1>(32)),
-            [=](sycl::nd_item<1> it) {
-                const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-                const auto blk = static_cast<int64_t>(it.get_group_linear_id());
-                const int64_t gi = blk / kGnGroups, g = blk - gi * kGnGroups;
-                const int64_t b1 = std::min<int64_t>(B, (gi + 1) * kGnMaxChunk);
-                float a = 0.f, comp = 0.f;
-                for (int64_t b = gi * kGnMaxChunk + lane; b < b1; b += 32) {
-                    const float y = part[b * kGnGroups + g] - comp, t = a + y;
-                    comp = (t - a) - y;
-                    a = t;
-                }
-                a = sycl::reduce_over_group(it.get_group(), a, sycl::plus<float>());
-                if (lane == 0) mid[gi * kGnGroups + g] = a;
-            });
-        finish(stream, e, "hunyuanimage3_group_stats (the reducers' level)");
-        queue_for(stream).wait();   // the last level reads every group's entry
-    }
-    // one work-item a group, serial Kahan over the (at most kGnMaxChunk) entries of its slice, or over the B chunk
-    // sums themselves when they fit one reducer
-    const int64_t MG = G > 1 ? G : B;
-    const float* src = G > 1 ? mid : part;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) kGnGroups), [=](sycl::id<1> id) {
-        const auto g = static_cast<int64_t>(id[0]);
-        float a = 0.f, comp = 0.f;
-        for (int64_t i = 0; i < MG; ++i) {
-            const float y = src[i * kGnGroups + g] - comp, t = a + y;
-            comp = (t - a) - y;
-            a = t;
-        }
-        const float n = (float) P * (float) CG;   // FP32 here too (no device FP64): the sums are Kahan-folded
-        stats[g] = sq ? 1.0f / sycl::sqrt(a / n + eps) : a / n;   // and a 1e-7 share of a ratio is far under the
-    });                                                          // FP16 floor the convolutions set
-    finish(stream, e, "hunyuanimage3_group_stats");
-}
-
-void hunyuanimage3_group_apply16(const float* x, const float* mean, const float* inv, const float* w,
-                                 const float* b, const float* scale, const float* shift, int64_t P, int64_t C,
-                                 bool silu, uint16_t* y16, void* stream, uint16_t* lo16) {
-    if (P <= 0) return;
-    const int64_t cg = C / kGnGroups;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (P * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i % C, g = c / cg;
-        float v = (x[i] - mean[g]) * inv[g] * w[c] + b[c];
-        if (scale != nullptr) v = v * (1.f + scale[c]) + shift[c];
-        if (silu) v = v / (1.f + sycl::exp(-v));
-        y16[i] = f16_from_f32(v);
-        if (lo16 != nullptr) lo16[i] = f16_from_f32(v - f32_from_f16(y16[i]));
-    });
-    finish(stream, e, "hunyuanimage3_group_apply16");
+    qi_bias_add(y, b, rows, N, stream);
 }
 
 void hunyuanimage3_scale_rows16(const float* x, const float* rs, int64_t n_rows, int64_t C, uint16_t* y16, void* stream) {
     if (n_rows <= 0) return;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::range<2>((size_t) n_rows, (size_t) C), [=](sycl::id<2> i) {
-            const int64_t r = (int64_t) i[0], c = (int64_t) i[1];
+    const auto e = kernels::for_rows_cols(queue_for(stream), n_rows, C, [=](int64_t r, int64_t c) {
             const float s = rs != nullptr ? rs[r] : 1.f;
             y16[r * C + c] = f16_from_f32(x[r * C + c] / s);
         });

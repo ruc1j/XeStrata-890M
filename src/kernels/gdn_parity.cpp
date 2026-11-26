@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// src/kernels/gdn_parity.cpp - P2.S2's test for the GDN recurrence, the conv and the two norms.
+// src/kernels/gdn_parity.cpp - P2.S2's test for the GDN recurrence, the conv and the two norms: the native kernels
+// (native_gdn.hpp, native_gdn_preprocess.hpp) against `ref/gdn.py`'s reading in double.
 //
 // `ref/gdn.py` carries eleven PROPERTY checks, several of which exist because a rival reading of the SOURCE
 // produces well-formed output.  The four that the kernels here can be wrong about are re-pinned below, each
@@ -18,15 +19,25 @@
 //      differs by sqrt(S) = 11.3x at S = 128.  `ref/gdn.py` PROPERTY 1 instruments the derivation, so it is
 //      not taken on trust there either.
 //
+// Last, a window's rows through the verify-window kernels (verify_kernels.hpp) as the plain engine runs them - the
+// rows in one launch each, the history and the state left after them, the rows' copies beside - against the same rows
+// one at a time: the same bits.
+//
 // It also checks the STATE LAYOUT, which is the one place these kernels intentionally differ from the
 // reference: (S, h_v, S) with j fastest instead of (S, S, h_v).  A layout mix-up is silent, so the state is
 // filled with a value that encodes its own coordinates.
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/gdn.hpp"
+#include "strata/kernels/native_gdn.hpp"
+#include "strata/kernels/native_gdn_preprocess.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include "parity_device.hpp"
+#include "strata/core/gpu.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,13 +65,13 @@ void ref_step(std::vector<double>& state, const std::vector<float>& q, const std
         for (int j = 0; j < S; ++j) {
             if (decay_first) for (int i = 0; i < S; ++i) at(i, j, h) *= dec;
             double sk = 0;
-            for (int i = 0; i < S; ++i) sk += at(i, j, h) * (double) k[(size_t) (src * S + i)];
-            const double d = ((double) v[(size_t) (h * S + j)] - sk) * b;
-            for (int i = 0; i < S; ++i) at(i, j, h) += (double) k[(size_t) (src * S + i)] * d;
+            for (int i = 0; i < S; ++i) sk += at(i, j, h) * (double) k[(size_t) src * S + i];
+            const double d = ((double) v[(size_t) h * S + j] - sk) * b;
+            for (int i = 0; i < S; ++i) at(i, j, h) += (double) k[(size_t) src * S + i] * d;
             if (!decay_first) for (int i = 0; i < S; ++i) at(i, j, h) *= dec;
             double dot = 0;
-            for (int i = 0; i < S; ++i) dot += at(i, j, h) * (double) q[(size_t) (src * S + i)];
-            oo[(size_t) (h * S + j)] = (float) dot;
+            for (int i = 0; i < S; ++i) dot += at(i, j, h) * (double) q[(size_t) src * S + i];
+            oo[(size_t) h * S + j] = (float) dot;
         }
     }
     o = oo;
@@ -72,11 +83,11 @@ void ref_conv(std::vector<float>& cs, const std::vector<float>& x, const std::ve
     out.assign((size_t) C, 0.0f);
     for (int c = 0; c < C; ++c) {
         double acc = 0;
-        for (int i = 0; i < dc - 1; ++i) acc += (double) cs[(size_t) (i * C + c)] * (double) kern[(size_t) (i * C + c)];
-        acc += (double) x[(size_t) c] * (double) kern[(size_t) ((dc - 1) * C + c)];
+        for (int i = 0; i < dc - 1; ++i) acc += (double) cs[(size_t) i * C + c] * (double) kern[(size_t) i * C + c];
+        acc += (double) x[(size_t) c] * (double) kern[(size_t) (dc - 1) * C + c];
         out[(size_t) c] = (float) acc;
-        for (int i = 0; i < dc - 2; ++i) cs[(size_t) (i * C + c)] = cs[(size_t) ((i + 1) * C + c)];
-        cs[(size_t) ((dc - 2) * C + c)] = x[(size_t) c];
+        for (int i = 0; i < dc - 2; ++i) cs[(size_t) i * C + c] = cs[(size_t) (i + 1) * C + c];
+        cs[(size_t) (dc - 2) * C + c] = x[(size_t) c];
     }
 }
 
@@ -112,7 +123,9 @@ int main(int argc, char** argv) {
     }
 
     const int S = strata::core::kCompiledGeometry.ssm_state_size;
-    std::mt19937 rng(2024);
+    strata::gpu::Stream cs = strata::gpu::stream_create();   // the native kernels take an explicit stream
+    if (cs == nullptr) { std::fprintf(stderr, "gdn_parity: no stream\n"); return 1; }
+    std::mt19937 rng(2024);  // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the parity inputs reproducible
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     int bad = 0;
 
@@ -186,7 +199,10 @@ int main(int argc, char** argv) {
         strata::parity::copy_bytes_in(d_b, beta.data(), beta.size() * 4);
 
         strata::kernels::GdnShapes sh{S, h_k, h_v};
-        strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
+        strata::kernels::native_gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, cs);
+        strata::gpu::stream_sync(cs);
+        // q is not pre-scaled: the kernel applies the recurrence's 1/sqrt(S) to the finished readout
+        for (auto& x : want_o) x = (float) ((double) x / std::sqrt((double) S));
 
         std::vector<float> got_o((size_t) h_v * S), got_st(st_dev.size());
         strata::parity::copy_bytes_out(got_o.data(), d_o, got_o.size() * 4);
@@ -218,7 +234,8 @@ int main(int argc, char** argv) {
             strata::parity::copy_bytes_in(d_st, zero.data(), zero.size() * 4);
             strata::parity::copy_bytes_in(d_g, zg.data(), zg.size() * 4);
             strata::parity::copy_bytes_in(d_b, zb.data(), zb.size() * 4);
-            strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
+            strata::kernels::native_gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, cs);
+            strata::gpu::stream_sync(cs);
             std::vector<float> zz(zero.size());
             strata::parity::copy_bytes_out(zz.data(), d_st, zz.size() * 4);
             double nz = 0;
@@ -241,18 +258,18 @@ int main(int argc, char** argv) {
         // mapping between them is written out below rather than assumed, in both directions.
         std::vector<float> cs_ref((size_t) (dc - 1) * C), x((size_t) C), kern((size_t) dc * C);
         for (int i = 0; i < dc - 1; ++i)
-            for (int c = 0; c < C; ++c) cs_ref[(size_t) (i * C + c)] = (float) (10 * (i + 1) + c);  // labelled
+            for (int c = 0; c < C; ++c) cs_ref[(size_t) i * C + c] = (float) (10 * (i + 1) + c);  // labelled
         for (int c = 0; c < C; ++c) x[(size_t) c] = (float) (100 + c);
         for (size_t i = 0; i < kern.size(); ++i) kern[i] = gauss(rng);
 
         auto to_dev_layout = [&](const std::vector<float>& r) {
             std::vector<float> d(r.size());
             for (int i = 0; i < dc - 1; ++i)
-                for (int c = 0; c < C; ++c) d[(size_t) (c * (dc - 1) + i)] = r[(size_t) (i * C + c)];
+                for (int c = 0; c < C; ++c) d[(size_t) c * (dc - 1) + i] = r[(size_t) i * C + c];
             return d;
         };
 
-        std::vector<float> cs = to_dev_layout(cs_ref);
+        std::vector<float> cst = to_dev_layout(cs_ref);
         std::vector<float> want;
         std::vector<float> cs_want_ref = cs_ref;
         ref_conv(cs_want_ref, x, kern, C, dc, want);
@@ -263,17 +280,17 @@ int main(int argc, char** argv) {
         // below is the ONLY place the two meet.
         std::vector<float> kW((size_t) C * dc);
         for (int c = 0; c < C; ++c)
-            for (int i = 0; i < dc; ++i) kW[(size_t) (c * dc + i)] = kern[(size_t) (i * C + c)];
+            for (int i = 0; i < dc; ++i) kW[(size_t) c * dc + i] = kern[(size_t) i * C + c];
         // and the rival reading, which must differ or the fixture cannot see a transposed weight
         std::vector<float> kW_wrong((size_t) C * dc);
         for (size_t i = 0; i < kern.size(); ++i) kW_wrong[i] = kern[i];
         {
             // apply the WRONG layout by hand: tap i of channel c is kW[c*dc+i] read as kW[i*C+c]
-            std::vector<float> cs2 = cs;
+            const std::vector<float>& cs2 = cst;
             std::vector<float> out_bad((size_t) C, 0.0f);
             for (int c = 0; c < C; ++c) {
                 double a = 0;
-                for (int i = 0; i < dc - 1; ++i) a += (double) cs2[(size_t) (i * C + c)] * (double) kW_wrong[(size_t) (c * dc + i)];
+                for (int i = 0; i < dc - 1; ++i) a += (double) cs2[(size_t) i * C + c] * (double) kW_wrong[(size_t) c * dc + i];
                 a += (double) x[(size_t) c] * (double) kW_wrong[(size_t) (c * dc + dc - 1)];
                 out_bad[(size_t) c] = (float) a;
             }
@@ -283,22 +300,33 @@ int main(int argc, char** argv) {
             if (!(rel > 0.05)) ++bad;
         }
 
-        float *d_cs = nullptr, *d_x = nullptr, *d_w = nullptr, *d_o = nullptr;
-        d_cs = static_cast<decltype(d_cs)>(strata::parity::alloc_bytes(cs.size() * 4));
+        float *d_cs = nullptr, *d_x = nullptr, *d_w = nullptr, *d_o = nullptr, *d_silu = nullptr;
+        d_cs = static_cast<decltype(d_cs)>(strata::parity::alloc_bytes(cst.size() * 4));
         d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes(x.size() * 4));
         d_w = static_cast<decltype(d_w)>(strata::parity::alloc_bytes(kW.size() * 4));
         d_o = static_cast<decltype(d_o)>(strata::parity::alloc_bytes((size_t) C * 4));
-        strata::parity::copy_bytes_in(d_cs, cs.data(), cs.size() * 4);
+        d_silu = static_cast<decltype(d_silu)>(strata::parity::alloc_bytes((size_t) C * 4));
+        strata::parity::copy_bytes_in(d_cs, cst.data(), cst.size() * 4);
         strata::parity::copy_bytes_in(d_x, x.data(), x.size() * 4);
         strata::parity::copy_bytes_in(d_w, kW.data(), kW.size() * 4);
-        strata::kernels::gdn_conv_step(d_cs, d_x, d_w, d_o, C, dc, nullptr);
-        std::vector<float> got((size_t) C), got_cs(cs.size());
+        strata::kernels::native_gdn_conv_silu(d_cs, d_x, d_w, d_o, d_silu, C, dc, cs);
+        strata::gpu::stream_sync(cs);
+        std::vector<float> got((size_t) C), got_silu((size_t) C), got_cs(cst.size());
         strata::parity::copy_bytes_out(got.data(), d_o, got.size() * 4);
+        strata::parity::copy_bytes_out(got_silu.data(), d_silu, got_silu.size() * 4);
         strata::parity::copy_bytes_out(got_cs.data(), d_cs, got_cs.size() * 4);
-        const double rel_out = rel_l1(want, got), rel_cs = rel_l1(cs_want, got_cs);
+        std::vector<float> want_silu((size_t) C);
+        for (int c = 0; c < C; ++c) {
+            const double v = (double) want[(size_t) c];
+            want_silu[(size_t) c] = (float) (v / (1.0 + std::exp(-v)));
+        }
+        const double rel_out = rel_l1(want, got), rel_cs = rel_l1(cs_want, got_cs), rel_silu = rel_l1(want_silu, got_silu);
         std::printf("  %-42s rel %.3e\n", "conv out vs reference", rel_out);
+        std::printf("  %-42s rel %.3e\n", "conv SiLU vs the double reference", rel_silu);
         std::printf("  %-42s rel %.3e\n", "conv state slide (mapped) vs reference", rel_cs);
         if (!(rel_out <= 1e-6)) { std::printf("    *** conv out ***\n"); ++bad; }
+        // f32 fast-math SiLU: a few ulp of the device's exp
+        if (!(rel_silu <= 1e-6)) { std::printf("    *** conv silu ***\n"); ++bad; }
         if (!(rel_cs <= 1e-6)) { std::printf("    *** conv state ***\n"); ++bad; }
         }
 
@@ -311,9 +339,9 @@ int main(int argc, char** argv) {
         const float eps = 1e-6f;
         for (int r = 0; r < rows; ++r) {
             double acc = 0;
-            for (int i = 0; i < cols; ++i) acc += (double) x_ref[(size_t) (r * cols + i)] * (double) x_ref[(size_t) (r * cols + i)];
+            for (int i = 0; i < cols; ++i) acc += (double) x_ref[(size_t) r * cols + i] * (double) x_ref[(size_t) r * cols + i];
             const float inv = (float) (1.0 / std::sqrt(acc + (double) eps));
-            for (int i = 0; i < cols; ++i) x_ref[(size_t) (r * cols + i)] *= inv;
+            for (int i = 0; i < cols; ++i) x_ref[(size_t) r * cols + i] *= inv;
         }
         // The rival reading puts THE SAME eps on the MEAN instead of on the squared norm, which at
         // ||x||^2 ~ 1152 and cols = 128 changes the divisor from sqrt(1152) to sqrt(9) - a factor of 11.3, so
@@ -322,9 +350,9 @@ int main(int argc, char** argv) {
         std::vector<float> x_mean = x;
         for (int r = 0; r < rows; ++r) {
             double acc = 0;
-            for (int i = 0; i < cols; ++i) acc += (double) x_mean[(size_t) (r * cols + i)] * (double) x_mean[(size_t) (r * cols + i)];
+            for (int i = 0; i < cols; ++i) acc += (double) x_mean[(size_t) r * cols + i] * (double) x_mean[(size_t) r * cols + i];
             const float inv = (float) (1.0 / std::sqrt(acc / cols + (double) eps));
-            for (int i = 0; i < cols; ++i) x_mean[(size_t) (r * cols + i)] *= inv;
+            for (int i = 0; i < cols; ++i) x_mean[(size_t) r * cols + i] *= inv;
         }
         const double rel_trap = rel_l1(x_ref, x_mean);
         std::printf("\n  %-42s %-4s (%.1f%% apart)\n", "eps on sum vs on mean is observable",
@@ -334,7 +362,8 @@ int main(int argc, char** argv) {
         float* d_x = nullptr;
         d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes(x.size() * 4));
         strata::parity::copy_bytes_in(d_x, x.data(), x.size() * 4);
-        strata::kernels::gdn_l2_norm(d_x, rows, cols, eps, nullptr);
+        strata::kernels::native_gdn_l2_norm(d_x, rows, cols, eps, cs);
+        strata::gpu::stream_sync(cs);
         std::vector<float> got(x.size());
         strata::parity::copy_bytes_out(got.data(), d_x, got.size() * 4);
         const double rel = rel_l1(x_ref, got);
@@ -352,11 +381,11 @@ int main(int argc, char** argv) {
         const float eps = 1e-6f;
         for (int h = 0; h < hv2; ++h) {
             double acc = 0;
-            for (int i = 0; i < S2; ++i) acc += (double) o[(size_t) (h * S2 + i)] * (double) o[(size_t) (h * S2 + i)];
+            for (int i = 0; i < S2; ++i) acc += (double) o[(size_t) h * S2 + i] * (double) o[(size_t) h * S2 + i];
             const float inv = (float) (1.0 / std::sqrt(acc / S2 + (double) eps));
             for (int i = 0; i < S2; ++i)
-                y_ref[(size_t) (h * S2 + i)] = o[(size_t) (h * S2 + i)] * inv * sn[(size_t) i] *
-                                              sigmoid_f(z[(size_t) (h * S2 + i)]);
+                y_ref[(size_t) h * S2 + i] = o[(size_t) h * S2 + i] * inv * sn[(size_t) i] *
+                                            sigmoid_f(z[(size_t) h * S2 + i]);
         }
         float *d_o = nullptr, *d_z = nullptr, *d_sn = nullptr, *d_y = nullptr;
         d_o = static_cast<decltype(d_o)>(strata::parity::alloc_bytes(o.size() * 4));
@@ -366,7 +395,8 @@ int main(int argc, char** argv) {
         strata::parity::copy_bytes_in(d_o, o.data(), o.size() * 4);
         strata::parity::copy_bytes_in(d_z, z.data(), z.size() * 4);
         strata::parity::copy_bytes_in(d_sn, sn.data(), sn.size() * 4);
-        strata::kernels::gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, nullptr);
+        strata::kernels::native_gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, cs);
+        strata::gpu::stream_sync(cs);
         std::vector<float> got(y_ref.size());
         strata::parity::copy_bytes_out(got.data(), d_y, got.size() * 4);
         const double rel = rel_l1(y_ref, got);
@@ -377,12 +407,12 @@ int main(int argc, char** argv) {
         std::vector<float> y_silu(y_ref.size());
         for (int h = 0; h < hv2; ++h) {
             double acc = 0;
-            for (int i = 0; i < S2; ++i) acc += (double) o[(size_t) (h * S2 + i)] * (double) o[(size_t) (h * S2 + i)];
+            for (int i = 0; i < S2; ++i) acc += (double) o[(size_t) h * S2 + i] * (double) o[(size_t) h * S2 + i];
             const float inv = (float) (1.0 / std::sqrt(acc / S2 + (double) eps));
             for (int i = 0; i < S2; ++i) {
-                const float zz = z[(size_t) (h * S2 + i)];
-                y_silu[(size_t) (h * S2 + i)] =
-                    o[(size_t) (h * S2 + i)] * inv * sn[(size_t) i] * (zz / (1.0f + std::exp(-zz)));
+                const float zz = z[(size_t) h * S2 + i];
+                y_silu[(size_t) h * S2 + i] =
+                    o[(size_t) h * S2 + i] * inv * sn[(size_t) i] * (zz / (1.0f + std::exp(-zz)));
             }
         }
         const double rel_silu = rel_l1(y_ref, y_silu);
@@ -392,7 +422,8 @@ int main(int argc, char** argv) {
 
         // ...and it is qwen35moe's: gdn_set_silu_gate switches the kernel to it, and back
         strata::kernels::gdn_set_silu_gate(true);
-        strata::kernels::gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, nullptr);
+        strata::kernels::native_gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, cs);
+        strata::gpu::stream_sync(cs);
         strata::kernels::gdn_set_silu_gate(false);
         strata::parity::copy_bytes_out(got.data(), d_y, got.size() * 4);
         const double rel_gate = rel_l1(y_silu, got);
@@ -400,6 +431,106 @@ int main(int argc, char** argv) {
         if (!(rel_gate <= 1e-6)) ++bad;
         }
 
+    // ================= 5. a window's rows at once, as the plain engine runs them =================
+    // (3 rows, and a wide window's 16: the kernels' wide instances)
+    for (const int T : {3, strata::kernels::kVerifyMaxT}) {
+        namespace sk = strata::kernels;
+        std::printf("\n  a window of %d rows\n", T);
+        const int NE = 256, C = 2 * h_k * S + h_v * S, ZV = h_v * S;
+        const float eps = 1e-6f;
+        auto fill = [&](std::vector<float>& v, size_t n, float scale) {
+            v.resize(n);
+            for (auto& x : v) x = gauss(rng) * scale;
+        };
+        std::vector<float> qkv, conv_w, hist, x, wa, wb, dt, sa, z, gamma, st;
+        fill(qkv, (size_t) T * C, 1.0f); fill(conv_w, (size_t) C * 4, 0.5f); fill(hist, (size_t) C * 3, 1.0f);
+        fill(x, (size_t) T * NE, 1.0f); fill(wa, (size_t) h_v * NE, 0.1f); fill(wb, (size_t) h_v * NE, 0.1f);
+        fill(dt, (size_t) h_v, 1.0f); fill(sa, (size_t) h_v, 1.0f); fill(z, (size_t) T * ZV, 1.0f);
+        fill(gamma, (size_t) S, 1.0f); fill(st, (size_t) S * h_v * S, 0.01f);
+        for (auto& v : sa) v = -std::fabs(v);
+        // BF16-exact weights: the F32 and BF16 forms of the alpha/beta kernel must then agree to the bit
+        std::vector<uint16_t> wa16(wa.size()), wb16(wb.size());
+        for (size_t i = 0; i < wa.size(); ++i) {
+            uint32_t u;
+            std::memcpy(&u, &wa[i], 4); u &= 0xffff0000u; std::memcpy(&wa[i], &u, 4); wa16[i] = (uint16_t) (u >> 16);
+            std::memcpy(&u, &wb[i], 4); u &= 0xffff0000u; std::memcpy(&wb[i], &u, 4); wb16[i] = (uint16_t) (u >> 16);
+        }
+        auto up = [&](const void* src, size_t bytes) {
+            void* d = strata::parity::alloc_bytes(std::max<size_t>(bytes, 4));
+            if (src != nullptr) strata::parity::copy_bytes_in(d, src, bytes);
+            return static_cast<float*>(d);
+        };
+        std::vector<int32_t> counts((size_t) T + 1);
+        for (int i = 0; i <= T; ++i) counts[(size_t) i] = i;
+        auto* d_counts = reinterpret_cast<int32_t*>(up(counts.data(), counts.size() * 4));
+        float *d_qkv = up(qkv.data(), qkv.size() * 4), *d_cw = up(conv_w.data(), conv_w.size() * 4),
+              *d_x = up(x.data(), x.size() * 4), *d_wa = up(wa.data(), wa.size() * 4), *d_wb = up(wb.data(), wb.size() * 4),
+              *d_dt = up(dt.data(), dt.size() * 4), *d_sa = up(sa.data(), sa.size() * 4), *d_z = up(z.data(), z.size() * 4),
+              *d_gm = up(gamma.data(), gamma.size() * 4);
+        auto* d_wa16 = reinterpret_cast<uint16_t*>(up(wa16.data(), wa16.size() * 2));
+        auto* d_wb16 = reinterpret_cast<uint16_t*>(up(wb16.data(), wb16.size() * 2));
+        // [0]: the window, [1]: row by row
+        float *d_hist[2], *d_st[2], *d_h[2], *d_gate[2], *d_beta[2], *d_y[2];
+        float *d_hsnap[2][sk::kVerifyMaxT - 1], *d_ssnap[2][sk::kVerifyMaxT - 1];
+        for (int w = 0; w < 2; ++w) {
+            d_hist[w] = up(hist.data(), hist.size() * 4);
+            d_st[w] = up(st.data(), st.size() * 4);
+            d_h[w] = up(nullptr, (size_t) T * C * 4);
+            d_gate[w] = up(nullptr, (size_t) T * h_v * 4);
+            d_beta[w] = up(nullptr, (size_t) T * h_v * 4);
+            d_y[w] = up(nullptr, (size_t) T * ZV * 4);
+            for (int t = 0; t < T - 1; ++t) {
+                d_hsnap[w][t] = up(nullptr, hist.size() * 4);
+                d_ssnap[w][t] = up(nullptr, st.size() * 4);
+            }
+        }
+        sk::GdnRowCopies hs, ss;
+        for (int t = 0; t < T - 1; ++t) { hs.p[t] = d_hsnap[0][t]; ss.p[t] = d_ssnap[0][t]; }
+        hs.n = ss.n = T - 1;
+        sk::gdn_ab_multi(d_x, d_wa, d_wb, d_dt, d_sa, d_gate[0], d_beta[0], NE, h_v, T, cs);
+        sk::gdn_conv_l2_multi(d_hist[0], d_qkv, d_cw, d_h[0], C, 2 * h_k, eps, T, cs, 0, false, &hs);
+        sk::gdn_conv_commit(d_hist[0], d_qkv, C, d_counts + T, cs);
+        sk::gdn_step_norm_multi(d_st[0], d_h[0], C, d_gate[0], d_beta[0], d_z, d_gm, eps, d_y[0], h_k, h_v, T,
+                                d_counts + T, cs, 0, nullptr, &ss);
+        for (int t = 0; t < T; ++t) {
+            sk::gdn_ab_multi(d_x + (size_t) t * NE, d_wa16, d_wb16, d_dt, d_sa, d_gate[1] + (size_t) t * h_v,
+                             d_beta[1] + (size_t) t * h_v, NE, h_v, 1, cs);
+            sk::gdn_conv_l2_multi(d_hist[1], d_qkv + (size_t) t * C, d_cw, d_h[1] + (size_t) t * C, C, 2 * h_k, eps, 1, cs,
+                                  0, true);
+            sk::gdn_step_norm_multi(d_st[1], d_h[1] + (size_t) t * C, C, d_gate[1] + (size_t) t * h_v,
+                                    d_beta[1] + (size_t) t * h_v, d_z + (size_t) t * ZV, d_gm, eps,
+                                    d_y[1] + (size_t) t * ZV, h_k, h_v, 1, d_counts + 1, cs);
+            if (t < T - 1) {
+                strata::gpu::stream_sync(cs);
+                std::vector<float> tmp(st.size());
+                strata::parity::copy_bytes_out(tmp.data(), d_st[1], tmp.size() * 4);
+                strata::parity::copy_bytes_in(d_ssnap[1][t], tmp.data(), tmp.size() * 4);
+                strata::parity::copy_bytes_out(tmp.data(), d_hist[1], hist.size() * 4);
+                strata::parity::copy_bytes_in(d_hsnap[1][t], tmp.data(), hist.size() * 4);
+            }
+        }
+        strata::gpu::stream_sync(cs);
+        auto same = [&](const char* what, const float* a, const float* b, size_t n) {
+            std::vector<float> va(n), vb(n);
+            strata::parity::copy_bytes_out(va.data(), a, n * 4);
+            strata::parity::copy_bytes_out(vb.data(), b, n * 4);
+            const bool ok = std::memcmp(va.data(), vb.data(), n * 4) == 0;
+            std::printf("  %-42s %s\n", what, ok ? "same bits" : "*** DIFFER ***");
+            if (!ok) ++bad;
+        };
+        same("window: gate (F32 vs BF16 weights)", d_gate[0], d_gate[1], (size_t) T * h_v);
+        same("window: beta (F32 vs BF16 weights)", d_beta[0], d_beta[1], (size_t) T * h_v);
+        same("window: conv + norms of the rows", d_h[0], d_h[1], (size_t) T * C);
+        same("window: outputs", d_y[0], d_y[1], (size_t) T * ZV);
+        same("window: conv history after the rows", d_hist[0], d_hist[1], hist.size());
+        same("window: state after the rows", d_st[0], d_st[1], st.size());
+        for (int t = 0; t < T - 1; ++t) {
+            same("window: conv history copy of a row", d_hsnap[0][t], d_hsnap[1][t], hist.size());
+            same("window: state copy of a row", d_ssnap[0][t], d_ssnap[1][t], st.size());
+        }
+    }
+
+    strata::gpu::stream_destroy(cs);
     std::printf("\ngdn: %d failures\n", bad);
     if (bad) return 1;
     if (selftest) std::printf("gdn_parity OK\n");

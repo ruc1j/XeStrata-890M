@@ -7,6 +7,12 @@ windows (BGEN), greedy.  Every slot's tokens must equal its solo tokens; prints 
 
   python3 tools/batch_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json --batch 4 --n 4 \
       --extra "--pcie-frac 0 --adapt-every 1000000"
+
+The tokens are the solo ones only where every expert is computed in the same place in both runs (a GPU and the CPU
+round an expert differently, and a near-tie can flip).  The other models' engine (plain) also moves experts into its
+VRAM tier after every prompt, so there --adapt-every 0 keeps the places (the solo prompts and the slots' are read at
+different times); and with the experts read over PCIe (--pcie-frac above 0) a batch window's misses past the staging
+slots go to the CPU, where the solo window's fit.
 """
 import argparse
 import json
@@ -32,7 +38,7 @@ QUESTIONS = [
     "Erklaere ausfuehrlich, wie ein Dieselmotor funktioniert.",
     "Write a Rust function that parses a CSV line with quoted fields, then explain it.",
     "What were the main consequences of the invention of the printing press?",
-    "Explique le theoreme de Pythagore avec trois demonstrations differentes.",
+    "Explique le theoreme de Pythagore avec trois demonstrations differentes.",  # codespell:ignore differentes (French)
     "Describe how the immune system responds to a viral infection.",
     "Explain the difference between processes and threads in an operating system.",
     "Beschreibe die Geschichte des Roemischen Reiches in Grundzuegen.",
@@ -96,7 +102,7 @@ def main():
     ap.add_argument("--long-tokens", type=int, default=0,
                     help="the LAST prompt is read from about this many tokens of filler text first: its chunks run "
                          "beside the earlier slots' windows (the prompt path lends experts then)")
-    ap.add_argument("--mt-min", default="", help="STRATA_IQ_MT_MIN for the engine (empty: the default, which is exact)")
+    ap.add_argument("--mt-min", default="", help="XESTRATA_IQ_MT_MIN for the engine (empty: the default, exact)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     tok = tokenizer(cfg["tokenizer"])
@@ -110,9 +116,9 @@ def main():
             filler = "".join(para % i for i in range(a.long_tokens // per + 1))
             text = f"<|im_start|>user\n{filler}\n\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         prompts.append(tok.encode(text, parse_special=True))
-    env = {"STRATA_DECODE_TIMING": "1", **({"STRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})}
+    env = {"XESTRATA_DECODE_TIMING": "1", **({"XESTRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})}
     if a.mt_min:
-        env["STRATA_IQ_MT_MIN"] = a.mt_min
+        env["XESTRATA_IQ_MT_MIN"] = a.mt_min
     eng = Engine(a.exe, cfg, a.batch, env, a.extra.split())
     out = eng.lines()
 

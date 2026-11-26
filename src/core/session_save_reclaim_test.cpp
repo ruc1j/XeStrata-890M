@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // CPU only: pressure is injected through telemetry, not by exhausting the host.
 #include "strata/core/session_save_reclaim.hpp"
 #include <cstdio>
@@ -46,6 +47,7 @@ int main() {
     // Every selected position, first-tie preference, and explicit pins (a pin can be shallower).
     for (size_t selected = 0; selected < 4; ++selected) for (bool pin : {false, true}) {
         std::vector<ConversationCheckpoint> chain;
+        chain.reserve(4);
         for (size_t i = 0; i < 4; ++i) chain.push_back(checkpoint(i == selected ? 300 : 100, pin && i == selected));
         if (pin) chain[(selected + 1) % 4].ids.resize(500); // deeper, unpinned
         auto before = *session_deepest_checkpoint(chain);

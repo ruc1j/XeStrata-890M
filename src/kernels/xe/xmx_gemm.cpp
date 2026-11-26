@@ -22,6 +22,7 @@
 #include "device_target.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_xmx_gemm
 #include "strata/kernels/device_arch_tag.hpp"
+#include "device_caps.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -193,9 +194,8 @@ sycl::event dispatch(sycl::queue& q, const E* X, const E* W, float* Y, int64_t T
 // accumulators, and 16-wide sub-groups, as the device (and the SYCL runtime) reports them.  Otherwise the products go
 // to dp4a_gemm.  STRATA_NO_XMX=1 forces that path, to compare the two.
 bool device_has_xmx(const sycl::device& d, mx::matrix_type in) {
-    if (const char* v = std::getenv("STRATA_NO_XMX"); v != nullptr && std::strtol(v, nullptr, 10) != 0) return false;
-    const auto sg = d.get_info<sycl::info::device::sub_group_sizes>();
-    if (std::find(sg.begin(), sg.end(), size_t(16)) == sg.end()) return false;
+    if (no_xmx()) return false;
+    if (!xe::has_sub_group(d, 16)) return false;
     for (const auto& c : matrix_combinations(d)) {
         const bool m = c.msize == TM || (c.msize == 0 && c.max_msize >= TM);
         const bool n = c.nsize == TN || (c.nsize == 0 && c.max_nsize >= TN);
@@ -217,7 +217,7 @@ bool large_grf_ok(const sycl::device& d) {
             ctx, {d}, {sycl::get_kernel_id<GemmKernel<sycl::half, 128, 256>>()});
         return true;
     } catch (const sycl::exception& e) {
-        std::fprintf(stderr, "strata: the GPU does not build kernels with the large register file (%s): XeStrata's own "
+        std::fprintf(stderr, "xestrata: the GPU does not build kernels with the large register file (%s): XeStrata's own "
                      "matrix-product kernels take their DP4a form\n", e.what());
         return false;
     }
@@ -258,6 +258,26 @@ bool f16_only_matrix_engines() {
     return per_device.get(q.get_device(), [&q] {
         return (use_xmx(XmxType::f16) || xe::mma_usable(q, false)) && !use_xmx(XmxType::bf16) && !xe::mma_usable(q, true);
     });
+}
+
+bool mma_products(XmxType t, bool kn) {
+    auto& q = core::Runtime::get().compute();
+    const bool bf16 = t == XmxType::bf16;
+    if (kn && (bf16 || !xe::mma_gemm_kn_usable(q))) return false;
+    return xe::mma_usable(q, bf16) && (xe::mma_forced() || !use_xmx(t));
+}
+
+bool gemm_kn(const uint16_t* X, const uint16_t* W, int64_t ldw, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+             void* stream) {
+    if (T <= 0 || N <= 0) return true;
+    const auto al = [](const void* p) { return ((uintptr_t) p & 63) == 0; };
+    if (N % 16 != 0 || K % 32 != 0 || ldw < N || ldw % 16 != 0 || ldy < N || ldy % 16 != 0 || !al(X) || !al(W) ||
+        !al(Y))
+        return false;
+    auto& q = core::Runtime::get().stream(stream);
+    if (!xe::mma_gemm_kn_usable(q)) return false;
+    finish(stream, xe::mma_gemm_kn(q, X, W, ldw, Y, T, N, K, ldy), "gemm_kn");
+    return true;
 }
 
 const char* gemm_path(XmxType t) {

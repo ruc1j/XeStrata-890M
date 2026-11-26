@@ -1,22 +1,24 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/image_lora.cpp - an adapter file read into the host tensors of ComfyUI's LoRA forms, its keys brought to
+// src/image/image_lora.cpp - an adapter file read into the host tensors of the LoRA forms, its keys brought to
 // the DiT's own names; and one entry's A and B on the GPU, its delta added to a product's output.
 //
-// The keys: ComfyUI's adapters take a weight's name `x` and the tensors `x.lora_up.weight` and `x.lora_down.weight`
+// The keys: an adapter names a weight `x` and its tensors `x.lora_up.weight` and `x.lora_down.weight`
 // (or `x.lora_B.weight` and `x.lora_A.weight`, `x.lora.up.weight` and `x.lora.down.weight`, or the bare
 // `x.lora_B`/`x.lora_A` of PEFT's own saves), with `x.alpha` and `x.dora_scale` beside them.  A file's prefix says
 // whose names they are: `transformer.` for diffusers' saves, `diffusion_model.` and `model.diffusion_model.` for
-// ComfyUI's and a GGUF's.  What is left is the DiT's own name, which the DiT's target table matches.
+// the dot form's (the DiT's names with points between them) and a GGUF's, and `lora_unet_` (sd-scripts) or
+// `lycoris_` (LyCORIS, SimpleTuner) for the files that write a name with every dot an underscore.  What is left is the
+// DiT's own name, which the DiT's target table matches in either spelling (lora_key_names).
 //
 // A LoHa (LyCORIS) writes one weight's delta as the element-wise product of two low-rank products,
 // (hada_w1_a . hada_w1_b) * (hada_w2_a . hada_w2_b), each side's under a Tucker core (hada_t1, hada_t2) where the
-// file has one (comfy/weight_adapter/loha.py).  The product is the weight's size, so it is made when the entry is bound
+// file has one.  The product is the weight's size, so it is made when the entry is bound
 // (LoraDeviceEntry::upload) rather than kept: the entry holds the four factors and the shapes that make it.
 //
 // A LoKr (LyCORIS) writes one weight's two matrices whole (`x.lokr_w1`, `x.lokr_w2`) or as two factors each
 // (`x.lokr_w1_a` [rows][rank] and `x.lokr_w1_b` [rank][cols]), w2's under a Tucker core (`x.lokr_t2`); the delta is
-// their Kronecker product, and the file's alpha is divided by the factorization's rank (comfy/weight_adapter/lokr.py).
+// their Kronecker product, and the file's alpha is divided by the factorization's rank.
 //
 // A GLoRA (a1/a2/b1/b2) writes its delta as a low rank of the weight on each side, W' = W + s (alpha / rank) (W a1
 // a2 + b1 b2), or LyCORIS's older W a2 a1 + b2 b1 (the shapes say which).  Its b pair is the plain form's (A = b2,
@@ -24,9 +26,9 @@
 // output is W x + s (W v + B (A x)), and the weight's delta itself is never made (that is the weight's size).
 //
 // A whole delta is the weight's own matrix: `x.diff` (LyCORIS's full form, a fine tune's difference from its base),
-// `x.w_norm` (the same role in ComfyUI's patch table) and `x.set_weight` (the weight itself).  ComfyUI patches them
-// as W += strength * diff and W = set_weight; the engine keeps the first and interpolates the second
-// (W + s (S - W)), so that a strength scales both.  `x.diff_b` (or `x.b_norm`, which ComfyUI reads only beside the
+// `x.w_norm` (a diff's role under another name) and `x.set_weight` (the weight itself).  Read as written, they patch
+// the weight as W += strength * diff and W = set_weight; the engine keeps the first and interpolates the second
+// (W + s (S - W)), so that a strength scales both.  `x.diff_b` (or `x.b_norm`, which is read only beside the
 // weight's `w_norm`, `x.diff_b` overriding it) is the same patch of the weight's bias: b' = b + strength * Db, added
 // where the DiT adds the bias it has, and no alpha involved (a file may hold one alone: LoraKind::bias).
 #include "strata/image/image_lora.hpp"
@@ -34,6 +36,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -48,6 +51,8 @@
 #include <cstring>
 #include <thread>
 #include <fstream>
+#include <mutex>
+#include <regex>
 #include <stdexcept>
 
 namespace strata::image {
@@ -61,8 +66,11 @@ bool ends_with(const std::string& s, const std::string& suffix) {
 void strip_suffix(std::string& s, const std::string& suffix) { s.erase(s.size() - suffix.size()); }
 
 // The prefixes a file's keys may carry; the first that matches is dropped (`model.diffusion_model.` before
-// `diffusion_model.`, so the longest is listed first).
-const char* const kPrefixes[] = {"model.diffusion_model.", "diffusion_model.", "transformer.", "lora_unet_"};
+// `diffusion_model.`, so the longest is listed first).  `lora_unet_` (sd-scripts, LyCORIS' kohya form) and
+// `lycoris_` (LyCORIS' own, SimpleTuner's) leave a weight's name with every dot written as an underscore, which
+// lora_key_names matches against the DiT's own names.
+const char* const kPrefixes[] = {"model.diffusion_model.", "diffusion_model.", "transformer.", "lora_unet_",
+                                 "lycoris_"};
 
 // The suffixes that say which tensor of a weight a key is; the role is the name here, the key is what is left.  The
 // first that matches wins, so a longer suffix is listed before its prefix (`lora_A.default` before `lora_A`).
@@ -78,6 +86,8 @@ const RoleSuffix kRoles[] = {
     {".lora_mid", "lora_mid"},       {".lora_linear_layer.down", "lora_A"},
     {".lora_linear_layer.up", "lora_B"},
     {".alpha", "alpha"},             {".dora_scale", "dora_scale"},
+    {".lora_magnitude_vector.default", "dora_scale"},   // PEFT's and ai-toolkit's names for the same magnitude
+    {".lora_magnitude_vector", "dora_scale"},          {".magnitude", "dora_scale"},
     {".lokr_w1_a", "lokr_w1_a"},     {".lokr_w1_b", "lokr_w1_b"},
     {".lokr_w2_a", "lokr_w2_a"},     {".lokr_w2_b", "lokr_w2_b"},
     {".lokr_w1", "lokr_w1"},         {".lokr_w2", "lokr_w2"},
@@ -92,13 +102,13 @@ const RoleSuffix kRoles[] = {
     {".reshape_weight", "reshape_weight"},
 };
 
-// A key as the file writes it -> the DiT's name and the role (empty: not one of the forms' tensors).
+// A key as the file writes it -> the DiT's name as the file spells it and the role (empty: not one of the forms'
+// tensors).  An underscore form keeps its underscores: only the DiT's own names answer it (lora_key_names), so a
+// name's own underscores (`attn.to_q`) are not mistaken for dots.
 void split_key(const std::string& raw, std::string& key, std::string& role) {
     std::string s = raw;
-    bool kohya = false;
     for (const char* p : kPrefixes) {
         if (s.rfind(p, 0) == 0) {
-            kohya = std::strcmp(p, "lora_unet_") == 0;
             s.erase(0, std::strlen(p));
             break;
         }
@@ -112,8 +122,6 @@ void split_key(const std::string& raw, std::string& key, std::string& role) {
             break;
         }
     }
-    if (kohya)   // sd-scripts' keys: the module's dots written as underscores (these models name none this way)
-        std::replace(s.begin(), s.end(), '_', '.');
     key = s;
 }
 
@@ -217,13 +225,27 @@ private:
     GgufFile g_;
 };
 
-// The metadata's first number after "key" (PEFT writes alpha and rank there as JSON, its keys prefixed with the
-// model's, e.g. "transformer.lora_alpha": 64).
-bool json_number(const std::string& s, const std::string& key, double& out) {
-    const std::string pat = "\"" + key + "\"";
-    size_t at = s.find(pat);
+// Where a metadata key's value starts: the key written plain ("lora_alpha") or with the model's own prefix
+// ("transformer.lora_alpha"), as diffusers' _pack_dict_with_prefix and PEFT's pipeline saves write it.  npos: no such
+// key at or after `from`.
+size_t meta_value_at(const std::string& s, const std::string& key, size_t from) {
+    const std::string pat = key + "\"";
+    size_t at = s.find(pat, from);
     while (at != std::string::npos) {
-        size_t i = at + pat.size();
+        if (at >= 1 && (s[at - 1] == '"' || s[at - 1] == '.')) return at + pat.size();
+        at = s.find(pat, at + 1);
+    }
+    return std::string::npos;
+}
+
+// Every number the metadata keeps under `key`, plain or prefixed: PEFT writes alpha and rank there as JSON.  A
+// diffusers file that packs several adapters in one writes one metadata field a component
+// ("text_encoder.lora_alpha" beside "transformer.lora_alpha"), so the same name can appear more than once.
+std::vector<double> json_numbers(const std::string& s, const std::string& key) {
+    std::vector<double> got;
+    size_t at = meta_value_at(s, key, 0);
+    while (at != std::string::npos) {
+        size_t i = at;
         while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
         if (i < s.size() && s[i] == ':') {
             ++i;
@@ -231,25 +253,80 @@ bool json_number(const std::string& s, const std::string& key, double& out) {
             const char* b = s.c_str() + i;
             char* e = nullptr;
             const double v = std::strtod(b, &e);
-            if (e != b) {
-                out = v;
-                return true;
-            }
+            if (e != b) got.push_back(v);
         }
-        at = s.find(pat, at + 1);
+        at = meta_value_at(s, key, at + 1);
+    }
+    return got;
+}
+
+// Whether the metadata says `key` true under any of its names (plain, or a component's prefix).  A packed file holds
+// one field a component, so `text_encoder.use_rslora` and `transformer.use_rslora` can both be in it: serve/loras.py
+// refuses the file when any of them is true, and the engine refuses it the same way.
+bool json_true(const std::string& s, const std::string& key) {
+    size_t at = meta_value_at(s, key, 0);
+    while (at != std::string::npos) {
+        size_t i = s.find(':', at);
+        if (i != std::string::npos) {
+            ++i;
+            while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+            if (s.compare(i, 4, "true") == 0) return true;
+        }
+        at = meta_value_at(s, key, at + 1);
     }
     return false;
 }
 
-bool json_true(const std::string& s, const std::string& key) {
-    const std::string pat = "\"" + key + "\"";
-    const size_t at = s.find(pat);
-    if (at == std::string::npos) return false;
-    size_t i = s.find(':', at + pat.size());
-    if (i == std::string::npos) return false;
-    ++i;
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
-    return s.compare(i, 4, "true") == 0;
+// The string -> number pairs of the metadata's `key` object, in the file's order (PEFT's alpha_pattern: a layer's
+// name pattern and its alpha).  A packed file holds one object a component, as json_numbers' fields.
+std::vector<std::pair<std::string, double>> json_pairs(const std::string& s, const std::string& key) {
+    std::vector<std::pair<std::string, double>> got;
+    size_t at = meta_value_at(s, key, 0);
+    while (at != std::string::npos) {
+        size_t i = at;
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
+        if (i < s.size() && s[i] == ':') ++i;
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
+        if (i < s.size() && s[i] == '{') {
+            for (++i; i < s.size() && s[i] != '}';) {
+                if (s[i] != '"') {
+                    ++i;
+                    continue;
+                }
+                std::string name;
+                for (++i; i < s.size() && s[i] != '"'; ++i) {
+                    if (s[i] == '\\' && i + 1 < s.size()) ++i;
+                    name += s[i];
+                }
+                ++i;
+                const size_t colon = s.find(':', i);
+                if (colon == std::string::npos) break;
+                const char* b = s.c_str() + colon + 1;
+                char* e = nullptr;
+                const double v = std::strtod(b, &e);
+                if (e != b) {
+                    got.emplace_back(std::move(name), v);
+                    i = (size_t) (e - s.c_str());
+                } else {
+                    i = colon + 1;
+                }
+            }
+        }
+        at = meta_value_at(s, key, at + 1);
+    }
+    return got;
+}
+
+// PEFT's get_pattern_key: the first pattern (the file's order) that matches the key's end - the pattern itself a
+// regular expression after any dotted prefix ("(.*\.)?(pattern)$").  A pattern the regex reader cannot compile is
+// matched as the literal name it usually is (a module's own name), not a refusal of the whole file.
+bool peft_pattern_matches(const std::string& pattern, const std::string& key) {
+    try {
+        return std::regex_match(key, std::regex("(.*\\.)?(" + pattern + ")$"));
+    } catch (const std::regex_error&) {
+        return key == pattern || (key.size() > pattern.size() && key.compare(key.size() - pattern.size() - 1,
+                                                                              pattern.size() + 1, "." + pattern) == 0);
+    }
 }
 
 /// The host's threads for one deltas' making: as many as the machine has, up to 16 (the image engine's other host rows
@@ -303,8 +380,8 @@ LoraKind kind_of(const Group& g, const std::string& path) {
     const bool glora = has("a1") || has("b1");
     const bool oft = has("oft_blocks");
     const bool diff = has("diff") || has("set_weight") || has("w_norm");
-    // one weight, one form: a file that holds two would have one of them silently dropped (ComfyUI keeps the last of
-    // its patches' types), so it is refused here, saying which
+    // one weight, one form: a file that holds two would have one of them silently dropped (a reader that keeps one
+    // patch a key keeps whichever form it reads last), so it is refused here, saying which
     const int forms = (int) lora + (int) lokr + (int) loha + (int) glora + (int) oft + (int) diff;
     if (forms > 1) {
         std::vector<const char*> which;
@@ -336,9 +413,8 @@ LoraKind kind_of(const Group& g, const std::string& path) {
 
 // A LoKr's two matrices -> its entry: w1 [out_l][in_m] and w2 [out_k][in_n], the file's whole matrices or its two
 // factors' products (w2's under a Tucker core), the delta their Kronecker product is at the weight's rows
-// out_l * out_k and columns in_m * in_n.  `rank` is the factorization's, where a matrix has one: ComfyUI divides the
-// file's alpha by w2's factors' rank, else w1's, and by nothing where both matrices are whole
-// (comfy/weight_adapter/lokr.py's calculate_weight).
+// out_l * out_k and columns in_m * in_n.  `rank` is the factorization's, where a matrix has one: the file's alpha is
+// divided by w2's factors' rank, else w1's, and by nothing where both matrices are whole.
 void make_lokr(LoraEntry& e, Group& g, const std::string& path) {
     const auto get = [&g](const char* r) -> const RawTensor* {
         auto it = g.by_role.find(r);
@@ -379,7 +455,7 @@ void make_lokr(LoraEntry& e, Group& g, const std::string& path) {
     RawTensor w1 = matrix_of("lokr_w1", "lokr_w1_a", "lokr_w1_b");
     RawTensor w2;
     const RawTensor* t2 = get("lokr_t2");
-    if (t2 == nullptr || get("lokr_w2") != nullptr) {   // a core beside the whole matrix stays unread, as ComfyUI
+    if (t2 == nullptr || get("lokr_w2") != nullptr) {   // a core beside the whole matrix stays unread: the matrix wins
         w2 = matrix_of("lokr_w2", "lokr_w2_a", "lokr_w2_b");
     } else {
         // Tucker: w2 [out_k][in_n] = w2_a [core_out][out_k]^T . T . w2_b [core_in][in_n], T the core's kernel, 1 x 1
@@ -403,7 +479,7 @@ void make_lokr(LoraEntry& e, Group& g, const std::string& path) {
                                                                    std::to_string(b->shape[0])));
         const int64_t core_out = t2->shape[0], core_in = t2->shape[1];
         const int64_t out_k = a->shape[1], in_n = b->shape[1];
-        rank = core_in;   // ComfyUI's dim: w2_b's rows
+        rank = core_in;   // the rank: w2_b's rows
         const std::vector<float> tb = mat_mul(t2->v.data(), core_out, core_in, b->v.data(), in_n);
         w2.shape = {out_k, in_n};
         w2.v.assign((size_t) (out_k * in_n), 0.0f);
@@ -460,9 +536,9 @@ bool hada_side_shape(const std::vector<int64_t>& sa, const std::vector<int64_t>&
     return true;
 }
 
-// A LoHa's four tensors -> its entry: the two sides' products must be one shape, the rank is ComfyUI's (w1's factors'
-// rows, the alpha's divisor).  The factors themselves go into `extra` and `shapes` with the file's other tensors (below),
-// for the delta made when the entry is bound.
+// A LoHa's four tensors -> its entry: the two sides' products must be one shape, the rank is w1's factors' rows (the
+// alpha's divisor).  The factors themselves go into `extra` and `shapes` with the file's other tensors (below), for
+// the delta made when the entry is bound.
 void make_loha(LoraEntry& e, Group& g, const std::string& path) {
     const auto get = [&g](const char* r) -> const RawTensor* {
         auto it = g.by_role.find(r);
@@ -495,7 +571,7 @@ void make_loha(LoraEntry& e, Group& g, const std::string& path) {
                                                    std::to_string(c2) + ": not the weight's one shape"));
     e.rows = r1;
     e.cols = c1;
-    e.rank = b1->shape[0];   // ComfyUI's dim: w1_b's rows, which the file's alpha is divided by
+    e.rank = b1->shape[0];   // the rank: w1_b's rows, which the file's alpha is divided by
 }
 
 // One of a GLoRA's readings laid into an entry: the plain form's pair (A [rank][cols] and B [rows][rank]) and the
@@ -512,13 +588,13 @@ void glora_reading(GloraReading& r, const RawTensor& in, const RawTensor& out, c
     lora_to_f16(out.v, r.out);
 }
 
-// A GLoRA's four tensors -> its entry: W' = W + s (alpha / rank) (W a1 a2 + b1 b2) (comfy/weight_adapter/glora.py's
-// calculate_weight), whose b1 b2 is a plain LoRA's pair (A = b2 [rank][cols], B = b1 [rows][rank]) and whose a1 a2 is
-// the weight's own product's input (v = a1 (a2 x)).  LyCORIS's older form writes the four the other way round
-// (W a2 a1 + b2 b1: A = b1, B = b2, v = a2 (a1 x)); the shapes say which a file holds - ComfyUI's two tests - and a
+// A GLoRA's four tensors -> its entry: W' = W + s (alpha / rank) (W a1 a2 + b1 b2), whose b1 b2 is a plain LoRA's
+// pair (A = b2 [rank][cols], B = b1 [rows][rank]) and whose a1 a2 is the weight's own product's input
+// (v = a1 (a2 x)).  LyCORIS's older form writes the four the other way round
+// (W a2 a1 + b2 b1: A = b1, B = b2, v = a2 (a1 x)); the shapes say which a file holds - two tests on them - and a
 // file of neither is refused.  Where both fit (the four are the weight's rows' and columns' square, so each reading
 // makes a product of its own shape), the entry keeps the older one and the other in `glora_other`: a weight's rows and
-// columns choose at the bind (lora_glora_for_weight), as ComfyUI's calculate_weight asks its weight's shape.
+// columns choose at the bind (lora_glora_for_weight): the reading whose product has the weight's shape.
 void make_glora(LoraEntry& e, Group& g, const std::string& path) {
     const auto get = [&g](const char* r) -> const RawTensor* {
         auto it = g.by_role.find(r);
@@ -535,8 +611,8 @@ void make_glora(LoraEntry& e, Group& g, const std::string& path) {
             throw std::runtime_error(path_key_what(path, e.key, "a1, a2, b1 and b2 must be matrices"));
     const auto r = [](const RawTensor* t) { return t->shape[0]; };
     const auto c = [](const RawTensor* t) { return t->shape[1]; };
-    // ComfyUI's two tests on the shapes as the file writes them: LyCORIS's older form (a1 [rank][cols], a2
-    // [cols][rank], b1 [rank][cols], b2 [rows][rank]) and the one ComfyUI's glora.py writes of its own (a1
+    // the two tests on the shapes as the file writes them: LyCORIS's older form (a1 [rank][cols], a2
+    // [cols][rank], b1 [rank][cols], b2 [rows][rank]) and the newer one (a1
     // [cols][rank], a2 [rank][cols], b1 [rows][rank], b2 [rank][cols])
     const bool old = c(m4) == r(m3) && r(m3) == r(m1) && r(m1) == c(m2);
     const bool current = r(m4) == c(m3) && c(m3) == c(m1) && c(m1) == r(m2);
@@ -550,7 +626,7 @@ void make_glora(LoraEntry& e, Group& g, const std::string& path) {
                                                    ": neither of a GLoRA's two readings (a1 [cols][rank], a2 "
                                                    "[rank][cols], b1 [rows][rank], b2 [rank][cols], or LyCORIS's "
                                                    "with a1/a2 and b1/b2 the other way round)"));
-    // the reading the entry holds first: the older one where both fit, as ComfyUI's calculate_weight keeps it for a
+    // the reading the entry holds first: the older one where both fit
     const bool first_old = old;
     GloraReading& main = e.glora;
     // the older reading's input path is a1 [rank][cols] then a2, its plain pair b1 [rank][cols] and b2 [rows][rank];
@@ -697,7 +773,7 @@ bool loha_delta(const LoraEntry& e, std::vector<uint16_t>& out, std::string& err
     return true;
 }
 
-// A block's rotation r = (I + Q) (I - Q)^-1 (comfy/weight_adapter/oft.py's Cayley transform of the skew matrix Q):
+// A block's rotation r = (I + Q) (I - Q)^-1 (the Cayley transform of the skew matrix Q):
 // (I - Q) inverted by Gauss-Jordan with partial pivoting, FP32, then multiplied by (I + Q).  `n` is a block's rows (a
 // few dozen at most: the file's block size).
 bool oft_cayley(const float* q, int64_t n, float* r) {
@@ -744,9 +820,9 @@ bool oft_cayley(const float* q, int64_t n, float* r) {
 }
 
 // An OFT's (a BOFT's) blocks -> the rotations the engine applies: r = (I + Q) (I - Q)^-1 a block, Q the block's skew
-// part, its Frobenius norm over the whole file clamped to the file's alpha where that is above 0 (ComfyUI's
+// part, its Frobenius norm over the whole file clamped to the file's alpha where that is above 0 (the OFT's
 // constraint).  The file's `oft_blocks` is [blocks][bs][bs] (an OFT) or [stages][blocks][bs][bs] (a BOFT, whose
-// stage i turns the rows in 2^i-row groups: comfy/weight_adapter/boft.py's reshapes want 2^i of the blocks).  The
+// stage i turns the rows in 2^i-row groups: the butterfly's reshapes want 2^i of the blocks).  The
 // rotations go to `extra` under "oft_r", a stage's blocks after another's; `rescale` is kept as the file has it.
 void make_oft(LoraEntry& e, Group& g, const std::string& path) {
     auto it = g.by_role.find("oft_blocks");
@@ -783,7 +859,7 @@ void make_oft(LoraEntry& e, Group& g, const std::string& path) {
     e.oft.boft = b.shape.size() == 4;
     e.rows = e.oft.rows();
     e.cols = 0;   // the rotation is over the weight's rows: its columns are the product's own
-    // the constraint: the file's alpha, a bound on the skew parts' Frobenius norm (ComfyUI clamps them as one tensor)
+    // the constraint: the file's alpha, a bound on the skew parts' Frobenius norm (clamped as one tensor)
     const float bound = e.alpha_set ? e.alpha : 0.0f;
     std::vector<float> q(b.v);
     for (int64_t i = 0; i < stages * blocks; ++i) {
@@ -860,8 +936,8 @@ LoraEntry make_entry(Group& g, const std::string& path) {
         lora_to_f16(b->v, e.b);
     }
     if (e.kind == LoraKind::diff) {
-        // the weight's own delta: set_weight (the weight itself) before diff, and w_norm, ComfyUI's patch table's
-        // order (comfy/lora.py writes each into the same key)
+        // the weight's own delta: set_weight (the weight itself) before diff, and w_norm last (the three fill one
+        // patch of the weight, so one of them is read)
         const char* const which =
             role("set_weight") != nullptr ? "set_weight" : (role("diff") != nullptr ? "diff" : "w_norm");
         const RawTensor* t = role(which);
@@ -888,22 +964,24 @@ LoraEntry make_entry(Group& g, const std::string& path) {
             throw std::runtime_error(path_key_what(path, e.key, std::string("a dora_scale on ") +
                                                                    (e.kind == LoraKind::oft ? "an OFT" : "a GLoRA") +
                                                                    ": the engine's DoRA is the plain form's"));
-        if (d->v.size() == (size_t) e.rows) {
-            e.dora = d->v;
-            e.dora_over_rows = true;
-        } else if (d->v.size() == (size_t) e.cols) {
-            e.dora = d->v;
-            e.dora_over_rows = false;
-        } else {
+        // Which way the magnitude runs, from its shape and not its element count: LyCORIS and PEFT write the rows as
+        // [rows][1] and the columns as [1][cols], so a 1 says which; a bare [n] takes n, and a weight whose rows are
+        // its columns (a square one) reads as the rows.
+        const int64_t n = (int64_t) d->v.size();
+        bool rows = false, cols = false;
+        if (d->shape.size() == 2 && d->shape[0] == 1) cols = n == e.cols;   // [1][cols]: over the columns
+        else if (d->shape.size() != 2 || d->shape[1] == 1) rows = n == e.rows;   // [rows] or [rows][1]: the rows
+        if (!rows && !cols)
             throw std::runtime_error(path_and(path, e.key) + ": dora_scale is neither the rows nor the columns");
-        }
+        e.dora = d->v;
+        e.dora_over_rows = rows;
     }
     if (role("lora_mid") != nullptr)
         throw std::runtime_error(path_and(path, e.key) +
                                  ": a LoRA with a middle layer (a convolution's) is not one the image engine's linear "
                                  "products take");
-    // a bias's delta: ComfyUI's load_lora papers the weight's bias with `diff_b` (or with `b_norm` beside the weight's
-    // `w_norm`, which `diff_b` then overrides), the same "diff" patch as the weight's - no alpha, the request's
+    // a bias's delta: `diff_b` patches the weight's bias (or `b_norm` beside the weight's `w_norm`, which `diff_b`
+    // then overrides), the same "diff" patch as the weight's - no alpha, the request's
     // strength only.  An entry may hold one alone (LoraKind::bias): its rows are the bias's.
     const RawTensor* bb = role("diff_b");
     if (bb == nullptr) {
@@ -911,7 +989,7 @@ LoraEntry make_entry(Group& g, const std::string& path) {
         if (bb != nullptr && role("w_norm") == nullptr)
             throw std::runtime_error(path_key_what(path, e.key,
                                                    "a bias's delta (b_norm) without the weight's w_norm, beside "
-                                                   "which ComfyUI's load_lora reads it"));
+                                                   "which the common readers take it"));
     }
     if (bb != nullptr) {
         if (bb->shape.size() != 1)
@@ -952,10 +1030,14 @@ std::vector<LoraEntry> read_entries(Reader& rd, const std::string& path) {
     std::sort(names.begin(), names.end());
     std::vector<Group> groups;
     std::map<std::string, size_t> index;
+    std::vector<std::string> left_out;   // keys that name no tensor of an adapter: said, never dropped in silence
     for (const std::string& raw : names) {
         std::string key, role;
         split_key(raw, key, role);
-        if (role.empty()) continue;   // a key of the file's own (a quantization's, a config's)
+        if (role.empty()) {   // a key of the file's own (a quantization's, a config's) or one the engine reads not yet
+            left_out.push_back(raw);
+            continue;
+        }
         if (key.empty()) throw std::runtime_error(path_key_what(path, raw, "a tensor with no weight's name"));
         if (is_training_aid(key)) {
             std::fprintf(stderr, "image engine: %s: %s: a training aid, not a LoRA tensor: left out\n", path.c_str(),
@@ -975,6 +1057,13 @@ std::vector<LoraEntry> read_entries(Reader& rd, const std::string& path) {
         }
         roles.emplace(role, rd.get(raw));
     }
+    if (!left_out.empty()) {   // the same names serve/loras.py kept and the response says: the first 6 and the count
+        std::string names;
+        for (size_t i = 0; i < left_out.size() && i < 6; ++i) names += (i ? ", " : "") + left_out[i];
+        if (left_out.size() > 6) names += ", ...";
+        std::fprintf(stderr, "image engine: %s: %zu of its keys hold no adapter tensor and were left out (%s)\n",
+                     path.c_str(), left_out.size(), names.c_str());
+    }
     std::vector<LoraEntry> entries;
     entries.reserve(groups.size());
     for (Group& g : groups) entries.push_back(make_entry(g, path));
@@ -982,7 +1071,11 @@ std::vector<LoraEntry> read_entries(Reader& rd, const std::string& path) {
 }
 
 // The scale a PEFT-form file keeps in its metadata ("lora_adapter_metadata": a JSON string), where no ".alpha"
-// tensor says it: alpha / rank.  rsLoRA's scale is another one (alpha / sqrt(rank)) and is refused.
+// tensor says it: alpha / rank.  A layer's own alpha the metadata's alpha_pattern says (PEFT's per-layer alphas,
+// the first pattern that matches the key); the rest take the file's lora_alpha.  rsLoRA's scale is another one
+// (alpha / sqrt(rank)) and is refused, and so is a file that names two different alphas for weights no pattern
+// covers: the engine reads one alpha for those, so which one the image's are under is not said (diffusers writes a
+// text encoder's and a transformer's one in the same field).
 void apply_peft_metadata(std::vector<LoraEntry>& entries, const std::map<std::string, std::string>& meta) {
     std::string json;
     for (const auto& [k, v] : meta)
@@ -991,16 +1084,56 @@ void apply_peft_metadata(std::vector<LoraEntry>& entries, const std::map<std::st
     if (json_true(json, "use_rslora"))
         throw std::runtime_error("the adapter is rsLoRA (use_rslora), whose scale is not the plain alpha / rank: not "
                                  "supported yet");
-    double alpha = 0;
-    if (!json_number(json, "lora_alpha", alpha)) return;
+    // Only a weight without its own ".alpha" takes the metadata's one (the ".alpha" wins as it does below).
+    const auto pattern = json_pairs(json, "alpha_pattern");
     for (LoraEntry& e : entries) {
-        if (e.alpha_set) continue;   // the file's own ".alpha" wins
-        e.alpha = (float) alpha;
+        if (e.alpha_set) continue;
+        for (const auto& [pat, a] : pattern)
+            if (peft_pattern_matches(pat, e.key)) {
+                e.alpha = (float) a;
+                e.alpha_set = true;
+                break;
+            }
+    }
+    const std::vector<double> alphas = json_numbers(json, "lora_alpha");
+    size_t distinct = 0;   // how many different values those names hold: a file of one component holds one
+    for (size_t i = 0; i < alphas.size(); ++i) {
+        bool seen = false;
+        for (size_t j = 0; j < i; ++j)
+            if (alphas[j] == alphas[i]) {
+                seen = true;
+                break;
+            }
+        if (!seen) ++distinct;
+    }
+    bool from_meta = false;
+    for (const LoraEntry& e : entries)
+        if (!e.alpha_set) from_meta = true;
+    if (distinct > 1 && from_meta)
+        throw std::runtime_error("its metadata names " + std::to_string(distinct) + " different lora_alpha values "
+                                 "(a text encoder's and a transformer's in one file): which one the image weights "
+                                 "take is not said: not supported yet");
+    if (alphas.empty()) return;
+    for (LoraEntry& e : entries) {
+        if (e.alpha_set) continue;   // the file's own ".alpha" and the alpha_pattern's win
+        e.alpha = (float) alphas.front();
         e.alpha_set = true;
     }
 }
 
 }  // namespace
+
+bool lora_key_names(const std::string& key, const std::string& name) {
+    if (key == name) return true;
+    // The same name as sd-scripts' `lora_unet_` and the LyCORIS form's `lycoris_` keys write it: every dot an
+    // underscore, the name's own underscores kept.  The DiT's names answer in their own form, each written in the
+    // underscore form too; serve/loras.py's kohya_name brings the same keys to the same names for the listing.  A
+    // dotted key holds a dot and an underscore form holds none, so the two readings never meet in the middle.
+    if (key.size() != name.size() || key.find('.') != std::string::npos) return false;
+    for (size_t i = 0; i < name.size(); ++i)
+        if (key[i] != (name[i] == '.' ? '_' : name[i])) return false;
+    return true;
+}
 
 const char* lora_kind_name(LoraKind k) {
     switch (k) {
@@ -1035,6 +1168,76 @@ uint64_t LoraFile::host_bytes() const {
         for (const auto& [role, v] : e.extra) n += v.size() * 4;
     }
     return n;
+}
+
+std::shared_ptr<const LoraFile> LoraFile::share(bool text) const {
+    auto out = std::make_shared<LoraFile>();
+    out->path_ = path_;
+    out->meta_ = meta_;
+    for (const LoraEntry& e : entries_)
+        if (lora_is_text_encoder_key(e.key) == text) out->entries_.push_back(e);
+    return out;
+}
+
+bool lora_is_text_encoder_key(const std::string& k) {
+    return k.rfind("lora_te", 0) == 0 || k.rfind("text_encoder", 0) == 0 || k.rfind("te.", 0) == 0;
+}
+
+std::string lora_text_encoder_name(const std::string& key) {
+    std::string s = key;
+    for (const char* p : {"lora_te1_", "lora_te2_", "lora_te_", "text_encoders.", "text_encoder.", "te."})
+        if (s.rfind(p, 0) == 0) {
+            s.erase(0, std::strlen(p));
+            break;
+        }
+    std::replace(s.begin(), s.end(), '_', '.');
+    // a model's own wrappers before its layers (a Qwen3-0.6B text encoder's qwen3_06b.transformer.model. in the dot
+    // form, Qwen3-VL's language_model.)
+    const size_t at = s.find("layers.");
+    if (at != std::string::npos && at > 0 && s[at - 1] == '.') s.erase(0, at);
+    return s;
+}
+
+std::string lora_key_of(const std::vector<LoraUse>& loras) {
+    std::string key;
+    for (const LoraUse& u : loras) {
+        if (!u.file) continue;
+        char num[32];
+        std::snprintf(num, sizeof num, "%.7g", (double) u.scale);
+        key += u.file->path() + ":" + num;
+        for (size_t b = 0; b < u.blocks.size(); ++b) {
+            std::snprintf(num, sizeof num, "%.7g", (double) u.blocks[b]);
+            key += (b == 0 ? "@" : ",") + std::string(num);
+        }
+        key += ";";
+    }
+    return key;
+}
+
+void lora_split(const std::vector<LoraUse>& in, std::vector<LoraUse>& dit, std::vector<LoraUse>& te) {
+    struct Kept {
+        std::shared_ptr<const LoraFile> file, dit, te;
+    };
+    static std::mutex mu;
+    static std::vector<Kept> kept;   // the last files' shares (a request names a handful)
+    dit.clear();
+    te.clear();
+    std::lock_guard<std::mutex> lock(mu);
+    for (const LoraUse& u : in) {
+        if (!u.file) continue;
+        auto it = std::find_if(kept.begin(), kept.end(), [&](const Kept& k) { return k.file == u.file; });
+        if (it == kept.end()) {
+            bool any_te = false, any_dit = false;
+            for (const LoraEntry& e : u.file->entries()) (lora_is_text_encoder_key(e.key) ? any_te : any_dit) = true;
+            Kept k{u.file, any_dit ? (any_te ? u.file->share(false) : u.file) : nullptr,
+                   any_te ? u.file->share(true) : nullptr};
+            if (kept.size() >= 16) kept.erase(kept.begin());
+            kept.push_back(k);
+            it = kept.end() - 1;
+        }
+        if (it->dit) dit.push_back({it->dit, u.scale, u.blocks});
+        if (it->te) te.push_back({it->te, u.scale, {}});   // a text encoder has no DiT blocks
+    }
 }
 
 std::unique_ptr<LoraFile> LoraFile::open(const std::string& path) {
@@ -1117,7 +1320,7 @@ struct KronRows {
     }
 };
 
-// A bias's delta: y[t][row0 + c] += scale * b[src_row + c] (ComfyUI's "diff" patch of the weight's bias)
+// A bias's delta: y[t][row0 + c] += scale * b[src_row + c] (a "diff" patch of the weight's bias)
 struct AddBias {
     const float* b;
     float scale;
@@ -1207,7 +1410,7 @@ void LoraDeviceEntry::release() {
 bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err, const float* row_coef) {
     release();
     kind_ = e.kind;
-    // a bias's delta (ComfyUI's "diff" patch of the weight's bias), beside or instead of the weight's own
+    // a bias's delta (a "diff" patch of the weight's bias), beside or instead of the weight's own
     const auto bias_to_gpu = [&]() -> bool {
         if (e.bias.empty()) return true;
         if ((int64_t) e.bias.size() != e.rows) {
@@ -1439,19 +1642,59 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err,
         release();
         return false;
     }
-    // a DoRA's c folded into B's rows (no copy where there is none, a rank-64 adapter's B being hundreds of MiB)
+    // a rank's pair whose A row could carry the product's middle x A^T, which add() rounds to FP16, past FP16's range,
+    // balanced by a power of two (A's row divided, B's column multiplied, so that B A stays).  x A_j reaches
+    // |A_j| times the activations' gain, which the upload cannot know (a model's, a block's, a step's); the gain seen:
+    // a Mage-Flow LoRA of an early trainer (A rows' norms 13.4 to 28 against B's 0.18) overflowed at strength 0.15,
+    // so the gain was at least 65504 / (0.15 * 28), about 15600, and a row stays in range at serve's largest strength
+    // (2) below 65504 / (15600 * 2), about 2.1.  Only such rows: an A row's norm was 1.07 at most in ai-toolkit's,
+    // XeStrata's and a published LoRA (476 weights), and balancing those too changed their images (the sampling
+    // carries the products' last bits; 2026-11-16, the RX 9060 XT)
+    constexpr double kFp16Max = 65504.0, kGainSeen = 65504.0 / (0.15 * 28.0), kStrengthMax = 2.0;
+    constexpr double kLargeRow = (kFp16Max / (kGainSeen * kStrengthMax)) * (kFp16Max / (kGainSeen * kStrengthMax));
+    std::vector<int> shift((size_t) e.rank, 0);
+    bool shifted = false;
+    for (int64_t j = 0; j < e.rank; ++j) {
+        double na = 0.0, nb = 0.0;
+        for (int64_t c = 0; c < e.cols; ++c) {
+            const double v = strata::kernels::f32_from_f16(e.a[(size_t) (j * e.cols + c)]);
+            na += v * v;
+        }
+        for (int64_t r = 0; r < e.rows; ++r) {
+            const double v = strata::kernels::f32_from_f16(e.b[(size_t) (r * e.rank + j)]);
+            nb += v * v;
+        }
+        if (na > kLargeRow && nb > 0.0) {
+            shift[(size_t) j] = std::max(0, (int) std::lround(std::log2(na / nb) / 4.0));   // log2(sqrt(|A| / |B|)), squared norms
+            shifted = shifted || shift[(size_t) j] != 0;
+        }
+    }
+    std::vector<uint16_t> a_bal;
+    const uint16_t* a = e.a.data();
+    if (shifted) {
+        a_bal = e.a;
+        for (int64_t j = 0; j < e.rank; ++j)
+            for (int64_t c = 0; c < e.cols; ++c) {
+                uint16_t& h = a_bal[(size_t) (j * e.cols + c)];
+                h = strata::kernels::f16_from_f32(std::ldexp(strata::kernels::f32_from_f16(h), -shift[(size_t) j]));
+            }
+        a = a_bal.data();
+    }
+    // a DoRA's c folded into B's rows, and the balance's powers of two into its columns (no copy where there is
+    // neither, a rank-64 adapter's B being hundreds of MiB)
     std::vector<uint16_t> scaled;
     const uint16_t* b = e.b.data();
-    if (row_coef != nullptr) {
+    if (row_coef != nullptr || shifted) {
         scaled = e.b;
         for (int64_t r = 0; r < e.rows; ++r)
             for (int64_t j = 0; j < e.rank; ++j) {
                 uint16_t& h = scaled[(size_t) (r * e.rank + j)];
-                h = strata::kernels::f16_from_f32(strata::kernels::f32_from_f16(h) * row_coef[r]);
+                const float v = std::ldexp(strata::kernels::f32_from_f16(h), shift[(size_t) j]);
+                h = strata::kernels::f16_from_f32(row_coef != nullptr ? v * row_coef[r] : v);
             }
         b = scaled.data();
     }
-    strata::gpu::copy_async(a_, e.a.data(), e.a.size() * 2, stream);
+    strata::gpu::copy_async(a_, a, e.a.size() * 2, stream);
     strata::gpu::copy_async(b_, b, e.b.size() * 2, stream);
     if (!strata::gpu::stream_sync(stream)) {
         err = "the image engine: the adapter " + e.key + " to the GPU: " + strata::gpu::last_error();
@@ -1572,6 +1815,174 @@ bool LoraLayer::has_oft() const {
     for (const LoraPart& p : parts)
         if (p.oft) return true;
     return false;
+}
+
+namespace {
+
+// A uniform value in [0, 1) of a weight's (row, column), the same for each bake: the dither of a requantized weight
+inline float bake_dither(int64_t row, int64_t c) {
+    uint32_t h = (uint32_t) row * 0x9E3779B1u ^ (uint32_t) c * 0x85EBCA77u;
+    h ^= h >> 15;
+    h *= 0x2C1B3C6Du;
+    h ^= h >> 12;
+    return (float) (h >> 8) * (1.0f / 16777216.0f);
+}
+
+}  // namespace
+
+bool LoraLayer::bakeable() const {
+    if (parts.empty()) return false;
+    for (const LoraPart& p : parts)
+        if (p.dora || p.oft || p.glora || p.replaces || !p.entry || !p.entry->plain() || p.entry->has_bias())
+            return false;
+    return true;
+}
+
+void LoraLayer::bake(int type, void* w, int64_t n, int64_t k, prefill::Gemm& gemm, float* tmp, uint16_t* at16,
+                     void* stream) const {
+    sycl::queue& q = strata::core::Runtime::get().stream(stream);
+    for (const LoraPart& p : parts) {
+        const LoraDeviceEntry& e = *p.entry;
+        const int64_t r = e.rank(), rows = std::min(p.n, n - p.row0);
+        if (rows <= 0 || p.scale == 0.0f || e.cols() != k) continue;
+        // A^T [k][r], then delta [rows][k] = B's rows . A (the product's weight is A^T)
+        const uint16_t* a = e.a();
+        q.parallel_for(sycl::range<1>((size_t) (k * r)), [=](sycl::id<1> id) {
+            const auto i = static_cast<int64_t>(id[0]);
+            const int64_t c = i / r, j = i - c * r;
+            at16[i] = a[j * k + c];
+        });
+        gemm.f16(e.b() + p.src_row * r, at16, tmp, rows, k, r);
+        const float s = p.scale;
+        if (type == 1) {
+            auto* w16 = static_cast<uint16_t*>(w) + p.row0 * k;
+            q.parallel_for(sycl::range<1>((size_t) (rows * k)), [=](sycl::id<1> id) {
+                const auto i = static_cast<int64_t>(id[0]);
+                const float v = strata::kernels::f32_from_f16(w16[i]) + s * tmp[i];
+                w16[i] = strata::kernels::f16_from_f32(sycl::clamp(v, -65504.f, 65504.f));
+            });
+        } else if (type == -8) {
+            // A work-group a row. Reserve one float a lane for the reduction's static local memory. The CUDA
+            // adapter opts in to larger allocations only above 48 KiB; avoid exactly that size on every device.
+            auto* w8 = static_cast<int8_t*>(w);
+            float* sw = reinterpret_cast<float*>(static_cast<uint8_t*>(w) + n * k);
+            const int64_t row0 = p.row0;
+            constexpr int64_t G = kQiRotate, L = 256;
+            const int64_t local_floats = (int64_t) (q.get_device().get_info<sycl::info::device::local_mem_size>() /
+                                                    sizeof(float));
+            constexpr int64_t optin_edge = 48LL * 1024 / (int64_t) sizeof(float);   // UR CUDA's dynamic shared-memory boundary
+            const int64_t fast_local = k + (k == optin_edge ? G : 0);
+            if (fast_local + L <= local_floats) {   // keep the row in local memory when it fits
+                q.submit([&](sycl::handler& h) {
+                    sycl::local_accessor<float, 1> v(sycl::range<1>((size_t) fast_local), h);
+                    h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (rows * L)), sycl::range<1>((size_t) L)),
+                                   [=](sycl::nd_item<1> it) {
+                        const auto rr = static_cast<int64_t>(it.get_group_linear_id());
+                        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+                        const int64_t row = row0 + rr;
+                        for (int64_t c = lane; c < k; c += L) v[c] = s * tmp[rr * k + c];
+                        for (int64_t m = 1; m < G; m <<= 1) {
+                            sycl::group_barrier(it.get_group());
+                            for (int64_t i = lane; i < k / 2; i += L) {   // pair i: group g, its j in the half below m
+                                const int64_t g = i / (G / 2), o = i - g * (G / 2), lo = (o / m) * 2 * m + o % m;
+                                const int64_t j = g * G + lo;
+                                const float x = v[j], y = v[j + m];
+                                v[j] = x + y;
+                                v[j + m] = x - y;
+                            }
+                        }
+                        sycl::group_barrier(it.get_group());
+                        const float d0 = sw[row];
+                        float amax = 0.f;
+                        for (int64_t c = lane; c < k; c += L) {
+                            const float u = (float) w8[row * k + c] * d0 + v[c] * (1.f / 16.f);
+                            v[c] = u;
+                            amax = sycl::fmax(amax, sycl::fabs(u));
+                        }
+                        amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
+                        const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
+                        // dithered: the weight's values sit on its grid, and a delta under half a step rounds back to
+                        // them (a LoRA lost); floor(x + u) keeps the delta on average over a product's sums
+                        for (int64_t c = lane; c < k; c += L)
+                            w8[row * k + c] = (int8_t) sycl::clamp(sycl::floor(v[c] * id + bake_dither(row, c)), -127.f,
+                                                                   127.f);
+                        if (lane == 0) sw[row] = d;
+                    });
+                });
+            } else {   // a wide row: the partial sums live in tmp until the row's scale is known
+                int64_t width = (local_floats - 2 * L) / G * G;
+                if (width + L == optin_edge) width -= G;
+                if (width < G) throw std::runtime_error("image engine: insufficient local memory for LoRA baking");
+                q.submit([&](sycl::handler& h) {
+                    sycl::local_accessor<float, 1> v(sycl::range<1>((size_t) (width + L)), h);
+                    h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (rows * L)), sycl::range<1>((size_t) L)),
+                                   [=](sycl::nd_item<1> it) {
+                        const auto rr = static_cast<int64_t>(it.get_group_linear_id());
+                        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+                        const int64_t row = row0 + rr;
+                        const float d0 = sw[row];
+                        float amax = 0.f;
+                        for (int64_t base = 0; base < k; base += width) {
+                            const int64_t count = sycl::min(width, k - base);
+                            sycl::group_barrier(it.get_group());
+                            for (int64_t c = lane; c < count; c += L) v[c] = s * tmp[rr * k + base + c];
+                            for (int64_t m = 1; m < G; m <<= 1) {
+                                sycl::group_barrier(it.get_group());
+                                for (int64_t i = lane; i < count / 2; i += L) {
+                                    const int64_t g = i / (G / 2), o = i - g * (G / 2), lo = (o / m) * 2 * m + o % m;
+                                    const int64_t j = g * G + lo;
+                                    const float x = v[j], y = v[j + m];
+                                    v[j] = x + y;
+                                    v[j + m] = x - y;
+                                }
+                            }
+                            sycl::group_barrier(it.get_group());
+                            for (int64_t c = lane; c < count; c += L) {
+                                const int64_t col = base + c;
+                                const float u = (float) w8[row * k + col] * d0 + v[c] * (1.f / 16.f);
+                                tmp[rr * k + col] = u;
+                                amax = sycl::fmax(amax, sycl::fabs(u));
+                            }
+                        }
+                        v[width + lane] = amax;
+                        for (int64_t stride = L / 2; stride > 0; stride /= 2) {
+                            sycl::group_barrier(it.get_group());
+                            if (lane < stride) v[width + lane] = sycl::fmax(v[width + lane], v[width + lane + stride]);
+                        }
+                        sycl::group_barrier(it.get_group());
+                        amax = v[width];
+                        const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
+                        // Dithered: a delta below half a step must not always round back to the old weight.
+                        for (int64_t c = lane; c < k; c += L)
+                            w8[row * k + c] = (int8_t) sycl::clamp(
+                                sycl::floor(tmp[rr * k + c] * id + bake_dither(row, c)), -127.f, 127.f);
+                        if (lane == 0) sw[row] = d;
+                    });
+                });
+            }
+        } else if (type == 8) {   // Q8_0: 32 values a block, its FP16 scale then the values
+            auto* w8 = static_cast<uint8_t*>(w);
+            const int64_t nb = k / 32, row0 = p.row0;
+            q.parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> id) {
+                const auto i = static_cast<int64_t>(id[0]);
+                const int64_t rr = i / nb, bl = i - rr * nb;
+                uint8_t* blk = w8 + ((row0 + rr) * nb + bl) * 34;
+                const float d0 = strata::kernels::f32_from_f16((uint16_t) (blk[0] | (blk[1] << 8)));
+                float u[32], amax = 0.f;
+                for (int j = 0; j < 32; ++j) {
+                    u[j] = (float) (int8_t) blk[2 + j] * d0 + s * tmp[rr * k + bl * 32 + j];
+                    amax = sycl::fmax(amax, sycl::fabs(u[j]));
+                }
+                const float d = amax / 127.f, id2 = amax > 0.f ? 1.f / d : 0.f;
+                const uint16_t dh = strata::kernels::f16_from_f32(d);
+                blk[0] = (uint8_t) (dh & 0xff);
+                blk[1] = (uint8_t) (dh >> 8);
+                for (int j = 0; j < 32; ++j)   // dithered, as the W8A8 rows above
+                    blk[2 + j] = (uint8_t) (int8_t) sycl::clamp(
+                        sycl::floor(u[j] * id2 + bake_dither(row0 + rr, bl * 32 + j)), -127.f, 127.f);
+            });
+        }
+    }
 }
 
 bool LoraLayer::has_glora() const {
@@ -1698,14 +2109,20 @@ int64_t lora_scratch_cols(const LoraEntry& e) {
 }
 
 uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
-    uint64_t bytes = 0;
+    uint64_t bytes = 0, bake = 0;
     int64_t cols = 0, glora_cols = 0, glora_rows = 0;
     for (const LoraUse& u : loras) {
         if (!u.file) continue;
         for (const LoraEntry& e : u.file->entries()) {
-            if (e.kind == LoraKind::lora)
+            if (e.kind == LoraKind::lora) {
                 bytes += 2 * (uint64_t) e.rank * (uint64_t) (e.rows + e.cols);   // A and B, FP16
-            else if (e.kind == LoraKind::glora && e.rows > 0 && e.cols > 0) {
+                // a plain LoRA folded into a block's weight (DitLoras' bake): the weight's delta in FP32 and A^T,
+                // taken once for the largest (a DiT that does not bake it takes none; a fused weight whose parts a
+                // file names apart is larger than its entries - the plan counts what the bind took)
+                if (e.dora.empty() && e.bias.empty())
+                    bake = std::max(bake, (uint64_t) e.rows * (uint64_t) e.cols * 4 +
+                                              (uint64_t) e.cols * (uint64_t) e.rank * 2);
+            } else if (e.kind == LoraKind::glora && e.rows > 0 && e.cols > 0) {
                 bytes += 2 * (uint64_t) e.rank * (uint64_t) (3 * e.cols + e.rows);   // its plain pair and the input's
                                                                                      // two factors, FP16
                 glora_cols = std::max(glora_cols, e.cols);
@@ -1728,10 +2145,10 @@ uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
     if (glora_cols > 0)   // a GLoRA's weight's product of its input: the table of a band's rows, and that input (an
         // int8 one of a W8A8 product's, a packed Q8_0 one's, and the FP16 it is made in)
         bytes += (uint64_t) kLoraGloraRows * ((uint64_t) glora_cols * 6 + (uint64_t) glora_rows * 4);
-    return bytes + (uint64_t) std::max<int64_t>(T, 0) * (uint64_t) cols * 6;
+    return bytes + bake + (uint64_t) std::max<int64_t>(T, 0) * (uint64_t) cols * 6;
 }
 
-bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n, const std::vector<float>& norms,
+bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t n, const std::vector<float>& norms,
                     float strength, std::vector<float>& coef, std::vector<float>& base, std::string& err) {
     if (e.kind != LoraKind::lora) {
         err = "a DoRA (dora_scale) on a ";
@@ -1740,19 +2157,18 @@ bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n
         return false;
     }
     if (!e.dora_over_rows) {
-        err = "a DoRA (dora_scale) over the weight's columns: the engine's DoRA scales its output's rows, as ComfyUI's "
-              "weight_decompose does where the scale is the output axis's";
+        err = "a DoRA (dora_scale) over the weight's columns: the engine's DoRA scales its output's rows (the "
+              "weight's decomposition where the scale is the output axis's)";
         return false;
     }
-    if (src_row < 0 || row0 < 0 || n < 0 || (int64_t) e.dora.size() < src_row + n ||
-        (int64_t) norms.size() < row0 + n) {
+    if (src_row < 0 || n < 0 || (int64_t) e.dora.size() < src_row + n || (int64_t) norms.size() < n) {
         err = "a DoRA (dora_scale) whose rows are not the weight's";
         return false;
     }
     coef.resize((size_t) n);
     base.resize((size_t) n);
     for (int64_t j = 0; j < n; ++j) {
-        const float c = e.dora[(size_t) (src_row + j)] / (norms[(size_t) (row0 + j)] + kLoraDoraEps);
+        const float c = e.dora[(size_t) (src_row + j)] / (norms[(size_t) j] + kLoraDoraEps);
         coef[(size_t) j] = c;
         base[(size_t) j] = 1.0f + strength * (c - 1.0f);
     }

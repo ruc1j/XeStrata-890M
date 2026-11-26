@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/qsa_prompt_attn_parity.cpp - perf-review D-1: the prompt attention on the matrix engines (XMX on Xe,
-// tensor cores in Strata's CUDA build; qsa_prompt_attn.hpp) against the FP32 kernel it replaces
-// (`qsa_decode_attn_batch`) and an FP64 host reference (GPU, synthetic, no model).
+// tensor cores in Strata's CUDA build; flash_attn.hpp, and qsa_prompt_attn.hpp on an integrated GPU on the HIP backend,
+// as prefill.cpp picks them) against the FP32 kernel it replaces (`qsa_decode_attn_batch`) and an FP64 host reference
+// (GPU, synthetic, no model).
 //
 // Int8, FP16 and Q4_0 pools with random codes, scales and queries; selections shaped like the prompt path's (the 2,051
 // widest, a recent window plus older cells that drift slowly from one query to the next, so neighbours share most
@@ -21,7 +22,8 @@
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
-#include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/flash_attn.hpp"
+#include "strata/kernels/qsa_prompt_attn.hpp"   // XeStrata-890M: the HIP integrated GPU's prompt attention
 #include "strata/kernels/kv_q4.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
@@ -149,14 +151,22 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
             k::qsa_decode_attn_batch(d_q + t0 * NH * HD, pl, d_ids + t0 * cap, d_steps + t0 * k::kStepCount, cap, s,
                                      scratch, d_old + t0 * NH * HD, std::min(batch, nq - t0), par::stream());
     };
+    // XeStrata-890M: prefill.cpp's choice (hip_igpu): an integrated GPU on the HIP backend takes qsa_prompt_attn's
+    // kernels (gfx1150's single-FP16 form, STRATA_PA_FAST, and the split form), every other device flash_attn_select
+    const sycl::device dv = strata::core::Runtime::get().compute().get_device();
+    const bool hip_igpu = dv.get_backend() == sycl::backend::ext_oneapi_hip && strata::core::integrated_gpu(dv);
+    auto prompt_attn = [&]() {
+        return hip_igpu ? k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, par::stream())
+                        : k::flash_attn_select(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, par::stream());
+    };
     auto new_run = [&]() {
-        if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, par::stream())) {
+        if (!prompt_attn()) {
             std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools (or the device has no matrix engines)\n");
             std::exit(2);
         }
     };
     // Q4_0 KV runs on Intel's kernel only (the portable one leaves it to the FP32 kernel; upstream 06a90a2)
-    if (fmt == 2 && !k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, par::stream())) {
+    if (fmt == 2 && !prompt_attn()) {
         std::printf("SKIP q4_0 ctx %lld: the prompt attention leaves Q4_0 KV to the FP32 kernel on this device\n",
                     (long long) ctx);
         return 0;

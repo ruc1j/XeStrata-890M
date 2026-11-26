@@ -1,17 +1,21 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2026 hiruhiru2005
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/native_dense.hpp"
+#include "strata/core/run_manifest.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/platform/memory.hpp"
 
-#include "strata/core/gpu.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/platform/env.hpp"
 #include <algorithm>
 #include <climits>
 #include <vector>
@@ -20,11 +24,86 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <limits>
 #include <memory>
 #include <set>
 
 namespace strata::core {
+namespace {
+std::map<std::string, DenseNqEntry> g_dense_nq;
+std::string g_dense_nq_file;
+}
+
+bool dense_nq_init(const std::string& pack_dir, std::string& err) {
+    std::map<std::string, DenseNqEntry> entries;
+    const std::string path = pack_dir + "/dense_nq.txt", binary = pack_dir + "/dense_nq.bin";
+    std::ifstream in(path);
+    if (!in) {
+        if (std::filesystem::exists(path) || std::filesystem::exists(binary)) {
+            err = "dense_nq: cannot open " + path;
+            return false;
+        }
+        g_dense_nq.clear(); g_dense_nq_file.clear();
+        return true;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string name, extra;
+        DenseNqEntry e;
+        if (!(ss >> name >> e.type >> e.ne0 >> e.ne1 >> e.offset >> e.bytes) || (ss >> extra) ||
+            (name != "output.weight" && !(name.rfind("blk.", 0) == 0 && name.ends_with(".attn_gate.weight"))) ||
+            (e.type != 11 && e.type != 12 && e.type != 13) || e.ne0 <= 0 || e.ne0 > INT_MAX ||
+            e.ne1 <= 0 || e.ne1 > INT_MAX || e.ne0 % 256 ||
+            e.bytes != strata::kernels::native_mmvq_weight_bytes(e.type, (int) e.ne0, (int) e.ne1) ||
+            e.offset > std::numeric_limits<uint64_t>::max() - e.bytes || !entries.emplace(name, e).second) {
+            err = "dense_nq.txt: invalid or duplicate row: " + line;
+            return false;
+        }
+        ranges.emplace_back(e.offset, e.offset + e.bytes);
+    }
+    if (in.bad() || entries.empty()) { err = "dense_nq.txt: empty or unreadable index"; return false; }
+    std::sort(ranges.begin(), ranges.end());
+    for (size_t i = 1; i < ranges.size(); ++i)
+        if (ranges[i].first < ranges[i - 1].second) { err = "dense_nq.txt: overlapping tensors"; return false; }
+    std::error_code ec;
+    const uint64_t size = std::filesystem::file_size(binary, ec);
+    if (ec || ranges.back().second > size) { err = "dense_nq.bin is absent or shorter than its index"; return false; }
+    g_dense_nq = std::move(entries); g_dense_nq_file = binary;
+    return true;
+}
+
+bool dense_nq_active() { return !g_dense_nq.empty(); }
+
+const DenseNqEntry* dense_nq_find(const std::string& name) {
+    const auto it = g_dense_nq.find(name);
+    return it == g_dense_nq.end() ? nullptr : &it->second;
+}
+
+bool dense_nq_read(const std::string& name, int64_t ne0, int64_t ne1, std::vector<uint8_t>& data,
+                   std::string& err) {
+    const DenseNqEntry* e = dense_nq_find(name);
+    if (!e) { err = "dense_nq: missing " + name; return false; }
+    if (e->ne0 != ne0 || e->ne1 != ne1 || e->bytes > std::numeric_limits<size_t>::max() ||
+        e->offset > (uint64_t) std::numeric_limits<std::streamoff>::max() ||
+        e->bytes > (uint64_t) std::numeric_limits<std::streamsize>::max()) {
+        err = "dense_nq: wrong dimensions or oversized tensor " + name; return false;
+    }
+    std::ifstream in(g_dense_nq_file, std::ios::binary);
+    data.resize((size_t) e->bytes);
+    in.seekg((std::streamoff) e->offset);
+    if (!in || !in.read((char*) data.data(), (std::streamsize) e->bytes)) {
+        err = "dense_nq.bin: short read for " + name; return false;
+    }
+    return true;
+}
+
 namespace {
 int g_layer_lb = -1, g_layer_le = -1;   // set_layer_range; -1: every layer
 bool in_range(const std::string& name) {
@@ -45,7 +124,7 @@ enum class HcQ8 { Off, On, OnDefault, Auto };   // OnDefault: On by default (int
 // to the BF16 read as Auto does.
 HcQ8 hc_q8_mode() {
     static const HcQ8 mode = [] {
-        const char* v = std::getenv("STRATA_HC_Q8");
+        const char* v = strata::env_get("HC_Q8");
         if (v == nullptr || *v == 0)
             return strata::core::device_info(strata::core::current_device()).integrated ? HcQ8::OnDefault : HcQ8::Auto;
         return std::strtol(v, nullptr, 10) != 0 ? HcQ8::On : HcQ8::Off;
@@ -83,14 +162,21 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
-// #4741 (upstream b0b942fa9): a native-eligible projection a pack keeps unquantized (BF16, GGUF type 30; Heretic v2 IQ4_NL has
-// its layer-0 attn_gate so) has no native kernel.  Its siblings are Q8_0, so it is served as Q8_0 made from the file's BF16
-// values (ggml's rounding), and the dispatchers that need a native projection find one.  The pack's BF16 copy stays where it is.
-bool bf16_as_q8_0(const strata::TensorInfo& tensor, const WeightRef& ref) {
+// upstream b0b942fa9 (#4741): a native-eligible projection a pack keeps unquantized (BF16, GGUF type 30; Heretic v2
+// IQ4_NL has its layer-0 attn_gate so) has no native kernel, and the prompt path and the verify window then stop with
+// "has no native GGUF blocks".  Its siblings are Q8_0, so it is served as Q8_0 made from the file's BF16 values
+// (ggml's rounding, q8_0_of_bf16 below), and every dispatcher finds a native projection; the pack's BF16 copy stays.
+// Not bit-exact against reading the BF16 values.
+bool bf16_file_shape(const strata::TensorInfo& tensor) {
     return tensor.type == 30 && tensor.name != "blk.1.ple_key.weight" && tensor.shape.size() == 2 &&
-           !ref.quantized() && ref.kind == WeightKind::Bf16InF32 &&
-           ref.ne0 > 0 && ref.ne0 <= INT_MAX && ref.ne1 > 0 && ref.ne1 <= INT_MAX && ref.ne0 % 32 == 0 &&
-           tensor.shape[0] == (uint64_t) ref.ne0 && tensor.shape[1] == (uint64_t) ref.ne1;
+           tensor.shape[0] > 0 && tensor.shape[0] <= (uint64_t) INT_MAX && tensor.shape[1] > 0 &&
+           tensor.shape[1] <= (uint64_t) INT_MAX && tensor.shape[0] % 32 == 0;
+}
+bool bf16_as_q8_0(const strata::TensorInfo& tensor, const WeightRef& ref) {
+    return bf16_file_shape(tensor) && !ref.quantized() && ref.kind == WeightKind::Bf16InF32 &&
+           ref.ne0 > 0 && ref.ne1 > 0 && ref.elements == ref.ne0 * ref.ne1 &&
+           ref.bytes == (uint64_t) ref.elements * 2 && tensor.shape[0] == (uint64_t) ref.ne0 &&
+           tensor.shape[1] == (uint64_t) ref.ne1;
 }
 // A BF16 matrix (the file's values) as Q8_0, ggml's reference rounding (quantize_row_q8_0_ref): per 32 values
 // d = amax / 127 (fp16), q = round(x / d)
@@ -117,14 +203,14 @@ struct Pending {
     WeightRef* ref;
     int type;
     uint64_t bytes;
-    DevicePtr data;
+    void* data;   ///< in a block (NativeDense::Block)
 };
 // STRATA_HC_Q8 unset: the first layer's attention-half read timed with its Q8_0 copies and without, on one token and
 // on a window of four; true when the Q8_0 read is faster over both.  Said either way.
-bool hc_q8_faster(const WeightTable& table, const std::vector<std::pair<WeightRef*, DevicePtr>>& q8, void* stream) {
+bool hc_q8_faster(const WeightTable& table, const std::vector<std::pair<WeightRef*, void*>>& q8, void* stream) {
     auto copy_of = [&q8](const WeightRef* ref) -> const uint8_t* {
         for (const auto& [r, data] : q8)
-            if (r == ref) return static_cast<const uint8_t*>(data.get());
+            if (r == ref) return static_cast<const uint8_t*>(data);
         return nullptr;
     };
     for (int l = 0; l < 1024; ++l) {
@@ -148,22 +234,22 @@ bool hc_q8_faster(const WeightTable& table, const std::vector<std::pair<WeightRe
             strata::kernels::fused_gr_time_q8(w, 1, 20, stream, b1, q1, f1);
             strata::kernels::fused_gr_time_q8(w, 4, 20, stream, b4, q4, f4);
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "strata: STRATA_HC_Q8: timing the read failed (%s): the BF16 read\n", e.what());
+            std::fprintf(stderr, "xestrata: XESTRATA_HC_Q8: timing the read failed (%s): the BF16 read\n", e.what());
             return false;
         }
         // the read with the launch that quantizes mixed after it, or (the 32-column Q8_0 up) writing the q8_1 itself
         // STRATA_HC_Q8_FUSE=0/1 overrides the choice between the two Q8_0 forms (the same bits either way)
         static const int fuse_env = [] {
-            const char* v = std::getenv("STRATA_HC_Q8_FUSE");
+            const char* v = strata::env_get("HC_Q8_FUSE");
             return v == nullptr || *v == 0 ? -1 : (int) (std::strtol(v, nullptr, 10) != 0);
         }();
         const bool fuse = fuse_env >= 0 ? fuse_env == 1 : f1 + f4 < q1 + q4;
         const double best = fuse ? f1 + f4 : q1 + q4;
         const bool faster = best < 0.99 * (b1 + b4);
         strata::kernels::fused_gr_set_q8_fuse(faster && fuse);
-        std::fprintf(stderr, "strata: STRATA_HC_Q8: the hyper-connection read and mixed's q8_1, 1 and 4 tokens: BF16 "
+        std::fprintf(stderr, "xestrata: XESTRATA_HC_Q8: the hyper-connection read and mixed's q8_1, 1 and 4 tokens: BF16 "
                              "%.1f + %.1f us, Q8_0 %.1f + %.1f us, Q8_0 writing the q8_1 %.1f + %.1f us: the %s read "
-                             "(STRATA_HC_Q8=0/1 picks one)\n",
+                             "(XESTRATA_HC_Q8=0/1 picks one)\n",
                      b1, b4, q1, q4, f1, f4, faster ? (fuse ? "Q8_0 (q8_1 in the read)" : "Q8_0") : "BF16");
         return faster;
     }
@@ -177,7 +263,7 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors())
-                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
+                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported((int) tensor.type) &&
                     tensor.shape.size() == 2)
                     out.insert(tensor.name);
         }
@@ -201,12 +287,15 @@ bool NativeDense::layer_bytes(const std::vector<std::string>& shards, bool inclu
                 if (!eligible(tensor, include_ple_key) || tensor.shape.size() != 2 || tensor.shape[0] > INT_MAX ||
                     tensor.shape[1] > INT_MAX)
                     continue;
-                // #4741: a BF16 projection is served as Q8_0 (bf16_as_q8_0; this count has no weight table to ask, so it
-                // counts every eligible BF16 matrix of 32-aligned width, a little high for a pack that quantized it itself)
-                const bool as_q8 = tensor.type == 30 && tensor.name != "blk.1.ple_key.weight" && tensor.shape[0] % 32 == 0;
-                if (!as_q8 && !strata::kernels::native_mmvq_supported((int) tensor.type)) continue;
-                const uint64_t b = as_q8 ? tensor.shape[0] / 32 * 34 * tensor.shape[1]
-                                         : strata::kernels::native_mmvq_weight_bytes((int) tensor.type, (int) tensor.shape[0],
+                const DenseNqEntry* nq = dense_nq_find(tensor.name);
+                if (nq && (nq->ne0 != (int64_t) tensor.shape[0] || nq->ne1 != (int64_t) tensor.shape[1])) {
+                    err = "dense_nq: wrong dimensions for " + tensor.name; return false;
+                }
+                const bool as_q8 = !nq && bf16_file_shape(tensor);     // #4741: its Q8_0 copy is what is allocated
+                if (!nq && !as_q8 && !strata::kernels::native_mmvq_supported((int) tensor.type)) continue;
+                const uint64_t b = nq ? nq->bytes : as_q8 ? (uint64_t) tensor.shape[0] / 32 * 34 * (uint64_t) tensor.shape[1]
+                                         : strata::kernels::native_mmvq_weight_bytes((int) tensor.type,
+                                                                                     (int) tensor.shape[0],
                                                                                      (int) tensor.shape[1]);
                 const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
                 if (tensor.name.find("ple") != std::string::npos || l < 0 || l >= n_layers) shared += b;
@@ -237,13 +326,110 @@ void* g_hc_scratch[4] = {nullptr, nullptr, nullptr, nullptr};
 
 NativeDense::~NativeDense() {
     if (scratch_) strata::gpu::free(scratch_);
-    for (void* p : weights_) strata::gpu::free(p);
-    for (void* p : hc_q8_) strata::gpu::free(p);
+    for (const Block& b : blocks_) strata::gpu::free(b.p);
+    for (const Block& b : hc_blocks_) strata::gpu::free(b.p);
+    for (void* p : host_) strata::gpu::free(p);
     if (hc_side_)
         for (void*& p : g_hc_scratch) { strata::gpu::free(p); p = nullptr; }
 }
 
 bool NativeDense::hc_q8_wanted() { return hc_q8_requested(); }
+
+namespace {
+// the layer of a "blk.N." row, -1 for another (the PLE key is the shared rows', as layer_bytes counts it)
+int row_layer(const std::string& name) {
+    if (name.rfind("blk.", 0) != 0 || name.find("ple") != std::string::npos) return -1;
+    char* end = nullptr;
+    const long l = std::strtol(name.c_str() + 4, &end, 10);
+    return end != nullptr && *end == '.' ? (int) l : -1;
+}
+
+// The free device memory as the device reports it, without STRATA_VRAM_LIMIT_MIB (0: not reported)
+uint64_t raw_free() {
+    uint64_t f = 0;
+    return strata::core::device_free_memory(strata::core::Runtime::get().device(), f) ? f : 0;
+}
+
+// Whether a freed allocation of `bytes` shows in the device's free memory again
+bool freed_shows(uint64_t bytes) {
+    void* p = nullptr;
+    const uint64_t f0 = raw_free();
+    if (f0 < bytes + (bytes >> 1) || !strata::gpu::alloc_device(&p, bytes)) return true;   // (not measured)
+    strata::gpu::memset(p, 0, bytes);
+    strata::gpu::device_sync();
+    const uint64_t f1 = raw_free();
+    strata::gpu::free(p);
+    strata::gpu::device_sync();
+    const uint64_t f2 = raw_free();
+    if (f0 == 0 || f0 < f1 + (bytes >> 1)) return true;   // the allocation did not show either: not measured
+    return f2 >= f1 + (bytes >> 1);
+}
+
+// The bytes the layers' projections are allocated together in (0: a layer an allocation).  A small card's last steps
+// move the hyper-connection copies and some layers to pinned memory and free their VRAM, but Level Zero's driver keeps
+// freed device allocations up to some size for reuse and the device's free memory does not show them (the B70,
+// 2026-11-17: freed allocations of 256 MiB and less kept, 257 MiB and more given back; the projections' ~12 MiB
+// matrices one an allocation never came back).  Where a freed 64 MiB is kept, the layers go together in blocks of
+// the smallest size of 512 MiB doubled up to the largest allocation that is seen given back.  Measured once a device.
+uint64_t block_target() {
+    static PerDevice<uint64_t> target;
+    return target.get(strata::core::Runtime::get().device(), [] {
+        if (freed_shows(64ull << 20)) return (uint64_t) 0;
+        const uint64_t most = strata::core::max_alloc_bytes();
+        uint64_t s = 512ull << 20;
+        while (s < most && !freed_shows(s)) s *= 2;
+        s = std::min(s, most);
+        std::fprintf(stderr, "xestrata: this driver keeps freed device allocations: the layers' projections in blocks "
+                             "of %llu MiB, which it gives back\n", (unsigned long long) (s >> 20));
+        return s;
+    });
+}
+
+// Moves a block to pinned memory: every row whose `field` points into it follows
+template <class Field>
+bool block_out(NativeDense::Block& b, std::map<std::string, WeightRef>& table, Field field, std::vector<void*>& host, std::string& err) {
+    if (b.p == nullptr) return true;
+    void* h = nullptr;
+    if (!strata::gpu::alloc_host(&h, b.used) || !strata::gpu::kernels_read_host(h) || !strata::gpu::copy(h, b.p, b.used)) {
+        if (h != nullptr) strata::gpu::free(h);
+        err = "to pinned memory (" + std::to_string(b.used >> 20) + " MiB): " + strata::gpu::last_error();
+        return false;
+    }
+    const auto* lo = static_cast<const uint8_t*>(b.p);
+    for (auto& kv : table) {
+        const void*& at = field(kv.second);
+        const auto* q = static_cast<const uint8_t*>(at);
+        if (q != nullptr && q >= lo && q < lo + b.used) at = static_cast<const uint8_t*>(h) + (q - lo);
+    }
+    strata::gpu::free(b.p);
+    b.p = nullptr;
+    host.push_back(h);
+    return true;
+}
+}  // namespace
+
+bool NativeDense::block_to_host(WeightTable& table, size_t i, std::string& err) {
+    if (i >= blocks_.size() || blocks_[i].p == nullptr) return true;
+    const uint64_t b = blocks_[i].used;
+    if (!block_out(blocks_[i], table.table_, [](WeightRef& r) -> const void*& { return r.native_data; }, host_, err)) {
+        err.insert(0, "layers " + std::to_string(blocks_[i].l0) + "-" + std::to_string(blocks_[i].l1) + "'s projections ");
+        return false;
+    }
+    bytes_ -= std::min(bytes_, b);
+    return true;
+}
+
+bool NativeDense::hc_q8_to_host(WeightTable& table, std::string& err) {
+    if (hc_q8_host_ || hc_q8_refs_.empty()) return true;
+    for (Block& b : hc_blocks_)
+        if (!block_out(b, table.table_, [](WeightRef& r) -> const void*& { return r.hc_q8; }, host_, err)) {
+            err.insert(0, "the hyper-connection projections ");
+            return false;
+        }
+    hc_q8_host_ = true;
+    bytes_ -= std::min(bytes_, hc_q8_bytes_);
+    return true;
+}
 
 bool NativeDense::hc_side_names(const std::string& pack_dir, std::set<std::string>& hc, std::set<std::string>& others,
                                 std::string& err) {
@@ -282,7 +468,7 @@ bool NativeDense::drop_hc_bf16(WeightTable& table, std::string& err) {
     }
     for (void*& p : g_hc_scratch) {
         if (p == nullptr && !strata::gpu::alloc_device(&p, largest)) {
-            err = std::string("native dense (STRATA_HC_Q8): the BF16 scratch: ") + strata::gpu::last_error();
+            err = std::string("native dense (XESTRATA_HC_Q8): the BF16 scratch: ") + strata::gpu::last_error();
             return false;
         }
     }
@@ -299,7 +485,7 @@ const uint16_t* hc_bf16_view(const WeightRef* w, int slot, void* stream) {
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
                        bool include_ple_key) {
-    if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
+    if (scratch_ || !blocks_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
         sycl::queue& compute = strata::core::Runtime::get().compute();
@@ -308,7 +494,98 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         int max_in = 0;
         uint64_t total = 0, hc_q8_bytes = 0;
         bool hc_q8_short = false;   // STRATA_HC_Q8 unset: no VRAM for the Q8_0 copies, the BF16 read
-        std::vector<std::pair<WeightRef*, DevicePtr>> hc_q8;
+        std::vector<std::pair<WeightRef*, void*>> hc_q8;
+        // The layers' projections go into blocks of some layers (block_target), planned from the GGUF headers
+        // (layer_bytes); the hyper-connection copies into one block.  A row its block has no room for (a plan that
+        // missed it) gets an allocation of its own.  Freed, unless kept, when the load fails.
+        std::vector<Block> blocks, hc_blocks;
+        struct Guard {
+            std::vector<Block>* v[2];
+            bool keep = false;
+            ~Guard() {
+                if (!keep)
+                    for (auto* x : v)
+                        for (const Block& b : *x) strata::gpu::free(b.p);
+            }
+        } guard{{&blocks, &hc_blocks}};
+        constexpr int kMaxLayers = 4096;
+        std::vector<int> layer_block(kMaxLayers, -1);
+        {
+            std::vector<uint64_t> per_layer;
+            uint64_t shared_b = 0;
+            if (!layer_bytes(shards, include_ple_key, kMaxLayers, per_layer, shared_b, err)) return false;
+            const uint64_t target = block_target(), most = strata::core::max_alloc_bytes();
+            constexpr uint64_t kSlack = 64ull << 10;   // the rows' 256-byte alignment, a layer
+            Block cur;
+            std::vector<int> members;
+            auto close = [&]() -> bool {
+                if (cur.cap == 0) return true;
+                if (!strata::gpu::alloc_device(&cur.p, cur.cap)) {
+                    err = "native dense: layers " + std::to_string(cur.l0) + "-" + std::to_string(cur.l1) + " (" +
+                          std::to_string(cur.cap >> 20) + " MiB): " + strata::gpu::last_error();
+                    return false;
+                }
+                for (const int l : members) layer_block[(size_t) l] = (int) blocks.size();
+                blocks.push_back(cur);
+                cur = Block{};
+                members.clear();
+                return true;
+            };
+            for (int l = 0; l < kMaxLayers; ++l) {
+                const uint64_t b = per_layer[(size_t) l];
+                if (b == 0 || !in_range("blk." + std::to_string(l) + ".")) continue;
+                if (cur.cap > 0 && cur.cap + b + kSlack > most && !close()) return false;
+                if (cur.cap == 0) cur.l0 = l;
+                cur.l1 = l;
+                cur.cap += b + kSlack;
+                members.push_back(l);
+                if (cur.cap >= target && !close()) return false;
+            }
+            if (!close()) return false;
+        }
+        auto take = [&](const std::string& name, uint64_t bytes) -> void* {
+            const int l = row_layer(name);
+            if (l >= 0 && l < kMaxLayers && layer_block[(size_t) l] >= 0) {
+                Block& b = blocks[(size_t) layer_block[(size_t) l]];
+                const uint64_t at = (b.used + 255) / 256 * 256;
+                if (at + bytes <= b.cap) {
+                    b.used = at + bytes;
+                    return static_cast<uint8_t*>(b.p) + at;
+                }
+            }
+            Block own;
+            own.l0 = own.l1 = l;
+            if (!strata::gpu::alloc_device(&own.p, bytes)) return nullptr;
+            own.cap = own.used = bytes;
+            blocks.push_back(own);
+            return own.p;
+        };
+        if (hc_q8_requested()) {   // the hyper-connection copies' block, from the canonical rows' shapes
+            uint64_t hb = 0;
+            for (const auto& [name, ref] : table.table_)
+                if (hc_q8_name(name) && in_range(name) && ref.ne0 > 0 && ref.ne0 % 32 == 0 && ref.ne1 > 0)
+                    hb += ((uint64_t) ref.ne0 / 32 * 34 * (uint64_t) hc_q8_rows_of(ref.ne1) + 255) / 256 * 256;
+            Block hcb;
+            if (hb > 0 && hb <= strata::core::max_alloc_bytes() && strata::gpu::alloc_device(&hcb.p, hb)) {
+                hcb.cap = hb;
+                hc_blocks.push_back(hcb);
+            }
+        }
+        auto take_hc = [&](uint64_t bytes) -> void* {
+            if (!hc_blocks.empty()) {
+                Block& b = hc_blocks.front();
+                const uint64_t at = (b.used + 255) / 256 * 256;
+                if (at + bytes <= b.cap) {
+                    b.used = at + bytes;
+                    return static_cast<uint8_t*>(b.p) + at;
+                }
+            }
+            Block own;
+            if (!strata::gpu::alloc_device(&own.p, bytes)) return nullptr;
+            own.cap = own.used = bytes;
+            hc_blocks.push_back(own);
+            return own.p;
+        };
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
@@ -387,26 +664,42 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
+                const DenseNqEntry* nq = dense_nq_find(tensor.name);
+                if (nq) {
+                    if (tensor.shape.size() != 2 || tensor.shape[0] != (uint64_t) ref.ne0 ||
+                        tensor.shape[1] != (uint64_t) ref.ne1) {
+                        err = "dense_nq: incompatible matrix " + tensor.name; return false;
+                    }
+                    std::vector<uint8_t> host;
+                    if (!dense_nq_read(tensor.name, ref.ne0, ref.ne1, host, err)) return false;
+                    void* data = take(tensor.name, nq->bytes);
+                    if (!data || !strata::gpu::copy(data, host.data(), host.size())) {
+                        err = "dense_nq upload " + tensor.name + ": " + strata::gpu::last_error(); return false;
+                    }
+                    max_in = (std::max)(max_in, (int) ref.ne0);
+                    total += nq->bytes;
+                    pending.push_back(Pending{&ref, nq->type, nq->bytes, data});
+                    continue;
+                }
                 if (bf16_as_q8_0(tensor, ref)) {   // #4741: a BF16 projection of the pack, served as Q8_0 like its siblings
                     const std::vector<uint8_t> q8 = q8_0_of_bf16((const uint16_t*) gguf.tensor_data(tensor),
                                                                  (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
-                    void* allocation = nullptr;
-                    bool status = strata::gpu::alloc_device(&allocation, q8.size());
-                    DevicePtr data(allocation);
-                    if (status) status = strata::gpu::copy(data.get(), q8.data(), q8.size());
+                    void* data = take(tensor.name, q8.size());
+                    bool status = data != nullptr;
+                    if (status) status = strata::gpu::copy(data, q8.data(), q8.size());
                     if (!status) {
                         err = "native dense upload " + tensor.name + ": " + strata::gpu::last_error(); return false;
                     }
                     int type = 8;
-                    if (strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {
-                        strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
+                    if (strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {   // the layout its Q8_0 siblings have
+                        strata::kernels::native_q8_0_to_rows(data, (int) ref.ne0, (int) ref.ne1, &compute);
                         type = strata::kernels::kNativeQ8Rows;
                     }
                     max_in = (std::max)(max_in, (int) ref.ne0);
                     total += q8.size();
                     std::fprintf(stderr, "native dense: %s is BF16 in the file: served as Q8_0 like its siblings (#4741)\n",
                                  tensor.name.c_str());
-                    pending.push_back(Pending{&ref, type, (uint64_t) q8.size(), std::move(data)});
+                    pending.push_back(Pending{&ref, type, (uint64_t) q8.size(), data});
                     continue;
                 }
                 if (!strata::kernels::native_mmvq_supported((int) tensor.type)) continue;
@@ -419,25 +712,27 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     (int) tensor.type, (int) ref.ne0, (int) ref.ne1);
-                void* allocation = nullptr;
-                bool status = strata::gpu::alloc_device(&allocation, bytes);
-                DevicePtr data(allocation);
+                void* data = take(tensor.name, bytes);
+                bool status = data != nullptr;
                 if (status)
-                    status = strata::gpu::copy(data.get(), gguf.tensor_data(tensor), bytes);
+                    status = strata::gpu::copy(data, gguf.tensor_data(tensor), bytes);
                 if (!status) {
                     err = "native dense upload " + tensor.name + ": " + strata::gpu::last_error(); return false;
                 }
                 int type = (int) tensor.type;
                 if (type == 14 && strata::kernels::native_q6_k_rows_ok((int) ref.ne0)) {   // aligned loads
-                    strata::kernels::native_q6_k_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
+                    strata::kernels::native_q6_k_to_rows(data, (int) ref.ne0, (int) ref.ne1, &compute);
                     type = strata::kernels::kNativeQ6KRows;
                 } else if (type == 8 && strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {
-                    strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
+                    strata::kernels::native_q8_0_to_rows(data, (int) ref.ne0, (int) ref.ne1, &compute);
                     type = strata::kernels::kNativeQ8Rows;
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
-                pending.push_back(Pending{&ref, type, bytes, std::move(data)});
+                // upstream 89f4fa18 (XESTRATA_MANIFEST): the dense formats as held
+                if (strata::core::manifest::enabled())
+                    strata::core::manifest::instance().tensors("dense", strata::ggml_type_name((uint32_t) tensor.type), 1, bytes);
+                pending.push_back(Pending{&ref, type, bytes, data});
             }
             for (const auto& tensor : gguf.tensors()) {
                 // XeStrata-890M: a GGUF whose hyper-connection matrices are BF16 (the IQ2_XS one) has them quantized
@@ -452,30 +747,35 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (tensor.shape.size() != 2 || tensor.shape[0] != (uint64_t) ref.ne0 ||
                     tensor.shape[1] != (uint64_t) ref.ne1 || ref.ne0 > INT_MAX || ref.ne1 > INT_MAX ||
                     !strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {
-                    err = "native dense (STRATA_HC_Q8): incompatible matrix " + tensor.name; return false;
+                    err = "native dense (XESTRATA_HC_Q8): incompatible matrix " + tensor.name; return false;
                 }
                 const uint64_t bytes = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1;
                 const uint64_t bytes_pad = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) hc_q8_rows_of(ref.ne1);
-                void* allocation = nullptr;
-                bool status = strata::gpu::alloc_device(&allocation, bytes_pad);
-                DevicePtr data(allocation);
+                void* data = take_hc(bytes_pad);
+                bool status = data != nullptr;
                 if (status && bytes_pad > bytes)
-                    status = strata::gpu::memset(static_cast<uint8_t*>(data.get()) + bytes, 0, bytes_pad - bytes);
+                    status = strata::gpu::memset(static_cast<uint8_t*>(data) + bytes, 0, bytes_pad - bytes);
                 std::vector<uint8_t> q8;
                 const void* src = gguf.tensor_data(tensor);
                 if (tensor.type == 30) {   // BF16 -> Q8_0 (q8_0_of_bf16 above)
                     q8 = q8_0_of_bf16(static_cast<const uint16_t*>(src), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
                     src = q8.data();
                 }
-                if (status) status = strata::gpu::copy(data.get(), src, bytes);
+                if (status) status = strata::gpu::copy(data, src, bytes);
                 if (!status) {
                     if (hc_q8_mode() == HcQ8::Auto || hc_q8_mode() == HcQ8::OnDefault) { hc_q8_short = true; break; }
-                    err = "native dense (STRATA_HC_Q8) upload " + tensor.name + ": " + strata::gpu::last_error();
+                    err = "native dense (XESTRATA_HC_Q8) upload " + tensor.name + ": " + strata::gpu::last_error();
                     return false;
                 }
-                strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) hc_q8_rows_of(ref.ne1), &compute);
+                strata::kernels::native_q8_0_to_rows(data, (int) ref.ne0, (int) hc_q8_rows_of(ref.ne1), &compute);
                 hc_q8_bytes += bytes_pad;
-                hc_q8.emplace_back(&ref, std::move(data));
+                hc_q8.emplace_back(&ref, data);
+            }
+        }
+        for (const auto& [name, entry] : g_dense_nq) {
+            (void) entry;
+            if (name != "output.weight" && in_range(name) && !seen.count(name)) {
+                err = "dense_nq: no native projection for " + name; return false;
             }
         }
         // upstream 0a379a1f: a pack whose GGUF has no Q8_0 copy of the layers' hyper-connection down / up projections
@@ -489,27 +789,26 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     continue;
                 if (ref.ne0 > INT_MAX || ref.ne1 > INT_MAX || ref.elements != ref.ne0 * ref.ne1 ||
                     ref.bytes != (uint64_t) ref.elements * 2 || !strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {
-                    err = "native dense (STRATA_HC_Q8): the arena copy of " + name + " is not a BF16 matrix";
+                    err = "native dense (XESTRATA_HC_Q8): the arena copy of " + name + " is not a BF16 matrix";
                     return false;
                 }
                 const uint64_t nb = (uint64_t) ref.elements / 32, bytes = nb * 34;
                 const uint64_t bytes_pad = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) hc_q8_rows_of(ref.ne1);
-                void* allocation = nullptr;
-                if (!strata::gpu::alloc_device(&allocation, bytes_pad)) {
+                void* data = take_hc(bytes_pad);
+                if (data == nullptr) {
                     if (hc_q8_mode() == HcQ8::Auto || hc_q8_mode() == HcQ8::OnDefault) { hc_q8_short = true; break; }
-                    err = "native dense (STRATA_HC_Q8) alloc " + name + ": " + strata::gpu::last_error();
+                    err = "native dense (XESTRATA_HC_Q8) alloc " + name + ": " + strata::gpu::last_error();
                     return false;
                 }
-                DevicePtr data(allocation);
-                if (bytes_pad > bytes && !strata::gpu::memset(static_cast<uint8_t*>(data.get()) + bytes, 0, bytes_pad - bytes)) {
-                    err = "native dense (STRATA_HC_Q8) clear " + name + ": " + strata::gpu::last_error();
+                if (bytes_pad > bytes && !strata::gpu::memset(static_cast<uint8_t*>(data) + bytes, 0, bytes_pad - bytes)) {
+                    err = "native dense (XESTRATA_HC_Q8) clear " + name + ": " + strata::gpu::last_error();
                     return false;
                 }
                 strata::kernels::fused_gr_quantize_q8_0(static_cast<const uint16_t*>(ref.data),
-                                                        static_cast<uint8_t*>(data.get()), (int64_t) nb, &compute);
-                strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) hc_q8_rows_of(ref.ne1), &compute);
+                                                        static_cast<uint8_t*>(data), (int64_t) nb, &compute);
+                strata::kernels::native_q8_0_to_rows(data, (int) ref.ne0, (int) hc_q8_rows_of(ref.ne1), &compute);
                 hc_q8_bytes += bytes_pad;
-                hc_q8.emplace_back(&ref, std::move(data));
+                hc_q8.emplace_back(&ref, data);
             }
         compute.wait();   // the Q6_K rewrites, before any other queue reads the weights
         if (hc_q8_mode() == HcQ8::Auto && !hc_q8_short && !hc_q8.empty()) {
@@ -519,13 +818,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             // the BF16 copies are in a side allocation the caller frees on the Q8_0 read (set_hc_side): the Q8_0
             // copies then take less VRAM than they give back.
             uint64_t q8_bytes = 0;
-            for (const auto& h : hc_q8) q8_bytes += (uint64_t) h.first->ne0 / 32 * 34 * (uint64_t) h.first->ne1;
+            for (const auto& h : hc_q8) q8_bytes += (uint64_t) h.first->ne0 / 32 * 34 * (uint64_t) hc_q8_rows_of(h.first->ne1);
             size_t free_b = 0, total_b = 0;
             const double share = strata::gpu::mem_info(&free_b, &total_b) && free_b + q8_bytes > 0
                                      ? (double) q8_bytes / (double) (free_b + q8_bytes) : 1.0;
             if (!hc_side_ && share > 0.05) {
-                std::fprintf(stderr, "strata: STRATA_HC_Q8: the Q8_0 hyper-connection projections would take %.1f%% "
-                                     "of the free VRAM from the expert cache: the BF16 read (STRATA_HC_Q8=1 keeps "
+                std::fprintf(stderr, "xestrata: XESTRATA_HC_Q8: the Q8_0 hyper-connection projections would take %.1f%% "
+                                     "of the free VRAM from the expert cache: the BF16 read (XESTRATA_HC_Q8=1 keeps "
                                      "them)\n", 100.0 * share);
                 hc_q8.clear();
             } else if (!hc_q8_faster(table, hc_q8, &compute)) {
@@ -533,33 +832,64 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             }
         }
         if (hc_q8_short) hc_q8.clear();
+        if (hc_q8.empty()) {   // the BF16 read: the copies' VRAM back
+            for (const Block& b : hc_blocks) strata::gpu::free(b.p);
+            hc_blocks.clear();
+        }
         hc_q8_bytes = 0;
-        for (const auto& h : hc_q8) hc_q8_bytes += (uint64_t) h.first->ne0 / 32 * 34 * (uint64_t) h.first->ne1;
+        for (const auto& h : hc_q8) hc_q8_bytes += (uint64_t) h.first->ne0 / 32 * 34 * (uint64_t) hc_q8_rows_of(h.first->ne1);
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
         void* allocation = nullptr;
         const bool status = strata::gpu::alloc_device(&allocation, strata::kernels::native_q8_1_bytes(max_in));
         DevicePtr scratch(allocation);
         if (!status) { err = std::string("native dense scratch: ") + strata::gpu::last_error(); return false; }
         // All checks and allocations finish before publishing any reference.
-        weights_.reserve(pending.size());
+        // the timing's launches read the weights uploaded here, as the decode reads a matrix after the others (not a
+        // span allocated for it, which a GPU's driver may keep from the free memory after it is freed)
+        std::vector<const void*> at;
+        std::vector<uint64_t> at_bytes;
+        for (const auto& item : pending) {
+            at.push_back(item.data);
+            at_bytes.push_back(item.bytes);
+        }
         for (auto& item : pending) {
-            item.ref->native_data = item.data.get();
+            // each shape's decode layout on this GPU, before any graph captures it (native_mmvq_tune)
+            strata::kernels::native_mmvq_tune(item.type, item.data, (int) item.ref->ne0, (int) item.ref->ne1,
+                                              &compute, (int) at.size(), at.data(), at_bytes.data());
+            item.ref->native_data = item.data;
             item.ref->native_type = item.type;
             item.ref->native_q8_1 = scratch.get();
-            weights_.push_back(item.data.release());
         }
         scratch_ = scratch.release();
+        count_ = pending.size();
         for (auto& [ref, data] : hc_q8) {
-            ref->hc_q8 = data.get();
+            ref->hc_q8 = data;
             ref->hc_q8_rows = hc_q8_rows_of(ref->ne1);
-            hc_q8_.push_back(data.release());
+            hc_q8_refs_.push_back(ref);
         }
+        for (Block& b : blocks)   // a planned block no row went into
+            if (b.used == 0) { strata::gpu::free(b.p); b.p = nullptr; }
+        blocks.erase(std::remove_if(blocks.begin(), blocks.end(), [](const Block& b) { return b.p == nullptr; }),
+                     blocks.end());
+        blocks_ = std::move(blocks);
+        hc_blocks_ = std::move(hc_blocks);
+        guard.keep = true;
+        hc_q8_bytes_ = hc_q8_bytes;
         bytes_ = total + hc_q8_bytes;
-        if (!hc_q8_.empty())
-            std::fprintf(stderr, "strata: STRATA_HC_Q8: %.2f GiB of Q8_0 hyper-connection projections (%zu)\n",
-                         (double) hc_q8_bytes / 1073741824.0, hc_q8_.size());
+        if (strata::core::manifest::enabled()) {   // upstream 89f4fa18: whether the hyper-connection rows were copied, and why
+            const char* v = strata::env_get("HC_Q8");
+            const bool on = hc_q8_requested() && !hc_q8_short;
+            strata::core::manifest::instance().path(
+                "dense", "hc_q8", on,
+                on ? (hc_q8_mode() == HcQ8::Auto ? "XESTRATA_HC_Q8=auto: measured faster on this GPU" : "XESTRATA_HC_Q8=1")
+                   : (v != nullptr && v[0] != '\0' && std::strcmp(v, "auto") != 0 ? "XESTRATA_HC_Q8 turned it off"
+                                                                                 : "off: the BF16 read, or no VRAM for the copies"));
+        }
+        if (!hc_q8_refs_.empty())
+            std::fprintf(stderr, "xestrata: XESTRATA_HC_Q8: %.2f GiB of Q8_0 hyper-connection projections (%zu)\n",
+                         (double) hc_q8_bytes / 1073741824.0, hc_q8_refs_.size());
         else if (hc_q8_short)
-            std::fprintf(stderr, "strata: STRATA_HC_Q8: no VRAM for the Q8_0 hyper-connection projections, the BF16 "
+            std::fprintf(stderr, "xestrata: XESTRATA_HC_Q8: no VRAM for the Q8_0 hyper-connection projections, the BF16 "
                                  "read\n");
         return true;
     } catch (const std::exception& error) {

@@ -30,6 +30,9 @@ class FakeProc:
     def poll(self):
         return None
 
+    def wait(self, timeout=None):
+        return 1
+
 
 def engine() -> StrataEngine:
     e = StrataEngine.__new__(StrataEngine)

@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""#4479 / #2481: the server's console output must not hold a request.
+"""serve/nonblocking_out.py - the server's console output must not hold a request (upstream b776e1cd0, #4479, #2481).
 
-A console that stops taking output (a Windows console in QuickEdit/selection mode, a terminal that is paused, a launcher
-that stopped reading the server's pipe) blocks `print()` in whatever thread called it - and some of those threads own
-the engine's turn, a cancel, or an admission.  `NonBlockingOut` stands in for sys.stdout / sys.stderr while the server
-runs: write() puts the text on a bounded queue and returns; one daemon thread writes it to the real stream, and may
-block there as long as it likes.  When the queue is full the OLDEST text is dropped (the newest lines matter most) and
-counted in `dropped_chunks` / `dropped_bytes`; nothing about a request waits for the console.
+A console that stops taking output (a Windows console in QuickEdit/selection mode, a terminal that is paused, a
+launcher that stopped reading the server's pipe) blocks `print()` in whatever thread called it - and some of those
+threads own the engine's turn, a cancel, or an admission.  `NonBlockingOut` stands in for sys.stdout / sys.stderr while
+the server runs: write() puts the text on a bounded queue and returns; one daemon thread writes it to the real stream,
+and may block there as long as it likes.  When the queue is full the OLDEST text is dropped (the newest lines matter
+most) and counted in `dropped_chunks` / `dropped_bytes`; nothing about a request waits for the console.
 
 Only diagnostics go through here.  Protocol output (the engine's pipe, the HTTP replies) does not.
 """
@@ -31,7 +31,7 @@ class NonBlockingOut:
         self._idle = True
         self.dropped_chunks = 0
         self.dropped_bytes = 0
-        self._thread = threading.Thread(target=self._run, name="strata-console", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="xestrata-console", daemon=True)
         self._thread.start()
 
     # ---- what the program calls: never blocks on the console
@@ -87,8 +87,7 @@ class NonBlockingOut:
                 self._real.write(text)
                 self._real.flush()
             except (OSError, ValueError, UnicodeError):
-                # a closed or broken console: the text is lost, the server is not held
-                pass
+                pass                            # a closed or broken console: the text is lost, the server is not held
 
     def drain(self, timeout: float = 2.0) -> bool:
         """Wait (bounded) until everything queued has been handed to the real stream."""

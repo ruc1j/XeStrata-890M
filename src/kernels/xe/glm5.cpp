@@ -12,10 +12,13 @@
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_glm5
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/kernels/rows_cols.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace strata::kernels {
@@ -35,12 +38,51 @@ inline float sigmoid(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 }  // namespace
 
 void glm5_hc_pre(const float* x, const float* mixes, const float* scale, const float* base, float rms_eps, float hc_eps,
-                 int iters, float* y, float* post, float* comb, int64_t n_embd, int64_t n_tokens, void* stream) {
+                 int iters, float* y, float* post, float* comb, int64_t n_embd, int64_t n_tokens, void* stream,
+                 int streams, float pre_scale) {
     if (n_tokens <= 0) return;
+    if (streams != 2 && streams != 4) throw core::DeviceError("glm5_hc_pre: unsupported stream count");
     if (n_embd <= 0 || iters < 1) throw core::DeviceError("glm5_hc_pre: n_embd " + std::to_string(n_embd) + ", iters " +
                                                           std::to_string(iters));
     constexpr int WG = 256;
     const int64_t N = n_embd;
+    if (streams == 2) {   // SenseNova-Loop: pre/post/bias and row-major log-domain Sinkhorn
+        const auto event = queue_for(stream).submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> pre(sycl::range<1>(2), h);
+            h.parallel_for(sycl::nd_range<1>((size_t) n_tokens * WG, WG), [=](sycl::nd_item<1> it) {
+                const int64_t t = (int64_t) it.get_group(0);
+                const int lid = (int) it.get_local_id(0);
+                const float* xt = x + t * 2 * N;
+                float ss = 0.0f;
+                for (int64_t i = lid; i < 2 * N; i += WG) ss += xt[i] * xt[i];
+                ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+                if (lid == 0) {
+                    const float inv = sycl::rsqrt(ss / (float) (2 * N) + rms_eps);
+                    float m[8];
+                    for (int i = 0; i < 8; ++i) m[i] = mixes[t * 8 + i] * inv + base[i];
+                    for (int i = 0; i < 2; ++i) {
+                        pre[i] = pre_scale * sigmoid(m[i]);
+                        post[t * 2 + i] = 2.0f * sigmoid(m[2 + i]);
+                    }
+                    auto normalize = [](float& a, float& b) {
+                        const float delta = a - b;
+                        const float z = sycl::log1p(sycl::exp(-sycl::fabs(delta)));
+                        a = sycl::fmin(delta, 0.0f) - z;
+                        b = sycl::fmin(-delta, 0.0f) - z;
+                    };
+                    for (int i = 0; i < iters; ++i) {
+                        normalize(m[4], m[5]); normalize(m[6], m[7]);
+                        normalize(m[4], m[6]); normalize(m[5], m[7]);
+                    }
+                    for (int i = 0; i < 4; ++i) comb[t * 4 + i] = sycl::exp(m[4 + i]);
+                }
+                sycl::group_barrier(it.get_group());
+                for (int64_t n = lid; n < N; n += WG) y[t * N + n] = xt[n] * pre[0] + xt[N + n] * pre[1];
+            });
+        });
+        sync_if_needed(stream, event, "glm5_hc_pre");
+        return;
+    }
     const auto event = queue_for(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> pre_l(sycl::range<1>(HC), h);
         h.parallel_for(sycl::nd_range<1>((size_t) n_tokens * WG, WG), [=](sycl::nd_item<1> it) {
@@ -109,11 +151,12 @@ void glm5_hc_pre(const float* x, const float* mixes, const float* scale, const f
     sync_if_needed(stream, event, "glm5_hc_pre");
 }
 
-void glm5_hc_init(const float* x, float* hs, int64_t n_embd, int64_t n_tokens, void* stream) {
+void glm5_hc_init(const float* x, float* hs, int64_t n_embd, int64_t n_tokens, void* stream, int streams) {
+    if (streams != 2 && streams != 4) throw core::DeviceError("glm5_hc_init: unsupported stream count");
     if (n_tokens <= 0 || n_embd <= 0) return;
     const int64_t N = n_embd;
-    const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n_tokens * HC * N)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], t = i / (HC * N), n = i % N;
+    const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n_tokens * streams * N)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], t = i / (streams * N), n = i % N;
         hs[i] = x[t * N + n];
     });
     sync_if_needed(stream, event, "glm5_hc_init");
@@ -129,11 +172,18 @@ void glm5_transpose_abd(const float* src, float* dst, int64_t a, int64_t b, int6
 }
 
 void glm5_hc_post(const float* f, const float* residual, const float* post, const float* comb, float* out,
-                  int64_t n_embd, int64_t n_tokens, void* stream) {
+                  int64_t n_embd, int64_t n_tokens, void* stream, int streams) {
+    if (streams != 2 && streams != 4) throw core::DeviceError("glm5_hc_post: unsupported stream count");
     if (n_tokens <= 0 || n_embd <= 0) return;
     const int64_t N = n_embd;
     const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n_tokens * N)), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0], t = i / N, n = i % N;
+        if (streams == 2) {
+            const float a = residual[t * 2 * N + n], b = residual[(t * 2 + 1) * N + n];
+            out[t * 2 * N + n] = a * comb[t * 4] + b * comb[t * 4 + 1] + f[i] * post[t * 2];
+            out[(t * 2 + 1) * N + n] = a * comb[t * 4 + 2] + b * comb[t * 4 + 3] + f[i] * post[t * 2 + 1];
+            return;
+        }
         const float fv = f[i];
         float r[HC];
         for (int s = 0; s < HC; ++s) r[s] = residual[(t * HC + s) * N + n];
@@ -146,7 +196,8 @@ void glm5_hc_post(const float* f, const float* residual, const float* post, cons
     sync_if_needed(stream, event, "glm5_hc_post");
 }
 
-void glm5_hc_mean(const float* x, float* y, int64_t n_embd, int64_t n_tokens, void* stream) {
+void glm5_hc_mean(const float* x, float* y, int64_t n_embd, int64_t n_tokens, void* stream, int streams) {
+    if (streams != 2 && streams != 4) throw core::DeviceError("glm5_hc_mean: unsupported stream count");
     if (n_tokens <= 0 || n_embd <= 0) return;
     const int64_t N = n_embd;
     const auto event = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n_tokens * N)), [=](sycl::id<1> id) {
@@ -154,8 +205,9 @@ void glm5_hc_mean(const float* x, float* y, int64_t n_embd, int64_t n_tokens, vo
         // each stream's pointer one step of N from the last: written as xt[N], xt[2 * N], xt[3 * N], IGC 2.27 to 2.30
         // read xt[N], xt[8 * N], xt[9 * N] on Xe2 GPUs, a fault past the buffer (AGENTS.md, "Intel Graphics Compiler";
         // the runtime turns the pass off, this form compiles right either way)
-        const float* x0 = x + t * HC * N + n;
+        const float* x0 = x + t * streams * N + n;
         const float* x1 = x0 + N;
+        if (streams == 2) { y[i] = (*x0 + *x1) * 0.5f; return; }
         const float* x2 = x1 + N;
         const float* x3 = x2 + N;
         y[i] = (((*x0 + *x1) + *x2) + *x3) * (1.0f / HC);
@@ -320,14 +372,16 @@ void glm5_kda_scan(float* state, const float* q, const float* k, const float* v,
     if (n_heads <= 0 || n_heads > 65535) throw core::DeviceError("glm5_kda_scan: " + std::to_string(n_heads) + " heads");
     if (n_snaps < 0 || n_snaps > kGlm5MaxSnaps) throw core::DeviceError("glm5_kda_scan: too many snapshots");
     if (n_tokens <= 0) return;
-    struct Snaps { float* p[kGlm5MaxSnaps]; } sn{};
-    for (int i = 0; i < n_snaps; ++i) sn.p[i] = snaps[i];
     const int NS = (int) std::min<int64_t>(n_snaps, n_tokens);
     const int H = (int) n_heads;
     const int64_t T = n_tokens, TS = (int64_t) H * S;
     const float scale = 1.0f / sycl::sqrt((float) S);
+    // CAP: the snapshots' argument, 8 for a window of up to 8 rows (the kernel it always ran), else the wide window's
+    const auto launch = [&]<int CAP>() {
+    struct Snaps { float* p[CAP]; } sn{};
+    for (int i = 0; i < n_snaps; ++i) sn.p[i] = snaps[i];
     // one sub-group a (head, column): its four state rows a lane in registers, as native_gdn_step
-    const auto event = queue_for(stream).parallel_for(
+    return queue_for(stream).parallel_for(
         sycl::nd_range<2>({(size_t) H, (size_t) S * WARP}, {1, (size_t) COLS * WARP}),
         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
@@ -364,6 +418,9 @@ void glm5_kda_scan(float* state, const float* q, const float* k, const float* v,
             }
             for (int r = 0; r < 4; ++r) state[((size_t) (r * WARP + lane) * H + head) * S + col] = s[r];
         });
+    };
+    const auto event = n_snaps <= kVerifyNarrowT ? launch.template operator()<kVerifyNarrowT>()
+                                                 : launch.template operator()<kGlm5MaxSnaps>();
     sync_if_needed(stream, event, "glm5_kda_scan");
 }
 
@@ -443,30 +500,38 @@ void glm5_idx_scores(const float* pooled, const float* q, const float* w, int n_
                                 " blocks, " + std::to_string(n_tokens) + " tokens");
     const size_t gx = (size_t) ((max_blocks + SG - 1) / SG);
     const int H = n_heads;
-    const auto event = queue_for(stream).parallel_for(
-        sycl::nd_range<2>({(size_t) n_tokens, gx * SG * WARP}, {1, (size_t) SG * WARP}),
-        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const sycl::sub_group sg = it.get_sub_group();
-            const int64_t t = (int64_t) it.get_group(0);
-            const int64_t b = (int64_t) it.get_group(1) * SG + (int64_t) sg.get_group_linear_id();
-            const int64_t n_bid = steps[t * kStepCount + kStepNBid];
-            if (b > n_bid || b >= max_blocks) return;   // uniform over the sub-group
-            const int lane = (int) sg.get_local_linear_id();
-            float score = 0.0f;
-            if (b < n_bid) {
-                float k[PER];
-                for (int i = 0; i < PER; ++i) k[i] = pooled[b * D + (int64_t) lane * PER + i];
-                for (int h = 0; h < H; ++h) {
-                    const float* qh = q + (t * H + h) * D + (int64_t) lane * PER;
-                    float d = 0.0f;
-                    for (int i = 0; i < PER; ++i) d += qh[i] * k[i];
-                    d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
-                    score += (d > 0.0f ? d : 0.0f) * w[t * H + h];
+    // the kernels' ids are ints (-fsycl-id-queries-range=int): a launch's work-items stay within one, so a long
+    // context's chunk goes in slices of tokens (a 131072-cell context's 32768 blocks take 1 M work-items a token, and
+    // a prompt chunk of over 2047 tokens failed)
+    const int64_t row = (int64_t) (gx * SG * WARP);
+    const int64_t slice = std::max<int64_t>(1, (int64_t) std::numeric_limits<int32_t>::max() / row);
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += slice) {
+        const int64_t nt = std::min<int64_t>(slice, n_tokens - t0);
+        const auto event = queue_for(stream).parallel_for(
+            sycl::nd_range<2>({(size_t) nt, (size_t) row}, {1, (size_t) SG * WARP}),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                const sycl::sub_group sg = it.get_sub_group();
+                const int64_t t = t0 + (int64_t) it.get_group(0);
+                const int64_t b = (int64_t) it.get_group(1) * SG + (int64_t) sg.get_group_linear_id();
+                const int64_t n_bid = steps[t * kStepCount + kStepNBid];
+                if (b > n_bid || b >= max_blocks) return;   // uniform over the sub-group
+                const int lane = (int) sg.get_local_linear_id();
+                float score = 0.0f;
+                if (b < n_bid) {
+                    float k[PER];
+                    for (int i = 0; i < PER; ++i) k[i] = pooled[b * D + (int64_t) lane * PER + i];
+                    for (int h = 0; h < H; ++h) {
+                        const float* qh = q + (t * H + h) * D + (int64_t) lane * PER;
+                        float d = 0.0f;
+                        for (int i = 0; i < PER; ++i) d += qh[i] * k[i];
+                        d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
+                        score += (d > 0.0f ? d : 0.0f) * w[t * H + h];
+                    }
                 }
-            }
-            if (lane == 0) scores[t * max_blocks + b] = score;
-        });
-    sync_if_needed(stream, event, "glm5_idx_scores");
+                if (lane == 0) scores[t * max_blocks + b] = score;
+            });
+        sync_if_needed(stream, event, "glm5_idx_scores");
+    }
 }
 
 void glm5_latent_store(const float* kv, const int32_t* steps, int64_t n_tokens, int64_t rank, uint16_t* latent,
@@ -547,9 +612,9 @@ void glm5_latent_gather(const uint16_t* latent, const int32_t* ids, int64_t cap,
     if (cap <= 0 || stride < cap + (tail_kpool > 1 ? tail_kpool - 1 : 0) || tail_kpool < 0 || tail_kpool == 1)
         throw core::DeviceError("glm5_latent_gather: cap " + std::to_string(cap) + ", stride " + std::to_string(stride));
     const int KP = tail_kpool;
-    const auto event = queue_for(stream).parallel_for(
-        sycl::range<2>((size_t) (n_tokens * stride), (size_t) W), [=](sycl::id<2> id) {
-            const int64_t t = (int64_t) id[0] / stride, j = (int64_t) id[0] % stride;
+    const auto event = for_rows_cols(queue_for(stream),
+        n_tokens * stride, W, [=](int64_t row, int64_t q) {
+            const int64_t t = row / stride, j = row % stride;
             const int64_t chosen = sycl::min<int64_t>(steps[t * kStepCount + kStepWidth], cap);
             const int32_t pos = steps[t * kStepCount + kStepPos];
             const int64_t tail0 = KP > 0 && pos >= 0 ? (int64_t) ((pos + 1) / KP) * KP : 0;
@@ -558,7 +623,7 @@ void glm5_latent_gather(const uint16_t* latent, const int32_t* ids, int64_t cap,
             const int64_t c = j < chosen ? (int64_t) ids[t * cap + j] : tail0 + (j - chosen);
             const auto* src = reinterpret_cast<const sycl::uint4*>(latent + c * L);
             auto* dst = reinterpret_cast<sycl::uint4*>(out + (t * stride + j) * L);
-            dst[id[1]] = src[id[1]];
+            dst[q] = src[q];
         });
     sync_if_needed(stream, event, "glm5_latent_gather");
 }

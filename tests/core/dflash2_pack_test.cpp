@@ -88,7 +88,7 @@ int main() {
     const std::pair<const char*, const char*> shapes[] = {
         {"layers", "0"},      {"layers", "-3"},       {"layers", "9"},       {"inter", "0"},
         {"inter", "-32"},     {"conv_group", "0"},    {"conv_group", "-16"}, {"conv_group", "8"},
-        {"taps", ""},         {"taps", "1,2,3,4,5,6"}, {"taps", "1,-2"},     {"window", "0"}};
+        {"taps", ""},         {"taps", "1,2,3,4,5,1024"}, {"taps", "1,-2"},  {"window", "0"}};
     for (const auto& [key, value] : shapes) {
         write_pack(cfg(key, value) + t, 256);
         if (!refused("shape")) {

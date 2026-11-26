@@ -102,7 +102,7 @@ class StopClosesAdmission(unittest.TestCase):
                 mock.patch.object(server.release_check, "enabled", lambda: False), \
                 contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             code = server.main()
-        self.assertIn("[strata] stopped", out.getvalue())
+        self.assertIn("[xestrata] stopped", out.getvalue())
         self.assertEqual(len(drains), 1)
         self.assertEqual(refused, [True])
         self.assertEqual(code, 0)

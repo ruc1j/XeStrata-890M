@@ -6,9 +6,9 @@
 #
 # - the program XeStrata's users run (setup.py as `xestrata`, the server, the web app, the tools setup runs, gguf-py,
 #   the data files), in <datadir>/xestrata, read-only; the user's files go to the XDG folders (setup.py, PACKAGED).
-# - the engine: strata, the image encoders and the SYCL runtime it was built with (intel/llvm's, which no distribution
-#   has as new: libsycl 9), with oneMath (its rocBLAS backend for AMD GPUs; oneMKL's and cuBLAS's in the contrib mode),
-#   in <libdir>/xestrata/engine.
+# - the engine: xestrata-engine, the image encoders and the SYCL runtime it was built with (intel/llvm's, which no
+#   distribution has as new: libsycl 9), with oneMath (its rocBLAS backend for AMD GPUs; oneMKL's and cuBLAS's in the
+#   contrib mode), in <libdir>/xestrata/engine.
 #
 # The packages provide and conflict with xestrata-engine, so one is installed at a time, and installing another
 # replaces it.  Nothing non-free goes in: the contrib engine opens oneMKL, cuBLAS and NVIDIA's driver at run time (the
@@ -18,15 +18,15 @@
 include(GNUInstallDirs)
 
 set(STRATA_PACKAGE_NAME "" CACHE STRING "the package's name, e.g. xestrata-free (STRATA_PACKAGE)")
-set(STRATA_PACKAGE_VISION_DIR "" CACHE PATH "the folder with strata-vision-cpu and strata-vision-vulkan")
 set(STRATA_PACKAGE_DEPENDS "" CACHE STRING "the package's dependencies, the distribution's names")
 set(STRATA_PACKAGE_RECOMMENDS "" CACHE STRING "the package's weak dependencies, installed by default")
 set(STRATA_PACKAGE_SUGGESTS "" CACHE STRING "the package's suggestions, not installed by default")
 set(STRATA_PACKAGE_RUNTIME "{}" CACHE STRING
     "the GPU makers' packages by maker, as a JSON object, for setup to tell what a PC lacks (BUILD.json's runtime)")
-if(NOT STRATA_PACKAGE_NAME OR NOT STRATA_PACKAGE_VISION_DIR)
-  message(FATAL_ERROR "STRATA_PACKAGE needs STRATA_PACKAGE_NAME and STRATA_PACKAGE_VISION_DIR "
-                      "(tools/package/build.sh sets them)")
+set(STRATA_PACKAGE_RELEASE_SUFFIX "" CACHE STRING
+    "the rpm Release's dist tag (fc44, fc45): it tells the two Fedoras' gui and free packages apart in a release")
+if(NOT STRATA_PACKAGE_NAME)
+  message(FATAL_ERROR "STRATA_PACKAGE needs STRATA_PACKAGE_NAME (tools/package/build.sh sets it)")
 endif()
 # A package runs on other PCs: nothing may come from this one's CPU or GPUs
 if(NOT STRATA_PORTABLE)
@@ -50,13 +50,11 @@ set(_pkg_engine ${CMAKE_INSTALL_LIBDIR}/xestrata/engine)
 set(_pkg_engine_abs ${CMAKE_INSTALL_FULL_LIBDIR}/xestrata/engine)
 
 # ---- the engine
-set_target_properties(strata strata-image PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
-install(TARGETS strata strata-image RUNTIME DESTINATION ${_pkg_engine})
+set_target_properties(strata strata-image strata-vision PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
+install(TARGETS strata strata-image strata-vision RUNTIME DESTINATION ${_pkg_engine})
 if(TARGET strata-inkling-2-mini)   # Inkling-2-Mini's engine, beside `strata` (STRATA_BUILD_INKLING2MINI)
   install(TARGETS strata-inkling-2-mini RUNTIME DESTINATION ${_pkg_engine})
 endif()
-install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/strata-vision-cpu ${STRATA_PACKAGE_VISION_DIR}/strata-vision-vulkan
-        DESTINATION ${_pkg_engine})
 # the SYCL runtime the engine was built with: what libsycl loads for Level Zero and HIP (and CUDA in the contrib mode).
 # (tools/intel_llvm_build.py builds no libsycl-jit: libsycl opens it only to compile kernels from source.)
 get_filename_component(_pkg_sycl_lib "${CMAKE_CXX_COMPILER}" DIRECTORY)
@@ -135,12 +133,14 @@ file(WRITE ${CMAKE_BINARY_DIR}/package/BUILD.json
 }
 ")
 install(FILES ${CMAKE_BINARY_DIR}/package/BUILD.json DESTINATION ${_pkg_engine})
+# the parts' notices (About > Licenses): tools/package/container.sh writes it with tools/package/engine_notices.py
+install(FILES ${CMAKE_BINARY_DIR}/package/NOTICES.json DESTINATION ${_pkg_engine})
 install(FILES third_party/main/intel-llvm/LICENSE.TXT
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.intel-llvm)
 # ROCm's device libraries: the engine's code for AMD GPUs carries parts of them (NCSA asks for the notice with binaries)
 install(FILES third_party/main/rocm-device-libs/LICENSE.TXT
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.rocm-device-libs)
-install(FILES third_party/main/stb/LICENSE   # stb_image, compiled into strata-image
+install(FILES third_party/main/stb/LICENSE   # stb_image, compiled into xestrata-image
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.stb)
 if(TARGET strata-inkling-2-mini)   # Zstandard's decoder, compiled into strata-inkling-2-mini (BSD: with the binaries)
   install(FILES third_party/main/zstd-dec/LICENSE
@@ -178,6 +178,17 @@ if(_strata_cudnn_frontend)   # compiled into the image engine
   install(FILES third_party/main/cudnn-frontend/LICENSE.txt
           DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.cudnn-frontend)
 endif()
+if(_strata_kitchen)   # the module beside the engine
+  install(TARGETS strata_hip_kitchen LIBRARY DESTINATION ${_pkg_engine}/lib)   # where i8_gemm.cpp looks for it
+  install(FILES third_party/main/comfy-kitchen/LICENSE
+          DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.comfy-kitchen)
+  install(FILES third_party/main/comfy-kitchen/NOTICE
+          DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME NOTICE.comfy-kitchen)
+endif()
+if(_strata_cutlass)   # compiled into the engine
+  install(FILES third_party/main/cutlass/LICENSE.txt
+          DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.cutlass)
+endif()
 install(FILES NOTICE COPYING COPYING.LESSER DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME})
 
 # ---- the program
@@ -186,11 +197,16 @@ install(FILES setup.py chat.py DESTINATION ${_pkg_share})
 install(DIRECTORY serve tools ref DESTINATION ${_pkg_share}
         FILES_MATCHING PATTERN "*.py" PATTERN "test_*" EXCLUDE PATTERN "mcp_fake_server.py" EXCLUDE
         PATTERN "__pycache__" EXCLUDE PATTERN "lint" EXCLUDE PATTERN "vision" EXCLUDE PATTERN "package" EXCLUDE)
+install(FILES serve/train_vram_models.inc serve/train_defaults.inc DESTINATION ${_pkg_share}/serve)
 install(DIRECTORY serve/web DESTINATION ${_pkg_share}/serve)
+install(DIRECTORY serve/skills DESTINATION ${_pkg_share}/serve)   # the chat's skills (the image tools' among them)
 install(DIRECTORY data DESTINATION ${_pkg_share})
 install(DIRECTORY third_party/main/outfit DESTINATION ${_pkg_share}/third_party/main)
 install(DIRECTORY third_party/main/katex DESTINATION ${_pkg_share}/third_party/main)   # the web chat's math
+install(DIRECTORY third_party/main/mermaid DESTINATION ${_pkg_share}/third_party/main)   # the web chat's flowcharts
 install(DIRECTORY third_party/main/quantscope DESTINATION ${_pkg_share}/third_party/main PATTERN "__pycache__" EXCLUDE)
+# the translation APIs' language detection
+install(DIRECTORY third_party/main/py3langid DESTINATION ${_pkg_share}/third_party/main PATTERN "__pycache__" EXCLUDE)
 install(DIRECTORY ${STRATA_GGML_DIR}/gguf-py DESTINATION ${_pkg_share}/third_party/main/llama.cpp
         PATTERN "__pycache__" EXCLUDE PATTERN "tests" EXCLUDE)
 install(FILES ${STRATA_GGML_DIR}/LICENSE DESTINATION ${_pkg_share}/third_party/main/llama.cpp)
@@ -223,6 +239,9 @@ set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/ruc1j/XeStrata-890M")
 set(CPACK_PACKAGING_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX})
 set(CPACK_STRIP_FILES ON)
 
+# compressed on every thread: the engine's files are a few GB (the deb's zstd; the rpm's payload above, at level 19)
+set(CPACK_THREADS 0)
+set(CPACK_DEBIAN_COMPRESSION_TYPE zstd)
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_NAME ${STRATA_PACKAGE_NAME})
 set(CPACK_DEBIAN_PACKAGE_RELEASE ${XESTRATA_REVISION})
@@ -234,17 +253,19 @@ set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS OFF)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "${STRATA_PACKAGE_DEPENDS}")
 set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "${STRATA_PACKAGE_RECOMMENDS}")
 set(CPACK_DEBIAN_PACKAGE_SUGGESTS "${STRATA_PACKAGE_SUGGESTS}")
-set(CPACK_DEBIAN_PACKAGE_PROVIDES xestrata-engine)
+# xestrata-engine: the name every variant provides, which xestrata-gui depends on at the same version (its window draws
+# its fields from this setup.py); one variant at a time
+set(CPACK_DEBIAN_PACKAGE_PROVIDES "xestrata-engine (= ${XESTRATA_PACKAGE_UPSTREAM}-${XESTRATA_REVISION})")
 set(CPACK_DEBIAN_PACKAGE_CONFLICTS xestrata-engine)
 set(CPACK_DEBIAN_PACKAGE_REPLACES xestrata-engine)
 
 set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 set(CPACK_RPM_PACKAGE_NAME ${STRATA_PACKAGE_NAME})
-set(CPACK_RPM_PACKAGE_RELEASE ${XESTRATA_REVISION})
+set(CPACK_RPM_PACKAGE_RELEASE ${XESTRATA_REVISION}${STRATA_PACKAGE_RELEASE_SUFFIX})
 set(CPACK_RPM_PACKAGE_LICENSE "LGPL-3.0-or-later AND MIT AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND OFL-1.1")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Engineering")
 set(CPACK_RPM_PACKAGE_REQUIRES "${STRATA_PACKAGE_DEPENDS}")
-set(CPACK_RPM_PACKAGE_PROVIDES xestrata-engine)
+set(CPACK_RPM_PACKAGE_PROVIDES "xestrata-engine = ${XESTRATA_PACKAGE_UPSTREAM}-${XESTRATA_REVISION}")
 set(CPACK_RPM_PACKAGE_CONFLICTS xestrata-engine)
 set(CPACK_RPM_PACKAGE_AUTOREQPROV ON)
 # The bundled libraries are found through the engine's own RUNPATH: they neither need nor give the system anything,
@@ -260,7 +281,8 @@ list(JOIN _pkg_not_required "|" _pkg_not_required)
 set(CPACK_RPM_SPEC_MORE_DEFINE
 "%global __provides_exclude_from ^${_pkg_engine_abs}/.*$
 %global __requires_exclude ^(${_pkg_not_required})
-%define _build_id_links none")
+%define _build_id_links none
+%define _binary_payload w19T0.zstdio")
 if(STRATA_PACKAGE_RECOMMENDS)
   set(CPACK_RPM_PACKAGE_RECOMMENDS "${STRATA_PACKAGE_RECOMMENDS}")
 endif()

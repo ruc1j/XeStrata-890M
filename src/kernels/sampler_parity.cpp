@@ -13,6 +13,8 @@
 // pass against either order.
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/sampler_host.hpp"
+#include "strata/kernels/exact.hpp"
 
 #include "parity_device.hpp"
 
@@ -20,6 +22,7 @@
 #include <cmath>
 #include <limits>
 #include <cstdio>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -125,116 +128,21 @@ int run(const char* name, const std::vector<float>& logits, int n_tokens, const 
     return bad;
 }
 
-// The Philox draw, host side - a transcription of the kernel's `philox_uniform` so the SAMPLED pick (not
-// just the greedy argmax) can be pinned against a reference.  `__umulhi(a, b)` is the high half of a 32x32
-// multiply, spelled `(uint32_t)(((uint64_t) a * b) >> 32)` here.
-struct PhiloxRound {
-    uint32_t& c0; uint32_t& c1; uint32_t& c2; uint32_t& c3;
-    void step(uint32_t k0, uint32_t k1) const {
-        const uint32_t hi0 = (uint32_t) (((uint64_t) 0x9E3779B9u * c0) >> 32);
-        const uint32_t hi1 = (uint32_t) (((uint64_t) 0xBB67AE85u * c2) >> 32);
-        const uint32_t lo0 = 0x9E3779B9u * c0;
-        const uint32_t lo1 = 0xBB67AE85u * c2;
-        const uint32_t n0 = hi1 ^ c1 ^ k0;
-        const uint32_t n1 = lo1;
-        const uint32_t n2 = hi0 ^ c3 ^ k1;
-        const uint32_t n3 = lo0;
-        c0 = n0; c1 = n1; c2 = n2; c3 = n3;
-    }
-};
-
-float host_philox_uniform(uint64_t seed, uint64_t counter) {
-    uint32_t c0 = (uint32_t) counter, c1 = (uint32_t) (counter >> 32);
-    uint32_t c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
-    PhiloxRound r{c0, c1, c2, c3};
-    for (int i = 0; i < 10; ++i) r.step((uint32_t) i, 0u);
-    return (float) (c0 >> 8) * (1.0f / 16777216.0f);
-}
-
-// The Gumbel-max noise, host side - a transcription of the kernel's `gumbel_exp` (STRATA_SPEC_GUMBEL): Exp(1) from
-// a splitmix64 hash of (seed, counter, token id).  The pick is argmax_i p_i / E_i, an exact sample of p.
-double host_gumbel_exp(uint64_t seed, uint64_t counter, uint32_t token) {
-    uint64_t z = seed ^ (counter * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) token * 0xD1B54A32D192ED03ull);
-    z += 0x9E3779B97F4A7C15ull;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    z ^= z >> 31;
-    const double u = ((double) (z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
-    return -std::log(u);
-}
-
-// The full SAMPLED chain, host side - the kernel's `sampler_kernel` in serial form, in llama.cpp's order:
-// penalties on the raw logits during the top_k selection (ties to the lowest index), top_p's cut in double over
-// the top_k list, the min_p prefix cut on its survivors, the temperature, and one Philox draw at
-// (seed, counter + row).  One penalties stage (issue #53: this reference used to repeat the kernel's second one).
+// The full SAMPLED chain, host side: sampler_host.hpp's, which a forward on the CPU picks with - so this test holds
+// the GPU kernel and the CPU's picks to the same tokens.  `hist` is the row's whole penalty window, `row` its draw's
+// offset from p.counter; the bias and the mask are the GPU's arrays in `p`, not read here.
 int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
                       const strata::kernels::SamplerParams& p, int row) {
-    auto penal = [&](float logit, int count) {
-        if (count <= 0) return logit;
-        if (logit <= 0.0f) logit *= p.penalty_repeat; else logit /= p.penalty_repeat;
-        logit -= (float) count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
-        return logit;
-    };
-    auto count = [&](int v) { int c = 0; for (int h : hist) if (h == v) ++c; return c; };
-    const int nv = (int) l.size();
-    const int KMAX = 64;                       // 1..64 as given; 0 (off) and wider keep the widest list, 64
-    const int k = std::min(nv, (p.top_k > 0 && p.top_k < KMAX) ? p.top_k : KMAX);
-    std::vector<int> sel_ids;
-    std::vector<float> sel_logit;
-    std::vector<char> taken((size_t) nv, 0);
-    for (int i = 0; i < k; ++i) {
-        int best = -1; float bv = 0;
-        for (int v = 0; v < nv; ++v) {
-            if (taken[(size_t) v]) continue;
-            const float s = penal(l[(size_t) v], count(v));
-            if (best < 0 || s > bv) { best = v; bv = s; }
-        }
-        taken[(size_t) best] = 1;
-        sel_ids.push_back(best); sel_logit.push_back(bv);
-    }
-    // llama.cpp's order (issue #53): top_p over the whole top_k list, then min_p on its survivors
-    const int n_sel = (int) sel_ids.size();
-    int n_keep = n_sel;
-    if (p.top_p < 1.0f) {
-        double sum = 0.0;
-        for (int i = 0; i < n_sel; ++i) sum += std::exp((double) sel_logit[(size_t) i] - (double) sel_logit[0]);
-        double cum = 0.0;
-        int cut = n_sel;
-        for (int i = 0; i < n_sel; ++i) {
-            cum += std::exp((double) sel_logit[(size_t) i] - (double) sel_logit[0]) / sum;
-            if (cum >= (double) p.top_p) { cut = i + 1; break; }
-        }
-        if (cut < p.min_keep) cut = p.min_keep < n_sel ? p.min_keep : n_sel;
-        n_keep = cut;
-    }
-    if (p.min_p > 0.0f) {
-        const float thresh = sel_logit[0] + std::log(p.min_p);
-        for (int i = 0; i < n_keep; ++i)
-            if (sel_logit[(size_t) i] < thresh) { n_keep = i; break; }
-    }
-    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
-    auto scaled = [&](int i) { return sel_logit[(size_t) i] * inv_t; };   // one penalties stage, before (#53)
-    float smx = scaled(0);
-    for (int i = 1; i < n_keep; ++i) smx = std::fmax(smx, scaled(i));
-    double sum = 0.0;
-    for (int i = 0; i < n_keep; ++i) sum += std::exp((double) scaled(i) - (double) smx);
-    int pick = sel_ids[(size_t) (n_keep - 1)];
-    if (p.gumbel) {
-        double best = -1.0;
-        for (int i = 0; i < n_keep; ++i) {
-            const double r = std::exp((double) scaled(i) - (double) smx) / sum /
-                             host_gumbel_exp(p.seed, p.counter + (uint64_t) row, (uint32_t) sel_ids[(size_t) i]);
-            if (r > best) { best = r; pick = sel_ids[(size_t) i]; }
-        }
-        return pick;
-    }
-    const float u = host_philox_uniform(p.seed, p.counter + (uint64_t) row);
-    double cum = 0.0;
-    for (int i = 0; i < n_keep; ++i) {
-        cum += std::exp((double) scaled(i) - (double) smx) / sum;
-        if ((double) u < cum) { pick = sel_ids[(size_t) i]; break; }
-    }
-    return pick;
+    strata::kernels::SamplerParams h = p;
+    h.counter = p.counter + (uint64_t) row;
+    h.penalty_last_n = (int) hist.size();
+    h.logit_bias = nullptr;
+    h.allowed = nullptr;
+    h.greedy = false;
+    int out = 0;
+    strata::kernels::sample_tokens_host(l.data(), 1, (int) l.size(), hist.empty() ? nullptr : hist.data(),
+                                        (int) hist.size(), h, &out);
+    return out;
 }
 
 // Survivors after the min_p + top_p cuts, in the sampled chain - the quantity an order or a threshold
@@ -313,7 +221,7 @@ int main(int argc, char** argv) {
             if (keep != nullptr) *keep = d_l;
             return got;
         };
-        std::vector<float> l(NV * NT), bias(NV, 0.0f), adjusted;
+        std::vector<float> l((size_t) NV * NT), bias(NV, 0.0f), adjusted;
         for (int t = 0; t < NT; ++t)
             for (int v = 0; v < NV; ++v) l[t * NV + v] = float(v % 17) / 4;
         l[0] = 50;
@@ -361,11 +269,11 @@ int main(int argc, char** argv) {
     // ---- fixture 1: plain greedy.  top_k = 0 (disabled), top_p = 1 (disabled), T = 1 -> argmax.
     {
         strata::kernels::SamplerParams p; p.top_k = 0; p.top_p = 1.0f; p.temperature = 1.0f; p.greedy = true;
-        std::mt19937 rng(3); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(3); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng);
         std::vector<int> want((size_t) NT);
-        for (int t = 0; t < NT; ++t) want[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV}, p, false);
+        for (int t = 0; t < NT; ++t) want[(size_t) t] = reference_pick({l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV}, p, false);
         bad += run("greedy argmax", l, NT, p, want);
     }
 
@@ -382,7 +290,7 @@ int main(int argc, char** argv) {
         }
         std::vector<int> want((size_t) NT), other((size_t) NT);
         for (int t = 0; t < NT; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
+            const std::vector<float> row(l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV);
             want[(size_t) t] = reference_pick(row, p, false);      // the SPECIFIED order
             other[(size_t) t] = reference_pick(row, p, true);      // temperature first
         }
@@ -394,7 +302,7 @@ int main(int argc, char** argv) {
         // order-SENSITIVE at the cut, which is a property of the fixture rather than of the kernel.
         int cut_spec = 0, cut_alt = 0;
         for (int t = 0; t < NT; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
+            const std::vector<float> row(l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV);
             cut_spec += reference_cut(row, p, false);
             cut_alt += reference_cut(row, p, true);
         }
@@ -412,11 +320,11 @@ int main(int argc, char** argv) {
     {
         strata::kernels::SamplerParams a; a.top_k = 20; a.top_p = 0.95f; a.temperature = 1.0f; a.greedy = true; a.seed = 1;
         strata::kernels::SamplerParams b = a; b.seed = 999999;
-        std::mt19937 rng(5); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(5); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng);
         std::vector<int> wa((size_t) NT);
-        for (int t = 0; t < NT; ++t) wa[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV}, a, false);
+        for (int t = 0; t < NT; ++t) wa[(size_t) t] = reference_pick({l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV}, a, false);
         float* d_l = nullptr; int *d_a = nullptr, *d_b = nullptr;
         d_l = static_cast<decltype(d_l)>(strata::parity::alloc_bytes(l.size() * sizeof(float)));
         d_a = static_cast<decltype(d_a)>(strata::parity::alloc_bytes((size_t) NT * sizeof(int)));
@@ -479,8 +387,8 @@ int main(int argc, char** argv) {
         for (int t = 0; t < NT2; ++t) hist_a[(size_t) t * 4 + 0] = 0;
         std::vector<int> want_a((size_t) NT2), alt_a((size_t) NT2);
         for (int t = 0; t < NT2; ++t) {
-            const std::vector<float> row(la.begin() + (size_t) t * NV2, la.begin() + (size_t) (t + 1) * NV2);
-            const std::vector<int> h(hist_a.begin() + (size_t) t * 4, hist_a.begin() + (size_t) (t + 1) * 4);
+            const std::vector<float> row(la.begin() + (std::ptrdiff_t) t * NV2, la.begin() + (std::ptrdiff_t) (t + 1) * NV2);
+            const std::vector<int> h(hist_a.begin() + (std::ptrdiff_t) t * 4, hist_a.begin() + (std::ptrdiff_t) (t + 1) * 4);
             want_a[(size_t) t] = pick(row, h, p, false);
             alt_a[(size_t) t] = pick(row, h, p, true);      // divide unconditionally
         }
@@ -506,8 +414,8 @@ int main(int argc, char** argv) {
         strata::kernels::SamplerParams q = p; q.penalty_present = 1.5f; q.penalty_freq = 0.0f;
         std::vector<int> want_b((size_t) NT2);
         for (int t = 0; t < NT2; ++t) {
-            const std::vector<float> row(lb.begin() + (size_t) t * NV2, lb.begin() + (size_t) (t + 1) * NV2);
-            const std::vector<int> h(hist_b.begin() + (size_t) t * 4, hist_b.begin() + (size_t) (t + 1) * 4);
+            const std::vector<float> row(lb.begin() + (std::ptrdiff_t) t * NV2, lb.begin() + (std::ptrdiff_t) (t + 1) * NV2);
+            const std::vector<int> h(hist_b.begin() + (std::ptrdiff_t) t * 4, hist_b.begin() + (std::ptrdiff_t) (t + 1) * 4);
             want_b[(size_t) t] = pick(row, h, q, false);
         }
         std::printf("  %-34s want token %d (with present=1.5, token 0 goes 5.0/2 - 1.5 = 1.0 vs token 1 at "
@@ -568,8 +476,8 @@ int main(int argc, char** argv) {
         clean_p.penalty_last_n = 0; clean_p.penalty_repeat = 1.0f;
         clean_p.penalty_freq = 0.0f; clean_p.penalty_present = 0.0f;
         for (int t = 0; t < NT2; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV2, l.begin() + (size_t) (t + 1) * NV2);
-            const std::vector<int> h(hist.begin() + (size_t) t * 4, hist.begin() + (size_t) (t + 1) * 4);
+            const std::vector<float> row(l.begin() + (std::ptrdiff_t) t * NV2, l.begin() + (std::ptrdiff_t) (t + 1) * NV2);
+            const std::vector<int> h(hist.begin() + (std::ptrdiff_t) t * 4, hist.begin() + (std::ptrdiff_t) (t + 1) * 4);
             want[(size_t) t] = sampled_reference(row, h, p, t);
             clean[(size_t) t] = sampled_reference(row, h, clean_p, t);
         }
@@ -597,7 +505,7 @@ int main(int argc, char** argv) {
 
         int c0 = 0, c05 = 0, c09 = 0;
         for (int t = 0; t < NT3; ++t) {
-            const std::vector<float> row(l.begin() + (size_t) t * NV3, l.begin() + (size_t) (t + 1) * NV3);
+            const std::vector<float> row(l.begin() + (std::ptrdiff_t) t * NV3, l.begin() + (std::ptrdiff_t) (t + 1) * NV3);
             strata::kernels::SamplerParams q = base; q.min_p = 0.0f;
             c0 += sampled_cut(row, {}, q);
             q.min_p = 0.5f; c05 += sampled_cut(row, {}, q);
@@ -612,7 +520,7 @@ int main(int argc, char** argv) {
             strata::kernels::SamplerParams q = base; q.min_p = mp;
             std::vector<int> want((size_t) NT3);
             for (int t = 0; t < NT3; ++t) {
-                const std::vector<float> row(l.begin() + (size_t) t * NV3, l.begin() + (size_t) (t + 1) * NV3);
+                const std::vector<float> row(l.begin() + (std::ptrdiff_t) t * NV3, l.begin() + (std::ptrdiff_t) (t + 1) * NV3);
                 want[(size_t) t] = sampled_reference(row, {}, q, t);
             }
             char name[64];
@@ -639,7 +547,7 @@ int main(int argc, char** argv) {
             int best = 0; float bv = 0; bool first = true;
             for (int v = 0; v < NV4; ++v) {
                 int c = 0;
-                for (int i = 0; i < (clamp ? 4 : 8); ++i) if (hist[(size_t) (8 - (clamp ? 4 : 8) + i)] == v) ++c;
+                for (int i = 0; i < (clamp ? 4 : 8); ++i) if (hist[(size_t) (8 - (clamp ? 4 : 8)) + (size_t) i] == v) ++c;
                 float logit = l[(size_t) v];
                 if (c > 0) { logit = logit <= 0.0f ? logit * p.penalty_repeat : logit / p.penalty_repeat;
                              logit -= (float) c * p.penalty_freq + p.penalty_present; }
@@ -710,7 +618,7 @@ int main(int argc, char** argv) {
     // from a previous penalised request while this request disables the penalties - the run must equal the
     // no-history run in both kernels, and the bitmap the launch did not size must stay untouched.
     {
-        std::mt19937 rng(11); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(11); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng);
         std::vector<int> hist((size_t) NT * 8, -1);
@@ -720,15 +628,15 @@ int main(int argc, char** argv) {
         p.top_k = 20; p.top_p = 0.95f; p.temperature = 0.8f; p.seed = 5;
         std::vector<int> want((size_t) NT);
         for (int t = 0; t < NT; ++t)
-            want[(size_t) t] = sampled_reference({l.begin() + (size_t) t * NV,
-                                                  l.begin() + (size_t) (t + 1) * NV}, {}, p, t);
+            want[(size_t) t] = sampled_reference({l.begin() + (std::ptrdiff_t) t * NV,
+                                                  l.begin() + (std::ptrdiff_t) (t + 1) * NV}, {}, p, t);
         bad += run("stale history, last_n=0 (sampled)", l, NT, p, want, hist, 8);
 
         strata::kernels::SamplerParams gp = p; gp.greedy = true; gp.top_k = 0; gp.top_p = 1.0f;
         std::vector<int> gwant((size_t) NT);
         for (int t = 0; t < NT; ++t)
-            gwant[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV,
-                                                l.begin() + (size_t) (t + 1) * NV}, gp, false);
+            gwant[(size_t) t] = reference_pick({l.begin() + (std::ptrdiff_t) t * NV,
+                                                l.begin() + (std::ptrdiff_t) (t + 1) * NV}, gp, false);
         bad += run("stale history, last_n=0 (greedy)", l, NT, gp, gwant, hist, 8);
     }
 
@@ -753,7 +661,7 @@ int main(int argc, char** argv) {
             }
             return best;
         };
-        std::mt19937 rng(12); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(12); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         const int TAIL = 5000;                           // longer than the widest window below
         std::vector<int32_t> tail((size_t) TAIL);
         for (auto& v : tail) v = (int32_t) (rng() % NV);
@@ -775,8 +683,8 @@ int main(int argc, char** argv) {
                 sp2.counter = 77; sp2.penalty_last_n = H; sp2.penalty_present = 4.0f; sp2.penalty_repeat = 1.1f;
                 std::vector<int> gwant((size_t) T), swant((size_t) T), rows_int(rows.begin(), rows.end());
                 for (int t = 0; t < T; ++t) {
-                    const std::vector<float> lr(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
-                    const std::vector<int> own(rows.begin() + (size_t) t * H, rows.begin() + (size_t) (t + 1) * H);
+                    const std::vector<float> lr(l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV);
+                    const std::vector<int> own(rows.begin() + (std::ptrdiff_t) t * H, rows.begin() + (std::ptrdiff_t) (t + 1) * H);
                     const std::vector<int> row0(rows.begin(), rows.begin() + H);
                     gwant[(size_t) t] = greedy_pen(lr, own, gp);
                     swant[(size_t) t] = sampled_reference(lr, own, sp2, t);
@@ -800,7 +708,7 @@ int main(int argc, char** argv) {
     // an id >= n_vocab used to set a bit past its end (a shared-memory write out of bounds - compute-sanitizer
     // memcheck reports it).  They can never be a candidate, so the result equals the reference without them.
     {
-        std::mt19937 rng(13); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(13); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         const int H = 16;
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng);
@@ -822,8 +730,8 @@ int main(int argc, char** argv) {
         sp2.greedy = false; sp2.temperature = 0.8f; sp2.top_k = 20; sp2.top_p = 0.95f; sp2.seed = 13;
         std::vector<int> gwant((size_t) NT), swant((size_t) NT);
         for (int t = 0; t < NT; ++t) {
-            const std::vector<float> lr(l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV);
-            const std::vector<int> ok(valid_only.begin() + (size_t) t * H, valid_only.begin() + (size_t) (t + 1) * H);
+            const std::vector<float> lr(l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV);
+            const std::vector<int> ok(valid_only.begin() + (std::ptrdiff_t) t * H, valid_only.begin() + (std::ptrdiff_t) (t + 1) * H);
             {   // the greedy reference with the penalty (reference_pick has none)
                 int best = 0; float bv = 0; bool first = true;
                 for (int v = 0; v < NV; ++v) {
@@ -844,14 +752,14 @@ int main(int argc, char** argv) {
     // kernel keeps, 64 - and every row is written (the sampled kernel used to print an error for 0 and leave the
     // row unwritten, which a verify window then read as a token; `run` pre-fills -1 so that fails here).
     {
-        std::mt19937 rng(14); std::normal_distribution<float> g(0.0f, 1.0f);
+        std::mt19937 rng(14); std::normal_distribution<float> g(0.0f, 1.0f);  // NOLINT(bugprone-random-generator-seed): reproducible inputs
         std::vector<float> l((size_t) NV * NT);
         for (auto& v : l) v = g(rng) * 0.3f;             // flat: the 64-wide list matters to the draw
         strata::kernels::SamplerParams p64;
         p64.top_k = 64; p64.top_p = 1.0f; p64.temperature = 1.5f; p64.seed = 14;
         std::vector<int> want((size_t) NT);
         for (int t = 0; t < NT; ++t)
-            want[(size_t) t] = sampled_reference({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV},
+            want[(size_t) t] = sampled_reference({l.begin() + (std::ptrdiff_t) t * NV, l.begin() + (std::ptrdiff_t) (t + 1) * NV},
                                                  {}, p64, t);
         bad += run("sampled top_k=64", l, NT, p64, want);
         strata::kernels::SamplerParams p0 = p64; p0.top_k = 0;
@@ -880,14 +788,14 @@ int main(int argc, char** argv) {
                         seq.insert(seq.end(), window.begin(), window.begin() + t + 1);
                         std::vector<int32_t> expect((size_t) h, -1);
                         const int take = (int) std::min<size_t>((size_t) h, seq.size());
-                        for (int j = 0; j < take; ++j) expect[(size_t) (h - take + j)] = seq[seq.size() - take + j];
-                        if (!std::equal(expect.begin(), expect.end(), rows.begin() + (size_t) t * h)) ++wrong;
+                        for (int j = 0; j < take; ++j) expect[(size_t) (h - take) + (size_t) j] = seq[seq.size() - take + j];
+                        if (!std::equal(expect.begin(), expect.end(), rows.begin() + (std::ptrdiff_t) t * h)) ++wrong;
                         ++cases;
                     }
                     // row 0 = the old single-row staging: consumed tail, then the fed-back head last
                     std::vector<int32_t> old((size_t) h, -1);
                     const int take0 = (int) std::min<int64_t>(h, (int64_t) n_tail + 1);
-                    for (int j = 0; j < take0 - 1; ++j) old[(size_t) (h - take0 + j)] = tail[(size_t) (n_tail - (take0 - 1) + j)];
+                    for (int j = 0; j < take0 - 1; ++j) old[(size_t) (h - take0) + (size_t) j] = tail[(size_t) (n_tail - (take0 - 1)) + (size_t) j];
                     old[(size_t) (h - 1)] = window[0];
                     if (!std::equal(old.begin(), old.end(), rows.begin())) ++wrong;
                     ++cases;
@@ -902,7 +810,7 @@ int main(int argc, char** argv) {
     // A continuous stream and individual decode calls consume the same draw counters.
     {
         constexpr int count = 32, vocab = 16;
-        std::vector<float> uniform(count * vocab, 0.0f);
+        std::vector<float> uniform((size_t) count * vocab, 0.0f);
         float* input = nullptr;
         int* output = nullptr;
         input = static_cast<decltype(input)>(strata::parity::alloc_bytes(uniform.size() * sizeof(float)));
@@ -927,7 +835,52 @@ int main(int argc, char** argv) {
         bad += !valid;
     }
 
-    // ---- GUMBEL-MAX (STRATA_SPEC_GUMBEL, p.gumbel; upstream 6381df34).  (a) The kernel's pick equals the host
+    // Mixed request parameters in one launch must match separate sampler calls, including untouched rows.
+    {
+        constexpr int T = 6, V = 257, H = 8;
+        std::vector<float> logits((size_t) T * V), bias((size_t) T * V, 0.0f);
+        std::vector<int> history((size_t) T * H), initial(T, -123), want(T), got(T);
+        std::vector<uint32_t> masks((size_t) T * ((V + 31) / 32), ~uint32_t(0));
+        for (int t = 0; t < T; ++t) {
+            for (int v = 0; v < V; ++v) logits[t * V + v] = float((v * 31 + t * 7) % 193) / 31.0f;
+            for (int j = 0; j < H; ++j) history[t * H + j] = (t * 19 + j / 2) % V;
+            bias[t * V + (t * 19) % V] = -100.0f;
+            masks[(size_t) t * ((V + 31) / 32)] &= ~(1u << t);
+        }
+        auto* dl = static_cast<float*>(strata::parity::alloc_bytes(logits.size() * sizeof(float)));
+        auto* db = static_cast<float*>(strata::parity::alloc_bytes(bias.size() * sizeof(float)));
+        auto* dh = static_cast<int*>(strata::parity::alloc_bytes(history.size() * sizeof(int)));
+        auto* dm = static_cast<uint32_t*>(strata::parity::alloc_bytes(masks.size() * sizeof(uint32_t)));
+        auto* out = static_cast<int*>(strata::parity::alloc_bytes(T * sizeof(int)));
+        auto* dp = static_cast<strata::kernels::SamplerParams*>(strata::parity::alloc_bytes(T * sizeof(strata::kernels::SamplerParams)));
+        strata::parity::copy_bytes_in(dl, logits.data(), logits.size() * sizeof(float));
+        strata::parity::copy_bytes_in(db, bias.data(), bias.size() * sizeof(float));
+        strata::parity::copy_bytes_in(dh, history.data(), history.size() * sizeof(int));
+        strata::parity::copy_bytes_in(dm, masks.data(), masks.size() * sizeof(uint32_t));
+        std::vector<strata::kernels::SamplerParams> params(T);
+        for (int t = 0; t < T; ++t) {
+            auto& p = params[t];
+            p.greedy = t % 2 == 0; p.temperature = p.greedy ? 0.0f : 0.7f;
+            p.top_k = 5 + t; p.top_p = 0.9f; p.min_p = 0.05f;
+            p.seed = 23 + t; p.counter = (uint64_t(1) << 32) + t;
+            p.penalty_last_n = t + 1; p.penalty_repeat = 1.2f; p.penalty_freq = 0.2f; p.penalty_present = 0.3f;
+            p.logit_bias = db + (size_t) t * V; p.allowed = dm + (size_t) t * ((V + 31) / 32);
+            p.gumbel = t == 3;
+            strata::kernels::sample_tokens(dl + (size_t) t * V, 1, V, dh + (size_t) t * H, H, p, out + t, nullptr);
+        }
+        strata::parity::copy_bytes_out(want.data(), out, T * sizeof(int));
+        params[4].penalty_last_n = -1;
+        want[4] = initial[4];
+        strata::parity::copy_bytes_in(dp, params.data(), T * sizeof(params[0]));
+        strata::parity::copy_bytes_in(out, initial.data(), T * sizeof(int));
+        strata::kernels::sample_token_rows(dl, T, V, dh, H, dp, out, nullptr);
+        strata::parity::copy_bytes_out(got.data(), out, T * sizeof(int));
+        const bool valid = got == want;
+        std::printf("  sampler mixed rows vs individual: %s\n", valid ? "PASS" : "FAIL");
+        bad += !valid;
+    }
+
+    // ---- GUMBEL-MAX (XESTRATA_SPEC_GUMBEL, p.gumbel; upstream 6381df34).  (a) The kernel's pick equals the host
     // reference's, draw for draw, under the chains the server uses (top_k / top_p / min_p / temperature) - on a GPU with
     // FP64 (one without sums and hashes in float).  (b) It is an exact sample: over many counters the picks' frequencies
     // match the softmax of the surviving logits.  (c) It is a different stream from the inverse-CDF draw (the flag is
@@ -1006,6 +959,43 @@ int main(int argc, char** argv) {
                     "gumbel: flag read, greedy unchanged", flag_bad ? "*** WRONG ***" : "matches", same, T,
                     greedy_same ? "unchanged" : "CHANGED");
         bad += flag_bad;
+
+        // (d) the form's top-k cut (YASAKANI's Q35_SMP_K): 64 equal logits, top_k off - a draw is made only for the
+        // first kGumbelK by (value, id), so the ids after them are never picked
+        {
+            const int nv3 = 64, R3 = 64, launches3 = 160;   // 10,240 draws
+            const std::vector<float> l3((size_t) nv3 * R3, 0.0f);
+            strata::kernels::SamplerParams g3;
+            g3.top_k = 0; g3.top_p = 1.0f; g3.temperature = 1.0f; g3.seed = 11; g3.gumbel = true;
+            int outside = 0;
+            for (int k3 = 0; k3 < launches3; ++k3) {
+                g3.counter = (uint64_t) k3 * R3;
+                for (int id : sample_rows(l3, R3, g3)) outside += id >= strata::kernels::kGumbelK;
+            }
+            std::printf("  %-34s %s (%d of %d picks beyond the cut)\n", "gumbel: top-k cut",
+                        outside ? "*** WRONG ***" : "matches", outside, R3 * launches3);
+            bad += outside != 0;
+        }
+
+        // (e) the auto arm (XESTRATA_SPEC_GUMBEL=auto): set_gumbel_auto(true) makes a sampled request draw Gumbel with
+        // p.gumbel clear - the arm the serve loop's measurement sets - and (false) takes it back off.  Unset is off on
+        // an integrated GPU on the HIP backend (gumbel_mode): XESTRATA_SPEC_GUMBEL=auto runs the case there
+        if (strata::kernels::gumbel_mode() != strata::kernels::GumbelMode::kAuto || strata::kernels::exact_sums()) {
+            std::printf("  %-34s skipped (XESTRATA_SPEC_GUMBEL is not auto here, or exact sums)\n", "gumbel: auto arm");
+        } else {
+            strata::kernels::SamplerParams off;
+            off.top_k = 20; off.top_p = 0.95f; off.temperature = 1.0f; off.seed = 21; off.counter = 5;
+            strata::kernels::SamplerParams on = off; on.gumbel = true;
+            const std::vector<int> a_off = sample_rows(l, T, off), a_on = sample_rows(l, T, on);
+            strata::kernels::set_gumbel_auto(true);
+            const std::vector<int> auto_on = sample_rows(l, T, off);
+            strata::kernels::set_gumbel_auto(false);
+            const std::vector<int> auto_off = sample_rows(l, T, off);
+            const bool auto_bad = auto_on != a_on || auto_off != a_off;
+            std::printf("  %-34s %s (the auto arm on/off matches the flag)\n", "gumbel: auto arm",
+                        auto_bad ? "*** WRONG ***" : "matches");
+            bad += auto_bad;
+        }
     }
 
     // ---- XeStrata-890M: the greedy pick that writes the rows' non-finite flags from its own pass

@@ -6,14 +6,18 @@
 // the pure part is serve/web/history.js, the browser store is serve/web/chatstore.js.
 //
 // Both are opt-in (Chat settings > Chats) and off by default: off, the page keeps the one chat it always had, with "New chat"
-// clearing it (and an Undo). Nothing here goes to the server.
+// clearing it (and an Undo). Nothing here goes to the server, unless the server keeps a debug chat log (/health's
+// debug_chat_log): then each chat as saved here goes there too (sendDebugChat).
 //
 // This file is loaded before app.js and uses its globals when its functions run: $, esc, icon, node, toast, store, settings,
-// messages, attachments, busy, pending, setBusy, renderChat, renderAttachments, autosize, generateReply, releasePending.
+// messages, attachments, busy, replies, pending, setBusy, renderChat, renderAttachments, autosize, generateReply, releasePending,
+// health, headers.
 // app.js calls initChats() once, from start().
-/* global tr, $, esc, icon, toast, store, settings, messages:writable, attachments:writable, busy, pending, setBusy, renderChat,
-          renderAttachments, autosize, generateReply, releasePending, StrataHistory, StrataChatStore */
-/* exported initChats, setChatList, syncActions, renderParent */
+/* global tr, $, esc, icon, toast, store, settings, messages:writable, attachments:writable, busy:writable, replies, pending, setBusy,
+          queueOf, syncPending, settlePending,
+          renderChat, renderAttachments, autosize, generateReply, releasePending, StrataHistory, StrataChatStore, StrataSegments, health,
+          headers */
+/* exported initChats, setChatList, syncActions, renderParent, saveChatOf, resumeReplies, chatName */
 "use strict";
 
 const H = StrataHistory;
@@ -46,10 +50,51 @@ function setMessages(next) {
   if (chat) chat.messages = next;
 }
 function saveChat() {
-  if (!listOn) { store.set("chat", H.cleanMessages(messages)); return; }   // off: one chat, as before
+  if (!listOn) {                                                         // off: one chat, as before
+    store.set("chat", H.cleanMessages(messages));
+    sendDebugChat({id: "single", messages: H.cleanChat({messages}).messages});
+    return;
+  }
   chat.time = Date.now();
   chatStore.put(H.cleanChat(chat));
+  sendDebugChat(H.cleanChat(chat));
   renderSidebar();
+}
+// the chat an answer is written in (generateReply's home), on the screen or not: with the list on, another chat may be open
+function saveChatOf(home) {
+  if (home.messages === messages) { saveChat(); return; }
+  if (!home.chat) return;                                                // the single chat is the one on the screen
+  home.chat.time = Date.now();
+  chatStore.put(H.cleanChat(home.chat));
+  sendDebugChat(H.cleanChat(home.chat));
+  renderSidebar();
+}
+// a chat's name as the list shows it (the header pill's list of the answers being written); the single chat is "this chat"
+function chatName(id) {
+  if (id === "single") return tr("pill.thisChat", "This chat");
+  const c = chats.find((x) => x.id === id);
+  return c ? H.chatTitle(c, untitled()) : untitled();
+}
+// The answers a page closed while it read them (their xestrata_reply id kept in the message): read again from the server,
+// which keeps each one until the page has read it, up to 12 hours.  Once a load, after /health.
+function resumeReplies() {
+  if (!health.kept_replies) return;
+  const homes = listOn ? chats.map((c) => ({id: c.id, chat: c, messages: c.messages, cache: c.id}))
+                       : [{id: "single", chat: null, messages, cache: chatId || "chat"}];
+  for (const home of homes) {
+    const m = home.messages.find((x) => x.role === "assistant" && x.rid);
+    if (m && !replies.has(home.id)) generateReply({home, resume: m});
+  }
+}
+// the server's debug chat log: a chat as this page keeps it, a second after its last change (one send per chat)
+const debugTimers = new Map();
+function sendDebugChat(c) {
+  if (!health.debug_chat_log || !c || !c.id) return;
+  clearTimeout(debugTimers.get(c.id));
+  debugTimers.set(c.id, setTimeout(() => {
+    debugTimers.delete(c.id);
+    fetch("v1/xestrata/debug/chat", {method: "POST", headers: headers(true), body: JSON.stringify(c)}).catch(() => {});
+  }, 1000));
 }
 function stillWriting() { toast("warn", tr("busy.stillWriting", "Still writing"), tr("busy.stopFirst", "Stop the answer first.")); }
 
@@ -94,9 +139,11 @@ function groupName(key) {
 }
 function chatItem(c) {
   const t = H.chatTitle(c, untitled());
-  const row = node("div", `chat-item${c.id === chatId ? " on" : ""}`);
+  const writing = replies.has(c.id);                    // an answer is being written there
+  const row = node("div", `chat-item${c.id === chatId ? " on" : ""}${writing ? " chat-item--writing" : ""}`);
   row.dataset.id = c.id;
-  row.innerHTML = `<button class="chat-item__title" data-open-chat title="${esc(t)}">${esc(t)}</button>` +
+  const label = writing ? `${t} · ${tr("sidebar.writing", "writing an answer")}` : t;
+  row.innerHTML = `<button class="chat-item__title" data-open-chat title="${esc(label)}">${esc(t)}</button>` +
     `<span class="chat-item__actions">` +
     `<button class="st-btn st-btn--icon" data-rename aria-label="${esc(tr("sidebar.rename", "Rename this chat"))}" title="${esc(tr("sidebar.renameShort", "Rename"))}">${icon("edit")}</button>` +
     `<button class="st-btn st-btn--icon" data-delete aria-label="${esc(tr("sidebar.delete", "Delete this chat"))}" title="${esc(tr("sidebar.deleteShort", "Delete"))}">${icon("trash")}</button>` +
@@ -122,25 +169,32 @@ function renderSidebar() {
   $("sidebar-foot").textContent = tr("sidebar.foot", {one: "{n} chat · kept in this browser", other: "{n} chats · kept in this browser"}, {n: chats.length});
 }
 
+// a chat on the screen; an answer still being written in it (replies) is the page's busy again
 function showChat(c) {
   clearUndo();
   chat = c; chatId = c.id; messages = c.messages;
+  busy = replies.get(c.id) || null;
+  syncPending();                          // its own waiting messages (queueOf), kept while another chat was open
   store.set("chatId", chatId);
   chatStore.put(H.cleanChat(chat));       // renderChat renders the list, so the write here does not render it again
   renderChat();
+  setBusy(!!busy);
+  const q = queueOf();
+  if (!busy && q.go) {                                // its answer ended while it was not open
+    const cut = q.go === "cut";
+    q.go = false;
+    settlePending(cut, !cut);                        // a message sent to interrupt goes after a cut
+  }
 }
+// another chat, while an answer may be written in this one: that answer goes on, in its own chat
 function openChat(id) {
-  if (busy) { stillWriting(); return; }
   const c = chats.find((x) => x.id === id);
   if (!c || c === chat) return;
-  releasePending();
   closePanel();
   showChat(c);
 }
 function startChat() {
-  if (busy) { stillWriting(); return; }
   if (!messages.length && !chat.parent) { $("input").focus(); return; }          // already a fresh chat
-  releasePending();
   closePanel();
   const prev = chatId, c = H.newChat();
   chats.push(c);
@@ -150,7 +204,7 @@ function startChat() {
         {label: tr("undo", "Undo"), run: () => openChat(prev)});
 }
 function deleteChat(c) {
-  if (busy && c.id === chatId) { stillWriting(); return; }
+  if (replies.has(c.id)) { stillWriting(); return; }
   const i = chats.indexOf(c), wasOpen = c.id === chatId;
   if (i < 0) return;                                // the list only ever passes a chat it holds
   chats.splice(i, 1);
@@ -263,11 +317,12 @@ const hiddenText = (n) => tr("hist.hidden", {one: "{n} message hidden", other: "
 function msgActions(m, i) {
   if (!settings.chatEdit) return null;
   if (busy && busy.msg === m) return null;              // the answer being written has no buttons until it is done
+  if (i < StrataSegments.segmentStart(messages)) return null;   // an earlier segment is read back as it was (segments.js)
   const row = node("div", "history-actions");
   const lock = historyLocked();
-  const add = (label, title, run) => {
+  const add = (label, title, run, off = lock) => {
     const b = node("button", "st-btn st-btn--secondary", label);
-    b.type = "button"; b.title = title; b.disabled = lock; b.onclick = run;
+    b.type = "button"; b.title = title; b.disabled = off; b.onclick = run;
     row.appendChild(b);
   };
   const last = i === messages.length - 1;
@@ -275,7 +330,9 @@ function msgActions(m, i) {
     add(tr("hist.regenerate", "Regenerate"), tr("hist.regenerateTitle", "Ask for a new answer to this question. Tools may run again."), () => regenerateAt(i));
   }
   if (m.role === "assistant") add(tr("hist.editAnswer", "Edit answer"), tr("hist.editAnswerTitle", "Correct the answer's text. No request is sent."), () => editAnswerAt(i));
-  add(tr("hist.rewind", "Rewind to here"), tr("hist.rewindTitle", "Go back to this point in the chat"), () => openRewind(i));
+  // while an answer is written (or messages wait), Rewind opens for its branch: a new chat, this one untouched
+  add(tr("hist.rewind", "Rewind to here"), tr("hist.rewindTitle", "Go back to this point in the chat"), () => openRewind(i),
+      !!panel || (lock && !listOn));
   return row;
 }
 // true when a history change may start now (and says why not when it may not)
@@ -355,6 +412,12 @@ function saveAnswerEdit(i, text) {
   if (typeof text !== "string" || !text.trim()) { toast("warn", tr("hist.empty", "The answer is empty"), tr("hist.emptyText", "Write something before saving.")); return false; }
   const plan = H.editAnswer(messages, i, text, tr("hist.edited", "Edited"));
   if (!plan) return false;
+  // the tool calls go away with the old text; keep the memory this answer wrote, or editing it reverts the memory
+  const old = messages[i];
+  if (((old.tools || []).some((t) => t.name === "memory_write" && t.state === "done")) || typeof old.memoryEdit === "string") {
+    const memory = StrataSegments.memoryAt(messages, i + 1);
+    if (memory) plan.keep[plan.keep.length - 1].memoryEdit = memory;
+  }
   closePanel();
   commit(plan.keep, plan.hidden ? tr("hist.editedHidden", {one: "Answer edited, {n} message hidden", other: "Answer edited, {n} messages hidden"}, {n: plan.hidden})
                                 : tr("hist.editedOnly", "Answer edited"));
@@ -363,24 +426,28 @@ function saveAnswerEdit(i, text) {
 
 // "Rewind to here" asks what to do (#3823): go back HERE (this chat, with an Undo) or BRANCH (a new chat, this one stays)
 function openRewind(i) {
-  if (!historyReady() || !messages[i]) return false;
+  // while this chat writes an answer or holds waiting messages, only its branch (listOn): rewinding it here would
+  // change the messages the answer is written after
+  const branchOnly = listOn && settings.chatEdit && !panel && (!!busy || !!pending);
+  if ((!branchOnly && !historyReady()) || !messages[i]) return false;
   const m = messages[i], el = $("chat").querySelector(`[data-i="${i}"]`);
   const user = m.role === "user";
   const box = node("div", "history-panel");
   box.setAttribute("role", "group");
   box.setAttribute("aria-label", tr("rewind.title", "Rewind to here"));
-  const choice = (label, text, run, primary) => {
+  const choice = (label, text, run, primary, off = false) => {
     const row = node("div", "history-choice");
     const b = node("button", `st-btn ${primary ? "st-btn--primary" : "st-btn--secondary"}`, label);
-    b.type = "button"; b.onclick = run;
+    b.type = "button"; b.onclick = run; b.disabled = off;
     row.appendChild(b);
     row.appendChild(node("span", "muted small", text));
     box.appendChild(row);
   };
   choice(user ? tr("rewind.hereUser", "Edit and send again here") : tr("rewind.hereAnswer", "Continue from here"),
-         user ? tr("rewind.hereUserText", "Hides this message and the ones after it, and puts your message in the box below. Undo brings them back.")
+         branchOnly ? tr("rewind.hereBusy", "Not while an answer is written or a message waits in this chat; a branch can start now.")
+         : user ? tr("rewind.hereUserText", "Hides this message and the ones after it, and puts your message in the box below. Undo brings them back.")
               : tr("rewind.hereAnswerText", "Hides the messages after this answer. Undo brings them back."),
-         () => rewindHere(i), true);
+         () => rewindHere(i), !branchOnly, branchOnly);
   if (listOn) {
     choice(tr("rewind.branch", "Branch from here"),
            user ? tr("rewind.branchUserText", "Starts a new chat with the messages before this one, and puts your message in its box. This chat stays as it is.")
@@ -396,7 +463,7 @@ function openRewind(i) {
   el.appendChild(box);
   panel = {kind: "rewind", index: i, el};
   setBusy(!!busy);
-  box.querySelector("button").focus();
+  box.querySelector("button:not(:disabled)").focus();
   box.scrollIntoView({block: "nearest"});
   return true;
 }
@@ -418,8 +485,9 @@ function rewindHere(i) {
   $("input").focus();
   return true;
 }
+// (also while this chat writes an answer: the branch copies the messages up to i, the answer goes on here)
 function branchHere(i) {
-  if (!listOn || busy || pending || !panel || panel.kind !== "rewind") return false;
+  if (!listOn || !panel || panel.kind !== "rewind") return false;
   const plan = H.rewind(messages, i);
   if (!plan) return false;
   closePanel();

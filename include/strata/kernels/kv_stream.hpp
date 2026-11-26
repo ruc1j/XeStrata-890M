@@ -30,19 +30,8 @@
 
 namespace strata::kernels {
 
-/// The host copy of one layer's K/V: device-mapped pointers (UVA) into pinned memory, identity layout
-/// `[block][kv_head][page_size][head_dim]`. All null when the layer is fully resident.
-struct KvHostPools {
-    uint16_t* k_pool = nullptr;   ///< fp16 mode
-    uint16_t* v_pool = nullptr;
-    int8_t* k_q = nullptr;        ///< int8 mode: codes
-    int8_t* v_q = nullptr;
-    uint16_t* k_scale = nullptr;  ///< int8 mode: fp16 scale per 64 values
-    uint16_t* v_scale = nullptr;
-    uint8_t* k_q4 = nullptr;      ///< q4_0 mode (kv_q4.hpp): block_q4_0 codes, 144 B per cell and head
-    uint8_t* v_q4 = nullptr;
-    bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
-};
+/// The host copy of one layer's K/V is `KvHostPools` (qsa.hpp): device-mapped pointers (UVA) into pinned memory,
+/// identity layout `[block][kv_head][page_size][head_dim]`. All null when the layer is fully resident.
 
 /// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0, and
 /// K8V4 (`--kv k8v4`: K as int8 codes + scales, V as rotated q4_0 - three runs, `k_q`, `k_scale`, `v_q4`).
@@ -103,6 +92,12 @@ void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt
 /// Copy the first `n_blocks` blocks of the host copy into a fully resident (identity-layout) pool: the prompt
 /// path's staging of one layer. Not capturable (DMA).
 void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks,
+                        const QsaShapes& s, void* stream);
+
+/// The reverse of kv_stage_from_host for blocks [b0, b1) (upstream c3c034745b, f0356cb25f): the staging pool's blocks
+/// into the host copy, by DMA, so the prompt path's append need not write host memory from a kernel
+/// (core/kv_host_dma.hpp).  Not capturable.
+void kv_unstage_to_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
                         const QsaShapes& s, void* stream);
 
 struct KvStreamCounters {

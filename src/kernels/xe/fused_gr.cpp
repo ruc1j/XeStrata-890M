@@ -14,10 +14,10 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_target.hpp"
-#include "q8_1_finite.hpp"
-#include "sm70_table.hpp"
+#include "strata/kernels/q8_act.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gr
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <cstdio>
 #include <algorithm>
@@ -87,17 +87,16 @@ inline float warp_sum(const sycl::sub_group& sg, float v) {
 inline float sigmoidf_(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 
 // Upstream's latency-hidden norm and up kernels (aaa323fe: gfx906's, which upstream runs on sm_70 too; V100-SXM2: 50.9
-// -> 46.7 us a read at T 1, hc-read0's up 1.08 -> 0.96 ms a window, bitwise): STRATA_GR_FAST=1 or 0 on any GPU, else
-// Volta with STRATA_SM70_TABLE=1 (sm70_table.hpp) and AMD GPUs (the HIP backend).
-bool gr_fast(sycl::queue& q) {
-    static const int env = [] {
-        const char* v = std::getenv("STRATA_GR_FAST");
-        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
+// -> 46.7 us a read at T 1, hc-read0's up 1.08 -> 0.96 ms a window, bitwise), on every GPU: Qwen3.8-Flash-Next's
+// decode on the RTX 4070 23.75 -> 24.8 tok/s, on the B70 and the RX 9060 XT the same (2026-11-07), the same tokens;
+// the 890M (gfx1150) 11.55 -> 11.92 tok/s at fixed clocks, bitwise.  STRATA_GR_FAST=0 the former kernels.
+bool gr_fast(sycl::queue&) {
+    static const bool on = [] {
+        const char* v = strata::env_get("GR_FAST");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    // XeStrata-890M: also on the HIP backend (the 890M, gfx1150: decode 11.55 -> 11.92 tok/s at fixed clocks, bitwise)
-    const bool on = env >= 0 ? env != 0 : xe::sm70_table(q) || q.get_device().get_backend() == sycl::backend::ext_oneapi_hip;
-    static const bool said = [on] {
-        std::fprintf(stderr, "strata: the hyper-connection read takes the %s form (STRATA_GR_FAST)\n",
+    static const bool said = [] {
+        std::fprintf(stderr, "xestrata: the hyper-connection read takes the %s form (STRATA_GR_FAST)\n",
                      on ? "latency-hidden" : "default");
         return true;
     }();
@@ -110,7 +109,7 @@ inline float dot8(const uint4 w, const float* x) {
     float acc = 0.0f;
     const uint32_t v[4] = {w.x(), w.y(), w.z(), w.w()};
     for (int j = 0; j < 4; ++j) {
-        acc = sycl::fma(sycl::bit_cast<float>(v[j] << 16), x[2 * j], acc);
+        acc = sycl::fma(sycl::bit_cast<float>(v[j] << 16), x[(size_t) 2 * j], acc);
         acc = sycl::fma(sycl::bit_cast<float>(v[j] & 0xffff0000u), x[2 * j + 1], acc);
     }
     return acc;
@@ -319,21 +318,9 @@ sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const 
                 // block is written here, a sub-group a token: native_quantize_q8_1's arithmetic on the same values
                 if (m.a[0].q8_mixed != nullptr) {
                     sycl::group_barrier(it.get_group());
-                    if (warp < T) {
-                        const float xi = mx[warp * COLS + lane];
-                        float amax = sycl::fabs(xi), sum = xi;
-                        for (int o = WARP / 2; o > 0; o >>= 1) {
-                            amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
-                            sum += sycl::permute_group_by_xor(sg, sum, o);
-                        }
-                        const float d = xe::q8_1_finite(amax / 127.0f);
-                        uint8_t* blk = static_cast<uint8_t*>(tok(m, warp).q8_mixed) + (size_t) (d0 / 32) * 36;
-                        blk[4 + lane] = (uint8_t) xe::q8_1_quant(xi, d, amax);
-                        if (lane == 0) {
-                            const sycl::half2 ds(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
-                            *reinterpret_cast<sycl::half2*>(blk) = ds;
-                        }
-                    }
+                    if (warp < T)
+                        q8act::q8_1_block(sg, mx[warp * COLS + lane],
+                                          static_cast<uint8_t*>(tok(m, warp).q8_mixed) + (size_t) (d0 / 32) * 36, lane);
                 }
             }
         });
@@ -618,7 +605,7 @@ sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
     constexpr int NCH = LR / 8;   // 8-value chunks of an up row: 40 for Flash-Next
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<sycl::float4, 1> lo(sycl::range<1>(kFusedGrMaxT * LR / 4), h);
-        sycl::local_accessor<float, 1> g(sycl::range<1>(kFusedGrMaxT * HC * UPM_COLS), h);
+        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) kFusedGrMaxT * HC * UPM_COLS), h);
         const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<1>((size_t) UPM_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             tok.stage(m, it);
@@ -637,8 +624,8 @@ sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
                 const uint16_t* wrow = m.a[0].w_up + (size_t) i * LR;
 #pragma unroll
                 for (int qq = 0; qq < 4; ++qq) {
-                    w[p][qq] = load_u4(wrow, (size_t) (j + 8 * qq));
-                    if (32 + 8 * qq < NCH) w[p][4 + qq] = load_u4(wrow, (size_t) (32 + j + 8 * qq));   // j < 8, NCH % 8 == 0
+                    w[p][qq] = load_u4(wrow, (size_t) j + 8 * (size_t) qq);
+                    if (32 + 8 * qq < NCH) w[p][4 + qq] = load_u4(wrow, 32 + (size_t) j + 8 * (size_t) qq);   // j < 8, NCH % 8 == 0
                 }
                 if (j < T) {
                     rv[p] = my.R[i];
@@ -1226,7 +1213,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     // STRATA_HC_SPLIT=0: one group per token (norm_step, or its latency-hidden form with gr_fast).
     const bool fast = gr_fast(q);
     static const bool split = [] {
-        const char* v = std::getenv("STRATA_HC_SPLIT");
+        const char* v = strata::env_get("HC_SPLIT");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     if (split) {
@@ -1394,7 +1381,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         // float4: a lane reads its 8 values as two 16-byte loads; one float at a time, the lanes' 32-byte stride put 8 of
         // them on each local-memory bank (RTX 4070: this kernel 53 us -> 40 us)
         sycl::local_accessor<sycl::float4, 1> lo(sycl::range<1>(kFusedGrMaxT * LR / 4), h);
-        sycl::local_accessor<float, 1> g(sycl::range<1>(kFusedGrMaxT * HC * UPM_COLS), h);
+        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) kFusedGrMaxT * HC * UPM_COLS), h);
         const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<1>((size_t) UPM_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             tok.stage(m, it);
@@ -1415,7 +1402,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                 const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
                 const uint16_t* wrow = m.a[0].w_up + (size_t) i * LR;
                 const uint4 wa = load_u4(wrow, (size_t) lane);
-                const uint4 wb = lane < LR / 8 - 32 ? load_u4(wrow, (size_t) (32 + lane)) : uint4(0, 0, 0, 0);
+                const uint4 wb = lane < LR / 8 - 32 ? load_u4(wrow, 32 + (size_t) lane) : uint4(0, 0, 0, 0);
                 float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
                 bool apply = false;
                 if (lane < T) {
@@ -1463,26 +1450,8 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
 
 void fused_gr_quantize_q8_0(const uint16_t* src, uint8_t* dst, int64_t nb, void* stream) {
     if (nb <= 0) return;
-    // one sub-group a block: lane i takes value i, the block's max |x| by a butterfly
-    queue_for(stream).parallel_for(sycl::nd_range<1>((size_t) nb * WARP, WARP),
-                                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-        const sycl::sub_group sg = it.get_sub_group();
-        const int64_t b = (int64_t) it.get_group(0);
-        const int i = (int) sg.get_local_linear_id();
-        const float x = sycl::bit_cast<float>((uint32_t) src[b * 32 + i] << 16);
-        float amax = sycl::fabs(x);
-        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
-        const float d = amax / 127.0f;
-        const float id = d != 0.0f ? 1.0f / d : 0.0f;
-        uint8_t* blk = dst + b * 34;
-        blk[2 + i] = (uint8_t) (int8_t) sycl::round(x * id);
-        if (i == 0) {
-            const sycl::half h = (sycl::half) d;
-            const uint16_t hb = sycl::bit_cast<uint16_t>(h);
-            blk[0] = (uint8_t) (hb & 0xff);
-            blk[1] = (uint8_t) (hb >> 8);
-        }
-    });
+    // ggml's quantize_row_q8_0 of the BF16 values: one sub-group a block
+    q8act::quantize<1, q8act::Mul>(queue_for(stream), nb, 0, q8act::FlatBf16{src}, q8act::Q8_0<>{dst});
 }
 
 namespace {
@@ -1593,7 +1562,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
     // the down projection (and the inject rows in one extra group), with the norm computed into local memory
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> xn(sycl::range<1>(D), h);
-        sycl::local_accessor<float, 1> part(sycl::range<1>(WARPS * HC), h);
+        sycl::local_accessor<float, 1> part(sycl::range<1>((size_t) WARPS * HC), h);
         sycl::local_accessor<float, 1> s_rs(sycl::range<1>(HC), h);
         h.parallel_for(sycl::nd_range<1>((size_t) (DOWN_BLOCKS + 1) * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
@@ -1625,7 +1594,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
     });
     const auto e = q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> lo(sycl::range<1>(LR), h);
-        sycl::local_accessor<float, 1> g(sycl::range<1>(HC * UP_COLS), h);
+        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) HC * UP_COLS), h);
         h.parallel_for(sycl::nd_range<1>((size_t) UP_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
@@ -1641,7 +1610,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
                 float acc = dot8(load_u4(wrow, (size_t) lane), xa);
                 if (lane < LR / 8 - 32) {
                     for (int e2 = 0; e2 < 8; ++e2) xa[e2] = lo[(32 + lane) * 8 + e2];
-                    acc += dot8(load_u4(wrow, (size_t) (32 + lane)), xa);
+                    acc += dot8(load_u4(wrow, 32 + (size_t) lane), xa);
                 }
                 acc = warp_sum(sg, acc);
                 if (lane == 0) {

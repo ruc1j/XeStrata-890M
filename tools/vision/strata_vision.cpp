@@ -1,58 +1,97 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// tools/vision/strata_vision.cpp - the image half of Strata's multimodal path.
+// tools/vision/strata_vision.cpp - the chat's picture reader: the vision encoder the image engine shares
+// (strata/core/vision.hpp: Qwen3-VL's ViT and its merger from the model's mmproj GGUF), on the GPU with --gpu and on
+// the CPU without (int8 products by default, BF16 with XESTRATA_VISION_CPU_I8=0, on --threads threads, default one a
+// core).  The protocol is the one llama.cpp's mtmd reader spoke before it, so serve and the engines do not change:
 //
-// Turns an image into the embeddings the text model reads in place of its <|image_pad|> tokens, with llama.cpp's
-// mtmd library and the model's mmproj file (vision encoder + projector).  The engine does the rest: it places the
-// rows at the image's pad tokens and gives them their 2-D M-RoPE positions (see --serve GENI in generate.cpp).
+//   xestrata-vision --mmproj <mmproj.gguf> [--model <text model, for a config that names it: not read>]
+//                   [--gpu] [--gpu-pci ADDR] [--threads N] [--max-tokens N] [--min-tokens N]
 //
-//   strata-vision --mmproj <mmproj.gguf> --model <text model .gguf, first split> [--gpu [--gpu-pci ADDR]]
-//                 [--threads N] [--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto] [--tower own|mtmd|auto]
-//
-// --tower picks the picture reader: own (Strata's own Qwen tower on the CPU, tools/vision/own), mtmd (llama.cpp's) or auto (the default; without --tower,
-// STRATA_VISION_TOWER's value).  auto takes ours in the CPU build and keeps mtmd in the GPU (Vulkan) build and with --gpu; when ours does not start, mtmd's
-// reader starts in its place in the same process.
-// --gpu-pci takes the GPU whose PCI address (domain:bus:device.function) is ADDR; without it, mtmd takes the backend's
-// first GPU, which with Vulkan can be the CPU's integrated graphics or another vendor's card.
-// Flash attention defaults to auto, and to off on the CPU when ggml is built with AVX-512 (see main).
-//
-// Resident: prints "READY <n_embd> <reader>" (reader: own or mtmd, then "fallback" when ours did not start), then per stdin line
+// Resident: prints "READY <n_embd>", then per stdin line
 //   ENC <image path> <output path>   ->  "OK <n_tokens> <nx> <ny> <ms>"  or  "ERR <message>"
 //   QUIT
-// The output file is  int32 {0x31455653 'SVE1', n_tokens, nx, ny, n_embd}  then float32 [n_tokens][n_embd],
-// row i at grid position (x = i % nx, y = i / nx).  The text model is opened vocab-only (no weights).
-#include "ggml-cpu.h"
-#include "gguf.h"
-#include "gguf_meta.h"
-#include "llama.h"
-#include "mtmd.h"
-#include "mtmd-helper.h"
-#include "own_reader.h"
+// The output file is  int32 {0x31455653 'SVE1', n_tokens, nx, ny, n_embd}  then float32 [n_tokens][n_embd], row i at
+// grid position (x = i % nx, y = i / nx): the format the engines' GENI reads.
+//
+// The picture becomes the tokens mtmd's qwen3vl reader makes of it (the same grid, so the prompt's pads and the
+// answers stay as they were): the sides to a multiple of patch * merge (32), the aspect kept, between --min-tokens
+// and --max-tokens, Pillow's bicubic, RGB in -1 .. 1 (the mmproj's image mean and deviation of 0.5).
+#include "strata/core/runtime.hpp"
+#include "strata/core/vision.hpp"
+#include "strata/kernels/cpu/bf16_gemm.hpp"
+#include "strata/kernels/cpu/i8_gemm.hpp"
+#include "strata/image/img_crop.hpp"
+#include "strata/image/img_start.hpp"
+#include "strata/image/pipeline.hpp"
+#include "strata/image/qi_image_io.hpp"
+#include "strata/platform/env.hpp"
+#include "strata/prefill/gemm.hpp"
 
 #include <algorithm>
-#if !defined(_WIN32)
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 namespace {
 
-void quiet_log(ggml_log_level level, const char* text, void*) {
-    if (level >= GGML_LOG_LEVEL_WARN) std::fputs(text, stderr);
+struct Size {
+    int64_t w = 0, h = 0;
+};
+
+// llama.cpp's mtmd_image_preprocessor_dyn_size (calc_size_preserved_ratio, tools/mtmd/mtmd-image.cpp): the sides
+// rounded to `align` (the patch times the merge), then shrunk below max_pixels or grown above min_pixels with the
+// aspect kept: the grid a qwen3vl reader makes of a picture.  The limits are tokens (the server's --min/--max).
+Size reader_size(int64_t width, int64_t height, int64_t align, int64_t min_tokens, int64_t max_tokens) {
+    const int64_t patch_area = align * align;
+    const int64_t min_pixels = std::max<int64_t>(0, min_tokens) * patch_area;
+    const int64_t max_pixels = std::max<int64_t>(0, max_tokens) * patch_area;
+    auto round_by = [align](double x) { return (int64_t) std::llround(x / (double) align) * align; };
+    auto ceil_by = [align](double x) { return (int64_t) std::ceil(x / (double) align) * align; };
+    auto floor_by = [align](double x) { return (int64_t) std::floor(x / (double) align) * align; };
+    int64_t w = std::max<int64_t>(align, round_by((double) width));
+    int64_t h = std::max<int64_t>(align, round_by((double) height));
+    if (max_pixels > 0 && h * w > max_pixels) {
+        const double beta = std::sqrt((double) height * (double) width / (double) max_pixels);
+        h = std::max<int64_t>(align, floor_by((double) height / beta));
+        w = std::max<int64_t>(align, floor_by((double) width / beta));
+    } else if (min_pixels > 0 && h * w < min_pixels) {
+        const double beta = std::sqrt((double) min_pixels / ((double) height * (double) width));
+        h = ceil_by((double) height * beta);
+        w = ceil_by((double) width * beta);
+    }
+    return {w, h};
 }
 
-// "ENC <image> <out>": paths may contain spaces, so the image path ends at the last " " before the output path;
-// the server always writes paths without spaces, but a user calling the tool by hand might not
+// The picture's planes [3][h][w] in -1 .. 1, the pixels mtmd's qwen3vl preprocessing makes of the same file: its
+// img_tool::resize with PAD_CEIL (the hparams' default, and qwen3vl does not change it) scales the picture to fit the
+// reader's size with its aspect kept - the sides to their ceilings, never past the target - and centres it on a canvas
+// of the pad color (black).  The alpha is dropped: mtmd reads three channels.
+std::vector<float> picture_planes(const std::vector<uint8_t>& rgba, int64_t width, int64_t height, const Size& size) {
+    const float scale = std::min((float) size.w / (float) width, (float) size.h / (float) height);
+    const int64_t new_w = std::min<int64_t>((int64_t) std::ceil((float) width * scale), size.w);
+    const int64_t new_h = std::min<int64_t>((int64_t) std::ceil((float) height * scale), size.h);
+    const strata::image::QiRef src{rgba, width, height};
+    const strata::image::QiRef at =
+        strata::image::pillow_resize(src, new_w, new_h, strata::image::Filter::bicubic);
+    std::vector<uint8_t> canvas((size_t) (size.w * size.h * 4), 0);   // mtmd's pad color: black
+    for (size_t i = 3; i < canvas.size(); i += 4) canvas[i] = 255;    // (the alpha plane is not read)
+    const int64_t ox = (size.w - new_w) / 2, oy = (size.h - new_h) / 2;
+    for (int64_t y = 0; y < new_h; ++y)
+        std::memcpy(canvas.data() + (size_t) ((y + oy) * size.w + ox) * 4,
+                    at.rgba.data() + (size_t) (y * new_w) * 4, (size_t) new_w * 4);
+    return strata::image::image_planes(canvas, size.w, size.h, 3, strata::image::PlaneAlpha::Keep,
+                                       strata::image::PlaneRange::Signed);
+}
+
+// "ENC <image> <out>": paths may contain spaces, so the image path ends at the last " " before the output path (as
+// mtmd's reader read it; the server writes paths without spaces)
 bool parse_enc(const std::string& line, std::string& img, std::string& out) {
     if (line.rfind("ENC ", 0) != 0) return false;
     const std::string rest = line.substr(4);
@@ -66,260 +105,195 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string mmproj, model;
+    std::string mmproj, model, gpu_pci;
+    int64_t max_tokens = 0, min_tokens = 0;
     bool gpu = false;
-    std::string gpu_pci;
-    int threads = 0, max_tokens = 0, min_tokens = 0;
-    llama_flash_attn_type fa = LLAMA_FLASH_ATTN_TYPE_AUTO;
-    bool fa_given = false;
-    // --tower mtmd|own|auto: whose picture reader runs (upstream's own-stack phase 3; there the default is auto, owner 11-11).  Without --tower the
-    // environment's STRATA_VISION_TOWER decides; an explicit --tower wins.
-    std::string tower_note;
-    std::string tower = strata_vit::vision_tower_default(std::getenv("STRATA_VISION_TOWER"), tower_note);
-    if (!tower_note.empty()) std::fprintf(stderr, "strata-vision: %s\n", tower_note.c_str());
+    int threads = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
-            if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); }
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "%s needs a value\n", a.c_str());
+                std::exit(2);
+            }
             return argv[++i];
         };
         if (a == "--mmproj") mmproj = next();
-        else if (a == "--model") model = next();
+        else if (a == "--model") model = next();   // the configs name it (mtmd's reader read its vocabulary); not read
         else if (a == "--gpu") gpu = true;
         else if (a == "--gpu-pci") gpu_pci = next();
-        else if (a == "--tower") {
-            tower = next();
-            if (tower != "mtmd" && tower != "own" && tower != "auto") { std::fprintf(stderr, "--tower takes mtmd, own or auto\n"); return 2; }
+        else if (a == "--threads") threads = (int) std::strtol(next().c_str(), nullptr, 10);
+        else if (a == "--max-tokens") max_tokens = std::strtoll(next().c_str(), nullptr, 10);
+        else if (a == "--min-tokens") min_tokens = std::strtoll(next().c_str(), nullptr, 10);
+        else {
+            std::fprintf(stderr, "unknown argument %s\n", a.c_str());
+            return 2;
         }
-        else if (a == "--threads") threads = std::atoi(next().c_str());
-        else if (a == "--max-tokens") max_tokens = std::atoi(next().c_str());
-        else if (a == "--min-tokens") min_tokens = (int) std::strtol(next().c_str(), nullptr, 10);   // mtmd image_min_tokens (upstream #767)
-        else if (a == "--flash-attn") {   // FA keeps K and V in FP16; off = the attention in FP32
-            const std::string v = next();
-            fa = v == "on" ? LLAMA_FLASH_ATTN_TYPE_ENABLED : v == "off" ? LLAMA_FLASH_ATTN_TYPE_DISABLED
-                                                                        : LLAMA_FLASH_ATTN_TYPE_AUTO;
-            fa_given = true;
-        }
-        else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
-    // auto: our tower where this program, the backend and the file allow it, else mtmd; when ours then fails before READY, mtmd's reader starts in its place.
-    // The GPU build is told by the build (STRATA_VISION_GPU_BUILD, tools/vision/CMakeLists.txt), never by a device's name.
-#ifdef STRATA_VISION_GPU_BUILD
-    constexpr bool gpu_build = true;
-#else
-    constexpr bool gpu_build = false;
-#endif
-    bool own_may_fall_back = false, own_fell_back = false;
-    if (tower == "auto") {
-        std::string why;
-        const bool own_ok = !mmproj.empty() && strata_vit::own_auto_allowed(gpu_build, why) &&
-                            strata_vit::own_reader_supported(mmproj, gpu, max_tokens, why);
-        tower = strata_vit::vision_tower_resolve(tower, own_ok);
-        own_may_fall_back = tower == "own" && !model.empty();   // mtmd needs the text model's header
-        if (tower == "mtmd" && !why.empty()) std::fprintf(stderr, "strata-vision: llama.cpp's reader (%s)\n", why.c_str());
-    }
-    if (mmproj.empty() || (model.empty() && tower != "own")) {   // our tower needs no text model: it never tokenizes
-        std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu [--gpu-pci ADDR]] "
-                             "[--threads N] [--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto] [--tower own|mtmd|auto]\n");
+    if (mmproj.empty()) {
+        std::fprintf(stderr, "usage: xestrata-vision --mmproj <mmproj.gguf> [--model <model.gguf>] [--gpu] "
+                             "[--gpu-pci ADDR] [--threads N] [--max-tokens N] [--min-tokens N]\n");
         return 2;
     }
-    if (tower == "own") {
-        strata_vit::OwnReaderOptions o;
-        o.mmproj = mmproj;
-        o.gpu = gpu;
-        o.threads = threads;
-        o.max_tokens = max_tokens;
-        o.min_tokens = min_tokens;
-        std::string start_error;
-        if (own_may_fall_back) o.start_error = &start_error;
-        const int rc = strata_vit::own_reader_run(o);
-        if (rc != strata_vit::kOwnStartFailed) return rc;
-        // nothing was written to stdout yet: the server still waits for READY, which mtmd's reader below gives (with "mtmd" as its third word)
-        std::fprintf(stderr, "strata-vision: Strata's picture reader did not start (%s); reading pictures with llama.cpp's reader\n", start_error.c_str());
-        std::fflush(stderr);
-        own_fell_back = true;
-    }
-    llama_log_set(quiet_log, nullptr);
-    mtmd_helper_log_set(quiet_log, nullptr);
-    llama_backend_init();
-
-    const auto load_t0 = std::chrono::steady_clock::now();
-#if !defined(_WIN32)   // posix_fadvise; on Windows the loader's reads go as they are (#24)
-    // ask the OS for the projector file up front (128 KiB steps) so the loader's sequential reads find it cached;
-    // STRATA_READ_AHEAD=0 turns it off, as in the engine
-    if (const char* ra = std::getenv("STRATA_READ_AHEAD"); ra == nullptr || std::strtol(ra, nullptr, 10) != 0) {
-        const int fd = open(mmproj.c_str(), O_RDONLY);
-        if (fd >= 0) {
-            const off_t n = lseek(fd, 0, SEEK_END);
-            for (off_t at = 0; at < n; at += (off_t) (128 << 10))
-                (void) posix_fadvise(fd, at, std::min<off_t>((off_t) (128 << 10), n - at), POSIX_FADV_WILLNEED);
-            close(fd);
-        }
-    }
+    (void) model;
+    // on the CPU without --threads: one per core (hardware threads over two, as mtmd's reader took them)
+    if (threads <= 0) threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
+    // the ViT's attention in 16 bits unless the environment names a choice: the rows come out closer to the FP32
+    // reference than the int8 kernel's, for about 40 ms a picture of 1,024 tokens
+    if (gpu && strata::env_get("IMAGE_ATTN_I8") == nullptr) {
+#if defined(_WIN32)
+        _putenv_s("XESTRATA_IMAGE_ATTN_I8", "0");
+#else
+        setenv("XESTRATA_IMAGE_ATTN_I8", "0", 0);
 #endif
-    // the vocabulary and header only: the weights (and their tensor types, which can be ones llama.cpp does not know,
-    // such as Gyro's TQK6 / TQK7) are never touched - see gguf_meta.h (upstream 3fe84ec28)
-    std::string how;
-    llama_model* text = strata_open_text_model(model, &how);
-    if (!text) {
-        std::printf("ERR cannot open the text model %s (%s)\n", model.c_str(), how.c_str());
-        std::fflush(stdout);
-        return 1;
+    }
+    // the runtime reads the card's PCI address when it starts (core/device.cpp: XESTRATA_GPU_PCI), as the engines take
+    // it: this has to happen before the first device is opened
+    if (gpu && !gpu_pci.empty()) {
+#if defined(_WIN32)
+        _putenv_s("XESTRATA_GPU_PCI", gpu_pci.c_str());
+#else
+        setenv("XESTRATA_GPU_PCI", gpu_pci.c_str(), 1);
+#endif
     }
 
-    mtmd_context_params cp = mtmd_context_params_default();
-    cp.use_gpu = gpu;
-    if (gpu && !gpu_pci.empty()) {
-        for (size_t i = 0; i < ggml_backend_dev_count() && cp.device == nullptr; ++i) {
-            ggml_backend_dev_t d = ggml_backend_dev_get(i);
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(d, &props);
-            if (props.device_id != nullptr && gpu_pci == props.device_id) cp.device = d;
+    // the products' library loaded on a thread of its own while the encoder opens (as the image engine starts), and not
+    // still loading when the process ends (the GPU's; the CPU opens no device)
+    struct GemmDone {
+        bool on = false;
+        ~GemmDone() {
+            if (on) strata::prefill::Gemm::finish();
         }
-        if (cp.device == nullptr) {
-            std::printf("ERR no GPU at PCI address %s\n", gpu_pci.c_str());
-            std::fflush(stdout);
-            return 1;
-        }
+    } gemm_done;
+    void* stream = nullptr;
+    if (gpu) {
+        stream = strata::core::Runtime::get().create_stream();
+        strata::prefill::Gemm::prepare();
+        strata::prefill::Gemm::settle();
+        gemm_done.on = true;
     }
-    cp.print_timings = false;
-    cp.warmup = false;
-    // On the CPU "auto" turns flash attention on.  ggml's fast (tiled) CPU kernel for it needs the head size, 72 in this
-    // encoder, to be a multiple of the vector width: 8 floats with AVX2, 16 with AVX-512, where ggml falls back to a
-    // kernel that is several times slower and accumulates in FP16 (upstream e7ec6b1a, a Ryzen 7 7700X: AVX2 8-10 s with
-    // it, 14-15 s without; AVX-512 44 s with it, 13 s without, for a 1024x1024 picture)
-    if (!gpu && !fa_given && ggml_cpu_has_avx512()) fa = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    cp.flash_attn_type = fa;
-    // on the CPU without --threads: one per core (mtmd's own default is 4 threads)
-    if (threads <= 0 && !gpu) threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
-    if (threads > 0) cp.n_threads = threads;
-    if (max_tokens > 0) cp.image_max_tokens = max_tokens;
-    if (min_tokens > 0) cp.image_min_tokens = min_tokens;
-    mtmd_context* ctx = mtmd_init_from_file(mmproj.c_str(), text, cp);
-    if (!ctx || !mtmd_support_vision(ctx)) {
-        std::printf("ERR cannot load the vision encoder %s\n", mmproj.c_str());
+    strata::core::Vision vision;
+    std::string err;
+    const auto load_t0 = std::chrono::steady_clock::now();
+    if (!(gpu ? vision.open(mmproj, stream, err) : vision.open_cpu(mmproj, threads, err))) {
+        std::printf("ERR cannot load the vision encoder %s (%s)\n", mmproj.c_str(), err.c_str());
         std::fflush(stdout);
         return 1;
     }
-    std::fprintf(stderr, "strata-vision: model files loaded in %.1f s\n",
-                 std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count());
-    // a vocab-only model reports no hparams, so the width comes from the projector: its output is the model's input
-    int n_embd = 0;
-    {
-        gguf_init_params gp{true, nullptr};
-        gguf_context* gg = gguf_init_from_file(mmproj.c_str(), gp);
-        const int64_t k = gg ? gguf_find_key(gg, "clip.vision.projection_dim") : -1;
-        if (k >= 0) n_embd = (int) gguf_get_val_u32(gg, k);
-        if (gg) gguf_free(gg);
-    }
-    if (n_embd <= 0) { std::printf("ERR the vision encoder has no projection_dim\n"); std::fflush(stdout); return 1; }
-    // Warm up at the LARGEST picture before READY: the encoder's GPU work buffers are allocated now, not at the first
-    // real picture.  The server starts this process before the engine, so the engine sizes its expert cache from
-    // what is really left. (A square image well above any cap; mtmd scales it to the token limit.)
-    // On the CPU there is no VRAM to reserve, and the warm-up would only delay the engine's start by one encode
-    // (~6 s at 1,024 tokens).
-    if (!gpu) std::fprintf(stderr, "strata-vision: on the CPU, %d threads, no warm-up\n", threads);
-    else {
-        const auto warm_t0 = std::chrono::steady_clock::now();
-        const uint32_t side = 2048;
-        std::vector<unsigned char> rgb((size_t) side * side * 3, 128);
-        mtmd_bitmap* bm = mtmd_bitmap_init(side, side, rgb.data());
-        mtmd_input_chunks* chunks = mtmd_input_chunks_init();
-        const std::string marker = mtmd_default_marker();
-        mtmd_input_text txt{marker.c_str(), marker.size(), false, true};
-        const mtmd_bitmap* bms[1] = {bm};
-        int warm_tokens = 0;
-        if (bm && mtmd_tokenize(ctx, chunks, &txt, bms, 1) == 0) {
-            for (size_t c = 0; c < mtmd_input_chunks_size(chunks); ++c) {
-                const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks, c);
-                if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE && mtmd_encode_chunk(ctx, ch) == 0)
-                    warm_tokens = (int) mtmd_input_chunk_get_n_tokens(ch);
-            }
-        }
-        std::fprintf(stderr, "strata-vision: warmed up at %d image tokens in %.1f s\n", warm_tokens,
-                     std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count());
-        // I7 (#3690): a picture that became 93,700 image tokens under --max-tokens 1024. The limit is not applied by this build of mtmd for
-        // this model, and the log line above is the evidence to ask for.
+    std::fprintf(stderr, "xestrata-vision: model files loaded in %.1f s (weights %.2f GB)\n",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count(),
+                 (double) vision.weight_bytes() / 1e9);
+    if (!gpu)
+        std::fprintf(stderr, "xestrata-vision: on the CPU, %d threads, %s products (%s), no warm-up\n", threads,
+                     vision.cpu_i8() ? "int8" : "BF16",
+                     vision.cpu_i8() ? strata::kernels::cpu::i8_gemm_isa_name(strata::kernels::cpu::i8_gemm_isa())
+                                     : strata::kernels::cpu::bf16_gemm_isa_name(strata::kernels::cpu::bf16_gemm_isa()));
+    const int64_t align = vision.patch() * vision.merge();
+    // Warm up at the largest picture (well above any cap; the reader's size rule brings it to --max-tokens) before
+    // READY: the encoder's work buffers are allocated now, not at the first real picture, and the server starts this
+    // process before the engine so that the engine sizes its expert cache from what is really left.  The CPU's
+    // buffers are the host's, so it only counts the tokens such a picture becomes (an encode there takes seconds).
+    int64_t warm_tokens = 0, n_embd = 0;
+    if (!gpu) {
+        const Size sz = reader_size(2048, 2048, align, min_tokens, max_tokens);
+        warm_tokens = (sz.w / align) * (sz.h / align);
+        n_embd = vision.dim();
         if (max_tokens > 0 && warm_tokens > max_tokens + max_tokens / 8)
-            std::fprintf(stderr, "strata-vision: WARNING the warm-up picture became %d image tokens, over the limit of %d (--max-tokens): "
-                                 "the limit is not applied for this model; pictures over it are refused\n", warm_tokens, max_tokens);
-        mtmd_input_chunks_free(chunks);
-        if (bm) mtmd_bitmap_free(bm);
-        // READY tells the server the encoder's buffers are allocated, and it starts the engine on what is left: an
-        // encoder whose warm-up failed has not allocated them and would fail its first picture anyway
-        if (warm_tokens <= 0) {
-            std::printf("ERR the warm-up encode failed\n");
+            std::fprintf(stderr, "xestrata-vision: WARNING a 2048 x 2048 picture becomes %lld image tokens, over the "
+                                 "limit of %lld (--max-tokens): pictures over it are refused\n",
+                         (long long) warm_tokens, (long long) max_tokens);
+    } else {
+        const auto warm_t0 = std::chrono::steady_clock::now();
+        const int64_t side = 2048;
+        std::vector<uint8_t> gray((size_t) (side * side * 4), 128);
+        const Size sz = reader_size(side, side, align, min_tokens, max_tokens);
+        try {
+            const auto rgb = picture_planes(gray, side, side, sz);
+            const strata::core::VisionOut out = vision.encode(rgb.data(), sz.w, sz.h);
+            warm_tokens = out.rows;
+            n_embd = out.dim;
+        } catch (const std::exception& e) {
+            std::printf("ERR the warm-up encode failed: %s\n", e.what());
             std::fflush(stdout);
             return 1;
         }
+        std::fprintf(stderr, "xestrata-vision: warmed up at %lld image tokens in %.1f s\n", (long long) warm_tokens,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count());
+        // I7 (#3690): a picture that became 93,700 image tokens under --max-tokens 1024: the evidence line the
+        // report asks for
+        if (max_tokens > 0 && warm_tokens > max_tokens + max_tokens / 8)
+            std::fprintf(stderr, "xestrata-vision: WARNING the warm-up picture became %lld image tokens, over the limit "
+                                 "of %lld (--max-tokens): pictures over it are refused\n", (long long) warm_tokens,
+                         (long long) max_tokens);
     }
-    // the third word names the reader; a fourth, "fallback", says our tower failed before READY (the server reads only the start: "READY")
-    std::printf("READY %d mtmd%s\n", n_embd, own_fell_back ? " fallback" : "");
+    if (warm_tokens <= 0 || n_embd <= 0) {
+        std::printf("ERR the warm-up encode failed\n");
+        std::fflush(stdout);
+        return 1;
+    }
+    std::printf("READY %lld\n", (long long) n_embd);
     std::fflush(stdout);
 
     std::string line;
     while (std::getline(std::cin, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
         if (line == "QUIT") break;
-        std::string img, out;
-        if (!parse_enc(line, img, out)) { std::printf("ERR expected: ENC <image> <output>\n"); std::fflush(stdout); continue; }
+        std::string img, out_path;
+        if (!parse_enc(line, img, out_path)) {
+            std::printf("ERR expected: ENC <image> <output>\n");
+            std::fflush(stdout);
+            continue;
+        }
         const auto t0 = std::chrono::steady_clock::now();
-        mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_file(ctx, img.c_str(), false,
-                                                                            mtmd_helper_init_opt_default());
-        if (!bw.bitmap) { std::printf("ERR cannot read the image %s\n", img.c_str()); std::fflush(stdout); continue; }
-        mtmd_input_chunks* chunks = mtmd_input_chunks_init();
-        const std::string prompt = mtmd_default_marker();
-        mtmd_input_text txt{prompt.c_str(), prompt.size(), false, true};
-        const mtmd_bitmap* bm[1] = {bw.bitmap};
-        std::string err;
-        const mtmd_input_chunk* ichunk = nullptr;
-        if (mtmd_tokenize(ctx, chunks, &txt, bm, 1) != 0) err = "the image could not be preprocessed";
-        for (size_t c = 0; err.empty() && c < mtmd_input_chunks_size(chunks); ++c) {
-            const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks, c);
-            if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE) ichunk = ch;
+        int64_t w = 0, h = 0;
+        const std::vector<uint8_t> rgba = strata::image::load_rgba8(img, w, h, err);
+        if (rgba.empty() || w <= 0 || h <= 0) {
+            std::printf("ERR cannot read the image %s (%s)\n", img.c_str(), err.c_str());
+            std::fflush(stdout);
+            continue;
         }
-        if (err.empty() && !ichunk) err = "no image chunk";
-        // the token count and the grid come from the preprocessing in mtmd_tokenize, so they are checked before the (costly) encode
-        int n = 0, nx = 0, ny = 0;
-        if (err.empty()) {
-            const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ichunk);
-            n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
-            if (n <= 0) err = "the image has no tokens";
-            if (err.empty()) {
-                // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
-                const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
-                nx = (int) last.x + 1;
-                ny = (int) last.y + 1;
-                if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
-            }
-            // never silently produce many times the budget (I7, #3690): over the limit (a rounding margin of an eighth) the picture is refused
-            if (err.empty() && max_tokens > 0 && n > max_tokens + max_tokens / 8)
-                err = "the picture became " + std::to_string(n) + " image tokens, over the limit of " + std::to_string(max_tokens) +
-                      " (vision.max_tokens); send a smaller picture or raise the limit";
+        const Size sz = reader_size(w, h, align, min_tokens, max_tokens);
+        strata::core::VisionOut out;
+        try {
+            const std::vector<float> rgb = picture_planes(rgba, w, h, sz);
+            out = vision.encode(rgb.data(), sz.w, sz.h);
+        } catch (const std::exception& e) {
+            std::printf("ERR %s\n", e.what());
+            std::fflush(stdout);
+            continue;
         }
-        if (err.empty() && mtmd_encode_chunk(ctx, ichunk) != 0) err = "the vision encoder failed";
-        if (err.empty()) {
-            const float* embd = mtmd_get_output_embd(ctx);
-            FILE* f = err.empty() ? std::fopen(out.c_str(), "wb") : nullptr;
-            if (err.empty() && !f) err = "cannot write " + out;
-            if (f) {
-                const int32_t hdr[5] = {0x31455653, n, nx, ny, n_embd};
-                const bool ok = std::fwrite(hdr, sizeof hdr, 1, f) == 1 &&
-                                std::fwrite(embd, sizeof(float) * (size_t) n_embd, (size_t) n, f) == (size_t) n;
-                std::fclose(f);
-                if (!ok) err = "short write to " + out;
-                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                if (ok) std::printf("OK %d %d %d %.0f\n", n, nx, ny, ms);
-            }
+        const int64_t n = out.rows, nx = out.grid_w, ny = out.grid_h;
+        if (nx * ny != n || out.dim != n_embd) {
+            std::printf("ERR the image grid is not rectangular (%lld tokens)\n", (long long) n);
+            std::fflush(stdout);
+            continue;
         }
-        if (!err.empty()) std::printf("ERR %s\n", err.c_str());
+        // never silently produce many times the budget (I7, #3690): over the limit (a rounding margin of an eighth)
+        // the picture is refused, as mtmd's reader refused it
+        if (max_tokens > 0 && n > max_tokens + max_tokens / 8) {
+            std::printf("ERR the picture became %lld image tokens, over the limit of %lld (vision.max_tokens); send a "
+                        "smaller picture or raise the limit\n", (long long) n, (long long) max_tokens);
+            std::fflush(stdout);
+            continue;
+        }
+        FILE* f = std::fopen(out_path.c_str(), "wb");
+        if (f == nullptr) {
+            std::printf("ERR cannot write %s\n", out_path.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        const int32_t hdr[5] = {0x31455653, (int32_t) n, (int32_t) nx, (int32_t) ny, (int32_t) out.dim};
+        const bool ok = std::fwrite(hdr, sizeof hdr, 1, f) == 1 &&
+                        std::fwrite(out.main.data(), sizeof(float) * (size_t) out.dim, (size_t) n, f) == (size_t) n;
+        std::fclose(f);
+        if (!ok) {
+            std::printf("ERR short write to %s\n", out_path.c_str());
+            std::fflush(stdout);
+            continue;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("OK %lld %lld %lld %.0f\n", (long long) n, (long long) nx, (long long) ny, ms);
         std::fflush(stdout);
-        mtmd_input_chunks_free(chunks);
-        mtmd_bitmap_free(bw.bitmap);
-        if (bw.video_ctx) mtmd_helper_video_free(bw.video_ctx);
     }
-    mtmd_free(ctx);
-    llama_model_free(text);
-    llama_backend_free();
     return 0;
 }

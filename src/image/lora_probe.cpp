@@ -27,15 +27,18 @@
 // adapter's layer kept on the weight through the load); MOSS_STEP_BLOCK_MIB: the blocks' VRAM (the rest streamed).
 // MF_STEP_HW, MF_STEP_TEXT: the latent's rows a side (2) and the text's (4); MF_STEP_Q8=1: the blocks in 8 bits (else
 // FP16); MF_STEP_BLOCK_MIB: the blocks' VRAM (the rest streamed from RAM); MF_STEP_REFS: an edit's reference images
-// (one, at the latent size, its own rows after the target's).
+// (one, at the latent size, its own rows after the target's).  LORA_STEP_NOBAKE=1: every step keeps the plain LoRAs
+// beside the products instead of baking them in (a DoRA is never baked; the same path on both sides of a comparison).
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/dit_loras.hpp"
 #include "strata/image/image_lora.hpp"
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/moss_dit.hpp"
 #include "strata/image/moss_pipeline.hpp"
 #include "strata/image/qi_dit.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/prefill/gemm.hpp"
 
@@ -79,7 +82,7 @@ int list(const std::string& path) {
                           e.oft.stages > 1 ? (" x " + std::to_string(e.oft.stages)).c_str() : "");
         std::printf("  %-56s %-5s rank %-4lld %s %lld x %lld scale %.4f%s%s%s%s%s\n", e.key.c_str(),
                     strata::image::lora_kind_name(e.kind), (long long) e.rank, "in/out", (long long) e.cols,
-                    (long long) e.rows, e.scale(), e.dora.empty() ? "" : " dora",
+                    (long long) e.rows, e.scale(), e.dora.empty() ? "" : (e.dora_over_rows ? " dora" : " dora(cols)"),
                     e.delta.empty() ? "" : (e.replaces ? " set_weight" : " diff"),
                     e.bias.empty() ? "" : " +bias", e.extra.empty() ? "" : " +tensors", oft);
     }
@@ -361,7 +364,7 @@ void selftest_loha(void* s, int64_t T, int64_t K, int64_t R1, int64_t R2, int64_
     e.kind = si::LoraKind::loha;
     e.cols = K;
     e.rows = N;
-    e.rank = R1;   // ComfyUI's dim: w1_b's rows
+    e.rank = R1;   // the rank: w1_b's rows
     const auto fill = [&](const char* role, std::vector<int64_t> shape) {
         size_t n_values = 1;
         for (int64_t d : shape) n_values *= (size_t) d;
@@ -459,7 +462,9 @@ void selftest_loha(void* s, int64_t T, int64_t K, int64_t R1, int64_t R2, int64_
 }
 
 // one DoRA entry: the base product's rows scaled by 1 + strength (c - 1), then the delta's rows by strength (file
-// scale) * c; c = dora_scale / (the weight's row norm + eps), the weight as the product takes it (FP16)
+// scale) * c; c = dora_scale / (||W + (alpha/rank) BA|| + eps), PEFT's composed row norm (the weight and the factors
+// as the product takes them, FP16).  The shared expansion (dit_dora_norms) is checked against PEFT's own form: the
+// composed weight made and its rows' norm taken directly.
 void selftest_dora(void* s, int64_t T, int64_t K, int64_t R, int64_t N) {
     namespace si = strata::image;
     std::mt19937 rng((uint32_t) (T * 31 + K * 17 + R * 13 + N * 7 + 1));
@@ -483,21 +488,35 @@ void selftest_dora(void* s, int64_t T, int64_t K, int64_t R, int64_t N) {
     si::lora_to_f16(a, e.a);
     si::lora_to_f16(b, e.b);
     const float strength = 0.7f, scale = strength * e.scale();
-    // the weight's rows' norms, from the FP16 values the product takes
+    // the composed norms ||W_r + (alpha/rank) (BA)_r||, from the FP16 values the product takes
     std::vector<uint16_t> w16((size_t) (N * K));
     si::lora_to_f16(w, w16);
-    std::vector<float> norms((size_t) N);
+    const auto read = [&w16, K](int64_t r0, int64_t n, float* out, std::string&) {
+        for (int64_t r = 0; r < n; ++r)
+            for (int64_t k = 0; k < K; ++k)
+                out[r * K + k] = strata::kernels::f32_from_f16(w16[(size_t) ((r0 + r) * K + k)]);
+        return true;
+    };
+    std::vector<float> norms;
+    std::string err;
+    if (!si::dit_dora_norms(e, 0, 0, N, K, read, norms, err)) throw std::runtime_error(err);
+    // PEFT's own form (tuners/lora/dora.py's get_weight_norm): the composed weight made, its rows' norm directly
+    const float fs = e.scale();
     for (int64_t r = 0; r < N; ++r) {
         double n2 = 0;
         for (int64_t k = 0; k < K; ++k) {
-            const double v = strata::kernels::f32_from_f16(w16[(size_t) (r * K + k)]);
+            double v = strata::kernels::f32_from_f16(w16[(size_t) (r * K + k)]);
+            for (int64_t j = 0; j < R; ++j)
+                v += (double) fs * strata::kernels::f32_from_f16(e.b[(size_t) (r * R + j)]) *
+                     strata::kernels::f32_from_f16(e.a[(size_t) (j * K + k)]);
             n2 += v * v;
         }
-        norms[(size_t) r] = (float) std::sqrt(n2);
+        const double want = std::sqrt(n2), got = norms[(size_t) r];
+        if (std::fabs(got - want) > 2e-5 * std::max(want, 1e-6))
+            throw std::runtime_error("the DoRA's composed norm is not PEFT's direct form's");
     }
     std::vector<float> coef, base;
-    std::string err;
-    if (!si::lora_dora_rows(e, 0, 0, N, norms, strength, coef, base, err)) throw std::runtime_error(err);
+    if (!si::lora_dora_rows(e, 0, N, norms, strength, coef, base, err)) throw std::runtime_error(err);
 
     si::LoraLayer layer;
     si::LoraPart part;
@@ -564,7 +583,7 @@ void selftest_dora(void* s, int64_t T, int64_t K, int64_t R, int64_t N) {
     if (!ok) throw std::runtime_error("the DoRA's product is not the reference's");
 }
 
-// a bias's delta (ComfyUI's "diff" patch of a weight's bias): y[t][row0 + c] += scale * bias[src_row + c], alone
+// a bias's delta (a "diff" patch of a weight's bias): y[t][row0 + c] += scale * bias[src_row + c], alone
 // (LoraKind::bias: the file holds no weight's delta) and beside a plain LoRA's, both into the rows of a fused weight's
 // second half where that is asked
 void selftest_bias(void* s, int64_t T, int64_t N, bool with_weight, int64_t src_row = 0, int64_t row0 = 0,
@@ -748,7 +767,7 @@ void selftest_glora(void* s, int64_t T, int64_t K, int64_t R, int64_t N, bool ro
     std::vector<float> rs((size_t) T);
     for (int64_t t = 0; t < T; ++t) rs[(size_t) t] = std::exp2((float) (t % 3)) * 0.5f;   // 0.5, 1, 2
     // the file's four tensors, in the reading its shapes take: LyCORIS's a1 [rank][cols], a2 [cols][rank], b1
-    // [rank][cols], b2 [rows][rank]; ComfyUI's own a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2 [rank][cols]
+    // [rank][cols], b2 [rows][rank]; the newer a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2 [rank][cols]
     si::LoraEntry e;
     e.key = "selftest-glora";
     e.kind = si::LoraKind::glora;
@@ -760,7 +779,7 @@ void selftest_glora(void* s, int64_t T, int64_t K, int64_t R, int64_t N, bool ro
         for (float& x : v) x = nd(rng) * 0.1f;
         return v;
     };
-    // the file's four, the reading's shapes: ComfyUI's a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
+    // the file's four, the reading's shapes: the newer a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
     // [rank][cols]; LyCORIS's a1 [rank][cols], a2 [cols][rank], b1 [rank][cols], b2 [rows][rank]
     std::vector<float> t1 = make(lycoris ? (size_t) (R * K) : (size_t) (K * R));
     std::vector<float> t2 = make(lycoris ? (size_t) (K * R) : (size_t) (R * K));
@@ -911,7 +930,7 @@ int selftest() {
         selftest_oft(s, 8, 64, 32, 1, true, false, 0.6f);
         selftest_oft(s, 8, 64, 4, 2, true, false, 1.0f);
         selftest_oft(s, 16, 64, 8, 3, true, true, 0.7f);
-        // a GLoRA: the plain form's pair and the weight's own product of the input its two factors make (ComfyUI's
+        // a GLoRA: the plain form's pair and the weight's own product of the input its two factors make (the newer
         // reading, then LyCORIS's older one), a W8A8 product's row scale, and the rows of a fused weight's half
         selftest_glora(s, 8, 64, 8, 32, false, false, 0.7f);
         selftest_glora(s, 8, 64, 8, 32, false, true, 1.0f);
@@ -945,7 +964,7 @@ int map(const std::string& dit_path, const std::string& lora_path, float scale) 
     for (const auto& entry : f->entries()) {
         const si::QiDit::LoraTarget* t = nullptr;
         for (const auto& c : targets)
-            if (c.name == entry.key) {
+            if (si::lora_key_names(entry.key, c.name)) {
                 t = &c;
                 break;
             }
@@ -981,9 +1000,10 @@ int step(const std::string& dit_path, const std::string& out_path, const std::st
     si::QiDit dit;
     std::string err;
     if (!dit.open(dit_path, s, err)) throw std::runtime_error(err);
+    if (std::getenv("LORA_STEP_NOBAKE") != nullptr) dit.set_lora_bake(false);   // the adapters added to each product
     if (!lora_path.empty()) {
         std::vector<si::LoraUse> loras;
-        loras.push_back({si::LoraFile::open(lora_path), scale});
+        loras.push_back({si::LoraFile::open(lora_path), scale, {}});
         if (!dit.set_loras(loras, err)) throw std::runtime_error(err);
     }
     const char* hw_env = std::getenv("QI_STEP_HW");
@@ -1037,6 +1057,15 @@ int step(const std::string& dit_path, const std::string& out_path, const std::st
 
 namespace {
 
+// n BF16 values on the device (MossDit's rows) as floats
+std::vector<float> bf16_rows(const uint16_t* d, size_t n) {
+    std::vector<uint16_t> b(n);
+    strata::gpu::copy(b.data(), d, n * 2);
+    std::vector<float> h(n);
+    for (size_t i = 0; i < n; ++i) h[i] = strata::kernels::f32_from_bf16(b[i]);
+    return h;
+}
+
 // MOSS-Image's table of the weights adapters may take (one line a name: its entry's rows and columns), and where each
 // entry of `lora` lands on it (a line a mapped weight, MISSING a key the DiT does not take, SHAPE a weight whose rows
 // and columns are not the entry's).
@@ -1064,7 +1093,7 @@ int moss_map(const std::string& dit_path, const std::string& lora_path, float sc
     for (const auto& entry : f->entries()) {
         const si::MossDit::LoraTarget* g = nullptr;
         for (const auto& c : groups)
-            if (c.name == entry.key) {
+            if (si::lora_key_names(entry.key, c.name)) {
                 g = &c;
                 break;
             }
@@ -1100,13 +1129,14 @@ int moss_step(const std::string& dit_path, const std::string& out_path, const st
     std::string err;
     const bool q8 = std::getenv("MOSS_STEP_Q8") != nullptr;
     if (!dit.open(dit_path, s, err, false, q8)) throw std::runtime_error(err);
+    if (std::getenv("LORA_STEP_NOBAKE") != nullptr) dit.set_lora_bake(false);   // the adapters added to each product
     if (const char* mib = std::getenv("MOSS_STEP_BLOCK_MIB"); mib != nullptr && *mib != 0) {   // VRAM of the blocks
         dit.set_block_budget((uint64_t) std::strtoull(mib, nullptr, 10) << 20);
         std::printf("the blocks' VRAM %s MiB, %d of %d resident\n", mib, dit.resident_blocks(), dit.blocks());
     }
     if (!lora_path.empty()) {
         std::vector<si::LoraUse> loras;
-        loras.push_back({si::LoraFile::open(lora_path), scale});
+        loras.push_back({si::LoraFile::open(lora_path), scale, {}});
         if (!dit.set_loras(loras, err)) throw std::runtime_error(err);
     }
     const char* hw_env = std::getenv("MOSS_STEP_HW");
@@ -1132,12 +1162,10 @@ int moss_step(const std::string& dit_path, const std::string& out_path, const st
         // the text embedder's weights go (the pipeline gives them up for the blocks' room) and come back: a weight an
         // adapter is bound to keeps its layer across the load, and the velocity is the same again
         const uint64_t before = dit.lora_bytes();
-        std::vector<float> rows_before((size_t) (n_text * dit.hidden()));
-        gpu::copy(rows_before.data(), dit.text_rows(0), rows_before.size() * 4);
+        std::vector<float> rows_before = bf16_rows(dit.text_rows(0), (size_t) (n_text * dit.hidden()));
         if (std::strcmp(drop, "1") == 0) dit.drop_text();
         dit.set_context(0, ctx.data(), n_text);
-        std::vector<float> rows_after((size_t) (n_text * dit.hidden()));
-        gpu::copy(rows_after.data(), dit.text_rows(0), rows_after.size() * 4);
+        std::vector<float> rows_after = bf16_rows(dit.text_rows(0), (size_t) (n_text * dit.hidden()));
         double rd = 0, ra = 0, rb = 0;
         for (size_t i = 0; i < rows_after.size(); ++i) {
             rd += (double) rows_before[i] * rows_after[i];
@@ -1196,7 +1224,7 @@ int mf_map(const std::string& dit_path, const std::string& lora_path, float scal
     for (const auto& entry : f->entries()) {
         const si::MfDit::LoraTarget* t = nullptr;
         for (const auto& c : targets)
-            if (c.name == entry.key) {
+            if (si::lora_key_names(entry.key, c.name)) {
                 t = &c;
                 break;
             }
@@ -1232,13 +1260,14 @@ int mf_step(const std::string& dit_path, const std::string& out_path, const std:
     std::string err;
     const bool q8 = std::getenv("MF_STEP_Q8") != nullptr;
     if (!dit.open(dit_path, s, err, false, q8)) throw std::runtime_error(err);
+    if (std::getenv("LORA_STEP_NOBAKE") != nullptr) dit.set_lora_bake(false);   // the adapters added to each product
     if (const char* mib = std::getenv("MF_STEP_BLOCK_MIB"); mib != nullptr && *mib != 0) {   // VRAM of the blocks
         dit.set_block_budget((uint64_t) std::strtoull(mib, nullptr, 10) << 20);
         std::printf("the blocks' VRAM %s MiB, %d of %d resident\n", mib, dit.resident_blocks(), (int) dit.blocks());
     }
     if (!lora_path.empty()) {
         std::vector<si::LoraUse> loras;
-        loras.push_back({si::LoraFile::open(lora_path), scale});
+        loras.push_back({si::LoraFile::open(lora_path), scale, {}});
         if (!dit.set_loras(loras, err)) throw std::runtime_error(err);
     }
     const char* hw_env = std::getenv("MF_STEP_HW");
@@ -1315,7 +1344,7 @@ int main(int argc, char** argv) {
                      argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-lora-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-lora-probe: %s\n", e.what());
         return 1;
     }
 }

@@ -5,22 +5,27 @@
 // decode attention over the selected cells for fp16, INT8 and Q4_0 KV, then a merge of the chunk partials.
 //
 // The head size HD and the query heads per KV head G are template parameters: (256, 12) is Qwen3.8's QSA, (256, 8)
-// Ornith-1.5's and (128, 10) llm-jp-4.1's full attention, which read EVERY cell (`qsa_dense_attn_*`: no selection,
-// cell c of the cache for slot c).  A work-group has HD work-items, one per dimension in the value loop; a lane holds
-// HD/32 dimensions in the score loop.  For (256, 12) every expression is the one this file had with HD and G fixed.
+// Ornith-1.5's, (128, 10) llm-jp-4.1's and (128, 6), (128, 16) and (128, 8) PLaMo 3 Translate's (2B, 0.8B and 8B)
+// full attention, which read EVERY cell (`qsa_dense_attn_*`: no selection, cell c of the cache for slot c), or with a
+// window the last `window` cells only (cell lo + c for slot c, lo = max(0, n_kv - window): PLaMo 3's sliding-window
+// layers).  A work-group has HD work-items, one per dimension in the value loop; a lane holds HD/32 dimensions in the
+// score loop.  For (256, 12) every expression is the one this file had with HD and G fixed.
 //
 // A warp is a sub-group of 32.  CUDA used the __expf intrinsic here; this uses the precise exp.  Explicit fmaf calls
 // stay fused (sycl::fma), and the library's -ffp-contract=off leaves every other multiply-add as written.
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "xe_shuffle.hpp"
-#include "q8_1_finite.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "kv_tcq_parts.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_decode_attn
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <cfloat>
@@ -29,12 +34,26 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace strata::kernels {
 namespace {
 
-constexpr int CHUNK = 64;        // cells per work-group
+constexpr int CHUNK = 64;        // cells per work-group (at most: chunk_of)
+
+// The cells a chunk takes: CHUNK, or for every cell (a dense query, no selection) on a short context fewer, so that its
+// cells spread over kShortChunks chunks of `min_chunk` cells or more: one group took a 64-cell chunk's heads in turn,
+// 11 us a layer on the RTX 4070 where llama.cpp's took 4.  From kShortChunks * CHUNK cells on, whole chunks: smaller
+// ones there cost more in partials than the groups gain (16-cell chunks: PLaMo 3 Translate 0.8B's decode after 12K
+// cells 447 -> 429 tok/s on the B70).  The selection's chunks (Qwen3.8-Flash-Next's) stay whole.
+constexpr int kShortChunks = 8;
+inline int chunk_of(bool dense, int n_ids, int n_slots, int min_chunk) {
+    if (!dense || min_chunk >= CHUNK) return CHUNK;
+    // (a slot takes one chunk at most where it keeps its partials: n_slots chunks at most)
+    const int per = sycl::max((n_ids + kShortChunks - 1) / kShortChunks, (n_ids + n_slots - 1) / n_slots);
+    return per < min_chunk ? min_chunk : per > CHUNK ? CHUNK : per;
+}
 constexpr int WARP = 32;
 
 sycl::queue& queue_for(void* stream) {
@@ -86,27 +105,44 @@ inline float reduce4(const sycl::sub_group& sg, const float (&part)[4], int lane
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
         const bool hi = (lane & 16) != 0;
-        r2[i] = (hi ? part[i + 2] : part[i]) + sycl::permute_group_by_xor(sg, hi ? part[i] : part[i + 2], 16);
+        r2[i] = (hi ? part[i + 2] : part[i]) + strata_shfl_xor(sg, hi ? part[i] : part[i + 2], 16);
     }
     const bool hi8 = (lane & 8) != 0;
-    float r = (hi8 ? r2[1] : r2[0]) + sycl::permute_group_by_xor(sg, hi8 ? r2[0] : r2[1], 8);
-    r += sycl::permute_group_by_xor(sg, r, 4);
-    r += sycl::permute_group_by_xor(sg, r, 2);
-    return r + sycl::permute_group_by_xor(sg, r, 1);
+    float r = (hi8 ? r2[1] : r2[0]) + strata_shfl_xor(sg, hi8 ? r2[0] : r2[1], 8);
+    r += strata_shfl_xor(sg, r, 4);
+    r += strata_shfl_xor(sg, r, 2);
+    return r + strata_shfl_xor(sg, r, 1);
 }
 inline int head_of_lane4(int lane) { return ((lane >> 4) & 1) * 2 + ((lane >> 3) & 1); }
 inline int head_of_lane(int lane) {
     return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
 }
 
+// The host copy (KV streaming) as attention pools: the same fields, so the loads below read it with the one code
+// path. Its page table is unused (the host row is the identity layout, computed where the cell is mapped).
+inline QsaAttnPools host_pools(const KvHostPools& h) {
+    QsaAttnPools p;
+    p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q;
+    p.k_scale = h.k_scale; p.v_scale = h.v_scale; p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
+    return p;
+}
+
 // One V element of pool row `row`, dimension `d` (the value loop's own work-item), per KV format.
+// tab: the trellis code's codebook in local memory (KV_MODE 4; the kernel fills it), else null
 template <int HD, int KV_MODE>
-inline float load_v1(const QsaAttnPools& p, long long row, int d) {
+inline float load_v1(const QsaAttnPools& p, long long row, int d, const float* tab, int ring) {
     if constexpr (KV_MODE == 0) {
         return h2f(p.v_pool[row * HD + d]);
     } else if constexpr (KV_MODE == 1) {
         const float sc = h2f(p.v_scale[row * (HD / KV_Q8_GROUP) + d / KV_Q8_GROUP]);
         return (float) p.v_q[row * HD + d] * sc;
+    } else if constexpr (KV_MODE == 4) {   // trellis-coded, rotated (kv_tcq.hpp); the caller rotates the output back
+        if (ring >= 0) {   // a cell not coded yet: the ring's INT8 (V's plane, ring + kTcqRing x the KV heads)
+            const int8_t* c = tcq::ring_codes(p.tc_ring, ring, HD);
+            return (float) c[d] * h2f(tcq::ring_scales(p.tc_ring, ring, HD, p.tc_ring_kv)[d / 64]);
+        }
+        const int bits = p.tc_bits;
+        return tcq::value(p.v_tc + row * (long long) tcq::row_bytes(HD, bits), HD, bits, d, tab);
     } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
         constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
         const int b = d / QK4_0;
@@ -121,14 +157,25 @@ inline float load_v1(const QsaAttnPools& p, long long row, int d) {
 }
 
 // N = HD / 32 consecutive values of one cell's key or value row, dimensions [d0, d0+N).  KV_MODE 0: FP16, 1: INT8,
-// 2: rotated Q4_0, 3: the hybrid K8V4 (K as INT8, V as rotated Q4_0; upstream 2aa8f72).  N divides 16, so the run
-// stays inside one Q4_0 half (the low nibbles hold elements 0-15 of a block, the high ones 16-31).
+// 2: rotated Q4_0, 3: the hybrid K8V4 (K as INT8, V as rotated Q4_0; upstream 2aa8f72), 4: trellis-coded K and V
+// (kv_tcq.hpp).  N divides 16, so the run stays inside one Q4_0 half (the low nibbles hold elements 0-15 of a block,
+// the high ones 16-31) and inside one chain of the trellis code.
 template <int HD, int KV_MODE>
-inline void loadn(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
+inline void loadn(const QsaAttnPools& p, bool value, long long row, int d0, float* out, const float* tab, int ring) {
     constexpr int N = HD / WARP;
-    if constexpr (KV_MODE == 3) {
-        if (value) loadn<HD, 2>(p, true, row, d0, out);
-        else loadn<HD, 1>(p, false, row, d0, out);
+    if constexpr (KV_MODE == 4) {
+        if (ring >= 0) {   // a cell not coded yet: the ring's INT8 (K's plane)
+            const int8_t* c = tcq::ring_codes(p.tc_ring, ring, HD) + d0;
+            const float sc = h2f(tcq::ring_scales(p.tc_ring, ring, HD, p.tc_ring_kv)[d0 / 64]);
+            for (int j = 0; j < N; ++j) out[j] = (float) c[j] * sc;
+            return;
+        }
+        const int bits = p.tc_bits;
+        tcq::values<N>((value ? p.v_tc : p.k_tc) + row * (long long) tcq::row_bytes(HD, bits), HD, bits,
+                       d0, out, tab);
+    } else if constexpr (KV_MODE == 3) {
+        if (value) loadn<HD, 2>(p, true, row, d0, out, tab, ring);
+        else loadn<HD, 1>(p, false, row, d0, out, tab, ring);
     } else if constexpr (KV_MODE == 0) {
         const uint16_t* base = (value ? p.v_pool : p.k_pool) + row * HD + d0;
         for (int j = 0; j < N; ++j) out[j] = h2f(base[j]);
@@ -162,75 +209,137 @@ inline float dotn(const float* k, const float* q) {
 
 // LOOP: a slot reads more than one chunk (n_slots below the chunks); without it every expression is the one this file
 // had before the slots.
-template <int HD, int G, int KV_MODE, bool LOOP, int NC>
-sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPools p, const int32_t* ids_all,
+// PERCELL: a work-item takes one selected cell and all its head products (percell_pick's choice).
+// ROWS: a batch window's rows, each with its own slot's pools.  A template argument, not a test of rows.n in the
+// kernel: the pools picked per work-item cost the B70 8 times the kernel's time (69 -> 532 us at 8192 cells) and the
+// RTX 4070 some, for every caller.
+template <int HD, int G, int KV_MODE, bool LOOP, int NC, bool PERCELL, bool ROWS>
+sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPools pools, const int32_t* ids_all,
                          const int32_t* step_all, int n_kv_heads, int page_size, float scale, float* part_acc_all,
                          float* part_m_all, float* part_l_all, int n_slots, size_t n_q, int cap,
-                         long long scratch_stride) {
+                         long long scratch_stride, int window, int kv_div, int min_chunk,
+                         const QsaAttnPoolsRows rows) {
     static_assert(G >= 1 && G <= 16, "reduce12 sums at most 16 heads");
     static_assert(HD % 128 == 0 && HD <= 256, "a lane holds HD/32 dimensions inside one Q4_0 half");
     constexpr int THREADS = HD;           // one work-item per dimension in the value loop
     constexpr int WARPS = THREADS / WARP;
     constexpr int N = HD / WARP;          // dimensions a lane holds in the score loop
     constexpr int GP = (G + 3) / 4 * 4;   // a cell's weights padded to whole float4s
-    // the local arrays below: 25 KiB at 16 heads of 256 (the largest shape the asserts above take), 19 at Flash-Next's
-    // 12; every GPU this runs on gives 32 KiB and more
-    static_assert((G * HD + G * CHUNK + CHUNK * GP + 2 * G) * 4 + CHUNK * 8 <= 32 * 1024, "a work-group's local memory");
+    // the local arrays below: 26 KiB at 16 heads of 256 with the trellis code's table (the largest shape the asserts
+    // above take), 20 at Flash-Next's 12; every GPU this runs on gives 32 KiB and more
+    static_assert((G * HD + (KV_MODE == 4 ? 256 : 1) + G * CHUNK + CHUNK * GP + (KV_MODE == 4 ? CHUNK : 1) + CHUNK +
+                   2 * G) * 4 + CHUNK * 8 <= 32 * 1024, "a work-group's local memory");
     // ids_all null: every cell, slot c of the chunk is cell c0 + c, and the count is the cache's (step[kStepNKv])
     const bool dense = ids_all == nullptr;
     return queue.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sq(sycl::range<1>(G * HD), hd);          // this KV head's query heads
+        sycl::local_accessor<float, 1> stab(sycl::range<1>(KV_MODE == 4 ? 256 : 1), hd);   // the trellis codebook
         sycl::local_accessor<float, 1> sp(sycl::range<1>((size_t) G * CHUNK), hd);       // scores
         sycl::local_accessor<sycl::float4, 1> spt(sycl::range<1>(CHUNK * GP / 4), hd);  // probabilities, cell-major
         sycl::local_accessor<long long, 1> srow(sycl::range<1>(CHUNK), hd);     // pool row of each cell
+        // KV_MODE 4, deferred coding: each cell's K row in the ring (a cell not coded yet), else -1
+        sycl::local_accessor<int, 1> sring(sycl::range<1>(KV_MODE == 4 ? CHUNK : 1), hd);
+        sycl::local_accessor<int, 1> shost(sycl::range<1>(CHUNK), hd);         // 1: the cell's row is in the host copy
         sycl::local_accessor<float, 1> sml(sycl::range<1>(2 * G), hd);           // a chunk's max and sum per head
         hd.parallel_for(sycl::nd_range<3>({n_q, (size_t) n_kv_heads, (size_t) n_slots * THREADS}, {1, 1, THREADS}),
                         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const auto grp = it.get_group();
             const sycl::sub_group sg = it.get_sub_group();
             const size_t z = it.get_group(0);
-            // batched form: query z, with its own q row, selection, step and scratch
+            // batched form: query z, with its own q row, selection, step and scratch; a batch window's row reads
+            // its own slot's pools (ROWS)
+            const QsaAttnPools& p = [&]() -> const QsaAttnPools& {
+                if constexpr (ROWS) return rows.p[z];
+                else return pools;
+            }();
+            const QsaAttnPools hp = host_pools(p.host);   // the host copy as pools (streamed dense attention)
             const float* q = q_all + z * (size_t) (n_kv_heads * G) * HD;
             const int32_t* ids = dense ? nullptr : ids_all + z * (size_t) cap;
             const int32_t* step = step_all + z * kStepCount;
             float* part_acc = part_acc_all + z * (size_t) scratch_stride;
             float* part_m = part_m_all + z * (size_t) scratch_stride;
             float* part_l = part_l_all + z * (size_t) scratch_stride;
-            const int n_ids = dense ? step[kStepNKv] : step[kStepWidth];
-            const int first = (int) it.get_group(2), kvh = (int) it.get_group(1);
+            const int n_all = dense ? step[kStepNKv] : step[kStepWidth];
+            const int lo = dense && window > 0 ? sycl::max(0, n_all - window) : 0;   // a window's first cell
+            const int n_ids = n_all - lo;
+            // kvh: the group's query heads (G of them); kv_div groups share a KV head (the query heads split
+            // across work-groups, each reading the KV head's cells: kv_div 1, one group a KV head)
+            const int first = (int) it.get_group(2), kvh = (int) it.get_group(1), kv_real = kvh / kv_div;
+            const int n_kv_real = n_kv_heads / kv_div;
             const int t = (int) it.get_local_id(2);
             const int lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
             const int slot = kvh * n_slots + first;
-            if (first * CHUNK >= n_ids) {                         // uniform across the group
+            const int csz = chunk_of(dense, n_ids, n_slots, min_chunk);
+            if (first * csz >= n_ids) {                           // uniform across the group
                 if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
                 return;
             }
             for (int i = t; i < G * HD; i += THREADS) sq[i] = q[(size_t) (kvh * G) * HD + i];
+            // the codebook's values over 256 (a code's value is it times the row's scale): a value read from local
+            // memory, not a gather from the constant table, in the loops below (the barrier after srow orders it)
+            if constexpr (KV_MODE == 4)
+                for (int i = t; i < 256; i += THREADS) stab[i] = (float) tcq::code_of(p.tc_bits, i) * (1.0f / 256.0f);
+            const float* tab = KV_MODE == 4 ? &stab[0] : nullptr;
+            // the cells below `coded` are trellis-coded, the rest still in the ring (kv_tcq.hpp); V's rows follow K's
+            const int coded =
+                KV_MODE == 4 && p.tc_ring != nullptr ? tcq::ring_coded(p.tc_ring, HD, p.tc_ring_kv) : 1 << 30;
+            const int v_ring = kTcqRing * p.tc_ring_kv;
+            const auto ring_of = [&](int c) -> int {
+                if constexpr (KV_MODE == 4) return sring[c];
+                else return -1;
+            };
             // chunks first, first + n_slots, ... in turn, each folded into the running max, sum and values (online
             // softmax); with one chunk a slot (n_slots the chunks) these are the chunk's own, as before
             float run_m[G], run_l[G], run_acc[G];
             for (int h = 0; h < G; ++h) { run_m[h] = -FLT_MAX; run_l[h] = 0.0f; run_acc[h] = 0.0f; }
-            for (int chunk = first; chunk * CHUNK < n_ids; chunk += n_slots) {
-                const int c0 = chunk * CHUNK;
-                const int n_here = sycl::min(CHUNK, n_ids - c0);
+            for (int chunk = first; chunk * csz < n_ids; chunk += n_slots) {
+                const int c0 = chunk * csz;
+                const int n_here = sycl::min(csz, n_ids - c0);
                 if (t < CHUNK) {
                     long long r = -1;
+                    int rr = -1;
+                    int host = 0;
                     if (t < n_here) {
-                        const int cell = dense ? c0 + t : ids[c0 + t];
-                        const long long page = (long long) p.page_table[cell / page_size];
-                        // a block the KV streaming could not make resident keeps page -1; its cells are masked (score
-                        // -FLT_MAX, weight 0) instead of being read from before the pool (upstream f3925cf)
-                        if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                        const int cell = dense ? lo + c0 + t : ids[c0 + t];
+                        if ((dense || p.sparse_host) && p.host.present() && cell < step[kStepNKv] - p.resident) {
+                            // the host copy, identity layout: block cell / page_size, its own KV head's run
+                            r = ((long long) (cell / page_size) * n_kv_real + kv_real) * page_size + (cell % page_size);
+                            host = 1;
+                        } else {
+                            const long long page = (long long) p.page_table[cell / page_size];
+                            // a block the KV streaming could not make resident keeps page -1; its cells are masked (score
+                            // -FLT_MAX, weight 0) instead of being read from before the pool (upstream f3925cf)
+                            if (page >= 0) r = (page * n_kv_real + kv_real) * page_size + (cell % page_size);
+                        }
+                        if (!host && cell >= coded) rr = tcq::ring_row(0, cell % kTcqRing, kv_real, p.tc_ring_kv);
                     }
                     srow[t] = r;
+                    if constexpr (KV_MODE == 4) sring[t] = rr;
+                    shost[t] = host;
                 }
                 sycl::group_barrier(grp);
+                if constexpr (PERCELL) {
+                    // A work-item takes one selected cell and all its head products.  This trades the subgroup
+                    // butterflies for a serial dot and changes the FP32 addition order.
+                    if (t < CHUNK) {
+                        float sums[G] = {};
+                        if (t < n_here && srow[t] >= 0) {
+                            for (int d = 0; d < HD; d += N) {
+                                float key[N];
+                                loadn<HD, KV_MODE>(shost[t] ? hp : p, false, srow[t], d, key, tab, ring_of(t));
+                                for (int h = 0; h < G; ++h) sums[h] += dotn<N>(key, &sq[h * HD + d]);
+                            }
+                        }
+                        for (int h = 0; h < G; ++h)
+                            sp[h * CHUNK + t] = t < n_here && srow[t] >= 0 ? sums[h] * scale : -FLT_MAX;
+                    }
+                } else {
                 // scores: each sub-group takes cells warp, warp+WARPS, ...; each lane holds N of the HD dimensions.
                 // NC cells per step (warp + WARPS * (i + j)): a lane's q slice comes out of local memory once for all
                 // of them (upstream fd95405); every dot product is the same expression as for a single cell, so the
-                // scores are unchanged.  NC is the GPU's own (nc_of, timed by qsa_dense_attn_tune).
+                // scores are unchanged.  NC is the GPU's own (form_of, timed by qsa_dense_attn_tune).
                 const int hd_lane = head_of_lane(lane);
-                for (int i = 0; i < CHUNK / WARPS; i += NC) {
+                for (int i = 0; i < (n_here + WARPS - 1) / WARPS; i += NC) {
                     int cc[NC];
                     bool all_ok = true;
                     for (int j = 0; j < NC; ++j) {
@@ -239,7 +348,8 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                     }
                     if (all_ok) {
                         float kk[NC][N];
-                        for (int j = 0; j < NC; ++j) loadn<HD, KV_MODE>(p, false, srow[cc[j]], lane * N, kk[j]);
+                        for (int j = 0; j < NC; ++j)
+                            loadn<HD, KV_MODE>(shost[cc[j]] ? hp : p, false, srow[cc[j]], lane * N, kk[j], tab, ring_of(cc[j]));
                         constexpr int HP = G <= 4 ? 4 : 16;   // the heads reduce4 or reduce12 sums
                         float pp[NC][HP];
     #pragma unroll
@@ -269,7 +379,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                                 continue;
                             }
                             float kn[N];
-                            loadn<HD, KV_MODE>(p, false, srow[c], lane * N, kn);
+                            loadn<HD, KV_MODE>(shost[c] ? hp : p, false, srow[c], lane * N, kn, tab, ring_of(c));
                             constexpr int HP = G <= 4 ? 4 : 16;
                             float part[HP];
                             for (int h = 0; h < G; ++h) part[h] = dotn<N>(kn, &sq[h * HD + lane * N]);
@@ -285,13 +395,17 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                         }
                     }
                 }
+                }
                 sycl::group_barrier(grp);
                 // per-head chunk max and exp-sum: sub-group w handles heads w, w+WARPS, ...
                 for (int h = warp; h < G; h += WARPS) {
                     constexpr int PER = CHUNK / WARP;   // the cells a lane takes
                     float mx = -FLT_MAX;
     #pragma unroll
-                    for (int k = 0; k < PER; ++k) mx = sycl::fmax(mx, sp[h * CHUNK + lane + WARP * k]);
+                    for (int k = 0; k < PER; ++k) {   // the cells past n_here hold no score of this chunk
+                        const int c = lane + WARP * k;
+                        if (c < n_here) mx = sycl::fmax(mx, sp[h * CHUNK + c]);
+                    }
                     const float m = warp_max(sg, mx);
                     float* pt = reinterpret_cast<float*>(&spt[0]);
                     float sum = 0.0f;
@@ -328,8 +442,11 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 for (; c + 4 <= n_here; c += 4) {
                     const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
                     if ((r0 | r1 | r2 | r3) < 0) break;
-                    const float v0 = load_v1<HD, KV_MODE>(p, r0, t), v1 = load_v1<HD, KV_MODE>(p, r1, t);
-                    const float v2 = load_v1<HD, KV_MODE>(p, r2, t), v3 = load_v1<HD, KV_MODE>(p, r3, t);
+                    const auto vr = [&](int k) { const int g = ring_of(c + k); return g >= 0 ? g + v_ring : -1; };
+                    const float v0 = load_v1<HD, KV_MODE>(shost[c] ? hp : p, r0, t, tab, vr(0));
+                    const float v1 = load_v1<HD, KV_MODE>(shost[c + 1] ? hp : p, r1, t, tab, vr(1));
+                    const float v2 = load_v1<HD, KV_MODE>(shost[c + 2] ? hp : p, r2, t, tab, vr(2));
+                    const float v3 = load_v1<HD, KV_MODE>(shost[c + 3] ? hp : p, r3, t, tab, vr(3));
                     fold(c, v0);
                     fold(c + 1, v1);
                     fold(c + 2, v2);
@@ -337,7 +454,8 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 }
                 for (; c < n_here; ++c) {
                     if (srow[c] < 0) continue;   // masked above, weight 0
-                    fold(c, load_v1<HD, KV_MODE>(p, srow[c], t));
+                    const int g = ring_of(c);
+                    fold(c, load_v1<HD, KV_MODE>(shost[c] ? hp : p, srow[c], t, tab, g >= 0 ? g + v_ring : -1));
                 }
                 if constexpr (!LOOP) {   // the chunk's own partials
                     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
@@ -361,11 +479,22 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
     });
 }
 
-template <int HD, int G>
+// steps_all (with `dense` and `window` as launch_chunk's): only the slots the query's cells reached are read (the others
+// hold no cells); null: every slot
+template <int HD, int G, bool PREFETCH>
 sycl::event launch_merge(sycl::queue& queue, const float* part_acc_all, const float* part_m_all, const float* part_l_all,
-                         int n_chunks, float* attn_all, size_t n_head, size_t n_q, long long scratch_stride) {
+                         int n_slots, float* attn_all, size_t n_head, size_t n_q, long long scratch_stride,
+                         const int32_t* steps_all = nullptr, bool dense = true, int window = 0, int min_chunk = CHUNK) {
     return queue.parallel_for(sycl::nd_range<2>({n_q, n_head * HD}, {1, HD}), [=](sycl::nd_item<2> it) {
         const size_t y = it.get_group(0);
+        int n_chunks = n_slots;
+        if (steps_all != nullptr) {
+            const int32_t* step = steps_all + y * kStepCount;
+            const int n_all = dense ? step[kStepNKv] : step[kStepWidth];
+            const int n_ids = n_all - (dense && window > 0 ? sycl::max(0, n_all - window) : 0);
+            const int csz = chunk_of(dense, n_ids, n_slots, min_chunk);
+            n_chunks = sycl::min(n_slots, (n_ids + csz - 1) / csz);
+        }
         const float* part_acc = part_acc_all + y * (size_t) scratch_stride;
         const float* part_m = part_m_all + y * (size_t) scratch_stride;
         const float* part_l = part_l_all + y * (size_t) scratch_stride;
@@ -374,10 +503,42 @@ sycl::event launch_merge(sycl::queue& queue, const float* part_acc_all, const fl
         const int kvh = h / G, hl = h % G;
         const int d = (int) it.get_local_id(1);
         float M = -FLT_MAX;
-        for (int c = 0; c < n_chunks; ++c) M = sycl::fmax(M, part_m[(kvh * n_chunks + c) * G + hl]);
+        int c = 0;
+        if constexpr (PREFETCH) {
+            for (; c + 8 <= n_chunks; c += 8) {
+                float maxima[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) maxima[j] = part_m[(kvh * n_slots + c + j) * G + hl];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) M = sycl::fmax(M, maxima[j]);
+            }
+        }
+        for (; c < n_chunks; ++c) M = sycl::fmax(M, part_m[(kvh * n_slots + c) * G + hl]);
         float L = 0.0f, acc = 0.0f;
-        for (int c = 0; c < n_chunks; ++c) {
-            const int slot = kvh * n_chunks + c;
+        c = 0;
+        if constexpr (PREFETCH) {
+            for (; c + 8 <= n_chunks; c += 8) {
+                float maxima[8], sums[8], values[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int slot = kvh * n_slots + c + j;
+                    maxima[j] = part_m[slot * G + hl];
+                    if (maxima[j] != -FLT_MAX) {
+                        sums[j] = part_l[slot * G + hl];
+                        values[j] = part_acc[((size_t) slot * G + hl) * HD + d];
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    if (maxima[j] == -FLT_MAX) continue;
+                    const float w = sycl::exp(maxima[j] - M);
+                    L = sycl::fma(sums[j], w, L);
+                    acc = sycl::fma(values[j], w, acc);
+                }
+            }
+        }
+        for (; c < n_chunks; ++c) {
+            const int slot = kvh * n_slots + c;
             const float m = part_m[slot * G + hl];
             if (m == -FLT_MAX) continue;
             const float w = sycl::exp(m - M);
@@ -422,17 +583,17 @@ sycl::event launch_merge_gate_q8(sycl::queue& queue, const float* part_acc_all, 
         const float raw = q_full[head * 2 * HD + HD + d];
         const float sigmoid = 1.0f / (1.0f + sycl::exp(-raw));
         const float o = a * sigmoid;
-        // the q8_1 block of the 32 values of this sub-group
+        // the q8_1 block of the 32 values of this sub-group (q8_act.hpp's Ggml rule and Q8_1 layout)
         const sycl::sub_group sg = it.get_sub_group();
         const float amax = warp_max(sg, sycl::fabs(o));
         const float sum = warp_sum(sg, o);
-        const float ds = xe::q8_1_finite(amax / 127.0f);
-        const int8_t qv = xe::q8_1_quant(o, ds, amax);
+        const float ds = q8act::Ggml::scale(amax);
+        const int8_t qv = q8act::Ggml::value(o, ds, 0.0f, amax);
         const size_t i = head * HD + (size_t) d;
         uint8_t* const block = xq + (i / 32) * 36;
         reinterpret_cast<int8_t*>(block + 4)[i % 32] = qv;
         if (i % 32 == 0)
-            *reinterpret_cast<sycl::half2*>(block) = sycl::half2(sycl::half(ds), sycl::half(xe::q8_1_finite(sum)));
+            *reinterpret_cast<sycl::half2*>(block) = sycl::half2(sycl::half(ds), sycl::half(q8act::finite(sum)));
     });
 }
 
@@ -447,7 +608,7 @@ int slots_for(sycl::queue& q, int64_t cap, int nkv, size_t n_q) {
     // and that changed the greedy answers (two of the bench's six chats on the 890M, 2026-11-02) at the same decode
     // speed (31.6-32.0 against 31.5-31.9 tok/s, three interleaved rounds), so every chunk keeps its own slot, as
     // before, unless asked for.
-    static const bool cu_slots = [] { const char* v = std::getenv("STRATA_QSA_CU_SLOTS"); return v != nullptr && v[0] == '1'; }();
+    static const bool cu_slots = [] { const char* v = strata::env_get("QSA_CU_SLOTS"); return v != nullptr && v[0] == '1'; }();
     if (!cu_slots) return (int) chunks;
     const int64_t cu = (int64_t) q.get_device().get_info<sycl::info::device::max_compute_units>();
     const int64_t want = std::max<int64_t>(1, cu * 8 / std::max<int64_t>(1, (int64_t) nkv * (int64_t) n_q));
@@ -455,104 +616,359 @@ int slots_for(sycl::queue& q, int64_t cap, int nkv, size_t n_q) {
 }
 
 int kv_mode_of(const QsaAttnPools& pools) {
+    if (pools.k_tc != nullptr) return 4;
     return pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3 : (pools.k_q != nullptr ? 1 : 0));
+}
+
+template <int HD, int G, bool LOOP, bool PERCELL, bool ROWS>
+void launch_kv_form(int kv_mode, int nc, sycl::queue& queue, const float* q, const QsaAttnPools& pools, const int32_t* ids,
+               const int32_t* steps, int nkv, int ps, float scale, float* part_acc, float* part_m, float* part_l,
+               int n_slots, size_t n_q, int cap, long long stride, int window, int kv_div,
+               int min_chunk, const QsaAttnPoolsRows& rows) {
+    constexpr int N8 = PERCELL ? 2 : 8, N4 = PERCELL ? 2 : 4;   // the per-cell form has no cells-a-step forms
+    if (kv_mode == 4) launch_chunk<HD, G, 4, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, N8, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, N4, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else launch_chunk<HD, G, 0, LOOP, 2, PERCELL, ROWS>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
 }
 
 template <int HD, int G, bool LOOP>
 void launch_kv(int kv_mode, int nc, sycl::queue& queue, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                const int32_t* steps, int nkv, int ps, float scale, float* part_acc, float* part_m, float* part_l,
-               int n_slots, size_t n_q, int cap, long long stride) {
-    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else launch_chunk<HD, G, 0, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
+               int n_slots, size_t n_q, int cap, long long stride, int window, int kv_div, int min_chunk, bool percell,
+               const QsaAttnPoolsRows& rows) {
+    const auto go = [&]<bool CELL, bool ROWS>() {
+        launch_kv_form<HD, G, LOOP, CELL, ROWS>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc,
+                                                part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk,
+                                                rows);
+    };
+    if (rows.n > 0) { if (percell) go.template operator()<true, true>(); else go.template operator()<false, true>(); }
+    else if (percell) go.template operator()<true, false>();
+    else go.template operator()<false, false>();
 }
 
-// The cells a step of the fp16 score loop takes (NC): 2 unless qsa_dense_attn_tune timed this GPU and shape.  2, 4 and
-// 8 are not the same on every GPU (Qwen3.5-9B's 32K decode, 2026-10-27: the RX 9060 XT 38.9 / 40.2 / 40.5 tok/s, the
-// RTX 4070 67.7 / 67.4 / 64.0, the B70 43.1 / 42.9 / 40.3), so the choice is timed rather than set.
+// XeStrata-890M: the fork's device conditions, an integrated GPU on the HIP backend (asked of the device, as
+// iq_kernels.cpp's expert rows are): there the decode attention keeps the forms it had before upstream's that change
+// the answer's bits (the per-cell scores, a short context's smaller chunks), unless they are asked for
+// (STRATA_QSA_PERCELL=1, STRATA_QSA_MIN_CHUNK), so its greedy answers stay as they were.
+bool fork_igpu(sycl::queue& q) {
+    static core::PerDevice<bool> per_device;
+    const sycl::device d = q.get_device();
+    return per_device.get(d, [&d] { return d.get_backend() == sycl::backend::ext_oneapi_hip && core::integrated_gpu(d); });
+}
+
+// The decode attention's form on a GPU, for a shape (head_dim, query heads per KV head): the cells a step of the fp16
+// score loop takes (NC) and the ways a KV head's query heads are split over work-groups (each reading the KV head's
+// cells).  2 and 1 unless qsa_dense_attn_tune timed this GPU and shape.  NC 2, 4 and 8 are not the same on every GPU
+// (Qwen3.5-9B's 32K decode, 2026-10-27: the RX 9060 XT 38.9 / 40.2 / 40.5 tok/s, the RTX 4070 67.7 / 67.4 / 64.0, the
+// B70 43.1 / 42.9 / 40.3).  The split puts more work-groups on a short context, where one group a KV head leaves the
+// GPU idle: PLaMo 3 Translate 0.8B (16 heads on 1 KV head) decoded 343 -> 504 tok/s after 64 cells on the B70 split 4
+// ways, 567 -> 593 on the RTX 4070; past a few ways the cells read again cost more than the groups gain (16 ways: 430
+// against 451 tok/s at 12K cells on the B70), and the 2B (6 heads a KV head) took 2 ways (2026-11-09).
+struct Form {
+    int nc = 2, split = 1, min_chunk = 16;   // min_chunk: chunk_of's
+};
 template <int HD, int G>
-core::PerDevice<int>& nc_store() {
-    static core::PerDevice<int> store;
+core::PerDevice<Form>& form_store() {
+    static core::PerDevice<Form> store;
     return store;
 }
 template <int HD, int G>
-int nc_of(sycl::queue& q) {
-    if (const char* e = std::getenv("STRATA_QSA_NC")) {   // 2, 4 or 8 over the timed choice (the parity test, --bench)
+Form form_of(sycl::queue& q) {
+    Form f = form_store<HD, G>().get(q.get_device(), [] { return Form{}; });
+    if (fork_igpu(q)) f.min_chunk = CHUNK;   // XeStrata-890M: whole chunks, as before (fork_igpu)
+    if (const char* e = strata::env_get("QSA_NC")) {   // 2, 4 or 8 over the timed choice (the parity test, --bench)
         const long v = std::strtol(e, nullptr, 10);
-        if (v == 2 || v == 4 || v == 8) return (int) v;
+        if (v == 2 || v == 4 || v == 8) f.nc = (int) v;
     }
-    return nc_store<HD, G>().get(q.get_device(), [] { return 2; });
+    if (const char* e = strata::env_get("QSA_SPLIT")) {   // the ways over the timed choice (A/B), one that divides G
+        const long v = std::strtol(e, nullptr, 10);
+        if (v >= 1 && G % v == 0) f.split = (int) v;
+    }
+    if (const char* e = strata::env_get("QSA_MIN_CHUNK")) {   // the least cells a chunk (64: whole chunks), A/B
+        const long v = std::strtol(e, nullptr, 10);
+        if (v >= 4 && v <= CHUNK) f.min_chunk = (int) v;
+    }
+    return f;
 }
 
+// Whether the merge reads eight slots' partials into registers before it folds them (the same fold order, the same
+// bits): timed once for a device and a head count, on partials of its own and on a queue of its own, since the
+// callers' queues are recording a graph when the decode windows first come here.  Below 8 slots the two forms are one.
+// One timing serves every slot count: the forms' ratio held from 33 to 640 slots on the B70 (4.0 / 2.7 us to 38.2 /
+// 19.2) and from 23 to 184 on the RTX 4070 (2.3 / 2.2 to 6.2 / 5.3), and a timing a slot count put 1 to 3% of a
+// 256-token decode into the windows' capture.
+// The B70 at a 32K context (2026-11-14): Ornith-1.5's window 22.53 -> 21.77 ms, Qwen3.8-Flash-Next's drafts 5.06 ->
+// 4.63 ms a round; the RTX 4070 the same within its noise.
+template <int HD, int G>
+bool merge_prefetch(sycl::queue& queue, int n_slots, size_t n_head) {
+    if (n_slots < 8) return false;
+    static core::TimedCache<sycl::device, int, bool> choices;
+    const int key = (int) n_head;
+    n_slots = std::max(n_slots, 64);
+    if (const auto cached = choices.get(queue.get_device(), key)) return *cached;
+    if (core::timing_depth != 0) return false;
+    sycl::queue probe(queue.get_context(), queue.get_device(), sycl::property::queue::in_order{});
+    const size_t n_ml = (size_t) n_slots * n_head, n_acc = n_ml * HD;
+    float* acc = sycl::malloc_device<float>(n_acc, probe);
+    float* m = sycl::malloc_device<float>(n_ml, probe);
+    float* l = sycl::malloc_device<float>(n_ml, probe);
+    float* out = sycl::malloc_device<float>(n_head * HD, probe);
+    bool pick = false;
+    if (acc && m && l && out) {
+        probe.fill(acc, 0.01f, n_acc);
+        probe.fill(m, 0.5f, n_ml);
+        probe.fill(l, 1.0f, n_ml).wait_and_throw();
+        const auto run = [&](bool prefetch) {
+            for (int i = 0; i < 8; ++i) {
+                if (prefetch) launch_merge<HD, G, true>(probe, acc, m, l, n_slots, out, n_head, 1, 0);
+                else launch_merge<HD, G, false>(probe, acc, m, l, n_slots, out, n_head, 1, 0);
+            }
+            return true;
+        };
+        const auto measured = core::timed_choice({{[&] { return run(false); }}, {[&] { return run(true); }}},
+                                                 [&] { probe.wait_and_throw(); }, 5, 1.05, 0.005);
+        pick = measured.pick == 1;
+        std::fprintf(stderr, "xestrata: attention merge %s (%d slots, %zu heads of %d; %.1f / %.1f us)\n",
+                     pick ? "prefetch" : "plain", n_slots, n_head, HD, measured.seconds[0] * 1e6 / 8,
+                     measured.seconds[1] * 1e6 / 8);
+    }
+    for (float* x : {acc, m, l, out})
+        if (x) sycl::free(x, probe);
+    return choices.put(queue.get_device(), key, pick);
+}
+
+// Whether a work-item takes one cell and all its head products (PERCELL) instead of the sub-groups' butterflies: the
+// same products in another FP32 addition order.  Timed once for a device, a pool format (FP16, or the int8 codes for
+// every quantized format) and a class of cell counts, on pools of its own and on a queue of its own (the callers'
+// queues are recording a graph when the decode windows first come here); taken only where the whole attention is a
+// quarter faster and its output within 1e-4 of the output's scale (upstream's parity line).  A quarter, not a tenth:
+// the form changes the answer's bits, and a choice near the line would differ from start to start (the RTX 4070 timed
+// 112.4 / 100.4 us on FP16 pools of 8192 cells, and its window did not change).  The RX 9060 XT at a 32K
+// context (2026-11-14, Qwen3.6-35B-A3B, int8 pools): the window 44.03 -> 35.75 ms, 65.3 -> 82.3 tok/s; the B70 and
+// the RTX 4070 are slower with it (the B70's Qwen3.8-Flash-Next window 17.19 -> 17.39 ms, the RTX 4070's Ornith-1.5
+// 38.51 -> 39.63 ms) and keep the sub-groups.
+template <int HD, int G>
+bool percell_pick(sycl::queue& queue, int kv_mode, int64_t cap, const QsaShapes& s, int nc, int split, int min_chunk) {
+    using Key = std::tuple<int, int64_t, int, int>;
+    static core::TimedCache<sycl::device, Key, bool> choices;
+    const bool i8 = kv_mode != 0;
+    const Key key{i8 ? 1 : 0, core::timed_key_class(cap), (int) s.n_head, split};
+    if (const auto cached = choices.get(queue.get_device(), key)) return *cached;
+    if (core::timing_depth != 0 || s.page_size <= 0) return false;
+    sycl::queue probe(queue.get_context(), queue.get_device(), sycl::property::queue::in_order{});
+    const int64_t ps = s.page_size, pages = (std::min<int64_t>(cap, 32768) + ps - 1) / ps, cells = pages * ps;
+    const int nkv = (int) s.n_head_kv * split;
+    const size_t rows = (size_t) (pages * s.n_head_kv * ps), heads = (size_t) s.n_head * HD;
+    const size_t n_scratch = (size_t) qsa_decode_attn_scratch_floats(cells, s);
+    std::vector<void*> owned;
+    const auto take = [&](size_t bytes) { void* x = sycl::malloc_device(bytes, probe); owned.push_back(x); return x; };
+    QsaAttnPools pools;
+    bool ok = true;
+    if (i8) {
+        auto* kq = static_cast<int8_t*>(take(rows * HD));
+        auto* vq = static_cast<int8_t*>(take(rows * HD));
+        auto* ks = static_cast<uint16_t*>(take(rows * (HD / KV_Q8_GROUP) * 2));
+        auto* vs = static_cast<uint16_t*>(take(rows * (HD / KV_Q8_GROUP) * 2));
+        ok = kq && vq && ks && vs;
+        if (ok) {
+            probe.fill(kq, (int8_t) 16, rows * HD);
+            probe.fill(vq, (int8_t) 16, rows * HD);
+            probe.fill(ks, (uint16_t) 0x1c00, rows * (HD / KV_Q8_GROUP));   // 2^-8: 16 codes are 0.0625
+            probe.fill(vs, (uint16_t) 0x1c00, rows * (HD / KV_Q8_GROUP));
+        }
+        pools.k_q = kq; pools.v_q = vq; pools.k_scale = ks; pools.v_scale = vs;
+    } else {
+        auto* k = static_cast<uint16_t*>(take(rows * HD * 2));
+        auto* v = static_cast<uint16_t*>(take(rows * HD * 2));
+        ok = k && v;
+        if (ok) {
+            probe.fill(k, (uint16_t) 0x2c00, rows * HD);   // 0.0625: moderate scores
+            probe.fill(v, (uint16_t) 0x2c00, rows * HD);
+        }
+        pools.k_pool = k; pools.v_pool = v;
+    }
+    auto* table = static_cast<int32_t*>(take((size_t) pages * sizeof(int32_t)));
+    auto* step = static_cast<int32_t*>(take(kStepCount * sizeof(int32_t)));
+    auto* qv = static_cast<float*>(take(heads * sizeof(float)));
+    auto* scratch = static_cast<float*>(take(n_scratch * sizeof(float)));
+    auto* attn = static_cast<float*>(take(heads * sizeof(float)));
+    ok = ok && table && step && qv && scratch && attn;
+    bool pick = false;
+    if (ok) {
+        std::vector<int32_t> pt((size_t) pages);
+        for (int64_t i = 0; i < pages; ++i) pt[(size_t) i] = (int32_t) i;
+        int32_t hs[kStepCount];
+        qsa_step_fill(hs, cells - 1, s);
+        probe.fill(qv, 0.01f, heads);
+        probe.memcpy(table, pt.data(), pt.size() * sizeof(int32_t));
+        probe.memcpy(step, hs, sizeof(hs)).wait_and_throw();
+        pools.page_table = table;
+        const int n_slots = slots_for(probe, cells, nkv, 1);
+        float* part_m = scratch + (size_t) n_slots * s.n_head * HD;
+        float* part_l = part_m + (size_t) n_slots * s.n_head;
+        const float scale = 1.0f / std::sqrt((float) HD);
+        const int mode = i8 ? 1 : 0;
+        const auto run = [&](bool cell) {
+            if (n_slots < (cells + CHUNK - 1) / CHUNK)
+                launch_kv<HD, G, true>(mode, nc, probe, qv, pools, nullptr, step, nkv, ps, scale, scratch, part_m, part_l,
+                                       n_slots, 1, (int) cells, 0, 0, split, min_chunk, cell, {});
+            else
+                launch_kv<HD, G, false>(mode, nc, probe, qv, pools, nullptr, step, nkv, ps, scale, scratch, part_m, part_l,
+                                        n_slots, 1, (int) cells, 0, 0, split, min_chunk, cell, {});
+            launch_merge<HD, G, false>(probe, scratch, part_m, part_l, n_slots, attn, (size_t) s.n_head, 1, 0, step, true,
+                                       0, min_chunk);
+            return true;
+        };
+        std::vector<float> base(heads), cand(heads);
+        run(false);
+        probe.memcpy(base.data(), attn, heads * sizeof(float)).wait_and_throw();
+        run(true);
+        probe.memcpy(cand.data(), attn, heads * sizeof(float)).wait_and_throw();
+        float diff = 0.0f, out_scale = 0.0f;
+        bool finite = true;
+        for (size_t i = 0; i < heads; ++i) {
+            finite = finite && std::isfinite(base[i]) && std::isfinite(cand[i]);
+            diff = std::max(diff, std::fabs(base[i] - cand[i]));
+            out_scale = std::max(out_scale, std::fabs(base[i]));
+        }
+        if (finite && diff <= 1e-4f * out_scale) {
+            const auto measured = core::timed_choice({{[&] { return run(false); }}, {[&] { return run(true); }}},
+                                                     [&] { probe.wait_and_throw(); }, 5, 1.25, 0.005);
+            pick = measured.pick == 1;
+            std::fprintf(stderr, "xestrata: attention cells %s (%s pools, %lld cells, %lld heads of %d; %.1f / %.1f us, "
+                                 "difference %.3g)\n", pick ? "per work-item" : "per sub-group", i8 ? "int8" : "FP16",
+                         (long long) cells, (long long) s.n_head, HD, measured.seconds[0] * 1e6,
+                         measured.seconds[1] * 1e6, diff);
+        }
+    }
+    for (void* x : owned)
+        if (x) sycl::free(x, probe);
+    return choices.put(queue.get_device(), key, pick);
+}
+
+// G: the query heads a work-group takes, the KV head's own split `split` ways
 template <int HD, int G>
 void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream,
+               int window, int nc, int split, int min_chunk = CHUNK, const QsaAttnPoolsRows& row_pools = {},
                const float* q_full = nullptr, uint8_t* xq = nullptr) {
     const int kv_mode = kv_mode_of(pools);
     auto& queue = queue_for(stream);
-    const int nkv = (int) s.n_head_kv, ps = (int) s.page_size;
-    const int n_slots = slots_for(queue, cap, nkv, n_q);
+    const int nkv = (int) s.n_head_kv * split, ps = (int) s.page_size;
+    // a batch window's rows keep one row's slot count, so each row's sums are its own 1-row call's bits
+    const int n_slots = slots_for(queue, cap, nkv, row_pools.n > 0 ? 1 : n_q);
     float* part_acc = scratch;
     float* part_m = scratch + (size_t) n_slots * s.n_head * HD;
     float* part_l = part_m + (size_t) n_slots * s.n_head;
     const float scale = 1.0f / std::sqrt((float) HD);
-    const int nc = nc_of<HD, G>(queue);
+    const QsaAttnPoolsRows pools_rows = row_pools;
+    static const int cell_mode = strata::env_auto("QSA_PERCELL");
+    const bool percell = cell_mode >= 0 ? cell_mode == 1
+                                        : !fork_igpu(queue) && percell_pick<HD, G>(queue, kv_mode, cap, s, nc, split, min_chunk);
     if (n_slots < (cap + CHUNK - 1) / CHUNK)
         launch_kv<HD, G, true>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
-                               n_slots, n_q, (int) cap, stride);
+                               n_slots, n_q, (int) cap, stride, window, split, min_chunk, percell, pools_rows);
     else
         launch_kv<HD, G, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
-                                n_slots, n_q, (int) cap, stride);
+                                n_slots, n_q, (int) cap, stride, window, split, min_chunk, percell, pools_rows);
+    // The merge's form: with XESTRATA_ATTN_MERGE_PREFETCH unset or auto, the one merge_prefetch timed for this device
+    // and slot count.
+    auto merge = [&](bool prefetch, size_t rows) {
+        return prefetch
+            ? launch_merge<HD, G, true>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, rows,
+                                        stride, steps, ids == nullptr, window, min_chunk)
+            : launch_merge<HD, G, false>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, rows,
+                                         stride, steps, ids == nullptr, window, min_chunk);
+    };
+    // XeStrata-890M: with q_full and xq the merge launch takes the gate and the q8_1 image as its tail
+    // (launch_merge_gate_q8; every slot's partials, as before)
+    static const int merge_mode = strata::env_auto("ATTN_MERGE_PREFETCH");
     const auto e = xq != nullptr
         ? launch_merge_gate_q8<HD, G>(queue, part_acc, part_m, part_l, n_slots, (size_t) s.n_head, n_q, stride, q_full, xq)
-        : launch_merge<HD, G>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q, stride);
+        : merge(merge_mode >= 0 ? merge_mode == 1 : merge_prefetch<HD, G>(queue, n_slots, (size_t) s.n_head), n_q);
     if (!stream) core::Runtime::get().wait(e, "qsa_decode_attn");
 }
 
+// `f` with G / split heads a work-group: the instantiations the splits take (a split to another count is not run)
+template <int HD>
+bool with_split(int heads_per_group, auto&& f) {
+    switch (heads_per_group) {
+    case 16: if constexpr (HD == 128) { f.template operator()<16>(); return true; } return false;
+    case 12: if constexpr (HD == 256) { f.template operator()<12>(); return true; } return false;
+    case 10: if constexpr (HD == 128) { f.template operator()<10>(); return true; } return false;
+    case 8: f.template operator()<8>(); return true;
+    case 6: if constexpr (HD == 128) { f.template operator()<6>(); return true; } return false;
+    case 4: f.template operator()<4>(); return true;
+    case 3: if constexpr (HD == 128) { f.template operator()<3>(); return true; } return false;
+    case 2: f.template operator()<2>(); return true;
+    case 1: f.template operator()<1>(); return true;
+    default: return false;
+    }
+}
+
+template <int HD, int G>
+void run_form(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+              const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window,
+              const QsaAttnPoolsRows& rows = {}, const float* q_full = nullptr, uint8_t* xq = nullptr) {
+    const Form f = form_of<HD, G>(queue_for(stream));
+    // streamed dense attention reads the host copy with the SAME form as a resident layer (the split, the cells a
+    // step, the chunk size): the chunk distribution sets the online-softmax folding order, so a different form would
+    // change the answer's bits. A split > 1 reads each host cell once per group (the traffic the form costs); the
+    // long contexts streaming engages usually time split 1.
+    const bool ok = with_split<HD>(G / f.split, [&]<int GS>() {
+        run_shape<HD, GS>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window, f.nc, f.split,
+                          f.min_chunk, rows, q_full, xq);
+    });
+    if (!ok)
+        run_shape<HD, G>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window, f.nc, 1, CHUNK, rows,
+                         q_full, xq);
+}
+
 // The shapes this file is built for, (head_dim, query heads per KV head): the one the engine is compiled for
-// (core/geometry.hpp: -DSTRATA_GEOMETRY; Flash-Next's 256 and 12), whatever its heads, and the plain models' (Ornith-1.5's
-// 256 and 8, Qwen3.5-9B's 256 and 4, llm-jp-4.1's 128 and 10, and 256 and 12).  A model of another shape needs its line
-// in with_shape; the kernels' local arrays are sized by G and HD.
+// (core/geometry.hpp: -DSTRATA_GEOMETRY; Flash-Next's 256 and 12), whatever its heads, and the other models' (Ornith-1.5's
+// 256 and 8, Qwen3.5-9B's 256 and 4, llm-jp-4.1's 128 and 10, PLaMo 3 Translate's 128 and 6, 16 and 8, and 256 and 12).
+// A model of another shape needs its line in with_shape; the kernels' local arrays are sized by G and HD.
 constexpr int kCHD = (int) strata::core::kCompiledGeometry.head_dim;
 constexpr int kCG = (int) (strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv);
-template <int HD, int G> struct AttnShape {
-    static constexpr int hd = HD, g = G;
-};
 
-// f(AttnShape<HD, G>{}) for s's shape; false, and no call, where this file has no kernels for it
-template <class F> bool with_shape(const QsaShapes& s, F&& f) {
+// `f` on the shape's (head_dim, query heads per KV head); false, and no call, where this file has no kernels for it
+bool with_shape(const QsaShapes& s, auto&& f) {
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv) return false;
     const int64_t g = s.n_head / s.n_head_kv;
-    if (s.head_dim == kCHD && g == kCG) f(AttnShape<kCHD, kCG>{});
-    else if (s.head_dim == 256 && g == 12) f(AttnShape<256, 12>{});
-    else if (s.head_dim == 256 && g == 8) f(AttnShape<256, 8>{});
-    else if (s.head_dim == 256 && g == 4) f(AttnShape<256, 4>{});
-    else if (s.head_dim == 128 && g == 10) f(AttnShape<128, 10>{});
+    if (s.head_dim == kCHD && g == kCG) f.template operator()<kCHD, kCG>();
+    else if (s.head_dim == 256 && g == 12) f.template operator()<256, 12>();
+    else if (s.head_dim == 256 && g == 8) f.template operator()<256, 8>();
+    else if (s.head_dim == 256 && g == 4) f.template operator()<256, 4>();
+    else if (s.head_dim == 128 && g == 6) f.template operator()<128, 6>();
+    else if (s.head_dim == 128 && g == 16) f.template operator()<128, 16>();
+    else if (s.head_dim == 128 && g == 8) f.template operator()<128, 8>();
+    else if (s.head_dim == 128 && g == 10) f.template operator()<128, 10>();
     else return false;
     return true;
 }
 
 bool shape_ok(const QsaShapes& s) {
-    return with_shape(s, [](auto) {});
+    return with_shape(s, []<int, int>() {});
 }
 
 void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-         const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream,
-         const float* q_full = nullptr, uint8_t* xq = nullptr) {
-    with_shape(s, [&](auto sh) {
-        run_shape<decltype(sh)::hd, decltype(sh)::g>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream,
-                                                     q_full, xq);
+         const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window = 0,
+         const QsaAttnPoolsRows& rows = {}, const float* q_full = nullptr, uint8_t* xq = nullptr) {
+    with_shape(s, [&]<int HD, int G>() {
+        run_form<HD, G>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window, rows, q_full, xq);
     });
 }
 
-// qsa_dense_attn_tune's timing: the fp16 score loop's NC = 2, 4 and 8 over `cells` cells of a dummy cache, as the
-// engine runs it (16 launches with their merge in a graph, the graphs replayed in turns, the first round a warm-up, the
-// fastest round of each kept); 2 when the buffers cannot be had
-template <int HD, int G>
-int time_nc(sycl::queue& q, const QsaShapes& s, int64_t cells) {
+// The timing's dummy cache of `cells` cells (as the engine runs it: 16 launches with their merge in a graph, replayed
+// 5 times, the first a warm-up, the fastest kept): microseconds a launch with GS heads a group, the KV heads split
+// `split` ways, NC `nc`; -1 when the buffers cannot be had
+template <int HD, int GS>
+double time_form(void* stream, const QsaShapes& s, int64_t cells, int nc, int split) {
+    sycl::queue& q = queue_for(stream);
     const int64_t ps = s.page_size, pages = (cells + ps - 1) / ps;
     cells = pages * ps;
     const size_t pool = (size_t) (pages * s.n_head_kv * ps * HD), heads = (size_t) s.n_head * HD;
@@ -570,7 +986,7 @@ int time_nc(sycl::queue& q, const QsaShapes& s, int64_t cells) {
     };
     if (!k || !v || !table || !step || !qv || !scratch || !attn) {
         release();
-        return 2;
+        return -1.0;
     }
     std::vector<int32_t> pt((size_t) pages);
     for (int64_t i = 0; i < pages; ++i) pt[(size_t) i] = (int32_t) i;
@@ -585,56 +1001,67 @@ int time_nc(sycl::queue& q, const QsaShapes& s, int64_t cells) {
     pools.k_pool = k;
     pools.v_pool = v;
     pools.page_table = table;
-    const int nkv = (int) s.n_head_kv, n_slots = slots_for(q, cells, nkv, 1);
-    float* part_m = scratch + (size_t) n_slots * s.n_head * HD;
-    float* part_l = part_m + (size_t) n_slots * s.n_head;
-    const float scale = 1.0f / std::sqrt((float) HD);
-    const bool loop = n_slots < (cells + CHUNK - 1) / CHUNK;
     namespace sx = sycl::ext::oneapi::experimental;
-    const int ncs[3] = {2, 4, 8};
-    std::vector<sx::command_graph<sx::graph_state::executable>> exec;
-    for (int nc : ncs) {
-        sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
-        graph.begin_recording(q);
-        for (int i = 0; i < 16; ++i) {
-            if (loop)
-                launch_kv<HD, G, true>(0, nc, q, qv, pools, nullptr, step, nkv, (int) ps, scale, scratch, part_m, part_l,
-                                       n_slots, 1, (int) cells, 0);
-            else
-                launch_kv<HD, G, false>(0, nc, q, qv, pools, nullptr, step, nkv, (int) ps, scale, scratch, part_m,
-                                        part_l, n_slots, 1, (int) cells, 0);
-            launch_merge<HD, G>(q, scratch, part_m, part_l, n_slots, attn, (size_t) s.n_head, 1, 0);
-        }
-        graph.end_recording(q);
-        exec.push_back(graph.finalize());
+    sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
+    graph.begin_recording(q);
+    for (int i = 0; i < 16; ++i)
+        run_shape<HD, GS>(qv, pools, nullptr, step, cells, s, scratch, attn, 1, 0, stream, 0, nc, split);
+    graph.end_recording(q);
+    auto exec = graph.finalize();
+    double best = 0.0;
+    for (int round = 0; round < 5; ++round) {
+        const auto t0 = std::chrono::steady_clock::now();
+        q.ext_oneapi_graph(exec);
+        q.wait();
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        if (round > 0 && (best == 0.0 || us < best)) best = us;
     }
-    double best[3] = {};
-    for (int round = 0; round < 5; ++round)
-        for (int i = 0; i < 3; ++i) {
-            const auto t0 = std::chrono::steady_clock::now();
-            q.ext_oneapi_graph(exec[(size_t) i]);
-            q.wait();
-            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
-            if (round > 0 && (best[i] == 0.0 || us < best[i])) best[i] = us;
-        }
     release();
-    int pick = 0;
-    for (int i = 1; i < 3; ++i)
-        if (best[i] < best[pick]) pick = i;
-    std::fprintf(stderr, "strata: the decode attention (%lld/%lld heads of %d) takes %d cells a step (timed at %lld "
-                         "cells: 2: %.0f us, 4: %.0f, 8: %.0f)\n", (long long) s.n_head, (long long) s.n_head_kv, HD,
-                 ncs[pick], (long long) cells, best[0] / 16, best[1] / 16, best[2] / 16);
-    return ncs[pick];
+    return best / 16;
+}
+
+// NC timed at `cells` (its old point) without a split.  The split is the least that puts 8 work-groups on a short
+// context's cells (a KV head's heads split `split` ways, n_kv * split groups), keeping 3 heads or more a group (each
+// group reads the KV head's cells again), else the most that keeps them; among those with an instantiation.  Timed
+// alone (16 launches in a graph) the splits came out slower than one group a KV head for PLaMo 3 Translate 2B (6 heads
+// a KV head, 4 KV heads), where its decode ran faster split 2 ways (B70 196 -> 203 tok/s after 64 cells, 178 -> 186
+// after 12K; RTX 4070 213 -> 216, 194 -> 197); the 0.8B (16 heads, 1 KV head) 4 ways (B70 456 -> 504 after 64 cells,
+// 404 -> 451 after 12K); Qwen3.5-0.8B and 2B (4 heads of 256 a KV head) split 4 ways decoded 5% slower after 8K cells
+// on the B70 and the RTX 4070 (one head a group), and keep one group a KV head (2026-11-09).
+int split_for(int g, int64_t n_kv, int hd) {
+    int pick = 1;
+    for (int split = 2; split <= g && n_kv * pick < 8; ++split) {
+        const int gs = g / split;
+        const bool inst = gs == 8 || gs == 4 || (hd == 128 && (gs == 16 || gs == 10 || gs == 6 || gs == 3)) ||
+                          (hd == 256 && gs == 12);
+        if (g % split == 0 && gs >= 3 && inst) pick = split;
+    }
+    return pick;
 }
 
 template <int HD, int G>
-void tune_shape(sycl::queue& q, const QsaShapes& s, int64_t cells) {
-    nc_store<HD, G>().get(q.get_device(), [&] { return time_nc<HD, G>(q, s, cells); });
+Form time_forms(void* stream, const QsaShapes& s, int64_t cells) {
+    Form f;
+    const int ncs[3] = {2, 4, 8};
+    double t[3];
+    int pick = 0;
+    for (int i = 0; i < 3; ++i) {
+        t[i] = time_form<HD, G>(stream, s, cells, ncs[i], 1);
+        if (t[i] >= 0.0 && (t[pick] < 0.0 || t[i] < t[pick])) pick = i;
+    }
+    f.nc = ncs[pick];
+    f.split = split_for(G, s.n_head_kv, HD);
+    std::fprintf(stderr, "xestrata: the decode attention (%lld/%lld heads of %d) takes %d cells a step (timed at %lld "
+                         "cells: 2: %.0f us, 4: %.0f, 8: %.0f) and splits a KV head's heads %d ways\n",
+                 (long long) s.n_head, (long long) s.n_head_kv, HD, f.nc, (long long) cells, t[0], t[1], t[2], f.split);
+    return f;
 }
+
 
 bool pools_ok(const QsaAttnPools& pools) {
     const int kv_mode = kv_mode_of(pools);
-    return kv_mode == 3 ? pools.k_scale != nullptr
+    return kv_mode == 4 ? pools.v_tc != nullptr && (pools.tc_bits == 4 || pools.tc_bits == 5)
+         : kv_mode == 3 ? pools.k_scale != nullptr
          : kv_mode == 2 ? pools.v_q4 != nullptr
          : kv_mode == 1 ? (pools.v_q && pools.k_scale && pools.v_scale) : (pools.k_pool && pools.v_pool);
 }
@@ -662,7 +1089,21 @@ void qsa_decode_attn_gate_q8_batch(const float* q, const QsaAttnPools& pools, co
         throw core::DeviceError("qsa_decode_attn_gate_q8_batch: unsupported geometry (" + shape_name(s) +
                                 ") or missing buffers");
     run(q, pools, ids, steps, cap, s, scratch, nullptr, (size_t) n_q, (long long) qsa_decode_attn_scratch_floats(cap, s),
-        stream, q_full, static_cast<uint8_t*>(xq));
+        stream, 0, {}, q_full, static_cast<uint8_t*>(xq));
+}
+
+void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids, const int32_t* steps,
+                                int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    if (n_q <= 0) return;
+    if (!shape_ok(s) || cap <= 0 || !scratch || !ids || !steps || rows.n != n_q || n_q > kQsaRowsMax ||
+        rows.p[0].page_table == nullptr)
+        throw core::DeviceError("qsa_decode_attn_batch_rows: unsupported geometry (" + shape_name(s) + ") or missing buffers");
+    const int mode = kv_mode_of(rows.p[0]);
+    for (int z = 1; z < rows.n; ++z)
+        if (kv_mode_of(rows.p[z]) != mode || rows.p[z].page_table == nullptr)
+            throw core::DeviceError("qsa_decode_attn_batch_rows: the rows' pools differ in format");
+    run(q, rows.p[0], ids, steps, cap, s, scratch, attn, (size_t) n_q, (long long) qsa_decode_attn_scratch_floats(cap, s),
+        stream, 0, rows);
 }
 
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
@@ -679,28 +1120,30 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 }
 
 void qsa_dense_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* step, int64_t max_cells,
-                         const QsaShapes& s, float* scratch, float* attn, void* stream) {
+                         const QsaShapes& s, float* scratch, float* attn, void* stream, int64_t window) {
     if (!shape_ok(s) || max_cells <= 0 || !scratch || !step || !pools.page_table)
         throw core::DeviceError("qsa_dense_attn: unsupported geometry (" + shape_name(s) + ") or missing buffers");
     if (!pools_ok(pools)) throw core::DeviceError("qsa_dense_attn: incomplete KV pools");
-    run(q, pools, nullptr, step, max_cells, s, scratch, attn, 1, 0, stream);
+    run(q, pools, nullptr, step, max_cells, s, scratch, attn, 1, 0, stream, (int) window);
 }
 
 void qsa_dense_attn_tune(const QsaShapes& s, int64_t max_cells, void* stream) {
     if (!shape_ok(s) || max_cells < CHUNK || s.page_size <= 0) return;
     auto& q = queue_for(stream);
     const int64_t cells = std::min<int64_t>(max_cells, 16384);
-    with_shape(s, [&](auto sh) { tune_shape<decltype(sh)::hd, decltype(sh)::g>(q, s, cells); });
+    with_shape(s, [&]<int HD, int G>() {
+        form_store<HD, G>().get(q.get_device(), [&] { return time_forms<HD, G>(stream, s, cells); });
+    });
 }
 
 void qsa_dense_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* steps, int64_t max_cells,
-                          const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+                          const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream, int64_t window) {
     if (n_q <= 0) return;
     if (!shape_ok(s) || max_cells <= 0 || !scratch || !steps || !pools.page_table || n_q > 65535)
         throw core::DeviceError("qsa_dense_attn_batch: unsupported geometry (" + shape_name(s) + ") or missing buffers");
     if (!pools_ok(pools)) throw core::DeviceError("qsa_dense_attn_batch: incomplete KV pools");
     run(q, pools, nullptr, steps, max_cells, s, scratch, attn, (size_t) n_q,
-        (long long) qsa_decode_attn_scratch_floats(max_cells, s), stream);
+        (long long) qsa_decode_attn_scratch_floats(max_cells, s), stream, (int) window);
 }
 
 }  // namespace strata::kernels

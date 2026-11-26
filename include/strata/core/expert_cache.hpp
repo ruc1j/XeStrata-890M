@@ -19,14 +19,14 @@
 //   * `h_layer` held-out is **0.0456** - only 4.6% of (layer, token) pairs have all ten experts resident - so
 //     this cannot be a per-layer grouped kernel and the three-way split is not an optimisation.
 //
-// **WHAT THIS FILE IS AND IS NOT, TODAY.** It is the SLOT STORAGE and the RESIDENCY TABLE: it allocates the
-// VRAM, fills it from the host arena, and answers `(layer, expert) -> slot or -1`. It does **not** yet compute
-// anything - `moe_hit_grouped_s2` does not exist and the hit/miss split is not wired into the graph - so with
-// the cache on and nothing consuming it, **the engine is slower by the fill cost and faster by nothing.**
-// That is stated here rather than discovered from a benchmark, and it is why `--expert-cache` defaults to 0.
-//
-// The order of work is `Memory/R4-design-note.md` §7: slots and residency first, then the split, then the
-// kernel. This is that first step, and the step it unblocks is the one that can be measured.
+// **WHAT THIS FILE IS TODAY.** It is the SLOT STORAGE and the RESIDENCY TABLE: it allocates the VRAM, fills it
+// from the host arena or the mapped experts, and answers `(layer, expert) -> slot or -1`. The hit kernel and the
+// hit/miss split are wired in both engines (`expert_hit_run`, `src/core/hit_hook.hpp`). Sizing is capacity-led
+// in both: the engine asks the device for what is free after the weights, session and K/V, keeps the reserve
+// `core::vram_room` reports, and takes the slots that fit; the expert source's RAM or the file supplies the
+// copies. Both engines default to this auto tier; `--expert-cache 0` is the explicit off. A profile is an
+// optional ranked head start. Without one, the adaptive tier in `expert_tier.hpp` fills the slots from the
+// routing the run actually sees, so no profile has to be made by hand.
 #pragma once
 
 #include <atomic>
@@ -135,6 +135,10 @@ public:
     /// `slots()` after a shrink must hold no resident expert and no loan: the CALLER evicts them first.
     void set_segment_bytes(int64_t seg_bytes) { seg_req_ = seg_bytes > 0 ? seg_bytes : 0; }
     bool segmented() const { return !segs_.empty(); }
+    /// Segmented, and the runtime gives an unmapped segment's VRAM back to the device, as `open` saw it with its last
+    /// segment: some keep it in the process until the whole range goes (ROCm 7.1 and 7.2's HIP did; 10.1's gives it
+    /// back), and then `shrink` refuses - nothing it unmaps would reach another program.
+    bool elastic() const { return segmented() && returns_vram_; }
     int64_t segment_bytes() const { return seg_; }
     /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
     int64_t mapped_bytes() const;
@@ -227,11 +231,15 @@ public:
     VmmRange* vmm_range() { return vmm_.get(); }
     /// Byte offset of slot `s` in the arena (s == slots(): the end).
     uint64_t slot_offset(int64_t s) const { return off_.empty() ? (uint64_t) s * (uint64_t) blob_ : off_[(size_t) s]; }
+    /// Usable bytes in one slot, including when its backing allocations are separate pieces.
+    uint64_t slot_capacity(int64_t s) const { return (uint64_t) (slot_end(s + 1) - slot_end(s)); }
 
 private:
     int64_t slot_end(int64_t n) const {
         return !size_off_.empty() ? (int64_t) size_off_[(size_t) n] : off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n];
     }
+    /// Resolve a copy length against the selected slot, not the largest slot in a sized cache.
+    bool slot_copy_size(int32_t slot, int64_t bytes, size_t& n, std::string& err) const;
     bool open_segmented(uint64_t want, std::string& err);
     bool open_pieces(const std::vector<uint64_t>& size_off, std::string& err);
     /// The piece allocations of `open_pieces` with the piece size given (not `piece_max_`).  `best_effort`: the first
@@ -255,6 +263,7 @@ private:
     std::vector<strata::gpu::VmemSegment*> segs_;   ///< #533: each segment's memory (null: unmapped)
     std::vector<int64_t> seg_size_;       ///< #533: each segment's size (the last one may be shorter)
     int64_t mapped_segs_ = 0;             ///< #533: segments [0, mapped_segs_) are backed
+    bool returns_vram_ = true;            ///< #533: an unmapped segment's VRAM went back to the device (open's check)
     std::unique_ptr<VmmRange> vmm_;       ///< the arena's range when it is in virtual memory (set_vmm, --kv-grow)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;

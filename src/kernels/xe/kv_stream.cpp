@@ -112,7 +112,7 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
 
 void kv_stream_reset(const KvStreamMap& m, void* stream) {
     const KvStreamMap mm = m;
-    const size_t total = 128 * 256;
+    const size_t total = size_t{128} * 256;
     const auto e = queue_for(stream).parallel_for(sycl::nd_range<1>(total, 256), [=](sycl::nd_item<1> it) {
         const long long i0 = (long long) it.get_global_id(0), st = (long long) total;
         for (long long i = i0; i < mm.n_blocks; i += st) mm.page_table[i] = -1;
@@ -234,7 +234,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     else if (rt == 512) resolve_launch<512>(queue, mm, ids, steps, nq, capi, page_size);
     else resolve_launch<256>(queue, mm, ids, steps, nq, capi, page_size);
     const Runs r = runs_of(slots, host, fmt, s);
-    const auto e = queue.parallel_for(sycl::nd_range<1>(96 * 128, 128), [=](sycl::nd_item<1> it) {
+    const auto e = queue.parallel_for(sycl::nd_range<1>(size_t{96} * 128, 128), [=](sycl::nd_item<1> it) {
         const int need = mm.ctl[2];
         for (int k = (int) it.get_group(0); k < need; k += 96) {
             const long long b = mm.miss_block[k], sl = mm.miss_slot[k];
@@ -249,7 +249,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
 }
 
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream) {
-    const size_t total = 64 * 256;
+    const size_t total = size_t{64} * 256;
     const auto e = queue_for(stream).parallel_for(sycl::nd_range<1>(total, 256), [=](sycl::nd_item<1> it) {
         for (long long i = (long long) it.get_global_id(0); i < n_blocks; i += (long long) total)
             page_table[i] = (int32_t) (i % n_slots);
@@ -277,6 +277,16 @@ void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int 
     const Runs r = runs_of(stage, host, fmt, s);
     auto& queue = queue_for(stream);
     for (int a = 0; a < r.n; ++a) queue.memcpy(r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]));
+    if (!stream) core::Runtime::get().finish(queue);
+}
+
+void kv_unstage_to_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
+                        const QsaShapes& s, void* stream) {
+    if (b1 <= b0) return;
+    const Runs r = runs_of(stage, host, fmt, s);   // src: the host copy, dst: the staging pool (identity layout both)
+    auto& queue = queue_for(stream);
+    for (int a = 0; a < r.n; ++a)
+        queue.memcpy((void*) (r.src[a] + b0 * r.len[a]), r.dst[a] + b0 * r.len[a], (size_t) ((b1 - b0) * r.len[a]));
     if (!stream) core::Runtime::get().finish(queue);
 }
 

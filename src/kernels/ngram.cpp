@@ -410,7 +410,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         MEMORYSTATUSEX ms;
         ms.dwLength = sizeof(ms);
         if (GlobalMemoryStatusEx(&ms) && need > ms.ullTotalPhys / 2)
-            std::fprintf(stderr, "strata: warning: --ple-io ram locks %.1f GiB, more than half of this PC's %.1f GiB of RAM\n",
+            std::fprintf(stderr, "xestrata: warning: --ple-io ram locks %.1f GiB, more than half of this PC's %.1f GiB of RAM\n",
                          (double) need / (1ull << 30), (double) ms.ullTotalPhys / (1ull << 30));
         const strata::platform::LockResult lr =
             strata::platform::lock_resident((void*) impl_->data, need);
@@ -419,7 +419,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         } else {
             // a partial lock is not a lock: the unlocked rest would fault on the token path, so give it back
             if (lr.locked_bytes > 0) strata::platform::unlock_resident((void*) impl_->data, lr.locked_bytes);
-            std::fprintf(stderr, "strata: PLE table lock failed (%s): touching its pages instead\n",
+            std::fprintf(stderr, "xestrata: PLE table lock failed (%s): touching its pages instead\n",
                          lr.note.c_str());
             volatile uint8_t sink = 0;
             for (uint64_t off = 0; off < need; off += 4096) sink = sink + impl_->data[off];
@@ -460,7 +460,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
             struct rlimit up = rl;
             up.rlim_cur = want;
             if (setrlimit(RLIMIT_MEMLOCK, &up) == 0)
-                std::fprintf(stderr, "strata: the memory this program may lock was %llu MiB; raised to %llu MiB for the PLE table\n",
+                std::fprintf(stderr, "xestrata: the memory this program may lock was %llu MiB; raised to %llu MiB for the PLE table\n",
                              (unsigned long long) (rl.rlim_cur >> 20), (unsigned long long) (want >> 20));
         }
         if (mlock((const void*) a0, a1 - a0) == 0) {
@@ -469,12 +469,12 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
             const int why = errno;
             struct rlimit now {};
             if (getrlimit(RLIMIT_MEMLOCK, &now) == 0 && now.rlim_cur != RLIM_INFINITY && (uint64_t) now.rlim_cur < a1 - a0)
-                std::fprintf(stderr, "strata: the PLE table (%.1f GiB) was not locked in RAM: this program may lock only %.1f GiB "
+                std::fprintf(stderr, "xestrata: the PLE table (%.1f GiB) was not locked in RAM: this program may lock only %.1f GiB "
                                      "(RLIMIT_MEMLOCK). It still works, with the table's pages faulted in but reclaimable; the lock was measured "
                                      "up to 6%% faster in decode (#4671). In a systemd service set LimitMEMLOCK=infinity, elsewhere run `ulimit -l unlimited`\n",
                              (double) (a1 - a0) / (1ull << 30), (double) now.rlim_cur / (1ull << 30));
             else
-                std::fprintf(stderr, "strata: PLE table mlock failed (%s; raise `ulimit -l`): its pages stay faulted in "
+                std::fprintf(stderr, "xestrata: PLE table mlock failed (%s; raise `ulimit -l`): its pages stay faulted in "
                                      "but may be reclaimed\n", std::strerror(why));
         }
 #endif
