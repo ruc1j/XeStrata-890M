@@ -10,9 +10,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.2.21-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
-移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 upstream の Strata 0.2.21（エンジンの版は 0.1.67、`d46f5f2`）までの変更のうち、
-この fork に当たるものを取り込んでいます（[Strata 0.1.67 の取り込み](#strata-0167-の取り込み)から [Strata 0.1.38 の取り込み](#strata-0138-の取り込み)までの各節）。
+XeStrata xe0.2.22-1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版は、取り込んだ upstream の版と、その版での XeStrata のリリースの回数（1 から）を「-」でつないだものです（xe0.2.8-1。upstream のベータ版のような先行の版は、deb と rpm のパッケージの版で「-」を「~」にします: xe0.2.0-beta-1 は 0.2.0~beta-1 で、正式版の 0.2.0-1 より前の版として扱われ、そのまま上げられます。2026-10-13 より前のリリースは、2 回目から末尾に番号を足していました: xe0.1.40.2.1）。
+移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 upstream の Strata 0.2.22（エンジンの版は 0.1.69、`b28ca95`）までの変更のうち、
+この fork に当たるものを取り込んでいます（[Strata 0.1.69 の取り込み](#strata-0169-の取り込み)から [Strata 0.1.38 の取り込み](#strata-0138-の取り込み)までの各節）。
 同じ SYCL のコードを intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
 upstream の CUDA のビルドは廃止してソースも消しました。
 CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe の各ソースは移植元の CUDA のファイル名をコメントに書いています。
@@ -231,6 +231,24 @@ upstream の Strata 0.2.10 の既定の drafter、DFlash2（incoai/Qwen3.8-Flash
 1 round に受け入れるトークンの数は MTP と同じほど（約 2.5）ですが、drafter 自身が 1 round に 7.8 ms かかり（5 層の Q4_0 の重み 0.5 GB を 890M の帯域で読む時間が大半）、MTP の約 4 ms より長いので、decode は 6〜7% 遅くなります。upstream が AMD の HIP で MTP より 4〜12% 速かったのは、帯域が 2.5〜6 倍のカード（Strix Halo、R9700）です。Issue #23（2026-10-24）の見積もり（drafter の重みの読みが MTP の 4 ms を超え、+2〜3% が上限）のとおりでした。drafter は下書きを変えるだけで、答えは verify が決めます。
 
 upstream が Strata-rdna3 から取り込んだ attention のカーネル（d31256b79）も、opt-in で移してあります（`STRATA_DF2_ATTN=3`）。Q と K と転置した V を FP16 でローカルメモリーに置き、S = Q K^T と O += P V を RDNA の行列命令（WMMA）で計算します。float64 の参照との差は出力の RMS の 0.2〜0.4% です（`dflash2_attention_parity`）。890M の交互 3 周（6 チャット、greedy、400 トークン）で、drafter は 7.89 / 7.72 / 7.72 ms から 7.61 / 7.57 / 7.56 ms/round になり、decode は 36.23 / 36.96 / 36.92 対 36.75 / 37.01 / 37.01 tok/s でした。同じ周の MTP は 40.81 / 42.27 / 42.02 tok/s です。答えは 3 周とも MTP と同じでした。drafter の時間の大半は重みを読む時間なので、attention を速くしても MTP との差は埋まりません。既定は FP32 のカーネルのままです。
+
+## Strata 0.1.69 の取り込み
+
+upstream の Strata 0.2.21 から 0.2.22（エンジンの版は 0.1.69、2026-11-25）までの 39 コミット（merge を除きます。0.2.21.1 も含みます）を 1 件ずつ見ました。一覧は `.upstream-0169.md`（リポジトリの根、git の外）です。
+エンジンの変更は、複数 GPU の layer split と Inkling-2-Mini の CUDA だけで、Qwen3.8-Flash-Next を 890M で動かす経路は変わっていません。
+
+移したものは次のとおりです。
+
+- serve: `/v1/responses` で custom tool（Codex の `apply_patch`）の引数をモデルが書いている間も、`KEEPALIVE_S` ごとに keep-alive を送ります（e83de74d7）。引数を出し終えるまでストリームに何も流れず、止まったストリームを切るクライアントやプロキシが、正常な要求を途中で終えていました。
+- setup: 実行の設定を書く前に、その置き場のフォルダーを作ります（2fdbdb56d）。
+- web: API キーが要るという 401 のメッセージに、キーがどこから来るか（`--api-key`、`STRATA_API_KEY`、実行の設定の `api_key`）を足しました（51644762f、284e2c5b6）。
+
+入れていないものは次のとおりです。
+
+- Inkling-2-Mini の 11 件（tool の結果の名前、sampling を指定しない要求へのモデルカードの sampling、思考の予算と段階、CPU で読む画像の縮小、setup の HIP の計画など）。Inkling-2-Mini の変更は取り込まないことにしています（2026-11-25）。
+- `--mtp` のとき sampling を指定しない要求を greedy にする規則を、Qwen3.6 だけに限る変更（1e5070f73）。XeStrata はこの規則（d35353903）を入れていないので、Qwen3.8-Flash-Next はもとからモデルカードの sampling で動きます。
+- 会話キャッシュを RAM に合わせて 8 GiB より大きくする変更（6c3f3fbb4）。大きさは空きの RAM からモデルのファイルなどを引いて決めるので、64 GB の 890M と Qwen3.8-Flash-Next では 8 GiB を越えません。
+- 複数 GPU の layer split の lend の予約（7ab0d923c、2aed34d4e）、READY を待つ時間の数え方（89ef8456a。XeStrata は、エンジンが CPU やディスクを使っている間は待ち続けます）、AVX-512 の CPU での drafter の自動選択（289fa51de。XeStrata の setup は DFlash2 を自動では選びません）。
 
 ## Strata 0.1.67 の取り込み
 

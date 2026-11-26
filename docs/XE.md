@@ -10,9 +10,9 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.2.21-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
-It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries the changes that apply to this fork up to upstream Strata 0.2.21 (engine 0.1.67, `d46f5f2`)
-(the sections from [Integration through Strata 0.1.67](#integration-through-strata-0167) down to [Integration through Strata 0.1.38](#integration-through-strata-0138)).
+XeStrata xe0.2.22-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.8-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries the changes that apply to this fork up to upstream Strata 0.2.22 (engine 0.1.69, `b28ca95`)
+(the sections from [Integration through Strata 0.1.69](#integration-through-strata-0169) down to [Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
 Upstream's CUDA build is retired and its sources are removed.
 Upstream Strata (`3ce2523`) keeps them, and each Xe source names the CUDA file it ports in a comment.
@@ -230,6 +230,24 @@ Three interleaved rounds (24,576 slots, cooled between runs): the MTP 31.6 / 31.
 The tokens accepted a round are about the MTP's (about 2.5), but the drafter itself takes 7.8 ms a round (mostly the time the 890M's bandwidth needs to read the 5 layers' 0.5 GB of Q4_0 weights), longer than the MTP's about 4 ms, so decode is 6 to 7% slower. Where upstream measured DFlash2 4 to 12% faster than the MTP on AMD HIP, the cards (Strix Halo, the R9700) have 2.5 to 6 times the bandwidth. Issue #23's estimate (2026-10-24: the drafter's weight reads exceed the MTP's 4 ms, +2 to 3% at best) held. The drafter changes only the drafts; the verify decides the answers.
 
 The attention kernel upstream took from Strata-rdna3 (d31256b79) is here as well, opt-in (`STRATA_DF2_ATTN=3`). It stages Q, K and the transposed V as FP16 in local memory and computes S = Q K^T and O += P V on RDNA's matrix instructions (WMMA). Against a float64 reference it differs by 0.2 to 0.4% of the output's RMS (`dflash2_attention_parity`). Three interleaved rounds on the 890M (six chats, greedy, 400 tokens): the drafter went from 7.89 / 7.72 / 7.72 ms to 7.61 / 7.57 / 7.56 ms a round, and decode was 36.23 / 36.96 / 36.92 against 36.75 / 37.01 / 37.01 tok/s. The MTP in the same rounds: 40.81 / 42.27 / 42.02 tok/s. The answers were the MTP's in all three rounds. Most of the drafter's time is reading its weights, so a faster attention does not close the gap to the MTP. The default stays the FP32 kernel.
+
+## Integration through Strata 0.1.69
+
+Strata 0.2.21 to 0.2.22 (engine version 0.1.69, 2026-11-25) is 39 commits without the merges, 0.2.21.1 among them. Each was looked at; the list is `.upstream-0169.md` (the repository root, outside git).
+The engine changes are the layer split of several GPUs and Inkling-2-Mini's CUDA path only: the path Qwen3.8-Flash-Next runs on the 890M did not change.
+
+What went in:
+
+- serve: `/v1/responses` sends a keep-alive every `KEEPALIVE_S` while the model writes a custom tool's input (Codex's `apply_patch`, e83de74d7). Nothing went out until the input was whole, and a client or proxy that cuts a quiet stream ended a healthy request.
+- setup: the folder of a run config is made before the config is written into it (2fdbdb56d).
+- web: the 401 messages that ask for an API key say where the key comes from (`--api-key`, `STRATA_API_KEY`, the run config's `api_key`; 51644762f, 284e2c5b6).
+
+What did not go in:
+
+- Inkling-2-Mini's 11 commits (the tool results' names, the model card's sampling for a request that names none, the thinking budget and levels, scaling pictures read on the CPU, setup's HIP plan and others). Inkling-2-Mini's changes are not taken (2026-11-25).
+- Keeping the greedy default under `--mtp` for Qwen3.6 only (1e5070f73). XeStrata never took that default (d35353903), so Qwen3.8-Flash-Next has run with the model card's sampling all along.
+- A conversation cache that grows past 8 GiB with the RAM (6c3f3fbb4). Its size is the free RAM less the model file and reserves, so on the 890M with 64 GB and Qwen3.8-Flash-Next it stays at 8 GiB.
+- The lend reservation of a layer split over several GPUs (7ab0d923c, 2aed34d4e), the READY wait counted from the last sign of life (89ef8456a; XeStrata waits while the engine uses the CPU or the disk), and the drafter Auto picks on an AVX-512 CPU (289fa51de; XeStrata's setup does not pick DFlash2 by itself).
 
 ## Integration through Strata 0.1.67
 
