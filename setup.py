@@ -5344,7 +5344,11 @@ def copy_private(src: Path, dst: Path) -> None:
 
 def write_config(path: Path, cfg: dict):
     """A run config, written whole or not at all (upstream #459): to a temporary file first, then moved over the old
-    one, so a setup stopped half-way (a closed window, a full disk) never leaves an empty config behind."""
+    one, so a setup stopped half-way (a closed window, a full disk) never leaves an empty config behind.
+    upstream #7012: the folder is made first, so the first config of an install whose folder is not there yet is
+    written too."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     write_private(path, json.dumps(cfg, indent=1))
 
 

@@ -9173,11 +9173,19 @@ def make_handler(svc: Service):
                     source = svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
                                      declared_only=not responses_api.codex_compaction(req)
                                      or tool_choice_of(req.get("tool_choice"))[0] == "none")
+                quiet = time.monotonic()                     # upstream #7132: the last time a byte went out
                 for kind, x in source:
                     if kind == "ping":
+                        quiet = time.monotonic()
                         yield None
                     elif kind == "event":
-                        yield from asm.feed(x)
+                        out = asm.feed(x)
+                        if out:
+                            quiet = time.monotonic()
+                            yield from out
+                        elif time.monotonic() - quiet >= KEEPALIVE_S:   # a custom tool's input is held until its end
+                            quiet = time.monotonic()
+                            yield None
                     elif kind == "mcp":
                         yield from asm.image_call(cast(dict, x), image_b64)
                     elif kind == "done":
