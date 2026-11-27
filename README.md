@@ -276,7 +276,7 @@ In each, setup looks at the GPU and writes [the settings for the 890M](#the-sett
 
 ### 1. rpm (Fedora 44)
 
-1. Download `xestrata-free-<version>.x86_64.rpm` and `SHA256SUMS` from the
+1. Download `xestrata-free-<version>.fc44.x86_64.rpm` and `SHA256SUMS` from the
    [Releases](https://github.com/ruc1j/XeStrata-890M/releases/latest) and check the file.
 
    ```bash
@@ -286,7 +286,7 @@ In each, setup looks at the GPU and writes [the settings for the 890M](#the-sett
 1. Install it. The ROCm libraries (HIP, rocBLAS, hipBLASLt) come with it as recommended dependencies.
 
    ```bash
-   sudo dnf install ./xestrata-free-0.2.22-1.x86_64.rpm
+   sudo dnf install ./xestrata-free-0.2.22-1.fc44.x86_64.rpm
    sudo usermod -aG render,video $USER    # to open /dev/kfd and /dev/dri/renderD*; log out and back in
    ```
 

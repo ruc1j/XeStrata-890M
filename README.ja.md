@@ -216,7 +216,7 @@ Fedora 44 で、次の 3 つのどれかで入れます。rpm がいちばん簡
 
 ### 1. rpm（Fedora 44）
 
-1. [Releases](https://github.com/ruc1j/XeStrata-890M/releases/latest) から `xestrata-free-<版>.x86_64.rpm` と `SHA256SUMS` をダウンロードし、確かめます。
+1. [Releases](https://github.com/ruc1j/XeStrata-890M/releases/latest) から `xestrata-free-<版>.fc44.x86_64.rpm` と `SHA256SUMS` をダウンロードし、確かめます。
 
    ```bash
    sha256sum -c SHA256SUMS --ignore-missing
@@ -225,7 +225,7 @@ Fedora 44 で、次の 3 つのどれかで入れます。rpm がいちばん簡
 1. 入れます。ROCm のライブラリ（HIP、rocBLAS、hipBLASLt）は rpm が推奨の依存として一緒に入ります。
 
    ```bash
-   sudo dnf install ./xestrata-free-0.2.22-1.x86_64.rpm
+   sudo dnf install ./xestrata-free-0.2.22-1.fc44.x86_64.rpm
    sudo usermod -aG render,video $USER    # /dev/kfd と /dev/dri/renderD* を開けるように。ログインし直します
    ```
 
