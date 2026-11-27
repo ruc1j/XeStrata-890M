@@ -52,9 +52,6 @@ set(_pkg_engine_abs ${CMAKE_INSTALL_FULL_LIBDIR}/xestrata/engine)
 # ---- the engine
 set_target_properties(strata strata-image strata-vision PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
 install(TARGETS strata strata-image strata-vision RUNTIME DESTINATION ${_pkg_engine})
-if(TARGET strata-inkling-2-mini)   # Inkling-2-Mini's engine, beside `strata` (STRATA_BUILD_INKLING2MINI)
-  install(TARGETS strata-inkling-2-mini RUNTIME DESTINATION ${_pkg_engine})
-endif()
 # the SYCL runtime the engine was built with: what libsycl loads for Level Zero and HIP (and CUDA in the contrib mode).
 # (tools/intel_llvm_build.py builds no libsycl-jit: libsycl opens it only to compile kernels from source.)
 get_filename_component(_pkg_sycl_lib "${CMAKE_CXX_COMPILER}" DIRECTORY)
@@ -142,10 +139,6 @@ install(FILES third_party/main/rocm-device-libs/LICENSE.TXT
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.rocm-device-libs)
 install(FILES third_party/main/stb/LICENSE   # stb_image, compiled into xestrata-image
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.stb)
-if(TARGET strata-inkling-2-mini)   # Zstandard's decoder, compiled into strata-inkling-2-mini (BSD: with the binaries)
-  install(FILES third_party/main/zstd-dec/LICENSE
-          DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.zstd)
-endif()
 if(TARGET strata_xgrammar)   # XGrammar, picojson and DLPack, compiled into the engine (grammar-constrained decoding)
   install(FILES third_party/main/xgrammar/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
           RENAME LICENSE.xgrammar)

@@ -1602,67 +1602,6 @@ if(STRATA_ENABLE_XE)
   strata_utf8_manifest(strata-image)
   target_link_libraries(strata-image PRIVATE strata_image)
 
-  # ---- strata-inkling-2-mini: Thinking Machines' Inkling-2-Mini (a looped MoE: 24 layers, 48 visits; `.strata` v1.1 files), on
-  # upstream Strata's engine for it (src/inkling2mini/, upstream's engine/src/inkling2 with the model's name written out:
-  # tools/upstream/inkling2mini_names.sed).  A program of its own beside `strata`, with the same `--serve` protocol: the model
-  # file's reader and the zstd decoder it needs, the scalar codecs of upstream's quant layer (src/quant/), a CPU backend (the
-  # reference) and the SYCL backend.  Upstream's CUDA, HIP and Metal backends are not taken: the SYCL one reaches the GPUs.
-  option(STRATA_BUILD_INKLING2MINI "Build strata-inkling-2-mini, the engine for Inkling-2-Mini" ON)
-  if(STRATA_BUILD_INKLING2MINI)
-    enable_language(C)
-    set(_strata_zstd ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/zstd-dec)
-    add_library(strata_zstd_dec STATIC
-      ${_strata_zstd}/common/debug.c ${_strata_zstd}/common/entropy_common.c ${_strata_zstd}/common/error_private.c
-      ${_strata_zstd}/common/fse_decompress.c ${_strata_zstd}/common/xxhash.c ${_strata_zstd}/common/zstd_common.c
-      ${_strata_zstd}/decompress/huf_decompress.c ${_strata_zstd}/decompress/zstd_ddict.c
-      ${_strata_zstd}/decompress/zstd_decompress.c ${_strata_zstd}/decompress/zstd_decompress_block.c)
-    target_include_directories(strata_zstd_dec PUBLIC ${_strata_zstd} ${_strata_zstd}/common ${_strata_zstd}/decompress)
-    target_compile_definitions(strata_zstd_dec PRIVATE ZSTD_DISABLE_ASM=1)
-    add_library(strata_inkling2mini_core STATIC
-      src/artifact/strata_reader.cpp src/quant/sk_codecs.cpp src/quant/dequant.cpp src/quant/types.cpp
-      src/inkling2mini/inkling2mini_loop.cpp src/inkling2mini/inkling2mini_cpu_backend.cpp)
-    target_include_directories(strata_inkling2mini_core PUBLIC include src src/inkling2mini third_party/main/stb)
-    target_link_libraries(strata_inkling2mini_core PUBLIC strata_zstd_dec Threads::Threads)
-    target_compile_options(strata_inkling2mini_core PRIVATE -mavx2 -mfma -mf16c)
-    add_library(strata_inkling2mini_sycl STATIC src/inkling2mini/sycl/inkling2mini_sycl_backend.cpp)
-    target_include_directories(strata_inkling2mini_sycl PRIVATE src/inkling2mini/sycl)
-    target_link_libraries(strata_inkling2mini_sycl PUBLIC strata_inkling2mini_core strata_sycl)
-    target_compile_options(strata_inkling2mini_sycl PRIVATE -fno-fast-math)
-    target_compile_definitions(strata_inkling2mini_core PUBLIC INKLING2MINI_ENABLE_SYCL=1)
-    add_executable(strata-inkling-2-mini src/inkling2mini/inkling2mini_main.cpp)
-    strata_utf8_manifest(strata-inkling-2-mini)
-    target_compile_definitions(strata-inkling-2-mini PRIVATE INKLING2MINI_VERSION="${STRATA_VERSION_NAME}")
-    target_link_libraries(strata-inkling-2-mini PRIVATE strata_inkling2mini_sycl)
-    if(STRATA_BUILD_TESTS)   # the program links and starts (no model file: a run on one is tools' and the records')
-      add_test(NAME inkling2mini_version COMMAND strata-inkling-2-mini --version)
-      set_tests_properties(inkling2mini_version PROPERTIES PASS_REGULAR_EXPRESSION "strata-inkling-2-mini ")
-      # the SYCL runner's K/V and buffers per slot, the largest --parallel that fits, and the sliding-window ring's size
-      # (upstream de1768f2b and #6878; no GPU)
-      add_executable(inkling2mini_sy_fit_test tests/core/inkling2mini_sy_fit_test.cpp)
-      target_include_directories(inkling2mini_sy_fit_test PRIVATE src/inkling2mini/sycl)
-      add_test(NAME inkling2mini_sy_fit_test COMMAND inkling2mini_sy_fit_test)
-      # the SYCL kernels' FP4 (E2M1) decode by integer ops equals its table for every code (upstream 8d98660cc; no GPU)
-      add_executable(inkling2mini_sy_e2m1_test tests/core/inkling2mini_sy_e2m1_test.cpp)
-      target_include_directories(inkling2mini_sy_e2m1_test PRIVATE src/inkling2mini)
-      add_test(NAME inkling2mini_sy_e2m1_test COMMAND inkling2mini_sy_e2m1_test)
-      # the host sampler's top-K selection in one pass leaves exactly what partial_sort left, ties included, and the
-      # sampled token streams do not change (upstream d1ca2c277, 7c3d15ed5; no GPU)
-      add_executable(inkling2mini_sample_topk_test tests/core/inkling2mini_sample_topk_test.cpp)
-      target_include_directories(inkling2mini_sample_topk_test PRIVATE include src src/inkling2mini
-                                 third_party/main/stb)
-      target_link_libraries(inkling2mini_sample_topk_test PRIVATE Threads::Threads)
-      add_test(NAME inkling2mini_sample_topk_test COMMAND inkling2mini_sample_topk_test)
-      # the model loaders' parts that need no model file and no GPU: the drafter tensors reach the backends as
-      # "dspark.<name>" (upstream #6762), a BF16 / F16 drafter's vectors widen to F32, a drafter in a layout the runners
-      # do not read is dropped, and a copied GGUF tensor's mapped pages go back to the OS
-      foreach(_t inkling2mini_names_test inkling2mini_widen_test inkling2mini_dspark_layout_test mapped_pages_test)
-        add_executable(${_t} tests/core/${_t}.cpp)
-        target_include_directories(${_t} PRIVATE include)
-        add_test(NAME ${_t} COMMAND ${_t})
-      endforeach()
-    endif()
-  endif()
-
   if(STRATA_BUILD_TESTS)
     add_executable(elementwise_parity src/kernels/elementwise_parity.cpp)
     target_link_libraries(elementwise_parity PRIVATE strata_kernels)
@@ -2458,8 +2397,6 @@ foreach(strata_target IN LISTS strata_targets)
   get_target_property(_strata_type ${strata_target} TYPE)
   if(strata_target STREQUAL "strata")
     set_target_properties(${strata_target} PROPERTIES OUTPUT_NAME xestrata-engine)
-  elseif(strata_target STREQUAL "strata-inkling-2-mini")
-    # this fork's Inkling-2-Mini engine keeps its name: serve/inkling2mini_family.py starts strata-inkling-2-mini
   elseif(_strata_type STREQUAL "EXECUTABLE" AND strata_target MATCHES "^strata-")
     string(REGEX REPLACE "^strata-" "xestrata-" _strata_name ${strata_target})
     set_target_properties(${strata_target} PROPERTIES OUTPUT_NAME ${_strata_name})
@@ -2477,7 +2414,7 @@ foreach(part_cond
         onemath=onemath onemath_rocblas=onemath_blas_rocblas onemath_cublas=onemath_blas_cublas
         onemkl=_strata_onemkl cuda=_strata_cuda_archs hip=_strata_hip_archs onednn=strata_dnnl
         aotriton=_strata_aotriton_lib cudnn_frontend=_strata_cudnn_frontend kitchen=_strata_kitchen
-        cutlass=_strata_cutlass xgrammar=strata_xgrammar zstd_dec=strata_zstd_dec)
+        cutlass=_strata_cutlass xgrammar=strata_xgrammar)
   string(REPLACE "=" ";" _strata_part_cond "${part_cond}")
   list(GET _strata_part_cond 0 _strata_part_name)
   list(GET _strata_part_cond 1 _strata_part_what)

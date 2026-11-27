@@ -22,12 +22,12 @@
   },
   "ADMIT_SHORT_FIRST": {
    "reads": [
-    "serve/server.py:406"
+    "serve/server.py:404"
    ]
   },
   "ALLOWED_HOSTS": {
    "reads": [
-    "serve/server.py:14290"
+    "serve/server.py:14161"
    ]
   },
   "ALLOW_UNPINNED": {
@@ -38,9 +38,9 @@
   },
   "API_KEY": {
    "reads": [
-    "serve/server.py:13948",
-    "serve/server.py:14266",
-    "setup.py:9220"
+    "serve/server.py:13822",
+    "serve/server.py:14137",
+    "setup.py:9202"
    ]
   },
   "ARENA_HOST_USM": {
@@ -142,7 +142,7 @@
   },
   "BATCH_MTP": {
    "reads": [
-    "serve/server.py:4725",
+    "serve/server.py:4706",
     "src/program/generate.cpp:5339",
     "src/program/plain_generate.cpp:2723"
    ]
@@ -155,7 +155,7 @@
   },
   "BATCH_TRACE": {
    "reads": [
-    "serve/server.py:1014"
+    "serve/server.py:1012"
    ]
   },
   "BF16_GEMM_BLOCK": {
@@ -197,7 +197,7 @@
   },
   "BLOCKING_CONSOLE": {
    "reads": [
-    "serve/server.py:13870"
+    "serve/server.py:13790"
    ]
   },
   "CACHE_MESSAGE_BOUNDARY": {
@@ -317,8 +317,8 @@
   "DEBUG": {
    "reads": [
     "serve/mcp.py:165",
-    "serve/server.py:7804",
-    "serve/server.py:8167"
+    "serve/server.py:7725",
+    "serve/server.py:8088"
    ]
   },
   "DECODE_TIMING": {
@@ -437,7 +437,7 @@
   },
   "DL_CONNECTIONS": {
    "reads": [
-    "setup.py:4158",
+    "setup.py:4140",
     "tools/mtp_fetch.py:273"
    ]
   },
@@ -448,7 +448,7 @@
   },
   "DRAFT_COSTS_DIR": {
    "reads": [
-    "serve/server.py:4777"
+    "serve/server.py:4758"
    ]
   },
   "DRAFT_INT2": {
@@ -515,7 +515,7 @@
   },
   "ENGINE_NICE": {
    "reads": [
-    "serve/server.py:1233"
+    "serve/server.py:1231"
    ]
   },
   "EVENT_MARK": {
@@ -665,13 +665,13 @@
     "serve/images.py:2888",
     "serve/images.py:6506",
     "serve/lora_train.py:400",
-    "serve/server.py:14054",
-    "serve/server.py:14207",
-    "serve/server.py:14212",
-    "serve/server.py:14215",
-    "serve/server.py:14368",
-    "serve/server.py:4298",
-    "serve/server.py:4987",
+    "serve/server.py:13926",
+    "serve/server.py:14078",
+    "serve/server.py:14083",
+    "serve/server.py:14086",
+    "serve/server.py:14239",
+    "serve/server.py:4281",
+    "serve/server.py:4968",
     "src/core/device.cpp:206",
     "src/core/device.cpp:218",
     "src/program/plain_generate.cpp:182"
@@ -684,7 +684,7 @@
   },
   "GRAMMAR": {
    "reads": [
-    "serve/server.py:5582"
+    "serve/server.py:5555"
    ]
   },
   "GROUPED_BENCH": {
@@ -752,7 +752,7 @@
   },
   "HTTP_BACKLOG": {
    "reads": [
-    "serve/server.py:12747"
+    "serve/server.py:12667"
    ]
   },
   "HUNYUANIMAGE3_HOST_ENDS": {
@@ -797,7 +797,7 @@
   },
   "IMAGE_URL_PRIVATE": {
    "reads": [
-    "serve/server.py:3424"
+    "serve/server.py:3407"
    ]
   },
   "INKLING_CPU_THREADS": {
@@ -920,7 +920,7 @@
   },
   "KEEP_EMPTY_TURNS": {
    "reads": [
-    "serve/frontend.py:145"
+    "serve/frontend.py:127"
    ]
   },
   "KEEP_IO_PRIORITY": {
@@ -1097,10 +1097,10 @@
   },
   "LAYER_SPLIT": {
    "reads": [
-    "serve/server.py:14084",
-    "serve/server.py:4628",
-    "serve/server.py:4933",
-    "serve/server.py:5059"
+    "serve/server.py:13956",
+    "serve/server.py:4609",
+    "serve/server.py:4914",
+    "serve/server.py:5040"
    ]
   },
   "LFUSE_GATE": {
@@ -1158,7 +1158,7 @@
   },
   "LOOP_GUARD": {
    "reads": [
-    "serve/server.py:13347"
+    "serve/server.py:13267"
    ]
   },
   "MANIFEST": {
@@ -1173,7 +1173,7 @@
   },
   "MAX_BODY_MIB": {
    "reads": [
-    "serve/server.py:9428"
+    "serve/server.py:9349"
    ]
   },
   "MEMORY_LIMIT_MIB": {
@@ -1345,7 +1345,7 @@
   },
   "NO_FAULTHANDLER": {
    "reads": [
-    "serve/server.py:13852"
+    "serve/server.py:13772"
    ]
   },
   "NO_INT8_MMA": {
@@ -1444,7 +1444,7 @@
   },
   "PARALLEL_SOLO": {
    "reads": [
-    "serve/server.py:2472"
+    "serve/server.py:2455"
    ]
   },
   "PARK_ASYNC": {
@@ -1979,12 +1979,12 @@
   },
   "REPLICA_START": {
    "reads": [
-    "serve/server.py:13439"
+    "serve/server.py:13359"
    ]
   },
   "REQUEST_LINES": {
    "reads": [
-    "serve/server.py:1331"
+    "serve/server.py:1326"
    ]
   },
   "RESIDENT_PIN": {
@@ -2300,7 +2300,7 @@
   },
   "START_RETRIES": {
    "reads": [
-    "serve/server.py:872"
+    "serve/server.py:870"
    ]
   },
   "STATE_HASH": {
@@ -2351,7 +2351,7 @@
   },
   "TOOL_MARKUP_RETRY": {
    "reads": [
-    "serve/server.py:5426"
+    "serve/server.py:5401"
    ]
   },
   "TOPK_OLD": {
@@ -2390,7 +2390,7 @@
   },
   "TRAILING_REMINDER": {
    "reads": [
-    "serve/server.py:219"
+    "serve/server.py:217"
    ]
   },
   "TRAIN_CONTROL_MS": {
@@ -2444,7 +2444,7 @@
   },
   "UNDECLARED_TOOL_CALLS": {
    "reads": [
-    "serve/server.py:13817"
+    "serve/server.py:13737"
    ]
   },
   "USAGE_SEED": {
@@ -2496,7 +2496,7 @@
   },
   "VRAM_LIMIT_MIB": {
    "reads": [
-    "serve/server.py:4308",
+    "serve/server.py:4291",
     "src/core/device.cpp:1233"
    ]
   },
@@ -2518,7 +2518,7 @@
   "WIDE_WINDOW": {
    "reads": [
     "include/strata/core/window_rows.hpp:26",
-    "serve/server.py:4700"
+    "serve/server.py:4681"
    ]
   },
   "WINDOW_TIMES": {
@@ -2560,7 +2560,7 @@
    "reads": [
     "tools/package/container.sh:278",
     "tools/package/gui.sh:113",
-    "tools/package/windows.sh:224"
+    "tools/package/windows.sh:223"
    ]
   },
   "XESTRATA_CUDNN_CACHE": {
@@ -2581,7 +2581,7 @@
     "tools/package/container.sh:279",
     "tools/package/gui.sh:114",
     "tools/package/reuse.sh:43",
-    "tools/package/windows.sh:225"
+    "tools/package/windows.sh:224"
    ]
   },
   "XESTRATA_JOBS": {
@@ -2593,7 +2593,7 @@
     "tools/package/container.sh:287",
     "tools/package/windows.sh:105",
     "tools/package/windows.sh:131",
-    "tools/package/windows.sh:239",
+    "tools/package/windows.sh:238",
     "tools/package/windows.sh:89"
    ]
   },

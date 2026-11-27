@@ -8,9 +8,9 @@ report that says "this model writes XML calls" and the parser the server picks c
 
     xml  `<tool_call>` around `<function=NAME>` and `<parameter=NAME>` blocks (Qwen3.6, Qwen3.8-Flash-Next: every
     template Strata ships) json  `<tool_call>` around a JSON object `{"name": ..., "arguments": {...}}` (Qwen3, Hermes)
-    dsml  DeepSeek-V4's `<｜DSML｜...>` blocks inkling2mini  Inkling-2-Mini's channels: tools declared under
-    `tool_declare<|content_xml|>`, a call written as
-          `<|content_invoke_tool_json|>` and a JSON object (serve/inkling2mini_dialect.py turns it into the json form)
+    dsml  DeepSeek-V4's `<｜DSML｜...>` blocks
+    inkling  Inkling-2-Mini's channels: tools declared under `tool_declare<|content_xml|>`, a call written as
+          `<|content_invoke_tool_json|>` and a JSON object (serve/inkling_dialect.py reads it)
     none  the template has no tool section
     other the template documents tools in a form this module does not know
 """
@@ -20,7 +20,7 @@ import re
 
 _DSML = "｜DSML｜"          # the full-width bars DeepSeek's template writes
 _XML_OPEN = re.compile(r"<function=[^>]*>")
-_INKLING2MINI = "<|content_invoke_tool_json|>"   # Thinking Machines' Inkling-2-Mini
+_INKLING = "<|content_invoke_tool_json|>"   # Thinking Machines' Inkling-2-Mini
 
 
 def tool_format(source: str) -> str:
@@ -29,8 +29,8 @@ def tool_format(source: str) -> str:
         return "none"
     if _DSML in source:
         return "dsml"
-    if _INKLING2MINI in source or "tool_declare<|content_xml|>" in source:
-        return "inkling2mini"
+    if _INKLING in source or "tool_declare<|content_xml|>" in source:
+        return "inkling"
     has_call = "<tool_call>" in source
     if has_call and _XML_OPEN.search(source) and "<parameter=" in source:
         return "xml"

@@ -101,10 +101,13 @@ CHATGLM4_PATTERN = (
 # token (a CJK string, a whole word) taken as that one token instead of run through the merges.
 HUNYUANIMAGE3_PRE = "hunyuanimage3"
 
-# `o200k` (Inkling-2-Mini, Thinking Machines: the o200k byte-level BPE of 200,058 tokens): the regex of the
-# Split step in the model's HF `tokenizer.json`, before the plain ByteLevel mapping; `model.ignore_merges` is set.
-# From upstream Strata's tools/strata_tokenizer.py (O200K_PATTERN).
-O200K_PATTERN = (
+# `gpt2` (Florence-2's BART tokenizer: RoBERTa's, GPT-2's vocabulary): Hugging Face's ByteLevel pre-tokenizer with
+# its regex on (`use_regex`, the default; tokenizers' `byte_level.rs`, GPT-2's encoder.py), `add_prefix_space` off.
+GPT2_PATTERN = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+
+# `inkling2` (Inkling-2-Mini, Thinking Machines): o200k's split as its `tokenizer.json` writes it (Unsloth's GGUF names
+# it `inkling2`), with `model.ignore_merges` set.
+INKLING2_PATTERN = (
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     r"|\p{N}{1,3}"
@@ -114,14 +117,6 @@ O200K_PATTERN = (
     r"|\s+"
 )
 
-# `gpt2` (Florence-2's BART tokenizer: RoBERTa's, GPT-2's vocabulary): Hugging Face's ByteLevel pre-tokenizer with
-# its regex on (`use_regex`, the default; tokenizers' `byte_level.rs`, GPT-2's encoder.py), `add_prefix_space` off.
-GPT2_PATTERN = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
-
-# `inkling2` (Inkling-2-Mini, Thinking Machines): o200k's split as its `tokenizer.json` writes it (Unsloth's GGUF names
-# it `inkling2`), with `model.ignore_merges` set.
-INKLING2_PATTERN = O200K_PATTERN                 # the same Split rule as `o200k`
-
 # The GGUF's `tokenizer.ggml.pre` -> (pattern, ignore_merges, where the pattern was transcribed from).  A `pre` not
 # listed is refused: tokenizing it with another type's pattern gives plausible tokens the model was not trained on.
 PRE_TYPES = {
@@ -130,7 +125,6 @@ PRE_TYPES = {
     "glm4": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
     "glm5": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
     HUNYUANIMAGE3_PRE: (QWEN2_PATTERN, True, "tencent/HunyuanImage-3.0*'s tokenizer.json, 2026-10-24"),
-    "o200k": (O200K_PATTERN, True, "Inkling-2-Mini's tokenizer.json (the o200k Split rule), upstream Strata c6f6427d9"),
     "gpt2": (GPT2_PATTERN, False, "Hugging Face tokenizers' ByteLevel pre-tokenizer (byte_level.rs), GPT-2's"),
     "inkling2": (INKLING2_PATTERN, True, "strata-engine/Inkling-2-Mini-Strata's tokenizer.json (04996a1e), 2026-11-23"),
 }

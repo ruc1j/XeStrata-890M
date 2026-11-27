@@ -36,8 +36,7 @@ import launcher_notices
 # not use).  ze_loader.dll comes with Intel's driver, nvcuda.dll and nvml.dll with NVIDIA's, amdhip64_7.dll with AMD's.
 SYCL_DLLS = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_adapter_cuda.dll", "ur_adapter_hip.dll",
              "ur_adapter_level_zero.dll", "ur_adapter_level_zero_v2.dll", "xptifw.dll")
-ENGINE_EXES = ("xestrata-engine.exe", "xestrata-device.exe", "xestrata-image.exe", "xestrata-vision.exe",
-               "strata-inkling-2-mini.exe")
+ENGINE_EXES = ("xestrata-engine.exe", "xestrata-device.exe", "xestrata-image.exe", "xestrata-vision.exe")
 # oneMath and its oneMKL backend (the engine's build folder's bin/), which loads oneMKL where the user installed it
 ONEMATH_DLLS = ("onemath.dll", "onemath_blas_mklgpu.dll", "onemath_blas_cublas.dll", "onemath_blas_rocblas.dll")
 # AMD GPUs' image attention: the engine's module that opens aotriton (on an AMD GPU only), aotriton's library (built
@@ -57,7 +56,7 @@ WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "p
 
 # The Windows engine's parts (engine_notices.py's PARTS.json names): what the 7z's engine is built with
 WIN_PARTS = {"onemath", "onemath_rocblas", "onemath_cublas", "onemkl", "cuda", "hip", "onednn", "aotriton",
-             "cudnn_frontend", "cutlass", "xgrammar", "zstd_dec"}
+             "cudnn_frontend", "cutlass", "xgrammar"}
 # the parts of engine_notices.ROWS the 7z carries, as COMPONENTS' rows; those it does not carry (the contrib engine's
 # oneMKL and NVIDIA's libraries, where the user installed them) go to NOTICES.json only
 ENGINE_ROWS = engine_notices.rows_for(WIN_PARTS, linux=False)

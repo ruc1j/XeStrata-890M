@@ -175,8 +175,7 @@ sed -i 's|^#if defined(_MSC_VER) && defined(_M_AMD64)$|#if 0  /* xestrata: the c
 grep -q 'xestrata: the contrib clang has no _umul128' "$cu128" || {
   echo "cutlass uint128.h: the MSVC guard is not where this script expects it" >&2; exit 1; }
 
-# CMake's targets keep upstream's names; strata-inkling-2-mini: Inkling-2-Mini's engine (this fork's)
-targets="strata strata-device strata-image strata-vision strata-inkling-2-mini onemath_backend_libs"
+targets="strata strata-device strata-image strata-vision onemath_backend_libs"   # CMake's targets keep upstream's names
 # shellcheck disable=SC2086
 cmake --build /build/engine --target $targets -j "$jobs"
 lap engine

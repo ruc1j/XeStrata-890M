@@ -755,27 +755,6 @@ The conversation cache, the checkpoints and the conversation save work as on a G
 On an i7-14700 (AVX-VNNI), reading a prompt of 1,692 tokens and giving a short answer took about 1.1 s with the 0.8B
 and 2.1 s with the 2B. A long prompt is slow: 31,000 tokens took the 2B about two and a half minutes.
 
-### Or: Inkling-2-Mini (a model on an engine of its own)
-
-[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) by Thinking Machines is a looped MoE of 26.4B (3.4B active for a token): it passes its 24 layers 48 times.
-It is built differently from Qwen3.8-Flash-Next, so an engine of its own runs it, `strata-inkling-2-mini` (upstream Strata's engine, carried over: `src/inkling2mini/`).
-The model files are the `.strata` files upstream Strata publishes, in three sizes: SQ-10 (10.5 GB), SQ-15 (14.3 GB) and SQ-20 (19.3 GB).
-
-```sh
-xestrata --setup --family inkling-2-mini
-```
-
-- setup asks for the size, the context length and whether it should read images, fetches the files, checks their sizes and SHA-256 and writes the config. An integrated GPU that shares the RAM is recommended SQ-10.
-- The drafter of its speculative decoding (DSpark) and its image reader are in the model file and the engine. No MTP layer, no pack and no image encoder are used.
-- The API is the same as Qwen3.8-Flash-Next's. A tool call the model writes in a channel of its own is translated by the server.
-- The model has no thinking levels. Thinking the model writes by itself is not returned, but counts against `max_tokens`.
-- `logprobs` and `logit_bias` are not available. The settings of Qwen3.8-Flash-Next's engine (`--kv`, the low-RAM modes, `--gpus` and the like) do not apply either.
-- `"parallel": N` (2 to 64) in the config serves several requests at once.
-
-SQ-10 on the 890M: a 512-token prefill at 43.6 tok/s and decode at 12.6 tok/s (the engine's `--bench`).
-Upstream's HIP build on the same PC: 448 tok/s and 15.2 tok/s. The prefill's matrix products are not on the matrix instructions in XeStrata's SYCL kernels yet.
-Against the CPU reference the teacher-forced KL is 0.076, about upstream's HIP build's 0.078.
-
 ### Less RAM than the model: the low-RAM mode
 
 Every model but Unsloth's sizes (huihui-ai's versions of them too) keeps all of its experts in RAM, and the GPU holds a copy of the most-used ones.

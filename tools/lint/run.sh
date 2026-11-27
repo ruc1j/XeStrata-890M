@@ -81,25 +81,15 @@ fi
 if [ ${#cpp[@]} -gt 0 ]; then
   if [ -n "$CLANG_TIDY" ] && [ -f "$BUILD/compile_commands.json" ]; then
     tidy=("$CLANG_TIDY" --quiet -p "$BUILD" --config-file="$C/clang-tidy.yaml" --warnings-as-errors='*')
-    # The folders of an engine carried over from upstream Strata as upstream wrote it (Inkling-2-Mini's, and the
-    # codecs of the .strata v1.1 files it reads): three checks are off there.  They flag the idiom of that code - bit
-    # fields unpacked from signed integers, index products in int, sums narrowed to the stored width - about a
-    # thousand times, and writing each one out would leave no line as upstream has it, for the next integration to
-    # carry over.  Every other check stays on there, and the code XeStrata writes elsewhere keeps all of them.  The
-    # tests of that engine taken from upstream (tests/core/inkling2mini_*) include its headers whole, so the three are
-    # off for them as well.
-    carried='^((src|include/strata)/(inkling2mini|quant)/|tests/core/inkling2mini_)'
-    relaxed=("--checks=-bugprone-signed-bitwise,-bugprone-implicit-widening-of-multiplication-result,-bugprone-narrowing-conversions")
     mapfile -t tus < <(python3 -c 'import json, sys; print("\n".join(sorted({e["file"] for e in json.load(open(sys.argv[1]))})))' \
       "$BUILD/compile_commands.json")
     # a source this build does not compile (another GPU maker's, as the AMD-only HIP files on a build without HIP):
     # clang-tidy would guess its command from a neighbor and report the headers it cannot find, so it is left out
     cxx=()
-    cxxc=()
     for f in "${cpp[@]}"; do
       [[ $f == *.cpp ]] || continue
       if grep -qxF "$PWD/$f" <<<"$(printf '%s\n' "${tus[@]}")"; then   # not a pipe: grep -q ends it early
-        if [[ $f =~ $carried ]]; then cxxc+=("$f"); else cxx+=("$f"); fi
+        cxx+=("$f")
       else
         echo "== clang-tidy: $f skipped (not compiled in $BUILD)"
       fi
@@ -109,10 +99,6 @@ if [ ${#cpp[@]} -gt 0 ]; then
     lines_of() { python3 -c 'import json, os, sys; print(json.dumps([{"name": os.path.abspath(f)} for f in sys.argv[1:]]))' "$@"; }
     if [ ${#cxx[@]} -gt 0 ]; then
       run clang-tidy "${tidy[@]}" --header-filter='.*' --line-filter="$(lines_of "${cxx[@]}")" "${cxx[@]}"
-    fi
-    if [ ${#cxxc[@]} -gt 0 ]; then
-      run "clang-tidy (an engine carried over from upstream: three checks off)" "${tidy[@]}" "${relaxed[@]}" \
-        --header-filter='.*' --line-filter="$(lines_of "${cxxc[@]}")" "${cxxc[@]}"
     fi
     # A header is checked inside a source that includes it, with that source's command: alone it gets the command of
     # whichever source's path is nearest, often one without -fsycl, and misses the macros a source defines before the
@@ -134,12 +120,10 @@ if [ ${#cpp[@]} -gt 0 ]; then
       }
       for h in "${hpp[@]}"; do
         tu=$(tu_of "$h")
-        htidy=("${tidy[@]}")
-        [[ $h =~ $carried ]] && htidy+=("${relaxed[@]}")
         if [ -n "$tu" ]; then
-          run "clang-tidy $h (in ${tu#"$PWD"/})" "${htidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$PWD/$h\"}]" "$tu"
+          run "clang-tidy $h (in ${tu#"$PWD"/})" "${tidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$PWD/$h\"}]" "$tu"
         else
-          run "clang-tidy $h" "${htidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$PWD/$h\"}]" "$h"
+          run "clang-tidy $h" "${tidy[@]}" --header-filter='.*' --line-filter="[{\"name\":\"$PWD/$h\"}]" "$h"
         fi
       done
     fi
@@ -169,8 +153,7 @@ done
 # upstream's name where a user reads XeStrata's (messages, environment variables, programs, documents)
 if [ ${#files[@]} -gt 0 ]; then
   echo "== upstream's name"
-  # advisory here: this fork keeps the STRATA_* names and strata-inkling-2-mini, which the lint reports on almost every
-  # file; CI's new_findings.py still counts the findings a change adds
+  # advisory here: this fork keeps the STRATA_* names, which the lint reports on almost every file; CI's new_findings.py still counts the findings a change adds
   python3 "$C/upstream_name.py" "${files[@]}" || true
   # Each file's SPDX header against where its code comes from (AGENTS.md, Licenses).
   echo "== license classes"

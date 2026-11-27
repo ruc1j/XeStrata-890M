@@ -194,11 +194,11 @@ Qwen3.8-Flash-Next の decode の 1 窓を段ごとに測り、段ごとに速�
 
 入ったものは次のとおりです。
 
-- 名前: 実行ファイルは `xestrata-engine`、`xestrata-image`、`xestrata-device` になりました（serve の `--engine strata` は引き続き使えます）。環境変数は `XESTRATA_<名前>` で、エンジンは `XESTRATA_<名前>`、`STRATA_<名前>` の順に読みます。ログの接頭辞は `xestrata` です。この fork が足したスイッチは、これまでどおり `STRATA_<名前>` で読めます。`strata-inkling-2-mini` は元の名前のままです。
+- 名前: 実行ファイルは `xestrata-engine`、`xestrata-image`、`xestrata-device` になりました（serve の `--engine strata` は引き続き使えます）。環境変数は `XESTRATA_<名前>` で、エンジンは `XESTRATA_<名前>`、`STRATA_<名前>` の順に読みます。ログの接頭辞は `xestrata` です。この fork が足したスイッチの名前は変わりません。
 - エンジンの構造: verify の窓の MoE を 1 つにまとめた `MoeWindow`、prompt の注意の形を選ぶ `flash_attn`、Qwen3.8 と密なモデルが共有する読み方（QSA、GDN、PLE、BF16 の積、埋め込み）、環境変数の読み取り `strata::env_get`、行列の命令の形の報告（`has_form`）。
 - decode: 返答の途中のチェックポイント（`--reply-checkpoint-every`、既定は 512 トークンごと）、GPU を失ったことの検出（verify と MTP の待ちが event を読み、20 秒で打ち切ります）、16 行までの窓（`--wide-window`。MTP の窓は 8 行のままです）、起動時に MTP、DFlash2、下書きなしを測って選ぶ `--draft auto`（DFlash2 の pack が要ります）、統合 GPU が全エキスパートを持つときにモデルのファイルのページキャッシュを返すこと（`XESTRATA_UMA_DROP_PAGES=0` で残します）。
 - prefill とカーネル: 密な積を形ごとに自前のカーネルとライブラリーで比べて選ぶこと、RDNA の WMMA のタイルの形、エキスパートの int8 の積の本体（K の塊のループをなくしてレジスターの退避を減らしたもの）、エキスパートの積の FP16 の形（`XESTRATA_IQ_MMQ_F16`）、MoE のモデルの密な射影の W8A8（`XESTRATA_LLM_W8A8=1`、opt-in）、上流の GDN の塊の走査（opt-in）、aotriton 0.15b の注意と comfy-kitchen の int8 の積のモジュール（AMD の GPU でだけ開きます）。
-- ほかのモデル: Inkling-2-Mini をエンジンの中で動かす経路（`src/inkling2`。この fork の `strata-inkling-2-mini` と並んで入ります）、画像の Qwen-Image-2.1、MOSS-Image の編集、Anima、ControlNet の前処理、LoRA の学習、RealESRGAN と SeedVR2 の拡大、SAM 3、BiRefNet、Florence-2、動画（ffmpeg を呼びます）。
+- ほかのモデル: Inkling-2-Mini をエンジンの中で動かす経路（`src/inkling2`）、画像の Qwen-Image-2.1、MOSS-Image の編集、Anima、ControlNet の前処理、LoRA の学習、RealESRGAN と SeedVR2 の拡大、SAM 3、BiRefNet、Florence-2、動画（ffmpeg を呼びます）。
 - serve と web ページ: 起動のたびに決める `auto` の設定（`serve/autotune.py`）、画像のモデルと同じ GPU で文のエンジンを降ろすときの共有の arena、答えにほかの言語の文字を出さない `script_guard`、会話の保存、モニターの GPU の役割のタブ。web ページは上流のものになり、チャットの一覧、編集、数式が既定で入ります。
 - setup: `--drafting auto|mtp|dflash2|off`、AMD の ROCm の確認（ライブラリーの名前で見ます）、画像と翻訳のモデルの質問、設定の一覧（`data/settings-register.json`、`tools/settings_register.py` が作ります）。
 - intel/llvm: `tools/intel_llvm_build.py` は v7.2.1 を指し、パッチは 31 本です。HIP の仮想メモリー、hostcall を要らなくする AMDGPU の修正、モジュールの読み込みでのメモリー不足の報告が加わりました。この fork の `hip-reqd-work-group-size` は 33 番に移しました。エンジンは実行時に GPU へ仮想メモリーの対応を尋ねるので、v7.2.0 で作った intel/llvm のままでもビルドでき、これまでどおり動きます。
@@ -212,6 +212,10 @@ fork の形を残したものは次のとおりです。HIP の統合 GPU であ
 - CPU: WAITPKG のない CPU では pool の待ちはこれまでどおり spin で、MWAITX は `POOL_UMWAIT=1` のときです。IQ の gather は CPUID で決めます。
 - serve と setup: エンジンの nice は 0 のまま（`XESTRATA_ENGINE_NICE=auto` で上流の +5）、`--vram-elastic` は統合 GPU では opt-in のまま、道具呼び出しの解析器は Strata 0.2.22 の形、統合 GPU の設定（`uma_host_cache`、`kfd_integrated`、`--mmap-experts`、`STRATA_CACHE_HOST=1`）と最初の提案（IQ3_XXS か Q2_0）、Unsloth の一覧。
 - README とこの fork の文書、`container/`（Fedora 44 と Fedora の ROCm。`XESTRATA_ROCM=10.1` で AMD の ROCm）、CI。
+
+この fork が自分で持っていた Inkling-2-Mini のエンジン（`src/inkling2mini/` の専用のプログラム）は、この取り込みのあとで外しました（2026-11-27）。
+エンジンのソースと試験、serve と setup の専用の分岐（`--family inkling-2-mini`）、`.strata` のファイルを読むために持っていた Zstandard の decoder（`third_party/main/zstd-dec/`）がなくなり、Inkling-2-Mini の経路は上流のもの（`src/inkling2`、setup の `inkling` と `inkling-qsa`）だけになります。
+この fork の目標は Qwen3.8-Flash-Next で、上流と同じファイルだけを持つほうが、次の取り込みで衝突が減るためです。
 
 既定が変わったものは次のとおりです。
 
@@ -345,7 +349,7 @@ serve のツール呼び出しの読み手は、この fork が引数の型を s
 - serve: `--prompt-cache-every` の定期チェックポイントを、再開した位置からの格子に置きます（2c8d300ad）。temperature 0 の要求には、モデルカードのペナルティを付けません（d7ce708ba、3313dbd61）。server の glibc のメモリー区画を 2 つに抑えます（aeecf0f5d の server の側）。
 - serve: Responses API の `max_output_tokens` で切れた答え、Codex の multi-agent v2 の item、クライアント側の `tool_search`（3af02433a、3cb933d29、277af44e9、e04cb092f）。
 - エンジン: DFlash2 の drafter の attention を RDNA の行列命令で計算するカーネルを、opt-in で移しました（`STRATA_DF2_ATTN=3`、upstream d31256b79。数字は上の DFlash2 の節にあります）。
-- 新しいモデル: Thinking Machines の Inkling-2-Mini を、upstream の専用のエンジン（`strata-inkling-2-mini`）ごと移しました（[DETAILS](DETAILS.ja.md#inkling-2-mini専用のエンジンで動くモデル)）。upstream の CUDA・HIP・Metal のバックエンドは取らず、SYCL のバックエンドを AMD の 32 レーンの sub-group で動くように直しています。モデルの名前は略さずに書く決まりなので、upstream の `ink_` などの名前は `inkling2mini_` に置き換えました（`tools/upstream/inkling2mini_names.sed`）。
+- 新しいモデル: Thinking Machines の Inkling-2-Mini を、upstream の専用のエンジン（`strata-inkling-2-mini`）ごと移しました（[DETAILS](DETAILS.ja.md) の説明は、2026-11-27 にこのエンジンと一緒に外しました）。upstream の CUDA・HIP・Metal のバックエンドは取らず、SYCL のバックエンドを AMD の 32 レーンの sub-group で動くように直しています。モデルの名前は略さずに書く決まりなので、upstream の `ink_` などの名前は `inkling2mini_` に置き換えました（`tools/upstream/inkling2mini_names.sed`）。
 - setup: RAM の予算（`--resident-budget-gib`）の規則を、RAM から 17 GB を引く形にしました（8780e9fdc、c8d70bbcd）。GPU が RAM を共有する PC は、upstream と同じく 24 GB を引く元の規則のままなので、890M では変わりません。
 - setup と tools: Coder のモデルの pin（3d54c7137）、`mtp_fetch.py` の `--repo`（c9b6956c6）、`--batch` のスロットを上書きされた会話の続きを確かめる試験の道具（6da257d80）ほか。
 

@@ -33,7 +33,6 @@ from pathlib import Path
 from urllib.parse import unquote
 
 import jinja2
-import jinja2.ext
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from serve import envvars
 
@@ -62,16 +61,6 @@ def keep_thinking_switch(source: str) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ template
-class _GenerationExtension(jinja2.ext.Extension):
-    """Hugging Face's `{% generation %}...{% endgeneration %}` tag (Inkling-2-Mini's chat template has it): the block
-    is rendered as it is, the tag itself writes nothing.  From upstream Strata's serve/frontend.py."""
-    tags = {"generation"}
-
-    def parse(self, parser):
-        next(parser.stream)
-        return parser.parse_statements(("name:endgeneration",), drop_needle=True)
-
-
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
     """The template refused the request's messages (e.g. "No user query found in messages."): a ValueError, so the
     client gets a 400 with the template's message instead of a dropped connection (#365)."""
@@ -91,7 +80,7 @@ class ChatTemplate:
             return datetime.datetime.now().strftime(fmt)
 
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
-                                            extensions=["jinja2.ext.loopcontrols", _GenerationExtension])
+                                            extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = strftime_now
@@ -108,15 +97,8 @@ class ChatTemplate:
         # GLM's templates (GLM-5.3-Flash): a call is `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...
         # </tool_call>`, read through GlmCallRewriter; the thinking always opened, its effort low, high or max
         self.call_form = "glm" if "<arg_key>" in self.source else "qwen"
-        # Inkling-2-Mini's template (serve/inkling2mini_dialect.py): tools declared under
-        # `tool_declare<|content_xml|>`, a call written in a channel as JSON; the tool calls' arguments rendered as
-        # objects, thinking always off
-        self.inkling2mini = ("<|content_invoke_tool_json|>" in self.source
-                             or "tool_declare<|content_xml|>" in self.source)
         # Inkling-2-Mini's template: its replies are channel tokens (serve/inkling_dialect.py reads them), its calls'
-        # arguments parsed objects, and no thinking (upstream inkling2's no-thinking mode).  The same template as
-        # inkling2mini above; this one is for the .strata engine's serve path (serve/inkling_kind.py), which wraps the
-        # parser by it.  Rendering prepares the messages once, through inkling2mini_dialect (the same functions)
+        # arguments parsed objects, and no thinking (upstream inkling2's no-thinking mode)
         self.inkling = "<|content_invoke_tool_json|>" in self.source
         self.caps = self._detect_caps()
         self.thinking = self._thinking_levels()
@@ -126,7 +108,7 @@ class ChatTemplate:
         (/health's "thinking", the web page's buttons): GLM-5.3-Flash's low, high and max; Harmony's (llm-jp-4.1's)
         low, medium and high, medium its default; Qwen3.8-Flash-Next's low, medium and high (xhigh); a template that
         only turns its thinking on and off, on; none at all, no levels."""
-        if self.inkling2mini:                          # no thinking mode
+        if self.inkling:
             return {"levels": [], "default": None}
         if self.call_form == "glm":
             return {"levels": ["none", "low", "high", "max"], "default": "max"}
@@ -148,10 +130,6 @@ class ChatTemplate:
                                                                     and not _text_of(m.get("content")).strip()
                                                                     and not _has_image(m.get("content"))
                                                                     and not m.get("tool_calls"))]
-        if self.inkling2mini:
-            from serve import inkling2mini_dialect
-            messages = inkling2mini_dialect.prepare_messages(messages)
-            kwargs = inkling2mini_dialect.template_kwargs(kwargs)
         if self.harmony:   # as llama.cpp's LLM-jp-4.1 path: the reasoning in the field the template reads, `thinking`,
             # and no content beside the calls of a turn that made them
             adjusted = []
@@ -162,6 +140,9 @@ class ChatTemplate:
                         m.pop("content", None)
                 adjusted.append(m)
             messages = adjusted
+        if self.inkling:
+            from serve import inkling_dialect
+            messages, kwargs = inkling_dialect.prepare_messages(messages), inkling_dialect.template_kwargs(kwargs)
         if tools and self.wrapped_tools:   # the template reads OpenAI's form, `tool.function` (llm-jp-4.1's)
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools]
         if self.call_form == "glm":        # its efforts: low, high and max (the default), taken by name
@@ -222,24 +203,6 @@ class ChatTemplate:
             return [{"name": call.name, "arguments": call.arguments} for call in parsed] == calls \
                 and all(reply in prompt for reply in replies)
 
-        if self.inkling2mini:   # its own spelling of the same capabilities (upstream's probe for this template)
-            def channel_calls(count):
-                calls = [{"name": f"strata_caps_call_{i}", "arguments": {"arg": f"strata_caps_arg_{i}"}}
-                         for i in range(count)]
-                messages = [user, {"role": "assistant", "content": "",
-                                   "tool_calls": [{"function": call} for call in calls]}]
-                messages += [{"role": "tool", "name": f"strata_caps_call_{i}", "content": f"strata_caps_result_{i}"}
-                             for i in range(count)] + [user]
-                prompt = render(messages, tools)
-                return all(f"<|message_model|>strata_caps_call_{i}<|content_invoke_tool_json|>" in prompt
-                           and f"strata_caps_result_{i}" in prompt for i in range(count))
-            return {"supports_tools": all(s in tool_prompt for s in ("strata_caps_call_0", "strata_caps_description",
-                                                                     "tool_declare<|content_xml|>")),
-                    "supports_tool_calls": channel_calls(1),
-                    "supports_system_role": "strata_caps_system" in render(
-                        [{"role": "system", "content": "strata_caps_system"}, user]),
-                    "supports_parallel_tool_calls": channel_calls(2),
-                    "supports_preserve_reasoning": False}
         history = [user, {"role": "assistant", "content": "strata_caps_answer",
                           "reasoning_content": "strata_caps_reasoning"}, user]
         form_tag = "<arg_key>" if self.call_form == "glm" else "<function="
@@ -3754,38 +3717,3 @@ class GlmOutputParser(OutputParser):
 
     def finish(self, reason: str | None = None) -> list[Event]:
         return super().feed(self.rewriter.flush()) + super().finish(reason)
-
-
-class Inkling2MiniOutputParser(OutputParser):
-    """OutputParser for Inkling-2-Mini (upstream's InklingOutputParser): the model writes its text and its calls in
-    channels (`<|content_text|>`, `<|content_invoke_tool_json|>` ...), which serve/inkling2mini_dialect.py turns into
-    text and `<tool_call>` frames with a JSON body as the output arrives.  It starts in the content state, for the model
-    opens a channel for whatever it writes, and reads the JSON body whatever the server's tool_call_recovery says: that
-    body is the dialect's own form here, not a model that drifted."""
-
-    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 recover: bool = False, declared_only: bool = False, deferred: bool = False):
-        super().__init__(thinking=False, tools=tools, stream_tools=stream_tools, recover=True,
-                         declared_only=declared_only, deferred=deferred)
-        from serve import inkling2mini_dialect
-        self._dialect = inkling2mini_dialect.Inkling2MiniDialect()
-
-    def _dispatch(self, chunks: list[tuple[str, str]]) -> list[Event]:
-        out: list[Event] = []
-        for kind, chunk in chunks:
-            if kind == "reasoning":
-                out.append(Event("reasoning", chunk))
-            elif chunk:
-                out.extend(super().feed(chunk))
-        return out
-
-    def feed(self, delta: str) -> list[Event]:
-        return self._dispatch(self._dialect.feed_channels(delta))
-
-    def feed_token(self, piece: str, *, is_special: bool) -> list[Event]:
-        """upstream #6675: one token's text, with whether it is a real special token (see the dialect's feed_token)."""
-        return self._dispatch(self._dialect.feed_token(piece, is_special=is_special))
-
-    def finish(self, reason: str | None = None) -> list[Event]:
-        out = self._dispatch(self._dialect.feed_channels("", final=True))
-        return out + super().finish(reason)
